@@ -197,6 +197,12 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 windows-sys = { version = "0.61", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    # `GetBestInterface` and `GetIfEntry2`, to tell whether internet traffic
+    # leaves through a VPN's adapter (see `src/vpn.rs`); the other two carry
+    # the types `MIB_IF_ROW2` and `GetIfEntry2` are declared with.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",

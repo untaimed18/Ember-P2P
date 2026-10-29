@@ -96,6 +96,7 @@
     not_windows: m.doctor_detail_not_windows,
     off: m.doctor_detail_off,
     stood_down: m.doctor_detail_stood_down,
+    vpn: m.doctor_detail_vpn,
     mapped: m.doctor_detail_mapped,
     not_mapped: m.doctor_detail_not_mapped,
     carrier_nat: m.doctor_detail_carrier_nat,
@@ -166,8 +167,9 @@
       }
       toast(m.doctor_action_done());
       // What the fix changed shows in a fresh check, once it has had a
-      // moment: a UPnP pass takes several seconds to ask the router.
-      if (action === 'retry_upnp') {
+      // moment: a UPnP pass takes several seconds to ask the router, and new
+      // firewall rules are tested again by a server login and Kad's check.
+      if (action === 'retry_upnp' || action === 'add_firewall_rules') {
         setTimeout(() => {
           if (!destroyed) void run();
         }, 10_000);

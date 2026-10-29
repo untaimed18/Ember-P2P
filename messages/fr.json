@@ -2930,6 +2930,7 @@
   "doctor_detail_not_windows": "Non utilisé sur ce système",
   "doctor_detail_off": "Désactivé",
   "doctor_detail_stood_down": "Mis en retrait : le routeur n’est pas ce que voit internet, souvent à cause d’un VPN",
+  "doctor_detail_vpn": "Inutile : votre connexion passe par un VPN, c’est sa redirection de ports qui ouvre les ports",
   "doctor_detail_mapped": "Ports ouverts sur le routeur",
   "doctor_detail_not_mapped": "Le routeur n’a pas ouvert les ports",
   "doctor_detail_carrier_nat": "Partagée par votre fournisseur (CGNAT)",

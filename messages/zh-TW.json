@@ -2930,6 +2930,7 @@
   "doctor_detail_not_windows": "此系統不使用",
   "doctor_detail_off": "已關閉",
   "doctor_detail_stood_down": "已停用：路由器不是網際網路看到的那一端，通常是因為 VPN",
+  "doctor_detail_vpn": "不需要：你的連線經過 VPN，連接埠由 VPN 的連接埠轉送開啟",
   "doctor_detail_mapped": "已在路由器上開啟連接埠",
   "doctor_detail_not_mapped": "路由器沒有開啟連接埠",
   "doctor_detail_carrier_nat": "由業者共用（電信級 NAT）",

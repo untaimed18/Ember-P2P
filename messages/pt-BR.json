@@ -2930,6 +2930,7 @@
   "doctor_detail_not_windows": "Não usado neste sistema",
   "doctor_detail_off": "Desativado",
   "doctor_detail_stood_down": "Recuado: o roteador não é o que a internet vê, em geral por causa de uma VPN",
+  "doctor_detail_vpn": "Não é necessário: sua conexão passa por uma VPN, então quem abre as portas é o encaminhamento de portas dela",
   "doctor_detail_mapped": "Portas abertas no roteador",
   "doctor_detail_not_mapped": "O roteador não abriu as portas",
   "doctor_detail_carrier_nat": "Compartilhado pelo provedor (CGNAT)",

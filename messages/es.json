@@ -2930,6 +2930,7 @@
   "doctor_detail_not_windows": "No se usa en este sistema",
   "doctor_detail_off": "Desactivado",
   "doctor_detail_stood_down": "Retirado: el router no es lo que ve internet, normalmente por una VPN",
+  "doctor_detail_vpn": "No hace falta: tu conexión pasa por una VPN, así que los puertos los abre su reenvío de puertos",
   "doctor_detail_mapped": "Puertos abiertos en el router",
   "doctor_detail_not_mapped": "El router no abrió los puertos",
   "doctor_detail_carrier_nat": "Compartida por tu proveedor (CGNAT)",

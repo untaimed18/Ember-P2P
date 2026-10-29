@@ -2930,6 +2930,7 @@
   "doctor_detail_not_windows": "Не используется в этой системе",
   "doctor_detail_off": "Выключено",
   "doctor_detail_stood_down": "Отключено: роутер не то, что видит интернет, обычно из-за VPN",
+  "doctor_detail_vpn": "Не нужно: подключение идёт через VPN, и порты открывает его проброс портов",
   "doctor_detail_mapped": "Порты открыты на роутере",
   "doctor_detail_not_mapped": "Роутер не открыл порты",
   "doctor_detail_carrier_nat": "Общий у провайдера (CGNAT)",

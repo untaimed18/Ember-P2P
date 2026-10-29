@@ -122,6 +122,9 @@ pub struct Signals {
     pub upnp_enabled: bool,
     pub upnp_mapped: bool,
     pub upnp_stood_down: bool,
+    /// Internet traffic leaves through a VPN's adapter, which the router's
+    /// UPnP cannot open ports on; the VPN's own port forwarding is what can.
+    pub behind_vpn: bool,
     /// The router's own WAN address is private or carrier-grade.
     pub router_behind_nat: bool,
     /// The router told us its WAN address.
@@ -220,6 +223,8 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
         check("upnp", Warn, "stood_down");
     } else if s.upnp_mapped {
         check("upnp", Pass, "mapped");
+    } else if s.behind_vpn {
+        check("upnp", Skip, "vpn");
     } else {
         check("upnp", Fail, "not_mapped");
     }
@@ -315,7 +320,9 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     if unreachable && s.router_behind_nat {
         fixes.push(Fix { id: "carrier_nat", action: None });
     } else if unreachable && settled && !s.restart_pending {
-        if s.upnp_stood_down {
+        // A forward the router did make still counts behind a VPN: a client
+        // that tunnels only some programs can leave Ember outside it.
+        if s.upnp_stood_down || (s.behind_vpn && !s.upnp_mapped) {
             fixes.push(Fix { id: "vpn", action: None });
         } else if !s.upnp_enabled {
             fixes.push(Fix { id: "enable_upnp", action: Some("enable_upnp") });
@@ -447,6 +454,7 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         upnp_enabled,
         upnp_mapped: stats.upnp_mapped,
         upnp_stood_down: stats.upnp_stood_down,
+        behind_vpn: crate::vpn::default_route_is_vpn().unwrap_or(false),
         router_behind_nat: wan.is_some_and(behind_another_nat),
         router_wan_known: wan.is_some(),
         kad_tcp: status_of(&stats.tcp_status),
@@ -548,12 +556,38 @@ pub async fn connection_doctor_action(
             let settings = state.config.read().await.settings.clone();
             let (tcp, udp, _, _) = session_ports(&stats, &settings);
             let quic = stats.quic_udp_port;
-            tokio::task::spawn_blocking(move || crate::security::firewall::add_rules_elevated(tcp, udp, quic))
-                .await
-                .map_err(|e| coded_ctx("doctor_failed", "Task error", e))
+            let added =
+                tokio::task::spawn_blocking(move || crate::security::firewall::add_rules_elevated(tcp, udp, quic))
+                    .await
+                    .map_err(|e| coded_ctx("doctor_failed", "Task error", e))?;
+            if added {
+                retest_ports(&state, stats.ed2k_low_id == Some(true)).await;
+            }
+            Ok(added)
         }
         _ => Err(coded("doctor_unknown_action", "That fix is not available here")),
     }
+}
+
+/// Have the ports tested again once rules let peers in: Kad's firewall check
+/// answers within a minute, and an eD2K server that gave a LowID (`low_id`)
+/// only hands out another ID at a fresh login, so that one logs in again.
+#[cfg(target_os = "windows")]
+async fn retest_ports(state: &AppState, low_id: bool) {
+    let (tx, _) = tokio::sync::oneshot::channel();
+    let _ = state.network_tx.try_send(NetworkCommand::RecheckFirewall { tx });
+    if !low_id {
+        return;
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if state.network_tx.try_send(NetworkCommand::GetConnectedServerSnapshot { tx }).is_err() {
+        return;
+    }
+    let Ok(Some(server)) = rx.await else {
+        return;
+    };
+    let (tx, _) = tokio::sync::oneshot::channel();
+    let _ = state.network_tx.try_send(NetworkCommand::ConnectToServer { ip: server.ip, port: server.port, tx });
 }
 
 #[cfg(test)]
@@ -633,6 +667,38 @@ mod tests {
         assert_eq!(fix_ids(&cgnat), vec!["carrier_nat"]);
         let vpn = Signals { upnp_stood_down: true, ..closed };
         assert_eq!(fix_ids(&vpn), vec!["vpn"]);
+    }
+
+    /// Behind a VPN no router answers UPnP, which is how it should be, so
+    /// that is neither a failure nor a reason to visit the router: the VPN's
+    /// own port forwarding is. The Windows rules still come first.
+    #[test]
+    fn behind_a_vpn_upnp_is_not_a_failure_and_the_vpn_is_the_fix() {
+        let tunnelled = Signals {
+            kad_tcp: Some(false),
+            kad_udp: Some(false),
+            low_id: Some(true),
+            probe_tcp: Some(TcpProbe::Timeout),
+            probe_udp: Some(false),
+            upnp_mapped: false,
+            behind_vpn: true,
+            firewall_rules: Some(false),
+            ..reachable()
+        };
+        let (_, checks, _, _) = assess(&tunnelled);
+        let upnp = checks.iter().find(|c| c.id == "upnp").expect("a UPnP line");
+        assert_eq!((upnp.status, upnp.detail), (CheckStatus::Skip, "vpn"));
+        assert_eq!(fix_ids(&tunnelled), vec!["windows_firewall", "vpn"]);
+
+        let upnp_off = Signals { upnp_enabled: false, ..tunnelled.clone() };
+        assert_eq!(fix_ids(&upnp_off), vec!["windows_firewall", "vpn"], "turning UPnP on would not help");
+
+        // Some VPN clients tunnel only chosen programs, and a forward the
+        // router made for Ember outside the tunnel is real.
+        let split = Signals { upnp_mapped: true, ..tunnelled };
+        let (_, checks, _, _) = assess(&split);
+        assert!(checks.iter().any(|c| c.id == "upnp" && c.status == CheckStatus::Pass));
+        assert_eq!(fix_ids(&split), vec!["windows_firewall", "forward_ports"]);
     }
 
     /// Whatever answers on a port Ember could not open is another program,

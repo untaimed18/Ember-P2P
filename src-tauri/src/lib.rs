@@ -41,6 +41,7 @@ mod storage;
 mod login_launch;
 mod tray;
 mod types;
+mod vpn;
 mod webservices;
 mod window_state;
 

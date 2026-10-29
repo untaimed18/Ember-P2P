@@ -2930,6 +2930,7 @@
   "doctor_detail_not_windows": "Auf diesem System nicht verwendet",
   "doctor_detail_off": "Ausgeschaltet",
   "doctor_detail_stood_down": "Zurückgezogen: Der Router ist nicht das, was das Internet sieht, meist wegen eines VPN",
+  "doctor_detail_vpn": "Nicht nötig: Deine Verbindung läuft über ein VPN, Ports öffnet dessen Portweiterleitung",
   "doctor_detail_mapped": "Ports am Router geöffnet",
   "doctor_detail_not_mapped": "Der Router hat die Ports nicht geöffnet",
   "doctor_detail_carrier_nat": "Von Ihrem Anbieter geteilt (Carrier-Grade-NAT)",

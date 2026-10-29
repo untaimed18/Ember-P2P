@@ -2930,6 +2930,7 @@
   "doctor_detail_not_windows": "Not used on this system",
   "doctor_detail_off": "Turned off",
   "doctor_detail_stood_down": "Stood down: the router is not what the internet sees, usually because of a VPN",
+  "doctor_detail_vpn": "Not needed: your connection goes through a VPN, so its port forwarding is what opens ports",
   "doctor_detail_mapped": "Ports opened on the router",
   "doctor_detail_not_mapped": "The router did not open the ports",
   "doctor_detail_carrier_nat": "Shared by your provider (carrier-grade NAT)",
