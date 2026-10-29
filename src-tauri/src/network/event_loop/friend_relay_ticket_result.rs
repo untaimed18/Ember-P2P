@@ -245,6 +245,7 @@ pub(in crate::network) async fn on_friend_relay_ticket_poll_result(
                             // opened it sends Hello first.
                             serve_friend_ember_hash: None,
                             relayed: true,
+                            friend_relay: true,
                         })
                         .await
                     {

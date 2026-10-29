@@ -2702,80 +2702,85 @@ pub(super) async fn handle_ember_dht_message(
         }
     }
 
-    // Buddy accepted a PROXY_STORE: fan the publisher-signed firewalled
-    // source record out via the normal publish driver. Charge budget and
-    // remember the publisher only after start_publish_to succeeds so a full
-    // publish table does not spend quota on a silent drop.
+    // Buddy accepted a PROXY_STORE: keep the replica, remember the publisher
+    // for callbacks, ack, and fan the record out via the normal publish driver.
     //
-    // When file uploads already own a configured cap, skip the fan-out
-    // (and the ACK). The publisher retries; taking the uplink now would
-    // steal tokens from peers we are already serving.
+    // The fan-out is the one part that can be skipped. The publisher stores
+    // the record to its own closest nodes once it has our ack, so when file
+    // uploads already own a configured cap, or the publish table is full, we
+    // still take and ack the request without the twenty STOREs. Refusing it
+    // outright, as this used to, sent no ack and no refusal while we kept
+    // endorsing, so the publisher kept naming a buddy that never placed a
+    // record — and a capped seeder, the best kind of buddy, is capped most of
+    // the time.
     if let Some((proxy_rid, forward)) = inbound.proxy_store_forward {
-        if bandwidth_limiter.file_uploads_own_uplink() {
-            debug!(
-                "Ember DHT: deferring PROXY_STORE fan-out from {from}; file uploads own the uplink"
-            );
-        } else if let Some(publisher) = inbound.sender_id {
+        if let Some(publisher) = inbound.sender_id {
             let now_inst = std::time::Instant::now();
             if state.ember_dht.can_accept_proxy_forward(publisher, from.ip(), now_inst) {
                 let key = forward.keyword_hash;
-                let targets =
-                    ember_overlay_publish_targets_within(state, key, EMBER_FORWARDED_TARGET_QUEUE_MAX);
                 let replica = forward.clone();
-                if let Some(publish_id) =
+                let publish_id = if bandwidth_limiter.file_uploads_own_uplink() {
+                    debug!(
+                        "Ember DHT: taking PROXY_STORE from {from} without fan-out; file uploads own the uplink"
+                    );
+                    None
+                } else {
+                    let targets =
+                        ember_overlay_publish_targets_within(state, key, EMBER_FORWARDED_TARGET_QUEUE_MAX);
                     state.ember_publish.start_publish_to(forward, targets)
-                {
-                    if state.ember_dht.commit_proxy_store(
-                        publisher,
-                        from,
-                        remote_noise_pub,
-                        &replica,
-                        now_inst,
-                    ) {
-                        state.ember_diagnostics.ember_dht_buddy_forwards = state
-                            .ember_diagnostics
-                            .ember_dht_buddy_forwards
-                            .saturating_add(1);
+                };
+                if state.ember_dht.commit_proxy_store(
+                    publisher,
+                    from,
+                    remote_noise_pub,
+                    &replica,
+                    now_inst,
+                ) {
+                    state.ember_diagnostics.ember_dht_buddy_forwards = state
+                        .ember_diagnostics
+                        .ember_dht_buddy_forwards
+                        .saturating_add(1);
+                    if let Some(publish_id) = publish_id {
                         drive_ember_publish(socket, state, publish_id).await;
-                        let ack_bytes =
-                            state.ember_dht.build_proxy_store_ack_frame(proxy_rid, key);
-                        match state.ember_transport.prepare_outgoing(
-                            from,
-                            Some(&remote_noise_pub),
-                            &ack_bytes,
-                        ) {
-                            ember::transport::OutgoingResult::Ready { packet }
-                            | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
-                                if let Err(e) = send_ember_udp(
-                                    socket,
-                                    &packet,
-                                    from,
-                                    &state.ember_dht_overhead,
-                                )
-                                .await
-                                {
-                                    debug!(
-                                        "Ember DHT: failed to send PROXY_STORE_ACK to {from}: {e}"
-                                    );
-                                }
-                            }
-                            ember::transport::OutgoingResult::Queued => {
+                    }
+                    let ack_bytes =
+                        state.ember_dht.build_proxy_store_ack_frame(proxy_rid, key);
+                    match state.ember_transport.prepare_outgoing(
+                        from,
+                        Some(&remote_noise_pub),
+                        &ack_bytes,
+                    ) {
+                        ember::transport::OutgoingResult::Ready { packet }
+                        | ember::transport::OutgoingResult::HandshakeStarted { packet } => {
+                            if let Err(e) = send_ember_udp(
+                                socket,
+                                &packet,
+                                from,
+                                &state.ember_dht_overhead,
+                            )
+                            .await
+                            {
                                 debug!(
-                                    "Ember DHT: PROXY_STORE_ACK to {from} queued behind handshake"
-                                );
-                            }
-                            ember::transport::OutgoingResult::Error(e) => {
-                                debug!(
-                                    "Ember DHT: transport error sending PROXY_STORE_ACK to {from}: {e}"
+                                    "Ember DHT: failed to send PROXY_STORE_ACK to {from}: {e}"
                                 );
                             }
                         }
-                    } else {
-                        // Slot was granted; replica/budget refused. Free it so
-                        // a failed store cannot occupy the publish table until
-                        // PUBLISH_TIMEOUT_SECS.
-                        let _ = state.ember_publish.remove(publish_id);
+                        ember::transport::OutgoingResult::Queued => {
+                            debug!(
+                                "Ember DHT: PROXY_STORE_ACK to {from} queued behind handshake"
+                            );
+                        }
+                        ember::transport::OutgoingResult::Error(e) => {
+                            debug!(
+                                "Ember DHT: transport error sending PROXY_STORE_ACK to {from}: {e}"
+                            );
+                        }
                     }
+                } else if let Some(publish_id) = publish_id {
+                    // Slot was granted; replica/budget refused. Free it so
+                    // a failed store cannot occupy the publish table until
+                    // PUBLISH_TIMEOUT_SECS.
+                    let _ = state.ember_publish.remove(publish_id);
                 }
             }
         }

@@ -2199,15 +2199,170 @@ pub(super) fn ember_udp_reachable(state: &NetworkState) -> bool {
 /// and consume uses before sending `CALLBACK_REQ`. `state.firewalled` starts
 /// as `!upnp_success` and Ember-only nodes never clear it, so consume must
 /// not use that flag.
+#[cfg(test)]
 pub(super) fn ember_tcp_firewalled_from(
     low_id: bool,
     tcp_status: crate::network::kad::firewall::FirewallStatus,
 ) -> bool {
-    low_id || tcp_status == crate::network::kad::firewall::FirewallStatus::Firewalled
+    ember_tcp_firewalled_with(low_id, tcp_status, None)
+}
+
+/// [`ember_tcp_firewalled_from`], with what the rendezvous server's
+/// outside-in probe found when it dialled our TCP port (`None` when it has
+/// not, or about another address or port).
+///
+/// The probe decides only while KAD and the eD2K server have said nothing:
+/// both are peers' own experience of us and outrank it. Before it, a node
+/// without them never learned it was firewalled at all — it published direct
+/// sources nobody could dial, never took a buddy, and asked firewalled
+/// publishers to call it back on a port that refused them.
+pub(super) fn ember_tcp_firewalled_with(
+    low_id: bool,
+    tcp_status: crate::network::kad::firewall::FirewallStatus,
+    outside_tcp_open: Option<bool>,
+) -> bool {
+    use crate::network::kad::firewall::FirewallStatus;
+    low_id
+        || tcp_status == FirewallStatus::Firewalled
+        || (tcp_status == FirewallStatus::Unknown && outside_tcp_open == Some(false))
+}
+
+/// How long an outside-in verdict stands without a fresh probe.
+pub(super) const OUTSIDE_VERDICT_TTL_SECS: i64 = 2 * 3600;
+
+/// The outside-in probe's TCP finding, while it is about the address and port
+/// we advertise now and recent enough to trust.
+pub(super) fn ember_outside_tcp_open(state: &NetworkState) -> Option<bool> {
+    let verdict = crate::network::reachability::outside_verdict()?;
+    let fresh = chrono::Utc::now().timestamp().saturating_sub(verdict.at_unix) < OUTSIDE_VERDICT_TTL_SECS;
+    (fresh
+        && ember_known_ipv4(state) == Some(verdict.ip)
+        && verdict.tcp_port == advertised_tcp_port(state))
+    .then_some(verdict.tcp_open)
+}
+
+/// How long after start the background probe waits, so the first one goes out
+/// with the external address and ports settled rather than mid-discovery.
+const OUTSIDE_PROBE_SETTLE: std::time::Duration = std::time::Duration::from_secs(90);
+/// How often the background probe repeats while nothing else has judged TCP,
+/// to notice a port opened or closed since. With a change of address or port
+/// it goes again sooner, though never more than once in
+/// [`OUTSIDE_PROBE_CHANGE_FLOOR`]: the server allows an address six probes an
+/// hour, and the connection doctor draws on the same allowance.
+const OUTSIDE_PROBE_REPEAT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const OUTSIDE_PROBE_CHANGE_FLOOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Ask the rendezvous server to dial us from outside, when nothing else has
+/// told us whether peers can reach our TCP port: no LowID or HighID from an
+/// eD2K server, no verdict from KAD's firewall check. An Ember-only node never
+/// has either. Also takes a probe's UDP finding as proof our UDP port is open.
+pub(super) fn maybe_probe_from_outside(state: &mut NetworkState, settings: &AppSettings) {
+    apply_outside_udp_proof(state);
+    if !settings.ember_native_enabled || settings.rendezvous_url.is_empty() {
+        return;
+    }
+    if state.low_id
+        || state.firewall_checker.tcp_status() != crate::network::kad::firewall::FirewallStatus::Unknown
+    {
+        return;
+    }
+    if state.session_started.elapsed() < OUTSIDE_PROBE_SETTLE {
+        return;
+    }
+    let Some(ip) = ember_known_ipv4(state) else {
+        return;
+    };
+    let (tcp_port, udp_port) = (advertised_tcp_port(state), advertised_udp_port(state));
+    if tcp_port == 0 || udp_port == 0 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let due = state.outside_probe_last.is_none_or(|(at, last_ip, last_tcp)| {
+        let since = now.saturating_duration_since(at);
+        since >= OUTSIDE_PROBE_REPEAT
+            || ((last_ip != ip || last_tcp != tcp_port) && since >= OUTSIDE_PROBE_CHANGE_FLOOR)
+    });
+    if !due {
+        return;
+    }
+    let Some(running) = crate::network::reachability::BackgroundProbe::begin() else {
+        return;
+    };
+    state.outside_probe_last = Some((now, ip, tcp_port));
+    let url = settings.rendezvous_url.clone();
+    tokio::spawn(async move {
+        let _running = running;
+        match crate::network::reachability::outside_in_probe(&url, tcp_port, udp_port).await {
+            Ok((crate::network::rendezvous::Reachability::Probed(answer), udp_arrived)) => info!(
+                "Outside-in probe: TCP {tcp_port} {}, UDP {udp_port} {}",
+                answer.tcp,
+                match udp_arrived {
+                    Some(true) => "reached us",
+                    Some(false) => "did not arrive",
+                    None => "not sent",
+                }
+            ),
+            Ok((other, _)) => debug!("Outside-in probe not run: {other:?}"),
+            Err(e) => debug!("Outside-in probe failed: {e}"),
+        }
+    });
+}
+
+/// How often a firewalled publisher pings its named buddy.
+///
+/// Under the 30 s many NATs give an idle UDP filter entry, on the 10 s tick
+/// that drives it. The buddy sends CALLBACK to the address it saw us at, and
+/// otherwise heard from us only on a PROXY_STORE, hours apart for a small
+/// library, so on a restricted NAT every callback after the first minute was
+/// dropped at our own router.
+const EMBER_BUDDY_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Keep the path from our named buddy to us open; see [`EMBER_BUDDY_KEEPALIVE`].
+pub(super) async fn keep_named_buddy_reachable(socket: &UdpSocket, state: &mut NetworkState) {
+    let Some(buddy) = state.ember_named_source_buddy else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    if state
+        .ember_buddy_keepalive_at
+        .is_some_and(|at| now.saturating_duration_since(at) < EMBER_BUDDY_KEEPALIVE)
+    {
+        return;
+    }
+    let Some(contact) = state.ember_dht.contact_for(&buddy).cloned() else {
+        return;
+    };
+    state.ember_buddy_keepalive_at = Some(now);
+    super::channel_relay::ping_ember_udp_peer(socket, state, contact.addr, Some(&contact.noise_pub)).await;
+}
+
+/// A datagram from the rendezvous server can only reach us unsolicited — we
+/// never send it UDP, so no NAT mapping toward it exists — which makes its
+/// arrival the same proof two strangers reaching us would be.
+fn apply_outside_udp_proof(state: &mut NetworkState) {
+    let Some(verdict) = crate::network::reachability::outside_verdict() else {
+        return;
+    };
+    if verdict.udp_arrived != Some(true)
+        || ember_known_ipv4(state) != Some(verdict.ip)
+        || verdict.udp_port != advertised_udp_port(state)
+        || state.ember_udp_reachable_at.is_some_and(|at| at >= verdict.at_unix)
+    {
+        return;
+    }
+    if state.ember_udp_reachable_at.is_none() {
+        info!("Ember: the rendezvous server's probe reached our UDP port unsolicited, treating it as open");
+    }
+    state.ember_udp_reachable_at = Some(verdict.at_unix);
+    state.ember_reach_external_ip = state.external_ip;
 }
 
 pub(super) fn ember_tcp_firewalled(state: &NetworkState) -> bool {
-    ember_tcp_firewalled_from(state.low_id, state.firewall_checker.tcp_status())
+    ember_tcp_firewalled_with(
+        state.low_id,
+        state.firewall_checker.tcp_status(),
+        ember_outside_tcp_open(state),
+    )
 }
 
 /// The buddy trailer we may write for `contact`, from the endorsement that
@@ -2285,17 +2440,16 @@ pub(super) fn epx_advertises_source_firewalled(state: &ed2k::sources::DownloadSo
     )
 }
 
-/// LowID↔LowID: both sides firewalled, source asked downloaders to use the
-/// Ember broker (`SOURCE_FLAG_RELAY_CAPABLE`). Same gate KAD uses via
-/// `is_ember_capable` before `attempt_low_to_low`.
-pub(super) fn ember_firewalled_source_should_broker(
-    we_are_unreachable: bool,
-    flags: u8,
-    ip: Ipv4Addr,
-    port: u16,
-) -> bool {
-    we_are_unreachable
-        && flags & ember::SOURCE_FLAG_FIREWALLED != 0
+/// A firewalled source that asked downloaders to use the Ember broker
+/// (`SOURCE_FLAG_RELAY_CAPABLE`), on a path with no callback to offer. Same
+/// gate KAD uses via `is_ember_capable` before `attempt_low_to_low`.
+///
+/// Not limited to downloaders that are firewalled themselves: a reachable one
+/// gets here only when the record named no buddy it could use, or the buddy's
+/// callbacks ran out, and parking the row then left it unreachable for the
+/// rest of the transfer.
+pub(super) fn ember_firewalled_source_should_broker(flags: u8, ip: Ipv4Addr, port: u16) -> bool {
+    flags & ember::SOURCE_FLAG_FIREWALLED != 0
         && flags & ember::SOURCE_FLAG_RELAY_CAPABLE != 0
         && port != 0
         && !ip.is_unspecified()

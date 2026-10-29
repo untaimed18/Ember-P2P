@@ -127,12 +127,8 @@ pub(super) async fn handle_epx_sources(
             if flags & ember::SOURCE_FLAG_FIREWALLED != 0 {
                 let mut stored_new = false;
                 for transfer_id in &matching_ids {
-                    let broker_started = ember_firewalled_source_should_broker(
-                        we_are_unreachable,
-                        flags,
-                        ip,
-                        port,
-                    ) && start_ember_low_to_low_broker(
+                    let broker_started = ember_firewalled_source_should_broker(flags, ip, port)
+                        && start_ember_low_to_low_broker(
                         state,
                         transfer_id,
                         *file_hash,
@@ -152,6 +148,7 @@ pub(super) async fn handle_epx_sources(
                         });
                     if pfs.add_source_full(ip, port, udp_port) {
                         stored_new = true;
+                        pfs.mark_unverified_claim(ip, port);
                     }
                     if broker_started {
                         pfs.set_ember_relay(ip, port, None);

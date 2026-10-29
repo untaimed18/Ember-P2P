@@ -248,7 +248,7 @@ pub struct DownloadSourceEntry {
     /// `CALLBACK_REQ`.
     pub callback_ember_token: Option<[u8; 16]>,
     /// Whether this row's address is known *only* from an Ember firewalled DHT
-    /// source record — that is, a publisher's unverified claim about its own
+    /// or EPX source record — that is, a publisher's unverified claim about its own
     /// address, which `SOURCE_FLAG_FIREWALLED` exempts from the storer's
     /// sender-IP bind.
     ///
@@ -1081,6 +1081,24 @@ impl PerFileSourceList {
                 s.arm_callback_reask();
             }
         }
+    }
+
+    /// Record that the row at `(ip, port)` was created from a firewalled
+    /// record's claim about its own address; see
+    /// [`DownloadSourceEntry::callback_addr_unverified_claim`]. Without it, a
+    /// row parked by EPX that a later callback record re-used (`is_new` false)
+    /// was handed back to the dial pool once the callbacks ran out.
+    pub fn mark_unverified_claim(&mut self, ip: Ipv4Addr, port: u16) {
+        if let Some(s) = self.find_mut(ip, port, None) {
+            s.callback_addr_unverified_claim = true;
+        }
+    }
+
+    /// Whether the callback route of the row at `(ip, port)` has had all of
+    /// its attempts.
+    pub fn callback_route_exhausted_at(&self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) -> bool {
+        self.find(ip, port, user_hash)
+            .is_some_and(|s| s.callback_route_exhausted())
     }
 
     /// Whether a KAD callback `CallbackReq` should be sent now.

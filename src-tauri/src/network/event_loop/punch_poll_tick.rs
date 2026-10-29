@@ -299,43 +299,55 @@ pub(in crate::network) async fn on_punch_poll_tick(
             ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
             return;
         }
-        // Ack means "taken", not "succeeded": the entry leaves the mailbox now
-        // instead of being re-leased to us every 5 s while we dial. A dial that
-        // then fails is not retried from here either way — the initiator's own
-        // connect into our accept loop is the other half of the punch.
-        ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
         let initiator_addr = SocketAddr::new(ip, info.port);
         tracing::info!(
             "Punch responder: reciprocating for initiator {} at {initiator_addr}",
             &info.from_id[..8.min(info.from_id.len())]
         );
 
-        // Reciprocate so the initiator's own `poll_punch`
-        // (keyed on its own id) finds us and learns our
-        // real external address to dial. The registered
-        // port is our QUIC port, not `our_addr.port()`
-        // (the KAD UDP NAT mapping) — the initiator
-        // dials this port over QUIC, not UDP/KAD.
-        if let Some(ext_addr) = our_ext_addr {
-            if let Err(e) = ember::relay::register_punch_with_ip(
-                &rv_url,
-                &our_punch_hash,
-                &friend_hash,
-                advertised_quic_port,
-                our_nat_type.as_u8(),
-                ext_addr.ip(),
-                &punch_secret,
-                &our_punch_hash,
-            )
-            .await
-            {
-                tracing::debug!("Punch responder: reciprocal register failed: {e}");
+        // Run beside the dial below rather than ahead of it: the initiator is
+        // dialling us already, and two round-trips to the server before our
+        // own packets opened the mapping used up its punch window. Its own
+        // task, so a punched stream is not held back for them either.
+        let reciprocate = {
+            let rv_url = rv_url.clone();
+            let info = info.clone();
+            async move {
+                // Ack means "taken", not "succeeded": the entry leaves the
+                // mailbox now instead of being re-leased to us every 5 s while
+                // we dial. A dial that then fails is not retried from here
+                // either way — the initiator's own connect into our accept loop
+                // is the other half of the punch.
+                ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
+                // Reciprocate so the initiator's own `poll_punch`
+                // (keyed on its own id) finds us and learns our
+                // real external address to dial. The registered
+                // port is our QUIC port, not `our_addr.port()`
+                // (the KAD UDP NAT mapping) — the initiator
+                // dials this port over QUIC, not UDP/KAD.
+                if let Some(ext_addr) = our_ext_addr {
+                    if let Err(e) = ember::relay::register_punch_with_ip(
+                        &rv_url,
+                        &our_punch_hash,
+                        &friend_hash,
+                        advertised_quic_port,
+                        our_nat_type.as_u8(),
+                        ext_addr.ip(),
+                        &punch_secret,
+                        &our_punch_hash,
+                    )
+                    .await
+                    {
+                        tracing::debug!("Punch responder: reciprocal register failed: {e}");
+                    }
+                } else {
+                    tracing::debug!(
+                        "Punch responder: no external address known yet, skipping reciprocal register"
+                    );
+                }
             }
-        } else {
-            tracing::debug!(
-                "Punch responder: no external address known yet, skipping reciprocal register"
-            );
-        }
+        };
+        tokio::spawn(reciprocate);
 
         // Also dial out ourselves. If this succeeds, treat
         // it as a normal inbound connection — we remain the
@@ -393,6 +405,7 @@ pub(in crate::network) async fn on_punch_poll_tick(
                     writer: Box::new(send),
                     serve_friend_ember_hash: serve_friend,
                     relayed: false,
+                    friend_relay: false,
                 };
                 if let Err(e) = punch_cb_tx.try_send(req) {
                     tracing::debug!("Punch responder: dropping punched stream: {e}");

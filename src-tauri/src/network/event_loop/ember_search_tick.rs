@@ -586,6 +586,11 @@ pub(in crate::network) async fn on_ember_search_tick(
                         src.udp_port,
                         src.user_hash,
                     );
+                    let relaying = pfs.sources.iter().any(|s| {
+                        s.ip == src.ip
+                            && s.tcp_port == src.tcp_port
+                            && matches!(s.state, ed2k::sources::DownloadSourceState::EmberRelay)
+                    });
                     pfs.set_ember_callback_buddy(
                         src.ip,
                         src.tcp_port,
@@ -599,6 +604,25 @@ pub(in crate::network) async fn on_ember_search_tick(
                         buddy.endorsed_until,
                         added,
                     );
+                    // A rediscovered record does not restore the budget, so
+                    // an unverified row whose callbacks ran out stayed parked
+                    // for good. The buddy vouched for this publisher, so the
+                    // relay may be pinned to it.
+                    if pfs.callback_route_exhausted_at(src.ip, src.tcp_port, src.user_hash)
+                        && ember_firewalled_source_should_broker(src.flags, src.ip, src.tcp_port)
+                    {
+                        let target = ember::broker::RelayTarget {
+                            quic_port: src.quic_port,
+                            node_id: Some(src.publisher_id),
+                        };
+                        if relaying
+                            || start_ember_low_to_low_broker(state, tid, fh, src.ip, src.tcp_port, target).await
+                        {
+                            if let Some(pfs) = state.per_file_sources.get_mut(tid) {
+                                pfs.set_ember_relay(src.ip, src.tcp_port, src.user_hash);
+                            }
+                        }
+                    }
                 }
                 if matching_ids.is_empty() {
                     continue;

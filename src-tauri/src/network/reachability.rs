@@ -82,6 +82,99 @@ pub fn probe_received(nonce: &[u8; 16]) -> bool {
     expected().lock().iter().any(|e| e.nonce == *nonce && e.arrived)
 }
 
+/// How long the UDP probe may take to arrive after the server says it sent it.
+const UDP_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// What the rendezvous server's outside-in probe last found, from the
+/// background check or the connection doctor alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutsideVerdict {
+    /// The address it probed: ours, as the server saw the request.
+    pub ip: std::net::Ipv4Addr,
+    pub tcp_port: u16,
+    /// Whether the TCP connect-back landed. Refused and timed out both mean
+    /// nobody outside can reach Ember on that port.
+    pub tcp_open: bool,
+    pub udp_port: u16,
+    /// Whether the UDP datagram arrived; `None` when it was not sent.
+    pub udp_arrived: Option<bool>,
+    pub at_unix: i64,
+}
+
+fn last_outside_verdict() -> &'static parking_lot::Mutex<Option<OutsideVerdict>> {
+    static LAST: std::sync::OnceLock<parking_lot::Mutex<Option<OutsideVerdict>>> = std::sync::OnceLock::new();
+    LAST.get_or_init(Default::default)
+}
+
+/// The newest outside-in verdict, if any probe has answered this session.
+pub fn outside_verdict() -> Option<OutsideVerdict> {
+    *last_outside_verdict().lock()
+}
+
+/// Ask the rendezvous server to dial our `tcp_port` and send a datagram to
+/// our `udp_port`, wait for the datagram, and keep the answer as the outside
+/// verdict when it is about an IPv4 address, the only kind Ember listens on.
+/// Returns the server's answer and whether the datagram arrived.
+pub async fn outside_in_probe(
+    rendezvous_url: &str,
+    tcp_port: u16,
+    udp_port: u16,
+) -> Result<(crate::network::rendezvous::Reachability, Option<bool>), String> {
+    use crate::network::rendezvous::Reachability;
+    let mut nonce = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+    let _expecting = expect_probe(nonce);
+    let answer = crate::network::rendezvous::request_reachability(rendezvous_url, tcp_port, udp_port, &nonce).await?;
+    let Reachability::Probed(probed) = &answer else {
+        return Ok((answer, None));
+    };
+    let Ok(ip) = probed.ip.parse::<std::net::Ipv4Addr>() else {
+        return Ok((answer, None));
+    };
+    let udp_arrived = if probed.udp_sent {
+        let deadline = tokio::time::Instant::now() + UDP_PROBE_WAIT;
+        let mut arrived = probe_received(&nonce);
+        while !arrived && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            arrived = probe_received(&nonce);
+        }
+        Some(arrived)
+    } else {
+        None
+    };
+    *last_outside_verdict().lock() = Some(OutsideVerdict {
+        ip,
+        tcp_port,
+        tcp_open: probed.tcp == "open",
+        udp_port,
+        udp_arrived,
+        at_unix: chrono::Utc::now().timestamp(),
+    });
+    Ok((answer, udp_arrived))
+}
+
+/// Whether a background outside-in probe is running, so ticks start one at a
+/// time. Held by [`BackgroundProbe`].
+static BACKGROUND_PROBE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The right to run the background probe, released when dropped.
+pub struct BackgroundProbe(());
+
+impl BackgroundProbe {
+    pub fn begin() -> Option<Self> {
+        BACKGROUND_PROBE_RUNNING
+            .compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .ok()
+            .map(|_| Self(()))
+    }
+}
+
+impl Drop for BackgroundProbe {
+    fn drop(&mut self) {
+        BACKGROUND_PROBE_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A probe datagram for `nonce`, as the server sends it.
 #[cfg(test)]
 pub fn probe_datagram(nonce: &[u8; 16]) -> [u8; PROBE_LEN] {

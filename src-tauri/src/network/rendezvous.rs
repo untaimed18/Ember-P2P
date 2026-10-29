@@ -663,7 +663,7 @@ fn client_cache() -> &'static tokio::sync::RwLock<std::collections::HashMap<Stri
 /// and ~86,400 full TCP+TLS handshakes per client per day against one server.
 /// Cloning a `reqwest::Client` shares the pool, so handing out clones is what
 /// makes connection reuse and TLS session resumption actually apply.
-async fn client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
+pub(crate) async fn client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
     {
         let cache = client_cache().read().await;
         if let Some(hit) = cache.get(rendezvous_url) {

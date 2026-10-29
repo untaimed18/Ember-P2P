@@ -286,14 +286,33 @@ pub(super) async fn request_friend_transfer(
 ) -> FriendXferRequestOutcome {
     let now = std::time::Instant::now();
     let key = (friend, file_hash);
-    let transport = friend_xfer_transport_choice(
-        state.firewalled,
-        advertised_tcp_port(state),
-        advertised_quic_port(state),
-        state.nat_info.nat_type,
-        state.nat_info.external_addr,
-        state.rendezvous_registered,
-    );
+    // Whether the friend can connect back to us: the shared TCP verdict, not
+    // `state.firewalled`, which an Ember-only node never clears after a failed
+    // UPnP pass and a router behind another NAT wrongly clears on success.
+    let firewalled = ember_tcp_firewalled(state);
+    let choose = |firewalled: bool| {
+        friend_xfer_transport_choice(
+            firewalled,
+            advertised_tcp_port(state),
+            advertised_quic_port(state),
+            state.nat_info.nat_type,
+            state.nat_info.external_addr,
+            state.rendezvous_registered,
+        )
+    };
+    let mut transport = choose(firewalled);
+    // Asked again after a connect-back: it did not land, whatever the verdict
+    // says, so this time the friend is asked to punch — unless a punch cannot
+    // work from here either, which leaves connect-back the only thing to try.
+    let connect_back_failed = state
+        .friend_xfer_attempts
+        .get(&key)
+        .is_some_and(|attempt| matches!(attempt.transport, FriendXferTransport::ConnectBack { .. }));
+    if !firewalled && connect_back_failed {
+        if let Ok(punch) = choose(true) {
+            transport = Ok(punch);
+        }
+    }
     let (transport, previous_attempts) =
         match friend_xfer_request_plan(transport, &state.friend_xfer_attempts, key, now) {
             Ok(plan) => plan,
@@ -1834,6 +1853,19 @@ mod friend_transfer_tests {
         assert!(ember_tcp_firewalled_from(true, FirewallStatus::Unknown));
     }
 
+    /// The outside-in probe settles an unknown verdict, and only that: KAD and
+    /// the eD2K server are peers' own experience and outrank it.
+    #[test]
+    fn the_outside_probe_decides_only_what_kad_and_the_server_left_unknown() {
+        use crate::network::kad::firewall::FirewallStatus;
+        assert!(ember_tcp_firewalled_with(false, FirewallStatus::Unknown, Some(false)));
+        assert!(!ember_tcp_firewalled_with(false, FirewallStatus::Unknown, Some(true)));
+        assert!(!ember_tcp_firewalled_with(false, FirewallStatus::Unknown, None));
+        assert!(!ember_tcp_firewalled_with(false, FirewallStatus::Open, Some(false)), "KAD's open stands");
+        assert!(ember_tcp_firewalled_with(false, FirewallStatus::Firewalled, Some(true)), "and its firewalled");
+        assert!(ember_tcp_firewalled_with(true, FirewallStatus::Unknown, Some(true)), "LowID stands");
+    }
+
     /// A buddy that never endorsed the endpoint is not a callback destination.
     ///
     /// This used to be half of a pair: the other test pinned the compatibility
@@ -1977,39 +2009,26 @@ mod friend_transfer_tests {
         let ip = Ipv4Addr::new(8, 8, 8, 8);
         assert!(
             ember_firewalled_source_should_broker(
-                true,
                 ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE,
                 ip,
                 4662,
             ),
-            "two firewalled Ember peers must start the broker"
+            "a firewalled source with no callback to offer must start the broker"
         );
         assert!(
-            !ember_firewalled_source_should_broker(
-                false,
-                ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE,
-                ip,
-                4662,
-            ),
-            "reachable searcher uses CALLBACK_REQ, not the broker"
+            !ember_firewalled_source_should_broker(ember::SOURCE_FLAG_FIREWALLED, ip, 4662),
+            "without RELAY_CAPABLE the source never offered to be brokered"
         );
         assert!(
-            !ember_firewalled_source_should_broker(
-                true,
-                ember::SOURCE_FLAG_FIREWALLED,
-                ip,
-                4662,
-            ),
-            "without RELAY_CAPABLE, admission already refuses LowID↔LowID"
+            !ember_firewalled_source_should_broker(ember::SOURCE_FLAG_RELAY_CAPABLE, ip, 4662),
+            "a reachable source is dialled, not brokered"
         );
         assert!(!ember_firewalled_source_should_broker(
-            true,
             ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE,
             Ipv4Addr::UNSPECIFIED,
             4662,
         ));
         assert!(!ember_firewalled_source_should_broker(
-            true,
             ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE,
             ip,
             0,

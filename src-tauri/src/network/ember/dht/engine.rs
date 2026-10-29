@@ -2779,6 +2779,16 @@ impl EmberDht {
                 failed_queries: 0,
             };
             out.sender_contact = Some(contact.clone());
+            // A publisher we relay callbacks for, heard from on a new address or
+            // key: callbacks go where it is now. Only a PROXY_STORE used to
+            // set this, so a NAT that re-mapped its port between republishes
+            // (hours apart for a small library) had every callback sent to a
+            // mapping that no longer existed. The frame is authenticated, so
+            // only the publisher itself can move it.
+            if let Some(client) = self.callback_clients.get_mut(&msg.sender_id) {
+                client.addr = from;
+                client.noise_pub = remote_noise_pub;
+            }
             match self.routing.add_contact(contact) {
                 AddResult::Added => out.learned_contact = true,
                 AddResult::PingOldest {

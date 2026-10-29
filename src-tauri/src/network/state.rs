@@ -1040,6 +1040,11 @@ pub(super) struct NetworkState {
     /// did not need one, and it hides exactly the open-port nodes that make the
     /// best relays for everyone else. See [`ember_udp_reachable`].
     pub(super) ember_udp_reachable_at: Option<i64>,
+    /// The last background outside-in probe we started, and the address and
+    /// advertised TCP port it was about. See [`maybe_probe_from_outside`].
+    pub(super) outside_probe_last: Option<(std::time::Instant, std::net::Ipv4Addr, u16)>,
+    /// When we last pinged our named source buddy to keep its path to us open.
+    pub(super) ember_buddy_keepalive_at: Option<std::time::Instant>,
     /// The external address `ember_reach_witness` and `ember_udp_reachable_at`
     /// were earned under. The evidence is dropped when the address moves to a
     /// different one, not when it is merely unknown for a while: KAD

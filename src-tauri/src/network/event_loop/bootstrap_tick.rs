@@ -44,6 +44,9 @@ pub(in crate::network) async fn on_bootstrap_tick(
     upnp_maintain_started_at: &mut Option<tokio::time::Instant>,
     upnp_mappings: &mut upnp::UpnpMappings,
 ) {
+    maybe_probe_from_outside(state, settings);
+    keep_named_buddy_reachable(udp_socket, state).await;
+
     // Only the KAD bootstrap below depends on KAD being up. The
     // friend-presence and friend-search work after this block must
     // not: `stats.status` is only ever advanced by KAD code paths,

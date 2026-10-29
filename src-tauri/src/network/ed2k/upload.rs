@@ -742,6 +742,9 @@ pub struct InboundStreamRequest {
     /// The stream runs through a relay rather than straight to the peer, so
     /// `peer_addr` is not an address the peer can be dialled at.
     pub relayed: bool,
+    /// A friend's session through the rendezvous relay, counted against
+    /// [`MAX_FRIEND_RELAYED_SESSIONS`] rather than the eD2K relays' budget.
+    pub friend_relay: bool,
 }
 
 /// A fully handshaked outbound connection produced by `connect_and_serve`, handed
@@ -1695,6 +1698,14 @@ const MAX_RELAYED_SESSIONS: usize = 8;
 /// [`MAX_RELAYED_SESSIONS`]. No session is ever recorded at `0.0.0.0` itself:
 /// [`relayed_session_addr`] never returns it.
 const RELAYED_SESSIONS_KEY: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+/// Friend sessions through the rendezvous relay allowed at once. Apart from
+/// [`MAX_RELAYED_SESSIONS`], which eight brokered eD2K uploads could fill and
+/// so turn away every friend who could only reach us that way.
+const MAX_FRIEND_RELAYED_SESSIONS: usize = 8;
+/// The `ip_connection_counts` key for [`MAX_FRIEND_RELAYED_SESSIONS`]. No
+/// session is recorded at `::`: relayed ones get [`relayed_session_addr`]'s
+/// IPv4 stand-ins, and a direct one at an unspecified address is refused.
+const FRIEND_RELAYED_SESSIONS_KEY: IpAddr = IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
 
 /// A stand-in address, unique to one relayed session, that the session is
 /// recorded under in place of the relay's.
@@ -6073,7 +6084,9 @@ pub async fn start_upload_server(
                     );
                     continue;
                 };
-                let (count_key, limit) = if relayed {
+                let (count_key, limit) = if relayed && req.friend_relay {
+                    (FRIEND_RELAYED_SESSIONS_KEY, MAX_FRIEND_RELAYED_SESSIONS)
+                } else if relayed {
                     (RELAYED_SESSIONS_KEY, MAX_RELAYED_SESSIONS)
                 } else {
                     (peer_ip, MAX_CONNECTIONS_PER_IP)

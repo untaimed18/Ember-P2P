@@ -1348,7 +1348,9 @@ pub(in crate::network) async fn on_download_event(
     }
     // Inject Ember Peer Exchange sources into matching active downloads
     if let DownloadEvent::EmberSources { ref transfer_id, ref entries, ref aich_roots, ref ember_peers, ref relay_attestations, from_ember_hash } = event {
-        let we_are_unreachable = state.firewalled || state.low_id;
+        // The same predicate the DHT source path uses, so one source is not
+        // brokered when gossiped and asked to call back when found by search.
+        let we_are_unreachable = ember_tcp_firewalled(state);
         handle_epx_sources(state, transfer_manager, source_manager, local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, &format!("download {transfer_id}"), false, we_are_unreachable, &HashMap::new()).await;
     }
 

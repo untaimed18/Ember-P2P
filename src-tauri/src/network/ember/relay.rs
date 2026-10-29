@@ -65,11 +65,12 @@ const MAX_RELAY_REQUEST_NONCE_IDENTITIES: usize = 256;
 /// indirectly by reqwest's default response cap and the very small
 /// JSON shapes these endpoints accept; if a future endpoint needs
 /// larger bodies, add an explicit `bytes_per_response` cap here.
+///
+/// The rendezvous module's cached client, so the punch poll shares its
+/// connection pool instead of resolving DNS and doing a TLS handshake on
+/// every poll.
 async fn relay_http_client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
-    let (_, host, addrs) = crate::security::validate_fetch_url(rendezvous_url)
-        .await
-        .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
-    crate::security::build_pinned_client(&host, &addrs)
+    crate::network::rendezvous::client(rendezvous_url).await
 }
 
 /// Defense-in-depth: refuse to contact a non-HTTPS rendezvous/relay URL.
@@ -278,6 +279,13 @@ impl RelayManager {
     /// anyway, so the count drains naturally.
     pub fn set_policy(&mut self, enabled: bool, max_sessions: u32) {
         self.enabled = enabled;
+        // What we already advertised stays in peers' candidate lists until it
+        // expires. Forgetting it makes their requests the refusal they drop us
+        // for, not the capacity one they retry, and keeps turning the setting
+        // back on from reviving attestations signed before it went off.
+        if !enabled {
+            self.attestation_hashes.clear();
+        }
         // `max_relay_sessions` is config.json-only, so it never passes through
         // the settings screen's clamps. Bound it here: each session can move
         // `RELAY_MAX_BYTES_PER_DIRECTION` in each direction, so an absurd
@@ -1133,6 +1141,13 @@ pub async fn poll_punch(
         }
     };
     let (target_id, target_raw) = punch_identity(our_ember_hash);
+    let client = relay_http_client(rendezvous_url).await?;
+    // The server refuses a poll that arrives after a later-signed one from the
+    // same key, and the responder tick, a friend connect and a room punch all
+    // poll this one mailbox. Signing and sending one at a time keeps them in
+    // order, where racing lost whichever crossed the other in flight.
+    static POLL_IN_ORDER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let in_order = POLL_IN_ORDER.lock().await;
     let ts = crate::network::rendezvous::current_timestamp();
     let nonce = punch_nonce();
     let mut signed = Vec::with_capacity(domain.len() + 1 + 32 + 16 + 8);
@@ -1142,7 +1157,6 @@ pub async fn poll_punch(
     signed.extend_from_slice(&nonce);
     signed.extend_from_slice(&ts.to_le_bytes());
     let sig = sign_punch(secret_key, &signed);
-    let client = relay_http_client(rendezvous_url).await?;
     let resp = client
         .post(format!("{}{}", rendezvous_url.trim_end_matches('/'), route))
         .json(&serde_json::json!({
@@ -1155,6 +1169,7 @@ pub async fn poll_punch(
         .send()
         .await
         .map_err(|e| format!("punch poll: {e}"))?;
+    drop(in_order);
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -2891,7 +2906,12 @@ pub async fn run_quic_accept_loop(
                 // tick — one connection advertising zero credit was enough.
                 let reject_reason = {
                     let mut mgr_lock = mgr.lock().await;
-                    if !mgr_lock.accepts_attestation_hash(&verified.attestation_hash) {
+                    if !mgr_lock.enabled {
+                        debug!(
+                            "QUIC accept: refusing relay request from {remote}: relaying for peers is off"
+                        );
+                        Some(REJECT_AUTH)
+                    } else if !mgr_lock.accepts_attestation_hash(&verified.attestation_hash) {
                         debug!(
                             "QUIC accept: refusing relay request from {remote}: unknown or expired attestation hash"
                         );
@@ -2960,6 +2980,7 @@ pub async fn run_quic_accept_loop(
                     serve_friend_ember_hash: None,
                     // `remote` is the relay node, not the peer behind it.
                     relayed: true,
+                    friend_relay: false,
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping relay-target stream from {remote}: {e}");
@@ -2988,6 +3009,7 @@ pub async fn run_quic_accept_loop(
                     // and that side never arrives through this accept loop.
                     serve_friend_ember_hash: None,
                     relayed: false,
+                    friend_relay: false,
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping direct stream from {remote}: {e}");
@@ -3835,6 +3857,26 @@ mod tests {
         assert!(mgr.accepts_attestation_hash(&current));
         assert!(mgr.accepts_attestation_hash(&previous));
         assert!(!mgr.accepts_attestation_hash(&unknown));
+    }
+
+    #[test]
+    fn turning_relaying_off_forgets_what_was_advertised() {
+        let mut mgr = RelayManager::new();
+        let hash = [1u8; 32];
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        mgr.set_current_attestation_hash(hash, expires);
+        mgr.set_policy(true, 0);
+        assert!(mgr.accepts_attestation_hash(&hash));
+        mgr.set_policy(false, 0);
+        mgr.set_policy(true, 0);
+        assert!(
+            !mgr.accepts_attestation_hash(&hash),
+            "an attestation signed before relaying went off must not come back with it"
+        );
     }
 
     #[test]

@@ -21,8 +21,6 @@ use crate::types::NetworkStats;
 /// A clock this far from the rendezvous server's breaks signed records and
 /// session timestamps; less is ordinary drift.
 const CLOCK_SKEW_WARN_SECS: i64 = 300;
-/// How long the UDP probe may take to arrive after the server says it sent it.
-const UDP_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// How long after start a session with no TCP finding is still checking:
 /// time for Kad to connect and run its check, or a server to give an ID.
 const SETTLING_SECS: u64 = 15 * 60;
@@ -469,35 +467,26 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
     if probe {
         use crate::network::rendezvous::Reachability;
         let url = crate::commands::channels::rendezvous_url(state).await;
-        let mut nonce = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-        let _expecting = crate::network::reachability::expect_probe(nonce);
-        match crate::network::rendezvous::request_reachability(&url, probe_tcp, probe_udp, &nonce).await {
+        // Also kept as the network's outside verdict, so a check run here
+        // tells Ember whether peers can reach it, as the background one does.
+        match crate::network::reachability::outside_in_probe(&url, probe_tcp, probe_udp).await {
             // Ember listens on IPv4 only: an answer about another address
             // says nothing about the ports peers reach.
-            Ok(Reachability::Probed(answer)) if answer.ip.parse::<Ipv4Addr>().is_ok() => {
+            Ok((Reachability::Probed(answer), udp_arrived)) if answer.ip.parse::<Ipv4Addr>().is_ok() => {
                 probed = true;
                 signals.probe_tcp = Some(match answer.tcp.as_str() {
                     "open" => TcpProbe::Open,
                     "closed" => TcpProbe::Closed,
                     _ => TcpProbe::Timeout,
                 });
-                if answer.udp_sent {
-                    let deadline = tokio::time::Instant::now() + UDP_PROBE_WAIT;
-                    let mut arrived = crate::network::reachability::probe_received(&nonce);
-                    while !arrived && tokio::time::Instant::now() < deadline {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        arrived = crate::network::reachability::probe_received(&nonce);
-                    }
-                    signals.probe_udp = Some(arrived);
-                }
+                signals.probe_udp = udp_arrived;
                 if answer.server_time > 0 {
                     signals.clock_skew_secs = Some(chrono::Utc::now().timestamp() - answer.server_time);
                 }
             }
-            Ok(Reachability::RateLimited) => signals.probe_rate_limited = true,
-            Ok(Reachability::Busy) => signals.probe_busy = true,
-            Ok(Reachability::Declined { server_time }) if server_time > 0 => {
+            Ok((Reachability::RateLimited, _)) => signals.probe_rate_limited = true,
+            Ok((Reachability::Busy, _)) => signals.probe_busy = true,
+            Ok((Reachability::Declined { server_time }, _)) if server_time > 0 => {
                 signals.clock_skew_secs = Some(chrono::Utc::now().timestamp() - server_time);
             }
             _ => {}

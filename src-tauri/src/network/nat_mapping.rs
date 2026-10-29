@@ -177,7 +177,22 @@ pub(super) fn advertised_quic_port(state: &NetworkState) -> Option<u16> {
 
 /// Keep the DHT engine's advertised buddy identity in sync with STUN/UPnP.
 pub(super) fn refresh_ember_advertised_buddy(state: &mut NetworkState) {
-    let ip = state.external_ip.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+    // A node whose UDP port is known closed to strangers offers no buddy
+    // endpoint: a searcher's CALLBACK_REQ to it would die at its NAT, and the
+    // publisher naming it would have every callback lost. Unknown still
+    // offers, as before — refusing it would leave firewalled publishers with
+    // nobody to ask until KAD or the outside probe had spoken for each node.
+    let udp_known_closed = !ember_udp_reachable(state)
+        && (state.firewall_checker.udp_status() == crate::network::kad::firewall::FirewallStatus::Firewalled
+            || crate::network::reachability::outside_verdict().is_some_and(|verdict| {
+                verdict.udp_arrived == Some(false)
+                    && Some(verdict.ip) == state.external_ip
+                    && verdict.udp_port == advertised_udp_port(state)
+            }));
+    let ip = state
+        .external_ip
+        .filter(|_| !udp_known_closed)
+        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
     state.ember_dht.set_advertised_buddy(
         *state.ember_transport.local_noise_public_key(),
         ip,

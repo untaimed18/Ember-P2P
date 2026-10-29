@@ -1079,6 +1079,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_store_loaded: false,
         ember_reach_witness: None,
         ember_udp_reachable_at: None,
+        outside_probe_last: None,
+        ember_buddy_keepalive_at: None,
         ember_reach_external_ip: None,
         ember_source_address: EmberSourceAddress::default(),
         ember_source_address_dirty: false,

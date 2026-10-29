@@ -238,7 +238,7 @@ pub(super) fn spawn_channel_neighbor_lookup(
     result_tx: mpsc::UnboundedSender<ChannelNeighborLookupResult>,
 ) {
     tokio::spawn(async move {
-        let mut endpoint = rendezvous::lookup_channel_presence(
+        let looked_up = rendezvous::lookup_channel_presence(
             &rv_url,
             &our_ember_hash,
             &our_pubkey,
@@ -246,10 +246,12 @@ pub(super) fn spawn_channel_neighbor_lookup(
             &peer_pubkey,
             &channel_id,
         )
-        .await
-        .ok()
-        .flatten();
-        if endpoint.is_none() {
+        .await;
+        // A lookup that failed, rate limited above all, is no reason to send
+        // the same server a punch registration and its polls as well.
+        let answered = looked_up.is_ok();
+        let mut endpoint = looked_up.ok().flatten();
+        if endpoint.is_none() && answered {
             if let Some((ip, port, nat_type)) = punch {
                 endpoint = punch_channel_neighbor(
                     &rv_url,

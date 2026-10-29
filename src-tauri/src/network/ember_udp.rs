@@ -486,7 +486,7 @@ pub(super) async fn handle_ember_control_message(
                     // bounded by the global relay-pool cap alone.
                     let from_ember_hash =
                         verified_session_node_id(state.ember_dht.routing(), from, &session_key);
-                    let we_are_unreachable = state.firewalled || state.low_id;
+                    let we_are_unreachable = ember_tcp_firewalled(state);
                     let injected = handle_epx_sources(
                         state,
                         transfer_manager,
