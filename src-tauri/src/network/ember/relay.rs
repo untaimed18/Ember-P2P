@@ -881,32 +881,49 @@ pub async fn register_punch_with_ip(
     )
     .await?
     .ok_or_else(|| "punch target has no registered v2 identity".to_string())?;
-    let capability = super::crypto::derive_pairwise_presence_capability(
-        secret_key,
-        &target_pubkey,
-        &target_pubkey,
-        epoch,
-    )
-    .ok_or_else(|| "could not derive pairwise punch capability".to_string())?;
-    register_punch_with_capability(
-        rendezvous_url,
-        from_ember_hash,
-        target_ember_hash,
-        capability,
-        epoch,
-        port,
-        nat_type,
-        advertised_ip,
-        secret_key,
-    )
-    .await
+    // The target registers the current epoch's capability on its presence
+    // heartbeat, every two minutes, so for up to that long after a rollover
+    // the server only holds the previous epoch's and refuses the current one
+    // with 403. The refusal comes before the replay mark, and the target reads
+    // whichever epoch an entry carries, so the previous one is tried next.
+    let mut last_err = String::new();
+    for epoch in [epoch, epoch - 1] {
+        let capability = super::crypto::derive_pairwise_presence_capability(
+            secret_key,
+            &target_pubkey,
+            &target_pubkey,
+            epoch,
+        )
+        .ok_or_else(|| "could not derive pairwise punch capability".to_string())?;
+        match register_punch_status(
+            rendezvous_url,
+            from_ember_hash,
+            target_ember_hash,
+            capability,
+            epoch,
+            port,
+            nat_type,
+            advertised_ip,
+            secret_key,
+        )
+        .await?
+        {
+            status if status.is_success() => return Ok(()),
+            reqwest::StatusCode::FORBIDDEN => last_err = "punch register: status 403 Forbidden".to_string(),
+            status => return Err(format!("punch register: status {status}")),
+        }
+    }
+    Err(last_err)
 }
 
-/// Register a punch using a pre-derived capability (channel gossip neighbors).
+/// Send one punch registration under a pre-derived capability and report the
+/// server's answer, which callers read to retry the previous epoch on 403.
 ///
-/// Skips the friend identity oracle so a room peer cannot be confused with
-/// a friend punch slot.
-pub async fn register_punch_with_capability(
+/// Room neighbours call this directly with their channel capability, skipping
+/// the friend identity oracle so a room peer cannot be confused with a friend
+/// punch slot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn register_punch_status(
     rendezvous_url: &str,
     from_ember_hash: &[u8; 16],
     target_ember_hash: &[u8; 16],
@@ -916,7 +933,7 @@ pub async fn register_punch_with_capability(
     nat_type: u8,
     advertised_ip: IpAddr,
     secret_key: &[u8; 32],
-) -> Result<(), String> {
+) -> Result<reqwest::StatusCode, String> {
     require_https(rendezvous_url)?;
     let protocol = crate::network::rendezvous::negotiate_protocol(rendezvous_url).await?;
     if matches!(advertised_ip, IpAddr::V6(_)) {
@@ -965,13 +982,7 @@ pub async fn register_punch_with_capability(
         .send()
         .await
         .map_err(|e| format!("punch register: {e}"))?;
-
-    let status = resp.status();
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(format!("punch register: status {status}"))
-    }
+    Ok(resp.status())
 }
 
 /// Verify initiator register proof returned by punch poll before dialing.
@@ -1061,6 +1072,46 @@ fn verify_punch_proof_freshness(register_ts: i64, epoch: i64, now: i64) -> Resul
         return Err("punch proof: capability epoch is not current or previous".to_string());
     }
     Ok(())
+}
+
+/// Mailbox senders a dedicated poller is waiting on right now, by the hashed id
+/// the mailbox reports, counted so overlapping waits on one sender nest.
+///
+/// One identity has one punch mailbox, and several pollers read it: the
+/// responder tick, a friend connect waiting on its friend's reply, a room
+/// punch waiting on its neighbour's. Only the waiting poller can tell such an
+/// entry is its own, so the responder, which acknowledges what it cannot use,
+/// leaves an awaited sender's entries to it.
+fn awaited_punch_senders() -> &'static parking_lot::Mutex<HashMap<String, usize>> {
+    static AWAITED: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    AWAITED.get_or_init(Default::default)
+}
+
+/// Marks a mailbox sender as awaited until dropped.
+pub struct AwaitedPunchSender(String);
+
+impl Drop for AwaitedPunchSender {
+    fn drop(&mut self) {
+        let mut awaited = awaited_punch_senders().lock();
+        if let Some(count) = awaited.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                awaited.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Wait on entries from `from_id` (a mailbox's hashed sender id).
+pub fn await_punch_from(from_id: String) -> AwaitedPunchSender {
+    *awaited_punch_senders().lock().entry(from_id.clone()).or_insert(0) += 1;
+    AwaitedPunchSender(from_id)
+}
+
+/// Whether some poller is waiting on entries from `from_id`.
+pub fn punch_sender_awaited(from_id: &str) -> bool {
+    awaited_punch_senders().lock().contains_key(from_id)
 }
 
 /// Signed self-mailbox poll. No friend list or stable target candidates are

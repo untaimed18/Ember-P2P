@@ -1673,6 +1673,10 @@ pub(super) struct NetworkState {
     /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
     pub(super) channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
     pub(super) channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
+    /// When a lookup last handed us a neighbor's address and we pinged it. A
+    /// later lookup for the same neighbor means the ping never became a
+    /// contact, which is when the room relay is offered as well.
+    pub(super) channel_neighbor_pinged_at: HashMap<[u8; 32], std::time::Instant>,
     /// Earliest tick at which [`maybe_dial_channel_neighbors`] should read the
     /// member roster again. `None` means "next tick". See
     /// [`CHANNEL_NEIGHBOR_IDLE_RESCAN`].

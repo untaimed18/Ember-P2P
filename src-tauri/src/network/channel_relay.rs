@@ -292,43 +292,67 @@ pub(super) async fn punch_channel_neighbor(
     }
     let ts = rendezvous::current_timestamp();
     let epoch = ember::crypto::pairwise_capability_epoch(ts);
-    let register_cap = ember::channel::derive_channel_presence_capability(
-        &our_secret,
-        &peer_pubkey,
-        &peer_pubkey,
-        &channel_id,
-        epoch,
-    )?;
-    let expected_cap = ember::channel::derive_channel_presence_capability(
-        &our_secret,
-        &peer_pubkey,
-        &our_pubkey,
-        &channel_id,
-        epoch,
-    )?;
     let peer_hash = ember::channel::channel_id_from_pubkey(&peer_pubkey);
     let expected_from = rendezvous::hashed_id(&peer_hash);
-    if ember::relay::register_punch_with_capability(
-        rendezvous_url,
-        &our_ember_hash,
-        &peer_hash,
-        register_cap,
-        epoch,
-        port,
-        nat_type,
-        IpAddr::V4(advertised_ip),
-        &our_secret,
-    )
-    .await
-    .is_err()
-    {
+    // Waited on from before the registration, so the responder tick leaves
+    // the neighbour's reply in the mailbox for the poll below.
+    let _awaiting = ember::relay::await_punch_from(expected_from.clone());
+    // The current epoch first, then the previous: for up to a presence
+    // heartbeat after a rollover the server holds only the previous epoch's
+    // capability and refuses the current one with 403.
+    let mut registered = false;
+    for epoch in [epoch, epoch - 1] {
+        let register_cap = ember::channel::derive_channel_presence_capability(
+            &our_secret,
+            &peer_pubkey,
+            &peer_pubkey,
+            &channel_id,
+            epoch,
+        )?;
+        match ember::relay::register_punch_status(
+            rendezvous_url,
+            &our_ember_hash,
+            &peer_hash,
+            register_cap,
+            epoch,
+            port,
+            nat_type,
+            IpAddr::V4(advertised_ip),
+            &our_secret,
+        )
+        .await
+        {
+            Ok(status) if status.is_success() => {
+                registered = true;
+                break;
+            }
+            Ok(reqwest::StatusCode::FORBIDDEN) => continue,
+            _ => return None,
+        }
+    }
+    if !registered {
         return None;
     }
+    // The neighbour's entry carries its own epoch, which a registration near a
+    // boundary (or a skewed clock) puts on the other side of ours.
+    let expected_cap_for = |info_epoch: i64| {
+        (info_epoch.abs_diff(epoch) <= 1)
+            .then(|| {
+                ember::channel::derive_channel_presence_capability(
+                    &our_secret,
+                    &peer_pubkey,
+                    &our_pubkey,
+                    &channel_id,
+                    info_epoch,
+                )
+            })
+            .flatten()
+    };
     for _ in 0..CHANNEL_PUNCH_POLL_ATTEMPTS {
         tokio::time::sleep(CHANNEL_PUNCH_POLL_INTERVAL).await;
         match ember::relay::poll_punch(rendezvous_url, &our_ember_hash, &our_secret).await {
             Ok(Some(info)) => {
-                if info.from_id != expected_from || info.capability != expected_cap {
+                if info.from_id != expected_from || expected_cap_for(info.epoch) != Some(info.capability) {
                     continue;
                 }
                 let Ok(IpAddr::V4(ip)) = info.ip.parse::<IpAddr>() else {
@@ -403,7 +427,19 @@ pub(super) async fn apply_channel_neighbor_lookup(
                     .insert((ip, port), (noise_pub, std::time::Instant::now()));
             }
             ping_ember_udp_peer(socket, state, addr, noise.as_ref()).await;
-            return;
+            // Lookups only run for a neighbor we hold no contact for, so a
+            // second one after a ping means the ping never reached it — a
+            // member behind a NAT that filters us, still registered under its
+            // public address. That is the case the room relay exists for, and
+            // this path used to ping such a member every interval forever.
+            let now = std::time::Instant::now();
+            let pinged_before = state
+                .channel_neighbor_pinged_at
+                .insert(result.peer_pubkey, now)
+                .is_some_and(|at| now.saturating_duration_since(at) < CHANNEL_NEIGHBOR_PINGED_MEMORY);
+            if !pinged_before {
+                return;
+            }
         }
     }
     maybe_offer_channel_relay(
@@ -580,8 +616,14 @@ pub(super) async fn run_channel_relay_session(
     // ever going to read them — the exact failure the delivery accounting
     // exists to prevent. Nothing is claimed until the peer has proved it
     // speaks this protocol, so giving up here has nothing to release.
+    // Every write is flushed: `WsStream` hands each one to tungstenite, which
+    // holds frames in its 128 KiB write buffer until something flushes it. The
+    // only thing that otherwise did was the reply to a server ping, every 10 s
+    // and only once bridged, so the magic sat unsent past the peer's handshake
+    // deadline and a formed session delayed every frame by up to 10 s.
     let handshake = tokio::time::timeout(CHANNEL_RELAY_HANDSHAKE_TIMEOUT, async {
         writer.write_all(CHANNEL_RELAY_WS_MAGIC).await?;
+        writer.flush().await?;
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic).await?;
         if magic != *CHANNEL_RELAY_WS_MAGIC {
@@ -659,8 +701,10 @@ pub(super) async fn run_channel_relay_session(
                 if body.len() > ember::dht::messages::MAX_DHT_PAYLOAD {
                     continue;
                 }
-                let len = (body.len() as u32).to_le_bytes();
-                if writer.write_all(&len).await.is_err() || writer.write_all(&body).await.is_err() {
+                let mut frame = Vec::with_capacity(4 + body.len());
+                frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&body);
+                if writer.write_all(&frame).await.is_err() || writer.flush().await.is_err() {
                     break;
                 }
             }

@@ -3517,6 +3517,11 @@ pub(super) fn channels_lite_cached(
 pub(super) const CHANNEL_NEIGHBOR_LOOKUP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(ember::channel::CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS);
 pub(super) const CHANNEL_NEIGHBOR_LOOKUPS_PER_TICK: usize = 4;
+/// How long a ping to a looked-up neighbor counts as unanswered if the
+/// neighbor is looked up again: a few lookup intervals, so one that was busy
+/// once is not written off, while one that never answers soon gets a relay.
+pub(super) const CHANNEL_NEIGHBOR_PINGED_MEMORY: std::time::Duration =
+    std::time::Duration::from_secs(ember::channel::CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS * 4);
 pub(super) const CHANNEL_NEIGHBOR_FIND_NODE_PER_TICK: usize = 2;
 pub(super) const CHANNEL_PUNCH_POLL_ATTEMPTS: usize = 12;
 pub(super) const CHANNEL_PUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);

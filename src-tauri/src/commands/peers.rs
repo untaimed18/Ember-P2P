@@ -1617,8 +1617,21 @@ pub async fn browse_friend(
         },
     )
     .await?;
-    await_reply(rx, "peers_no_response", "No response").await?
+    // A friend with no live session is connected first, and the reply only
+    // comes once that has finished: a direct dial of up to 15 s, then a punch
+    // and relay phase of up to 60 s. The usual 10 s reply window gave up on
+    // every firewalled friend before the relay could land, and the response
+    // that arrived afterwards had nobody waiting for it.
+    match tokio::time::timeout(BROWSE_CONNECT_REPLY_TIMEOUT, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(coded("peers_no_response", "No response")),
+        Err(_) => Err(coded("network_timeout", "The network is not responding")),
+    }
 }
+
+/// The longest [`browse_friend`] waits for the connect behind it: the direct
+/// dial and the whole punch-and-relay phase, with room for the lookups.
+const BROWSE_CONNECT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[tauri::command]
 pub async fn cancel_browse_friend(

@@ -1251,6 +1251,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_roster_cache: None,
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),
+        channel_neighbor_pinged_at: HashMap::new(),
         channel_neighbor_scan_after: None,
         channel_relay_outboxes: HashMap::new(),
         channel_relay_pending: HashSet::new(),

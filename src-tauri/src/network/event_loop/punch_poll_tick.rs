@@ -3,9 +3,14 @@
 
 use super::*;
 
-/// Idle cadence for the same poll, preserving the old behaviour when no
-/// transfer punch is pending so an idle client does not poll every 3 s.
-const PUNCH_POLL_IDLE_SECS: u64 = 60;
+/// Idle cadence for the same poll, when no transfer punch is pending, so an
+/// idle client does not poll every 3 s.
+///
+/// Under the server's `PUNCH_TTL` (30 s): a friend's chat or browse punch
+/// toward us registers one entry and waits, and at 60 s most of those expired
+/// before we ever looked, leaving the pair on the relay. Three polls a minute
+/// is still a small share of the 60-a-minute general budget it is charged to.
+const PUNCH_POLL_IDLE_SECS: u64 = 20;
 
 /// Budget for the responder's own dial toward the initiator.
 ///
@@ -235,6 +240,13 @@ pub(in crate::network) async fn on_punch_poll_tick(
                 return;
             }
         };
+        // A friend connect waiting on this friend's reply, or a room punch on
+        // this neighbour, owns the entry: taking it here as a fresh request
+        // answered a reply with another punch and left the waiting side on its
+        // relay, and acknowledging a room entry deleted it unseen.
+        if ember::relay::punch_sender_awaited(&info.from_id) {
+            return;
+        }
         let Some(_claim) = gate.claim(&info.punch_id) else {
             tracing::trace!("Punch responder: {} already being handled", info.punch_id);
             return;

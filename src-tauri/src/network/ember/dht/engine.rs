@@ -104,11 +104,15 @@ const MAX_CALLBACK_CLIENTS_PER_SUBNET: usize = MAX_CALLBACK_CLIENTS / 4;
 const _: () = assert!(MAX_CALLBACK_CLIENTS_PER_SUBNET >= MAX_CALLBACK_CLIENTS_PER_ADDR);
 /// Files remembered per callback client, against [`CallbackClient::files`].
 ///
-/// One firewalled publisher proxies a tick's worth of source records through a
-/// single buddy, so this has to cover a publish round rather than a single
-/// file; past it the least recently proxied file is forgotten and its searchers
-/// fall back to the park path, exactly as they would once the record expired.
-const MAX_CALLBACK_FILES_PER_CLIENT: usize = 64;
+/// Every record a publisher proxies through us names us for its whole six-hour
+/// life, so this has to cover the publisher's library rather than a publish
+/// round: at 64 a library of a few hundred files had all but its last 64
+/// silently uncallable within minutes, while every one of those records still
+/// sent its searchers here. Past the cap the least recently proxied file is
+/// forgotten and its searchers fall back to the park path. Bounded by memory:
+/// about 56 bytes a grant across [`MAX_CALLBACK_CLIENTS`] publishers is some
+/// 15 MiB at the worst a table can be filled to.
+const MAX_CALLBACK_FILES_PER_CLIENT: usize = 1024;
 /// `CALLBACK_REQ`s we will bounce per searcher per minute.
 const MAX_CALLBACK_FORWARDS_PER_SENDER: usize = 8;
 const MAX_CALLBACK_FORWARDS_IN_FLIGHT: usize = 32;

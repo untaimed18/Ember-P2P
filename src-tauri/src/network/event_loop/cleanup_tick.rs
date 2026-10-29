@@ -112,6 +112,9 @@ pub(in crate::network) async fn on_cleanup_tick(
         state.channel_neighbor_lookup_at.retain(|_, at| {
             now.saturating_duration_since(*at) < CHANNEL_NEIGHBOR_LOOKUP_INTERVAL
         });
+        state.channel_neighbor_pinged_at.retain(|_, at| {
+            now.saturating_duration_since(*at) < CHANNEL_NEIGHBOR_PINGED_MEMORY
+        });
     }
 
     // Drop publish-ack counters for files no longer being

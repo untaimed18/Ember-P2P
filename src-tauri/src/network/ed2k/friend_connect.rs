@@ -2058,6 +2058,8 @@ async fn punch_friend_until(
     secret_key: &[u8; 32],
     deadline: tokio::time::Instant,
 ) -> Result<PunchedStreams, String> {
+    let friend_id = crate::network::rendezvous::hashed_id(&friend_ember_hash);
+    let _awaiting = crate::network::ember::relay::await_punch_from(friend_id.clone());
     for _ in 0..FRIEND_PUNCH_POLL_ATTEMPTS {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -2077,6 +2079,11 @@ async fn punch_friend_until(
         .await
         {
             Ok(Ok(Some(info))) => {
+                // Someone else's entry: a room punch or another friend's
+                // request, left for whoever polls for it.
+                if info.from_id != friend_id {
+                    continue;
+                }
                 let info_for_timeout = info.clone();
                 match tokio::time::timeout_at(
                     punch_attempt_deadline(tokio::time::Instant::now(), deadline),

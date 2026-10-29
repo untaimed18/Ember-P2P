@@ -2739,6 +2739,19 @@ pub(super) async fn maybe_publish_ember_sources(
             if renew {
                 ask_ember_buddy_endorsements(socket, state, std::slice::from_ref(contact)).await;
             }
+            // A buddy we are skipping is named only for want of another
+            // endorsement, and asks went out only while nobody was named, so
+            // one that kept endorsing but never acked a PROXY_STORE (a full
+            // publish table, a saturated uplink, a moved endpoint) stayed our
+            // buddy for good while nothing was placed. Ask the others for a
+            // replacement; the per-candidate pacing bounds this to one ask
+            // each every few minutes.
+            if state
+                .ember_proxy_buddies
+                .is_skipped(&contact.node_id, std::time::Instant::now())
+            {
+                ask_ember_buddy_endorsements(socket, state, &buddy_candidates).await;
+            }
         }
     } else if state.ember_named_source_buddy.take().is_some() {
         // Reachable again: the records naming a buddy and flagged firewalled
