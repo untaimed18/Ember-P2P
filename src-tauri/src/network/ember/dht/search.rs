@@ -15,7 +15,8 @@ const MAX_ACTIVE_SEARCHES: usize = 64;
 ///
 /// The cap is one pool shared by everything, and almost every creator is
 /// background: channel presence starts a walk a second, download source
-/// lookups five a minute, bucket refresh and publish-target lookups six more.
+/// lookups five a minute, bucket refresh a few more, and publish-target lookups
+/// up to eight at a time while a publish waits on them.
 /// Each of those retries on its own tick, so a refusal costs them nothing. The
 /// user's keyword search has no second chance — `start_find_value` returning
 /// `None` drops the Ember leg for that query, the results arrive KAD-only, and

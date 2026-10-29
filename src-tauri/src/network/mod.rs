@@ -1071,6 +1071,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_session_hold_pinged: HashSet::new(),
         ember_publish_targets: HashMap::new(),
         ember_publish_target_queue: std::collections::VecDeque::new(),
+        ember_awaited_lookup_minute: None,
         ember_publish_target_waits: HashMap::new(),
         ember_publish_target_lookups: HashMap::new(),
         ember_key_record_holds: HashMap::new(),

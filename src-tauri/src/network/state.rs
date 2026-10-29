@@ -1001,6 +1001,9 @@ pub(super) struct NetworkState {
     /// and whether the lookup has since ended, whatever it found. See
     /// [`ember_publish_awaits_lookup`].
     pub(super) ember_publish_target_waits: HashMap<[u8; 16], (i64, bool)>,
+    /// When the current minute of awaited target lookups began, and how many
+    /// it has started. See [`EMBER_MAX_AWAITED_TARGET_LOOKUPS_PER_MIN`].
+    pub(super) ember_awaited_lookup_minute: Option<(std::time::Instant, usize)>,
     /// In-flight target lookups, search id to the key each is resolving.
     pub(super) ember_publish_target_lookups: HashMap<u32, [u8; 16]>,
     /// Our key-epoch records waiting for a target lookup, by key. See

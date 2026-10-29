@@ -1938,29 +1938,14 @@ pub(super) async fn run_ember_maintenance(
     //     selected key, and with only the nodes_ember.dat lead to ask, those
     //     FIND_NODEs are two more unanswered queries on the same handshake
     //     that the liveness ping is already waiting on.
+    //
+    //     While publishes wait on them, `top_up_awaited_target_lookups` starts
+    //     them every second instead.
     prune_ember_publish_target_waits(state);
     if state.ember_dht.routing().verified_len() > 0 {
-        let lookups = ember_target_lookups_this_cycle(
-            state.ember_publish_target_queue.len(),
-            ember_publish_lookups_awaited(state),
-        );
-        for _ in 0..lookups {
-            let Some(key) = state.ember_publish_target_queue.pop_front() else {
-                break;
-            };
-            let target = ember::dht::EmberNodeId(key);
-            match start_ember_background_find_node(state, target) {
-                Some(search_id) => {
-                    state.ember_publish_target_lookups.insert(search_id, key);
-                    drive_ember_search(socket, state, search_id).await;
-                }
-                None => {
-                    // Search cap reached. Put it back so the key is not silently
-                    // dropped from the rotation, and stop for this cycle.
-                    state.ember_publish_target_queue.push_front(key);
-                    break;
-                }
-            }
+        if !ember_publish_lookups_awaited(state) {
+            let lookups = ember_target_lookups_this_cycle(state.ember_publish_target_queue.len());
+            start_ember_publish_target_lookups(socket, state, lookups).await;
         }
         start_key_record_lookups(socket, state).await;
     }

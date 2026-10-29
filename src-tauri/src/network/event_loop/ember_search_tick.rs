@@ -91,6 +91,9 @@ pub(in crate::network) async fn on_ember_search_tick(
         }
     }
 
+    // Ahead of the idle guard: a queued lookup is not one of the maps it reads.
+    top_up_awaited_target_lookups(udp_socket, state).await;
+
     // Key-epoch records whose target lookup has landed (see
     // `hold_key_record_in`); nothing to do while none has.
     if !state.ember_key_records_ready.is_empty() {

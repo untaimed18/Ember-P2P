@@ -2674,11 +2674,11 @@ fn the_named_buddy_survives_a_missed_query() {
 /// Target lookups keep pace with the queue instead of a fixed two a minute.
 #[test]
 fn target_lookups_scale_with_the_queue() {
-    assert_eq!(ember_target_lookups_this_cycle(0, false), EMBER_MAINT_MIN_TARGET_LOOKUPS);
-    assert_eq!(ember_target_lookups_this_cycle(100, false), EMBER_MAINT_MIN_TARGET_LOOKUPS);
-    assert_eq!(ember_target_lookups_this_cycle(300, false), 5);
+    assert_eq!(ember_target_lookups_this_cycle(0), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(100), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(300), 5);
     assert_eq!(
-        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX, false),
+        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX),
         EMBER_MAINT_MAX_TARGET_LOOKUPS
     );
 }
@@ -2824,23 +2824,24 @@ fn the_lookup_gate_reads_the_wait_rule_without_starting_it() {
     );
 }
 
-/// A lookup a publish is waiting on holds a file back, so the queue drains in
-/// minutes then rather than over the hour an ordinary refresh can take.
+/// A lookup a publish is waiting on holds a file back, so they are kept
+/// running as they finish rather than started in a batch each minute, within
+/// a bound on how many run at once and how many start in a minute.
 #[test]
-fn awaited_target_lookups_drain_within_a_few_cycles() {
-    assert_eq!(ember_target_lookups_this_cycle(0, true), EMBER_MAINT_MIN_TARGET_LOOKUPS);
-    assert_eq!(ember_target_lookups_this_cycle(10, true), 10, "a held-back file is asked about at once");
-    assert_eq!(ember_target_lookups_this_cycle(20, true), EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS);
-    assert_eq!(
-        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX, true),
-        EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS
+fn awaited_target_lookups_are_topped_up_within_their_bounds() {
+    let conc = EMBER_MAX_CONCURRENT_AWAITED_TARGET_LOOKUPS;
+    let per_min = EMBER_MAX_AWAITED_TARGET_LOOKUPS_PER_MIN;
+    assert_eq!(ember_awaited_target_lookups_to_start(0, 0, 0), 0, "nothing queued");
+    assert_eq!(ember_awaited_target_lookups_to_start(3, 0, 0), 3, "a held-back file is asked about at once");
+    assert_eq!(ember_awaited_target_lookups_to_start(500, 0, 0), conc);
+    assert_eq!(ember_awaited_target_lookups_to_start(500, conc - 2, 0), 2, "finished ones are replaced");
+    assert_eq!(ember_awaited_target_lookups_to_start(500, conc, 0), 0);
+    assert_eq!(ember_awaited_target_lookups_to_start(500, 0, per_min - 1), 1);
+    assert_eq!(ember_awaited_target_lookups_to_start(500, 0, per_min), 0, "the minute's allowance is spent");
+    assert!(
+        per_min > EMBER_MAINT_MAX_TARGET_LOOKUPS * 8,
+        "a waiting file is asked about far faster than a republish refresh"
     );
-    for queued in [0, 1, 20, 100, EMBER_PUBLISH_TARGET_QUEUE_MAX] {
-        assert!(
-            ember_target_lookups_this_cycle(queued, true)
-                >= ember_target_lookups_this_cycle(queued, false)
-        );
-    }
 }
 
 /// Which of a file's keys resolves last is timing, not outcome: a timeout

@@ -1560,39 +1560,47 @@ pub(super) const EMBER_MAINT_MIN_TARGET_LOOKUPS: usize = 2;
 /// background share of the search pool.
 pub(super) const EMBER_MAINT_MAX_TARGET_LOOKUPS: usize = 8;
 
-/// Most target lookups started per maintenance cycle while publishes wait on
-/// them. A quarter of the background search pool, each walk lasting well
-/// under its minute.
-pub(super) const EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS: usize = 16;
-
-/// Cycles a queue of awaited lookups is drained over.
+/// Target lookups that may run at once while publishes wait on them.
 ///
-/// One: every key in it is a file held back from publishing, so it is asked
-/// about as fast as [`EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS`] allows. Draining
-/// over four cycles made the average wait four minutes, and with the waiting
-/// files holding their selection slots meanwhile, publishing ran at a fifth of
-/// what the storers would take.
-pub(super) const EMBER_AWAITED_TARGET_LOOKUP_CYCLES: usize = 1;
+/// Topped up every second as they finish, rather than started in a batch on
+/// the minute tick. A walk over a table this size takes seconds, so a batch of
+/// sixteen a minute left the pool idle most of the minute — and with a file
+/// needing its source key and about eight keywords looked up, sixteen a minute
+/// published two files a minute while hundreds waited.
+pub(super) const EMBER_MAX_CONCURRENT_AWAITED_TARGET_LOOKUPS: usize = 8;
 
-/// Target lookups to start this cycle with `queued` keys waiting.
+/// Most awaited target lookups started in a minute, however fast they finish.
+///
+/// About ten `FIND_NODE`s a walk makes this some twenty a second spread over
+/// the table, under one a second for each peer, where a peer admits about six
+/// lookup queries a second from one address (`MAX_LOOKUPS_PER_WINDOW`).
+pub(super) const EMBER_MAX_AWAITED_TARGET_LOOKUPS_PER_MIN: usize = 120;
+
+/// Awaited target lookups to start now, with `queued` keys waiting,
+/// `in_flight` target lookups running, and `started_this_minute` already
+/// started in the current minute.
+pub(super) fn ember_awaited_target_lookups_to_start(
+    queued: usize,
+    in_flight: usize,
+    started_this_minute: usize,
+) -> usize {
+    queued
+        .min(EMBER_MAX_CONCURRENT_AWAITED_TARGET_LOOKUPS.saturating_sub(in_flight))
+        .min(EMBER_MAX_AWAITED_TARGET_LOOKUPS_PER_MIN.saturating_sub(started_this_minute))
+}
+
+/// Target lookups to start this maintenance cycle with `queued` keys waiting
+/// and no publish waiting on them (those are started by
+/// [`ember_awaited_target_lookups_to_start`]).
 ///
 /// Enough to drain the queue within a quarter of a target set's lifetime. A
 /// fixed two a minute assumed one key per file; there are about eight (the
 /// source key plus each keyword), so at two a minute a large library held
 /// fewer fresh target sets than it had keys, a full queue took longer to drain
 /// than a set lived, and most records went to our own table's closest, which
-/// on a large overlay refuse on proximity.
-///
-/// `awaited` is whether publishes are waiting on these lookups (see
-/// [`ember_publish_awaits_lookup`]). Then the queue is drained within a few
-/// minutes, since every key in it is a file not yet published; otherwise a
-/// lookup only improves a republish hours away, and an hour is soon enough.
-pub(super) fn ember_target_lookups_this_cycle(queued: usize, awaited: bool) -> usize {
-    if awaited {
-        return queued
-            .div_ceil(EMBER_AWAITED_TARGET_LOOKUP_CYCLES)
-            .clamp(EMBER_MAINT_MIN_TARGET_LOOKUPS, EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS);
-    }
+/// on a large overlay refuse on proximity. Such a lookup only improves a
+/// republish hours away, so an hour is soon enough.
+pub(super) fn ember_target_lookups_this_cycle(queued: usize) -> usize {
     let cycles = (EMBER_PUBLISH_TARGETS_TTL_SECS as u64 / 4 / EMBER_MAINT_INTERVAL.as_secs()).max(1) as usize;
     queued
         .div_ceil(cycles)
@@ -2074,6 +2082,57 @@ pub(super) fn prune_key_record_holds_in(
 pub(super) fn key_record_lookups_this_cycle(queued: usize) -> usize {
     let cycles = (KEY_RECORD_HOLD_SECS as u64 / 2 / EMBER_MAINT_INTERVAL.as_secs()).max(1) as usize;
     queued.div_ceil(cycles).clamp(KEY_RECORD_MIN_LOOKUPS, KEY_RECORD_MAX_LOOKUPS)
+}
+
+/// Start up to `count` lookups from the publish-target queue; how many started.
+/// Stops at a full search pool, putting the key back.
+pub(super) async fn start_ember_publish_target_lookups(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    count: usize,
+) -> usize {
+    let mut started = 0;
+    for _ in 0..count {
+        let Some(key) = state.ember_publish_target_queue.pop_front() else {
+            break;
+        };
+        match start_ember_background_find_node(state, ember::dht::EmberNodeId(key)) {
+            Some(search_id) => {
+                state.ember_publish_target_lookups.insert(search_id, key);
+                drive_ember_search(socket, state, search_id).await;
+                started += 1;
+            }
+            None => {
+                state.ember_publish_target_queue.push_front(key);
+                break;
+            }
+        }
+    }
+    started
+}
+
+/// Keep [`EMBER_MAX_CONCURRENT_AWAITED_TARGET_LOOKUPS`] lookups running while
+/// publishes wait on them. Runs every second.
+pub(super) async fn top_up_awaited_target_lookups(socket: &UdpSocket, state: &mut NetworkState) {
+    if state.ember_publish_target_queue.is_empty()
+        || state.ember_publish_target_lookups.len() >= EMBER_MAX_CONCURRENT_AWAITED_TARGET_LOOKUPS
+        || !ember_publish_lookups_awaited(state)
+        || state.ember_dht.routing().verified_len() == 0
+    {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let (minute_start, started_this_minute) = state
+        .ember_awaited_lookup_minute
+        .filter(|(at, _)| now.saturating_duration_since(*at) < std::time::Duration::from_secs(60))
+        .unwrap_or((now, 0));
+    let count = ember_awaited_target_lookups_to_start(
+        state.ember_publish_target_queue.len(),
+        state.ember_publish_target_lookups.len(),
+        started_this_minute,
+    );
+    let started = start_ember_publish_target_lookups(socket, state, count).await;
+    state.ember_awaited_lookup_minute = Some((minute_start, started_this_minute + started));
 }
 
 /// Start this cycle's key-record lookups, from the maintenance tick. A key
