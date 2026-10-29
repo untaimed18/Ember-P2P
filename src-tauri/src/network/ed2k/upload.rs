@@ -703,20 +703,20 @@ enum ConnInit {
         secure_peer: Option<super::secure_stream::SecurePeerIdentity>,
         relayed: bool,
         /// A duplicate handle on the TCP socket underneath, when there is one,
-        /// so a file stream can widen the send buffer the listener capped for
-        /// eD2K. Dropped as soon as the stream has said what it is: while it
+        /// so a file stream can set its own send buffer (see
+        /// [`FILE_STREAM_SEND_BUFFER_BYTES`]). Dropped as soon as the stream has said what it is: while it
         /// is held, closing the stream's own halves does not close the socket.
         socket: Option<socket2::Socket>,
     },
 }
 
 /// Kernel send buffer for a chat attachment or room transfer served from the
-/// upload listener, in place of the 256 KiB it caps eD2K sockets to.
+/// upload listener, which leaves eD2K sockets to the OS's autotuning.
 ///
-/// The eD2K cap keeps the upload counter close to what the peer has received.
-/// A file stream needs no such thing — the recipient says when it has every
-/// byte — and at 256 KiB its throughput stops at the buffer over the round
-/// trip: 2.5 MB/s at 100 ms. This covers 40 MB/s there. Linux holds any request
+/// A file stream wants the full window from its first byte rather than after
+/// autotuning has ramped up — the recipient says when it has every byte, so
+/// nothing needs the buffer kept small. A buffer limits throughput to itself
+/// over the round trip; this covers 40 MB/s at 100 ms. Linux holds any request
 /// to `net.core.wmem_max`, so there it helps only as far as that allows.
 const FILE_STREAM_SEND_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
@@ -5830,23 +5830,15 @@ pub async fn start_upload_server(
                         // `multi_source::NEW_CONNS_PER_FIVE`.
                         super::multi_source::note_inbound_connection();
                         let _ = stream.set_nodelay(true);
-                        // Cap the kernel TCP send buffer so our sender-side
-                        // `uploaded` counter (which advances when bytes are
-                        // handed to the OS, not when they hit the wire)
-                        // stays within a bounded window of what the peer has
-                        // actually received. Without this, Windows TCP
-                        // autotuning can grow SO_SNDBUF to several MB under
-                        // a fast uplink — uploads then appear "complete" on
-                        // our end while the peer is still draining the
-                        // kernel buffer. 256 KiB is big enough that a
-                        // 10 KiB packet write (see packet-splitting below)
-                        // never meaningfully back-pressures on a healthy
-                        // link, while keeping the queued-vs-wire gap
-                        // bounded to ~25 ms at 10 MB/s.
-                        {
-                            let sref = socket2::SockRef::from(&stream);
-                            let _ = sref.set_send_buffer_size(256 * 1024);
-                        }
+                        // No SO_SNDBUF here. Setting one turns off Windows'
+                        // send autotuning, and a connection can then carry
+                        // only that much per round trip: 256 KiB holds one
+                        // upload to about 2 MB/s to Europe and 1 MB/s to Asia,
+                        // whatever the uplink. Autotuning sizes each buffer to
+                        // what its own connection drains in a round trip, so
+                        // the `uploaded` counter, which advances when bytes
+                        // reach the OS, still runs only about a round trip
+                        // ahead of the peer, slow peers included.
                         debug!("Incoming ED2K connection from {peer_addr}");
                         tokio::spawn(async move {
                             let _admission_guard = admission_guard;
@@ -12633,11 +12625,10 @@ impl UploadHandler {
                         //     packet granularity instead of bursting a full
                         //     block then idling,
                         //   * makes the sender-side `uploaded` counter track
-                        //     bytes-on-wire within ~10 KiB instead of
-                        //     ~180 KiB, which combined with the 256 KiB
-                        //     SO_SNDBUF cap on the listening socket keeps
-                        //     our progress close to what the peer actually
-                        //     sees,
+                        //     what reaches the OS within ~10 KiB instead of
+                        //     ~180 KiB, which with the send buffer autotuned
+                        //     to the connection keeps our progress close to
+                        //     what the peer actually sees,
                         //   * is required for OP_COMPRESSEDPART compatibility
                         //     with older downloaders that enforce a max
                         //     packet size — eMule's format is a stream where

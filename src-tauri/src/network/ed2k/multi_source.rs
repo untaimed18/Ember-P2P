@@ -1509,8 +1509,7 @@ pub struct EstablishedSource {
 /// slow-ramp window without harming anything at low speeds — the kernel
 /// only uses as much as the sender is actually filling, and `SockRef`'s
 /// `set_recv_buffer_size` is advisory (the OS is free to clamp lower, it
-/// just won't clamp higher-than-default). Mirrors the 256 KiB SO_SNDBUF
-/// cap we apply to accepted upload sockets in `upload.rs`.
+/// just won't clamp higher-than-default).
 const PEER_RECV_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Apply the standard low-latency + high-throughput socket tuning to a
