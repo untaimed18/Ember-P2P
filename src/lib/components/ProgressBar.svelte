@@ -37,8 +37,8 @@
   };
 
   let resolvedColor = $derived(color || STATUS_COLORS[status] || 'var(--accent)');
-  // The percentage drawn over the fill has to read against that fill, and
-  // amber in particular needs dark text where accent needs light.
+  // The percentage drawn over the fill has to read against that fill, so each
+  // status colour brings the theme's text colour for it.
   const ON_COLORS: Record<string, string> = {
     'var(--success)': 'var(--on-success)',
     'var(--warning)': 'var(--on-warning)',

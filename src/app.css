@@ -21,7 +21,9 @@
 
   --text-primary: #1a1c24;
   --text-secondary: #4a5068;
-  --text-muted: #8890a8;
+  /* At least 4:1 on every surface up to `--bg-hover`, as in the dark theme,
+     while staying a clear step below `--text-secondary`. */
+  --text-muted: #687089;
   --text-accent: #245f9a;
 
   --accent: #2a6cb0;
@@ -36,10 +38,12 @@
   --toggle-knob: #ffffff;
   --on-accent: #ffffff;
   --on-success: #ffffff;
-  --on-warning: #1a1c24;
+  --on-warning: #ffffff;
   --on-danger: #ffffff;
-  --success: #2f9a55;
-  --warning: #c98412;
+  /* Status colours are text as often as fills, so each holds 4:1 on every
+     surface up to `--bg-hover`. */
+  --success: #1f8048;
+  --warning: #b45309;
   --danger: #c4453c;
   --danger-hover: #b03c34;
   --badge-success-text: color-mix(in srgb, var(--success) 85%, #000);
@@ -58,11 +62,12 @@
      directly since they already map to those meanings).
      Ember is rose rather than the obvious ember-orange: the friends-only
      badge in the same row is --warning orange, and two warm pills side by
-     side stop reading as separate states. */
-  --kad-color: #3498db;
+     side stop reading as separate states. Those also used as text hold 4:1
+     on every surface up to `--bg-hover`. */
+  --kad-color: #1f78b4;
   --ed2k-color: #9b59b6;
   --ember-color: #c2185b;
-  --aich-color: #27ae60;
+  --aich-color: #11804a;
   /* File-type tiles (FileTypeIcon), one hue per Library type category. */
   --type-audio: #7c4ddb;
   --type-video: #d9486f;
@@ -72,9 +77,9 @@
   --type-program: #3d7a32;
   --type-disc: #5f6e84;
   --type-collection: #9a5b2f;
-  --priority-verylow: #888888;
-  --priority-low: #5599bb;
-  --priority-auto: #7cb342;
+  --priority-verylow: #737373;
+  --priority-low: #33739c;
+  --priority-auto: #4f7f2a;
   --stat-ratio: #9c27b0;
   --ember-dht-color: #00838f;
   /* Room reaction chips: a star and a heart, and the glossy highlight across
@@ -87,8 +92,9 @@
   --border-light: #c4c9d4;
   /* A field's outline is how it is found, so it can be firmer than the quiet
      dividers `--border` draws everywhere else. */
-  --input-border: var(--border);
-  --scrollbar-thumb: var(--border-light);
+  --input-border: #b8bfcc;
+  /* Over a transparent track, so it has to carry against white panels. */
+  --scrollbar-thumb: #b3b9c6;
 
   /* Data tables. Every table's rows sit on the page canvas, so one stripe,
      one selection and one header read the same whatever a table's density.
@@ -359,16 +365,7 @@
   background: var(--danger-hover);
 }
 
-/* Softer, more controlled scrollbars for dark. WebView2 draws from
-   `scrollbar-color` and ignores the `::-webkit-scrollbar` rules once it is
-   set, so the thumb colour has to live here. The track is transparent: a
-   canvas-coloured groove cut a dark stripe down every panel. */
-[data-theme="dark"] * {
-  scrollbar-color: var(--scrollbar-thumb) transparent;
-}
-[data-theme="dark"] ::-webkit-scrollbar-track {
-  background: transparent;
-}
+/* Softer, more controlled scrollbars for dark. */
 [data-theme="dark"] ::-webkit-scrollbar-thumb {
   background: var(--scrollbar-thumb);
   border: 2px solid transparent;
@@ -402,9 +399,13 @@ body {
   width: 100vw;
 }
 
+/* WebView2 draws from `scrollbar-color` and ignores the `::-webkit-scrollbar`
+   rules once it is set, so the thumb colour has to live here. The track is
+   transparent: a canvas-coloured groove cut a stripe down every panel of
+   another colour, white panels in the light theme as much as dark ones. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--scrollbar-thumb) var(--bg-primary);
+  scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
 ::-webkit-scrollbar {
@@ -413,7 +414,7 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: var(--bg-primary);
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
@@ -546,7 +547,7 @@ select {
   cursor: pointer;
   padding-right: 28px;
   background-color: var(--bg-input);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%238890a8' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%23687089' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 8px center;
   background-size: 12px;
