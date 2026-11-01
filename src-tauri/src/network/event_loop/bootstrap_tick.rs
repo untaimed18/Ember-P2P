@@ -192,12 +192,25 @@ pub(in crate::network) async fn on_bootstrap_tick(
 
     tokio::task::yield_now().await;
 
-    // Firewall detection using FirewallChecker
-    if !state.firewall_checker.is_checking() && state.firewall_checker.should_recheck() && table_size >= 10 {
+    // Firewall detection using FirewallChecker. Requests go only to verified
+    // contacts, so a check waits until there are enough of them: one started
+    // with none sends nothing yet stamps its start, and the next would wait an
+    // hour. Contacts from a legacy or downloaded nodes.dat load unverified.
+    let checks = state.firewall_checker.checks_to_send() as usize;
+    if !state.firewall_checker.is_checking()
+        && state.firewall_checker.should_recheck()
+        && table_size >= 10
+        && state
+            .routing_table
+            .all_contacts()
+            .filter(|c| c.verified && !c.is_dead())
+            .take(checks)
+            .count()
+            >= checks
+    {
         state.firewall_checker.start_check();
         clear_external_udp_for_firewall_recheck(state);
         if let Ok(mut probes) = firewall_probe_ips.lock() { probes.clear(); }
-        let checks = state.firewall_checker.checks_to_send() as usize;
 
         let fw_contacts: Vec<KadContact> = state
             .routing_table

@@ -2280,8 +2280,10 @@ pub async fn download_nodes_dat(
 #[tauri::command]
 pub async fn download_ipfilter(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
 ) -> Result<IpFilterDownloadResult, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     info!("Downloading ipfilter.zip from {IPFILTER_ARCHIVE_URL}");
 
     let response = crate::security::fetch_pinned_get(IPFILTER_ARCHIVE_URL)

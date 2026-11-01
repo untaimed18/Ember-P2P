@@ -1469,24 +1469,34 @@ async fn attach_link_web_sources(state: &AppState, file_hash: &str, urls: Vec<St
     else {
         return;
     };
-    let added = crate::network::ed2k::web_sources::register(
+    let registered = crate::network::ed2k::web_sources::register_replacing_retired(
         hash,
         urls.into_iter()
             .take(crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE * 2),
     );
-    if added.is_empty() {
+    if registered.added.is_empty() && registered.revived.is_empty() {
         return;
     }
-    tracing::info!("Download of {file_hash} has {} web source(s) from its link", added.len());
-    save_web_sources(state, file_hash, added).await;
+    tracing::info!(
+        "Download of {file_hash} has {} web source(s) from its link, {} tried again",
+        registered.added.len(),
+        registered.revived.len()
+    );
+    save_web_sources(state, file_hash, registered.added, registered.replaced).await;
 }
 
 /// Save web sources just registered for `file_hash`, so the download keeps
-/// them across restarts and re-queues.
-async fn save_web_sources(state: &AppState, file_hash: &str, added: Vec<String>) {
+/// them across restarts and re-queues, and forget the retired ones they
+/// replaced, so a restart does not bring those back in their place.
+async fn save_web_sources(state: &AppState, file_hash: &str, added: Vec<String>, replaced: Vec<String>) {
     let db = state.db.clone();
     let fh = file_hash.to_string();
     db_blocking(move || {
+        for url in &replaced {
+            if let Err(e) = db.delete_transfer_web_source(&fh, url) {
+                tracing::warn!("Failed to forget a retired web source of {fh}: {e}");
+            }
+        }
         if let Err(e) = db.add_transfer_web_sources(&fh, &added) {
             tracing::warn!("Failed to save the web sources of {fh}: {e}");
         }
@@ -1503,9 +1513,10 @@ const REFUSED_LINE_ECHO_CHARS: usize = 200;
 /// What adding web mirrors by hand did, for the dialog to say.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AddedWebSources {
-    /// Mirrors the download did not have, now in use.
+    /// Mirrors now in use: new ones, and ones given up on after failures and
+    /// asked for again.
     pub added: u32,
-    /// Mirrors it already had.
+    /// Mirrors it already had in use, or had retired for sending bad data.
     pub already: u32,
     /// Valid mirrors left out because the download has as many as it keeps.
     pub over_limit: u32,
@@ -1580,22 +1591,26 @@ pub async fn add_transfer_web_sources(
     };
 
     let mut result = AddedWebSources::default();
-    let had = web_sources::urls(&hash);
-    let mut fresh: Vec<String> = Vec::new();
+    let mut valid: Vec<String> = Vec::new();
     for line in lines {
         match web_sources::normalize_web_source_url(&line) {
             None => result.refused.push(line.chars().take(REFUSED_LINE_ECHO_CHARS).collect()),
-            Some(url) if had.contains(&url) || fresh.contains(&url) => result.already += 1,
-            Some(url) => fresh.push(url),
+            Some(url) if valid.contains(&url) => result.already += 1,
+            Some(url) => valid.push(url),
         }
     }
-    let wanted = fresh.len();
-    let added = web_sources::register(hash, fresh);
-    result.added = added.len() as u32;
-    result.over_limit = (wanted - added.len()) as u32;
-    if !added.is_empty() {
-        tracing::info!("Download of {file_hash} has {} web source(s) added by hand", added.len());
-        save_web_sources(&state, &file_hash, added).await;
+    let registered = web_sources::register_replacing_retired(hash, valid);
+    // One given up on and asked for again is in use again: added, to the user.
+    result.added = (registered.added.len() + registered.revived.len()) as u32;
+    result.already += registered.already as u32;
+    result.over_limit = registered.over_limit as u32;
+    if result.added > 0 {
+        tracing::info!(
+            "Download of {file_hash} has {} web source(s) added by hand, {} tried again",
+            registered.added.len(),
+            registered.revived.len()
+        );
+        save_web_sources(&state, &file_hash, registered.added, registered.replaced).await;
     }
     Ok(result)
 }
@@ -2456,9 +2471,11 @@ async fn without_completing(state: &AppState, transfer_ids: Vec<String>) -> Vec<
 
 #[tauri::command]
 pub async fn cancel_transfers_batch(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     check_batch_size(&transfer_ids)?;
     let transfer_ids = without_completing(&state, transfer_ids).await;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
@@ -3101,7 +3118,7 @@ pub async fn delete_finished_downloads(
         };
         match deleted {
             Ok(()) => {
-                if let Err(e) = remove_transfer(state.clone(), transfer_id.clone()).await {
+                if let Err(e) = discard_transfer(&state, transfer_id.clone(), true).await {
                     tracing::warn!("The file of {transfer_id} was deleted but its row could not be removed: {e}");
                 }
                 report.removed.push(transfer_id);
@@ -3127,9 +3144,11 @@ pub async fn delete_finished_downloads(
 
 #[tauri::command]
 pub async fn remove_transfer(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     discard_transfer(&state, transfer_id, true).await
 }
 

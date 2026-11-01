@@ -1729,6 +1729,11 @@ impl PartTracker {
         self.in_progress_claims.iter().map(|&c| c > 0).collect()
     }
 
+    /// How many sources hold a claim on `part_idx`.
+    pub fn claims_on(&self, part_idx: usize) -> u16 {
+        self.in_progress_claims.get(part_idx).copied().unwrap_or(0)
+    }
+
     /// How many parts have at least one outstanding claim (diagnostics).
     pub fn in_progress_part_count(&self) -> usize {
         self.in_progress_claims.iter().filter(|&&c| c > 0).count()

@@ -3246,8 +3246,11 @@ pub(super) async fn handle_udp_packet_inner(
                     );
                 }
             } else {
-                state.firewall_checker.handle_udp_firewall_result(false);
-                info!("UDP firewall test returned remote error from {from} on port {udp_port} (error={error_code})");
+                // The peer could not run a test worth the name (eMule answers
+                // 1 when it already holds a path to us through our NAT), and
+                // eMule records it as cancelled. Counted as an answer, it read
+                // as UDP closed when nobody had tested it.
+                info!("UDP firewall test from {from} on port {udp_port} not run by the peer (error={error_code}); ignoring");
             }
         }
 

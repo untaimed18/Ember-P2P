@@ -99,6 +99,11 @@ pub async fn open_chat_window(
             "The chat window can only be opened from the main window",
         ));
     }
+    // Commands run concurrently, and a window is registered under its label
+    // only once it is built: two opens a moment apart both found none and both
+    // built one. Held from the look to the build, the second finds the first's.
+    static OPENING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _opening = OPENING.lock().await;
     if let Some(existing) = app.get_webview_window(CHAT_WINDOW_LABEL) {
         bring_forward(&existing);
         return Ok(());

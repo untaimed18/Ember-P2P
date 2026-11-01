@@ -351,12 +351,21 @@ impl WebWorker {
             // part. On a part it joined a peer on, the verdict is about both,
             // and only a source that wrote at least half of it is charged
             // (`web_sources::note_corrupt_range`).
+            //
+            // Not while another source still holds the part, as one this mirror
+            // joined does: that source hashes it when its own fetch ends, and on
+            // a mismatch it may be waiting on an AICH answer that narrows the
+            // repair to one block. Hashing here as well reopened the whole part
+            // under it, so the answer was thrown away and the part fetched again
+            // in full with nobody blamed. A part nobody else holds is still
+            // checked here; one left complete and unclaimed goes to the sweep.
             let (to_check, part_done) = {
                 let t = self.tracker.read().await;
                 let (ps, pe) = t.part_range(part);
                 let done = t.is_part_complete(part);
+                let shared = t.claims_on(part) > 1;
                 (
-                    (outcome.is_ok() && done && !t.is_part_verified(part))
+                    (outcome.is_ok() && done && !shared && !t.is_part_verified(part))
                         .then(|| ((ps, pe), t.part_content_generation(part))),
                     done,
                 )

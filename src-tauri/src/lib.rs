@@ -1497,6 +1497,8 @@ pub fn run() {
                 // Not walked until re-approved, so not filled in from known.met
                 // either: what is at the path now is not what was approved.
                 let mut refused_roots: Vec<String> = Vec::new();
+                // Read nothing of: a drive not plugged in, a share offline.
+                let mut unreachable_roots: Vec<String> = Vec::new();
                 for (folder, handle) in discovery_handles {
                     match handle.await {
                         Ok((refused, result)) => {
@@ -1508,6 +1510,7 @@ pub fn run() {
                             // says nothing about where its paging stood; a
                             // `None` here erased the cursor it had.
                             if result.saw_nothing() {
+                                unreachable_roots.push(folder);
                                 continue;
                             }
                             if result.reached_file_cap() {
@@ -1538,11 +1541,14 @@ pub fn run() {
                     }
                 }
 
-                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    info!("Startup hashing cancelled during discovery");
-                    startup_cancel_flags.write().await.remove("__startup__");
-                    let _ = startup_app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
-                    return;
+                // A Stop during the walk still lets last session's files into
+                // the index: only hashing is skipped (see `was_cancelled`).
+                // Returning here left the Library empty with the loading flag
+                // cleared, and a feed saved or published then dropped every
+                // item as gone.
+                let cancelled_in_discovery = cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
+                if cancelled_in_discovery {
+                    info!("Startup hashing cancelled during discovery; indexing known files only");
                 }
 
                 let known_list = match known_load.await {
@@ -1681,7 +1687,15 @@ pub fn run() {
                 // large share (>100k files) loses every non-first-page row
                 // until the user manually triggers enough reloads to cycle it
                 // back in.
-                if startup_cursor_updates.values().any(Option::is_some) {
+                //
+                // A folder that could not be read at all keeps its rows the
+                // same way, as one that goes offline mid-session does: it is
+                // unavailable, not empty. Left out, its files looked gone once
+                // the Library had loaded, and a feed saved or published then
+                // dropped every item on it for good.
+                let hydrate_paged = startup_cursor_updates.values().any(Option::is_some);
+                if hydrate_paged || !unreachable_roots.is_empty() {
+                    let hydration_unreachable = unreachable_roots.clone();
                     let mut known_paths = all_discovered
                         .iter()
                         .map(|file| crate::search::index::normalize_path_key(&file.path))
@@ -1740,6 +1754,18 @@ pub fn run() {
                                         record_path,
                                     )
                                 {
+                                    return false;
+                                }
+                                // As known.met last saw it: its drive cannot
+                                // say otherwise until it is back, and the
+                                // first walk that reads it reconciles the rows.
+                                if hydration_unreachable
+                                    .iter()
+                                    .any(|root| crate::security::path_within_dir(&record.file_path, root))
+                                {
+                                    return true;
+                                }
+                                if !hydrate_paged {
                                     return false;
                                 }
                                 let metadata = match std::fs::symlink_metadata(&record.file_path)
@@ -1926,7 +1952,7 @@ pub fn run() {
                 // small whether files hash slowly (large) or quickly (many).
                 let mut last_known_met_persist = std::time::Instant::now();
                 let mut hashed_since_persist = 0usize;
-                let mut was_cancelled = false;
+                let mut was_cancelled = cancelled_in_discovery;
 
                 // Same scheduler the folder-add and reload passes use: one read
                 // at a time per physical drive, more only where a drive has
@@ -1943,7 +1969,8 @@ pub fn run() {
                     cancel_flag.clone(),
                 );
                 pipeline.log_plan("Startup hashing", total_to_hash);
-                loop {
+                // Every exit that cancels sets `was_cancelled` and breaks.
+                while !was_cancelled {
                     let started = match pipeline.next_started() {
                         commands::sharing::NextHash::Ready(started) => started,
                         // Every drive with work left is busy with a read this

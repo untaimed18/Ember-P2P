@@ -1264,6 +1264,7 @@
   "kad_buddy_none": "Aucun",
   "kad_buddy_connected": "Connecté",
   "kad_buddy_connecting": "Connexion",
+  "kad_buddy_searching": "Recherche",
   "kad_buddy_serving": "En service",
   "kad_bootstrap_modal_title": "Amorcer KAD",
   "kad_bootstrap_tab_ip": "Par IP / hôte",

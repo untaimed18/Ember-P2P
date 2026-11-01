@@ -642,9 +642,11 @@ async fn tear_down_friend(state: &AppState, hash: [u8; 16]) -> Result<(), String
 #[tauri::command]
 pub async fn block_friend(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
 
@@ -664,9 +666,11 @@ pub async fn block_friend(
 
 #[tauri::command]
 pub async fn unblock_friend(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let canonical = user_hash_hex.to_lowercase();
     parse_user_hash(&canonical)?;
 
@@ -1315,9 +1319,11 @@ pub async fn get_friend_requests(
 
 #[tauri::command]
 pub async fn accept_friend_request(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     sender_hash: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let canonical = sender_hash.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
 
@@ -1456,9 +1462,11 @@ pub async fn accept_friend_request(
 
 #[tauri::command]
 pub async fn reject_friend_request(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     sender_hash: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     // Validate identically to `accept_friend_request` so a malformed
     // hash is rejected before it reaches the database. The DB path
     // uses bound parameters and is safe today, but consistency makes

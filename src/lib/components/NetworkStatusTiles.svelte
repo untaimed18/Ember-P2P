@@ -106,6 +106,7 @@
         <span class="stat-label" title={m.kad_stat_buddy_help()}>{m.kad_stat_buddy()}</span>
         <span class="stat-value">
           {buddyStatus === 'none' ? m.kad_buddy_none() :
+           buddyStatus === 'searching' ? m.kad_buddy_searching() :
            buddyStatus.startsWith('connected') ? m.kad_buddy_connected() :
            buddyStatus.startsWith('connecting') ? m.kad_buddy_connecting() :
            buddyStatus.startsWith('serving') ? m.kad_buddy_serving() :

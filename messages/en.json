@@ -1264,6 +1264,7 @@
   "kad_buddy_none": "None",
   "kad_buddy_connected": "Connected",
   "kad_buddy_connecting": "Connecting",
+  "kad_buddy_searching": "Searching",
   "kad_buddy_serving": "Serving",
   "kad_bootstrap_modal_title": "Bootstrap KAD",
   "kad_bootstrap_tab_ip": "By IP / Host",

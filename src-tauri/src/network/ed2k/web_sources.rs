@@ -161,26 +161,74 @@ pub fn normalize_web_source_url(raw: &str) -> Option<String> {
 /// Remember `urls` as web sources for `file_hash`, keeping any it already has
 /// first. Returns the ones that were new, normalized, for the caller to persist.
 pub fn register(file_hash: [u8; 16], urls: impl IntoIterator<Item = String>) -> Vec<String> {
-    let mut added = Vec::new();
+    register_inner(file_hash, urls, false).added
+}
+
+/// What asking for web sources by hand or by link did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Registered {
+    /// New to the file, normalized, for the caller to persist.
+    pub added: Vec<String>,
+    /// Held already, and given up on or resting after failures: asked for
+    /// again, they are tried again now.
+    pub revived: Vec<String>,
+    /// Retired ones that gave their place to the new, for the caller to forget.
+    pub replaced: Vec<String>,
+    /// Held already, and working or retired for bad data.
+    pub already: usize,
+    /// New, but left out: the file has as many working ones as it keeps.
+    pub over_limit: usize,
+}
+
+/// [`register`] for a source asked for again, by hand or in a pasted link:
+///
+/// - A retired source gives up its place to a new one once the file has as
+///   many as it keeps. Without that a mirror that turned out dead held its
+///   place for good: the cap counted it, and every restart loaded it again,
+///   ahead of any added since.
+/// - One already held that was given up on, or is resting, after failures is
+///   tried again: asking for it again is the user saying it works now. One
+///   retired for sending bad data stays retired.
+pub fn register_replacing_retired(file_hash: [u8; 16], urls: impl IntoIterator<Item = String>) -> Registered {
+    register_inner(file_hash, urls, true)
+}
+
+fn register_inner(file_hash: [u8; 16], urls: impl IntoIterator<Item = String>, asked_again: bool) -> Registered {
+    let mut result = Registered::default();
     let mut map = registry().write();
     let known = map.entry(file_hash).or_default();
     for raw in urls {
-        if known.len() >= MAX_WEB_SOURCES_PER_FILE {
-            break;
-        }
         let Some(url) = normalize_web_source_url(&raw) else {
             continue;
         };
-        if known.iter().any(|s| s.url == url) {
+        if let Some(held) = known.iter_mut().find(|s| s.url == url) {
+            let failed = held.retired || held.retry_at.is_some();
+            if asked_again && failed && held.bad_parts < MAX_BAD_PARTS {
+                held.retired = false;
+                held.failures = 0;
+                held.retry_at = None;
+                result.revived.push(url);
+            } else {
+                result.already += 1;
+            }
             continue;
         }
+        if known.len() >= MAX_WEB_SOURCES_PER_FILE {
+            match known.iter().position(|s| s.retired).filter(|_| asked_again) {
+                Some(at) => result.replaced.push(known.remove(at).url),
+                None => {
+                    result.over_limit += 1;
+                    continue;
+                }
+            }
+        }
         known.push(WebSource::new(url.clone()));
-        added.push(url);
+        result.added.push(url);
     }
     if known.is_empty() {
         map.remove(&file_hash);
     }
-    added
+    result
 }
 
 /// Drop every web source of `file_hash`: the download finished or went.
@@ -317,6 +365,20 @@ pub fn note_corrupt_range(file_hash: &[u8; 16], start: u64, end: u64) -> Vec<Str
     retired
 }
 
+/// A part check passed over `[start, end)`: what any source wrote there has its
+/// verdict, good, and is forgotten. Kept, those ranges filled
+/// [`MAX_WRITTEN_RANGES`] on a long download, after which a source's writes
+/// went unrecorded and a mirror sending bad data could no longer be blamed.
+pub fn note_verified_range(file_hash: &[u8; 16], start: u64, end: u64) {
+    let mut map = registry().write();
+    let Some(sources) = map.get_mut(file_hash) else {
+        return;
+    };
+    for source in sources.iter_mut() {
+        remove_range(&mut source.written, start, end);
+    }
+}
+
 /// Corrupt parts `url` has been charged for `file_hash` this session.
 #[cfg(test)]
 pub fn bad_parts(file_hash: &[u8; 16], url: &str) -> u32 {
@@ -383,9 +445,47 @@ mod tests {
         note_failure(&hash, "https://a.example/f", true);
         assert!(!ready(&hash).contains(&"https://a.example/f".to_string()), "retired");
         assert_eq!(urls(&hash).len(), MAX_WEB_SOURCES_PER_FILE, "still remembered");
+        assert!(register(hash, ["https://late.example/f".to_string()]).is_empty(), "the cap holds");
+
+        // A new mirror takes a retired one's place, never a working one's.
+        let registered =
+            register_replacing_retired(hash, ["https://new.example/f".to_string(), "https://more.example/f".to_string()]);
+        assert_eq!(registered.added, vec!["https://new.example/f"]);
+        assert_eq!(registered.replaced, vec!["https://a.example/f"]);
+        assert_eq!(registered.over_limit, 1, "no retired one is left to give way");
+        assert_eq!(urls(&hash).len(), MAX_WEB_SOURCES_PER_FILE);
+        assert!(!urls(&hash).contains(&"https://a.example/f".to_string()));
 
         forget(&hash);
         assert!(urls(&hash).is_empty());
+    }
+
+    /// Asked for again, a mirror given up on after failures is tried again,
+    /// and one retired for bad data is not.
+    #[test]
+    fn a_mirror_asked_for_again_is_tried_again_unless_it_sent_bad_data() {
+        let hash = [0xAC; 16];
+        clear_for_tests(&hash);
+        let dead = "https://dead.example/f".to_string();
+        let bad = "https://bad.example/f".to_string();
+        let fine = "https://fine.example/f".to_string();
+        register(hash, [dead.clone(), bad.clone(), fine.clone()]);
+        note_failure(&hash, &dead, true);
+        let part = 9_728_000u64;
+        for _ in 0..MAX_BAD_PARTS {
+            note_written(&hash, &bad, &[(0, part)]);
+            note_corrupt_range(&hash, 0, part);
+        }
+        assert!(is_retired(&hash, &dead) && is_retired(&hash, &bad));
+
+        let registered = register_replacing_retired(hash, [dead.clone(), bad.clone(), fine.clone()]);
+        assert_eq!(registered.revived, vec![dead.clone()]);
+        assert_eq!(registered.already, 2, "the working one and the bad one");
+        assert!(registered.added.is_empty());
+        assert!(ready(&hash).contains(&dead));
+        assert!(!ready(&hash).contains(&bad));
+        assert!(register(hash, [dead.clone()]).is_empty(), "loading them again revives nothing");
+        forget(&hash);
     }
 
     #[test]
@@ -428,6 +528,22 @@ mod tests {
         assert!(is_retired(&hash, &bad));
         assert!(!ready(&hash).contains(&bad));
         assert!(note_corrupt_range(&hash, 0, part).is_empty(), "retired once");
+        forget(&hash);
+    }
+
+    /// A verified part's writes have their verdict, so they no longer count
+    /// toward the ranges a source may keep.
+    #[test]
+    fn a_verified_part_forgets_what_was_written_there() {
+        let hash = [0xCE; 16];
+        clear_for_tests(&hash);
+        let url = "https://m.example/f".to_string();
+        register(hash, [url.clone()]);
+        let part = 9_728_000u64;
+        note_written(&hash, &url, &[(0, 100), (200, 300), (part, part + 100)]);
+        note_verified_range(&hash, 0, part);
+        let written = registry().read().get(&hash).map(|s| s[0].written.clone()).unwrap_or_default();
+        assert_eq!(written, vec![(part, part + 100)]);
         forget(&hash);
     }
 }

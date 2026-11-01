@@ -1264,6 +1264,7 @@
   "kad_buddy_none": "无",
   "kad_buddy_connected": "已连接",
   "kad_buddy_connecting": "连接中",
+  "kad_buddy_searching": "搜索中",
   "kad_buddy_serving": "服务中",
   "kad_bootstrap_modal_title": "引导 KAD",
   "kad_bootstrap_tab_ip": "按 IP / 主机",

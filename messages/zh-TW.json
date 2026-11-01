@@ -1264,6 +1264,7 @@
   "kad_buddy_none": "無",
   "kad_buddy_connected": "已連線",
   "kad_buddy_connecting": "連線中",
+  "kad_buddy_searching": "搜尋中",
   "kad_buddy_serving": "服務中",
   "kad_bootstrap_modal_title": "引導 KAD",
   "kad_bootstrap_tab_ip": "按 IP / 主機",

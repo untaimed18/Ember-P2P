@@ -1737,6 +1737,7 @@ pub(in crate::network) async fn on_download_event(
     }
     if let DownloadEvent::PartVerified { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
         state.corruption_blackbox.verified_part(file_hash, part_start, part_end);
+        ed2k::web_sources::note_verified_range(file_hash, part_start, part_end);
         if let Some(ref uh) = sender_user_hash {
             state.reputation.record_event(uh, ember::reputation::ReputationEvent::SuccessfulChunk);
         }

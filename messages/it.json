@@ -1264,6 +1264,7 @@
   "kad_buddy_none": "Nessuno",
   "kad_buddy_connected": "Connesso",
   "kad_buddy_connecting": "Connessione in corso",
+  "kad_buddy_searching": "Ricerca in corso",
   "kad_buddy_serving": "In servizio",
   "kad_bootstrap_modal_title": "Bootstrap KAD",
   "kad_bootstrap_tab_ip": "Per IP / Host",

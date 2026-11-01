@@ -130,15 +130,21 @@
   }
 
   /** Read the page before the oldest message shown, keeping the view where it
-   *  was. The page takes the oldest shown timestamp in, since messages can
-   *  share one; those already shown are dropped by the merge. */
+   *  was. Paged by that message's timestamp and stored row, since timestamps
+   *  are the sender's and can repeat. One not read back from storage has no
+   *  row, so the page then takes its timestamp in and the merge drops what is
+   *  shown already. */
   async function loadOlder() {
     if (loadingOlder || !hasOlder || messages.length === 0) return;
     const seq = loadSeq;
     loadingOlder = true;
     olderError = false;
     try {
-      const rows = await getRoomDmMessages(who, messages[0].timestamp + 1, PAGE_SIZE);
+      const oldest = messages[0];
+      const rows =
+        oldest.seq > 0
+          ? await getRoomDmMessages(who, oldest.timestamp, PAGE_SIZE, oldest.seq)
+          : await getRoomDmMessages(who, oldest.timestamp + 1, PAGE_SIZE);
       if (seq !== loadSeq) return;
       const shown = new Set(messages.map(rowKey));
       const fresh = rows.filter((row) => !shown.has(rowKey(row)));
@@ -147,7 +153,10 @@
       if (fresh.length === 0) return;
       const height = listEl?.scrollHeight ?? 0;
       const top = listEl?.scrollTop ?? 0;
-      messages = merged(messages, fresh);
+      // The older page first: the sort is stable and by timestamp alone, so
+      // among messages sharing one it keeps them ahead of those shown, and the
+      // next page's cursor is the oldest row.
+      messages = merged(fresh, messages);
       await tick();
       if (listEl) listEl.scrollTop = top + (listEl.scrollHeight - height);
     } catch {
@@ -218,6 +227,7 @@
             text: msg.text,
             timestamp: msg.timestamp,
             status: 'received',
+            seq: 0,
           };
           messages = merged(messages, [row]);
           void scrollToEnd();

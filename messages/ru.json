@@ -1264,6 +1264,7 @@
   "kad_buddy_none": "Нет",
   "kad_buddy_connected": "Подключено",
   "kad_buddy_connecting": "Подключение",
+  "kad_buddy_searching": "Поиск",
   "kad_buddy_serving": "Обслуживает",
   "kad_bootstrap_modal_title": "Запуск KAD",
   "kad_bootstrap_tab_ip": "По IP / хосту",

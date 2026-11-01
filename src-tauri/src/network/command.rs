@@ -4801,16 +4801,28 @@ async fn handle_command_inner(
                 probes.clear();
             }
 
-            let contacts: Vec<KadContact> = state
+            // Only requests that left count, as in the automatic check. A send
+            // can be held back by its destination's budget, spent when the
+            // automatic check asked the same contact moments ago, so a held
+            // one is passed over for the next contact rather than waited on as
+            // if it had gone.
+            const RECHECK_REQUESTS: usize = 4;
+            const RECHECK_CANDIDATES: usize = 16;
+            let candidates: Vec<KadContact> = state
                 .routing_table
                 .all_contacts()
                 .filter(|contact| contact.verified && !contact.is_dead())
-                .take(4)
+                .take(RECHECK_CANDIDATES)
                 .cloned()
                 .collect();
 
             let fw_tcp_port = advertised_tcp_port(state);
-            for contact in &contacts {
+            let mut tried = 0usize;
+            for contact in &candidates {
+                if state.firewall_checks_sent as usize >= RECHECK_REQUESTS {
+                    break;
+                }
+                tried += 1;
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let (msg, track_opcode) = if contact.version > KADEMLIA_VERSION6_49ABETA {
                     (
@@ -4830,31 +4842,37 @@ async fn handle_command_inner(
                     )
                 };
                 if let Ok(packet) = messages::encode_packet(&msg) {
-                    state.flood_protection.track_request(addr, track_opcode);
-                    if let Ok(mut probes) = firewall_probe_ips.lock() {
-                        probes.insert(contact.ip);
+                    // In the probe set before the request leaves, since the
+                    // peer's connect-back races our return from the send; out
+                    // again if it never left.
+                    let newly_probed = firewall_probe_ips
+                        .lock()
+                        .is_ok_and(|mut probes| probes.insert(contact.ip));
+                    if send_kad_packet(socket, &packet, addr, state, &contact.id).await.is_ok() {
+                        state.flood_protection.track_request(addr, track_opcode);
+                        state.firewall_checks_sent += 1;
+                        state.firewall_checker.record_tcp_request_sent(contact.ip);
+                    } else if newly_probed {
+                        if let Ok(mut probes) = firewall_probe_ips.lock() {
+                            probes.remove(&contact.ip);
+                        }
                     }
-                    let _ = send_kad_packet(socket, &packet, addr, state, &contact.id).await;
-                    state.firewall_checks_sent += 1;
-                    state.firewall_checker.record_tcp_request_sent(contact.ip);
                 }
             }
 
-            let ping_contacts: Vec<KadContact> = state
-                .routing_table
-                .all_contacts()
-                .filter(|contact| contact.verified && !contact.is_dead())
-                .skip(4)
-                .take(4)
-                .cloned()
-                .collect();
-            for contact in &ping_contacts {
+            let mut pings_sent = 0usize;
+            for contact in candidates.iter().skip(tried) {
+                if pings_sent >= RECHECK_REQUESTS {
+                    break;
+                }
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::Ping;
                 if let Ok(packet) = messages::encode_packet(&msg) {
-                    state.flood_protection.track_request(addr, 0x60);
-                    let _ = send_kad_packet(socket, &packet, addr, state, &contact.id).await;
-                    state.firewall_checker.record_udp_port_probe_sent();
+                    if send_kad_packet(socket, &packet, addr, state, &contact.id).await.is_ok() {
+                        state.flood_protection.track_request(addr, 0x60);
+                        state.firewall_checker.record_udp_port_probe_sent();
+                        pings_sent += 1;
+                    }
                 }
             }
 
@@ -4865,11 +4883,11 @@ async fn handle_command_inner(
             info!(
                 "Sent {} firewall checks and {} ping probes",
                 state.firewall_checks_sent,
-                ping_contacts.len()
+                pings_sent
             );
             let _ = tx.send(
-                if state.firewall_checks_sent > 0 || !ping_contacts.is_empty() {
-                    Ok((state.firewall_checks_sent as usize) + ping_contacts.len())
+                if state.firewall_checks_sent > 0 || pings_sent > 0 {
+                    Ok((state.firewall_checks_sent as usize) + pings_sent)
                 } else {
                     Err("No verified contacts available for firewall recheck".to_string())
                 },

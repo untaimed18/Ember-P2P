@@ -185,6 +185,11 @@ const BACKUP_FILES: &[BackupFile] = &[
     plain("nodes.dat"),
     // Filters, reputation and learned spam, all expensive to rebuild.
     plain("ipfilter.dat"),
+    // The user's own ranges, put back on every list the daily update installs,
+    // and whether the installed list is the default one that update replaces.
+    // Without them a restored custom list or edit lasted until that update.
+    plain("ipfilter_edits.json"),
+    plain("ipfilter_update.json"),
     plain("antileech.dat"),
     plain("reputation.json"),
     plain("search_spam.json"),

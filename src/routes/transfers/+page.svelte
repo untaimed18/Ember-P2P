@@ -3018,18 +3018,25 @@
     try {
       const result = await addTransferWebSources(mirrorDialog.id, lines);
       mirrorDialog.busy = false;
-      // Anything refused stays in the dialog to be corrected; what was taken
-      // is reported once it closes.
+      // Anything refused stays in the dialog to be corrected; the rest of the
+      // outcome is reported either way, in one line (a second `showInfo`
+      // replaces the first), so a valid mirror the cap left out is never
+      // dropped without a word.
+      const outcome = [
+        result.added > 0 ? m.transfers_mirror_added({ count: result.added }) : '',
+        result.over_limit > 0
+          ? m.transfers_mirror_over_limit({ count: result.over_limit })
+          : result.added === 0 && result.already > 0
+            ? m.transfers_mirror_already()
+            : '',
+      ].filter(Boolean);
+      if (outcome.length > 0) showInfo(outcome.join(' · '));
       if (result.refused.length > 0) {
         mirrorDialog.value = result.refused.join('\n');
         mirrorDialog.error = m.transfers_mirror_refused({ count: result.refused.length });
-        if (result.added > 0) showInfo(m.transfers_mirror_added({ count: result.added }));
         return;
       }
       mirrorDialog = { ...MIRROR_DIALOG_CLOSED };
-      if (result.added > 0) showInfo(m.transfers_mirror_added({ count: result.added }));
-      if (result.over_limit > 0) showInfo(m.transfers_mirror_over_limit({ count: result.over_limit }));
-      else if (result.added === 0 && result.already > 0) showInfo(m.transfers_mirror_already());
     } catch (e: unknown) {
       mirrorDialog.busy = false;
       mirrorDialog.error = toErrorMsg(e);
