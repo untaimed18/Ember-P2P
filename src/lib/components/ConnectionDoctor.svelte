@@ -114,6 +114,7 @@
     partly: m.doctor_detail_partly,
     high_id: m.doctor_detail_high_id,
     low_id: m.doctor_detail_low_id,
+    logging_in_again: m.doctor_detail_logging_in_again,
     not_connected: m.doctor_detail_not_connected,
     symmetric: m.doctor_detail_symmetric,
     no_contacts: m.doctor_detail_no_contacts,

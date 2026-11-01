@@ -290,10 +290,14 @@ resends; a message to someone with no shared room is refused.
   Settings > Channels. Notifications use the message switch.
 
 **Not yet:** "Add friend" from a conversation with no shared room (the text
-says to), offline delivery through the chat mailbox, "load older" in a
-conversation (the newest 100 show), disappearing-message timers, and an
-end-to-end test over two network loops; the receive path is covered by its
-parts' tests.
+says to), offline delivery through the chat mailbox, disappearing-message
+timers, and an end-to-end test over two network loops; the receive path is
+covered by its parts' tests.
+
+**Done in 1.7.6:** "Load older" in a conversation. The newest 100 show as
+before, and each older page is read from the oldest one shown, that one's
+timestamp included, since messages can share one; rows already shown are
+dropped, and a page that brings nothing new marks the conversation's start.
 
 ## 3. Follow a publisher (feeds)
 
@@ -583,12 +587,30 @@ building"). Nothing that already exists changes format.
   twelve, has no Alt shortcut. With Ember off Channels and Feeds are both
   hidden, and the shortcuts are as in 1.7.4.
 
-**Not yet:** "Add to feed…" on Library rows (the editor's picker does the
-same), "Feeds" on a friend's card and feed cards in room messages, a
-per-feed download folder, labelling auto-started downloads with their feed
-in Transfers (the category does it for now), spam scoring of item names,
+**Not yet:** "Feeds" on a friend's card and feed cards in room messages,
 carrying a feed to another device of the same identity, and lookups under a
 throwaway identity (item 1).
+
+**Done in 1.7.6:**
+
+- **"Add to feed" on Library rows,** for the clicked file or the selection
+  it is part of, narrowed to files shared with everyone that have their
+  Ember hash. A submenu lists this identity's feeds; picking one appends the
+  files through `add_feed_items`, which reads and saves the items under the
+  editor's lock so a save from the editor cannot cross it, leaves files the
+  feed lists where they are, and names those it could not take. It is saved
+  as an edit, so the feed shows as changed until it is published from Feeds.
+- **Spam scoring of item names.** Each item is scored by the search spam
+  filter as a one-row result from Ember (`spam_items`): the user's own
+  verdicts (hashes marked spam, names like them) and the name checks, with
+  the cross-result signals off since a feed is one publisher's list, and a
+  file in the Library never spam. One taken for spam shows the Spam badge,
+  is held from auto-download (`held: spam`), and can still be downloaded by
+  hand. Nothing is scored with the spam filter off.
+- **The download folder and the Transfers label are settled otherwise.**
+  Feed downloads finish in their feed's own folder (`Feeds/<feed>`) and are
+  kept off Transfers (`sharing/feed_downloads.rs`), so neither a folder per
+  feed nor a label in Transfers is left to build.
 
 **Tests:**
 - **Keys.** Storers refuse a head whose key does not match its publisher and
@@ -820,21 +842,41 @@ probe needs the rendezvous server change above, and works without it.
 
 **Left as they are:**
 
-- **Firewall rules are judged by name and port.** A disabled or blocking
-  rule of that name passes, and Windows Firewall switched off, or a
-  third-party firewall, reads as missing rules. The outside probe is what
-  says whether traffic gets through.
-- **No QUIC rule from the doctor.** With QUIC on the Kad UDP port (the
-  default) none is needed; on a port of its own, the rule startup adds is
-  the only one.
-- **"Reconnect the eD2K server" is not an action.** "Check again" restarts
-  the Kad firewall checks only, and is offered only when offline or still
-  checking.
+- **Firewall rules are judged by name and program.** Windows Firewall
+  switched off, or a third-party firewall, reads as missing rules. The
+  outside probe is what says whether traffic gets through.
 - **The TCP probe is a connect.** A SYN-proxying firewall, or a router
   service on the port, reads as open. Writing the nonce on the connection
   for the upload listener to recognise would close it; not done.
-- **The permission prompt has no owner window** and may open behind Ember,
-  as a flashing taskbar button.
+
+**Changed in 1.7.6:**
+
+- **The rules open every port for Ember's own executable,** as the rules
+  Windows writes for a program do, where each named one port. A VPN hands
+  out a new forwarded port on every connect, and a rule naming the old one
+  closed the new one, which a start without elevation cannot rewrite. A rule
+  from an older Ember that names the port in use still counts, and is
+  widened whenever Ember may change rules. The UDP rule covers QUIC on a
+  port of its own, so the doctor's fix removes the QUIC rule rather than
+  adding one.
+- **One rule per executable under each name.** Ember deletes only rules
+  naming its own program (`netsh … program=`), so an installed copy and a
+  development build no longer delete each other's rule on every start, and
+  a switched-off rule of another copy's does not stop this one adding its
+  own.
+- **Behind a VPN** (the route to the internet leaves through a tunnel or a
+  VPN client's adapter, `vpn.rs`), UPnP that mapped nothing reads as not
+  needed rather than failed, and the fix offered is the VPN's own port
+  forwarding instead of the router's UPnP. A forward the router did make
+  still counts, for clients that tunnel only some programs.
+- **The eD2K server is tested again.** "Check again" logs in to a server
+  that gave a LowID again, which is when a server tests the port, and so
+  does adding the firewall rules. When the outside test reaches the TCP port
+  while the server still has us on LowID, the check logs in again itself and
+  the server line says so rather than failing.
+- **The permission prompt opens in front of Ember.** It is asked for through
+  `ShellExecuteExW` with Ember's window as its owner, where a windowless
+  PowerShell asked before and Windows showed the prompt behind Ember.
 
 **How the open questions were settled:**
 
@@ -967,6 +1009,15 @@ feed that lists it, carry none.
 - **Bad data costs nothing but time:** every part a mirror fills is checked
   against the MD4 part hashes (and AICH when known), and two corrupt parts
   retire it for the session (`MAX_BAD_PARTS`).
+
+**Done in 1.7.6: step 1.** "Add Web Mirror…" on an unfinished download's
+menu takes one address per line through `add_transfer_web_sources`, which
+validates and caps them as a pasted link's `s=` mirrors are, keeps them
+across restarts, and reports how many it added, which the download already
+had, which the cap of 5 left out, and the lines that can never be a mirror,
+left in the dialog to correct. It is disabled while web sources are off
+(Settings > Transfers), and refused for a download being checked, moved,
+done or failed. Steps 2 and 3 remain.
 
 **Tests:** the dialog refuses what the link path refuses and adds what it
 adds; a mirror is kept on the Library entry only after a verified part and

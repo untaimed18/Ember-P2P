@@ -1443,6 +1443,12 @@ impl SpamFilter {
             .collect();
     }
 
+    /// The mutation counter: it moves with every change to what scoring
+    /// reads, so a score taken at one value holds while it stays there.
+    pub fn generation(&self) -> u64 {
+        self.gen
+    }
+
     /// Mark the database dirty and advance the mutation counter so an
     /// in-flight save can detect that newer changes have landed.
     fn mark_dirty(&mut self) {

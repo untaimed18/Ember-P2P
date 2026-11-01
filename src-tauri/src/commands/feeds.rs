@@ -686,32 +686,11 @@ pub async fn set_feed_items(
         .into_iter()
         .map(|item| (item.ed2k, item.name))
         .collect();
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(items.len());
     let mut saved = SavedFeedItems::default();
-    {
+    let out = {
         let index = state.local_index.read().await;
-        for input in items {
-            let ed2k = input.ed2k.trim().to_ascii_lowercase();
-            if !seen.insert(ed2k.clone()) {
-                continue;
-            }
-            let shared = index.get_by_hash(&ed2k).filter(|file| file.is_public_listable() && file.ember_file_hash.len() == 64);
-            let Some(file) = shared else {
-                let name = index.get_by_hash(&ed2k).map(|file| file.name.clone()).or_else(|| held.get(&ed2k).cloned());
-                saved.dropped.push(name.unwrap_or(ed2k));
-                continue;
-            };
-            out.push(FeedItem {
-                ed2k,
-                name: file.name.clone(),
-                size: file.size as i64,
-                aich: file.aich_hash.clone(),
-                blake3: file.ember_file_hash.to_ascii_lowercase(),
-                note: clip(&crate::security::sanitize_remote_text(&input.note, 4096), FEED_NOTE_MAX),
-            });
-        }
-    }
+        library_items(&index, items, &held, &mut saved.dropped)
+    };
     if !saved.dropped.is_empty() && crate::commands::sharing::startup_library_loading() {
         return Err(library_loading());
     }
@@ -724,6 +703,106 @@ pub async fn set_feed_items(
     }
     saved.items = out;
     Ok(saved)
+}
+
+/// Each of `inputs` as a feed item, from the Library: a file shared with
+/// everyone, with the BLAKE3 a follower checks it by. Any other goes in
+/// `dropped` by its Library name, else its name in `held`, else its hash. A
+/// repeat of an earlier input is skipped.
+fn library_items(
+    index: &crate::search::index::LocalIndex,
+    inputs: impl IntoIterator<Item = FeedItemInput>,
+    held: &HashMap<String, String>,
+    dropped: &mut Vec<String>,
+) -> Vec<FeedItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for input in inputs {
+        let ed2k = input.ed2k.trim().to_ascii_lowercase();
+        if !seen.insert(ed2k.clone()) {
+            continue;
+        }
+        let shared = index.get_by_hash(&ed2k).filter(|file| file.is_public_listable() && file.ember_file_hash.len() == 64);
+        let Some(file) = shared else {
+            let name = index.get_by_hash(&ed2k).map(|file| file.name.clone()).or_else(|| held.get(&ed2k).cloned());
+            dropped.push(name.unwrap_or(ed2k));
+            continue;
+        };
+        out.push(FeedItem {
+            ed2k,
+            name: file.name.clone(),
+            size: file.size as i64,
+            aich: file.aich_hash.clone(),
+            blake3: file.ember_file_hash.to_ascii_lowercase(),
+            note: clip(&crate::security::sanitize_remote_text(&input.note, 4096), FEED_NOTE_MAX),
+        });
+    }
+    out
+}
+
+/// What adding Library files to a feed did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AddedFeedItems {
+    /// Files added to the end of the feed.
+    pub added: u32,
+    /// Files the feed already lists, left where they are.
+    pub already: u32,
+    /// The names of files left out because they are not shared with everyone
+    /// or have no Ember digest yet.
+    pub dropped: Vec<String>,
+}
+
+/// Add files from the Library to the end of a feed's items, for the Library's
+/// "Add to feed". Saved as an edit is: the feed shows as changed until it is
+/// published from the Feeds page.
+#[tauri::command]
+pub async fn add_feed_items(
+    state: tauri::State<'_, AppState>,
+    salt: String,
+    ed2ks: Vec<String>,
+) -> Result<AddedFeedItems, String> {
+    let salt = hex::encode(hex_salt(&salt)?);
+    if ed2ks.len() > FEED_ITEMS_MAX {
+        return Err(coded("feeds_too_many_items", "A feed holds at most 2,000 files"));
+    }
+    // Across the read and the save, so a save from the editor in between is
+    // neither undone by this one nor undoes it.
+    let _editing = edit_lock().lock().await;
+    let (db, key) = (state.db.clone(), salt.clone());
+    let mut items = blocking(move || db.feed_own_items(&key), "feeds_failed", "Could not read feeds").await?;
+    let listed: std::collections::HashSet<String> = items.iter().map(|item| item.ed2k.clone()).collect();
+    let mut result = AddedFeedItems::default();
+    let inputs: Vec<FeedItemInput> = ed2ks
+        .into_iter()
+        .map(|ed2k| ed2k.trim().to_ascii_lowercase())
+        .filter(|ed2k| {
+            let new = !listed.contains(ed2k);
+            result.already += u32::from(!new);
+            new
+        })
+        .map(|ed2k| FeedItemInput { ed2k, note: String::new() })
+        .collect();
+    let fresh = {
+        let index = state.local_index.read().await;
+        library_items(&index, inputs, &HashMap::new(), &mut result.dropped)
+    };
+    if !result.dropped.is_empty() && crate::commands::sharing::startup_library_loading() {
+        return Err(library_loading());
+    }
+    if fresh.is_empty() {
+        return Ok(result);
+    }
+    if items.len() + fresh.len() > FEED_ITEMS_MAX {
+        return Err(coded("feeds_too_many_items", "A feed holds at most 2,000 files"));
+    }
+    result.added = fresh.len() as u32;
+    items.extend(fresh);
+    let db = state.db.clone();
+    let found = blocking(move || db.feed_own_set_items(&salt, &items), "feeds_failed", "Could not save the feed").await?;
+    if !found {
+        return Err(coded("feeds_not_found", "That feed could not be found"));
+    }
+    Ok(result)
 }
 
 /// Refusal for a save or publish that would drop items while the startup scan
@@ -1626,6 +1705,8 @@ pub async fn get_feed_items(
     // space says so rather than nothing.
     let mut room = if feed.auto_download { auto_download_room(&state).await } else { u64::MAX };
     mark("free space", &mut at);
+    let spam = spam_items(&state, items.iter().map(|item| &item.item)).await;
+    mark("spam filter", &mut at);
     let elapsed = started.elapsed();
     if elapsed >= Duration::from_secs(1) {
         let phases: Vec<String> = phases.iter().map(|(phase, ms)| format!("{phase} {ms} ms")).collect();
@@ -1689,10 +1770,12 @@ pub async fn get_feed_items(
                 })
                 .map(|(_, _, _, transfer)| transfer.clone());
             let elsewhere = copy_elsewhere.filter(|_| status == ItemStatus::Elsewhere);
+            let is_spam = spam.contains(&hash);
             // In the order a pass takes them, each counted off the 24-hour
             // cap as it would be started.
             let held = if status == ItemStatus::None && auto_takes(&feed, &item) {
                 match auto_choice(&feed, &item.item, spent, room, false) {
+                    AutoChoice::Start if is_spam => Some("spam"),
                     AutoChoice::Start => {
                         spent = spent.saturating_add(item.item.size);
                         room = room.saturating_sub(size);
@@ -1706,6 +1789,7 @@ pub async fn get_feed_items(
             };
             FollowedItemInfo {
                 risky: auto_download_refuses(&item.item.name),
+                spam: is_spam,
                 status,
                 progress,
                 held,
@@ -1852,11 +1936,15 @@ pub struct FollowedItemInfo {
     /// A type that can run code or change settings, which automatic
     /// downloads never take: the page asks before downloading it.
     pub risky: bool,
+    /// The spam filter takes it for spam (see [`spam_items`]): shown as such,
+    /// and never downloaded automatically.
+    pub spam: bool,
     pub status: ItemStatus,
     /// Of a download on its way, 0 to 100.
     pub progress: f64,
     /// Why auto-download has not started it: `risky`, `too_large`,
-    /// `day_limit` or `disk` (too little free space, or none could be read).
+    /// `day_limit`, `disk` (too little free space, or none could be read) or
+    /// `spam`.
     pub held: Option<&'static str>,
     /// Its download, while it is in the transfer list.
     pub transfer: Option<ItemTransfer>,
@@ -3414,6 +3502,142 @@ fn auto_download_refuses(name: &str) -> bool {
         || crate::security::is_dangerous_extension(name)
 }
 
+/// Of `items`, the eD2K hashes (lowercase) the spam filter takes for spam,
+/// each scored as a search result is from what a feed says of a file: its
+/// name and size, against the user's own verdicts (hashes marked spam, names
+/// like those) and the name checks. A feed is one publisher's list, not a
+/// result set, so the signals drawn from many results together do not apply,
+/// and a file in the Library is never spam. Empty with the filter off.
+async fn spam_items<'a>(
+    state: &AppState,
+    items: impl IntoIterator<Item = &'a FeedItem>,
+) -> std::collections::HashSet<String> {
+    use crate::search::spam::{BatchSpamContext, CommunityRating, SpamFilterProfile, SpamKeywords};
+    let (enabled, profile) = {
+        let config = state.config.read().await;
+        (
+            config.settings.spam_filter_enabled,
+            SpamFilterProfile::from_setting(&config.settings.spam_filter_profile),
+        )
+    };
+    if !enabled {
+        return Default::default();
+    }
+    let results: Vec<crate::types::SearchResult> = items.into_iter().map(feed_item_result).collect();
+    // A scan holds the index through a whole re-index, and the page asks
+    // every few seconds: a busy index exempts nothing rather than waiting.
+    let owned: Vec<String> = match state.local_index.try_read() {
+        Ok(index) => results
+            .iter()
+            .map(|result| result.file.hash.clone())
+            .filter(|hash| index.get_by_hash(hash).is_some())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let filter = state.spam_filter.read().await;
+    // The page asks every few seconds, and scoring compares each name with
+    // every name the user marked spam: a feed's verdicts are kept until its
+    // items, the Library's copies of them, the filter or the profile change.
+    let key = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&filter.generation().to_le_bytes());
+        hasher.update(format!("{profile:?}").as_bytes());
+        for result in &results {
+            hasher.update(result.file.hash.as_bytes());
+            hasher.update(&result.file.size.to_le_bytes());
+            hasher.update(&(result.file.name.len() as u64).to_le_bytes());
+            hasher.update(result.file.name.as_bytes());
+        }
+        hasher.update(b"owned");
+        for hash in &owned {
+            hasher.update(hash.as_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    };
+    if let Some(hit) = spam_verdicts().lock().iter().find(|(held, _)| *held == key) {
+        return hit.1.clone();
+    }
+    let batch = BatchSpamContext::for_owned_hashes(owned);
+    let keywords = SpamKeywords::new(&[]);
+    let spam: std::collections::HashSet<String> = results
+        .iter()
+        .filter(|result| {
+            filter
+                .explain_result_with_keywords(result, &keywords, None, profile, CommunityRating::default(), &batch)
+                .is_spam
+        })
+        .map(|result| result.file.hash.clone())
+        .collect();
+    let mut cache = spam_verdicts().lock();
+    if cache.len() >= SPAM_VERDICTS_KEPT {
+        cache.pop_front();
+    }
+    cache.push_back((key, spam.clone()));
+    spam
+}
+
+/// Verdict sets [`spam_items`] keeps: a few feeds' pages and passes at once.
+const SPAM_VERDICTS_KEPT: usize = 8;
+
+/// The verdicts of [`spam_items`]' last scorings, by what they were taken from.
+fn spam_verdicts() -> &'static parking_lot::Mutex<std::collections::VecDeque<([u8; 32], std::collections::HashSet<String>)>> {
+    static VERDICTS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::VecDeque<([u8; 32], std::collections::HashSet<String>)>>,
+    > = std::sync::OnceLock::new();
+    VERDICTS.get_or_init(Default::default)
+}
+
+/// A feed item as the spam filter scores a search result: a file offered over
+/// Ember, with nothing known of it beyond its listing.
+fn feed_item_result(item: &FeedItem) -> crate::types::SearchResult {
+    let extension = Path::new(&item.name)
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::types::SearchResult {
+        file: crate::types::FileInfo {
+            id: item.ed2k.to_ascii_lowercase(),
+            name: item.name.clone(),
+            path: String::new(),
+            size: u64::try_from(item.size).unwrap_or(0),
+            hash: item.ed2k.to_ascii_lowercase(),
+            aich_hash: item.aich.clone(),
+            ember_file_hash: item.blake3.clone(),
+            extension: extension.clone(),
+            modified_at: 0,
+            priority: "normal".to_string(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            alltime_requests: 0,
+            alltime_accepted: 0,
+            alltime_transferred: 0,
+            complete_sources: 0,
+            folder: String::new(),
+            shared: false,
+            friends_only: false,
+            shared_kad: false,
+            shared_ed2k: false,
+            shared_ember: false,
+        },
+        peer_id: String::new(),
+        peer_name: String::new(),
+        availability: 1,
+        file_type: crate::search::index::infer_file_type(&extension),
+        source_addresses: Vec::new(),
+        rating: None,
+        comment: None,
+        media: None,
+        spam_rating: 0,
+        is_spam: false,
+        clean_name: String::new(),
+        result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
+        origin_server_ip: None,
+        spam_reasons: Vec::new(),
+        spam_reason_details: Vec::new(),
+    }
+}
+
 /// What auto-download does with one item of a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutoChoice {
@@ -3525,8 +3749,13 @@ async fn auto_download(app: &tauri::AppHandle, state: &AppState, publisher: &str
     // Measured once: what this pass starts is not on disk yet, so it is
     // counted off as it goes.
     let mut room = auto_download_room(state).await;
+    let spam = spam_items(state, added).await;
     let mut started = 0;
     for item in added {
+        // Shown on the page as held for it, and started only by hand.
+        if spam.contains(&item.ed2k.to_ascii_lowercase()) {
+            continue;
+        }
         // Held already, or on its way. A feed's files are in no library, so
         // one this feed started before counts as held. Not looked for, under
         // two locks, when its type or a cap holds it back: `auto_choice`
@@ -4315,6 +4544,37 @@ mod tests {
     }
 
     const ROOM: u64 = u64::MAX;
+
+    /// A feed item is scored as a search result for the same file is: one
+    /// whose hash the user marked spam is spam in a feed too, and an
+    /// ordinary file beside it is not.
+    #[test]
+    fn a_feed_item_the_user_marked_spam_scores_as_spam() {
+        use crate::search::spam::{BatchSpamContext, CommunityRating, SpamFilter, SpamFilterProfile, SpamKeywords};
+        let dir = std::env::temp_dir().join(format!("ember-feed-spam-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut filter = SpamFilter::load(&dir);
+        let fake = FeedItem { ed2k: "a".repeat(32), ..item("Album.2026.FLAC.zip", 300) };
+        let honest = FeedItem { ed2k: "b".repeat(32), ..item("holiday photos.zip", 40) };
+        filter.mark_spam(&feed_item_result(&fake), &[], None);
+
+        let score = |item: &FeedItem| {
+            filter
+                .explain_result_with_keywords(
+                    &feed_item_result(item),
+                    &SpamKeywords::new(&[]),
+                    None,
+                    SpamFilterProfile::Balanced,
+                    CommunityRating::default(),
+                    &BatchSpamContext::default(),
+                )
+                .is_spam
+        };
+        assert!(score(&fake), "the hash the user marked");
+        assert!(!score(&honest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn auto_download_keeps_to_its_caps_and_never_starts_a_program() {

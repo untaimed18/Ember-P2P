@@ -467,29 +467,82 @@ fn both_rules(tcp: Option<bool>, udp: Option<bool>) -> Option<bool> {
 /// Add the TCP and UDP rules, which open every port, from an elevated
 /// `netsh`, which is one Windows permission prompt. Ember does not run
 /// elevated, so this is the only way it can add them after setup; the
-/// connection doctor offers it, and only when the user asks. Returns whether
-/// the session's ports (QUIC's too, when it has a port of its own) are let in
-/// afterwards, so a declined prompt reads as not done.
-pub fn add_rules_elevated(tcp_port: u16, udp_port: u16, quic_port: u16) -> bool {
+/// connection doctor offers it, and only when the user asks. `owner` is the
+/// window the prompt belongs to (0 for none). Returns whether the session's
+/// ports (QUIC's too, when it has a port of its own) are let in afterwards, so
+/// a declined prompt reads as not done.
+pub fn add_rules_elevated(tcp_port: u16, udp_port: u16, quic_port: u16, owner: isize) -> bool {
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
     let script = elevated_rules_script(&exe.to_string_lossy(), &windows_system_path(NETSH).to_string_lossy());
-    let encoded = utf16_base64(&script);
-    let powershell = strip_quotes(&windows_system_path(POWERSHELL).to_string_lossy());
-    let launcher = format!(
-        "Start-Process -FilePath '{powershell}' -Verb RunAs -Wait -WindowStyle Hidden \
-         -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{encoded}'"
+    let parameters = format!(
+        "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand {}",
+        utf16_base64(&script)
     );
-    let ran = Command::new(windows_system_path(POWERSHELL))
-        .args(["-NoProfile", "-NonInteractive", "-Command", &launcher])
-        .creation_flags(0x08000000)
-        .output();
-    if let Err(e) = ran {
-        warn!("Could not ask Windows to add the firewall rules: {e}");
+    if !run_elevated(&windows_system_path(POWERSHELL).to_string_lossy(), &parameters, owner) {
         return false;
     }
     rules_in_place(tcp_port, udp_port, quic_port) == Some(true)
+}
+
+/// How long to wait for the elevated script, which runs a few `netsh` calls.
+const ELEVATED_WAIT_MS: u32 = 120_000;
+
+/// Run `program` elevated, hidden, and wait for it. Returns whether it started;
+/// a declined permission prompt is `false`.
+///
+/// Asked for by Ember itself through `ShellExecuteExW`, owned by `owner`, so
+/// the prompt opens in front of Ember's window. A hidden helper asking instead
+/// (`Start-Process -Verb RunAs` from a windowless PowerShell) has no right to
+/// the foreground, and Windows showed its prompt behind Ember as a flashing
+/// taskbar button.
+fn run_elevated(program: &str, parameters: &str, owner: isize) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
+    use windows_sys::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let wide = |text: &str| text.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (verb, file, parameters) = (wide("runas"), wide(program), wide(parameters));
+    // SAFETY: called with no reserved pointer; a thread that already has COM
+    // in another mode answers with an error, and then is not uninitialised.
+    let com = unsafe { CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) };
+    // SAFETY: SHELLEXECUTEINFOW is plain data, for which all zeroes is valid.
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    info.hwnd = owner as _;
+    info.lpVerb = verb.as_ptr();
+    info.lpFile = file.as_ptr();
+    info.lpParameters = parameters.as_ptr();
+    info.nShow = SW_HIDE;
+    // SAFETY: `info` is a valid SHELLEXECUTEINFOW with `cbSize` set, and the
+    // strings it points at outlive the call.
+    let started = unsafe { ShellExecuteExW(&mut info) } != 0;
+    if !started {
+        // SAFETY: no arguments; reads this thread's last error.
+        match unsafe { GetLastError() } {
+            ERROR_CANCELLED => debug!("Firewall rules: the permission prompt was declined"),
+            code => warn!("Could not ask Windows to add the firewall rules: error {code}"),
+        }
+    } else if !info.hProcess.is_null() {
+        // SAFETY: a process handle ShellExecuteExW opened for us, closed once.
+        unsafe {
+            WaitForSingleObject(info.hProcess, ELEVATED_WAIT_MS);
+            CloseHandle(info.hProcess);
+        }
+    }
+    if com >= 0 {
+        // SAFETY: balances the successful CoInitializeEx above on this thread.
+        unsafe { CoUninitialize() };
+    }
+    started
 }
 
 /// UTF-16LE in base64, as `-EncodedCommand` and `[Text.Encoding]::Unicode`

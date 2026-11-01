@@ -132,6 +132,9 @@ pub struct Signals {
     pub kad_tcp: Option<bool>,
     pub kad_udp: Option<bool>,
     pub low_id: Option<bool>,
+    /// A LowID the outside test contradicts, so the server is being logged in
+    /// to again for a fresh ID.
+    pub logging_in_again: bool,
     pub nat_symmetric: bool,
     pub nat_known: bool,
     pub buddy_connected: bool,
@@ -263,6 +266,7 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     }
     match s.low_id {
         Some(false) => check("server_id", Pass, "high_id"),
+        Some(true) if s.logging_in_again => check("server_id", Skip, "logging_in_again"),
         Some(true) => check("server_id", Fail, "low_id"),
         None => check("server_id", Skip, "not_connected"),
     }
@@ -511,7 +515,13 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
 /// Run every check and say what they mean.
 #[tauri::command]
 pub async fn run_connection_check(state: tauri::State<'_, AppState>) -> Result<ConnectionReport, String> {
-    let gathered = gather(&state, true).await?;
+    let mut gathered = gather(&state, true).await?;
+    // The outside test reached the TCP port the server would test, so a LowID
+    // is from before whatever opened it, and lasts until a login asks again.
+    let s = &gathered.signals;
+    if s.low_id == Some(true) && s.probe_tcp == Some(TcpProbe::Open) && !s.tcp_listen_failed {
+        gathered.signals.logging_in_again = log_in_again(&state).await;
+    }
     let (verdict, checks, helping, fixes) = assess(&gathered.signals);
     Ok(ConnectionReport {
         verdict,
@@ -541,13 +551,21 @@ pub async fn connection_doctor_action(
             Ok(true)
         }
         "recheck" => {
+            // A server that gave a LowID tests the port only at a login, so
+            // checking again logs in again too.
+            let low_id = network_stats(&state).await?.ed2k_low_id == Some(true);
+            let logged_in_again = low_id && log_in_again(&state).await;
             let (tx, rx) = tokio::sync::oneshot::channel();
             state
                 .network_tx
                 .try_send(NetworkCommand::RecheckFirewall { tx })
                 .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-            await_reply(rx, "doctor_failed", "Could not start the checks again").await??;
-            Ok(true)
+            match await_reply(rx, "doctor_failed", "Could not start the checks again").await? {
+                Ok(_) => Ok(true),
+                // Kad had nobody to ask, but the server is testing the port.
+                Err(_) if logged_in_again => Ok(true),
+                Err(e) => Err(e),
+            }
         }
         #[cfg(target_os = "windows")]
         "add_firewall_rules" => {
@@ -556,10 +574,14 @@ pub async fn connection_doctor_action(
             let settings = state.config.read().await.settings.clone();
             let (tcp, udp, _, _) = session_ports(&stats, &settings);
             let quic = stats.quic_udp_port;
-            let added =
-                tokio::task::spawn_blocking(move || crate::security::firewall::add_rules_elevated(tcp, udp, quic))
-                    .await
-                    .map_err(|e| coded_ctx("doctor_failed", "Task error", e))?;
+            // The permission prompt belongs to this window, so it opens in
+            // front of Ember rather than behind it.
+            let owner = window.hwnd().map(|hwnd| hwnd.0 as isize).unwrap_or(0);
+            let added = tokio::task::spawn_blocking(move || {
+                crate::security::firewall::add_rules_elevated(tcp, udp, quic, owner)
+            })
+            .await
+            .map_err(|e| coded_ctx("doctor_failed", "Task error", e))?;
             if added {
                 retest_ports(&state, stats.ed2k_low_id == Some(true)).await;
             }
@@ -576,18 +598,26 @@ pub async fn connection_doctor_action(
 async fn retest_ports(state: &AppState, low_id: bool) {
     let (tx, _) = tokio::sync::oneshot::channel();
     let _ = state.network_tx.try_send(NetworkCommand::RecheckFirewall { tx });
-    if !low_id {
-        return;
+    if low_id {
+        log_in_again(state).await;
     }
+}
+
+/// Log in to the eD2K server we are on again, which is when a server tests our
+/// port and hands out an ID. Returns whether a login was asked for.
+async fn log_in_again(state: &AppState) -> bool {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if state.network_tx.try_send(NetworkCommand::GetConnectedServerSnapshot { tx }).is_err() {
-        return;
+        return false;
     }
     let Ok(Some(server)) = rx.await else {
-        return;
+        return false;
     };
     let (tx, _) = tokio::sync::oneshot::channel();
-    let _ = state.network_tx.try_send(NetworkCommand::ConnectToServer { ip: server.ip, port: server.port, tx });
+    state
+        .network_tx
+        .try_send(NetworkCommand::ConnectToServer { ip: server.ip, port: server.port, tx })
+        .is_ok()
 }
 
 #[cfg(test)]
@@ -667,6 +697,23 @@ mod tests {
         assert_eq!(fix_ids(&cgnat), vec!["carrier_nat"]);
         let vpn = Signals { upnp_stood_down: true, ..closed };
         assert_eq!(fix_ids(&vpn), vec!["vpn"]);
+    }
+
+    /// A LowID the outside test contradicts is from before the port opened:
+    /// the server line says a login is asking again rather than failing, and
+    /// the verdict follows the probe.
+    #[test]
+    fn a_low_id_from_before_the_port_opened_is_not_a_failure_while_logging_in_again() {
+        let stale = Signals { low_id: Some(true), logging_in_again: true, ..reachable() };
+        let (verdict, checks, _, fixes) = assess(&stale);
+        assert_eq!(verdict, Verdict::Reachable);
+        let server = checks.iter().find(|c| c.id == "server_id").expect("a server line");
+        assert_eq!((server.status, server.detail), (CheckStatus::Skip, "logging_in_again"));
+        assert!(fixes.is_empty());
+
+        let still_low = Signals { low_id: Some(true), ..reachable() };
+        let (_, checks, _, _) = assess(&still_low);
+        assert!(checks.iter().any(|c| c.id == "server_id" && c.status == CheckStatus::Fail));
     }
 
     /// Behind a VPN no router answers UPnP, which is how it should be, so

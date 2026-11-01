@@ -177,6 +177,7 @@ pub async fn close_chat_window(app: tauri::AppHandle) -> Result<(), String> {
 /// the chat nothing and keeps a compromised chat webview from them.
 pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "acknowledge_security_policy_reset",
+    "add_feed_items",
     "add_ip_filter_range",
     "add_server",
     "ban_peer",

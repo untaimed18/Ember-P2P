@@ -2796,11 +2796,12 @@
   let ctxSendSub = $state(false);
   let ctxWebSub = $state(false);
   let ctxCategorySub = $state(false);
+  let ctxFeedSub = $state(false);
 
   // Submenus open on hover, on click and from the keyboard; see `hoverSubmenus`.
-  type HoverSub = 'priority' | 'copy' | 'send' | 'web' | 'category';
+  type HoverSub = 'priority' | 'copy' | 'send' | 'web' | 'category' | 'feed';
   const ctxSubs = hoverSubmenus<HoverSub>(
-    () => (ctxPrioritySub ? 'priority' : ctxCopySub ? 'copy' : ctxSendSub ? 'send' : ctxWebSub ? 'web' : ctxCategorySub ? 'category' : null),
+    () => (ctxPrioritySub ? 'priority' : ctxCopySub ? 'copy' : ctxSendSub ? 'send' : ctxWebSub ? 'web' : ctxCategorySub ? 'category' : ctxFeedSub ? 'feed' : null),
     (which) => {
       ctxPrioritySub = which === 'priority';
       ctxCopySub = which === 'copy';
@@ -2808,8 +2809,53 @@
       ctxSendSub = which === 'send';
       ctxWebSub = which === 'web';
       ctxCategorySub = which === 'category';
+      if (which === 'feed' && !ctxFeedSub) void loadMyFeeds();
+      ctxFeedSub = which === 'feed';
     },
   );
+
+  /** This identity's feeds, for "Add to feed"; `null` while they load. */
+  let myFeeds: { salt: string; title: string; item_count: number }[] | null = $state(null);
+  /** Feeds exist only while Ember is on. */
+  let feedsAvailable = $derived($appSettings?.ember_native_enabled === true);
+
+  async function loadMyFeeds() {
+    myFeeds = null;
+    try {
+      const { listMyFeeds } = await import('$lib/api/feeds');
+      myFeeds = (await listMyFeeds()).map((feed) => ({
+        salt: feed.salt,
+        title: feed.title,
+        item_count: feed.items.length,
+      }));
+    } catch {
+      myFeeds = [];
+    }
+  }
+
+  /** What "Add to feed" adds: the clicked file, or the selection it is part
+   *  of, narrowed to files a feed can list: shared with everyone, with the
+   *  Ember digest a follower checks them by. */
+  function feedTargets(f: FileInfo): FileInfo[] {
+    const rows = checkedCount > 1 && checkedPaths.has(f.path) ? getCheckedFiles() : [f];
+    return rows.filter((row) => !!row.hash && row.shared && !row.friends_only && row.ember_file_hash.length === 64);
+  }
+
+  async function addToFeed(targets: FileInfo[], salt: string) {
+    const feed = myFeeds?.find((candidate) => candidate.salt === salt);
+    if (!feed || targets.length === 0) return;
+    const { addFeedItems } = await import('$lib/api/feeds');
+    const result = await addFeedItems(salt, [...new Set(targets.map((t) => t.hash))]);
+    const title = feed.title || m.library_feed_untitled();
+    if (result.added > 0) {
+      toastSuccess(m.library_feed_added({ count: formatNumber(result.added), title }));
+    } else if (result.already > 0 && result.dropped.length === 0) {
+      toastInfo(m.library_feed_already({ title }));
+    }
+    if (result.dropped.length > 0) {
+      toastWarning(m.library_feed_dropped({ count: formatNumber(result.dropped.length) }));
+    }
+  }
   const openHoverSub = ctxSubs.open;
   const enterHoverSub = ctxSubs.enter;
   const leaveHoverSub = ctxSubs.leave;
@@ -3266,6 +3312,9 @@
         case 'tag_remove': await applyEmberTag(emberTagTargets(f, false).map((t) => t.path), false); break;
         case 'move_category':
           if (extra !== undefined) await moveToCategory(categoryMoveTargets(f), extra);
+          break;
+        case 'add_to_feed':
+          if (extra) await addToFeed(feedTargets(f), extra);
           break;
         case 'edit_categories': categoriesOpen = true; break;
         // The backend reads the template from settings by index and does the
@@ -5651,6 +5700,7 @@
   {@const moveTargets = categoryMoveTargets(ctxMenu.file)}
   {@const tagAddTargets = emberTagTargets(ctxMenu.file, true)}
   {@const tagRemoveTargets = emberTagTargets(ctxMenu.file, false)}
+  {@const feedTargetCount = feedsAvailable ? feedTargets(ctxMenu.file).length : 0}
   <div class="ctx-menu" role="menu" bind:this={ctxMenuEl} use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
@@ -5729,6 +5779,42 @@
             {/each}
             <div class="ctx-sep" role="separator"></div>
             <button class="ctx-item" role="menuitem" onclick={() => ctxAction('edit_categories')}>{m.library_ctx_edit_categories()}</button>
+          </div>
+        {/if}
+      </div>
+    {/if}
+    {#if feedsAvailable && feedTargetCount > 0}
+      <!-- Only for files a feed can list: shared with everyone, with their
+           Ember digest. Added as an edit; the feed is published from Feeds. -->
+      <div
+        class="ctx-item ctx-sub"
+        class:ctx-sub-open={ctxFeedSub}
+        role="menuitem"
+        tabindex="0"
+        aria-haspopup="menu"
+        aria-expanded={ctxFeedSub}
+        onmouseenter={() => enterHoverSub('feed')}
+        onmouseleave={leaveHoverSub}
+        onclick={(e) => clickHoverSub(e, 'feed')}
+        onkeydown={(e) => onSubmenuKey(e, 'feed')}
+      >
+        {feedTargetCount > 1
+          ? m.library_ctx_add_to_feed_count({ count: formatNumber(feedTargetCount) })
+          : m.library_ctx_add_to_feed()}
+        {#if ctxFeedSub}
+          <div class="ctx-submenu ctx-scroll" role="menu" use:ctxSubmenuPlacement>
+            {#if myFeeds === null}
+              <div class="ctx-label ctx-note" role="presentation">{m.common_loading()}</div>
+            {:else if myFeeds.length === 0}
+              <div class="ctx-label ctx-note" role="presentation">{m.library_ctx_no_feeds()}</div>
+            {:else}
+              {#each myFeeds as feed (feed.salt)}
+                <button class="ctx-item" role="menuitem" onclick={() => ctxAction('add_to_feed', feed.salt)}>
+                  <bdi dir="auto">{feed.title || m.library_feed_untitled()}</bdi>
+                  <span class="ctx-hint">{formatNumber(feed.item_count)}</span>
+                </button>
+              {/each}
+            {/if}
           </div>
         {/if}
       </div>

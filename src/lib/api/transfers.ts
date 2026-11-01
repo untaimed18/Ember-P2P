@@ -267,6 +267,23 @@ export async function renameTransfer(transferId: string, fileName: string): Prom
   return invoke('rename_transfer', { transferId, fileName });
 }
 
+/** What adding web mirrors by hand did. */
+export interface AddedWebSources {
+  /** Mirrors the download did not have, now in use. */
+  added: number;
+  /** Mirrors it already had. */
+  already: number;
+  /** Valid mirrors left out because the download keeps no more. */
+  over_limit: number;
+  /** Lines that can never be a mirror, shortened. */
+  refused: string[];
+}
+
+/** Add web mirrors (one per entry) to a download still in progress. */
+export async function addTransferWebSources(transferId: string, urls: string[]): Promise<AddedWebSources> {
+  return invoke('add_transfer_web_sources', { transferId, urls });
+}
+
 export async function setPreviewPriority(transferId: string, enabled: boolean): Promise<void> {
   return invoke('set_preview_priority', { transferId, enabled });
 }

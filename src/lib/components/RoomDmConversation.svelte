@@ -98,6 +98,15 @@
     if (listEl && stick) listEl.scrollTop = listEl.scrollHeight;
   }
 
+  /** Messages one read brings: the newest at first, then each older page. */
+  const PAGE_SIZE = 100;
+  /** Storage holds messages older than the oldest shown, as far as is known. */
+  let hasOlder = $state(false);
+  /** An older page found nothing new: the conversation's start is shown. */
+  let reachedStart = false;
+  let loadingOlder = $state(false);
+  let olderError = $state(false);
+
   let loadSeq = 0;
   /** Read the conversation from storage. `replace` when what is stored may
    *  have lost rows (declined, deleted): only rows that arrived during the
@@ -107,14 +116,44 @@
     const shownBefore = new Set(messages.map(rowKey));
     loading = true;
     try {
-      const rows = await getRoomDmMessages(who);
+      const rows = await getRoomDmMessages(who, undefined, PAGE_SIZE);
       if (seq !== loadSeq) return;
       messages = merged(rows, replace ? messages.filter((row) => !shownBefore.has(rowKey(row))) : messages);
+      if (replace) reachedStart = false;
+      hasOlder = !reachedStart && rows.length >= PAGE_SIZE;
       await scrollToEnd(true);
     } catch (e) {
       if (seq === loadSeq) toastError(translateError(e, m.error_operation_failed()));
     } finally {
       if (seq === loadSeq) loading = false;
+    }
+  }
+
+  /** Read the page before the oldest message shown, keeping the view where it
+   *  was. The page takes the oldest shown timestamp in, since messages can
+   *  share one; those already shown are dropped by the merge. */
+  async function loadOlder() {
+    if (loadingOlder || !hasOlder || messages.length === 0) return;
+    const seq = loadSeq;
+    loadingOlder = true;
+    olderError = false;
+    try {
+      const rows = await getRoomDmMessages(who, messages[0].timestamp + 1, PAGE_SIZE);
+      if (seq !== loadSeq) return;
+      const shown = new Set(messages.map(rowKey));
+      const fresh = rows.filter((row) => !shown.has(rowKey(row)));
+      if (fresh.length === 0 || rows.length < PAGE_SIZE) reachedStart = true;
+      hasOlder = !reachedStart;
+      if (fresh.length === 0) return;
+      const height = listEl?.scrollHeight ?? 0;
+      const top = listEl?.scrollTop ?? 0;
+      messages = merged(messages, fresh);
+      await tick();
+      if (listEl) listEl.scrollTop = top + (listEl.scrollHeight - height);
+    } catch {
+      olderError = true;
+    } finally {
+      loadingOlder = false;
     }
   }
 
@@ -300,6 +339,16 @@
     {:else if messages.length === 0 && !justDeclined}
       <p class="dm-empty">{m.channels_dm_empty_hint()}</p>
     {/if}
+    {#if hasOlder && messages.length > 0}
+      <div class="dm-load-older">
+        <button class="dm-load-older-btn" type="button" onclick={() => void loadOlder()} disabled={loadingOlder}>
+          {loadingOlder ? m.chat_loading_short() : (olderError ? m.common_retry() : m.chat_load_older())}
+        </button>
+        {#if olderError}
+          <span class="dm-load-older-error" role="alert">{m.chat_load_older_failed()}</span>
+        {/if}
+      </div>
+    {/if}
     {#each messages as row (rowKey(row))}
       <div class="dm-row" class:out={row.direction === 'out'}>
         <div class="dm-bubble">
@@ -388,6 +437,35 @@
     text-align: center;
     color: var(--text-muted);
     font-size: var(--font-size-sm);
+  }
+
+  .dm-load-older {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 8px;
+  }
+
+  .dm-load-older-btn {
+    padding: 6px 12px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .dm-load-older-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .dm-load-older-error {
+    font-size: var(--font-size-xs);
+    color: var(--danger);
   }
 
   .dm-row {

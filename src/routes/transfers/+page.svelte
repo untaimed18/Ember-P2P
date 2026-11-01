@@ -18,7 +18,7 @@
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, removeTransfer, deleteFinishedDownloads,
-    clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransfersCategory, renameTransfer, setPreviewPriority,
+    clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransfersCategory, renameTransfer, setPreviewPriority, addTransferWebSources,
     pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch, getTransfers,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
@@ -592,6 +592,19 @@
   let renameModalEl: HTMLDivElement | undefined = $state();
   let renameOverlayEl: HTMLDivElement | undefined = $state();
   let renameReturnFocusEl: HTMLElement | null = null;
+  let mirrorDialog: {
+    open: boolean;
+    id: string;
+    name: string;
+    value: string;
+    error: string | null;
+    busy: boolean;
+  } = $state({ open: false, id: '', name: '', value: '', error: null, busy: false });
+  let mirrorInputEl: HTMLTextAreaElement | undefined = $state();
+  let mirrorModalEl: HTMLDivElement | undefined = $state();
+  let mirrorOverlayEl: HTMLDivElement | undefined = $state();
+  let mirrorReturnFocusEl: HTMLElement | null = null;
+  let webSourcesOn = $derived($appSettings?.web_sources_enabled ?? true);
   let recoveringIds: Set<string> = $state(new Set());
   // L14: persist the Completed-section collapsed state so it survives
   // navigation. Falls back to expanded on first load or invalid storage.
@@ -2982,6 +2995,65 @@
     return inertBackground(renameOverlayEl);
   });
 
+  const MIRROR_DIALOG_CLOSED = { open: false, id: '', name: '', value: '', error: null, busy: false };
+
+  function openAddMirror(t: Transfer) {
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    mirrorReturnFocusEl =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+    mirrorDialog = { ...MIRROR_DIALOG_CLOSED, open: true, id: t.id, name: t.file_name };
+  }
+
+  function closeAddMirror() {
+    if (mirrorDialog.busy) return;
+    mirrorDialog = { ...MIRROR_DIALOG_CLOSED };
+  }
+
+  async function submitAddMirror() {
+    if (!mirrorDialog.open || mirrorDialog.busy) return;
+    const lines = mirrorDialog.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length === 0) return;
+    mirrorDialog.busy = true;
+    mirrorDialog.error = null;
+    try {
+      const result = await addTransferWebSources(mirrorDialog.id, lines);
+      mirrorDialog.busy = false;
+      // Anything refused stays in the dialog to be corrected; what was taken
+      // is reported once it closes.
+      if (result.refused.length > 0) {
+        mirrorDialog.value = result.refused.join('\n');
+        mirrorDialog.error = m.transfers_mirror_refused({ count: result.refused.length });
+        if (result.added > 0) showInfo(m.transfers_mirror_added({ count: result.added }));
+        return;
+      }
+      mirrorDialog = { ...MIRROR_DIALOG_CLOSED };
+      if (result.added > 0) showInfo(m.transfers_mirror_added({ count: result.added }));
+      if (result.over_limit > 0) showInfo(m.transfers_mirror_over_limit({ count: result.over_limit }));
+      else if (result.added === 0 && result.already > 0) showInfo(m.transfers_mirror_already());
+    } catch (e: unknown) {
+      mirrorDialog.busy = false;
+      mirrorDialog.error = toErrorMsg(e);
+    }
+  }
+
+  $effect(() => {
+    if (!mirrorDialog.open) return;
+    const raf = requestAnimationFrame(() => mirrorInputEl?.focus());
+    return () => {
+      cancelAnimationFrame(raf);
+      const el = mirrorReturnFocusEl;
+      mirrorReturnFocusEl = null;
+      if (el && typeof document !== 'undefined' && document.contains(el)) {
+        requestAnimationFrame(() => el.focus());
+      }
+    };
+  });
+
+  $effect(() => {
+    if (!mirrorDialog.open || !mirrorOverlayEl) return;
+    return inertBackground(mirrorOverlayEl);
+  });
+
   const archiveExts = ['zip', 'cbz', 'jar', 'rar', 'cbr', 'ace'];
   function isArchive(t: Transfer): boolean {
     const ext = t.file_name.split('.').pop()?.toLowerCase() ?? '';
@@ -3465,6 +3537,7 @@
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'rename': openRename(t); return;
+        case 'add_mirror': openAddMirror(t); return;
         case 'priority': if (extra && PRIORITIES.includes(extra as Priority)) await setPriorityFor(targets, extra as Priority); break;
         case 'queue_front':
         case 'queue_back': {
@@ -5273,6 +5346,7 @@
     // fallback for when focus has somehow ended up outside it, and it comes
     // first because the dialog sits above everything else.
     if (renameDialog.open) { closeRename(); e.preventDefault(); e.stopPropagation(); }
+    else if (mirrorDialog.open) { closeAddMirror(); e.preventDefault(); e.stopPropagation(); }
     else if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
     else if (ctxMenu) {
       const returnTo = ctxReturnFocus;
@@ -5331,7 +5405,7 @@
     (target instanceof HTMLInputElement && !['checkbox', 'radio', 'button'].includes(target.type))
     || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable
   );
-  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
+  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open || mirrorDialog.open) return;
   // A dialog owned elsewhere (the shortcut sheet, a settings modal) or the
   // chat dock has the keyboard; File Details is this page's own and keeps F2.
   if (target?.closest('.chat-dock')) return;
@@ -7282,6 +7356,13 @@
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!webSourcesOn}
+        title={webSourcesOn ? undefined : m.transfers_mirror_off_title()}
+        onclick={() => ctxAction('add_mirror')}
+      >{m.transfers_ctx_add_mirror()}</button>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
       <!-- Greyed out exactly where eMule greys it out — see `relatedSearchReady`. -->
       <button
@@ -7762,6 +7843,70 @@
   </div>
 {/if}
 
+{#if mirrorDialog.open}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay rename-overlay"
+    bind:this={mirrorOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="dl-mirror-title"
+    tabindex="-1"
+    onclick={(e) => { if (e.target === e.currentTarget) closeAddMirror(); }}
+    onkeydown={(e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeAddMirror();
+        return;
+      }
+      trapTabKey(e, mirrorModalEl);
+    }}
+  >
+    <div class="modal-content rename-modal" bind:this={mirrorModalEl}>
+      <div class="modal-header">
+        <span id="dl-mirror-title" class="modal-title">{m.transfers_mirror_title()}</span>
+        <button
+          type="button"
+          class="icon-close"
+          title={m.common_close()}
+          aria-label={m.common_close()}
+          disabled={mirrorDialog.busy}
+          onclick={closeAddMirror}
+        >
+          <IconX size={15} />
+        </button>
+      </div>
+      <form
+        class="modal-body"
+        onsubmit={(e) => { e.preventDefault(); void submitAddMirror(); }}
+      >
+        <p class="dl-details-note mirror-file" title={mirrorDialog.name}>{mirrorDialog.name}</p>
+        <label class="rename-label" for="dl-mirror-input">{m.transfers_mirror_label()}</label>
+        <textarea
+          id="dl-mirror-input"
+          class="rename-input mirror-input"
+          rows="4"
+          placeholder="https://"
+          bind:this={mirrorInputEl}
+          bind:value={mirrorDialog.value}
+          disabled={mirrorDialog.busy}
+          spellcheck="false"
+          aria-describedby="dl-mirror-help"
+        ></textarea>
+        <p id="dl-mirror-help" class="dl-details-note">{m.transfers_mirror_help()}</p>
+        {#if mirrorDialog.error}
+          <p class="dl-details-note error-msg" role="alert">{mirrorDialog.error}</p>
+        {/if}
+        <div class="modal-footer rename-actions">
+          <button type="button" class="ghost" disabled={mirrorDialog.busy} onclick={closeAddMirror}>{m.common_cancel()}</button>
+          <button type="submit" disabled={mirrorDialog.busy || !mirrorDialog.value.trim()}>{m.transfers_mirror_add()}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
 <style>
   /* --- File Details dialog ---
      Same shell as the Search page's details modal, so the two read as the same
@@ -7989,6 +8134,20 @@
     background: var(--bg-primary);
     color: var(--text-primary);
     font: inherit;
+  }
+
+  .mirror-input {
+    resize: vertical;
+    min-height: 4.5em;
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-sm);
+  }
+
+  .mirror-file {
+    margin: 0 0 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .rename-actions {

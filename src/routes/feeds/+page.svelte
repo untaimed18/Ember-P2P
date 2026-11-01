@@ -665,6 +665,7 @@
     if (held === 'risky') return m.feeds_held_risky();
     if (held === 'too_large') return m.feeds_held_too_large();
     if (held === 'disk') return m.feeds_held_disk();
+    if (held === 'spam') return m.feeds_held_spam();
     return m.feeds_held_day_limit();
   }
 
@@ -2293,6 +2294,7 @@
                             {#if item.is_new && !item.removed}<span class="badge sm tone-accent">{m.feeds_badge_new()}</span>{/if}
                             {#if item.removed}<span class="badge sm tone-muted">{m.feeds_badge_removed()}</span>{/if}
                             {#if item.risky}<span class="badge sm tone-warning" title={m.common_risky_file()}>{m.feeds_badge_risky()}</span>{/if}
+                            {#if item.spam}<span class="badge sm tone-warning" title={m.feeds_badge_spam_title()}>{m.search_spam_label()}</span>{/if}
                           </span>
                           <span class="file-meta">
                             <span>{formatBytes(item.size)}</span>

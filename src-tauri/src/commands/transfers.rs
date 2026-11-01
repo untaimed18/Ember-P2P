@@ -1478,6 +1478,12 @@ async fn attach_link_web_sources(state: &AppState, file_hash: &str, urls: Vec<St
         return;
     }
     tracing::info!("Download of {file_hash} has {} web source(s) from its link", added.len());
+    save_web_sources(state, file_hash, added).await;
+}
+
+/// Save web sources just registered for `file_hash`, so the download keeps
+/// them across restarts and re-queues.
+async fn save_web_sources(state: &AppState, file_hash: &str, added: Vec<String>) {
     let db = state.db.clone();
     let fh = file_hash.to_string();
     db_blocking(move || {
@@ -1486,6 +1492,112 @@ async fn attach_link_web_sources(state: &AppState, file_hash: &str, urls: Vec<St
         }
     })
     .await;
+}
+
+/// Lines the Add web mirror dialog may send at once: past the per-file cap
+/// already, with room for a few the cap would refuse to be reported as such.
+const MAX_WEB_SOURCE_LINES: usize = 20;
+/// How much of a refused line is echoed back for the dialog to name.
+const REFUSED_LINE_ECHO_CHARS: usize = 200;
+
+/// What adding web mirrors by hand did, for the dialog to say.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AddedWebSources {
+    /// Mirrors the download did not have, now in use.
+    pub added: u32,
+    /// Mirrors it already had.
+    pub already: u32,
+    /// Valid mirrors left out because the download has as many as it keeps.
+    pub over_limit: u32,
+    /// Lines that can never be a mirror (not http or https, carrying a
+    /// password, naming this computer or the local network), shortened.
+    pub refused: Vec<String>,
+}
+
+/// Add web mirrors to a download still in progress, the same way pasting its
+/// link again with `s=` mirrors does: validated, capped per file, used at once
+/// and kept across restarts. The main window's alone: it has Ember fetch
+/// addresses from the internet, and the chat window imports the module its
+/// wrapper is in, so the denied list cannot name it.
+#[tauri::command]
+pub async fn add_transfer_web_sources(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    urls: Vec<String>,
+) -> Result<AddedWebSources, String> {
+    use crate::network::ed2k::web_sources;
+    crate::commands::chat_window::require_main_window(&window)?;
+    // The dialog sends no blank lines, so the count is checked before any is
+    // looked at.
+    if urls.len() > MAX_WEB_SOURCE_LINES {
+        return Err(coded(
+            "transfers_too_many_web_sources",
+            "Enter at most 20 web mirrors at once",
+        ));
+    }
+    let lines: Vec<String> = urls
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !web_sources::enabled() {
+        return Err(coded(
+            "transfers_web_sources_off",
+            "Web sources are turned off in Settings > Transfers",
+        ));
+    }
+    let file_hash = {
+        let manager = state.transfer_manager.read().await;
+        let Some(transfer) = manager.get_transfer(&transfer_id) else {
+            return Err(coded("transfers_transfer_not_found", "Transfer not found"));
+        };
+        // A part is never fetched again once the file is being checked,
+        // moved or done, so a mirror added then would only sit in the table.
+        if transfer.direction != TransferDirection::Download
+            || matches!(
+                transfer.status,
+                TransferStatus::Verifying
+                    | TransferStatus::Completing
+                    | TransferStatus::Hashing
+                    | TransferStatus::Completed
+                    | TransferStatus::Failed
+            )
+        {
+            return Err(coded(
+                "transfers_cannot_add_web_sources",
+                "Web mirrors can only be added to a download that is still in progress",
+            ));
+        }
+        transfer.file_hash.clone()
+    };
+    let Some(hash) = hex::decode(&file_hash).ok().and_then(|b| <[u8; 16]>::try_from(b).ok()) else {
+        return Err(coded(
+            "transfers_cannot_add_web_sources",
+            "Web mirrors can only be added to a download that is still in progress",
+        ));
+    };
+
+    let mut result = AddedWebSources::default();
+    let had = web_sources::urls(&hash);
+    let mut fresh: Vec<String> = Vec::new();
+    for line in lines {
+        match web_sources::normalize_web_source_url(&line) {
+            None => result.refused.push(line.chars().take(REFUSED_LINE_ECHO_CHARS).collect()),
+            Some(url) if had.contains(&url) || fresh.contains(&url) => result.already += 1,
+            Some(url) => fresh.push(url),
+        }
+    }
+    let wanted = fresh.len();
+    let added = web_sources::register(hash, fresh);
+    result.added = added.len() as u32;
+    result.over_limit = (wanted - added.len()) as u32;
+    if !added.is_empty() {
+        tracing::info!("Download of {file_hash} has {} web source(s) added by hand", added.len());
+        save_web_sources(&state, &file_hash, added).await;
+    }
+    Ok(result)
 }
 
 #[tauri::command]

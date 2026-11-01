@@ -221,6 +221,12 @@ windows-sys = { version = "0.61", features = [
     # idle before friends see them as Away (see `src/idle.rs`).
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # `ShellExecuteExW` and `CoInitializeEx`, to ask for elevation from
+    # Ember's own window so the permission prompt opens in front of it (see
+    # `security::firewall::run_elevated`).
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
