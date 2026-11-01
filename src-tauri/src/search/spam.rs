@@ -1225,7 +1225,21 @@ enum HeldUserChange {
         server_ip: Option<String>,
     },
     MarkNotSpam(String),
+    UndoMarkSpam(String, PriorSpamVerdict),
     Reset,
+}
+
+/// Where a hash stood before [`SpamFilter::mark_spam`], so undoing the mark
+/// puts it back there. Mark not spam would whitelist a file the user had never
+/// judged, which is a different state from never having marked it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorSpamVerdict {
+    Unmarked,
+    NotSpam,
+    AutoNotSpam,
+    /// Already marked: the mark replaced the old one, and undo leaves it.
+    Spam,
 }
 
 /// Search keywords prepared once for scoring many rows of one search.
@@ -1644,6 +1658,9 @@ impl SpamFilter {
                     server_ip,
                 } => self.apply_mark_spam(&result, &keywords, server_ip.as_deref()),
                 HeldUserChange::MarkNotSpam(hash) => self.apply_mark_not_spam(&hash),
+                HeldUserChange::UndoMarkSpam(hash, prior) => {
+                    self.apply_undo_mark_spam(&hash, prior)
+                }
                 HeldUserChange::Reset => self.apply_reset(),
             }
         }
@@ -2148,8 +2165,18 @@ impl SpamFilter {
         result: &SearchResult,
         search_keywords: &[String],
         server_ip: Option<&str>,
-    ) {
+    ) -> PriorSpamVerdict {
         self.begin_user_change();
+        let hash = normalize_hash(&result.file.hash);
+        let prior = if self.db.spam_hashes.contains(&hash) {
+            PriorSpamVerdict::Spam
+        } else if self.db.not_spam_hashes.contains(&hash) {
+            PriorSpamVerdict::NotSpam
+        } else if self.db.auto_not_spam_hashes.contains(&hash) {
+            PriorSpamVerdict::AutoNotSpam
+        } else {
+            PriorSpamVerdict::Unmarked
+        };
         if self.persist_blocked {
             self.hold(HeldUserChange::MarkSpam {
                 result: Box::new(result.clone()),
@@ -2158,6 +2185,47 @@ impl SpamFilter {
             });
         }
         self.apply_mark_spam(result, search_keywords, server_ip);
+        prior
+    }
+
+    /// Take back a [`Self::mark_spam`] that returned `prior`: the hash and what
+    /// the mark learned from it go, and the hash returns to the not-spam set it
+    /// was in, if any.
+    pub fn undo_mark_spam(&mut self, file_hash: &str, prior: PriorSpamVerdict) {
+        if normalize_hash(file_hash).is_empty() || prior == PriorSpamVerdict::Spam {
+            return;
+        }
+        self.begin_user_change();
+        if self.persist_blocked {
+            self.hold(HeldUserChange::UndoMarkSpam(file_hash.to_string(), prior));
+        }
+        self.apply_undo_mark_spam(file_hash, prior);
+    }
+
+    fn apply_undo_mark_spam(&mut self, file_hash: &str, prior: PriorSpamVerdict) {
+        let file_hash = normalize_hash(file_hash);
+        if file_hash.is_empty() || prior == PriorSpamVerdict::Spam {
+            return;
+        }
+        self.db.spam_hashes.remove(&file_hash);
+        if let Some(pos) = self.db.spam_marks.iter().position(|m| m.hash == file_hash) {
+            let mark = self.db.spam_marks.remove(pos);
+            self.db.drop_mark_collateral(&mark);
+            self.rebuild_similar_name_features();
+        }
+        match prior {
+            PriorSpamVerdict::NotSpam => {
+                self.db.not_spam_hashes.insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
+            }
+            PriorSpamVerdict::AutoNotSpam => {
+                self.db
+                    .auto_not_spam_hashes
+                    .insert(file_hash.clone(), AUTO_NOT_SPAM_HASHES_CAP);
+            }
+            PriorSpamVerdict::Unmarked | PriorSpamVerdict::Spam => {}
+        }
+        self.mark_dirty();
+        info!("Undid spam mark: {file_hash}");
     }
 
     fn apply_mark_spam(
@@ -5005,6 +5073,46 @@ mod tests {
         let (data, _, _) = filter.take_save_data().unwrap();
         let saved: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert!(saved["auto_not_spam_hashes"].as_array().is_some_and(|a| !a.is_empty()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Undoing a mark returns the hash to where it was, not to the whitelist,
+    /// and forgets what the mark learned.
+    #[test]
+    fn undoing_a_spam_mark_restores_the_prior_verdict() {
+        let dir = temp_dir("undo-mark");
+        let mut filter = SpamFilter::load(&dir);
+        let fresh = "f1".repeat(16);
+        let prior = filter.mark_spam(&sample_result(&fresh, "fake.album.zip"), &[], None);
+        assert_eq!(prior, PriorSpamVerdict::Unmarked);
+        assert!(!filter.db.spam_filenames.is_empty());
+        filter.undo_mark_spam(&fresh, prior);
+        assert!(!filter.db.spam_hashes.contains(&fresh));
+        assert!(!filter.db.is_not_spam(&fresh), "not whitelisted");
+        assert!(filter.db.spam_filenames.is_empty(), "the learned name goes");
+        assert!(filter.db.spam_marks.is_empty());
+
+        let auto = "f2".repeat(16);
+        filter.auto_mark_not_spam(&auto);
+        let prior = filter.mark_spam(&sample_result(&auto, "other.bin"), &[], None);
+        assert_eq!(prior, PriorSpamVerdict::AutoNotSpam);
+        filter.undo_mark_spam(&auto, prior);
+        assert!(filter.db.auto_not_spam_hashes.contains(&auto));
+        assert!(!filter.db.not_spam_hashes.contains(&auto));
+
+        let chosen = "f3".repeat(16);
+        filter.mark_not_spam(&chosen);
+        let prior = filter.mark_spam(&sample_result(&chosen, "third.bin"), &[], None);
+        assert_eq!(prior, PriorSpamVerdict::NotSpam);
+        filter.undo_mark_spam(&chosen, prior);
+        assert!(filter.db.not_spam_hashes.contains(&chosen));
+
+        let again = filter.mark_spam(&sample_result(&chosen, "third.bin"), &[], None);
+        let twice = filter.mark_spam(&sample_result(&chosen, "third.bin"), &[], None);
+        assert_eq!(again, PriorSpamVerdict::NotSpam);
+        assert_eq!(twice, PriorSpamVerdict::Spam);
+        filter.undo_mark_spam(&chosen, twice);
+        assert!(filter.db.spam_hashes.contains(&chosen), "a re-mark's undo keeps the mark");
         let _ = std::fs::remove_dir_all(dir);
     }
 

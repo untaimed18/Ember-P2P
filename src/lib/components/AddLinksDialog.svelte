@@ -11,6 +11,7 @@
   import { distinctLinks, parseEd2kLinks, type Ed2kLinkBatch } from '$lib/api/search';
   import { formatBytes, formatNumber, readFromClipboard } from '$lib/utils';
   import { plural } from '$lib/plural';
+  import { translateError } from '$lib/i18n';
 
   let {
     open = $bindable(false),
@@ -24,6 +25,8 @@
     initialText?: string | null;
     busy?: boolean;
     maxLength: number;
+    /** The dialog stays open until this settles, and closes only if it
+     *  resolves: a rejection is shown here with the links kept to retry. */
     onsubmit: (text: string) => void | Promise<void>;
   } = $props();
 
@@ -34,6 +37,8 @@
   const overLimit = (value: string) => value.length > maxLength || byteLength(value) > maxLength;
   let text = $state('');
   let batch = $state<Ed2kLinkBatch | null>(null);
+  let submitting = $state(false);
+  let submitError = $state('');
   let dialogEl: HTMLDivElement | undefined = $state(undefined);
   let overlayEl: HTMLDivElement | undefined = $state(undefined);
   let textareaEl: HTMLTextAreaElement | undefined = $state(undefined);
@@ -56,6 +61,7 @@
     if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
     text = '';
     batch = null;
+    submitError = '';
     let cancelled = false;
     const given = untrack(() => initialText);
     void (given !== null ? Promise.resolve(given) : readFromClipboard()).then((clip) => {
@@ -105,19 +111,30 @@
   const cap = $derived(batch?.links.length ?? 0);
 
   function close() {
+    // Not mid-submit: a failure has to have somewhere to show.
+    if (submitting) return;
     open = false;
   }
 
   async function submit() {
     const value = text.trim();
-    if (busy || value === '' || tooLong) return;
-    // Parsed afresh: the count above trails typing and the clipboard fill.
-    const parsed = await parseEd2kLinks(value).catch(() => null);
-    if (!parsed || parsed.links.length === 0 || !open || text.trim() !== value) return;
-    open = false;
+    if (busy || submitting || value === '' || tooLong) return;
+    submitError = '';
+    submitting = true;
     try {
-      await onsubmit(value);
+      // Parsed afresh: the count above trails typing and the clipboard fill.
+      const parsed = await parseEd2kLinks(value).catch(() => null);
+      if (!parsed || parsed.links.length === 0 || !open || text.trim() !== value) return;
+      try {
+        await onsubmit(value);
+      } catch (e: unknown) {
+        submitError = translateError(e, m.error_operation_failed());
+        requestAnimationFrame(() => textareaEl?.focus());
+        return;
+      }
+      open = false;
     } finally {
+      submitting = false;
       // After the frame the close handed focus back in, and after the opener
       // is re-enabled; not if the user has put focus somewhere since.
       requestAnimationFrame(() => {
@@ -176,7 +193,12 @@
         autocomplete="off"
         placeholder={m.transfers_add_links_placeholder()}
         aria-label={m.transfers_add_links_title()}
+        readonly={submitting}
+        oninput={() => (submitError = '')}
       ></textarea>
+      {#if submitError}
+        <p class="add-links-error" role="alert">{submitError}</p>
+      {/if}
       <div class="add-links-status" aria-live="polite">
         {#if tooLong}
           <span class="warn">{m.transfers_add_links_too_long({ size: formatBytes(byteLength(text.trim())), max: formatBytes(maxLength) })}</span>
@@ -191,9 +213,9 @@
         {/if}
       </div>
       <div class="dialog-actions">
-        <button type="button" class="ghost" onclick={close}>{m.common_cancel()}</button>
-        <button type="button" onclick={() => void submit()} disabled={busy || count === 0 || tooLong} aria-busy={busy}>
-          {busy ? m.transfers_pasting() : m.transfers_add_links_submit()}
+        <button type="button" class="ghost" onclick={close} disabled={submitting}>{m.common_cancel()}</button>
+        <button type="button" onclick={() => void submit()} disabled={busy || submitting || count === 0 || tooLong} aria-busy={busy || submitting}>
+          {busy || submitting ? m.transfers_pasting() : m.transfers_add_links_submit()}
         </button>
       </div>
     </div>
@@ -226,5 +248,12 @@
 
   .add-links-status .warn {
     color: var(--warning);
+  }
+
+  .add-links-error {
+    margin: 8px 0 0;
+    font-size: var(--font-size-sm);
+    color: var(--danger);
+    overflow-wrap: anywhere;
   }
 </style>

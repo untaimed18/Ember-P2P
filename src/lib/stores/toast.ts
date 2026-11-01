@@ -208,7 +208,22 @@ export async function flushToastActionsBeforeExit(timeoutMs = 3500): Promise<voi
   clearTimeout(timer);
 }
 
+/**
+ * A plain toast. The same type and message again while one is still on screen
+ * restarts that one's countdown instead of stacking a copy: a repeated event
+ * says nothing new, and the copies would push other toasts out of the cap.
+ * A sticky toast stays sticky, and a sticky repeat makes a timed one sticky.
+ */
 export function addToast(type: ToastItem['type'], message: string, durationMs = 5000) {
+  const existing = get(toasts).find((t) => !t.action && t.type === type && t.message === message);
+  if (existing) {
+    if (!stickyToasts.has(existing.id)) {
+      clearToastTimer(existing.id);
+      if (durationMs <= 0) stickyToasts.add(existing.id);
+      else armToastTimer(existing.id, durationMs);
+    }
+    return existing.id;
+  }
   const id = nextId++;
   return pushToast(id, { id, type, message }, durationMs);
 }

@@ -27,6 +27,7 @@
   import type { FriendInfo } from '$lib/api/friends';
   import type { FriendOverrides } from '$lib/types';
   import IconX from './IconX.svelte';
+  import ConfirmDialog from './ConfirmDialog.svelte';
 
   let {
     friend,
@@ -94,6 +95,25 @@
   let autoDefaultMb = $derived($appSettings?.chat_attachment_auto_accept_mb ?? 0);
   let disappearDefault = $derived($appSettings?.chat_disappear_secs ?? 0);
   let disappearOn = $derived((disappear === 'default' ? disappearDefault : Number(disappear)) > 0);
+
+  /** The form as the user has it, to tell whether closing would lose edits. */
+  function formState(): string {
+    return JSON.stringify([
+      name.trim(),
+      chat,
+      files,
+      browse,
+      readReceipts,
+      notifyOnline,
+      notifyMessages,
+      autoChoice,
+      autoChoice === 'up_to' ? autoMb : null,
+      disappear,
+    ]);
+  }
+  const formAtOpen = untrack(formState);
+  let edited = $derived(formState() !== formAtOpen);
+  let confirmDiscardOpen = $state(false);
 
   let presence = $derived(friendPresence(hash, $onlineFriends, $friendStatuses));
   let displayName = $derived(name.trim() || opened.self_name || shortId);
@@ -169,11 +189,19 @@
     if (!busy) onclose();
   }
 
+  /** Escape, the backdrop and the ✕ are easy to hit by accident, so they ask
+   *  before throwing edits away. Cancel says what it does and does not. */
+  function dismiss() {
+    if (busy) return;
+    if (edited) confirmDiscardOpen = true;
+    else onclose();
+  }
+
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      close();
+      dismiss();
       return;
     }
     trapTabKey(e, dialogEl);
@@ -217,7 +245,7 @@
   aria-busy={busy}
   tabindex="-1"
   onkeydown={onKeydown}
-  onclick={(e) => e.target === e.currentTarget && close()}
+  onclick={(e) => e.target === e.currentTarget && dismiss()}
   transition:fade={{ duration: prefersReducedMotion.current ? 0 : 140 }}
 >
   <div
@@ -235,7 +263,7 @@
         title={m.common_close()}
         aria-label={m.common_close()}
         disabled={busy}
-        onclick={close}
+        onclick={dismiss}
       >
         <IconX size={15} />
       </button>
@@ -407,6 +435,18 @@
     </form>
   </div>
 </div>
+
+<!-- After the settings overlay, not inside it: it has to paint above it, and
+     its keys must not reach the settings dialog's Escape and Tab handling. -->
+<ConfirmDialog
+  bind:open={confirmDiscardOpen}
+  title={m.common_discard_title()}
+  message={m.common_discard_message()}
+  confirmLabel={m.common_discard()}
+  cancelLabel={m.common_keep_editing()}
+  danger={true}
+  onconfirm={onclose}
+/>
 
 <style>
   /* The File Details window's frame, so the app's detail-style dialogs look

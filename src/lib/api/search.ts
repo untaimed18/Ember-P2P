@@ -256,7 +256,7 @@ export async function markSpam(
   searchQuery: string,
   serverIp?: string | null,
   resultOrigin?: string | null,
-): Promise<void> {
+): Promise<PriorSpamVerdict> {
   return invoke('mark_spam', {
     fileHash,
     fileName,
@@ -271,6 +271,13 @@ export async function markSpam(
 
 export async function markNotSpam(fileHash: string): Promise<void> {
   return invoke('mark_not_spam', { fileHash });
+}
+
+/** Where a hash stood before `markSpam`; `undoMarkSpam` puts it back there. */
+export type PriorSpamVerdict = 'unmarked' | 'not_spam' | 'auto_not_spam' | 'spam';
+
+export async function undoMarkSpam(fileHash: string, prior: PriorSpamVerdict): Promise<void> {
+  return invoke('undo_mark_spam', { fileHash, prior });
 }
 
 export async function getSpamStats(): Promise<SpamStats> {

@@ -53,7 +53,7 @@
     setPendingReply,
     type PendingReply,
   } from '$lib/channelReply';
-  import { activeChatHash, clearUnread, onlineFriends } from '$lib/stores/friends';
+  import { activeChatHash, clearUnread, friendsList, onlineFriends } from '$lib/stores/friends';
   import { clearChannelUnread, noteChannelOnScreen } from '$lib/stores/channels';
   import {
     editChannelMessage,
@@ -116,6 +116,7 @@
   import { openExternalUrl } from '$lib/api/settings';
   import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import IconX from '$lib/components/IconX.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';
 
   // The backend rejects friend chat messages whose UTF-8 encoding exceeds this
@@ -235,6 +236,24 @@
   let isOnline = $derived(
     !isChannel && friendHash ? $onlineFriends.has(friendHash.toLowerCase()) : false,
   );
+  let shownFriendName = $derived(friendName || friendHash.slice(0, 8));
+  /** One-sided until they accept. Unknown (not pending) while the list has
+   *  not loaded, so nothing claims they have not accepted when they have. */
+  let friendPending = $derived(
+    !isChannel &&
+      !!friendHash &&
+      $friendsList.some((f) => f.user_hash.toLowerCase() === friendHash.toLowerCase() && !f.mutual),
+  );
+  /** Said above the composer while a message would wait rather than go. */
+  let presenceNote = $derived(
+    isChannel || !friendHash
+      ? null
+      : friendPending
+        ? m.chat_friend_pending_note({ name: shownFriendName })
+        : !isOnline
+          ? m.chat_friend_offline_note({ name: shownFriendName })
+          : null,
+  );
 
   // The user can disable chat in Settings, or for this friend in theirs; when
   // off, the backend drops inbound and refuses outbound chat, so reflect that
@@ -308,6 +327,11 @@
       return best;
     }, 0),
   );
+  /** The newest queued line carries the reason; the ones above it only say
+   *  "Queued", or a burst sent offline would repeat it on every bubble. */
+  let lastQueuedId = $derived(
+    messages.findLast((message) => message.direction === 'sent' && message.delivery === 'queued')?.id ?? null,
+  );
   let inputText = $state('');
   let loading = $state(false);
   let sending = $state(false);
@@ -380,6 +404,10 @@
   let roomTypingSentAt = 0;
   let roomTypingChannel = '';
   let removingMessage = $state<number | null>(null);
+  /** The message the delete confirmation is about. Kept apart from the open
+   *  flag so the dialog's wording holds while it animates out. */
+  let removeAsk = $state<{ id: number; key: string; queued: boolean } | null>(null);
+  let removeAskOpen = $state(false);
   /** Undo for this component's "room is on screen" claim. */
   let releaseChannelOnScreen: (() => void) | null = null;
   let loadGen = 0;
@@ -2681,6 +2709,14 @@
     return pendingClockNow - msg.timestamp * 1000 >= CHANNEL_PENDING_GRACE_MS;
   }
 
+  /** Mirrors `CHAT_QUEUE_MAX_AGE_SECS` in the backend: the outbox gives up on
+   *  a line queued this long, which is nearly always why one failed. */
+  const CHAT_QUEUE_MAX_AGE_SECS = 7 * 24 * 60 * 60;
+
+  function queuedPastCeiling(msg: ConvMessage): boolean {
+    return msg.timestamp > 0 && Date.now() / 1000 - msg.timestamp >= CHAT_QUEUE_MAX_AGE_SECS;
+  }
+
   /**
    * Send a message the delivery queue gave up on again.
    *
@@ -2952,21 +2988,59 @@
   /** Describes the composer while it is replying, so a screen reader hears who
    *  the line will answer on focus. */
   const replyBarId = `${formatSheetId}-reply`;
+  const presenceNoteId = `${formatSheetId}-presence`;
 
   /** Forget one message on this device only. The protocol has no redaction, so
    *  every other member keeps their copy — the label says so rather than
    *  implying a delete that cannot happen. */
+  function askRemoveMessage(msg: ConvMessage) {
+    if (msg.id <= 0 || removingMessage !== null) return;
+    removeAsk = {
+      id: msg.id,
+      key: conversationKey,
+      queued: !isChannel && msg.direction === 'sent' && msg.delivery === 'queued',
+    };
+    removeAskOpen = true;
+  }
+
+  // The question is about a line in the conversation it was asked in.
+  $effect(() => {
+    void conversationKey;
+    untrack(() => (removeAskOpen = false));
+  });
+
+  /** After a delete, the line that took its place, or the one above it at the
+   *  end of the transcript, rather than dropping focus to the page. */
+  function focusAfterRemoval(neighbourId: number | null) {
+    const bubble =
+      neighbourId === null
+        ? null
+        : messagesContainerEl?.querySelector<HTMLElement>(`.conv-bubble[data-msg-id="${neighbourId}"]`);
+    const tool =
+      bubble?.querySelector<HTMLElement>('.bubble-tools [tabindex="0"]') ??
+      bubble?.querySelector<HTMLElement>('.bubble-tools button:not([disabled])');
+    if (tool) tool.focus();
+    else if (chatInputEl && !chatInputEl.disabled) chatInputEl.focus();
+    else messagesContainerEl?.focus();
+  }
+
   async function handleRemoveMessage(id: number) {
     const channel = channelId;
     const friend = friendHash;
     if ((!channel && !friend) || id <= 0 || removingMessage !== null) return;
+    const at = rows.findIndex((row) => row.msg.id === id);
+    const neighbourId = at === -1 ? null : ((rows[at + 1] ?? rows[at - 1])?.msg.id ?? null);
     removingMessage = id;
     try {
       if (!channel) {
         // From this computer only; the friend's copy follows their own
         // settings. A queued message goes with it and is never sent.
         await deleteChatMessage(friend, id);
-        if (friend === friendHash) messages = messages.filter((msg) => msg.id !== id);
+        if (friend === friendHash) {
+          messages = messages.filter((msg) => msg.id !== id);
+          await tick();
+          focusAfterRemoval(neighbourId);
+        }
         return;
       }
       await deleteChannelMessage(channel, id);
@@ -2977,6 +3051,8 @@
           removedMsgIds = new Set([...removedMsgIds, removed]);
           if (replyTarget?.msgId === removed) cancelReply();
         }
+        await tick();
+        focusAfterRemoval(neighbourId);
       }
     } catch (e: unknown) {
       if (channel === channelId && friend === friendHash) {
@@ -3685,9 +3761,14 @@
           <p class="empty-title">{m.friends_chat_locked_title()}</p>
         {:else if chatDisabled}
           <p class="empty-title">{m.chat_empty_disabled()}</p>
+        {:else if isChannel && youAreKeyBehind}
+          <!-- Not "No messages yet": there may well be messages, just none
+               this device can read. -->
+          <p class="empty-title">{m.channels_key_behind()}</p>
+          <p class="empty-sub">{m.channels_empty_chat_key_behind()}</p>
         {:else if isChannel}
           <p class="empty-title">
-            {youAreBanned || youAreKeyBehind || announceOnly
+            {youAreBanned || announceOnly
               ? m.channels_empty_chat_readonly()
               : m.channels_empty_chat()}
           </p>
@@ -3753,6 +3834,10 @@
           <div class="bubble-who">
             <bdi dir="auto">{senderLabel(row.msg.sender_pubkey)}</bdi>
           </div>
+        {:else}
+          <span class="sr-only">
+            {row.msg.direction === 'sent' ? m.chat_msg_from_you() : m.chat_msg_from({ name: shownFriendName })}
+          </span>
         {/if}
         <div
           class="conv-bubble"
@@ -3982,7 +4067,7 @@
                   type="button"
                   class="bubble-remove"
                   disabled={removingMessage === row.msg.id}
-                  onclick={() => handleRemoveMessage(row.msg.id)}
+                  onclick={() => askRemoveMessage(row.msg)}
                   title={removeLabel}
                   aria-label={removeLabel}
                 >
@@ -4100,8 +4185,16 @@
           <div class="bubble-status">
             {#if pending}
               <span title={m.chat_delivery_queued_title()}>{m.chat_delivery_queued()}</span>
+              {#if row.msg.id === lastQueuedId}
+                <span class="bubble-status-reason">{m.chat_delivery_queued_reason({ name: shownFriendName })}</span>
+              {/if}
             {:else if failed}
               <span class="failed" title={m.chat_delivery_failed_title()}>{m.chat_delivery_failed()}</span>
+              <span class="bubble-status-reason">
+                {queuedPastCeiling(row.msg)
+                  ? m.chat_delivery_failed_reason_stale({ name: shownFriendName })
+                  : m.chat_delivery_failed_reason()}
+              </span>
               <button
                 class="bubble-resend"
                 type="button"
@@ -4253,6 +4346,15 @@
         </button>
       </div>
     {/if}
+    {#if presenceNote}
+      <!-- Before anything is sent, so "Queued" under the first message is not
+           the first sign that it will wait. Not a live region: presence
+           comes and goes, and reading out every change would be noise. -->
+      <div class="conv-presence-note" id={presenceNoteId}>
+        <span class="conv-presence-dot" aria-hidden="true"></span>
+        <span>{presenceNote}</span>
+      </div>
+    {/if}
     {#if disappearSecs > 0}
       <!-- Said where the message is written, so nobody sends one without
            knowing it will go. Phrased for what this side controls: our own
@@ -4339,7 +4441,7 @@
               : m.channels_send_placeholder()
             : m.chat_input_placeholder_named({ name: friendName || friendHash.slice(0, 8) })}
           aria-label={m.chat_input_label()}
-          aria-describedby={isChannel && replyTarget ? replyBarId : undefined}
+          aria-describedby={isChannel && replyTarget ? replyBarId : presenceNote ? presenceNoteId : undefined}
           maxlength={COMPOSER_MAX_CHARS}
           rows="1"
           readonly={sending}
@@ -4462,6 +4564,23 @@
     </div>
   {/if}
 </div>
+
+<!-- Asks rather than offering Undo: a queued message deleted on a timer could
+     be delivered while the timer runs. -->
+<ConfirmDialog
+  bind:open={removeAskOpen}
+  title={isChannel ? m.channels_remove_local_title() : m.chat_delete_message_title()}
+  message={isChannel
+    ? m.channels_remove_local_body()
+    : removeAsk?.queued
+      ? m.chat_delete_message_body_queued({ name: shownFriendName })
+      : m.chat_delete_message_body({ name: shownFriendName })}
+  confirmLabel={isChannel ? m.common_remove() : m.common_delete()}
+  danger={true}
+  onconfirm={() => {
+    if (removeAsk?.key === conversationKey) void handleRemoveMessage(removeAsk.id);
+  }}
+/>
 
 <style>
   .conversation {
@@ -5113,6 +5232,7 @@
      trailing corner of a friend bubble, on the transcript surface. */
   .bubble-status {
     display: inline-flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 6px;
     margin-top: 2px;
@@ -5124,6 +5244,10 @@
 
   .bubble-status .failed {
     color: var(--danger);
+  }
+
+  .bubble-status-reason {
+    font-weight: 400;
   }
 
   .bubble-seen {
@@ -6263,7 +6387,8 @@
     text-overflow: ellipsis;
   }
 
-  .conv-disappear-note {
+  .conv-disappear-note,
+  .conv-presence-note {
     display: flex;
     align-items: center;
     gap: 6px;
@@ -6280,8 +6405,22 @@
     color: var(--accent);
   }
 
-  /* The note and the composer read as one strip. */
-  .conv-disappear-note + .conv-input-area {
+  .conv-presence-dot {
+    width: 8px;
+    height: 8px;
+    margin: 0 2px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--text-muted);
+  }
+
+  .conv-presence-note + .conv-disappear-note {
+    border-top: none;
+    padding-top: 4px;
+  }
+
+  /* The notes and the composer read as one strip. */
+  :is(.conv-disappear-note, .conv-presence-note) + .conv-input-area {
     border-top: none;
     padding-top: 6px;
   }

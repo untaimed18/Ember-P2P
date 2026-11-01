@@ -7,9 +7,26 @@
   import IconX from './IconX.svelte';
   import { isChatWindow } from '$lib/windowRole';
   import { shortcutModAria } from '$lib/platform';
+  import { afterNavigate } from '$app/navigation';
 
   /** The chat window is all dock, so there is no dock beside it to clear. */
   const besideDock = !isChatWindow();
+
+  /** Where the stack starts: under the page header, whose buttons are what
+   *  most toasts report on, so an error never covers the button that caused
+   *  it. Measured when toasts appear and on navigation, since headers differ
+   *  in height from page to page and with the window width. */
+  let stackTop = $state(4);
+  function measureHeader() {
+    const header = document.querySelector('#main-content .page-header');
+    stackTop = header ? Math.max(4, Math.round(header.getBoundingClientRect().bottom)) : 4;
+  }
+  $effect(() => {
+    if ($toasts.length > 0) measureHeader();
+  });
+  afterNavigate(() => {
+    if ($toasts.length > 0) measureHeader();
+  });
 
   /** Slides in from the window edge, settling as it lands. */
   function toastIn(_node: Element) {
@@ -82,6 +99,8 @@
   bind:this={container}
   class="toast-container"
   class:dock-open={besideDock && $chatDockOpen}
+  style:top="{stackTop}px"
+  style:max-height="calc(100dvh - {stackTop}px)"
   data-a11y-no-inert
   onmouseenter={pauseToastDismiss}
   onmouseleave={resumeToastDismiss}

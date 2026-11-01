@@ -238,6 +238,7 @@
           messages = messages.map((row) =>
             row.direction === 'out' && row.message_id === update.message_id ? { ...row, status: update.status } : row,
           );
+          if (update.status === 'failed') void announceFailed();
         }),
       ]);
       if (alive) unlisten.push(...fns);
@@ -285,6 +286,15 @@
     } finally {
       answering = false;
     }
+  }
+
+  /** Said aloud when one of ours fails; cleared first so a second failure in
+   *  a row is announced again. */
+  let failedAnnouncement = $state('');
+  async function announceFailed() {
+    failedAnnouncement = '';
+    await tick();
+    failedAnnouncement = m.channels_dm_status_failed();
   }
 
   async function retry(row: RoomDmMessage) {
@@ -360,15 +370,26 @@
       </div>
     {/if}
     {#each messages as row (rowKey(row))}
+      {@const failed = row.direction === 'out' && row.status === 'failed'}
       <div class="dm-row" class:out={row.direction === 'out'}>
-        <div class="dm-bubble">
+        <div class="dm-bubble" class:failed>
           <p class="dm-text"><bdi dir="auto">{row.text}</bdi></p>
           <span class="dm-meta">
             {timeOf(row.timestamp)}
-            {#if row.direction === 'out' && row.status !== 'received'}
-              · <span class:dm-failed={row.status === 'failed'}>{statusLabel(row)}</span>
+            {#if row.direction === 'out' && row.status !== 'received' && !failed}
+              · <span>{statusLabel(row)}</span>
             {/if}
           </span>
+          {#if failed}
+            <span class="dm-failed">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="8" cy="8" r="6.2"/>
+                <path d="M8 4.8v3.6"/>
+                <path d="M8 11.1v.1"/>
+              </svg>
+              {statusLabel(row)}
+            </span>
+          {/if}
           {#if row.status === 'failed' && !blocked}
             <button
               type="button"
@@ -381,6 +402,7 @@
       </div>
     {/each}
   </div>
+  <span class="sr-only" role="alert">{failedAnnouncement}</span>
 
   {#if blocked}
     <p class="dm-blocked" role="status">{blocked}</p>
@@ -511,8 +533,28 @@
     opacity: 0.75;
   }
 
+  /* Off the accent fill, so the error colour reads against the bubble. */
+  .dm-row.out .dm-bubble.failed {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--danger);
+  }
+
   .dm-failed {
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    margin-top: 4px;
+    color: var(--danger);
+    font-size: var(--font-size-xs);
     font-weight: 600;
+  }
+
+  .dm-failed svg {
+    flex-shrink: 0;
+    width: 13px;
+    height: 13px;
+    margin-top: 1px;
   }
 
   .dm-retry {

@@ -2301,6 +2301,90 @@
       || ulStatusLabel(t).toLowerCase().includes(query)
     );
   });
+
+  // Upload and known-peer rows each keep one Tab stop per table: the row last
+  // focused, else the first one drawn.
+  let ulFocusId = $state<string | null>(null);
+  let knownFocusHash = $state<string | null>(null);
+  let ulTabStopId = $derived(
+    ulFocusId && filteredActiveUploads.some((t) => t.id === ulFocusId)
+      ? ulFocusId
+      : (filteredActiveUploads[0]?.id ?? null),
+  );
+  let knownTabStopHash = $derived(
+    knownFocusHash && displayedKnownClients.some((kc) => kc.user_hash === knownFocusHash)
+      ? knownFocusHash
+      : (displayedKnownClients[0]?.user_hash ?? null),
+  );
+  let knownCtxMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** Where focus was when the Menu key opened the known-peer menu, handed
+   *  back when Escape closes it. */
+  let knownCtxReturnFocus: HTMLElement | null = null;
+
+  /** Arrow keys between the rows of the upload and known-peer tables, and the
+   *  Menu key or Shift+F10 for the focused row's menu: Ban, Unban and Add
+   *  Friend live only there. */
+  function onBottomRowKeydown(
+    e: KeyboardEvent & { currentTarget: HTMLElement },
+    index: number,
+    count: number,
+    focusRow: (index: number) => void,
+    openMenu: (e: MouseEvent) => void,
+  ) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    let next: number | null = null;
+    if (e.key === 'ArrowDown') next = Math.min(count - 1, index + 1);
+    else if (e.key === 'ArrowUp') next = Math.max(0, index - 1);
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = count - 1;
+    if (next !== null) {
+      e.preventDefault();
+      focusRow(next);
+      return;
+    }
+    if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      e.preventDefault();
+      swallowKeyboardContextMenu();
+      const rect = e.currentTarget.getBoundingClientRect();
+      openMenu(new MouseEvent('contextmenu', {
+        cancelable: true,
+        clientX: rect.left + Math.min(24, rect.width / 2),
+        clientY: rect.top + Math.min(16, rect.height / 2),
+      }));
+    }
+  }
+
+  function focusUploadRow(index: number) {
+    const t = filteredActiveUploads[index];
+    if (!t) return;
+    ulFocusId = t.id;
+    void tick().then(() => {
+      uploadTableEl?.querySelector<HTMLElement>(`tr[data-upload-id="${CSS.escape(t.id)}"]`)?.focus();
+    });
+  }
+
+  function openUploadMenuFromKey(e: MouseEvent, t: Transfer, row: HTMLElement) {
+    onCtx(e, t, 'upload');
+    ctxReturnFocus = row;
+    void tick().then(() => ctxMenuEl?.querySelector<HTMLElement>('.ctx-item:not([disabled])')?.focus());
+  }
+
+  function focusKnownRow(index: number) {
+    const kc = filteredKnownClients[index];
+    if (!kc) return;
+    knownFocusHash = kc.user_hash;
+    knownWindow.reveal(index, knownTableEl?.tHead?.getBoundingClientRect().height ?? 0);
+    void tick().then(() => {
+      knownTableEl?.querySelector<HTMLElement>(`tr[data-user-hash="${CSS.escape(kc.user_hash)}"]`)?.focus();
+    });
+  }
+
+  function openKnownMenuFromKey(e: MouseEvent, kc: KnownClient, row: HTMLElement) {
+    onKnownCtx(e, kc);
+    knownCtxReturnFocus = row;
+    void tick().then(() => knownCtxMenuEl?.querySelector<HTMLElement>('.ctx-item:not([disabled])')?.focus());
+  }
+
   // Removed `filteredCompletedUploads`, `filteredFailedUploads`,
   // `filteredQueuedUploads` derivations — they fed UI sections that no
   // longer exist (terminal upload rows are dropped from the store, and
@@ -2509,6 +2593,50 @@
     if (e.shiftKey) e.preventDefault();
     focusedDlId = t.id;
     lastClickedDlId = t.id;
+  }
+
+  /** Double-click or Enter on a row: a finished download opens its file, a
+   *  running one shows its sources. */
+  function activateDownloadRow(t: Transfer) {
+    if (t.status === 'completed') {
+      void openFile(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); });
+    } else if (!isFinished(t)) {
+      void toggleSourceDetail(t);
+    }
+  }
+
+  function onDownloadRowKeydown(e: KeyboardEvent, t: Transfer) {
+    if (e.key !== 'Enter' || e.target !== e.currentTarget || e.repeat) return;
+    e.preventDefault();
+    activateDownloadRow(t);
+  }
+
+  /** The one download row Tab stops on: the highlighted one when it is drawn,
+   *  else the first row drawn. */
+  let dlTabStopId = $derived.by(() => {
+    const drawn = completedFirst ? [...dlCompletedSlice, ...dlActiveSlice] : [...dlActiveSlice, ...dlCompletedSlice];
+    if (focusedDlId && drawn.some((t) => t.id === focusedDlId)) return focusedDlId;
+    return drawn[0]?.id ?? null;
+  });
+
+  /** Arrow keys move the highlight; the row's own focus follows so a screen
+   *  reader reads it, unless the keyboard is busy with a control elsewhere. */
+  function focusDownloadRowEl(id: string) {
+    const active = document.activeElement;
+    if (active && active !== document.body && !downloadsScrollEl?.contains(active)) return;
+    void tick().then(() => {
+      downloadsScrollEl
+        ?.querySelector<HTMLElement>(`tr[data-transfer-id="${CSS.escape(id)}"]`)
+        ?.focus({ preventScroll: true });
+    });
+  }
+
+  /** Cancel deletes a finished download's file, so on one it says so. */
+  function cancelLabel(rows: Transfer[]): string {
+    const completed = rows.filter((t) => t.status === 'completed').length;
+    if (completed === 0) return m.common_cancel();
+    if (rows.some((t) => !isFinished(t))) return m.transfers_cancel_and_delete();
+    return completed === 1 ? m.transfers_delete_file() : m.transfers_delete_files();
   }
 
   function toggleDlCheck(t: Transfer, shiftKey: boolean) {
@@ -2969,6 +3097,8 @@
     } catch (e: unknown) {
       renameDialog.busy = false;
       renameDialog.error = toErrorMsg(e);
+      // The field was disabled while saving, which dropped focus.
+      void tick().then(() => renameInputEl?.focus());
     }
   }
 
@@ -3200,6 +3330,7 @@
     closePaneCtx();
     closeUploadsPaneCtx();
     knownCtxMenu = { x: e.clientX, y: e.clientY, client };
+    knownCtxReturnFocus = null;
   }
   /// Background menu for the downloads pane, distinct from the per-row one.
   /// It acts on the whole visible list, and it is the only place two of these
@@ -3756,16 +3887,16 @@
   // accepts a multi-line blob and returns only the first link: the later lines
   // survive as `|`-segments its tag loop skips, so pasting ten links used to
   // queue one and report success.
+  // Throws when nothing was queued, so the Add Links dialog can stay open with
+  // the reason beside the text.
   async function queuePastedLinks(text: string) {
     const trimmed = text.trim();
     if (trimmed.length > MAX_PASTE_LEN) {
-      transferError = m.transfers_clipboard_too_long({ length: trimmed.length, max: MAX_PASTE_LEN });
-      return;
+      throw new Error(m.transfers_clipboard_too_long({ length: trimmed.length, max: MAX_PASTE_LEN }));
     }
     const batch = await parseEd2kLinks(trimmed);
     if (batch.links.length === 0) {
-      transferError = m.transfers_clipboard_not_ed2k();
-      return;
+      throw new Error(m.transfers_clipboard_not_ed2k());
     }
 
     // A file pasted twice is one download; its copies count as already listed.
@@ -3807,10 +3938,7 @@
     // including the real error, whether or not it succeeded.
     const ignored = batch.invalid + batch.skipped + failed;
     if (links.length === 1 && batch.invalid === 0 && batch.skipped === 0) {
-      if (firstError !== undefined) {
-        transferError = toErrorMsg(firstError);
-        return;
-      }
+      if (firstError !== undefined) throw firstError;
       const only = links[0];
       showInfo(queued > 0
         ? m.transfers_queued_from_clipboard({ name: only.name })
@@ -3847,8 +3975,6 @@
     pasteLinkBusy = true;
     try {
       await queuePastedLinks(text);
-    } catch (e: unknown) {
-      transferError = toErrorMsg(e);
     } finally {
       pasteLinkBusy = false;
     }
@@ -3904,10 +4030,11 @@
    *  state finished last rather than the one asked for. */
   let selectedActionBusy = $state(false);
 
-  async function runSelectedAction(action: 'pause' | 'resume' | 'stop' | 'sources' | 'preview') {
+  async function runSelectedAction(action: 'pause' | 'resume' | 'stop' | 'sources' | 'preview' | 'open') {
     if (!selectedTransfer || selectedActionBusy) return;
     selectedActionBusy = true;
     try {
+      if (action === 'open' && selectedTransfer.status === 'completed') await openFile(selectedTransfer.id);
       if (action === 'pause' && canPause(selectedTransfer)) await pauseTransfer(selectedTransfer.id);
       if (action === 'resume' && canResume(selectedTransfer)) await resumeTransfer(selectedTransfer.id);
       if (action === 'stop' && canStop(selectedTransfer)) await stopTransfer(selectedTransfer.id);
@@ -4548,6 +4675,33 @@
     // snapshot so a later widen doesn't undo the user's choice.
     preAutoCompactHidden = null;
     applyDownloadColumnPreset(showAdvancedDlCols);
+  }
+
+  /** The More menu is a `<details>`; this gives it a menu's keys. Up and Down
+   *  open it from its button and move between the items; Escape is the page
+   *  handler's. */
+  function onMoreKeydown(e: KeyboardEvent & { currentTarget: HTMLDetailsElement }) {
+    const more = e.currentTarget;
+    if (!more.open) {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      more.open = true;
+    }
+    menuKeydown(e, more.querySelector<HTMLElement>('.toolbar-more-menu'));
+  }
+
+  /** Tabbing out of the More menu closes it, as leaving a menu does. */
+  function onMoreFocusout(e: FocusEvent & { currentTarget: HTMLDetailsElement }) {
+    const more = e.currentTarget;
+    if (more.open && e.relatedTarget instanceof Node && !more.contains(e.relatedTarget)) more.open = false;
+  }
+
+  function runFromMore(e: MouseEvent & { currentTarget: HTMLElement }, run: () => void) {
+    const more = e.currentTarget.closest('details');
+    run();
+    if (more) {
+      more.open = false;
+      more.querySelector('summary')?.focus();
+    }
   }
 
   function ariaSortValue(currentField: string, field: string, asc: boolean): 'ascending' | 'descending' | 'none' {
@@ -5364,12 +5518,20 @@
     }
     else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (uploadsPaneCtxMenu) { closeUploadsPaneCtx(); e.preventDefault(); e.stopPropagation(); }
-    else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); e.stopPropagation(); }
+    else if (knownCtxMenu) {
+      const returnTo = knownCtxReturnFocus;
+      closeKnownCtx();
+      returnTo?.focus({ preventScroll: true });
+      e.preventDefault();
+      e.stopPropagation();
+    }
     else if (columnMenu) { closeColumnMenu(); e.preventDefault(); e.stopPropagation(); }
     else {
       const openMore = document.querySelector('.toolbar-more[open]') as HTMLDetailsElement | null;
       if (openMore) {
+        const hadFocus = openMore.contains(document.activeElement);
         openMore.open = false;
+        if (hadFocus) openMore.querySelector('summary')?.focus();
         e.preventDefault();
         e.stopPropagation();
       } else if (e.target instanceof HTMLInputElement && e.target.classList.contains('filter-input') && transferFilter) {
@@ -5417,6 +5579,9 @@
   // chat dock has the keyboard; File Details is this page's own and keeps F2.
   if (target?.closest('.chat-dock')) return;
   if ([...document.querySelectorAll('[aria-modal="true"]')].some((el) => el !== fileDetailsOverlayEl)) return;
+  // An upload or known-peer row has the keyboard: the download keys below
+  // would act on a list the user is not in.
+  if (target?.closest('.uploads-pane tbody')) return;
   if (e.key === 'F2') {
     const t = fileDetailsId
       ? (fileDetailsTransfer && canRename(fileDetailsTransfer) ? fileDetailsTransfer : null)
@@ -5478,6 +5643,7 @@
     focusedDlId = next.id;
     lastClickedDlId = next.id;
     revealDownloadRow(next.id);
+    focusDownloadRowEl(next.id);
   } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
     // The focused row's menu, beside the row, as Library and Search do.
     const focusRowId = target?.closest<HTMLElement>('tr[data-transfer-id]')?.dataset.transferId ?? null;
@@ -5650,7 +5816,17 @@
       </button>
     </div>
     <div class="pane-toolbar">
-      <span class="pane-title">{m.transfers_downloading_count({ shown: filteredActiveDownloads.length, total: activeDownloads.length })}</span>
+      <span class="pane-title">
+        {#if filteredActiveDownloads.length !== activeDownloads.length}
+          {m.transfers_downloading_count({ shown: formatNumber(filteredActiveDownloads.length), total: formatNumber(activeDownloads.length) })}
+        {:else}
+          {plural(activeDownloads.length, {
+            one: () => m.transfers_categories_count_one({ count: formatNumber(activeDownloads.length) }),
+            oneShowsCount: true,
+            other: () => m.transfers_categories_count_other({ count: formatNumber(activeDownloads.length) }),
+          })}
+        {/if}
+      </span>
       <div class="toolbar-actions">
         <label
           class="finish-action"
@@ -5682,24 +5858,26 @@
           </select>
         </label>
         <span class="toolbar-sep"></span>
-        <button class="tb-btn tb-toggle" onclick={toggleAdvancedDlCols} title={m.transfers_toggle_cols_title()}>
-          {showAdvancedDlCols ? m.transfers_toggle_compact() : m.transfers_toggle_full()}
-        </button>
+        <div class="tb-segmented" role="group" aria-label={m.transfers_toggle_cols_title()} title={m.transfers_toggle_cols_title()}>
+          <button type="button" class="tb-btn" aria-pressed={!showAdvancedDlCols} onclick={() => { if (showAdvancedDlCols) toggleAdvancedDlCols(); }}>{m.transfers_toggle_compact()}</button>
+          <button type="button" class="tb-btn" aria-pressed={showAdvancedDlCols} onclick={() => { if (!showAdvancedDlCols) toggleAdvancedDlCols(); }}>{m.transfers_toggle_full()}</button>
+        </div>
         <span class="toolbar-sep"></span>
-        <details class="toolbar-more">
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+        <details class="toolbar-more" onkeydown={onMoreKeydown} onfocusout={onMoreFocusout}>
           <summary class="tb-btn" title={m.common_more()} aria-haspopup="menu">{m.common_more()}</summary>
           <div class="toolbar-more-menu" role="menu">
-            <button type="button" role="menuitem" onclick={(e) => { handlePauseAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_pause_all()}</button>
-            <button type="button" role="menuitem" onclick={(e) => { handleResumeAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_resume_all()}</button>
+            <button type="button" role="menuitem" onclick={(e) => runFromMore(e, () => void handlePauseAll())}>{m.transfers_pause_all()}</button>
+            <button type="button" role="menuitem" onclick={(e) => runFromMore(e, () => void handleResumeAll())}>{m.transfers_resume_all()}</button>
             {#if activeDownloads.length > 0}
-              <button type="button" role="menuitem" onclick={(e) => { handleStopAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_stop_all()}</button>
-              <button type="button" role="menuitem" class="menu-danger" onclick={(e) => { handleCancelAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_cancel_all()}</button>
+              <button type="button" role="menuitem" onclick={(e) => runFromMore(e, () => void handleStopAll())}>{m.transfers_stop_all()}</button>
+              <button type="button" role="menuitem" class="menu-danger" onclick={(e) => runFromMore(e, () => void handleCancelAll())}>{m.transfers_cancel_all()}</button>
             {/if}
             {#if clearCompletedTargets().length > 0}
-              <button type="button" role="menuitem" onclick={(e) => { clearCompletedWithUndo(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
+              <button type="button" role="menuitem" onclick={(e) => runFromMore(e, clearCompletedWithUndo)}>{m.transfers_clear_completed()}</button>
             {/if}
             <div class="toolbar-more-sep" role="separator"></div>
-            <button type="button" role="menuitemcheckbox" aria-checked={completedFirst} onclick={(e) => { completedFirst = !completedFirst; (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_completed_first()}</button>
+            <button type="button" role="menuitemcheckbox" aria-checked={completedFirst} onclick={(e) => runFromMore(e, () => (completedFirst = !completedFirst))}>{m.transfers_completed_first()}</button>
           </div>
         </details>
       </div>
@@ -5772,12 +5950,16 @@
               class="dl-row {t.status}"
               class:row-alt={((dlActiveStripeOffset + dlActiveWindow.start + i) & 1) === 1}
               class:expanded={expandedTransferId === t.id}
-              class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
+              class:selected={checkedDlIdSet.has(t.id)}
+              class:focused={focusedDlId === t.id}
               class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
               data-transfer-id={t.id}
+              tabindex={dlTabStopId === t.id ? 0 : -1}
+              onfocus={(e) => { if (e.currentTarget.matches(':focus-visible')) { focusedDlId = t.id; lastClickedDlId = t.id; } }}
+              onkeydown={(e) => onDownloadRowKeydown(e, t)}
               onclick={(e) => onDownloadRowClick(e, t)}
               oncontextmenu={(e) => onCtx(e, t, 'active')}
-              ondblclick={() => toggleSourceDetail(t)}
+              ondblclick={() => activateDownloadRow(t)}
             >
               <td class="col-dl-check">
                 <input
@@ -5980,11 +6162,16 @@
               <tr
                 class="dl-row completed-row {t.status}"
                 class:row-alt={((dlCompletedStripeOffset + dlCompletedWindow.start + i) & 1) === 1}
-                class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
+                class:selected={checkedDlIdSet.has(t.id)}
+                class:focused={focusedDlId === t.id}
                 class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
                 data-transfer-id={t.id}
+                tabindex={dlTabStopId === t.id ? 0 : -1}
+                onfocus={(e) => { if (e.currentTarget.matches(':focus-visible')) { focusedDlId = t.id; lastClickedDlId = t.id; } }}
+                onkeydown={(e) => onDownloadRowKeydown(e, t)}
                 onclick={(e) => onDownloadRowClick(e, t)}
                 oncontextmenu={(e) => onCtx(e, t, 'completed')}
+                ondblclick={() => activateDownloadRow(t)}
               >
                 <td class="col-dl-check">
                   <input
@@ -6123,14 +6310,14 @@
               <option value={prio}>{priorityLabel(prio)}</option>
             {/each}
           </select>
-          <button class="tb-btn tb-danger" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
+          <button class="tb-btn tb-danger" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{cancelLabel(selectedBatchTransfers)}</button>
           <button class="tb-btn" disabled={copyingAllDownloadLinks || linkableSelectedCount === 0} onclick={() => void copyDownloadLinks(selectedBatchTransfers)} title={m.transfers_copy_selected_links_title()}>{m.transfers_copy_links_btn()}</button>
           {#if selectedFinishedCount > 0}
             <button class="tb-btn" onclick={handleBatchRemoveDownloads} title={m.transfers_batch_remove_title()}>
               {m.transfers_batch_remove({ count: selectedFinishedCount })}
             </button>
           {/if}
-          <button class="tb-btn" onclick={clearDlSelection} title={m.transfers_batch_clear_title()}>{m.common_clear()}</button>
+          <button class="tb-btn" onclick={clearDlSelection}>{m.transfers_ctx_clear_selection()}</button>
         </div>
       </div>
     {:else if selectedTransfer}
@@ -6168,9 +6355,37 @@
           {/if}
           {#if isFinished(selectedTransfer)}
             {@const finishedId = selectedTransfer.id}
+            {#if selectedTransfer.status === 'completed'}
+              <button class="tb-btn" disabled={selectedActionBusy} onclick={() => runSelectedAction('open')}>{m.transfers_ctx_open_file()}</button>
+            {/if}
             <button class="tb-btn" onclick={() => discardWithUndo([], [finishedId])} title={m.transfers_batch_remove_title()}>
               {m.transfers_ctx_remove_from_list()}
             </button>
+          {:else}
+            <select
+              class="tb-btn tb-select"
+              value=""
+              aria-label={m.transfers_ctx_priority()}
+              title={m.transfers_ctx_priority()}
+              onkeydown={holdClosedSelectKeys}
+              onchange={(e) => {
+                const value = e.currentTarget.value;
+                e.currentTarget.value = '';
+                void applyBulkPriority(value);
+              }}
+            >
+              <option value="" disabled>{m.transfers_ctx_priority()}</option>
+              {#each PRIORITIES as prio}
+                <option value={prio}>{priorityLabel(prio)}</option>
+              {/each}
+            </select>
+          {/if}
+          {#if selectedTransfer.status !== 'failed'}
+            <button
+              class="tb-btn tb-danger"
+              title={selectedTransfer.status === 'completed' ? m.transfers_cancel_finished_title() : undefined}
+              onclick={handleBatchCancelDownloads}
+            >{cancelLabel([selectedTransfer])}</button>
           {/if}
         </div>
       </div>
@@ -6282,6 +6497,7 @@
           onclick={() => bottomView = 'download_clients'}
         >{m.transfers_tab_download_clients()}</button>
       </div>
+      <button type="button" class="tb-btn tabs-refresh" onclick={refreshBottomPane}>{m.common_refresh()}</button>
     </div>
     <!-- `tabindex`: answering the pane's own right-click makes this element
          interactive as far as the a11y check is concerned, which then wants it
@@ -6304,6 +6520,13 @@
     >
       {#if bottomView === 'uploading'}
         <!-- UPLOADING VIEW -->
+        {#if transferFilter.trim()}
+          <!-- The downloads filter box narrows this list too. -->
+          <div class="known-toolbar" role="status">
+            <span class="known-stat">{m.transfers_uploads_filtered({ query: transferFilter.trim() })}</span>
+            <button type="button" class="tb-btn" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
+          </div>
+        {/if}
         <table
           class="transfer-table ul-table"
           bind:this={uploadTableEl}
@@ -6352,8 +6575,15 @@
             </tr>
           </thead>
           <tbody>
-            {#each filteredActiveUploads as t (t.id)}
-              <tr class="ul-row" oncontextmenu={(e) => onCtx(e, t, 'upload')}>
+            {#each filteredActiveUploads as t, i (t.id)}
+              <tr
+                class="ul-row"
+                data-upload-id={t.id}
+                tabindex={ulTabStopId === t.id ? 0 : -1}
+                onfocus={() => (ulFocusId = t.id)}
+                onkeydown={(e) => onBottomRowKeydown(e, i, filteredActiveUploads.length, focusUploadRow, (ev) => openUploadMenuFromKey(ev, t, e.currentTarget))}
+                oncontextmenu={(e) => onCtx(e, t, 'upload')}
+              >
                 {#each visibleUploadColumns as column (column.key)}
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={t.country_code ?? ''}>{#if countryFlagSrc(t.country_code)}<img src={countryFlagSrc(t.country_code)} alt={t.country_code ?? ''} class="flag-img" />{/if}</td>
@@ -6752,6 +6982,10 @@
                 class="client-row win-row"
                 class:row-alt={((knownWindow.start + i) & 1) === 1}
                 class:client-row-friend={isFriend}
+                data-user-hash={kc.user_hash}
+                tabindex={knownTabStopHash === kc.user_hash ? 0 : -1}
+                onfocus={() => (knownFocusHash = kc.user_hash)}
+                onkeydown={(e) => onBottomRowKeydown(e, knownWindow.start + i, filteredKnownClients.length, focusKnownRow, (ev) => openKnownMenuFromKey(ev, kc, e.currentTarget))}
                 oncontextmenu={(e) => onKnownCtx(e, kc)}
               >
                 {#each visibleKnownColumns as column (column.key)}
@@ -7272,7 +7506,7 @@
       {#if ctxTargets.some(isFinished)}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
       {/if}
-      <button class="ctx-item ctx-danger" role="menuitem" disabled={!ctxTargets.some((x) => !isFinished(x) || x.status === 'completed')} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+      <button class="ctx-item ctx-danger" role="menuitem" disabled={!ctxTargets.some((x) => !isFinished(x) || x.status === 'completed')} onclick={() => ctxAction('cancel')}>{cancelLabel(ctxTargets)}</button>
     {:else if ctxMenu.section !== 'upload' && ctxMulti}
       {#if ctxTargets.some(canResume)}
         <button class="ctx-item" role="menuitem" title={m.transfers_ctx_resume_failed_title()} onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
@@ -7291,7 +7525,7 @@
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
       {#if ctxTargets.some((x) => x.status === 'completed')}
-        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{cancelLabel(ctxTargets)}</button>
       {/if}
     {:else if ctxMenu.section === 'active'}
       {#if canPause(ctxTransfer)}
@@ -7424,7 +7658,7 @@
       {#if ctxTransfer.status === 'completed'}
         <!-- Cancel on a finished download deletes its file, which Remove
              from List never does. -->
-        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.transfers_delete_file()}</button>
       {/if}
     {:else}
       {@const uploadFriendHash = emberHashForUpload(ctxTransfer)}
@@ -7459,8 +7693,10 @@
     class="ctx-menu"
     role="menu"
     tabindex="-1"
+    bind:this={knownCtxMenuEl}
     use:ctxMenuPosition={{ x: knownCtxMenu.x, y: knownCtxMenu.y }}
     onclick={(e) => e.stopPropagation()}
+    onkeydown={(e) => menuKeydown(e, e.currentTarget)}
   >
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">
@@ -7837,13 +8073,15 @@
           bind:value={renameDialog.value}
           disabled={renameDialog.busy}
           spellcheck="false"
+          aria-invalid={renameDialog.error ? 'true' : undefined}
+          aria-describedby={renameDialog.error ? 'dl-rename-error' : undefined}
         />
         {#if renameDialog.error}
-          <p class="dl-details-note error-msg">{renameDialog.error}</p>
+          <p id="dl-rename-error" class="dl-details-note error-msg" role="alert">{renameDialog.error}</p>
         {/if}
         <div class="modal-footer rename-actions">
           <button type="button" class="ghost" disabled={renameDialog.busy} onclick={closeRename}>{m.common_cancel()}</button>
-          <button type="submit" disabled={renameDialog.busy || !renameDialog.value.trim()}>{m.transfers_rename_save()}</button>
+          <button type="submit" disabled={renameDialog.busy || !renameDialog.value.trim()}>{renameDialog.busy ? m.transfers_renaming() : m.transfers_rename_save()}</button>
         </div>
       </form>
     </div>
@@ -8375,14 +8613,26 @@
     border-color: var(--accent);
     color: var(--accent);
   }
-  /* A view option rather than an action: dashed until pointed at. */
-  .tb-btn.tb-toggle {
-    color: var(--text-muted);
-    border-style: dashed;
+  /* A view option rather than an action: the column set in use is the pressed
+     half. */
+  .tb-segmented {
+    display: inline-flex;
   }
-  .tb-btn.tb-toggle:hover:not(:disabled) {
+  .tb-segmented .tb-btn {
+    color: var(--text-muted);
+  }
+  .tb-segmented .tb-btn:first-child {
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  }
+  .tb-segmented .tb-btn:last-child {
+    margin-left: -1px;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  }
+  .tb-segmented .tb-btn[aria-pressed="true"] {
+    position: relative;
+    background: var(--bg-hover);
+    border-color: var(--accent);
     color: var(--text-primary);
-    border-style: solid;
   }
   .toolbar-more {
     position: relative;
@@ -8478,6 +8728,10 @@
   }
   .bottom-tabs::-webkit-scrollbar {
     display: none;
+  }
+  .tabs-refresh {
+    flex-shrink: 0;
+    margin-bottom: 3px;
   }
   .tab-btn {
     position: relative;
@@ -8733,6 +8987,25 @@
   .transfer-table tbody tr.dl-row.selected:hover {
     background: var(--table-row-selected);
   }
+  /* The highlighted row is outlined, not filled: once any box is ticked the
+     batch actions skip it, so it must not look ticked. */
+  .transfer-table tbody tr.dl-row:focus {
+    outline: none;
+  }
+  .transfer-table tbody tr.dl-row.focused {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+  }
+  .transfer-table tbody tr.dl-row.focused:focus-visible,
+  .transfer-table tbody tr.ul-row:focus-visible,
+  .transfer-table tbody tr.client-row:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .transfer-table tbody tr.ul-row:focus:not(:focus-visible),
+  .transfer-table tbody tr.client-row:focus:not(:focus-visible) {
+    outline: none;
+  }
   /* The row a context menu is open for, when it is not part of the selection:
      marked as the Library marks it, without selecting (and so checking) it. */
   .transfer-table tbody tr.dl-row.ctx-target,
@@ -8883,8 +9156,14 @@
     text-overflow: ellipsis;
   }
   .selection-meta strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     color: var(--text-primary);
     font-weight: 600;
+  }
+  .selection-meta span {
+    flex: none;
   }
   .selection-footer-idle {
     justify-content: center;

@@ -1368,7 +1368,7 @@ pub async fn mark_spam(
     server_ip: Option<String>,
     search_query: Option<String>,
     result_origin: Option<String>,
-) -> Result<(), String> {
+) -> Result<crate::search::spam::PriorSpamVerdict, String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
         return Err(coded("search_invalid_file_hash", "Invalid file hash"));
     }
@@ -1421,14 +1421,33 @@ pub async fn mark_spam(
         spam_reasons: Vec::new(),
         spam_reason_details: Vec::new(),
     };
-    let dirty = {
+    let (prior, dirty) = {
         let mut spam = state.spam_filter.write().await;
-        spam.mark_spam(&result, &keywords, server_ip.as_deref());
-        spam.is_dirty()
+        let prior = spam.mark_spam(&result, &keywords, server_ip.as_deref());
+        (prior, spam.is_dirty())
     };
     // Persist off the IPC path so the UI isn't parked on disk I/O. In-memory
     // state is already updated; a crash before the write lands is recovered by
     // the next mark or the periodic spam flush in the network loop.
+    spawn_spam_filter_save(state.spam_filter.clone(), dirty);
+    Ok(prior)
+}
+
+/// Undo a [`mark_spam`], given the verdict it returned.
+#[tauri::command]
+pub async fn undo_mark_spam(
+    state: tauri::State<'_, AppState>,
+    file_hash: String,
+    prior: crate::search::spam::PriorSpamVerdict,
+) -> Result<(), String> {
+    if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
+        return Err(coded("search_invalid_file_hash", "Invalid file hash"));
+    }
+    let dirty = {
+        let mut spam = state.spam_filter.write().await;
+        spam.undo_mark_spam(&file_hash, prior);
+        spam.is_dirty()
+    };
     spawn_spam_filter_save(state.spam_filter.clone(), dirty);
     Ok(())
 }

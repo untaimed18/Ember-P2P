@@ -15,6 +15,7 @@
   import { plural } from '$lib/plural';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { formatBytes, formatNumber } from '$lib/utils';
   import {
     addSharedFolder,
@@ -133,6 +134,8 @@
     focusedPath = null;
     focusedTreeId = null;
     selectionNote = null;
+    discardConfirmOpen = false;
+    afterDiscard = null;
     try {
       const view = await openShareBrowser();
       if (gen !== sessionGen) {
@@ -298,6 +301,26 @@
 
   function closeDialog() {
     open = false;
+  }
+
+  /** A selection can be gathered across many folders; leaving with it asks first. */
+  let discardConfirmOpen = $state(false);
+  let afterDiscard: (() => void) | null = null;
+
+  function leaveAfterConfirm(leave: () => void) {
+    if (selectedCount === 0) {
+      leave();
+      return;
+    }
+    afterDiscard = leave;
+    discardConfirmOpen = true;
+  }
+
+  function settleDiscard(discard: boolean) {
+    const leave = afterDiscard;
+    afterDiscard = null;
+    discardConfirmOpen = false;
+    if (discard) leave?.();
   }
 
   function toggleExpand(entry: ShareBrowserEntry, e: Event) {
@@ -842,13 +865,15 @@
   }
 
   function onDialogKey(e: KeyboardEvent) {
+    // The discard question handles its own keys.
+    if (discardConfirmOpen) return;
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
       // Mid-share the dialog is already unclosable by click or button; letting
       // Escape through would unmount it while the selection is still being
       // added and leave the Library with no report of what happened.
-      if (!sharing) closeDialog();
+      if (!sharing) leaveAfterConfirm(closeDialog);
       return;
     }
     if (e.key === 'Backspace' && e.target instanceof HTMLInputElement) return;
@@ -926,7 +951,7 @@
     >
       <div class="modal-header">
         <span id="share-explorer-title" class="modal-title">{m.library_add_folder_title()}</span>
-        <button type="button" class="icon-close" onclick={closeDialog} aria-label={m.common_close()} disabled={sharing}>
+        <button type="button" class="icon-close" onclick={() => leaveAfterConfirm(closeDialog)} aria-label={m.common_close()} disabled={sharing}>
           <IconX size={15} />
         </button>
       </div>
@@ -1091,6 +1116,8 @@
               {#each visibleChildren as entry, index (entry.id)}
                 {@const badge = statusLabel(entry)}
                 {@const checked = selectedPaths.has(entry.path) || isShared(entry)}
+                <!-- Selected is the user's picks only, so the count read out
+                     matches the one shown; the badge says what is already shared. -->
                 <div
                   class="list-row"
                   class:shared={isShared(entry)}
@@ -1098,7 +1125,7 @@
                   class:checked={selectedPaths.has(entry.path)}
                   bind:this={listRowEls[entry.path]}
                   role="option"
-                  aria-selected={checked}
+                  aria-selected={selectedPaths.has(entry.path)}
                   aria-disabled={entry.kind === 'file' && !canCheck(entry)}
                   tabindex={entry.path === tabbablePath ? 0 : -1}
                   title={entry.path}
@@ -1205,7 +1232,7 @@
           {shareOutcome}
         </p>
         <div class="footer-actions">
-          <button type="button" class="ghost footer-fallback" onclick={useSystemDialog} disabled={sharing}>{m.library_explorer_system_dialog()}</button>
+          <button type="button" class="ghost footer-fallback" onclick={() => leaveAfterConfirm(() => void useSystemDialog())} disabled={sharing}>{m.library_explorer_system_dialog()}</button>
           <button type="button" class="ghost" onclick={closeDialog} disabled={sharing}>{m.common_cancel()}</button>
           <button
             type="button"
@@ -1219,6 +1246,18 @@
         </div>
       </div>
     </div>
+    <!-- Inside the overlay: outside it, the overlay's own inert background
+         would take the question in with it. -->
+    <ConfirmDialog
+      bind:open={discardConfirmOpen}
+      title={m.common_discard_title()}
+      message={m.common_discard_message()}
+      confirmLabel={m.common_discard()}
+      cancelLabel={m.common_keep_editing()}
+      danger={true}
+      onconfirm={() => settleDiscard(true)}
+      oncancel={() => settleDiscard(false)}
+    />
   </div>
 {/if}
 

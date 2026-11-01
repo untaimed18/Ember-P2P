@@ -288,7 +288,6 @@
   let autoItemMib = $state(0);
   let autoDayMib = $state(0);
   let autoOpen = $state(false);
-  let autoSaving = $state(false);
   let itemFilter = $state<'all' | 'new'>('all');
   let itemQuery = $state('');
 
@@ -610,27 +609,36 @@
     }
   });
 
-  async function saveAuto(): Promise<boolean> {
+  /** Auto-download saves, run one after another in the order they were made. */
+  let autoQueue: Promise<unknown> = Promise.resolve();
+
+  /** Save the open feed's switch and limits as they stand now. They are
+   *  taken at once: a limit saved as its field loses focus to another
+   *  feed's row must not be given to that feed. */
+  function saveAuto(): Promise<boolean> {
     const feed = selected;
-    if (!feed || autoSaving) return false;
-    autoSaving = true;
-    try {
-      autoItemMib = capMib(autoItemMib);
-      autoDayMib = capMib(autoDayMib);
-      const saved = await setFeedAutoDownload(feed.publisher, feed.salt, autoEnabled, autoItemMib, autoDayMib);
-      await refreshFollowedFeeds();
-      // The fields show what was saved, which the backend may have clipped.
-      if (selectedKey === keyOf(feed)) {
-        autoItemMib = saved.auto_max_item_mib;
-        autoDayMib = saved.auto_max_day_mib;
+    if (!feed) return Promise.resolve(false);
+    const enabled = autoEnabled;
+    const itemMib = (autoItemMib = capMib(autoItemMib));
+    const dayMib = (autoDayMib = capMib(autoDayMib));
+    const run = autoQueue.then(async () => {
+      try {
+        const saved = await setFeedAutoDownload(feed.publisher, feed.salt, enabled, itemMib, dayMib);
+        await refreshFollowedFeeds();
+        // The fields show what was saved, which the backend may have clipped,
+        // unless the user has typed something else since.
+        if (selectedKey === keyOf(feed) && autoItemMib === itemMib && autoDayMib === dayMib) {
+          autoItemMib = saved.auto_max_item_mib;
+          autoDayMib = saved.auto_max_day_mib;
+        }
+        return true;
+      } catch (e) {
+        toastError(aboutFeed(feed, translateError(e, m.error_operation_failed())));
+        return false;
       }
-      return true;
-    } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
-      return false;
-    } finally {
-      autoSaving = false;
-    }
+    });
+    autoQueue = run;
+    return run;
   }
 
   /** The switch saves at once; turning it on opens the limits that go with it. */
@@ -638,15 +646,20 @@
     const key = selectedKey;
     autoEnabled = on;
     if (!(await saveAuto())) {
-      // Not another feed's switch, if the user moved on meanwhile.
-      if (selectedKey === key) autoEnabled = !on;
+      // Not another feed's switch, nor one flipped again meanwhile.
+      if (selectedKey === key && autoEnabled === on) autoEnabled = !on;
       return;
     }
     if (on && selectedKey === key) autoOpen = true;
   }
 
-  async function saveAutoLimits() {
-    if (await saveAuto()) toastSuccess(m.feeds_auto_saved());
+  /** A limit saves once its field is left, as the switch does when flipped. */
+  async function commitAutoLimits() {
+    autoItemMib = capMib(autoItemMib);
+    autoDayMib = capMib(autoDayMib);
+    const feed = selected;
+    if (!feed || !autoChanged) return;
+    if (await saveAuto()) toastSuccess(aboutFeed(feed, m.feeds_auto_saved()));
   }
 
   /** A cap in MiB as people read sizes; 0 is no limit. */
@@ -657,7 +670,12 @@
 
   /** The limits in force, said under the switch while it is on. */
   function autoSummary(itemMib: number, dayMib: number): string {
-    return m.feeds_auto_summary({ item: mibText(itemMib), day: mibText(dayMib) });
+    const item = capMib(itemMib);
+    const day = capMib(dayMib);
+    if (item === 0 && day === 0) return m.feeds_auto_summary_no_limits();
+    if (item === 0) return m.feeds_auto_summary_day_only({ day: mibText(day) });
+    if (day === 0) return m.feeds_auto_summary_item_only({ item: mibText(item) });
+    return m.feeds_auto_summary({ item: mibText(item), day: mibText(day) });
   }
 
   /** Why auto-download has left a file for the user to start. */
@@ -1534,7 +1552,7 @@
     if (!d || busy || !d.title.trim()) return;
     saving = true;
     try {
-      await saveDraft(d);
+      if (await saveDraft(d)) toastSuccess(m.feeds_saved_toast());
     } finally {
       saving = false;
     }
@@ -1569,10 +1587,34 @@
     listedSwitch = mineFeed?.listed ?? false;
   });
 
-  /** Listing goes out at once, apart from the editor's Save and Publish. */
-  async function toggleListed(on: boolean) {
+  /** The published feed waiting on the user's word before it is listed. */
+  let listAsk = $state<OwnFeed | null>(null);
+  /** Its name as asked, as `unfollowTitle` is. */
+  let listAskTitle = $state('');
+
+  /** Listing goes out at once, apart from the editor's Save and Publish, so
+   *  a published feed is listed only once the user agrees; taking it out,
+   *  or listing one not yet published, needs no asking. */
+  function toggleListed(on: boolean) {
     const feed = mineFeed;
     if (!feed || listing) return;
+    listedSwitch = on;
+    if (on && feed.published_at > 0) {
+      listAskTitle = feed.title.trim() || m.feeds_untitled();
+      listAsk = feed;
+    } else {
+      void setListed(feed, on);
+    }
+  }
+
+  function cancelListing() {
+    const feed = listAsk;
+    listAsk = null;
+    if (feed && mineSelected === feed.salt) listedSwitch = false;
+  }
+
+  async function setListed(feed: OwnFeed, on: boolean) {
+    if (listing) return;
     listedSwitch = on;
     listing = true;
     try {
@@ -1598,11 +1640,28 @@
     if (!feed) return;
     try {
       await deleteFeed(feed.salt);
-      if (mineSelected === feed.salt) mineSelected = null;
-      await loadMine();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
+      return;
     }
+    // As Unfollow does: gone at once, and its neighbour in the list opens.
+    const at = mine.findIndex((f) => f.salt === feed.salt);
+    const next = mine[at + 1] ?? mine[at - 1] ?? null;
+    mine = mine.filter((f) => f.salt !== feed.salt);
+    if (mineSelected === feed.salt) {
+      if (next) selectMine(next);
+      else mineSelected = null;
+    }
+    toastSuccess(m.feeds_deleted_toast({ feed: feed.title.trim() || m.feeds_untitled() }));
+    // The Delete button went with the feed: focus goes to the one opened,
+    // or to New feed when none is left.
+    if (next) {
+      await focusActiveRow();
+    } else {
+      await tick();
+      composeTrigger?.focus();
+    }
+    void loadMine();
   }
 
   beforeNavigate((nav) => {
@@ -2206,7 +2265,6 @@
                         </button>
                         <ToggleSwitch
                           checked={autoEnabled}
-                          disabled={autoSaving}
                           ariaLabel={m.feeds_auto_enable()}
                           onchange={(on) => void toggleAuto(on)}
                         />
@@ -2216,20 +2274,17 @@
                           <div class="auto-grid">
                             <label class="field">
                               <span class="field-label">{m.feeds_auto_max_item()}</span>
-                              <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoItemMib} onchange={() => (autoItemMib = capMib(autoItemMib))} />
+                              <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoItemMib} onchange={() => void commitAutoLimits()} />
                               <span class="field-hint">{mibText(autoItemMib)}</span>
                             </label>
                             <label class="field">
                               <span class="field-label">{m.feeds_auto_max_day()}</span>
-                              <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoDayMib} onchange={() => (autoDayMib = capMib(autoDayMib))} />
+                              <input type="number" min="0" max={AUTO_MIB_MAX} bind:value={autoDayMib} onchange={() => void commitAutoLimits()} />
                               <span class="field-hint">{mibText(autoDayMib)}</span>
                             </label>
                           </div>
                           <div class="auto-foot">
                             <p class="hint">{m.feeds_auto_hint()}</p>
-                            <button type="button" class="secondary" disabled={!autoChanged || autoSaving} onclick={() => void saveAutoLimits()}>
-                              {m.feeds_save()}
-                            </button>
                           </div>
                         </div>
                       {/if}
@@ -2474,6 +2529,27 @@
               </div>
             </div>
           </div>
+        {:else if discovered.length === 0 && emberOff && !discovering}
+          <div class="empty-card">
+            <div class="empty-state">
+              <span class="empty-glyph">{@render feedGlyph()}</span>
+              <p class="empty-title">{m.channels_disabled_title()}</p>
+              <p class="empty-sub">{m.feeds_discover_off_body()}</p>
+              <div class="empty-actions">
+                <button type="button" class="primary empty-action" onclick={() => void goto('/ember').catch(() => {})}>
+                  {m.settings_open_page({ page: m.nav_ember_network() })}
+                </button>
+                <button
+                  type="button"
+                  class="secondary empty-action"
+                  onclick={() => {
+                    setTab('following');
+                    compose = 'follow';
+                  }}
+                >{m.feeds_follow_a_feed()}</button>
+              </div>
+            </div>
+          </div>
         {:else if discovered.length === 0}
           <div class="empty-card">
             <div class="empty-state">
@@ -2608,12 +2684,15 @@
                           <button type="button" class="secondary sm-btn" onclick={() => editOwn(feed)}>{m.feeds_discover_edit()}</button>
                         </span>
                       {:else if isFollowed}
-                        <button type="button" class="secondary sm-btn" data-card-action onclick={() => openFollowed(feed)}>{m.feeds_discover_open()}</button>
+                        <span class="own-actions">
+                          <span class="badge sm tone-muted">{m.feeds_badge_following()}</span>
+                          <button type="button" class="secondary sm-btn" data-card-action onclick={() => openFollowed(feed)}>{m.feeds_discover_open()}</button>
+                        </span>
                       {:else}
                         <button
                           type="button"
                           class="primary sm-btn"
-                          disabled={emberOff || followingFromDiscover.has(key)}
+                          disabled={followingFromDiscover.has(key)}
                           data-card-action
                           onclick={() => void followDiscovered(feed)}
                         >
@@ -2722,9 +2801,11 @@
                       {#if feed.listed && feed.published_at > 0}<span aria-hidden="true"> · </span>{m.feeds_badge_listed()}{/if}
                     </span>
                   </span>
-                  {#if feed.published_at === 0}
+                  {#if active && dirty}
+                    <span class="badge sm tone-warning">{m.feeds_badge_unsaved()}</span>
+                  {:else if feed.published_at === 0}
                     <span class="badge sm tone-muted">{m.feeds_badge_draft()}</span>
-                  {:else if feed.changed || (active && dirty)}
+                  {:else if feed.changed}
                     <span class="badge sm tone-warning">{m.feeds_badge_unpublished()}</span>
                   {/if}
                 </button>
@@ -2850,19 +2931,18 @@
                   />
                 </div>
 
-                {#if mineFeed.published_at === 0}
-                  <div class="state-strip" role="status">
+                {#if mineFeed.published_at === 0 || mineFeed.changed || dirty}
+                  <div class="state-strip" class:tone-warning={mineFeed.published_at > 0} role="status">
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
                       <circle cx="8" cy="8" r="6"/><line x1="8" y1="7" x2="8" y2="11"/><line x1="8" y1="5" x2="8" y2="5.1"/>
                     </svg>
-                    <span>{m.feeds_not_published()}</span>
-                  </div>
-                {:else if mineFeed.changed || dirty}
-                  <div class="state-strip tone-warning" role="status">
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
-                      <circle cx="8" cy="8" r="6"/><line x1="8" y1="7" x2="8" y2="11"/><line x1="8" y1="5" x2="8" y2="5.1"/>
-                    </svg>
-                    <span>{m.feeds_unpublished_changes()}</span>
+                    <span>
+                      {dirty
+                        ? m.feeds_strip_unsaved()
+                        : mineFeed.published_at === 0
+                          ? m.feeds_not_published()
+                          : m.feeds_unpublished_changes()}
+                    </span>
                   </div>
                 {/if}
 
@@ -2953,8 +3033,8 @@
                 </div>
 
                 <footer class="editor-foot">
-                  <p class="hint" class:up-to-date={upToDate} id="feeds-publish-hint">
-                    {upToDate ? m.feeds_publish_up_to_date_title() : m.feeds_publish_public_hint()}
+                  <p class="hint" class:up-to-date={upToDate} class:publish-off={emberOff && !upToDate} id="feeds-publish-hint">
+                    {upToDate ? m.feeds_publish_up_to_date_title() : emberOff ? m.feeds_disabled_body() : m.feeds_publish_public_hint()}
                   </p>
                   <div class="editor-foot-actions">
                     <button
@@ -2970,7 +3050,7 @@
                       type="button"
                       class="primary"
                       disabled={busy || emberOff || upToDate || titleMissing}
-                      aria-describedby={titleMissing ? 'feeds-title-required' : upToDate ? 'feeds-publish-hint' : undefined}
+                      aria-describedby={titleMissing ? 'feeds-title-required' : upToDate || emberOff ? 'feeds-publish-hint' : undefined}
                       onclick={() => void publish()}
                     >
                       {#if publishing}
@@ -3068,6 +3148,20 @@
   confirmLabel={m.feeds_delete()}
   danger
   onconfirm={() => void doDelete()}
+/>
+
+<ConfirmDialog
+  open={listAsk !== null}
+  title={m.feeds_listed_confirm_title({ title: listAskTitle })}
+  message={m.feeds_listed_confirm_body()}
+  confirmLabel={m.feeds_listed_toggle()}
+  focusCancel
+  onconfirm={() => {
+    const feed = listAsk;
+    listAsk = null;
+    if (feed) void setListed(feed, true);
+  }}
+  oncancel={cancelListing}
 />
 
 <ConfirmDialog
@@ -3586,6 +3680,10 @@
   .detail-meta .unsaved {
     color: var(--badge-warning-text);
     font-weight: 600;
+  }
+
+  .hint.publish-off {
+    color: var(--badge-warning-text);
   }
 
   .status-dot {

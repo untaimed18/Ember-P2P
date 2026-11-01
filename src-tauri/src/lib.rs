@@ -2443,6 +2443,7 @@ pub fn run() {
             commands::search::parse_ed2k_links,
             commands::search::mark_spam,
             commands::search::mark_not_spam,
+            commands::search::undo_mark_spam,
             commands::search::get_spam_stats,
             commands::search::explain_spam_result,
             commands::search::reset_spam_filter,

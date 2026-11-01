@@ -1,6 +1,6 @@
 <script lang="ts">
   import SearchBar from '$lib/components/SearchBar.svelte';
-  import { searchFiles, searchWatchdogSecs, cancelSearch, searchMore, findNotes, publishNote, markSpam, markNotSpam, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, SEARCH_METHODS, type SearchMethod, type RelatedPlan } from '$lib/api/search';
+  import { searchFiles, searchWatchdogSecs, cancelSearch, searchMore, findNotes, publishNote, markSpam, markNotSpam, undoMarkSpam, type PriorSpamVerdict, explainSpamResult, getDownloadHistory, removeDownloadHistoryEntry, formatEd2kLink, formatEd2kLinks, SEARCH_METHODS, type SearchMethod, type RelatedPlan } from '$lib/api/search';
   import {
     pendingRelatedSearch,
     relationKindLabel,
@@ -54,7 +54,7 @@
   import type { SearchResult, SpamExplanation } from '$lib/types';
   import { formatNumber, formatDecimal, formatSize, formatLiveSpeed, copyToClipboard, sizeUnitLabel, compareFileNames } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
-  import { addToast } from '$lib/stores/toast';
+  import { addActionToast, addToast, setToastMessage } from '$lib/stores/toast';
   import { inertBackground, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
@@ -778,6 +778,7 @@
   let columnVis = $state<Record<MediaColumn, boolean>>({ ...DEFAULT_COLUMN_VIS });
   let showColumnMenu = $state(false);
   let syntaxHelpEl = $state<HTMLDetailsElement | undefined>(undefined);
+  let tableHelpEl = $state<HTMLDetailsElement | undefined>(undefined);
 
   function toggleColumn(key: MediaColumn) {
     // Reassign (rather than mutate in place) so the persistence $effect, which
@@ -987,6 +988,9 @@
     return [before, after];
   }
   const filterHelpParts = aroundPlaceholder((minus) => m.search_filter_help({ minus }));
+  /** The tip under the filter box repeats its placeholder, so it only takes a
+   *  line while the box is in use. */
+  let filterTextFocused = $state(false);
 
   /** Lists in the app language: "a, b and c", and the bare "a, b, c" a status
    *  line uses. Locale changes reload the page, so built once. */
@@ -3342,9 +3346,7 @@
     // publish's to touch, so its outcome goes to a toast instead.
     const requestId = notesRequestId;
     const stillShown = () => requestId === notesRequestId;
-    // The rating input is a free-form number field; browsers can submit
-    // out-of-range or fractional values (and an empty field yields NaN).
-    // Clamp to the backend's 0..5 integer contract before publishing.
+    // 0 is "No rating"; the backend takes an integer 0..5.
     const rating = Math.max(0, Math.min(5, Math.round(Number(noteRating) || 0)));
     try {
       const raw = await publishNote(
@@ -3617,10 +3619,16 @@
     // Persist in the background; waiting on IPC (incl. disk) used to freeze the UI.
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    // The rows the re-score below may hide, to say so in the toast.
+    const cleanBefore = new Set(
+      ($searchTabs.find((t) => t.id === markedTabId)?.results ?? [])
+        .filter((r) => !r.is_spam && r.file.hash !== hash)
+        .map(resultKey),
+    );
     const undoPatch = patchSpamFlagByHash(hash, true, spamThreshold, [m.search_spam_reason_manual_spam()]);
     clearSpamExplainForResult(result);
     try {
-      await markSpam(
+      const prior = await markSpam(
         hash,
         // Raw wire name: the stored spam entry is matched against names peers
         // send, which never arrive pre-cleaned.
@@ -3639,11 +3647,85 @@
       // its keyword-stripped form, its size and its sources, and every one of
       // those is a rule about the other rows in this tab.
       if (markedTabId) rescoreTabAfterSpamMark(markedTabId, 'spam');
+      announceSpamMark(hash, gen, prior, markedTabId, cleanBefore, undoPatch);
     } catch (e) {
       console.error('Failed to mark spam:', e);
       if (spamToggleGen.get(hash) === gen) {
         undoPatch();
         addToast('error', m.search_failed_mark_spam());
+      }
+    }
+  }
+
+  /**
+   * Say that a row went, and how many the re-score took with it, with an Undo.
+   * The re-score lands after the toast is up, so its count follows while the
+   * toast is on screen.
+   */
+  function announceSpamMark(
+    hash: string,
+    gen: number,
+    prior: PriorSpamVerdict,
+    tabId: string | null,
+    cleanBefore: Set<string>,
+    undoPatch: () => void,
+  ) {
+    const message = (hidden: number) => hidden === 0 || !hidingSpam
+      ? m.search_marked_spam()
+      : plural(hidden, {
+        one: () => m.search_marked_spam_more_one({ count: formatNumber(hidden) }),
+        oneShowsCount: true,
+        other: () => m.search_marked_spam_more_other({ count: formatNumber(hidden) }),
+      });
+    if (prior === 'spam') {
+      addToast('info', message(0));
+      return;
+    }
+    let shown = 0;
+    let stopWatching = () => {};
+    const id = addActionToast(
+      'info',
+      message(0),
+      {
+        label: m.common_undo(),
+        undo: true,
+        run: () => {
+          stopWatching();
+          // Marked or unmarked again since: that choice stands.
+          if (spamToggleGen.get(hash) !== gen) return;
+          void undoSpamMark(hash, prior, tabId, undoPatch);
+        },
+      },
+      () => stopWatching(),
+    );
+    stopWatching = searchTabs.subscribe((tabs) => {
+      const tab = tabs.find((t) => t.id === tabId);
+      if (!tab) return;
+      let hidden = 0;
+      for (const r of tab.results) if (r.is_spam && cleanBefore.has(resultKey(r))) hidden++;
+      if (hidden === shown) return;
+      shown = hidden;
+      setToastMessage(id, message(hidden));
+    });
+  }
+
+  async function undoSpamMark(
+    hash: string,
+    prior: PriorSpamVerdict,
+    tabId: string | null,
+    undoPatch: () => void,
+  ) {
+    const gen = nextSpamToggleGen(hash);
+    undoPatch();
+    try {
+      await undoMarkSpam(hash, prior);
+      if (spamToggleGen.get(hash) !== gen) return;
+      if (tabId) rescoreTabAfterSpamMark(tabId, 'not-spam');
+    } catch (e) {
+      console.error('Failed to undo spam mark:', e);
+      if (spamToggleGen.get(hash) === gen) {
+        patchSpamFlagByHash(hash, true, spamThreshold, [m.search_spam_reason_manual_spam()]);
+        addToast('error', m.search_failed_undo_spam());
       }
     }
   }
@@ -4367,14 +4449,15 @@
     // Open, the Columns menu also holds off the row keys, so a click that
     // only dismissed it visually would leave the keyboard dead.
     if (showColumnMenu && !inside(columnMenuEl)) showColumnMenu = false;
-    if (!syntaxHelpEl || !syntaxHelpEl.open) return;
-    if (inside(syntaxHelpEl)) return;
-    syntaxHelpEl.open = false;
+    for (const help of [syntaxHelpEl, tableHelpEl]) {
+      if (help?.open && !inside(help)) help.open = false;
+    }
   }}
   onkeydown={(e) => {
   if (e.key === 'Escape') {
-    if (syntaxHelpEl?.open) {
-      syntaxHelpEl.open = false;
+    const openHelp = [syntaxHelpEl, tableHelpEl].find((help) => help?.open);
+    if (openHelp) {
+      openHelp.open = false;
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -4461,7 +4544,7 @@
   if (typing || confirmOpen || networkAlertOpen || selectedResult || contextMenu || showColumnMenu) return;
   if (target?.closest('.chat-dock') || document.querySelector('[aria-modal="true"]')) return;
   // Non-modal overlays too: the status bar's speed limits, the syntax help.
-  if (target?.closest('[role="dialog"]') || syntaxHelpEl?.open) return;
+  if (target?.closest('[role="dialog"]') || syntaxHelpEl?.open || tableHelpEl?.open) return;
   if (handleResultsKeydown(e)) e.preventDefault();
 }} />
 
@@ -4498,8 +4581,8 @@
       searchMethod = chosenSearchMethod = v;
       stagedExtension = '';
     }}
-    title={m.search_method_title()}
-    aria-label={m.search_method_title()}
+    title={emberEnabled ? m.search_method_title() : m.search_method_title_no_ember()}
+    aria-label={emberEnabled ? m.search_method_title() : m.search_method_title_no_ember()}
   >
     <option value="global">{m.search_method_global()}</option>
     <option value="kad">{m.search_method_kad_only()}</option>
@@ -4508,11 +4591,15 @@
       <option value="ember">{m.search_method_ember_only()}</option>
     {/if}
   </select>
-  <select class="type-select" bind:value={searchFileType} title={m.search_filter_by_filetype()} aria-label={m.search_filter_by_filetype()}>
-    {#each FILE_TYPES as ft}
-      <option value={ft.value}>{ft.label}</option>
-    {/each}
-  </select>
+  <label class="search-type-field" title={m.search_filetype_search_for_title()}>
+    <span class="search-type-label">{m.search_filetype_search_for()}</span>
+    <select class="type-select" bind:value={searchFileType} aria-describedby="search-type-hint">
+      {#each FILE_TYPES as ft}
+        <option value={ft.value}>{ft.label}</option>
+      {/each}
+    </select>
+    <span id="search-type-hint" class="sr-only">{m.search_filetype_search_for_title()}</span>
+  </label>
   <details class="syntax-help" bind:this={syntaxHelpEl}>
     <summary title={m.search_syntax_help()} aria-label={m.search_syntax_help()}>?</summary>
     <div class="syntax-popover" role="note">
@@ -4658,6 +4745,9 @@
           placeholder={m.search_filter_text_placeholder()}
           bind:value={filterTextInput}
           oninput={onFilterTextInput}
+          onfocus={() => (filterTextFocused = true)}
+          onblur={() => (filterTextFocused = false)}
+          aria-describedby="filter-text-help"
           class="filter-text-input"
         />
         {#if filterTextInput}
@@ -4672,12 +4762,13 @@
     </div>
 
     <div class="filter-group">
-      <label for="filter-type">{m.search_col_type()}</label>
-      <select id="filter-type" bind:value={filterType}>
+      <label for="filter-type">{m.search_filetype_show_only()}</label>
+      <select id="filter-type" bind:value={filterType} title={m.search_filter_by_filetype()} aria-describedby="filter-type-hint">
         {#each FILE_TYPES as ft}
           <option value={ft.value}>{ft.label}</option>
         {/each}
       </select>
+      <span id="filter-type-hint" class="sr-only">{m.search_filter_by_filetype()}</span>
     </div>
 
     <button class="ghost advanced-toggle" aria-expanded={showAdvancedFilters} aria-controls={showAdvancedFilters ? 'search-advanced-filters' : undefined} onclick={() => (showAdvancedFilters = !showAdvancedFilters)}>
@@ -4710,6 +4801,7 @@
               type="button"
               class="filter-help-icon"
               aria-label={m.search_explain_spam_hiding()}
+              aria-describedby="spam-hiding-help"
               onmouseenter={() => (showSpamHelp = true)}
               onmouseleave={() => (showSpamHelp = false)}
               onfocus={() => (showSpamHelp = true)}
@@ -4722,21 +4814,21 @@
                 <circle cx="8" cy="11.5" r="0.55" fill="currentColor" stroke="none"/>
               </svg>
             </button>
-            {#if showSpamHelp}
-              <div class="filter-help-popover" role="tooltip">
-                {#if hidingSpam && spamHiddenCount > 0}
-                  {plural(spamHiddenCount, {
-                    one: () => m.search_spam_hidden_count_one({ count: formatNumber(spamHiddenCount) }),
-                    oneShowsCount: true,
-                    other: () => m.search_spam_hidden_count({ count: formatNumber(spamHiddenCount) }),
-                  })}
-                {:else}
-                  {m.search_spam_hidden_none()}
-                {/if}
-                <br />
-                {#each spamHelpParts as part, partIdx (partIdx)}{#if part.mark}<strong>{part.text}</strong>{:else}{part.text}{/if}{/each}
-              </div>
-            {/if}
+            <!-- Kept in the page while hidden so the button's description
+                 is there before it is opened. -->
+            <div id="spam-hiding-help" class="filter-help-popover" role="tooltip" hidden={!showSpamHelp}>
+              {#if hidingSpam && spamHiddenCount > 0}
+                {plural(spamHiddenCount, {
+                  one: () => m.search_spam_hidden_count_one({ count: formatNumber(spamHiddenCount) }),
+                  oneShowsCount: true,
+                  other: () => m.search_spam_hidden_count({ count: formatNumber(spamHiddenCount) }),
+                })}
+              {:else}
+                {m.search_spam_hidden_none()}
+              {/if}
+              <br />
+              {#each spamHelpParts as part, partIdx (partIdx)}{#if part.mark}<strong>{part.text}</strong>{:else}{part.text}{/if}{/each}
+            </div>
           </span>
         </label>
         <label class="filter-toggle" title={m.search_hide_owned_title()}>
@@ -4849,7 +4941,7 @@
     {/if}
   {/if}
 
-  <p class="filter-help">{filterHelpParts[0]}<code>-</code>{filterHelpParts[1]}</p>
+  <p id="filter-text-help" class="filter-help" hidden={!filterTextFocused}>{filterHelpParts[0]}<code>-</code>{filterHelpParts[1]}</p>
 </div>
 
 <div class="page-content results-scroll" bind:this={resultsScrollEl} use:passiveScroll={onResultsScroll}>
@@ -5020,6 +5112,12 @@
         {/if}
       </div>
       <div class="results-info-actions">
+        <details class="syntax-help table-help" bind:this={tableHelpEl}>
+          <summary title={m.search_table_help()} aria-label={m.search_table_help()}>?</summary>
+          <div class="syntax-popover" role="note">
+            <p>{m.search_double_click_hint()}</p>
+          </div>
+        </details>
         <details class="column-menu" bind:open={showColumnMenu} bind:this={columnMenuEl}>
           <summary class="column-menu-summary" title={m.search_columns_aria()} aria-label={m.search_columns_aria()} aria-haspopup="true">
             <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
@@ -5166,7 +5264,7 @@
           <th class="col-action" aria-label={m.search_th_actions_aria()}></th>
         </tr>
       </thead>
-      <tbody title={m.search_double_click_hint()} bind:this={resultsBodyEl}>
+      <tbody bind:this={resultsBodyEl}>
         <!-- Scroll space for the rows above and below the window. Empty cells
              with no padding, so each spacer is exactly the height of the rows
              it stands in for and the scrollbar matches the full list. -->
@@ -5241,6 +5339,7 @@
                       class="spam-flag-btn"
                       type="button"
                       aria-label={m.search_show_spam_reason()}
+                      aria-describedby={spamTooltipKey === rKey ? `${resultRowId(rKey)}-spam-tip` : undefined}
                       onclick={(e) => openSpamTooltip(result, e.currentTarget)}
                       onfocus={(e) => openSpamTooltip(result, e.currentTarget)}
                       onmouseenter={(e) => openSpamTooltip(result, e.currentTarget)}
@@ -5250,7 +5349,9 @@
                       {m.search_spam_label()}
                     </button>
                     {#if spamTooltipKey === resultKey(result)}
-                      <div class="spam-tooltip" role="tooltip" style={spamTooltipStyle}>
+                      <!-- Live: the reasons usually arrive after focus has
+                           already read out the "Evaluating" placeholder. -->
+                      <div class="spam-tooltip" id="{resultRowId(rKey)}-spam-tip" role="tooltip" aria-live="polite" style={spamTooltipStyle}>
                         {#if spamExplainPending[resultKey(result)]}
                           <div class="spam-tooltip-title">{m.search_spam_evaluating()}</div>
                         {:else if spamExplainErrors[resultKey(result)]}
@@ -5534,20 +5635,24 @@
         <div class="ctx-sep" role="separator"></div>
         <!-- Greyed out with the reason as the tooltip rather than left to
              fail with a toast; see `spamMarkBlockedReason`. -->
-        <button
-          class="ctx-item"
-          role="menuitem"
-          disabled={!!spamMarkBlockedReason(contextMenu.result)}
-          title={spamMarkBlockedReason(contextMenu.result)}
-          onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}
-        >{m.search_mark_spam()}</button>
-        <button
-          class="ctx-item"
-          role="menuitem"
-          disabled={!!spamMarkBlockedReason(contextMenu.result)}
-          title={spamMarkBlockedReason(contextMenu.result)}
-          onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}
-        >{m.search_mark_not_spam()}</button>
+        <!-- One or the other, by the row's verdict, as eMule's toggle does. -->
+        {#if contextMenu.result.is_spam}
+          <button
+            class="ctx-item"
+            role="menuitem"
+            disabled={!!spamMarkBlockedReason(contextMenu.result)}
+            title={spamMarkBlockedReason(contextMenu.result)}
+            onclick={() => { if (contextMenu) handleMarkNotSpam(contextMenu.result); }}
+          >{m.search_mark_not_spam()}</button>
+        {:else}
+          <button
+            class="ctx-item"
+            role="menuitem"
+            disabled={!!spamMarkBlockedReason(contextMenu.result)}
+            title={spamMarkBlockedReason(contextMenu.result)}
+            onclick={() => { if (contextMenu) handleMarkSpam(contextMenu.result); }}
+          >{m.search_mark_spam()}</button>
+        {/if}
         {#if downloadHistoryMap[contextMenu.result.file.hash]}
           <div class="ctx-sep" role="separator"></div>
           <button
@@ -5650,7 +5755,7 @@
               {#if spamExplainLoading}
                 {m.search_evaluating()}
               {:else if selectedSpam}
-                {selectedSpam.score}/{selectedSpam.threshold}
+                {m.search_spam_score_value({ score: selectedSpam.score, threshold: selectedSpam.threshold })}
                 {#if selectedSpam.is_spam}
                   <span class="spam-chip">{m.search_spam_flagged({ profile: spamProfileText(selectedSpam.profile) })}</span>
                 {:else}
@@ -5732,7 +5837,12 @@
             <h4>{m.search_add_note()}</h4>
             <div class="note-form">
               <label for="note-rating">{m.search_rating_label()}</label>
-              <input id="note-rating" type="number" min="0" max="5" bind:value={noteRating} />
+              <select id="note-rating" bind:value={noteRating}>
+                <option value={0}>{m.search_rating_none()}</option>
+                {#each [1, 2, 3, 4, 5] as n (n)}
+                  <option value={n}>{m.search_rating_option({ count: formatNumber(n) })}</option>
+                {/each}
+              </select>
               <label for="note-comment">{m.search_comment_label()}</label>
               <input id="note-comment" type="text" maxlength="4096" bind:value={noteComment} placeholder={m.search_comment_placeholder()} />
               <button onclick={handlePublishNote} disabled={publishingNote || !selectedResult.file.hash}>{publishingNote ? m.search_publishing() : m.search_publish_note()}</button>
@@ -5744,6 +5854,14 @@
         </div>
         <div class="modal-footer">
           <button type="button" class="ghost" onclick={closeFileDetails}>{m.common_close()}</button>
+          <button
+            type="button"
+            disabled={isInLibraryOnly(selectedResult) || !!getBlockingDownloadTransfer(selectedResult) || !!downloadPending[resultKey(selectedResult)]}
+            title={isInLibraryOnly(selectedResult)
+              ? m.search_action_already_in_library_title()
+              : getBlockingDownloadTransfer(selectedResult) ? m.search_action_already_downloading_title() : undefined}
+            onclick={() => { if (selectedResult) void download(selectedResult); }}
+          >{m.search_ctx_download()}</button>
         </div>
         </div>
       </div>
@@ -5837,6 +5955,23 @@
   .type-select:focus {
     border-color: var(--accent);
     outline: none;
+  }
+
+  .search-type-field {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .search-type-field .type-select {
+    align-self: stretch;
+  }
+
+  .search-type-label {
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+    white-space: nowrap;
   }
 
   .search-tabs {
@@ -6304,8 +6439,29 @@
 
   .results-info-actions {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
+  }
+
+  .table-help {
+    align-self: auto;
+  }
+
+  .table-help summary {
+    width: 28px;
+    height: auto;
+    min-height: 0;
+    padding: 3px 0;
+    font-size: var(--font-size-sm);
+    border-radius: var(--radius-sm);
+  }
+
+  .table-help .syntax-popover p {
+    margin: 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    color: var(--text-secondary);
   }
 
   .column-menu {
@@ -6384,6 +6540,7 @@
 
   .bulk-actions {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 10px;
     padding: 8px 20px;
@@ -6986,10 +7143,6 @@
   .note-form label {
     font-size: var(--font-size-sm);
     color: var(--text-muted);
-  }
-
-  .note-form input[type="number"] {
-    width: 60px;
   }
 
   .note-form input[type="text"] {

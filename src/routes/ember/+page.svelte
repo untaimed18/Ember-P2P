@@ -1,10 +1,10 @@
 <script lang="ts">
   /*
-   * "Ember Network" page, laid out like the KAD page: routing contacts on
-   * the left, the network status panel on the right — status, reachability
-   * and sharing in plain language, then the counters — and the protocol
-   * tables in tabs underneath. Only what is on screen is polled: the
-   * contacts, and the table of the open tab.
+   * "Ember Network" page, and the one the app opens on. The network status
+   * panel comes first — status, reachability and sharing in plain language,
+   * then the counters — and the routing contacts and protocol tables wait
+   * under a collapsed "Technical details". Only what is on screen is polled:
+   * while that section is open, the contacts and the table of the open tab.
    *
    * The overlay is always on.
    */
@@ -48,6 +48,7 @@
   // by a profile backup.
   const LOWER_TAB_KEY = 'ember.page.lower-tab.v1';
   const GROWING_DISMISSED_KEY = 'ember.page.growing-dismissed.v1';
+  const DETAILS_OPEN_KEY = 'ember.page.details-open.v1';
   type LowerTab = 'searches' | 'store' | 'stats' | 'identity';
   const LOWER_TABS: LowerTab[] = ['searches', 'store', 'stats', 'identity'];
   function readFlag(key: string): boolean {
@@ -100,6 +101,14 @@
     growingDismissed = true;
     writeFlag(GROWING_DISMISSED_KEY, true);
   }
+  let detailsOpen = $state(readFlag(DETAILS_OPEN_KEY));
+  function onDetailsToggle(e: Event) {
+    const open = (e.currentTarget as HTMLDetailsElement).open;
+    if (open === detailsOpen) return;
+    detailsOpen = open;
+    writeFlag(DETAILS_OPEN_KEY, open);
+    if (open) void refreshLists();
+  }
   let showRestartPrompt = $state(false);
   let restarting = $state(false);
   let restartError = $state('');
@@ -137,8 +146,9 @@
     await refreshLists();
   }
 
-  // The contacts are always on screen; the search and store snapshots only
-  // under their own tab, so each tick asks for those alone. Guarded
+  // The contacts are on screen while Technical details is open; the search
+  // and store snapshots only under their own tab, so each tick asks for those
+  // alone. Guarded
   // separately from the diagnostics poll, so switching tabs fills the table
   // at once unless a list fetch is already in flight, which the next tick
   // then completes.
@@ -150,6 +160,7 @@
       storeEntries = [];
       return;
     }
+    if (!detailsOpen) return;
     inFlightLists = true;
     const tab = lowerTab;
     try {
@@ -656,7 +667,7 @@
   <div class="header-actions">
     <button
       type="button"
-      class="secondary"
+      class="ghost"
       onclick={() => { restartError = ''; showRestartPrompt = true; }}
       disabled={restarting}
     >
@@ -716,9 +727,105 @@
     <div class="banner banner-warn" role="status">{m.ember_version_mismatch_banner()}</div>
   {/if}
 
-  <div class="ember-upper">
-    <!-- Routing contacts, where the KAD page keeps its contact list. -->
-    <section class="ember-upper-left" aria-labelledby="ember-contacts-label">
+  <!-- The KAD page's Network Status panel, with Ember's own verdicts on top. -->
+  <section class="stats-panel" aria-label={m.kad_network_status()}>
+    <div class="panel-title">{m.kad_network_status()}</div>
+
+    <div class="status-body">
+      <div class="health-list" aria-live="polite">
+        <div class="health-item">
+          <div class="health-head">
+            <span class="stat-label-text">{m.kad_stat_status()}</span>
+            <span class="badge" class:tone-success={heroState === 'connected'} class:tone-warning={heroState === 'connecting' || heroState === 'no_peers'} class:tone-muted={heroState === 'loading'}>
+              {#if joining}<span class="spinner xs current" aria-hidden="true"></span>{/if}
+              {statusLabel}
+            </span>
+          </div>
+          {#if statusHint}<p class="health-hint">{statusHint}</p>{/if}
+        </div>
+
+        {#if isActive}
+          <div class="health-item">
+            <div class="health-head">
+              <span class="stat-label-text">{m.ember_health_reachability()}</span>
+              <span class="badge" class:tone-success={reachabilityTone === 'ok'} class:tone-warning={reachabilityTone === 'warn'} class:tone-muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
+            </div>
+            <p class="health-hint">{reachabilityHint}</p>
+            {#if relayedFix}<p class="health-hint">{relayedFix}</p>{/if}
+            <div class="health-tool"><PortTest /></div>
+          </div>
+
+          <div class="health-item">
+            <div class="health-head">
+              <span class="stat-label-text">{m.ember_health_sharing()}</span>
+              <span class="badge" class:tone-success={sharingTone === 'ok'} class:tone-warning={sharingTone === 'warn'} class:tone-muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
+            </div>
+            <p class="health-hint">{sharingHint}</p>
+          </div>
+        {/if}
+      </div>
+
+      <div class="status-readings">
+        {#if isActive}
+          <div class="stat-group stat-group-grid">
+            <div class="stat-tile">
+              <span class="stat-label" title={m.ember_overview_contacts()}>{m.ember_overview_contacts()}</span>
+              <span class="stat-value stat-numeric">{formatNumber(verifiedCount)}</span>
+            </div>
+            <div class="stat-tile">
+              <span class="stat-label" title={m.ember_stat_network_size()}>{m.ember_stat_network_size()}</span>
+              <span class="stat-value stat-numeric">{estimatedNodes}</span>
+            </div>
+            <div class="stat-tile" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
+              <span class="stat-label" title={m.ember_overview_published()}>{m.ember_overview_published()}</span>
+              <span class="stat-value stat-numeric">
+                {publishedTotal > 0 ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal }) : formatNumber(publishedCount)}
+              </span>
+            </div>
+            <div class="stat-tile">
+              <span class="stat-label" title={m.ember_stat_active_searches()}>{m.ember_stat_active_searches()}</span>
+              <span class="stat-value stat-numeric">{formatNumber(activeSearches)}</span>
+            </div>
+          </div>
+        {/if}
+
+        <!--
+          The readings behind the reachability verdict. Shown whatever the
+          overlay's state, because external IP, firewall and port mapping
+          describe this machine's connection rather than Ember. Same component
+          as the KAD page's panel, so the two cannot drift. The firewall and
+          IP come from KAD's own checks, which can disagree with Ember's
+          verdict above, so here they say so.
+        -->
+        <NetworkStatusTiles
+          kadSourced
+          relayTile={{
+            label: m.ember_relay_label(),
+            help: m.ember_relay_help(),
+            value: emberRelayValue,
+            title: emberRelayTitle,
+          }}
+        />
+      </div>
+    </div>
+
+    {#if isActive}
+      <div class="stats-actions">
+        <button type="button" class="ghost" onclick={() => copyText(diagnosticsText(), 'diagnostics')}>
+          {#if copiedKey === 'diagnostics'}{m.ember_copied()}
+          {:else if copiedKey === 'diagnostics:error'}{m.ember_copy_failed()}
+          {:else}{m.ember_copy_diagnostics()}{/if}
+        </button>
+      </div>
+    {/if}
+  </section>
+
+  <!-- Routing contacts and protocol tables: for diagnosing, not for knowing
+       whether Ember works, so they stay folded away until asked for. -->
+  <details class="ember-details" open={detailsOpen} ontoggle={onDetailsToggle}>
+    <summary class="details-summary">{m.ember_details_summary()}</summary>
+    <div class="details-body">
+    <section class="ember-contacts" aria-labelledby="ember-contacts-label">
       <div class="panel-toolbar">
         <span class="toolbar-label" id="ember-contacts-label">
           {m.ember_dht_contacts_title()}
@@ -819,97 +926,8 @@
       </div>
     </section>
 
-    <!-- The KAD page's Network Status panel, with Ember's own verdicts on top. -->
-    <div class="ember-upper-right scroll-shadows">
-      <section class="stats-panel" aria-label={m.kad_network_status()}>
-        <div class="panel-title">{m.kad_network_status()}</div>
-
-        <div class="health-list" aria-live="polite">
-          <div class="health-item">
-            <div class="health-head">
-              <span class="stat-label-text">{m.kad_stat_status()}</span>
-              <span class="badge" class:tone-success={heroState === 'connected'} class:tone-warning={heroState === 'connecting' || heroState === 'no_peers'} class:tone-muted={heroState === 'loading'}>
-                {#if joining}<span class="spinner xs current" aria-hidden="true"></span>{/if}
-                {statusLabel}
-              </span>
-            </div>
-            {#if statusHint}<p class="health-hint">{statusHint}</p>{/if}
-          </div>
-
-          {#if isActive}
-            <div class="health-item">
-              <div class="health-head">
-                <span class="stat-label-text">{m.ember_health_reachability()}</span>
-                <span class="badge" class:tone-success={reachabilityTone === 'ok'} class:tone-warning={reachabilityTone === 'warn'} class:tone-muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
-              </div>
-              <p class="health-hint">{reachabilityHint}</p>
-              {#if relayedFix}<p class="health-hint">{relayedFix}</p>{/if}
-              <div class="health-tool"><PortTest /></div>
-            </div>
-
-            <div class="health-item">
-              <div class="health-head">
-                <span class="stat-label-text">{m.ember_health_sharing()}</span>
-                <span class="badge" class:tone-success={sharingTone === 'ok'} class:tone-warning={sharingTone === 'warn'} class:tone-muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
-              </div>
-              <p class="health-hint">{sharingHint}</p>
-            </div>
-          {/if}
-        </div>
-
-        {#if isActive}
-          <div class="stat-group stat-group-grid">
-            <div class="stat-tile">
-              <span class="stat-label" title={m.ember_overview_contacts()}>{m.ember_overview_contacts()}</span>
-              <span class="stat-value stat-numeric">{formatNumber(verifiedCount)}</span>
-            </div>
-            <div class="stat-tile">
-              <span class="stat-label" title={m.ember_stat_network_size()}>{m.ember_stat_network_size()}</span>
-              <span class="stat-value stat-numeric">{estimatedNodes}</span>
-            </div>
-            <div class="stat-tile" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
-              <span class="stat-label" title={m.ember_overview_published()}>{m.ember_overview_published()}</span>
-              <span class="stat-value stat-numeric">
-                {publishedTotal > 0 ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal }) : formatNumber(publishedCount)}
-              </span>
-            </div>
-            <div class="stat-tile">
-              <span class="stat-label" title={m.ember_stat_active_searches()}>{m.ember_stat_active_searches()}</span>
-              <span class="stat-value stat-numeric">{formatNumber(activeSearches)}</span>
-            </div>
-          </div>
-        {/if}
-
-        <!--
-          The readings behind the reachability verdict. Shown whatever the
-          overlay's state, because external IP, firewall and port mapping
-          describe this machine's connection rather than Ember. Same component
-          as the KAD page's panel, so the two cannot drift.
-        -->
-        <NetworkStatusTiles
-          relayTile={{
-            label: m.ember_relay_label(),
-            help: m.ember_relay_help(),
-            value: emberRelayValue,
-            title: emberRelayTitle,
-          }}
-        />
-
-        {#if isActive}
-          <div class="stats-actions">
-            <button type="button" class="ghost" onclick={() => copyText(diagnosticsText(), 'diagnostics')}>
-              {#if copiedKey === 'diagnostics'}{m.ember_copied()}
-              {:else if copiedKey === 'diagnostics:error'}{m.ember_copy_failed()}
-              {:else}{m.ember_copy_diagnostics()}{/if}
-            </button>
-          </div>
-        {/if}
-      </section>
-    </div>
-  </div>
-
-  <!-- Protocol tables, where the KAD page keeps its searches. -->
-  <section class="ember-lower" aria-label={m.ember_details_summary()}>
+    <!-- Protocol tables, where the KAD page keeps its searches. -->
+    <section class="ember-lower" aria-label={m.ember_details_summary()}>
     <div class="lower-header">
       <div class="lower-tabs" role="tablist" aria-label={m.ember_details_summary()}>
         {#each [
@@ -1072,7 +1090,9 @@
         {/if}
       {/if}
     </div>
-  </section>
+    </section>
+    </div>
+  </details>
 </div>
 
 <!--
@@ -1100,9 +1120,9 @@
 
 <style>
   /*
-   * The KAD page's frame: a fixed header, then panels that fill the window
-   * and scroll inside themselves. Contacts on the left, the network status
-   * panel on the right, the protocol tables underneath.
+   * A fixed header, then the network status panel and the folded technical
+   * details, scrolling together. The tables inside the details keep fixed
+   * heights and scroll inside themselves.
    */
   .page-header {
     gap: 16px;
@@ -1126,21 +1146,53 @@
     flex: 1;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    min-height: 0;
+    overflow-y: auto;
     padding: var(--workspace-padding);
     gap: 12px;
     background: var(--bg-primary);
   }
 
-  .ember-upper {
-    display: flex;
-    flex: 1;
-    min-height: 0;
-    gap: 12px;
+  .ember-layout > * {
+    flex-shrink: 0;
   }
 
-  .ember-upper-left {
-    flex: 1;
+  /* --- Technical details: the routing table and protocol tables, folded --- */
+
+  .ember-details {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-sm);
+  }
+
+  .details-summary {
+    padding: 11px 14px;
+    font-size: var(--font-size-base);
+    font-weight: 600;
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-radius: var(--radius-lg);
+  }
+
+  .details-summary:hover {
+    color: var(--text-primary);
+  }
+
+  .details-summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
+  .details-body {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 0 12px 12px;
+  }
+
+  .ember-contacts {
+    height: 360px;
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -1148,16 +1200,6 @@
     border-radius: var(--radius-lg);
     overflow: hidden;
     background: var(--bg-secondary);
-    box-shadow: var(--shadow-sm);
-  }
-
-  .ember-upper-right {
-    width: 340px;
-    flex-shrink: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    overflow-y: auto;
   }
 
   /* --- Panel chrome, as on the KAD page --- */
@@ -1247,6 +1289,28 @@
     container-type: inline-size;
   }
 
+  /* The verdicts beside the readings behind them while there is room. */
+  .status-body {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 0 28px;
+    align-items: start;
+  }
+
+  .status-body .health-list {
+    border-bottom: none;
+  }
+
+  @container (max-width: 720px) {
+    .status-body {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .status-body .health-list {
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+    }
+  }
+
   /* Numeric readouts read at a glance, as on the KAD panel. */
   .stat-tile .stat-numeric {
     font-size: var(--font-size-xl);
@@ -1262,7 +1326,6 @@
   }
 
   .stats-actions button {
-    flex: 1;
     font-size: var(--font-size-sm);
     padding: 7px 10px;
     white-space: nowrap;
@@ -1515,16 +1578,13 @@
   /* --- Lower: the protocol tables in tabs --- */
 
   .ember-lower {
-    flex: 1 1 32%;
-    max-height: 42%;
+    height: 360px;
     display: flex;
     flex-direction: column;
-    min-height: 140px;
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     overflow: hidden;
     background: var(--bg-secondary);
-    box-shadow: var(--shadow-sm);
   }
 
   .lower-header {
@@ -1839,41 +1899,14 @@
 
   /* --- Smaller windows, the KAD page's breakpoints --- */
 
-  @media (max-height: 900px) {
-    .ember-lower {
-      flex: 0 1 30%;
-      max-height: 36%;
-      min-height: 120px;
-    }
-  }
-
   @media (max-width: 1200px) {
     .ember-layout {
       padding: 10px;
       gap: 10px;
-      overflow-y: auto;
     }
 
-    .ember-upper {
-      flex-direction: column;
-      gap: 10px;
-      flex: none;
-    }
-
-    .ember-upper-left {
-      min-height: 260px;
-      max-height: 420px;
-    }
-
-    .ember-upper-right {
-      width: 100%;
-      overflow: visible;
-    }
-
-    .ember-lower {
-      flex: none;
-      max-height: none;
-      height: 360px;
+    .ember-contacts {
+      height: 300px;
     }
   }
 

@@ -110,6 +110,9 @@
   let pendingBlock: { user_hash: string; nickname: string } | null = $state(null);
   /** Display name for the block dialog, kept for its outro like `removeDialog`. */
   let blockDialogName = $state('');
+  /** Blocking someone who only sent a request: there is no friendship or chat
+   *  to remove, so the dialog says what blocking them does instead. */
+  let blockDialogRequest = $state(false);
   let blocked: BlockedInfo[] = $state([]);
   let blockedOpen = $state(false);
   let unblocking: Set<string> = $state(new Set());
@@ -606,9 +609,11 @@
     await Promise.all([loadFriends(), reloadFriendRequests(), loadBlocked()]);
   }
 
-  function confirmBlock(user_hash: string, nickname: string) {
+  function confirmBlock(user_hash: string, nickname: string, fromRequest = false) {
     pendingBlock = { user_hash, nickname };
     blockDialogName = nickname || user_hash.slice(0, 8) + '\u2026';
+    blockDialogRequest =
+      fromRequest && !friends.some((f) => f.user_hash.toLowerCase() === user_hash.toLowerCase());
     confirmBlockOpen = true;
   }
 
@@ -795,8 +800,8 @@
     saveEditPending = true;
     const hash = editingHash;
     const nick = editNickname.trim();
+    // The editor stays open and says why next to the field.
     if (friendNameTooLong(nick)) {
-      error = m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_CHARS });
       saveEditPending = false;
       return;
     }
@@ -980,7 +985,9 @@
 <ConfirmDialog
   bind:open={confirmBlockOpen}
   title={m.friends_confirm_block_title()}
-  message={m.friends_confirm_block_message({ name: blockDialogName })}
+  message={blockDialogRequest
+    ? m.friends_confirm_block_request_message({ name: blockDialogName })
+    : m.friends_confirm_block_message({ name: blockDialogName })}
   confirmLabel={m.friends_block()}
   danger={true}
   onconfirm={handleBlock}
@@ -1085,7 +1092,7 @@
     {/if}
   </div>
 
-  <!-- Your Friend ID + network status -->
+  <!-- Your Friend Code + network status -->
   {#if myHash}
     <div class="my-id-card">
       <div class="my-id-left">
@@ -1274,7 +1281,7 @@
                   escaping prevents XSS; this closes the
                   bidi-spoofing presentation gap.
                 -->
-                <bdi dir="auto">{req.sender_nickname || m.friends_unknown_sender()}</bdi>
+                <bdi dir="auto" title={req.sender_nickname || undefined}>{req.sender_nickname || m.friends_unknown_sender()}</bdi>
                 {#if req.verified}
                   <!-- "Verified" badge: see commit history for the
                        cryptographic semantics. -->
@@ -1293,7 +1300,7 @@
               <!-- Rejecting only clears the row; the same stranger can ask
                    again immediately. Blocking from here is the way to make
                    a persistent requester stop. -->
-              <button class="request-block" onclick={() => confirmBlock(req.sender_hash, req.sender_nickname)} disabled={processingRequests.has(req.sender_hash)} aria-label={m.friends_block_aria({ name: reqName })}>{m.friends_block()}</button>
+              <button class="request-block" onclick={() => confirmBlock(req.sender_hash, req.sender_nickname, true)} disabled={processingRequests.has(req.sender_hash)} aria-label={m.friends_block_aria({ name: reqName })}>{m.friends_block()}</button>
             </div>
           </div>
         {/each}
@@ -1442,7 +1449,7 @@
       section headers above already group online vs offline, and unread is
       counted on the Chat button, the same pill the room list and the dock
       use, whatever the status line is busy saying. Reference
-      data (Friend ID, last address, added date) and the secondary actions live
+      data (internal ID, last address, added date) and the secondary actions live
       in the overflow menu so the resting card is name + status + Chat.
     -->
     {#snippet friendCard(f: FriendInfo, isOnline: boolean)}
@@ -1486,7 +1493,13 @@
               use:autoFocus
               aria-label={m.friends_nickname_edit_placeholder()}
               aria-invalid={friendNameTooLong(editNickname)}
+              aria-describedby={friendNameTooLong(editNickname) ? `edit-error-${f.user_hash}` : undefined}
             />
+            {#if friendNameTooLong(editNickname)}
+              <span id="edit-error-{f.user_hash}" class="edit-error" role="alert">
+                {m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_CHARS })}
+              </span>
+            {/if}
           {:else}
             <div class="card-name-row">
               <button class="nick-btn" onclick={() => startEdit(f)} title={m.friends_edit_nickname_title()} aria-label={m.friends_edit_nickname_aria({ name: f.nickname ? shortName : m.friends_no_nickname() })}>
@@ -1625,8 +1638,9 @@
                   title={m.friends_action_reconnect_title()}
                 >{searching ? m.friends_status_searching() : m.friends_action_reconnect()}</button>
               {/if}
-              <!-- The ID lives on the action that uses it, so the reference
-                   value is one hover away without sitting on every card.
+              <!-- The internal ID no longer finds anyone, so it is offered for
+                   troubleshooting only and named so it is not mistaken for
+                   the shareable Friend Code.
                    Deliberately does NOT close the menu: the label flips to
                    "Copied!" for 1.5s, which the user could not see otherwise. -->
               <button
@@ -1634,7 +1648,7 @@
                 role="menuitem"
                 class="menu-item-stacked"
                 onclick={() => copyHash(f.user_hash)}
-                title={f.user_hash}
+                title={`${m.friends_copy_id_hint()}\n${f.user_hash}`}
                 aria-label={copiedHash === f.user_hash
                   ? m.friends_copied_id_aria()
                   : m.friends_copy_id_aria({ name: shortName })}
@@ -2307,6 +2321,15 @@
     box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
+  .edit-input[aria-invalid='true'] {
+    border-color: var(--danger);
+  }
+
+  .edit-error {
+    font-size: var(--font-size-xs);
+    color: var(--danger);
+  }
+
   @keyframes badge-pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
@@ -2744,6 +2767,7 @@
 
   .request-card {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 12px;
     padding: 10px 16px;
@@ -2770,8 +2794,10 @@
     height: 16px;
   }
 
+  /* The basis is what pushes the actions onto their own line when the card
+     is too narrow for both, rather than squeezing the name to nothing. */
   .request-info {
-    flex: 1;
+    flex: 1 1 160px;
     min-width: 0;
     display: flex;
     flex-direction: column;
@@ -2788,6 +2814,13 @@
     display: flex;
     align-items: center;
     gap: 6px;
+  }
+
+  .request-name bdi {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .request-hash {
@@ -2812,7 +2845,7 @@
     letter-spacing: 0.4px;
     padding: 1px 6px;
     border-radius: var(--radius-pill);
-    flex-shrink: 0;
+    flex: none;
   }
   .request-badge-verified {
     background: color-mix(in srgb, var(--success) 18%, transparent);
@@ -2832,8 +2865,10 @@
 
   .request-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
-    flex-shrink: 0;
+    min-width: 0;
+    margin-inline-start: auto;
   }
 
   .request-accept {

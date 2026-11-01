@@ -66,6 +66,7 @@
   let lastEmptyRefresh = 0;
   let rechecking = $state(false);
   let recheckTimer: ReturnType<typeof setTimeout> | undefined;
+  let kadUsersHelpOpen = $state(false);
 
   let bootstrapOpen = $state(false);
   let bootstrapMode: BootstrapMode = $state('ip');
@@ -1135,7 +1136,17 @@
             <span class="stat-value stat-numeric">{formatNumber(contacts.length)}</span>
           </div>
           <div class="stat-tile">
-            <span class="stat-label" title={m.kad_stat_kad_users_title()}>{m.kad_stat_kad_users()}</span>
+            <span class="stat-label-row">
+              <span class="stat-label" title={m.kad_stat_kad_users_title()}>{m.kad_stat_kad_users()}</span>
+              <button
+                type="button"
+                class="term-help"
+                aria-expanded={kadUsersHelpOpen}
+                aria-controls="kad-users-help"
+                aria-label={m.kad_explain_term({ term: m.kad_stat_kad_users() })}
+                onclick={() => (kadUsersHelpOpen = !kadUsersHelpOpen)}
+              >?</button>
+            </span>
             <span class="stat-value stat-numeric">
               {$networkStats.status === 'disconnected' || $networkStats.kad_users_estimate == null
                 ? '—'
@@ -1143,6 +1154,7 @@
             </span>
           </div>
         </div>
+        <p class="tile-help" id="kad-users-help" hidden={!kadUsersHelpOpen}>{m.kad_stat_kad_users_title()}</p>
 
         <NetworkStatusTiles />
 
@@ -1792,6 +1804,57 @@
 
   .tile-wide {
     grid-column: span 1;
+  }
+
+  /* The explanation behind a term, on a button so the keyboard and touch
+     reach it too; same look as `NetworkStatusTiles`' own. */
+  .stat-label-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .stat-label-row .stat-label {
+    min-width: 0;
+  }
+
+  .term-help {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .term-help:hover,
+  .term-help[aria-expanded='true'] {
+    background: transparent;
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .term-help:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .tile-help {
+    margin: 6px 0 8px;
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    color: var(--text-secondary);
   }
 
   /* Numeric readouts get the larger "stat card" treatment so peer

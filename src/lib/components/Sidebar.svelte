@@ -442,16 +442,20 @@
         <ul class="nav-items">
     {#each run.entries as { item, index } (item.id)}
       {@const digit = navShortcutDigit(index)}
+      {@const settings = item.id === 'settings'}
       <li>
         <a
           href={item.href}
           class:active={isActive(item, $page.url.pathname)}
           aria-current={isActive(item, $page.url.pathname) ? 'page' : undefined}
-          aria-keyshortcuts={digit ? `Alt+${digit}` : undefined}
+          aria-keyshortcuts={[digit ? `Alt+${digit}` : '', settings ? `${shortcutModAria()}+,` : '']
+            .filter(Boolean).join(' ') || undefined}
           onclick={(e: MouseEvent) => navigate(e, item.href)}
-          title={digit
-            ? m.sidebar_nav_with_shortcut_title({ label: item.label(), n: digit })
-            : item.label()}
+          title={settings
+            ? m.sidebar_nav_with_mod_title({ label: item.label(), mod: shortcutModSymbol() })
+            : digit
+              ? m.sidebar_nav_with_shortcut_title({ label: item.label(), n: digit })
+              : item.label()}
         >
           <span class="nav-icon" aria-hidden="true">
             {#if item.id === 'kad'}
@@ -532,39 +536,46 @@
           {#if item.id === 'friends' || item.id === 'feeds'}
             <span class="beta-badge">{m.common_beta()}</span>
           {/if}
+          <!-- Each count is drawn as a bare number and spoken as what it
+               counts: a link read as "Transfers 2 1" says nothing. -->
           {#if item.id === 'feeds' && $totalFeedUnread > 0}
-            <span class="nav-badge" title={m.feeds_unread_title({ count: $totalFeedUnread })}>{navCount($totalFeedUnread)}</span>
+            {@const what = m.feeds_unread_title({ count: $totalFeedUnread })}
+            <span class="nav-badge" title={what}><span aria-hidden="true">{navCount($totalFeedUnread)}</span><span class="sr-only">{what}</span></span>
           {/if}
           {#if item.id === 'transfers' && activeTransferCount > 0}
             <span class="nav-transfer-counts">
               {#if activeDownloadCount > 0}
                 <span class="tc-chip tc-down" title={downloadsTitle(activeDownloadCount)}>
-                  <span class="tc-arrow" aria-hidden="true">↓</span>{navCount(activeDownloadCount)}
+                  <span class="tc-arrow" aria-hidden="true">↓</span><span aria-hidden="true">{navCount(activeDownloadCount)}</span>
+                  <span class="sr-only">{downloadsTitle(activeDownloadCount)}</span>
                 </span>
               {/if}
               {#if activeUploadCount > 0}
                 <span class="tc-chip tc-up" title={uploadsTitle(activeUploadCount)}>
-                  <span class="tc-arrow" aria-hidden="true">↑</span>{navCount(activeUploadCount)}
+                  <span class="tc-arrow" aria-hidden="true">↑</span><span aria-hidden="true">{navCount(activeUploadCount)}</span>
+                  <span class="sr-only">{uploadsTitle(activeUploadCount)}</span>
                 </span>
               {/if}
             </span>
             <span
               class="nav-badge nav-badge-collapsed"
               title={transfersTitle(activeDownloadCount, activeUploadCount)}
-            >{navCount(activeTransferCount)}</span>
+            ><span aria-hidden="true">{navCount(activeTransferCount)}</span><span class="sr-only">{transfersTitle(activeDownloadCount, activeUploadCount)}</span></span>
           {/if}
           {#if item.id === 'friends' && pendingFriendInboxCount > 0}
+            {@const what = friendInboxTitle(pendingFriendRequestCount, pendingFileOfferCount)}
             <span
               class="nav-badge nav-badge-attention"
-              title={friendInboxTitle(pendingFriendRequestCount, pendingFileOfferCount)}
-            >{navCount(pendingFriendInboxCount)}</span>
+              title={what}
+            ><span aria-hidden="true">{navCount(pendingFriendInboxCount)}</span><span class="sr-only">{what}</span></span>
           {/if}
           {#if item.id === 'channels' && channelInboxCount > 0}
+            {@const what = channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount, dmRequestCount)}
             <span
               class="nav-badge"
               class:nav-badge-attention={awaitingChannelOfferCount > 0 || dmRequestCount > 0}
-              title={channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount, dmRequestCount)}
-            >{navCount(channelInboxCount)}</span>
+              title={what}
+            ><span aria-hidden="true">{navCount(channelInboxCount)}</span><span class="sr-only">{what}</span></span>
           {/if}
         </a>
       </li>
@@ -1035,9 +1046,23 @@
     justify-content: center;
   }
 
-  .sidebar.collapsed .nav-label,
   .sidebar.collapsed .beta-badge {
     display: none;
+  }
+
+  /* Hidden from sight only: with `display: none` the link was named by its
+     count badge alone. Same recipe as the global `.sr-only`, which scoped
+     styles can't reach. */
+  .sidebar.collapsed .nav-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
   }
 
   .nav-label {

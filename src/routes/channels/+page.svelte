@@ -23,7 +23,7 @@
   } from '$lib/channelLanguages';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
   import { closeDmTab, dmPreview, dmRequests, keepDmTab, openPrivateChat, refreshDmThreads } from '$lib/stores/roomDm';
-  import { answerRoomDmRequest, dropRoomDmRequest } from '$lib/api/roomDm';
+  import { answerRoomDmRequest, dropRoomDmRequest, type RoomDmThread } from '$lib/api/roomDm';
   import {
     copyToClipboard,
     disambiguatedMemberName,
@@ -41,7 +41,7 @@
     xferSecondsLeft,
     type RateSamples,
   } from '$lib/xferRate';
-  import { toast, toastError, toastSuccess } from '$lib/stores/toast';
+  import { addActionToast, toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import {
@@ -183,6 +183,8 @@
   /** True for any Discover walk, including the 60s refresh. The Find button
    *  uses `discovering` so a background walk does not lock the control. */
   let gatherInFlight = $state(false);
+  /** A Discover walk has finished on this visit, so an empty list is empty. */
+  let directorySearched = $state(false);
   /** Which walk the shard events arriving now belong to. Random rather than a
    *  counter: a previous visit's walk can still be emitting after this page has
    *  remounted, and a counter would have restarted at the same number. */
@@ -569,11 +571,28 @@
     renameDraft = selected?.name ?? '';
   }
 
+  /** A typed name, topic or welcome that was never saved. The other settings
+   *  save as they are changed. */
+  let roomSettingsDirty = $derived(
+    !!selected
+      && ((editingModeration && (editTopic !== selected.topic || editWelcome !== selected.welcome))
+        || (!!renameDraft.trim() && renameDraft.trim() !== selected.name)),
+  );
+  let discardSettingsOpen = $state(false);
+
+  function requestCloseRoomSettings() {
+    if (roomSettingsDirty && !savingModeration && !renaming) {
+      discardSettingsOpen = true;
+      return;
+    }
+    closeRoomSettings();
+  }
+
   function onRoomSettingsKey(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      closeRoomSettings();
+      requestCloseRoomSettings();
       return;
     }
     trapTabKey(e, roomSettingsEl);
@@ -1246,7 +1265,7 @@
   async function openListRow(ch: ChannelInfo) {
     listHighlightId = null;
     if (!ch.in_room) {
-      void joinCard(ch);
+      previewId = ch.channel_id;
       return;
     }
     listQuery = '';
@@ -1349,7 +1368,7 @@
       return;
     }
     if (roomInfoOpen) {
-      closeRoomSettings();
+      requestCloseRoomSettings();
       e.preventDefault();
       return;
     }
@@ -1530,6 +1549,47 @@
       if (holdsBanner) answeringDm = null;
       void refreshDmThreads();
     }
+  }
+
+  /** Requests declined or ignored from their banner while the Undo is still
+   *  on offer. The answer goes out only when the toast does, since both drop
+   *  what they wrote; until then the banner is only hidden. */
+  let dmAnswersHeld = $state<string[]>([]);
+  let shownDmRequests = $derived($dmRequests.filter((r) => !dmAnswersHeld.includes(r.member_pubkey)));
+  let dmRequestsOpen = $state(false);
+
+  function holdDmAnswer(member: string, message: string, answer: () => Promise<void>) {
+    dmAnswersHeld = [...dmAnswersHeld, member];
+    const release = () => {
+      dmAnswersHeld = dmAnswersHeld.filter((key) => key !== member);
+    };
+    addActionToast(
+      'info',
+      message,
+      { label: m.common_undo(), undo: true, run: release },
+      async () => {
+        try {
+          await answer();
+          await refreshDmThreads();
+        } finally {
+          release();
+        }
+      },
+    );
+  }
+
+  function declineDmRequest(member: string, name: string) {
+    holdDmAnswer(member, m.channels_dm_declined_toast({ name }), async () => {
+      try {
+        await answerRoomDmRequest(member, false);
+      } catch (e) {
+        toastError(translateError(e, m.error_operation_failed()));
+      }
+    });
+  }
+
+  function ignoreDmRequester(member: string, name: string) {
+    holdDmAnswer(member, m.channels_dm_ignoring_toast({ name }), () => ignoreEverywhereSilently(member, name));
   }
 
   function askRemoveDeletedElsewhere(room: RoomDeletedElsewhere) {
@@ -1814,12 +1874,6 @@
     untrack(() => {
       if (membersFor !== id && !membersLoading && !membersError) void refreshMembers(id);
     });
-  });
-
-  $effect(() => {
-    if (emberOff) {
-      goto('/ember').catch(() => {});
-    }
   });
 
   $effect(() => {
@@ -2239,6 +2293,7 @@
       // this invocation then forgets. Clearing `discovering` only if no
       // walk started under us avoids wiping that Find's Searching label.
       gatherInFlight = false;
+      directorySearched = true;
       const shouldNotify = notifyEmpty || pendingNotifyEmpty;
       pendingNotifyEmpty = false;
       if (shouldNotify) {
@@ -2255,9 +2310,53 @@
     await refreshDirectory(true);
   }
 
+  /** A Discover row opened to look at before joining. Read from the list, so
+   *  it closes by itself once the room is joined or drops out of it. */
+  let previewId = $state<string | null>(null);
+  let previewRoom = $derived(
+    previewId ? directoryList.find((c) => c.channel_id === previewId && !c.in_room) ?? null : null,
+  );
+  let previewOverlayEl = $state<HTMLDivElement>();
+  let previewEl = $state<HTMLDivElement>();
+  let previewBackdropPress = false;
+
+  $effect(() => {
+    if (!previewRoom || !previewOverlayEl) return;
+    return inertBackground(previewOverlayEl);
+  });
+
+  $effect(() => {
+    if (!previewId) return;
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    void tick().then(() => {
+      (previewEl?.querySelector<HTMLElement>('.room-preview-join:not(:disabled)') ?? previewEl)?.focus();
+    });
+    return () => {
+      if (opener?.isConnected) opener.focus();
+    };
+  });
+
+  $effect(() => {
+    if (previewId && !previewRoom) previewId = null;
+  });
+
+  function onPreviewKey(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      previewId = null;
+      return;
+    }
+    trapTabKey(e, previewEl);
+  }
+
+  function joinFromPreview(ch: ChannelInfo) {
+    previewId = null;
+    void joinCard(ch);
+  }
+
   async function joinCard(ch: ChannelInfo) {
     if (needsUsername) {
-      // The row itself stays clickable, so say why nothing happened.
       toast(m.channels_username_required());
       return;
     }
@@ -3210,11 +3309,11 @@
     </div>
   {/if}
 
-  {#each $dmRequests as request (request.member_pubkey)}
+  {#snippet dmRequestRow(request: RoomDmThread, className: string)}
     <!-- Someone in a room wrote privately first. Nothing of it counts as
          unread until it is accepted. -->
     {@const requestName = request.name || m.channels_dm_someone()}
-    <div class="banner dm-request-banner" role="region" aria-label={m.channels_dm_request_banner({ name: requestName })}>
+    <div class={className} role="region" aria-label={m.channels_dm_request_banner({ name: requestName })}>
       <span>
         {m.channels_dm_request_banner({ name: requestName })}
         {#if request.last_text}
@@ -3225,24 +3324,49 @@
         <button class="ghost" onclick={() => openPrivateChat(request.member_pubkey, request.name)}>
           {m.channels_dm_open()}
         </button>
-        <button class="ghost" disabled={answeringDm !== null} onclick={() => void answerDmRequest(request.member_pubkey, true, request.name)}>
+        <button class="primary" disabled={answeringDm !== null} onclick={() => void answerDmRequest(request.member_pubkey, true, request.name)}>
           {m.channels_dm_accept()}
         </button>
-        <button class="ghost" disabled={answeringDm !== null} onclick={() => void answerDmRequest(request.member_pubkey, false)}>
+        <button class="ghost" disabled={answeringDm !== null} onclick={() => declineDmRequest(request.member_pubkey, requestName)}>
           {m.channels_dm_decline()}
         </button>
         <!-- Sends them nothing: the request goes, and whatever they send
              next anywhere is dropped. -->
         <button
-          class="ghost"
+          class="ghost dm-request-ignore"
           disabled={answeringDm !== null}
-          onclick={() => void ignoreEverywhereSilently(request.member_pubkey, request.name)}
+          onclick={() => ignoreDmRequester(request.member_pubkey, request.name)}
         >
           {m.channels_ignore_everywhere()}
         </button>
       </div>
     </div>
-  {/each}
+  {/snippet}
+
+  {#if shownDmRequests.length > 1}
+    <div class="banner dm-request-group">
+      <div class="dm-request-group-head">
+        <span>{m.channels_dm_requests_title({ count: shownDmRequests.length })}</span>
+        <button
+          class="ghost"
+          aria-expanded={dmRequestsOpen}
+          aria-controls="dm-request-list"
+          onclick={() => (dmRequestsOpen = !dmRequestsOpen)}
+        >{dmRequestsOpen ? m.channels_dm_requests_hide() : m.channels_dm_requests_show()}</button>
+      </div>
+      {#if dmRequestsOpen}
+        <div id="dm-request-list" class="dm-request-list">
+          {#each shownDmRequests as request (request.member_pubkey)}
+            {@render dmRequestRow(request, 'dm-request-item')}
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {:else}
+    {#each shownDmRequests as request (request.member_pubkey)}
+      {@render dmRequestRow(request, 'banner dm-request-banner')}
+    {/each}
+  {/if}
 
   {#each deletedElsewhere as room (room.channel_id)}
     <!-- The registry says this room was deleted, but this device still runs
@@ -3378,6 +3502,11 @@
           <p>{m.common_loading()}</p>
         {/if}
       </div>
+    {:else if directoryList.length === 0 && ((gatherInFlight && !directorySearched) || discovering)}
+      <div class="empty-state" role="status">
+        <div class="spinner lg"></div>
+        <p>{m.channels_looking_for_rooms()}</p>
+      </div>
     {:else if directoryList.length === 0}
       <div class="empty-state">
         <div class="empty-icon">
@@ -3410,6 +3539,7 @@
             disabled={needsUsername}
             title={needsUsername ? m.channels_username_required() : undefined}
           >{m.channels_join_title()}</button>
+          <button class="ghost" onclick={handleDiscover} disabled={discovering}>{m.channels_discover()}</button>
         </div>
       </div>
     {:else}
@@ -3573,14 +3703,12 @@
                     type="button"
                     class="chan-row-main"
                     aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
-                    aria-label={ch.in_room ? undefined : m.channels_join_room_aria({ name: ch.name })}
+                    aria-haspopup={ch.in_room ? undefined : 'dialog'}
                     aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
-                    aria-disabled={!ch.in_room && needsUsername ? 'true' : undefined}
-                    title={!ch.in_room && needsUsername ? m.channels_username_required() : undefined}
                     disabled={!ch.in_room && joiningIds.includes(ch.channel_id)}
                     onclick={() => {
                       if (ch.in_room) void selectChannel(ch.channel_id);
-                      else void joinCard(ch);
+                      else previewId = ch.channel_id;
                     }}
                   >
                     <div
@@ -3729,16 +3857,19 @@
                         class="chan-door chan-join"
                         disabled={joiningIds.includes(ch.channel_id) || needsUsername}
                         title={needsUsername ? m.channels_username_required() : undefined}
+                        aria-label={joiningIds.includes(ch.channel_id) ? undefined : m.channels_join_room_aria({ name: ch.name })}
                         onclick={() => joinCard(ch)}
                       >{joiningIds.includes(ch.channel_id)
                         ? m.channels_joining()
                         : m.channels_join()}</button>
                       {#if !ch.is_owner}
+                        {@const stored = storedChannelIds.has(ch.channel_id)}
                         <button
                           type="button"
                           class="chan-forget"
-                          title={storedChannelIds.has(ch.channel_id) ? m.channels_forget() : m.channels_hide_listing()}
-                          aria-label={storedChannelIds.has(ch.channel_id)
+                          class:hide-listing={!stored}
+                          title={stored ? m.channels_forget() : m.channels_hide_listing()}
+                          aria-label={stored
                             ? m.channels_forget_aria({ name: ch.name })
                             : m.channels_hide_listing_aria({ name: ch.name })}
                           disabled={forgettingIds.includes(ch.channel_id)
@@ -3746,9 +3877,15 @@
                           onclick={() => requestForget(ch.channel_id)}
                         >
                           <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                            <path d="M2.5 4.5h11"/>
-                            <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
-                            <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
+                            {#if stored}
+                              <path d="M2.5 4.5h11"/>
+                              <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
+                              <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
+                            {:else}
+                              <path d="M1.8 8S4 3.8 8 3.8 14.2 8 14.2 8 12 12.2 8 12.2 1.8 8 1.8 8z"/>
+                              <circle cx="8" cy="8" r="1.9"/>
+                              <path d="M2.5 2.5l11 11"/>
+                            {/if}
                           </svg>
                         </button>
                       {/if}
@@ -4032,14 +4169,22 @@
                 <!-- Splits the four view toggles from the two actions that
                      actually change something. -->
                 <span class="conv-actions-sep" aria-hidden="true"></span>
-                <!-- Disabled with the reason rather than failing after the
+                <!-- Unavailable with the reason rather than failing after the
                      click: the backend refuses non-owners here. -->
                 <button
                   class="ghost conv-action"
-                  disabled={copyingInvite || invitesClosed}
+                  disabled={copyingInvite}
+                  aria-disabled={invitesClosed ? 'true' : undefined}
+                  aria-describedby={invitesClosed ? 'copy-invite-why' : undefined}
                   title={invitesClosed ? m.error_channels_invites_owner_only() : undefined}
-                  onclick={handleCopyInvite}
+                  onclick={() => {
+                    if (invitesClosed) toast(m.error_channels_invites_owner_only());
+                    else void handleCopyInvite();
+                  }}
                 >{copyingInvite ? m.channels_copying_invite() : m.channels_invite()}</button>
+                {#if invitesClosed}
+                  <span class="sr-only" id="copy-invite-why">{m.error_channels_invites_owner_only()}</span>
+                {/if}
                 <!-- Delete room used to sit here, identical red text one gap
                      away from Leave. Only one of the two can be undone, so it
                      moved in beside the owner's other room settings. -->
@@ -4419,6 +4564,24 @@
                       </span>
                     </div>
                     {#if memberHasMenu(mem)}
+                      {@const sendFileBlocked = selectedBanned
+                        ? m.channels_you_are_banned()
+                        : mem.banned
+                          ? m.channels_send_file_member_banned()
+                          : sendingTo.includes(mem.member_pubkey)
+                            ? m.channels_send_file_busy()
+                            : null}
+                      {@const dmBlocked = selectedBanned
+                        ? m.channels_you_are_banned()
+                        : mem.banned
+                          ? m.channels_dm_member_banned()
+                          : friendRelation === 'mutual'
+                            ? m.channels_dm_is_friend()
+                            : ignoreScope !== 'none'
+                              ? m.channels_dm_ignored()
+                              : $appSettings?.room_dm_policy === 'off'
+                                ? m.channels_dm_policy_off()
+                                : null}
                       <details class="card-more">
                         <summary class="card-more-btn" title={m.common_more()} aria-haspopup="menu" aria-label={m.common_more()}>
                           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -4427,39 +4590,25 @@
                             <circle cx="12.5" cy="8" r="1.4"/>
                           </svg>
                         </summary>
+                        <!-- Unavailable items stay in the arrow-key walk with
+                             their reason said beside them, not only on hover. -->
                         <div class="card-more-menu" role="menu">
                           <button
                             type="button"
                             role="menuitem"
                             tabindex="-1"
-                            disabled={sendingTo.includes(mem.member_pubkey) || mem.banned || selectedBanned}
-                            title={selectedBanned
-                              ? m.channels_you_are_banned()
-                              : mem.banned
-                                ? m.channels_send_file_member_banned()
-                                : sendingTo.includes(mem.member_pubkey)
-                                  ? m.channels_send_file_busy()
-                                  : undefined}
-                            onclick={(e) => { closeCardMenu(e.currentTarget); handleSendFile(mem); }}
-                          >{m.channels_send_file()}</button>
+                            aria-disabled={sendFileBlocked ? 'true' : undefined}
+                            aria-describedby={sendFileBlocked ? `member-file-why-${mem.member_pubkey}` : undefined}
+                            onclick={(e) => { if (sendFileBlocked) return; closeCardMenu(e.currentTarget); handleSendFile(mem); }}
+                          >{m.channels_send_file()}{#if sendFileBlocked}<span class="menu-reason" id="member-file-why-{mem.member_pubkey}" aria-hidden="true">{sendFileBlocked}</span>{/if}</button>
                           <button
                             type="button"
                             role="menuitem"
                             tabindex="-1"
-                            disabled={mem.banned || selectedBanned || friendRelation === 'mutual' || ignoreScope !== 'none' || $appSettings?.room_dm_policy === 'off'}
-                            title={selectedBanned
-                              ? m.channels_you_are_banned()
-                              : mem.banned
-                                ? m.channels_dm_member_banned()
-                                : friendRelation === 'mutual'
-                                  ? m.channels_dm_is_friend()
-                                  : ignoreScope !== 'none'
-                                    ? m.channels_dm_ignored()
-                                    : $appSettings?.room_dm_policy === 'off'
-                                      ? m.channels_dm_policy_off()
-                                      : undefined}
-                            onclick={(e) => { closeCardMenu(e.currentTarget); openPrivateChat(mem.member_pubkey, mem.nickname || roomMemberLabel(mem)); }}
-                          >{m.channels_dm_message_privately()}</button>
+                            aria-disabled={dmBlocked ? 'true' : undefined}
+                            aria-describedby={dmBlocked ? `member-dm-why-${mem.member_pubkey}` : undefined}
+                            onclick={(e) => { if (dmBlocked) return; closeCardMenu(e.currentTarget); openPrivateChat(mem.member_pubkey, mem.nickname || roomMemberLabel(mem)); }}
+                          >{m.channels_dm_message_privately()}{#if dmBlocked}<span class="menu-reason" id="member-dm-why-{mem.member_pubkey}" aria-hidden="true">{dmBlocked}</span>{/if}</button>
                           <button
                             type="button"
                             role="menuitem"
@@ -4739,6 +4888,90 @@
   {/if}
 </div>
 
+{#if previewRoom}
+  {@const ch = previewRoom}
+  {@const memberCount = directoryMemberCount(ch)}
+  {@const joining = joiningIds.includes(ch.channel_id)}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay"
+    bind:this={previewOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="room-preview-title"
+    aria-describedby="room-preview-hint"
+    tabindex="-1"
+    onpointerdown={(e) => (previewBackdropPress = e.target === e.currentTarget)}
+    onclick={(e) => {
+      if (previewBackdropPress && e.target === e.currentTarget) previewId = null;
+    }}
+    onkeydown={onPreviewKey}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+  >
+    <div
+      class="modal-content room-preview"
+      bind:this={previewEl}
+      tabindex="-1"
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
+      <div class="modal-header">
+        <div class="room-settings-heading">
+          <span id="room-preview-title" class="modal-title room-preview-name"><bdi dir="auto">{ch.name}</bdi></span>
+          <span class="room-settings-room">{m.channels_public_badge()}</span>
+        </div>
+        <button type="button" class="icon-close" onclick={() => (previewId = null)} title={m.common_close()} aria-label={m.common_close()}>
+          <IconX size={15} />
+        </button>
+      </div>
+      <div class="modal-body room-preview-body">
+        {#if ch.topic.trim()}
+          <p class="room-preview-topic"><bdi dir="auto">{ch.topic}</bdi></p>
+        {/if}
+        <ul class="room-preview-facts">
+          {#if memberCount !== null}
+            <li>{plural(memberCount, {
+              one: () => m.channels_members_one({ count: memberCount }),
+              oneShowsCount: true,
+              few: () => m.channels_members_few({ count: memberCount }),
+              other: () => m.channels_members_n({ count: memberCount }),
+            })}</li>
+          {/if}
+          {#if isChannelLanguage(ch.language)}
+            {@const languageName = channelLanguageName(ch.language)}
+            <li class="room-preview-language">
+              <img class="chan-flag" src={channelLanguageFlagSrc(ch.language)} alt="" />
+              {m.channels_language_flag_title({ language: languageName })}
+            </li>
+          {/if}
+          {#if ch.successor_id}
+            <li>{m.channels_transferred_badge()}</li>
+          {/if}
+          {#if likelySpamIds.has(ch.channel_id)}
+            <li class="room-preview-warn">{m.channels_likely_spam_title()}</li>
+          {/if}
+        </ul>
+        <p class="room-preview-hint" id="room-preview-hint">{m.channels_preview_hint()}</p>
+        {#if needsUsername}
+          <p class="form-hint" id="room-preview-why">{m.channels_username_required()}</p>
+        {/if}
+      </div>
+      <div class="room-preview-actions">
+        <button type="button" class="ghost" onclick={() => (previewId = null)}>{m.common_close()}</button>
+        <button
+          type="button"
+          class="primary room-preview-join"
+          disabled={joining}
+          aria-disabled={needsUsername ? 'true' : undefined}
+          aria-describedby={needsUsername ? 'room-preview-why' : undefined}
+          onclick={() => {
+            if (!needsUsername) joinFromPreview(ch);
+          }}
+        >{joining ? m.channels_joining() : m.channels_join()}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if selected?.is_owner && roomInfoOpen}
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
@@ -4750,7 +4983,7 @@
     tabindex="-1"
     onpointerdown={(e) => (roomSettingsBackdropPress = e.target === e.currentTarget)}
     onclick={(e) => {
-      if (roomSettingsBackdropPress && e.target === e.currentTarget) closeRoomSettings();
+      if (roomSettingsBackdropPress && e.target === e.currentTarget) requestCloseRoomSettings();
     }}
     onkeydown={onRoomSettingsKey}
     transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
@@ -4766,7 +4999,7 @@
           <span id="room-settings-title" class="modal-title">{m.channels_room_settings()}</span>
           <span class="room-settings-room" title={selected.name}><bdi dir="auto">{selected.name}</bdi></span>
         </div>
-        <button type="button" class="icon-close" onclick={closeRoomSettings} title={m.common_close()} aria-label={m.common_close()}>
+        <button type="button" class="icon-close" onclick={requestCloseRoomSettings} title={m.common_close()} aria-label={m.common_close()}>
           <IconX size={15} />
         </button>
       </div>
@@ -4968,6 +5201,16 @@
     </div>
   </div>
 {/if}
+
+<ConfirmDialog
+  bind:open={discardSettingsOpen}
+  title={m.common_discard_title()}
+  message={m.common_discard_message()}
+  confirmLabel={m.common_discard()}
+  cancelLabel={m.common_keep_editing()}
+  danger
+  onconfirm={closeRoomSettings}
+/>
 
 <ConfirmDialog
   bind:open={leaveOpen}
@@ -5211,6 +5454,7 @@
 
   .banner-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
     flex-shrink: 0;
   }
@@ -5222,9 +5466,46 @@
     overflow-wrap: anywhere;
   }
 
+  .banner-actions .dm-request-ignore {
+    color: var(--text-muted);
+  }
+
+  .banner-actions .dm-request-ignore:hover:not(:disabled) {
+    color: var(--danger);
+  }
+
+  .banner.dm-request-group {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .dm-request-group-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .dm-request-list {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .dm-request-item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 12px;
+    padding: 8px 0;
+    border-top: 1px solid var(--border);
+  }
+
   .banner {
     flex-shrink: 0;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
@@ -5790,6 +6071,12 @@
     color: var(--danger);
   }
 
+  .chan-forget.hide-listing:hover:not(:disabled) {
+    background: var(--bg-hover);
+    border-color: var(--border);
+    color: var(--text-primary);
+  }
+
   .chan-forget:focus-visible { opacity: 1; }
 
   .chan-forget svg {
@@ -6252,6 +6539,11 @@
     border-radius: var(--radius-pill);
   }
 
+  .conv-action[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
   /* Plain at rest: tinted red beside Copy invite, it was the loudest thing in
      the header for the action least often wanted. Red once the pointer or
      focus is on it, and it still asks before it goes. */
@@ -6307,6 +6599,68 @@
   .room-settings {
     width: min(620px, calc(100vw - 2rem));
     height: min(760px, calc(100vh - 3rem));
+  }
+
+  .room-preview {
+    width: min(420px, calc(100vw - 2rem));
+  }
+
+  .room-preview-name {
+    overflow-wrap: anywhere;
+  }
+
+  .room-preview-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    overflow-y: auto;
+  }
+
+  .room-preview-topic {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .room-preview-facts {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-size: var(--font-size-sm);
+    color: var(--text-secondary);
+  }
+
+  .room-preview-facts:empty { display: none; }
+
+  .room-preview-language .chan-flag {
+    margin-inline: 0 6px;
+  }
+
+  .room-preview-warn { color: var(--warning); }
+
+  .room-preview-hint {
+    margin: 0;
+    font-size: var(--font-size-sm);
+    color: var(--text-muted);
+  }
+
+  .room-preview-body .form-hint { margin: 0; }
+
+  .room-preview-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+  }
+
+  .room-preview-actions button[aria-disabled='true'] {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   .modal-header {
@@ -7501,8 +7855,18 @@
     cursor: pointer;
   }
 
-  .card-more-menu button:hover:not(:disabled) { background: var(--bg-hover); }
+  .card-more-menu button:hover:not(:disabled, [aria-disabled='true']) { background: var(--bg-hover); }
   .card-more-menu button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .card-more-menu button[aria-disabled='true'] { color: var(--text-muted); cursor: not-allowed; }
+
+  .menu-reason {
+    display: block;
+    max-width: 30ch;
+    margin-top: 1px;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    white-space: normal;
+  }
   .menu-item-danger:hover:not(:disabled) { color: var(--danger); }
 
   /* Set from `placeRowMenu`, out of the compiler's sight. */

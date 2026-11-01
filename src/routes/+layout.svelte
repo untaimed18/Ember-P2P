@@ -61,8 +61,10 @@
     getSecurityPolicyState,
   } from '$lib/api/security';
   import {
-    addActionToast, addToast, clearAllToasts, onPendingUndoChange, toastError, toastSuccess, toastWarning,
+    addActionToast, addToast, clearAllToasts, onPendingUndoChange, setToastMessage, toastError, toastSuccess,
+    toastWarning, toasts,
   } from '$lib/stores/toast';
+  import { get } from 'svelte/store';
   import { backupReminderDue, noteBackupReminderShown } from '$lib/backupReminder';
   import { afterNavigate, goto } from '$app/navigation';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -634,18 +636,29 @@
 
     // Downloads re-queue on their own once the folder is fixed, so without this
     // the only sign of a folder Ember cannot write is rows that never start.
+    // Both of these stop downloads, so they stay until dismissed rather than
+    // vanishing while the user is looking elsewhere.
     listen('download-folder-unavailable', () => {
       if (!mounted) return;
-      toastWarning(m.layout_download_folder_unavailable());
+      addToast('warning', m.layout_download_folder_unavailable(), 0);
     })
       .then((fn) => { if (mounted) unlistenDownloadFolder = fn; else fn(); })
       .catch((e) => console.error('Failed to register download-folder-unavailable listener:', e));
 
+    // One notice per drive: a repeat rewords the one still up with the latest
+    // free space rather than stacking another.
+    const diskSpaceToasts = new Map<string, number>();
     listen<{ path?: string; freeBytes?: number }>('disk-space-low', (event) => {
       if (!mounted) return;
+      const path = event.payload?.path ?? '';
       const free = formatBytes(event.payload?.freeBytes ?? 0);
-      const message = m.layout_disk_space_low({ free, path: event.payload?.path ?? '' });
-      toastWarning(message);
+      const message = m.layout_disk_space_low({ free, path });
+      const shown = diskSpaceToasts.get(path);
+      if (shown !== undefined && get(toasts).some((t) => t.id === shown)) {
+        setToastMessage(shown, message);
+      } else {
+        diskSpaceToasts.set(path, addToast('warning', message, 0));
+      }
       void notify('disk_space', m.layout_disk_space_low_title(), message);
     })
       .then((fn) => { if (mounted) unlistenDiskSpace = fn; else fn(); })

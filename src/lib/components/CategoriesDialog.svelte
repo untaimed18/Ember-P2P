@@ -517,7 +517,7 @@
       <input type="checkbox" bind:checked={ownFolder} disabled={busy || (cleaned !== '' && newFolder === null)} />
       <span>
         {newFolder
-          ? m.transfers_categories_own_folder({ folder: `Downloads/${newFolder}` })
+          ? m.transfers_categories_own_folder({ folder: folderPath(newFolder) })
           : m.transfers_categories_own_folder_generic()}
       </span>
     </label>

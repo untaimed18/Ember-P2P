@@ -927,7 +927,7 @@
       class="browse-modal"
       role="dialog"
       aria-modal="true"
-      aria-labelledby="browse-title-{instanceId}"
+      aria-labelledby="browse-title-{instanceId} browse-subtitle-{instanceId}"
       tabindex="-1"
       bind:this={modalEl}
       onkeydown={handleKeydown}
@@ -935,7 +935,7 @@
       <div class="browse-header">
         <div class="browse-header-text">
           <h3 id="browse-title-{instanceId}">{m.browse_title_prefix()}</h3>
-          <p class="browse-subtitle" title={friendName || friendHash}>
+          <p id="browse-subtitle-{instanceId}" class="browse-subtitle" title={friendName || friendHash}>
             <bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
           </p>
         </div>
@@ -962,14 +962,14 @@
 
       <div class="browse-body">
         {#if loading}
-          <div class="browse-status">{m.browse_requesting()}</div>
+          <div class="browse-status" role="status">{m.browse_requesting()}</div>
         {:else if error}
           <div class="browse-error">
-            <p>{error}</p>
+            <p role="alert">{error}</p>
             <button type="button" class="browse-retry" onclick={() => void retryBrowse()}>{m.common_retry()}</button>
           </div>
         {:else if files.length === 0}
-          <div class="browse-status">{m.browse_no_files()}</div>
+          <div class="browse-status" role="status">{m.browse_no_files()}</div>
         {:else}
           <div class="browse-toolbar">
             <div class="browse-categories" role="group" aria-label={m.library_type_filter_aria()}>

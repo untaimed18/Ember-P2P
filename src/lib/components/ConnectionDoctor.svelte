@@ -21,10 +21,13 @@
   interface Props {
     /** Bring the port fields into view, for a port another program holds. */
     onMovePorts?: () => void;
-    /** Turn UPnP on in the settings being edited. */
-    onEnableUpnp?: () => void;
+    /** Turn UPnP on in the settings being edited; resolves whether it saved. */
+    onEnableUpnp?: () => boolean | Promise<boolean>;
+    /** UPnP is saved on but this run started without it. */
+    upnpPendingRestart?: boolean;
+    onRestart?: () => void;
   }
-  let { onMovePorts, onEnableUpnp }: Props = $props();
+  let { onMovePorts, onEnableUpnp, upnpPendingRestart = false, onRestart }: Props = $props();
 
   let running = $state(false);
   let report = $state<ConnectionReport | null>(null);
@@ -155,7 +158,13 @@
       return;
     }
     if (action === 'enable_upnp') {
-      onEnableUpnp?.();
+      if (!onEnableUpnp) return;
+      acting = action;
+      try {
+        if ((await onEnableUpnp()) && !destroyed) toast(m.doctor_upnp_enabled_toast());
+      } finally {
+        acting = null;
+      }
       return;
     }
     acting = action;
@@ -271,7 +280,18 @@
             <li>
               <strong>{FIX[fix.id]?.[0](params) ?? fix.id}</strong>
               <span>{FIX[fix.id]?.[1](params) ?? ''}</span>
-              {#if fix.action && (fix.action !== 'move_ports' || onMovePorts) && (fix.action !== 'enable_upnp' || onEnableUpnp)}
+              {#if fix.action === 'enable_upnp' && upnpPendingRestart}
+                <!-- This report predates the change; the running check keeps
+                     asking for UPnP until a restart starts it. -->
+                <div class="doctor-row">
+                  <span class="doctor-pending">{m.doctor_upnp_pending()}</span>
+                  {#if onRestart}
+                    <button type="button" class="secondary small" onclick={() => onRestart?.()}>
+                      {m.settings_restart_now()}
+                    </button>
+                  {/if}
+                </div>
+              {:else if fix.action && (fix.action !== 'move_ports' || onMovePorts) && (fix.action !== 'enable_upnp' || onEnableUpnp)}
                 <button
                   type="button"
                   class="secondary small"
@@ -371,6 +391,12 @@
     font-size: var(--font-size-sm);
     color: var(--text-muted);
     margin: 0;
+  }
+
+  .doctor-pending {
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--success);
   }
 
   .doctor-verdict {

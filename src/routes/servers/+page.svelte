@@ -1079,6 +1079,15 @@
 
   let selectionCount = $derived(selectedServers.size);
   let failedServerCount = $derived(servers.filter((s) => s.fail_count >= 3).length);
+  /** What Connect does with no row picked: the server most likely to answer,
+   *  ranked the way the startup auto-connect ranks them. Priority means what
+   *  it does in eMule: High first, Low never chosen for you. */
+  let bestServer = $derived.by(() => {
+    const rank = { high: 0, normal: 1, low: 2 } as const;
+    const order = (a: ServerInfo, b: ServerInfo) =>
+      rank[a.priority] - rank[b.priority] || a.fail_count - b.fail_count || b.user_count - a.user_count;
+    return servers.filter((s) => s.priority !== 'low').sort(order)[0] ?? null;
+  });
   let totalListedUsers = $derived(servers.reduce((sum, s) => sum + s.user_count, 0));
   let totalListedFiles = $derived(servers.reduce((sum, s) => sum + s.file_count, 0));
 
@@ -1138,6 +1147,8 @@
       <button class="danger" onclick={handleDisconnect}>{showConnecting ? m.common_cancel() : m.servers_disconnect()}</button>
     {:else if selectedServer}
       <button onclick={() => handleConnect()}>{m.servers_connect()}</button>
+    {:else if bestServer}
+      <button onclick={() => bestServer && handleConnect(bestServer)} title={m.servers_connect_best_title()}>{m.servers_connect_best()}</button>
     {:else}
       <span title={m.servers_connect_select_hint()}>
         <button disabled>{m.servers_connect()}</button>
@@ -1487,6 +1498,15 @@
             <div class="info-row muted">
               <span>{m.servers_not_connected()}</span>
             </div>
+            {#if selectedServer || bestServer}
+              <div class="info-actions">
+                {#if selectedServer}
+                  <button type="button" onclick={() => handleConnect()}>{m.servers_connect()}</button>
+                {:else}
+                  <button type="button" onclick={() => bestServer && handleConnect(bestServer)} title={m.servers_connect_best_title()}>{m.servers_connect_best()}</button>
+                {/if}
+              </div>
+            {/if}
           {/if}
         </div>
       </div>
@@ -1994,6 +2014,16 @@
     color: var(--text-muted);
     font-style: italic;
     padding: 8px 0;
+  }
+
+  .info-actions {
+    display: flex;
+    padding-top: 2px;
+  }
+
+  .info-actions button {
+    font-size: var(--font-size-sm);
+    padding: 5px 12px;
   }
 
   .info-label {

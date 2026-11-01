@@ -187,7 +187,7 @@
   // Render overhead rows in descending size so the biggest contributor
   // sits at the top. Zero-byte categories stay visible so a KAD/Ember
   // session still shows which pathways are silent versus active.
-  // `help` is a hover explanation per category. "Source Exchange", "EPX",
+  // `help` explains each category, behind its "?" button. "Source Exchange", "EPX",
   // "File Requests" and "Ember DHT" are protocol vocabulary, and this section
   // was six bar charts of it with nothing saying what any of them are or why
   // a large number there is fine.
@@ -216,7 +216,25 @@
     });
   }
 
+  /** The term whose explanation is open. A button rather than only a hover
+   *  title, so the keyboard and touch can reach it too. */
+  let openHelp = $state<string | null>(null);
 </script>
+
+{#snippet termButton(id: string, label: string)}
+  <button
+    type="button"
+    class="term-help"
+    aria-expanded={openHelp === id}
+    aria-controls="term-help-{id}"
+    aria-label={m.kad_explain_term({ term: label })}
+    onclick={() => (openHelp = openHelp === id ? null : id)}
+  >?</button>
+{/snippet}
+
+{#snippet termHelp(id: string, help: string)}
+  <p class="term-help-text" id="term-help-{id}" hidden={openHelp !== id}>{help}</p>
+{/snippet}
 
 <div class="page-header">
   <div>
@@ -417,7 +435,10 @@
       <div class="overhead-bars">
         {#each overheadRows as row (row.key)}
           <div class="oh-row">
-            <span class="oh-label" title={row.help}>{row.label}</span>
+            <span class="term-row">
+              <span class="oh-label" title={row.help}>{row.label}</span>
+              {@render termButton(`oh-${row.key}`, row.label)}
+            </span>
             <div class="oh-track">
               <div
                 class="oh-fill {row.cls}"
@@ -427,6 +448,7 @@
             </div>
             <span class="oh-value">{formatBytes(row.value)}</span>
           </div>
+          {@render termHelp(`oh-${row.key}`, row.help)}
         {/each}
         {#if totalOverhead === 0}
           <p class="oh-empty">{m.stats_no_overhead()}</p>
@@ -469,22 +491,34 @@
         </div>
         <div class="reputation-row">
           <div class="rep-stat">
-            <span class="rep-label" title={m.stats_tracked_peers_hint()}>{m.stats_tracked_peers()}</span>
+            <span class="term-row">
+              <span class="rep-label" title={m.stats_tracked_peers_hint()}>{m.stats_tracked_peers()}</span>
+              {@render termButton('rep-tracked', m.stats_tracked_peers())}
+            </span>
             <span class="rep-value">{formatNumber(repStats.tracked_peers)}</span>
           </div>
           <div class="rep-stat">
-            <span class="rep-label" title={m.stats_banned_peers_hint()}>{m.stats_banned_peers()}</span>
+            <span class="term-row">
+              <span class="rep-label" title={m.stats_banned_peers_hint()}>{m.stats_banned_peers()}</span>
+              {@render termButton('rep-banned-peers', m.stats_banned_peers())}
+            </span>
             <span class="rep-value" class:rep-danger={repStats.banned_peers > 0}>
               {formatNumber(repStats.banned_peers)}
             </span>
           </div>
           <div class="rep-stat">
-            <span class="rep-label" title={m.stats_banned_ips_hint()}>{m.stats_banned_ips()}</span>
+            <span class="term-row">
+              <span class="rep-label" title={m.stats_banned_ips_hint()}>{m.stats_banned_ips()}</span>
+              {@render termButton('rep-banned-ips', m.stats_banned_ips())}
+            </span>
             <span class="rep-value" class:rep-danger={repStats.banned_ips > 0}>
               {formatNumber(repStats.banned_ips)}
             </span>
           </div>
         </div>
+        {@render termHelp('rep-tracked', m.stats_tracked_peers_hint())}
+        {@render termHelp('rep-banned-peers', m.stats_banned_peers_hint())}
+        {@render termHelp('rep-banned-ips', m.stats_banned_ips_hint())}
       </section>
     {:else if stats && repUnavailable}
       <section class="card">
@@ -670,6 +704,45 @@
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     white-space: nowrap;
+  }
+  .term-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .term-help {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+  }
+  .term-help:hover,
+  .term-help[aria-expanded='true'] {
+    background: transparent;
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+  .term-help:focus-visible {
+    outline-offset: 1px;
+  }
+  .term-help-text {
+    margin: 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+  .reputation-row ~ .term-help-text {
+    margin-top: 10px;
   }
   .oh-value {
     font-size: var(--font-size-sm);

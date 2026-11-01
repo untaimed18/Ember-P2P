@@ -108,6 +108,41 @@ describe('action toasts', () => {
     expect(get(toasts).some((t) => t.message === 'consent')).toBe(true);
   });
 
+  it('restarts an identical toast instead of stacking a copy', () => {
+    const first = addToast('warning', 'Disk full', 1000);
+    vi.advanceTimersByTime(800);
+    expect(addToast('warning', 'Disk full', 1000)).toBe(first);
+    expect(get(toasts)).toHaveLength(1);
+    vi.advanceTimersByTime(800);
+    expect(get(toasts)).toHaveLength(1);
+    vi.advanceTimersByTime(200);
+    expect(get(toasts)).toHaveLength(0);
+  });
+
+  it('keeps toasts that differ in type or message apart', () => {
+    addToast('warning', 'Disk full');
+    addToast('error', 'Disk full');
+    addToast('warning', 'Disk nearly full');
+    expect(get(toasts)).toHaveLength(3);
+  });
+
+  it('never folds a repeat into a toast offering an action', () => {
+    const onExpire = vi.fn();
+    addActionToast('info', 'Removed', { label: 'Undo', run: vi.fn() }, onExpire);
+    addToast('info', 'Removed');
+    expect(get(toasts)).toHaveLength(2);
+    expect(onExpire).not.toHaveBeenCalled();
+  });
+
+  it('keeps a sticky toast sticky when it repeats, and a sticky repeat pins a timed one', () => {
+    addToast('warning', 'Folder unavailable', 0);
+    addToast('warning', 'Folder unavailable', 1000);
+    addToast('info', 'Copied', 1000);
+    addToast('info', 'Copied', 0);
+    vi.advanceTimersByTime(60_000);
+    expect(get(toasts).map((t) => t.message)).toEqual(['Folder unavailable', 'Copied']);
+  });
+
   it('holds the expiry while the stack is hovered', () => {
     const onExpire = vi.fn();
     addActionToast('info', 'Cancelled', { label: 'Undo', run: vi.fn() }, onExpire, 1000);

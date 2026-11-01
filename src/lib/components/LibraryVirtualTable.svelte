@@ -4,7 +4,7 @@
   import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
-  import { swallowKeyboardContextMenu } from '$lib/a11y';
+  import { menuKeydown, swallowKeyboardContextMenu } from '$lib/a11y';
   import { formatSize, formatNumber, formatDateTime, formatDateWithYear as formatDate } from '$lib/utils';
   import { onMount, onDestroy, tick, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
@@ -124,7 +124,8 @@
   const OVERSCAN = 10;
 
   let scrollContainer: HTMLDivElement | undefined = $state(undefined);
-  let headerWrap: HTMLDivElement | undefined = $state(undefined);
+  /** The sticky header sits inside the scroll container, above the rows. */
+  let headerHeight = $state(0);
   // `indeterminate` is an IDL property only — it has no HTML attribute, so a
   // one-way `indeterminate={...}` in the template is a no-op in Svelte 5.
   // Drive it imperatively from an effect so the header checkbox shows the
@@ -135,7 +136,6 @@
   });
   let scrollTop = $state(0);
   let viewportHeight = $state(600);
-  let scrollbarWidth = $state(0);
 
   let scrollRaf = 0;
   let lastScrollEl: HTMLDivElement | null = null;
@@ -145,10 +145,7 @@
     if (scrollRaf) return;
     scrollRaf = requestAnimationFrame(() => {
       scrollRaf = 0;
-      if (lastScrollEl) {
-        scrollTop = lastScrollEl.scrollTop;
-        if (headerWrap) headerWrap.scrollLeft = lastScrollEl.scrollLeft;
-      }
+      if (lastScrollEl) scrollTop = lastScrollEl.scrollTop;
     });
   }
 
@@ -168,7 +165,7 @@
   });
 
   $effect(() => {
-    const maxScroll = Math.max(0, sortedFiles.length * ROW_HEIGHT - viewportHeight);
+    const maxScroll = Math.max(0, sortedFiles.length * ROW_HEIGHT + headerHeight - viewportHeight);
     const current = untrack(() => scrollTop);
     if (current > maxScroll) {
       scrollTop = maxScroll;
@@ -184,13 +181,15 @@
     if (!scrollContainer || index < 0 || index >= sortedFiles.length) return;
     const rowTop = index * ROW_HEIGHT;
     const rowBottom = rowTop + ROW_HEIGHT;
+    // Row offsets start below the header, which covers the top of the view.
+    const rowsHeight = scrollContainer.clientHeight - headerHeight;
     const viewTop = scrollContainer.scrollTop;
-    const viewBottom = viewTop + scrollContainer.clientHeight;
+    const viewBottom = viewTop + rowsHeight;
     let newTop: number | null = null;
     if (rowTop < viewTop) {
       newTop = rowTop;
     } else if (rowBottom > viewBottom) {
-      newTop = rowBottom - scrollContainer.clientHeight;
+      newTop = rowBottom - rowsHeight;
     }
     if (newTop !== null) {
       scrollContainer.scrollTop = newTop;
@@ -201,7 +200,6 @@
       // `scrollTop` for one frame — the newly-selected row could land in
       // the just-scrolled-past overscan gap and flash unhighlighted.
       scrollTop = newTop;
-      if (headerWrap) headerWrap.scrollLeft = scrollContainer.scrollLeft;
     }
   }
 
@@ -217,7 +215,7 @@
       e.preventDefault();
       e.stopPropagation();
       const rect = anchor.getBoundingClientRect();
-      colMenu = { x: rect.left, y: rect.bottom + 2 };
+      showMenu({ x: rect.left, y: rect.bottom + 2 });
       return;
     }
     openMenu(e);
@@ -227,15 +225,10 @@
     const el = scrollContainer;
     if (!el) return;
     const ro = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        viewportHeight = entry.contentRect.height;
-        const t = entry.target as HTMLElement;
-        scrollbarWidth = t.offsetWidth - t.clientWidth;
-      }
+      for (const entry of entries) viewportHeight = entry.contentRect.height;
     });
     ro.observe(el);
     viewportHeight = el.clientHeight;
-    scrollbarWidth = el.offsetWidth - el.clientWidth;
     return () => ro.disconnect();
   });
 
@@ -398,6 +391,26 @@
 
   function swallowClick(e: MouseEvent) { e.preventDefault(); e.stopPropagation(); }
 
+  const RESIZE_STEP = 10;
+  /** Where the arrow keys stop widening; a drag can go further. */
+  const MAX_KEYBOARD_WIDTH = 800;
+
+  function onResizeKeydown(e: KeyboardEvent, col: LibraryColumn) {
+    // On the page these would open or check the selected row.
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    e.stopPropagation();
+    const width = getColWidth(col.key);
+    const next = width + (e.key === 'ArrowRight' ? RESIZE_STEP : -RESIZE_STEP);
+    colWidths[col.key] = Math.max(col.minWidth, Math.min(Math.max(MAX_KEYBOARD_WIDTH, width), next));
+    persistWidths();
+  }
+
   // --- Column drag reorder ---
   let activeDrag: { key: string } | null = $state(null);
   let dropTarget: { key: string; position: 'before' | 'after' } | null = $state(null);
@@ -476,14 +489,35 @@
 
   // --- Column context menu ---
   let colMenu: { x: number; y: number } | null = $state(null);
+  let colMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** What had focus when the menu opened, given back when it closes. */
+  let colMenuReturnFocus: HTMLElement | null = null;
+
+  function showMenu(at: { x: number; y: number }) {
+    const active = document.activeElement;
+    if (!colMenu && active instanceof HTMLElement && active !== document.body) colMenuReturnFocus = active;
+    colMenu = at;
+    // Without focus inside it, the arrow keys would move the row selection
+    // underneath the menu.
+    void tick().then(() => colMenuEl?.querySelector<HTMLElement>('[role^="menuitem"]')?.focus());
+  }
 
   function openMenu(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    colMenu = { x: e.clientX, y: e.clientY };
+    showMenu({ x: e.clientX, y: e.clientY });
   }
 
-  function closeMenu() { colMenu = null; }
+  function closeMenu() {
+    colMenu = null;
+    colMenuReturnFocus = null;
+  }
+
+  function closeMenuAndRefocus() {
+    const target = colMenuReturnFocus;
+    closeMenu();
+    if (target?.isConnected) target.focus();
+  }
 
   // Registered for the capture phase: the page listens on the document too, and
   // a bubble-phase stop could not keep its Escape from also clearing the
@@ -492,8 +526,16 @@
     if (event.key === 'Escape' && colMenu) {
       event.preventDefault();
       event.stopPropagation();
-      closeMenu();
+      closeMenuAndRefocus();
     }
+  }
+
+  function onMenuKeydown(e: KeyboardEvent) {
+    if (e.key === 'Tab') {
+      closeMenuAndRefocus();
+      return;
+    }
+    menuKeydown(e, colMenuEl);
   }
 
   function toggleVisibility(key: string) {
@@ -596,13 +638,30 @@
 <svelte:document onclick={() => closeMenu()} onkeydowncapture={onDocumentKeydown} />
 
 <div class="library-virtual-table-root">
-<div class="vtable-header" bind:this={headerWrap} style="padding-right:{scrollbarWidth}px;">
-  <table class="lib-table" style="min-width:{tableMinWidth}px;">
+<!-- The header is inside the grid, held at the top as the rows scroll, so each
+     cell is read with its column's name. -->
+<div
+  class="vtable-scroll scroll-shadows"
+  class:no-cursor={activeIndex < 0}
+  bind:this={scrollContainer}
+  use:passiveScroll={onTableScroll}
+  title={m.library_table_hint()}
+  role="grid"
+  tabindex="0"
+  aria-label={m.library_files_grid_aria()}
+  aria-rowcount={sortedFiles.length + 1}
+  aria-activedescendant={activeRowId}
+  onkeydown={onGridKeydown}
+>
+<div class="vtable-header" class:scrolled={scrollTop > 0} role="rowgroup" bind:clientHeight={headerHeight}>
+  <table class="lib-table" role="presentation" style="min-width:{tableMinWidth}px;">
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <thead oncontextmenu={openMenu}>
-      <tr>
+      <!-- svelte-ignore a11y_no_redundant_roles -->
+      <tr role="row" aria-rowindex={1}>
         {#if onToggleCheck}
-          <th class="col-check">
+          <!-- svelte-ignore a11y_no_redundant_roles -->
+          <th class="col-check" role="columnheader">
             <input
               type="checkbox"
               bind:this={headerCheckbox}
@@ -628,7 +687,7 @@
             aria-sort={col.sortField ? ariaSort(col.sortField) : undefined}
             onclick={() => onHeaderClick(col)}
             onkeydown={(e) => {
-              if (!col.sortField) return;
+              if (!col.sortField || e.target !== e.currentTarget) return;
               sortOnKey(e, col.sortField);
               // Sorting is all these keys do here; on the page they would also
               // open or check the selected row.
@@ -642,33 +701,26 @@
             <span class="header-content" title={col.label()}>
               {col.label()}{col.sortField ? arrow(col.sortField) : ''}
             </span>
-            <button
-              type="button"
+            <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+            <div
               class="col-resize-handle"
-              tabindex="-1"
+              role="separator"
+              tabindex="0"
+              aria-orientation="vertical"
+              aria-valuenow={getColWidth(col.key)}
+              aria-valuemin={col.minWidth}
+              aria-valuemax={Math.max(MAX_KEYBOARD_WIDTH, getColWidth(col.key))}
               aria-label={m.library_resize_column({ name: col.label() })}
               onmousedown={(e) => beginResize(e, col.key)}
               onclick={swallowClick}
-            ></button>
+              onkeydown={(e) => onResizeKeydown(e, col)}
+            ></div>
           </th>
         {/each}
       </tr>
     </thead>
   </table>
 </div>
-<div
-  class="vtable-scroll scroll-shadows"
-  class:no-cursor={activeIndex < 0}
-  bind:this={scrollContainer}
-  use:passiveScroll={onTableScroll}
-  title={m.library_table_hint()}
-  role="grid"
-  tabindex="0"
-  aria-label={m.library_files_grid_aria()}
-  aria-rowcount={sortedFiles.length}
-  aria-activedescendant={activeRowId}
-  onkeydown={onGridKeydown}
->
   <div class="vtable-spacer" role="presentation" style="height:{sortedFiles.length * ROW_HEIGHT}px;">
     <table class="lib-table vtable-body" role="presentation" style="transform:translateY({virtualSlice.topPad}px);min-width:{tableMinWidth}px;">
       <colgroup>
@@ -685,7 +737,7 @@
           <tr
             id={rowId(virtualSlice.startIdx + i)}
             role="row"
-            aria-rowindex={virtualSlice.startIdx + i + 1}
+            aria-rowindex={virtualSlice.startIdx + i + 2}
             class:row-alt={((virtualSlice.startIdx + i) & 1) === 1}
             class:selected={selectedPath === file.path}
             class:ctx-target={contextPath === file.path && selectedPath !== file.path}
@@ -793,7 +845,16 @@
 
 {#if colMenu}
   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="ctx-menu ctx-scroll" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: colMenu.x, y: colMenu.y }} onclick={(e) => e.stopPropagation()}>
+  <div
+    class="ctx-menu ctx-scroll"
+    role="menu"
+    tabindex="-1"
+    aria-label={m.library_columns_title()}
+    bind:this={colMenuEl}
+    use:ctxMenuPosition={{ x: colMenu.x, y: colMenu.y }}
+    onclick={(e) => e.stopPropagation()}
+    onkeydown={onMenuKeydown}
+  >
     <div class="ctx-label" role="presentation">{m.library_columns_title()}</div>
     {#each orderedColumns.filter(c => c.key !== FIXED_KEY) as col (col.key)}
       <button
@@ -818,8 +879,14 @@
   }
 
   .vtable-header {
-    flex-shrink: 0;
-    overflow: hidden;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    transition: box-shadow var(--transition-fast);
+  }
+  /* The scroll shadow is drawn under the header now, so it casts its own. */
+  .vtable-header.scrolled {
+    box-shadow: 0 4px 8px -4px var(--scroll-shadow);
   }
   .vtable-header table {
     margin-bottom: 0;
@@ -925,11 +992,15 @@
   .lib-table th:hover .col-resize-handle::after,
   .lib-table th.resizing .col-resize-handle::after,
   .col-resize-handle:hover::after,
-  .col-resize-handle:active::after {
+  .col-resize-handle:active::after,
+  .col-resize-handle:focus-visible::after {
     background: var(--accent);
   }
   .col-resize-handle:focus {
     outline: none;
+  }
+  .col-resize-handle:focus-visible::after {
+    width: 3px;
   }
 
   .lib-table td {

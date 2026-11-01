@@ -288,14 +288,16 @@
 
   function pickLocale(next: Locale) {
     if (!followingSystem && next === currentLocale) return;
-    currentLocale = next;
-    followingSystem = false;
-    setLocale(next);
+    guardLanguageChange(() => {
+      currentLocale = next;
+      followingSystem = false;
+      setLocale(next);
+    });
   }
 
   function pickSystemLocale() {
     if (followingSystem) return;
-    useSystemLocale();
+    guardLanguageChange(useSystemLocale);
   }
 
   let settings: AppSettings | null = $state(null);
@@ -370,6 +372,10 @@
   // restart part of the operation rather than an optional follow-up.
   let backupPassphrase = $state('');
   let backupPassphraseConfirm = $state('');
+  /** Said once both have something in them, not after Export. */
+  let backupPassphraseMismatch = $derived(
+    backupPassphrase.length > 0 && backupPassphraseConfirm.length > 0 && backupPassphrase !== backupPassphraseConfirm,
+  );
   let backupBusy = $state(false);
   let backupMessage: string | null = $state(null);
   let backupMessageKind: 'progress' | 'success' | 'error' = $state('progress');
@@ -1215,7 +1221,7 @@
     // `beforeNavigate` hook below, which is the path a desktop user actually
     // takes (the sidebar navigates with `goto`).
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (hasUnsavedChanges) e.preventDefault();
+      if (hasUnsavedChanges && !discardConfirmed) e.preventDefault();
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('keydown', handleFindKey);
@@ -1496,6 +1502,27 @@
   ] as const satisfies readonly (keyof AppSettings)[];
   type ApplyField = (typeof APPLY_FIELDS)[number];
   const APPLY_FIELD_SET: ReadonlySet<string> = new Set(APPLY_FIELDS);
+  const APPLY_FIELD_SECTION: Record<ApplyField, SettingsSection> = {
+    nickname: 'general',
+    max_concurrent_downloads: 'downloads',
+    max_concurrent_uploads: 'downloads',
+    max_sources_per_file: 'downloads',
+    max_download_file_size_gib: 'downloads',
+    max_connections: 'network',
+    max_connections_per_five_secs: 'network',
+    tcp_port: 'network',
+    udp_port: 'network',
+    search_timeout_secs: 'search',
+    filename_cleanups: 'search',
+    max_upload_speed: 'bandwidth',
+    max_download_speed: 'bandwidth',
+    alt_max_upload_speed: 'bandwidth',
+    alt_max_download_speed: 'bandwidth',
+    bandwidth_schedule: 'bandwidth',
+    chat_attachment_auto_accept_mb: 'friends',
+    max_friends: 'friends',
+    channel_username: 'channels',
+  };
 
   /**
    * Fields the automatic save leaves alone. The anti-leech and IP switches
@@ -2100,6 +2127,47 @@
   // checker still applies plain TDZ analysis to the referenced binding.
   let hasUnsavedChanges = $derived(fieldsDirty(APPLY_FIELDS) || antileechDraftDirty);
 
+  /** Sections holding a typed change not applied yet, in sidebar order. */
+  let pendingSections = $derived.by((): SettingsSection[] => {
+    const dirty = new Set<SettingsSection>(
+      APPLY_FIELDS.filter((field) => fieldsDirty([field])).map((field) => APPLY_FIELD_SECTION[field]),
+    );
+    if (antileechDraftDirty) dirty.add('security');
+    return sections.filter((section) => dirty.has(section));
+  });
+  let pendingSectionNames = $derived(
+    new Intl.ListFormat(getLocale(), { type: 'conjunction' }).format(pendingSections.map(sectionLabel)),
+  );
+
+  // Changing the language reloads the page, which drops every typed change
+  // not applied yet, so it asks first.
+  let languageConfirmOpen = $state(false);
+  let pendingLanguageChange: (() => void) | null = null;
+  /** The user chose to discard, so the reload must not ask again. */
+  let discardConfirmed = false;
+
+  function guardLanguageChange(change: () => void) {
+    if (!hasUnsavedChanges) {
+      change();
+      return;
+    }
+    pendingLanguageChange = change;
+    languageConfirmOpen = true;
+  }
+
+  async function applyThenChangeLanguage() {
+    const change = pendingLanguageChange;
+    pendingLanguageChange = null;
+    // One field at a time: a failure is shown under the field it was for.
+    const applied = await Promise.all(
+      APPLY_FIELDS.filter((field) => fieldsDirty([field])).map((field) => applyFields([field])),
+    );
+    if (antileechDraftDirty) await handleSaveAntileech();
+    if (applied.every(Boolean) && !hasUnsavedChanges) change?.();
+    // The failure may be under a field on another tab, out of sight.
+    else toastError(m.settings_language_apply_failed());
+  }
+
   // In-app routing (the sidebar uses `goto`) would otherwise discard typed
   // edits not yet applied with no prompt — `beforeunload` never fires for it. `nav.cancel()`
   // must be called synchronously, so confirm out-of-band and re-issue the
@@ -2559,6 +2627,15 @@
   {/if}
 </div>
 
+{#snippet restartBadge(field: RestartField, id: string)}
+  <!-- Strong once a change to the field is typed or saved and waiting for the
+       restart; until then only a note that changing it needs one. -->
+  {@const pending = restartPending(field) || fieldsDirty([field])}
+  <span class="restart-badge" class:pending {id} aria-hidden="true">
+    {pending ? m.settings_restart_badge() : m.settings_restart_hint()}
+  </span>
+{/snippet}
+
 {#snippet applyButton(fields: readonly ApplyField[], name: string, blocked = false)}
   {#if fieldsDirty(fields)}
     {@const error = applyErrorFor(fields)}
@@ -2699,6 +2776,10 @@
               {/if}
             </span>
             <span>{sectionLabel(section)}</span>
+            {#if pendingSections.includes(section)}
+              <span class="settings-nav-pending" aria-hidden="true"></span>
+              <span class="sr-only">{m.settings_tab_unsaved()}</span>
+            {/if}
           </button>
         {/each}
         </div>
@@ -3960,6 +4041,16 @@
               />
             </div>
 
+            <!-- The rules' switches look like the instant ones elsewhere but wait
+                 for Apply, and switching the schedule off hides them, so what
+                 is still unapplied is said up here. -->
+            {#if fieldsDirty(['bandwidth_schedule'])}
+              <div class="field schedule-unsaved" role="status">
+                <span>{settings.bandwidth_schedule_enabled ? m.settings_schedule_unsaved() : m.settings_schedule_unsaved_hidden()}</span>
+                {@render applyButton(['bandwidth_schedule'], m.settings_schedule_label(), scheduleHasError)}
+              </div>
+            {/if}
+
             <!-- Hidden while the feature is off: the rules are not in force, and
                  a timetable nobody is using is a card of controls that do
                  nothing. They are kept, not discarded — flipping the toggle back
@@ -4095,8 +4186,17 @@
                   <!-- The backend refuses the whole schedule for one malformed
                        rule, and the rejection names no rule. Blocking here
                        instead points at the row that is wrong, which is already
-                       showing its own reason. -->
-                  {@render applyButton(['bandwidth_schedule'], m.settings_schedule_label(), scheduleHasError)}
+                       showing its own reason. A second Apply, for a long list;
+                       a failure shows once, in the bar above. -->
+                  {#if fieldsDirty(['bandwidth_schedule'])}
+                    <button
+                      type="button"
+                      class="action-btn primary field-apply"
+                      disabled={scheduleHasError}
+                      onclick={() => void applyFields(['bandwidth_schedule'])}
+                      aria-label={m.settings_apply_field_aria({ name: m.settings_schedule_label() })}
+                    >{m.settings_apply()}</button>
+                  {/if}
                 </div>
               </div>
             {/if}
@@ -4159,8 +4259,12 @@
                 field?.select();
               }}
               onEnableUpnp={() => {
-                if (settings) settings.upnp_enabled = true;
+                if (!settings) return false;
+                settings.upnp_enabled = true;
+                return enqueueSave(() => saveFields(['upnp_enabled'], { revertOnFailure: true }));
               }}
+              upnpPendingRestart={settings.upnp_enabled && restartPending('upnp_enabled')}
+              onRestart={performRestart}
             />
           </div>
           <div class="settings-group">
@@ -4172,7 +4276,7 @@
                      announced as the input's description instead. -->
                 <label for="tcp-port">
                   {m.settings_tcp_port()}
-                  <span class="restart-badge" class:pending={restartPending('tcp_port')} id="tcp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
+                  {@render restartBadge('tcp_port', 'tcp-port-restart')}
                 </label>
                 <div class="apply-input">
                   <input id="tcp-port" type="number" min="1" max="65535" aria-describedby="tcp-port-restart" bind:value={settings.tcp_port} onkeydown={(e) => applyOnEnter(e, ['tcp_port'])} />
@@ -4183,7 +4287,7 @@
               <div class="field half">
                 <label for="udp-port">
                   {m.settings_udp_port()}
-                  <span class="restart-badge" class:pending={restartPending('udp_port')} id="udp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
+                  {@render restartBadge('udp_port', 'udp-port-restart')}
                 </label>
                 <div class="apply-input">
                   <input id="udp-port" type="number" min="1" max="65535" aria-describedby="udp-port-restart" bind:value={settings.udp_port} onkeydown={(e) => applyOnEnter(e, ['udp_port'])} />
@@ -4194,7 +4298,7 @@
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <label class="toggle-title" id="upnp-label" for="upnp-switch">{m.settings_upnp_label()} <span class="restart-badge" class:pending={restartPending('upnp_enabled')} id="upnp-restart" aria-hidden="true">{m.settings_restart_badge()}</span></label>
+                <label class="toggle-title" id="upnp-label" for="upnp-switch">{m.settings_upnp_label()} {@render restartBadge('upnp_enabled', 'upnp-restart')}</label>
                 <span class="hint" id="upnp-hint">{m.settings_upnp_hint()}</span>
               </div>
               <ToggleSwitch
@@ -5046,12 +5150,17 @@
                 type="password"
                 autocomplete="new-password"
                 bind:value={backupPassphraseConfirm}
+                aria-invalid={backupPassphraseMismatch}
+                aria-describedby={backupPassphraseMismatch ? 'backup-passphrase-mismatch' : undefined}
               />
+              {#if backupPassphraseMismatch}
+                <span class="feedback error" id="backup-passphrase-mismatch">{m.settings_backup_passphrase_mismatch()}</span>
+              {/if}
               <div class="action-row">
                 <button
                   class="action-btn primary"
                   onclick={handleExportBackup}
-                  disabled={backupBusy || backupPassphrase.length === 0}
+                  disabled={backupBusy || backupPassphrase.length === 0 || backupPassphrase !== backupPassphraseConfirm}
                 >{m.settings_backup_export()}</button>
               </div>
               <p class="backup-callout" role="note">
@@ -5487,11 +5596,30 @@
 <ConfirmDialog
   bind:open={leaveConfirmOpen}
   title={m.settings_unsaved_leave_title()}
-  message={m.settings_unsaved_leave_message()}
+  message={pendingSections.length > 0
+    ? `${m.settings_unsaved_leave_message()} ${m.settings_unsaved_leave_sections({ sections: pendingSectionNames })}`
+    : m.settings_unsaved_leave_message()}
   confirmLabel={m.settings_unsaved_leave_confirm()}
   danger={true}
   onconfirm={resumeLeave}
   oncancel={() => { pendingLeaveHref = null; }}
+/>
+
+<ConfirmDialog
+  bind:open={languageConfirmOpen}
+  title={m.settings_language_unsaved_title()}
+  message={m.settings_language_unsaved_message({ sections: pendingSectionNames })}
+  confirmLabel={m.settings_language_apply_switch()}
+  altLabel={m.settings_language_discard_switch()}
+  cancelLabel={m.common_keep_editing()}
+  onconfirm={() => void applyThenChangeLanguage()}
+  onalt={() => {
+    const change = pendingLanguageChange;
+    pendingLanguageChange = null;
+    discardConfirmed = true;
+    change?.();
+  }}
+  oncancel={() => { pendingLanguageChange = null; }}
 />
 
 <!--
@@ -5656,6 +5784,16 @@
   .settings-nav-item:hover .settings-nav-icon,
   .settings-nav-item.active .settings-nav-icon {
     opacity: 1;
+  }
+
+  /* A change typed in this section and not applied yet. */
+  .settings-nav-pending {
+    width: 7px;
+    height: 7px;
+    margin-left: auto;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--warning);
   }
 
   .cards-grid {
@@ -5954,14 +6092,15 @@
     letter-spacing: 0.3px;
     padding: 1px 6px;
     border-radius: var(--radius-pill);
-    color: var(--warning);
-    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--text-muted) 12%, transparent);
     vertical-align: middle;
     line-height: 1.5;
   }
 
-  /* Saved, and waiting for the restart the header banner offers. */
+  /* Changed, and waiting for the restart the header banner offers. */
   .restart-badge.pending {
+    color: var(--warning);
     background: color-mix(in srgb, var(--warning) 26%, transparent);
     box-shadow: inset 0 0 0 1px var(--warning);
   }
@@ -7148,6 +7287,20 @@
   .schedule-error {
     color: var(--danger);
     font-size: var(--font-size-sm);
+  }
+
+  .field.schedule-unsaved {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--warning) 8%, var(--bg-surface));
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
   }
 
   .schedule-footer {

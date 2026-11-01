@@ -21,6 +21,7 @@
   import { translateError } from '$lib/i18n';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import * as m from '$lib/paraglide/messages';
 
   interface Props {
@@ -165,6 +166,8 @@
     typeFilter = 'All';
     selectedHashes = new Set();
     selectionAnchor = null;
+    discardAsk = false;
+    addedAnnouncement = '';
     void load();
   });
 
@@ -218,6 +221,7 @@
   async function addOne(file: FileInfo, row: number) {
     if (room <= 0 || isAdded(file)) return;
     onadd([file]);
+    addedAnnouncement = m.feeds_picker_added({ name: file.name });
     const next = new Set(selectedHashes);
     next.delete(keyOf(file));
     selectedHashes = next;
@@ -241,6 +245,18 @@
     onclose();
   }
 
+  /** Files picked and not yet added: a stray click beside the dialog, or
+   *  Escape, asks before dropping them. */
+  let discardAsk = $state(false);
+
+  function closeUnlessPicked() {
+    if (selected.length > 0) discardAsk = true;
+    else close();
+  }
+
+  /** What a screen reader is told once a row's Add has run. */
+  let addedAnnouncement = $state('');
+
   let modalEl: HTMLDivElement | undefined = $state(undefined);
   let dialogRootEl: HTMLDivElement | undefined = $state(undefined);
   let filterInputEl: HTMLInputElement | undefined = $state(undefined);
@@ -250,7 +266,7 @@
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
-      close();
+      closeUnlessPicked();
       return;
     }
     trapTabKey(e, modalEl);
@@ -286,7 +302,7 @@
   <div bind:this={dialogRootEl}>
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="picker-overlay" onclick={close}></div>
+    <div class="picker-overlay" onclick={closeUnlessPicked}></div>
     <!-- svelte-ignore a11y_interactive_supports_focus -->
     <div
       class="picker-modal"
@@ -555,8 +571,22 @@
       </div>
 
       <div class="picker-footer">
+        <p class="picker-footer-note">{m.feeds_picker_draft_note()}</p>
+        <span class="sr-only" role="status">{addedAnnouncement}</span>
         <button type="button" class="picker-secondary-btn" onclick={close}>{m.common_close()}</button>
       </div>
+    </div>
+    <!-- Above the picker, which shares the dialogs' stacking level. -->
+    <div class="picker-ask">
+      <ConfirmDialog
+        bind:open={discardAsk}
+        title={m.common_discard_title()}
+        message={m.common_discard_message()}
+        confirmLabel={m.common_discard()}
+        cancelLabel={m.common_keep_editing()}
+        danger
+        onconfirm={close}
+      />
     </div>
   </div>
 {/if}
@@ -1146,11 +1176,26 @@
 
   .picker-footer {
     display: flex;
+    align-items: center;
     justify-content: flex-end;
     gap: 8px;
     padding: 12px 20px;
     border-top: 1px solid var(--border);
     flex-shrink: 0;
+  }
+
+  .picker-footer-note {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    line-height: 1.4;
+  }
+
+  .picker-ask {
+    position: relative;
+    z-index: 10002;
   }
 
   @media (max-width: 640px) {
