@@ -1990,6 +1990,7 @@ impl SignedRecord {
     /// the publisher's identity and filed under its shard of the feed index,
     /// stamped `timestamp`. `withdrawn` takes the feed out of the index. `None`
     /// for a head with a field out of bounds.
+    #[cfg(test)]
     pub fn feed_listing_record(
         salt: &crate::network::ember::feed::FeedSalt,
         head: &crate::network::ember::feed::FeedHead,
@@ -1997,7 +1998,19 @@ impl SignedRecord {
         identity: &SigningKey,
         timestamp: i64,
     ) -> Option<Self> {
-        let extra = crate::network::ember::feed::encode_feed_listing_extra(head, withdrawn)?;
+        let flags = if withdrawn { crate::network::ember::feed::FEED_LISTING_WITHDRAWN } else { 0 };
+        Self::feed_listing_record_flagged(salt, head, flags, identity, timestamp)
+    }
+
+    /// [`Self::feed_listing_record`] with its flags byte as given.
+    pub fn feed_listing_record_flagged(
+        salt: &crate::network::ember::feed::FeedSalt,
+        head: &crate::network::ember::feed::FeedHead,
+        flags: u8,
+        identity: &SigningKey,
+        timestamp: i64,
+    ) -> Option<Self> {
+        let extra = crate::network::ember::feed::encode_feed_listing_extra_flags(head, flags)?;
         let pubkey = identity.verifying_key().to_bytes();
         let shard = crate::network::ember::feed::feed_index_shard(&pubkey, salt);
         let record = Self::build_with_media(
@@ -2029,6 +2042,16 @@ impl SignedRecord {
         let head = self.feed_head_from(title, fields)?;
         let withdrawn = flags & crate::network::ember::feed::FEED_LISTING_WITHDRAWN != 0;
         Some((self.file_hash, head, withdrawn))
+    }
+
+    /// Whether a feed listing says followers cannot fetch its files now
+    /// ([`crate::network::ember::feed::FEED_LISTING_CANNOT_SHARE`]).
+    pub fn feed_listing_cannot_share(&self) -> bool {
+        self.record_type == RECORD_TYPE_FEED_LISTING
+            && self
+                .name_and_trailer_extra()
+                .and_then(|(_, extra)| crate::network::ember::feed::decode_feed_listing_extra(extra))
+                .is_some_and(|(flags, _)| flags & crate::network::ember::feed::FEED_LISTING_CANNOT_SHARE != 0)
     }
 
     /// Whether a storer should keep this listing: one of this version or a

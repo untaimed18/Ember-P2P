@@ -117,6 +117,17 @@ struct Registry {
     /// Every download begun here and not yet forgotten, with when it was
     /// begun: what the feeds service watches.
     watched: HashMap<String, Instant>,
+    /// The feed and file of each, for a publisher reached by a hole punch
+    /// once its hold has ended (see [`punched`]).
+    feeds: HashMap<String, WatchedFile>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WatchedFile {
+    key: [u8; 32],
+    salt: [u8; 16],
+    file_hash: [u8; 16],
+    size: u64,
 }
 
 fn registry() -> &'static parking_lot::Mutex<Registry> {
@@ -141,6 +152,10 @@ pub fn begin(transfer_id: &str, file_hash: [u8; 16], size: u64, publisher: Publi
         return false;
     }
     reg.watched.insert(transfer_id.to_string(), Instant::now());
+    reg.feeds.insert(
+        transfer_id.to_string(),
+        WatchedFile { key: publisher.key, salt: publisher.salt, file_hash, size },
+    );
     let tcp = publisher.friend_tcp.filter(|_| streamable(size));
     reg.holds.insert(
         transfer_id.to_string(),
@@ -183,6 +198,44 @@ pub fn forget(transfer_id: &str) {
     reg.holds.remove(transfer_id);
     reg.streams.remove(transfer_id);
     reg.watched.remove(transfer_id);
+    reg.feeds.remove(transfer_id);
+}
+
+/// The publisher key and feed salt of `transfer_id`, when nothing streams it
+/// from its publisher and its hold has ended: its publisher placed no record
+/// the stream could reach, so may be reached by a hole punch instead.
+pub fn needs_publisher(transfer_id: &str) -> Option<([u8; 32], [u8; 16])> {
+    let reg = registry().lock();
+    let file = reg.feeds.get(transfer_id)?;
+    let held = reg.holds.get(transfer_id).is_some_and(|hold| hold.released.is_none());
+    (!held && !reg.streams.contains_key(transfer_id) && streamable(file.size)).then_some((file.key, file.salt))
+}
+
+/// The publisher with `key` was reached by a hole punch at `addr`, through
+/// our `endpoint`: stream every watched download of its feeds that has no
+/// stream from there.
+pub fn punched(key: &[u8; 32], addr: SocketAddr, endpoint: Arc<quinn::Endpoint>) {
+    let Some(node) = super::ember::crypto::node_id_from_ed25519_bytes(key) else {
+        return;
+    };
+    let mut reg = registry().lock();
+    let Registry { streams, feeds, .. } = &mut *reg;
+    for (transfer_id, file) in feeds.iter().filter(|(_, file)| file.key == *key && streamable(file.size)) {
+        let stream = streams.entry(transfer_id.clone()).or_insert_with(|| StreamSource {
+            publisher: node,
+            xfer_id: feed_stream_id(&file.key, &file.salt, &file.file_hash),
+            capability: feed_stream_capability(&file.key, &file.salt, &file.file_hash),
+            quic: None,
+            tcp: None,
+            endpoint: None,
+        });
+        // One known by TCP alone (a friend's last address) gains the
+        // punched QUIC address, which the worker dials first.
+        if stream.quic.is_none() {
+            stream.quic = Some(addr);
+            stream.endpoint = Some(endpoint.clone());
+        }
+    }
 }
 
 /// The downloads begun and not forgotten, with when each was begun: to be
@@ -395,6 +448,10 @@ pub struct Served {
     pub ed2k: [u8; 16],
     /// Its BLAKE3 as the feed's list names it.
     pub blake3: [u8; 32],
+    /// For a feed's list itself: the app folder it is kept in, which it is
+    /// opened within. A list is never in the Library, so none of the
+    /// Library's checks apply to it.
+    pub list_folder: Option<PathBuf>,
 }
 
 /// A follower who read a file of one of our feeds to its end from us, and
@@ -503,8 +560,31 @@ pub fn served_entry(
 ) -> ([u8; 16], Served) {
     (
         feed_stream_id(publisher, salt, ed2k),
-        Served { path, size, capability: feed_stream_capability(publisher, salt, ed2k), salt: *salt, ed2k: *ed2k, blake3 },
+        Served {
+            path,
+            size,
+            capability: feed_stream_capability(publisher, salt, ed2k),
+            salt: *salt,
+            ed2k: *ed2k,
+            blake3,
+            list_folder: None,
+        },
     )
+}
+
+/// [`served_entry`] for a feed's list, kept in `folder`.
+pub fn served_list_entry(
+    publisher: &[u8; 32],
+    salt: &[u8; 16],
+    ed2k: &[u8; 16],
+    blake3: [u8; 32],
+    path: PathBuf,
+    size: u64,
+    folder: PathBuf,
+) -> ([u8; 16], Served) {
+    let (id, mut served) = served_entry(publisher, salt, ed2k, blake3, path, size);
+    served.list_folder = Some(folder);
+    (id, served)
 }
 
 /// What a follower's request is checked against when it comes, as an eMule
@@ -536,10 +616,23 @@ pub fn set_serve_checks(checks: ServeChecks) {
 /// built), not friends-only by known.met, and opened within the folders
 /// returned. Otherwise the status the follower is refused with: busy while
 /// what decides it cannot be read yet, which the follower asks again after,
-/// and unknown for a file not ours to stream.
-pub fn served(xfer_id: &[u8; 16]) -> Result<super::ember::attach_stream::FeedGrant, AttachStreamStatus> {
+/// and unknown for a file not ours to stream. A feed's list is served as it
+/// is kept; with `lists_only`, as over the server relay, nothing else is.
+pub fn served(xfer_id: &[u8; 16], lists_only: bool) -> Result<super::ember::attach_stream::FeedGrant, AttachStreamStatus> {
     use crate::network::ed2k::upload::{friends_only_snapshot_contains, friends_only_snapshot_ready};
     let file = served_file(xfer_id).ok_or(AttachStreamStatus::Unknown)?;
+    if let Some(folder) = &file.list_folder {
+        return Ok(super::ember::attach_stream::FeedGrant {
+            path: file.path,
+            size: file.size,
+            blake3: file.blake3,
+            capability: file.capability,
+            roots: vec![folder.to_string_lossy().into_owned()],
+        });
+    }
+    if lists_only {
+        return Err(AttachStreamStatus::Unknown);
+    }
     let checks = serve_checks().read().clone().ok_or(AttachStreamStatus::Busy)?;
     if !friends_only_snapshot_ready(&checks.friends_only) {
         return Err(AttachStreamStatus::Busy);
@@ -803,7 +896,37 @@ mod tests {
         note_downloaded(&id, [1; 16]);
         assert!(!note_served(&id, [1; 16], 0), "counted, and begun again");
         assert!(!note_served(&[0x99; 16], [1; 16], 5_000), "not a file of ours");
+
+        // A list is served as kept, from its own folder, and is the only
+        // thing a relayed stream may have.
+        let (list_id, list) =
+            served_list_entry(&key, &SALT, &[0x48; 16], [0x49; 32], PathBuf::from("lists/l"), 300, PathBuf::from("lists"));
+        set_served(HashMap::from([(list_id, list), (id, served_file(&id).expect("still served"))]));
+        let grant = served(&list_id, true).expect("a list is served even when only lists are");
+        assert_eq!((grant.path, grant.size, grant.roots), (PathBuf::from("lists/l"), 300, vec!["lists".to_string()]));
+        assert_eq!(served(&id, true), Err(AttachStreamStatus::Unknown), "an item is never served when only lists are");
         set_served(HashMap::new());
+    }
+
+    #[tokio::test]
+    async fn a_punched_publisher_streams_its_downloads_that_have_none() {
+        let (key, id) = (key(), "punched-publisher-test");
+        assert!(begin(id, [0x51; 16], 1_000, Publisher { key, salt: SALT, friend_tcp: None }));
+        assert_eq!(needs_publisher(id), None, "still held for a lookup");
+        lookup_unavailable(id);
+        assert_eq!(needs_publisher(id), Some((key, SALT)), "let go with no stream");
+
+        let endpoint = Arc::new(quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap());
+        let addr = SocketAddr::from(([203, 0, 113, 7], 4672));
+        punched(&[0x77; 32], addr, endpoint.clone());
+        assert!(!stream_ready(id), "another publisher's punch");
+        punched(&key, addr, endpoint);
+        let source = stream_for(id).expect("streamed from the punched address");
+        assert_eq!((source.quic, source.tcp), (Some(addr), None));
+        assert_eq!(source.xfer_id, feed_stream_id(&key, &SALT, &[0x51; 16]));
+        assert_eq!(needs_publisher(id), None, "it has a stream now");
+        forget(id);
+        assert_eq!(needs_publisher(id), None);
     }
 
     #[test]

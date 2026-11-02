@@ -22,6 +22,7 @@ pub(in crate::network) async fn on_friend_relay_ticket_poll_result(
     friend_relay_ticket_session_done_tx: &mpsc::UnboundedSender<String>,
     friend_relay_ticket_sessions_in_flight: &mut HashSet<String>,
     inbound_stream_tx: &mpsc::Sender<upload_server::InboundStreamRequest>,
+    bandwidth_limiter: &Arc<crate::bandwidth::limiter::BandwidthLimiter>,
 ) {
     *friend_relay_ticket_polls_in_flight =
         friend_relay_ticket_polls_in_flight.saturating_sub(1);
@@ -69,6 +70,52 @@ pub(in crate::network) async fn on_friend_relay_ticket_poll_result(
     // network loop.
     let mut rosters: HashMap<[u8; 16], Vec<[u8; 32]>> = HashMap::new();
     for offer in offers {
+        // A follower of a feed of ours, for its list: the envelope named the
+        // feed's own presence capability, so whoever it is holds its link.
+        if offer.feed_salt.is_some() {
+            let Some(slot) = crate::network::feed_reach::relay_slot() else {
+                tracing::debug!("Ignoring a feed relay ticket: all feed relay slots are taken");
+                continue;
+            };
+            let ticket_id = offer.ticket_id;
+            if !friend_relay_ticket_sessions_in_flight.insert(ticket_id.clone()) {
+                continue;
+            }
+            let rv_url = settings.rendezvous_url.clone();
+            let done_tx = friend_relay_ticket_session_done_tx.clone();
+            let limiter = bandwidth_limiter.clone();
+            let our_pubkey = ed25519_dalek::SigningKey::from_bytes(&ed25519_secret_key)
+                .verifying_key()
+                .to_bytes();
+            tokio::spawn(async move {
+                let _slot = slot;
+                let token = tokio::time::timeout(
+                    rendezvous::FRIEND_RELAY_TICKET_ACTION_TIMEOUT,
+                    rendezvous::accept_friend_relay_ticket(&rv_url, &ember_hash, &ticket_id, &ed25519_secret_key),
+                )
+                .await;
+                let ws = match token {
+                    Ok(Ok(token)) => ember::relay::connect_server_relay(&rv_url, &ticket_id, &token).await,
+                    Ok(Err(e)) => Err(e),
+                    Err(_) => Err("timed out".to_string()),
+                };
+                let _ = done_tx.send(ticket_id);
+                match ws {
+                    Ok(ws) => {
+                        crate::network::feed_reach::serve_relayed_list(
+                            ws,
+                            ember_hash,
+                            our_pubkey,
+                            ed25519_secret_key,
+                            limiter,
+                        )
+                        .await;
+                    }
+                    Err(e) => tracing::debug!("Feed relay ticket join failed: {e}"),
+                }
+            });
+            continue;
+        }
         if let Some(channel_id) = offer.channel_id {
             if state.channel_relay_outboxes.len()
                 + state.channel_relay_pending.len()

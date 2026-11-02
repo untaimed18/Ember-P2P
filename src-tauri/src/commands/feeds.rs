@@ -276,6 +276,8 @@ pub struct OwnFeedInfo {
     pub followers: Option<FollowerCount>,
     /// Followers who downloaded each file from us, by lowercase eD2K hash.
     pub downloads: HashMap<String, u32>,
+    /// How followers can fetch it now.
+    pub reach: crate::network::feed_reach::Reach,
 }
 
 async fn own_feed_info(state: &AppState, feed: OwnFeed) -> Result<OwnFeedInfo, String> {
@@ -292,6 +294,7 @@ async fn own_feed_info(state: &AppState, feed: OwnFeed) -> Result<OwnFeedInfo, S
     Ok(OwnFeedInfo {
         publisher: hex::encode(state.identity.ed25519_public_key),
         link: link_for(&state.identity.ed25519_public_key, &salt),
+        reach: crate::network::feed_reach::reach(&salt),
         feed,
         items,
         followers,
@@ -617,6 +620,45 @@ async fn send_listing(state: &AppState, feed: &OwnFeed, now: i64) {
     }
 }
 
+/// Whether the last listing sent of each feed of ours said followers could
+/// fetch its files, and when it went, so a listing goes again when that
+/// changes.
+fn listing_share_sent() -> &'static parking_lot::Mutex<HashMap<FeedSalt, (bool, Instant)>> {
+    type Sent = HashMap<FeedSalt, (bool, Instant)>;
+    static SENT: std::sync::OnceLock<parking_lot::Mutex<Sent>> = std::sync::OnceLock::new();
+    SENT.get_or_init(Default::default)
+}
+
+/// How soon after a listing another may go for a change in whether its
+/// files can be fetched: a buddy coming and going must not re-sign it every
+/// minute.
+const LISTING_SHARE_RESEND: Duration = Duration::from_secs(10 * 60);
+
+/// Send again the listings of our listed feeds whose last one said otherwise
+/// about whether followers can fetch their files.
+async fn resend_changed_listings(state: &AppState, now: i64) {
+    let db = state.db.clone();
+    let Ok(Ok(feeds)) = tokio::task::spawn_blocking(move || db.feeds_own()).await else {
+        return;
+    };
+    for feed in feeds.iter().filter(|feed| feed.listed && feed.sequence > 0) {
+        let Ok(salt) = hex_to16(&feed.salt) else { continue };
+        let sent = listing_share_sent().lock().get(&salt).copied();
+        let can_share = crate::network::feed_reach::can_share(&salt);
+        // None sent this session: the one at storers said its files could be
+        // fetched, unless sent before the restart saying otherwise, which the
+        // next hourly republish puts right.
+        let changed = match sent {
+            Some((said, at)) => said != can_share && at.elapsed() >= LISTING_SHARE_RESEND,
+            None => !can_share,
+        };
+        if changed {
+            listing_share_sent().lock().insert(salt, (can_share, Instant::now()));
+            send_listing(state, feed, now).await;
+        }
+    }
+}
+
 /// Sign and queue `due`: the feed's listing naming `head`, or its
 /// withdrawal, which names nothing of the feed.
 async fn queue_listing(state: &AppState, due: &DueListing, head: &FeedHead) {
@@ -625,7 +667,18 @@ async fn queue_listing(state: &AppState, due: &DueListing, head: &FeedHead) {
     };
     let head = if due.withdrawn { withdrawal_head() } else { head.clone() };
     let signing = crate::network::ember::crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key);
-    let Some(record) = SignedRecord::feed_listing_record(&salt, &head, due.withdrawn, &signing, due.stamp) else {
+    let flags = if due.withdrawn {
+        crate::network::ember::feed::FEED_LISTING_WITHDRAWN
+    } else {
+        let can_share = crate::network::feed_reach::can_share(&salt);
+        listing_share_sent().lock().insert(salt, (can_share, Instant::now()));
+        if can_share {
+            0
+        } else {
+            crate::network::ember::feed::FEED_LISTING_CANNOT_SHARE
+        }
+    };
+    let Some(record) = SignedRecord::feed_listing_record_flagged(&salt, &head, flags, &signing, due.stamp) else {
         return;
     };
     if let Err(error) = crate::commands::channels::queue_signed_record(state, record).await {
@@ -916,6 +969,18 @@ fn served_rebuild_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(Default::default)
 }
 
+/// The feeds of ours the rendezvous heartbeat registers, newest published
+/// first (see `network::feed_reach`).
+async fn refresh_registered_feeds(state: &AppState) {
+    let db = state.db.clone();
+    let Ok(Ok(mut feeds)) = tokio::task::spawn_blocking(move || db.feeds_own()).await else {
+        return;
+    };
+    feeds.retain(|feed| feed.sequence > 0);
+    feeds.sort_by_key(|feed| std::cmp::Reverse(feed.published_at));
+    crate::network::feed_reach::set_own_feeds(feeds.iter().filter_map(|feed| hex_to16(&feed.salt).ok()).collect());
+}
+
 /// Let followers stream our feeds' files (see `network::feed_direct`): every
 /// file the published or pending list of a feed of ours names, as followers
 /// may hold either, that is still shared with everyone, from where the
@@ -923,13 +988,15 @@ fn served_rebuild_lock() -> &'static tokio::sync::Mutex<()> {
 /// has been sent. Left as it was while the Library is still loading or busy
 /// re-indexing.
 async fn refresh_served_files(state: &AppState) {
+    refresh_registered_feeds(state).await;
     if crate::commands::sharing::startup_library_loading() {
         return;
     }
     let _rebuilding = served_rebuild_lock().lock().await;
     let db = state.db.clone();
     let us = hex::encode(state.identity.ed25519_public_key);
-    let feeds = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, Vec<(String, String)>)>> {
+    type OwnServed = (String, Vec<[u8; 16]>, Vec<(String, String)>);
+    let feeds = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<OwnServed>> {
         let mut out = Vec::new();
         let mut lists_used = std::collections::HashSet::new();
         for feed in db.feeds_own()? {
@@ -938,14 +1005,14 @@ async fn refresh_served_files(state: &AppState) {
             let mut files = Vec::new();
             let mut lists = published.into_iter().chain(pending).filter_map(|hash| hex_to16(hash).ok()).collect::<Vec<_>>();
             lists.dedup();
-            for hash in lists {
-                lists_used.insert(hash);
-                match own_list_files(&hash, &us, &feed.salt) {
+            for hash in &lists {
+                lists_used.insert(*hash);
+                match own_list_files(hash, &us, &feed.salt) {
                     Some(listed) => files.extend(listed.iter().cloned()),
                     None => tracing::debug!("Feed {}: list {} is not served; its files are not either", feed.salt, hex::encode(hash)),
                 }
             }
-            out.push((feed.salt, files));
+            out.push((feed.salt, lists, files));
         }
         own_list_files_cache().lock().retain(|hash, _| lists_used.contains(hash));
         Ok(out)
@@ -955,8 +1022,25 @@ async fn refresh_served_files(state: &AppState) {
     let publisher = state.identity.ed25519_public_key;
     let Ok(index) = state.local_index.try_read() else { return };
     let mut served = HashMap::new();
-    for (salt, files) in &feeds {
+    for (salt, lists, files) in &feeds {
         let Ok(salt) = hex_to16(salt) else { continue };
+        // The list itself, for a follower who reached us through the
+        // rendezvous server rather than a source record.
+        for hash in lists {
+            let Some(share) = feed_files::hidden_share(hash) else { continue };
+            let (Ok(digest), Some(folder)) = (hex_to32(&share.ember_file_hash), share.path.parent()) else { continue };
+            let folder = folder.to_path_buf();
+            let (id, entry) = crate::network::feed_direct::served_list_entry(
+                &publisher,
+                &salt,
+                hash,
+                digest,
+                share.path.clone(),
+                share.size,
+                folder,
+            );
+            served.insert(id, entry);
+        }
         for (ed2k_hex, blake3) in files {
             let (Some(file), Ok(ed2k), Ok(digest)) = (index.get_by_hash(ed2k_hex), hex_to16(ed2k_hex), hex_to32(blake3)) else {
                 continue;
@@ -1557,6 +1641,12 @@ pub struct FeedActivity {
     /// When the next fetch of its list may start, after one gave up; 0 if
     /// none did.
     pub retry_at: i64,
+    /// Its last fetch gave up without finding anyone holding its list, its
+    /// publisher included, and none has found anyone since.
+    pub unsourced: bool,
+    /// Its publisher is being reached through the rendezvous server for its
+    /// list, as no source record names one.
+    pub reaching: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1582,6 +1672,8 @@ fn activity_of(feed: &FollowedFeed) -> FeedActivity {
         too_large: too_large().lock().contains(&key),
         fetching,
         retry_at: gave_up().lock().get(&key).map_or(0, |at| at + FETCH_RETRY_SECS),
+        unsourced: unsourced().lock().contains(&key),
+        reaching: reaching().lock().0.contains(&key),
     }
 }
 
@@ -1649,6 +1741,13 @@ pub async fn refresh_feed(
         return Err(coded("feeds_not_found", "That feed could not be found"));
     }
     let outcome = look_up_head(&app, &state, &publisher, &salt).await;
+    let key = (publisher.clone(), salt.clone());
+    // Nobody had its list last time: reach its publisher at once, beside
+    // the fetch Retry starts.
+    if unsourced().lock().contains(&key) {
+        reaching().lock().1.remove(&key);
+        tauri::async_runtime::spawn(reach_publisher(app.clone(), publisher.clone(), salt.clone()));
+    }
     if outcome != LookupOutcome::Updated {
         gave_up().lock().remove(&(publisher.clone(), salt.clone()));
         // A list that did not match its head is fetched once more, from the
@@ -2282,13 +2381,67 @@ fn spawn_hold_watcher(app: tauri::AppHandle) {
         loop {
             tick.tick().await;
             if let Some(state) = app.try_state::<AppState>() {
-                watch_holds(&state).await;
+                watch_holds(&app, &state).await;
             }
         }
     });
 }
 
-async fn watch_holds(state: &AppState) {
+/// How long a feed download may find no source before its publisher is
+/// reached by a hole punch, past its hold and the lookup that ended it.
+const ITEM_REACH_AFTER: Duration = Duration::from_secs(90);
+/// How soon one publisher is punched again for its items.
+const ITEM_REACH_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// When each publisher was last punched for its items, by key.
+fn item_reaches() -> &'static parking_lot::Mutex<HashMap<[u8; 32], Instant>> {
+    static REACHES: std::sync::OnceLock<parking_lot::Mutex<HashMap<[u8; 32], Instant>>> = std::sync::OnceLock::new();
+    REACHES.get_or_init(Default::default)
+}
+
+/// Whether the publisher with `key` may be punched for its items now, which
+/// marks it as punched.
+fn item_reach_due(key: &[u8; 32]) -> bool {
+    let mut reaches = item_reaches().lock();
+    reaches.retain(|_, at| at.elapsed() < ITEM_REACH_RETRY);
+    if reaches.contains_key(key) {
+        return false;
+    }
+    reaches.insert(*key, Instant::now());
+    true
+}
+
+/// Reach the publisher with `key` by a hole punch, through the feed `salt`'s
+/// presence, and stream every download of its feeds that has no source from
+/// it (see `network::feed_direct::punched`).
+async fn reach_for_items(app: tauri::AppHandle, key: [u8; 32], salt: [u8; 16]) {
+    let Some(state) = app.try_state::<AppState>() else {
+        item_reaches().lock().remove(&key);
+        return;
+    };
+    let Some(network) = reach_network(&state).await else {
+        // Nothing was tried: the next tick may, once we are registered.
+        item_reaches().lock().remove(&key);
+        tracing::debug!("feed {}: its publisher cannot be punched for its files: we are not on the rendezvous server", hex::encode(salt));
+        return;
+    };
+    let ctx = crate::network::feed_reach::ReachContext::new(
+        network,
+        state.identity.ember_hash,
+        state.identity.ed25519_public_key,
+        state.identity.ed25519_secret_key,
+    );
+    match tokio::time::timeout(REACH_MAX, crate::network::feed_reach::punch_for_items(&ctx, &key, &salt)).await {
+        Ok(Ok((addr, endpoint))) => {
+            tracing::info!("feed {}: reached its publisher by a hole punch for its files", hex::encode(salt));
+            crate::network::feed_direct::punched(&key, addr, endpoint);
+        }
+        Ok(Err(e)) => tracing::info!("feed {}: could not punch through to its publisher for its files: {e}", hex::encode(salt)),
+        Err(_) => tracing::info!("feed {}: punching through to its publisher for its files ran out of time", hex::encode(salt)),
+    }
+}
+
+async fn watch_holds(app: &tauri::AppHandle, state: &AppState) {
     use crate::network::feed_direct::{self, Poll};
     use TransferStatus as S;
     let watched = feed_direct::watched();
@@ -2303,7 +2456,7 @@ async fn watch_holds(state: &AppState) {
                 let active = manager.active.contains_key(&id);
                 let row = manager
                     .get_transfer(&id)
-                    .map(|t| (t.transferred, t.status.clone(), t.file_hash.clone(), t.total_size, active));
+                    .map(|t| (t.transferred, t.status.clone(), t.file_hash.clone(), t.total_size, active, t.active_sources));
                 (id, begun, row)
             })
             .collect()
@@ -2317,9 +2470,20 @@ async fn watch_holds(state: &AppState) {
             }
             continue;
         }
-        let Some((transferred, status, hash, size, active)) = row else { continue };
+        let Some((transferred, status, hash, size, active, sending)) = row else { continue };
         // Waiting for a download slot is not the publisher's to answer for.
         let counting = active && !matches!(status, S::Paused | S::Stopped);
+        // Nobody sending, and its publisher placed no record the stream
+        // could reach: reach the publisher by a hole punch instead. Sources
+        // known but not sending, as a firewalled record's callback that never
+        // comes, do not hold that off.
+        if counting && sending == 0 && now.saturating_duration_since(begun) >= ITEM_REACH_AFTER {
+            if let Some((key, salt)) = feed_direct::needs_publisher(&transfer_id) {
+                if item_reach_due(&key) {
+                    tauri::async_runtime::spawn(reach_for_items(app.clone(), key, salt));
+                }
+            }
+        }
         // Watched on once let go, for as long as the download lasts: its
         // publisher's stream outlives the hold, and is forgotten with it.
         if let Poll::Released(why) = feed_direct::poll(&transfer_id, transferred, counting, now) {
@@ -2560,6 +2724,7 @@ pub async fn unfollow_feed(
     push_gates().lock().remove(&key);
     missed_lookups().lock().remove(&key);
     gave_up().lock().remove(&key);
+    unsourced().lock().remove(&key);
     too_large().lock().remove(&key);
     listing_fallbacks().lock().remove(&key);
     let dir = feeds_dir(&app);
@@ -3030,12 +3195,23 @@ struct Fetching {
     bytes: u64,
     /// Sources it has now, sending or queued at.
     sources: u32,
+    /// Whether it ever had one.
+    sourced: bool,
 }
 
 impl Fetching {
     fn new(publisher: &str, salt: &str, sequence: i64) -> Self {
         let now = Instant::now();
-        Self { publisher: publisher.into(), salt: salt.into(), sequence, started: now, progressed: now, bytes: 0, sources: 0 }
+        Self {
+            publisher: publisher.into(),
+            salt: salt.into(),
+            sequence,
+            started: now,
+            progressed: now,
+            bytes: 0,
+            sources: 0,
+            sourced: false,
+        }
     }
 
     /// Note what its transfer holds now: `bytes` on disk and `sources`.
@@ -3045,6 +3221,7 @@ impl Fetching {
         }
         self.bytes = self.bytes.max(bytes);
         self.sources = sources;
+        self.sourced |= sources > 0;
     }
 
     /// Given up: no byte and no source for [`FETCH_TIMEOUT`], or running
@@ -3063,6 +3240,145 @@ fn fetching() -> &'static parking_lot::Mutex<HashMap<String, Fetching>> {
 fn gave_up() -> &'static parking_lot::Mutex<HashMap<(String, String), i64>> {
     static GAVE_UP: std::sync::OnceLock<parking_lot::Mutex<HashMap<(String, String), i64>>> = std::sync::OnceLock::new();
     GAVE_UP.get_or_init(Default::default)
+}
+
+/// How long a list fetch may find no source before its publisher is reached
+/// through the rendezvous server instead (see `network::feed_reach`).
+const REACH_AFTER: Duration = Duration::from_secs(3 * 60);
+/// How long after one such attempt the next may start, unless the user asks.
+const REACH_RETRY: Duration = Duration::from_secs(20 * 60);
+/// How long one may run in all: a lookup, a direct dial, a punch and a relay.
+const REACH_MAX: Duration = Duration::from_secs(4 * 60);
+
+/// Feeds whose publisher is being reached now, and when each last was.
+fn reaching() -> &'static parking_lot::Mutex<(std::collections::HashSet<(String, String)>, HashMap<(String, String), Instant>)> {
+    type Reaching = (std::collections::HashSet<(String, String)>, HashMap<(String, String), Instant>);
+    static REACHING: std::sync::OnceLock<parking_lot::Mutex<Reaching>> = std::sync::OnceLock::new();
+    REACHING.get_or_init(Default::default)
+}
+
+/// Whether the publisher of `(publisher, salt)` may be reached now: none
+/// running for it, and the last at least [`REACH_RETRY`] ago.
+fn reach_due(publisher: &str, salt: &str) -> bool {
+    let key = (publisher.to_string(), salt.to_string());
+    let reaching = reaching().lock();
+    !reaching.0.contains(&key) && reaching.1.get(&key).is_none_or(|at| at.elapsed() >= REACH_RETRY)
+}
+
+/// What the network task holds for reaching a publisher, or `None` while it
+/// is not registered on the rendezvous server or does not answer.
+async fn reach_network(state: &AppState) -> Option<crate::network::feed_reach::NetworkReach> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bounded_send(&state.network_tx, NetworkCommand::FeedReachNetwork { tx }).await.ok()?;
+    tokio::time::timeout(crate::commands::errors::CMD_REPLY_TIMEOUT, rx).await.ok()?.ok()?
+}
+
+/// Takes a feed off [`reaching`]'s running set when its attempt ends.
+struct ReachRunning((String, String));
+
+impl Drop for ReachRunning {
+    fn drop(&mut self) {
+        reaching().lock().0.remove(&self.0);
+    }
+}
+
+/// Reach the publisher of a followed feed through the rendezvous server for
+/// the list its head names, and take it up as a fetched one would be.
+async fn reach_publisher(app: tauri::AppHandle, publisher: String, salt: String) {
+    let key = (publisher.clone(), salt.clone());
+    if !reaching().lock().0.insert(key.clone()) {
+        return;
+    }
+    let _running = ReachRunning(key.clone());
+    let Some(state) = app.try_state::<AppState>() else { return };
+    let db = state.db.clone();
+    let (key_pub, key_salt) = (publisher.clone(), salt.clone());
+    let Ok(Ok(Some(feed))) = tokio::task::spawn_blocking(move || db.feed_followed(&key_pub, &key_salt)).await else {
+        return;
+    };
+    if !list_owed(&feed) {
+        return;
+    }
+    let (Ok(publisher_key), Ok(salt_bytes), Ok(ed2k), Ok(blake3)) =
+        (hex_to32(&feed.publisher), hex_to16(&feed.salt), hex_to16(&feed.list_ed2k), hex_to32(&feed.list_blake3))
+    else {
+        return;
+    };
+    let target = crate::network::feed_reach::ListTarget {
+        publisher: publisher_key,
+        salt: salt_bytes,
+        ed2k,
+        blake3,
+        size: feed.list_size.max(0) as u64,
+    };
+    let Some(network) = reach_network(&state).await else {
+        tracing::debug!("feed {}: its publisher cannot be reached through the rendezvous server: we are not registered there", feed.salt);
+        return;
+    };
+    // Spent only on an attempt that reaches the network.
+    reaching().lock().1.insert(key, Instant::now());
+    let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": feed.publisher, "salt": feed.salt }));
+    let ctx = crate::network::feed_reach::ReachContext::new(
+        network,
+        state.identity.ember_hash,
+        state.identity.ed25519_public_key,
+        state.identity.ed25519_secret_key,
+    );
+    match tokio::time::timeout(REACH_MAX, crate::network::feed_reach::fetch_list(&ctx, &target)).await {
+        Ok(Ok((bytes, by))) => {
+            tracing::info!("feed {}: fetched its list from its publisher through the rendezvous server ({by:?})", feed.salt);
+            take_reached_list(&app, &state, &feed, bytes).await;
+        }
+        Ok(Err(e)) => tracing::info!("feed {}: could not reach its publisher through the rendezvous server: {e}", feed.salt),
+        Err(_) => tracing::info!("feed {}: reaching its publisher through the rendezvous server ran out of time", feed.salt),
+    }
+    let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": feed.publisher, "salt": feed.salt }));
+}
+
+/// Take up a list fetched from its publisher by [`reach_publisher`] for
+/// `reached`'s head: in place of the fetch still looking for sources, as
+/// that fetch's own completion would be.
+async fn take_reached_list(app: &tauri::AppHandle, state: &AppState, reached: &FollowedFeed, bytes: Vec<u8>) {
+    let followed = followed_lock().lock().await;
+    let db = state.db.clone();
+    let (key_pub, key_salt) = (reached.publisher.clone(), reached.salt.clone());
+    let Ok(Ok(Some(feed))) = tokio::task::spawn_blocking(move || db.feed_followed(&key_pub, &key_salt)).await else {
+        return;
+    };
+    if feed.sequence != reached.sequence || !list_owed(&feed) {
+        return;
+    }
+    for id in fetches_for(&feed.publisher, &feed.salt) {
+        cancel_fetch(state, &id).await;
+    }
+    let dest = followed_list_path(&feeds_dir(app), &feed.publisher, &feed.salt, feed.sequence);
+    let path = dest.clone();
+    let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &bytes)
+    })
+    .await;
+    if !matches!(written, Ok(Ok(()))) {
+        tracing::warn!("feed {}: could not save the list its publisher sent", feed.salt);
+        return;
+    }
+    gave_up().lock().remove(&(feed.publisher.clone(), feed.salt.clone()));
+    let list = take_list_held(app, state, feed, dest).await;
+    drop(followed);
+    if let Some(list) = list {
+        after_list(app, state, list).await;
+    }
+}
+
+/// Feeds whose last fetch of their list gave up without finding anyone
+/// holding it, the publisher included, until a fetch finds someone: what
+/// the page says while their lists cannot be had.
+fn unsourced() -> &'static parking_lot::Mutex<std::collections::HashSet<(String, String)>> {
+    static UNSOURCED: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    UNSOURCED.get_or_init(Default::default)
 }
 
 fn fetches_for(publisher: &str, salt: &str) -> Vec<String> {
@@ -3420,6 +3736,8 @@ async fn take_list_held(app: &tauri::AppHandle, state: &AppState, feed: Followed
     let db = state.db.clone();
     let task_feed = feed.clone();
     let now = chrono::Utc::now().timestamp();
+    // The list came from someone, or was held already.
+    unsourced().lock().remove(&(feed.publisher.clone(), feed.salt.clone()));
     let took = tokio::task::spawn_blocking(move || {
         let feed = task_feed;
         let owner = followed_owner(&feed.publisher, &feed.salt);
@@ -4385,7 +4703,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
             })
             .collect()
     };
-    let stale: Vec<(String, Fetching)> = {
+    let (stale, sourced, sourceless): (Vec<(String, Fetching)>, Vec<(String, String)>, Vec<(String, String)>) = {
         let mut fetching = fetching().lock();
         let instant = Instant::now();
         for (id, fetch) in fetching.iter_mut() {
@@ -4393,8 +4711,27 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
                 fetch.note(*bytes, *sources, instant);
             }
         }
-        fetching.iter().filter(|(_, f)| f.stalled(instant)).map(|(id, f)| (id.clone(), f.clone())).collect()
+        (
+            fetching.iter().filter(|(_, f)| f.stalled(instant)).map(|(id, f)| (id.clone(), f.clone())).collect(),
+            fetching.values().filter(|f| f.sourced).map(|f| (f.publisher.clone(), f.salt.clone())).collect(),
+            fetching
+                .values()
+                .filter(|f| !f.sourced && f.started.elapsed() >= REACH_AFTER)
+                .map(|f| (f.publisher.clone(), f.salt.clone()))
+                .collect(),
+        )
     };
+    {
+        let mut unsourced = unsourced().lock();
+        for key in &sourced {
+            unsourced.remove(key);
+        }
+    }
+    for (publisher, salt) in sourceless {
+        if reach_due(&publisher, &salt) {
+            tauri::async_runtime::spawn(reach_publisher(app.clone(), publisher, salt));
+        }
+    }
     for (id, fetch) in stale {
         tracing::info!(
             "feed {}: gave up fetching its list after {} min ({} bytes, no source for {} min)",
@@ -4404,7 +4741,11 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
             fetch.progressed.elapsed().as_secs() / 60
         );
         cancel_fetch(state, &id).await;
-        gave_up().lock().insert((fetch.publisher.clone(), fetch.salt.clone()), now);
+        let key = (fetch.publisher.clone(), fetch.salt.clone());
+        if !fetch.sourced {
+            unsourced().lock().insert(key.clone());
+        }
+        gave_up().lock().insert(key, now);
         let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": fetch.publisher, "salt": fetch.salt }));
     }
     feed_files::forget_cancelled_fetches(CANCELLED_FETCH_GRACE);
@@ -4415,6 +4756,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
         return;
     }
     send_due_withdrawals(state, now).await;
+    resend_changed_listings(state, now).await;
     // Deleted feeds' tombstones, off the tick: each waits on the network.
     if !sending_tombstones().swap(true, std::sync::atomic::Ordering::AcqRel) {
         let app = app.clone();
@@ -5142,12 +5484,15 @@ mod tests {
         assert!(!fetch.stalled(start + FETCH_TIMEOUT - Duration::from_secs(1)));
         assert!(fetch.stalled(start + FETCH_TIMEOUT), "no byte and no source");
 
+        assert!(!fetch.sourced, "found nobody");
+
         let mut fetch = Fetching::new("p", "s", 1);
         let start = fetch.started;
         fetch.note(0, 1, start + FETCH_TIMEOUT - Duration::from_secs(1));
         assert!(!fetch.stalled(start + FETCH_TIMEOUT), "queued at a source");
         let later = start + FETCH_TIMEOUT * 2;
         fetch.note(500, 0, later);
+        assert!(fetch.sourced, "a source lost since was still found");
         assert!(!fetch.stalled(later + FETCH_TIMEOUT - Duration::from_secs(1)), "bytes came");
         fetch.note(400, 0, later + Duration::from_secs(60));
         assert_eq!(fetch.bytes, 500, "a part file read short is not a loss");

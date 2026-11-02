@@ -2805,6 +2805,10 @@ pub(super) async fn handle_ember_dht_message(
     if let (Some(rid), Some(sender)) = (inbound.proxy_store_ack, inbound.sender_id) {
         flush_ember_proxy_overlay_ack(socket, state, sender, rid).await;
     }
+    if inbound.buddy_endorsed {
+        state.ember_diagnostics.ember_dht_buddy_endorsements =
+            state.ember_diagnostics.ember_dht_buddy_endorsements.saturating_add(1);
+    }
 
     // Encrypt and send any signed DHT replies (e.g. the PONG answering
     // a PING, the FOUND_NODE answering a FIND_NODE, or the STORE_ACK /

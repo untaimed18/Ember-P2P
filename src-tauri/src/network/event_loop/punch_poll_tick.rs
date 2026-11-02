@@ -252,7 +252,26 @@ pub(in crate::network) async fn on_punch_poll_tick(
             return;
         };
         let Some(friend_hash) = known_punch_friends.get(&info.from_id).copied() else {
-            ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
+            // A follower of a feed of ours who found no source for its list.
+            let our_pubkey = ed25519_dalek::SigningKey::from_bytes(&punch_secret)
+                .verifying_key()
+                .to_bytes();
+            if crate::network::feed_reach::own_feed_for_capability(&our_pubkey, info.epoch, &info.capability)
+                .is_some()
+            {
+                let responder = crate::network::feed_reach::PunchResponder {
+                    rendezvous_url: rv_url.clone(),
+                    endpoint: endpoint.clone(),
+                    our_hash: our_punch_hash,
+                    our_secret: punch_secret,
+                    quic_port: advertised_quic_port,
+                    nat_type: our_nat_type.as_u8(),
+                    external_ip: our_ext_addr.map(|addr| addr.ip()),
+                };
+                crate::network::feed_reach::answer_feed_punch(responder, info).await;
+            } else {
+                ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
+            }
             return;
         };
         let expected_capability = match rendezvous::fetch_identity_pubkey_authenticated(

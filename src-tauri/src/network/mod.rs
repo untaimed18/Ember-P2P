@@ -21,6 +21,7 @@ mod ember_search;
 mod ember_udp;
 mod event_loop;
 pub(crate) mod feed_direct;
+pub(crate) mod feed_reach;
 pub(crate) mod friend_intro;
 mod friend_transfer;
 mod friends;
@@ -3530,6 +3531,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &friend_relay_ticket_session_done_tx,
                     &mut friend_relay_ticket_sessions_in_flight,
                     &inbound_stream_tx,
+                    &bandwidth_limiter,
                 )
                 .await;
             }

@@ -6274,6 +6274,7 @@ impl UploadHandler {
                 Some(peer.ember_hash),
                 &self.bandwidth_limiter,
                 Some(&self.credit_manager),
+                false,
             )
             .await;
             if let Ok(Some(xfer_id)) = served {

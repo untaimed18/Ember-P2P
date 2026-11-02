@@ -532,6 +532,10 @@ export interface EmberDiagnostics {
   ember_dht_buddy_forwards: number;
   /** Firewalled sources parked because the named buddy never signed for that endpoint. */
   ember_dht_buddy_unendorsed?: number;
+  /** Requests sent asking a reachable peer to relay for us while firewalled. */
+  ember_dht_buddy_endorse_asks?: number;
+  /** Peers that agreed, each one we may name as our buddy. */
+  ember_dht_buddy_endorsements?: number;
   /** Ember CALLBACK_REQ frames sent (searcher → buddy). */
   ember_dht_callback_sent?: number;
   /** CALLBACK_REQs bounced to a firewalled publisher. */

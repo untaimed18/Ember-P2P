@@ -1029,6 +1029,46 @@ never after a corrupt one; Copy eD2K Link carries kept mirrors, and none with
 the switch off; a feed list with the new tag parses in a build without it;
 feed mirrors are not fetched with the per-feed switch off.
 
+## 7. Feeds whose publisher can place no source record (shipped in 1.7.6)
+
+**Reported:** a follower found a feed ("1233软件库": 62 items, a 12 KB list)
+whose publisher Discover showed as active, and its list never loaded: every
+fetch gave up after 30 minutes with no source. A direct DHT lookup of the
+list's source key had 14 nodes answer and none hold a record. A firewalled
+publisher with no buddy places no source record at all, while its head and
+listing still go out.
+
+**What 1.7.6 does** (`docs/feed-reachability-plan.md`; wire details in
+`docs/channels-format.md`, "Reaching a publisher"):
+
+- Publishers register their 16 newest published feeds on the rendezvous
+  server, as sealed intros under a capability only the feed's link holders
+  can compute. The deployed server needed no change.
+- A follower whose list fetch finds no source for 3 minutes, or who presses
+  Retry after one that found none, reaches the publisher through it: at the
+  registered address, by a hole punch, then over the server relay, which
+  carries lists only. The list is checked against the signed head as a
+  fetched one is.
+- The publisher serves its lists on the feed stream, and answers feed punches
+  and `feed-list` relay offers from non-friends, capped (6 punches a minute,
+  2 from one follower; 2 relays at once).
+- The feed page says when the publisher cannot be reached, and while Ember is
+  reaching it directly. My feeds says when followers reach a feed only through
+  the server, or not at all; the listing carries the second as flag `0x02`,
+  which Discover shows as "Publisher online, files unavailable".
+- The Ember Network page counts buddy requests sent and buddies that agreed.
+
+- A feed download that finds no source punches its publisher the same way and
+  streams the file from it.
+
+**Not covered:** a 1.7.5 publisher is not reachable this way, as it never
+registers. Items of a fully blocked publisher are not relayed by the server;
+they come over a direct or punched connection or from any other source.
+
+**To check live:** a publisher behind a firewall with no buddy (no endorsements
+on the Ember Network page) and a follower elsewhere, both on 1.7.6. The
+follower's log says how the list came (`Direct`, `Punch` or `Relay`).
+
 ## Smaller follow-ups from the 1.7.6 fixes
 
 - **Check friend meets live.** 1.7.6 puts the sender's Noise key in the meet

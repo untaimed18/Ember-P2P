@@ -1500,7 +1500,12 @@ publisher's identity key:
 **Trailer.** Framed as the channel trailer: `flags(1) ||` the head in the
 clear (`version(1) = 1 || sequence(8) || list_ed2k_hash(16) || item_count(4) ||
 total_size(8) || description_len(2) || description`). Flag `0x01` withdraws the feed from the
-index; other bits are kept for later builds. A listing names its feed by
+index. Flag `0x02` (`FEED_LISTING_CANNOT_SHARE`, from 1.7.6) says followers
+cannot fetch the feed's files now: its publisher can place no source record
+(firewalled with no buddy, or no known address) and is not registered on the
+rendezvous server either (see "Reaching a publisher" below). Discover shows such
+a feed's running publisher as online with its files unavailable. Other bits
+are kept for later builds. A listing names its feed by
 publisher and salt, which is all its link holds, so Discover follows it as it
 would the link. A withdrawal carries a
 fixed placeholder head (`withdrawal_head`: title `-`, every hash byte `0xFF`,
@@ -1638,6 +1643,69 @@ the rest of the network is asked alongside. Three failed dials or streams in
 a row, any other refusal, or a chunk that does not verify end it, and every
 network is asked for the file. A feed's download restored after a restart is
 held for its publisher again, as when it was started.
+
+**Lists.** From 1.7.6 the publisher also serves its feeds' published and
+pending lists on this stream, under the same `xfer_id` and `capability`
+derivations with the list's eD2K hash, from the app folder it keeps them in.
+A list is never in the Library, so none of the Library's checks apply to it.
+
+## Reaching a publisher (1.7.6)
+
+A follower whose list fetch has found no source for 3 minutes
+(`REACH_AFTER`), at most once every 20 minutes per feed or at once on Retry,
+reaches the publisher through the rendezvous server
+(`network/feed_reach.rs`). A firewalled publisher with no buddy places no
+source record, while its head and listing still go out, so its feed was
+found and never loaded.
+
+**Presence.** Each heartbeat, after the friend and room registrations, the
+publisher registers its 16 most lately published feeds (`MAX_REGISTERED_FEEDS`)
+with `POST /v4/presence/register` as sealed intros: `intro = true`,
+`peer_pubkey` its own key, and `intro_key = BLAKE3_derive_key("ember-feed-presence-key-v1:{epoch}",
+publisher(32) || salt(16))`, with the capability that key derives as a
+sealed intro's does (`ember-intro-presence-v2:{epoch}` over publisher ||
+key). Only holders of the feed's link can compute it. The server checks
+the derivation under the registrant's key, as for any sealed intro, and
+learns nothing of which feed it is; no server change was needed. A server
+that refuses sealed intros gets no feed entries.
+
+**Lookup.** The follower looks the capability up for the current and the
+previous epoch, and checks the answer as a friend's is: signed by the feed's
+publisher key over the address, the key hashing to the id asked for, fresh,
+and a routable IPv4.
+
+**Connecting.** In order, stopping at the first that works:
+
+1. *Direct:* the registered address and TCP port, as the feed stream's
+   secure TCP carrier, pinned to the publisher's node id.
+2. *Hole punch:* the follower first registers presence for the publisher
+   alone, under the pairwise capability their keys share (so the
+   publisher's reply is admitted), then `POST /v4/punch/register` under the
+   feed's capability. A publisher answers a punch from a non-friend only
+   when its capability is one of its own feeds', only from an IP-bound
+   (v4) registration whose proof verifies, at most 6 a minute and 2 from
+   one follower: it
+   acknowledges it, registers a reply to the follower, and dials it to open
+   its NAT. The follower dials QUIC pinned to the publisher at the address
+   the reply names, and the publisher's accept loop serves the feed stream.
+3. *Server relay:* an offer under the feed's capability whose sealed
+   envelope names the purpose `feed-list`. The publisher accepts it only
+   for one of its own feeds' capabilities, at most 2 at once
+   (`MAX_FEED_RELAY_SESSIONS`), runs the secure handshake as the responder
+   over the relay, and serves the feed stream for lists only, for at most
+   2 minutes. A 1.7.5 publisher drops an unknown purpose. Items never cross
+   the server relay.
+
+Whichever connects, the follower asks for the list on the feed stream,
+checks the chunk list against the BLAKE3 the head names and every chunk
+against it, and takes the list up as a fetched one, checked against the head
+again.
+
+**The publisher's page.** A published feed whose publisher can place no
+source record says followers reach it only through the server, and followers
+on 1.7.5 or older cannot fetch it; one that is not registered either says
+followers cannot fetch it at all. That last state is what flag `0x02` of its
+listing carries, sent again (at most every 10 minutes) when it changes.
 
 ## Friend sessions: `EMBER_EXT_BROWSE_SCOPE_AWARE`
 

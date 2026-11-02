@@ -2417,7 +2417,8 @@ where
 /// refused as busy, and the follower asks again later. Returns the stream's
 /// id once this follower has been sent the whole file, over this stream and
 /// those before it, for the caller to count the download once the follower
-/// says it has it.
+/// says it has it. With `lists_only`, as over the server relay, only a
+/// feed's list is served.
 pub async fn serve_feed_stream<R, W>(
     recv: &mut R,
     send: &mut W,
@@ -2425,6 +2426,7 @@ pub async fn serve_feed_stream<R, W>(
     follower: Option<[u8; 16]>,
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
     credits: Option<&SharedCredits>,
+    lists_only: bool,
 ) -> anyhow::Result<Option<[u8; 16]>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2438,7 +2440,7 @@ where
         send,
         header,
         |xfer_id| {
-            let file = crate::network::feed_direct::served(xfer_id);
+            let file = crate::network::feed_direct::served(xfer_id, lists_only);
             busy.store(file == Err(super::attach::AttachStreamStatus::Busy), std::sync::atomic::Ordering::Relaxed);
             file
         },
@@ -2823,6 +2825,7 @@ pub async fn run_quic_accept_loop(
                     peer_node_id,
                     limiter.as_ref(),
                     credits.as_ref(),
+                    false,
                 )
                 .await;
                 let _ = init_send.finish();

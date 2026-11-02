@@ -38,6 +38,9 @@ export interface OwnFeed {
   followers: { count: number; at_least: boolean; checked_at: number } | null;
   /** Followers who downloaded each file from this identity, by eD2K hash. */
   downloads: Record<string, number>;
+  /** How followers can fetch it now: through source records (`direct`),
+   *  only through Ember's server (`server`), or not at all (`none`). */
+  reach: 'unknown' | 'direct' | 'server' | 'none';
 }
 
 /** A feed this identity follows. */
@@ -87,6 +90,11 @@ export interface FeedActivity {
   fetching: { secs: number; bytes: number; sources: number } | null;
   /** When the next fetch may start after one gave up, in seconds; 0 if none did. */
   retry_at: number;
+  /** Its last fetch found no one holding its list, its publisher included,
+   *  and none has since. */
+  unsourced: boolean;
+  /** Its publisher is being reached directly for its list. */
+  reaching: boolean;
 }
 
 /** What a lookup of a followed feed came to; `deleted`, its tombstone found. */
@@ -170,6 +178,8 @@ export interface DiscoveredFeed {
   link: string;
   /** Its publisher signed the listing in the last few hours: running. */
   active: boolean;
+  /** Its listing says its files can't be fetched right now. */
+  cannot_share: boolean;
   following: boolean;
   own: boolean;
 }

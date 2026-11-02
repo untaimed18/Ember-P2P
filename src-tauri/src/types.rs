@@ -1159,6 +1159,15 @@ pub struct EmberDiagnostics {
     /// callback path is unavailable and downloads use the relay/park route.
     #[serde(default)]
     pub ember_dht_buddy_uncorroborated: u32,
+    /// `BUDDY_ENDORSE_REQ` frames we sent, asking a reachable peer to relay
+    /// for us while firewalled. Rising with no endorsements beside it means
+    /// nobody answers, and no source record of ours can be placed.
+    #[serde(default)]
+    pub ember_dht_buddy_endorse_asks: u32,
+    /// Endorsements received in answer, each letting us name that peer as
+    /// our buddy.
+    #[serde(default)]
+    pub ember_dht_buddy_endorsements: u32,
     /// Ember `CALLBACK_REQ` frames we sent (searcher → buddy).
     #[serde(default)]
     pub ember_dht_callback_sent: u32,

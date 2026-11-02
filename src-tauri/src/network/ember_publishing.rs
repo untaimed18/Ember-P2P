@@ -3016,6 +3016,7 @@ pub(super) async fn maybe_publish_ember_sources(
     state.ember_diagnostics.ember_dht_firewalled_publishing =
         known_ipv4.is_some() && !waiting_buddy && needs_buddy;
     state.ember_diagnostics.ember_dht_reachability_known = true;
+    crate::network::feed_reach::note_source_publishing(known_ipv4.is_some() && !waiting_buddy);
 
     // Not serving: the upload listener is refusing every inbound connection,
     // so a source record placed now names a node that will not hand the file
@@ -3438,6 +3439,8 @@ pub(super) async fn ask_ember_buddy_endorsements(
             continue;
         };
         asked += 1;
+        state.ember_diagnostics.ember_dht_buddy_endorse_asks =
+            state.ember_diagnostics.ember_dht_buddy_endorse_asks.saturating_add(1);
         match state.ember_transport.prepare_outgoing(
             contact.addr,
             Some(&contact.noise_pub),

@@ -560,6 +560,12 @@ pub enum NetworkCommand {
     GetEmberDiagnostics {
         tx: oneshot::Sender<EmberDiagnostics>,
     },
+    /// What a follower needs from the network to reach a feed's publisher
+    /// through the rendezvous server (`feed_reach::fetch_list`): `None`
+    /// while we are not registered there.
+    FeedReachNetwork {
+        tx: oneshot::Sender<Option<super::feed_reach::NetworkReach>>,
+    },
     /// Send an Ember-native `Ping` over the Noise transport to a peer.
     ///
     /// When `peer_pubkey` is `Some`, the network task uses it directly

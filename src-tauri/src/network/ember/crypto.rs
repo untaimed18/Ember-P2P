@@ -397,6 +397,27 @@ pub fn derive_sealed_intro_presence_capability(
     )
 }
 
+/// Presence of a feed on the rendezvous server, for followers who find no
+/// source for its list: only holders of the feed's link (its publisher key
+/// and salt) can compute it. Registered as a sealed intro, so the server
+/// checks the epoch key derives the capability under the publisher's key
+/// without learning which feed it is. Returns `(capability, epoch_key)`.
+pub fn derive_feed_presence_capability(
+    publisher_ed25519_pubkey: &[u8; 32],
+    salt: &[u8; 16],
+    epoch: i64,
+) -> ([u8; 32], [u8; 32]) {
+    let context = format!("ember-feed-presence-key-v1:{epoch}");
+    let mut input = [0u8; 48];
+    input[..32].copy_from_slice(publisher_ed25519_pubkey);
+    input[32..].copy_from_slice(salt);
+    let epoch_key = blake3::derive_key(&context, &input);
+    (
+        derive_sealed_intro_capability_from_key(publisher_ed25519_pubkey, &epoch_key, epoch),
+        epoch_key,
+    )
+}
+
 /// A fresh random intro secret.
 pub fn generate_intro_secret() -> [u8; INTRO_SECRET_LEN] {
     let mut secret = [0u8; INTRO_SECRET_LEN];

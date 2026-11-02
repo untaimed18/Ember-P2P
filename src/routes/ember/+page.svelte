@@ -587,6 +587,8 @@
     { id: 'buddy-pub', k: m.ember_stat_buddy_publishes(), v: formatNumber(diag?.ember_dht_buddy_publishes ?? 0) },
     { id: 'buddy-fwd', k: m.ember_stat_buddy_forwards(), v: formatNumber(diag?.ember_dht_buddy_forwards ?? 0) },
     { id: 'buddy-unendorsed', k: m.ember_stat_buddy_unendorsed(), v: formatNumber(diag?.ember_dht_buddy_unendorsed ?? 0) },
+    { id: 'buddy-asks', k: m.ember_stat_buddy_endorse_asks(), v: formatNumber(diag?.ember_dht_buddy_endorse_asks ?? 0) },
+    { id: 'buddy-endorsed', k: m.ember_stat_buddy_endorsements(), v: formatNumber(diag?.ember_dht_buddy_endorsements ?? 0) },
     { id: 'callback-sent', k: m.ember_stat_callback_sent(), v: formatNumber(diag?.ember_dht_callback_sent ?? 0) },
     { id: 'callback-fwd', k: m.ember_stat_callback_forwards(), v: formatNumber(diag?.ember_dht_callback_forwards ?? 0) },
     { id: 'callback-conn', k: m.ember_stat_callback_connects(), v: formatNumber(diag?.ember_dht_callback_connects ?? 0) },

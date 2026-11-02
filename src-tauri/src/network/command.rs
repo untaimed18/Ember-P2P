@@ -2588,6 +2588,16 @@ async fn handle_command_inner(
             let _ = tx.send(state.stats.clone());
         }
 
+        NetworkCommand::FeedReachNetwork { tx } => {
+            let reach = state.rendezvous_registered.then(|| super::feed_reach::NetworkReach {
+                rendezvous_url: settings.rendezvous_url.clone(),
+                external_ip: state.external_ip,
+                tcp_port: advertised_tcp_port(state),
+                nat: state.friend_nat_context.clone(),
+            });
+            let _ = tx.send(reach);
+        }
+
         NetworkCommand::GetEmberDiagnostics { tx } => {
             let mut diag = state.ember_diagnostics.clone();
             mirror_ember_dht_counters(state, &mut diag);

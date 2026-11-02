@@ -368,7 +368,12 @@
     if (f.activity.too_large) return m.feeds_state_too_large_short();
     if (f.state === 'broken') return m.feeds_state_broken_short();
     if (notSeen(f)) return m.feeds_state_not_seen_short({ when: ago(f.seen_at) });
-    if (f.activity.fetching) return m.feeds_state_fetching_short();
+    const fetch = f.activity.fetching;
+    if (f.activity.reaching && !(fetch && fetch.sources > 0)) return m.feeds_state_reaching_short();
+    if (f.activity.unsourced && (resting(f) || (fetch && fetch.sources === 0))) {
+      return m.feeds_state_publisher_unreachable_short();
+    }
+    if (fetch) return m.feeds_state_fetching_short();
     if (resting(f)) return m.feeds_state_list_waiting_short();
     if (f.state === 'fetching' || (noList(f) && f.sequence > 0)) return m.feeds_state_fetching_short();
     if (noList(f)) {
@@ -967,6 +972,9 @@
     const fetch = f.activity.fetching;
     if (f.activity.too_large) return { text: m.feeds_state_too_large(), warn: true, busy: false, retry: false };
     if (f.state === 'broken') return { text: m.feeds_state_broken(), warn: true, busy: false, retry: true };
+    if (f.activity.reaching && !(fetch && fetch.sources > 0)) {
+      return { text: m.feeds_state_reaching(), warn: false, busy: true, retry: false };
+    }
     if (fetch) {
       // The source count changes as the poll runs: a screen reader is told
       // the fetch, not each count.
@@ -978,10 +986,21 @@
             busy: true,
             retry: false,
           }
-        : { text: m.feeds_state_fetching_finding(), warn: false, busy: true, retry: false };
+        : f.activity.unsourced
+          ? { text: m.feeds_state_publisher_unreachable_finding(), warn: true, busy: true, retry: false }
+          : { text: m.feeds_state_fetching_finding(), warn: false, busy: true, retry: false };
     }
     if (resting(f)) {
       const minutes = Math.max(1, Math.ceil((f.activity.retry_at - now) / 60));
+      if (f.activity.unsourced) {
+        return {
+          text: m.feeds_state_publisher_unreachable({ minutes: formatNumber(minutes) }),
+          spoken: m.feeds_state_publisher_unreachable_spoken(),
+          warn: true,
+          busy: false,
+          retry: true,
+        };
+      }
       return {
         text: m.feeds_state_list_waiting({ minutes: formatNumber(minutes) }),
         spoken: m.feeds_state_list_waiting_spoken(),
@@ -1310,9 +1329,16 @@
     }
   }
 
-  /** The line saying when a listed feed's publisher was last running. */
+  /** The line saying when a listed feed's publisher was last running, and
+   *  whether its files can be fetched while it is. */
   function seenText(feed: DiscoveredFeed): string {
+    if (feed.active && feed.cannot_share) return m.feeds_discover_cannot_share();
     return feed.active ? m.feeds_discover_active() : m.feeds_discover_seen({ when: ago(feed.listed_at) });
+  }
+
+  function seenTitle(feed: DiscoveredFeed): string | undefined {
+    if (!feed.active) return undefined;
+    return feed.cannot_share ? m.feeds_discover_cannot_share_title() : m.feeds_discover_active_title();
   }
 
   // ── My feeds ─────────────────────────────────────────────────────────
@@ -2638,8 +2664,18 @@
                       <div class="discover-card-title">
                         <h3 title={feed.title}><bdi dir="auto">{feed.title.trim() || m.feeds_untitled()}</bdi></h3>
                         <p class="discover-seen">
-                          <span class="seen-state" class:active={feed.active} title={feed.active ? m.feeds_discover_active_title() : undefined}>
-                            <span class="status-dot" class:published={feed.active} aria-hidden="true"></span>
+                          <span
+                            class="seen-state"
+                            class:active={feed.active && !feed.cannot_share}
+                            class:limited={feed.active && feed.cannot_share}
+                            title={seenTitle(feed)}
+                          >
+                            <span
+                              class="status-dot"
+                              class:published={feed.active && !feed.cannot_share}
+                              class:limited={feed.active && feed.cannot_share}
+                              aria-hidden="true"
+                            ></span>
                             {seenText(feed)}
                           </span>
                           <span class="seen-sep" aria-hidden="true">·</span>
@@ -2943,6 +2979,15 @@
                           ? m.feeds_not_published()
                           : m.feeds_unpublished_changes()}
                     </span>
+                  </div>
+                {/if}
+
+                {#if mineFeed.published_at > 0 && (mineFeed.reach === 'server' || mineFeed.reach === 'none')}
+                  <div class="state-strip" class:tone-warning={mineFeed.reach === 'none'} role="status">
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+                      <circle cx="8" cy="8" r="6"/><line x1="8" y1="7" x2="8" y2="11"/><line x1="8" y1="5" x2="8" y2="5.1"/>
+                    </svg>
+                    <span>{mineFeed.reach === 'none' ? m.feeds_own_reach_none() : m.feeds_own_reach_server()}</span>
                   </div>
                 {/if}
 
@@ -4679,6 +4724,15 @@
 
   .seen-state.active {
     color: var(--success);
+  }
+
+  .seen-state.limited {
+    color: var(--warning);
+  }
+
+  .status-dot.limited {
+    background: var(--warning);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--warning) 20%, transparent);
   }
 
   .seen-state .status-dot {
