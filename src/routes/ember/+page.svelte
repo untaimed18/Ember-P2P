@@ -440,9 +440,9 @@
 
   let sharingPillLabel = $derived(
     publishedTotal > 0
-      ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal })
+      ? m.ember_overview_published_of({ published: formatNumber(publishedCount), total: formatNumber(publishedTotal) })
       : sharingPublished
-        ? m.ember_health_sharing_published_count({ count: publishedCount })
+        ? m.ember_health_sharing_published_count({ count: formatNumber(publishedCount) })
         : m.ember_health_sharing_waiting(),
   );
   // A green "Published" next to "Connecting…" is a contradiction: the count
@@ -461,7 +461,7 @@
       ? m.ember_health_sharing_waiting_hint()
       : publishedInProgress && isConnected
         ? m.ember_health_sharing_publishing_hint({
-            remaining: publishedTotal - publishedCount,
+            remaining: formatNumber(publishedTotal - publishedCount),
           })
         : isConnected
           ? m.ember_health_sharing_published_hint()
@@ -541,7 +541,7 @@
     { id: 'peers', k: m.ember_stat_peers(), v: formatNumber(diag?.ember_peers_known ?? 0) },
     { id: 'sessions', k: m.ember_stat_sessions(), v: formatNumber(diag?.ember_sessions ?? 0) },
     { id: 'records', k: m.ember_stat_records(), v: formatNumber(diag?.ember_dht_stored_records ?? 0) },
-    { id: 'published-files', k: m.ember_stat_published_files(), v: publishedTotal > 0 ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal }) : String(publishedCount) },
+    { id: 'published-files', k: m.ember_stat_published_files(), v: publishedTotal > 0 ? m.ember_overview_published_of({ published: formatNumber(publishedCount), total: formatNumber(publishedTotal) }) : formatNumber(publishedCount) },
     { id: 'stored-keys', k: m.ember_stat_stored_keys(), v: formatNumber(diag?.ember_dht_stored_keys ?? 0) },
     { id: 'stored-for-others', k: m.ember_stat_stored_for_others(), v: formatNumber(diag?.ember_dht_stored_for_others_records ?? 0) },
     { id: 'publishes', k: m.ember_stat_active_publishes(), v: formatNumber(diag?.ember_dht_active_publishes ?? 0) },
@@ -665,6 +665,13 @@
     <p class="page-subtitle">{m.ember_page_subtitle()}</p>
   </div>
   <div class="header-actions">
+    {#if isActive}
+      <button type="button" class="ghost" onclick={() => copyText(diagnosticsText(), 'diagnostics')}>
+        {#if copiedKey === 'diagnostics'}{m.ember_copied()}
+        {:else if copiedKey === 'diagnostics:error'}{m.ember_copy_failed()}
+        {:else}{m.ember_copy_diagnostics()}{/if}
+      </button>
+    {/if}
     <button
       type="button"
       class="ghost"
@@ -727,97 +734,115 @@
     <div class="banner banner-warn" role="status">{m.ember_version_mismatch_banner()}</div>
   {/if}
 
-  <!-- The KAD page's Network Status panel, with Ember's own verdicts on top. -->
-  <section class="stats-panel" aria-label={m.kad_network_status()}>
-    <div class="panel-title">{m.kad_network_status()}</div>
-
-    <div class="status-body">
-      <div class="health-list" aria-live="polite">
-        <div class="health-item">
-          <div class="health-head">
-            <span class="stat-label-text">{m.kad_stat_status()}</span>
-            <span class="badge" class:tone-success={heroState === 'connected'} class:tone-warning={heroState === 'connecting' || heroState === 'no_peers'} class:tone-muted={heroState === 'loading'}>
-              {#if joining}<span class="spinner xs current" aria-hidden="true"></span>{/if}
-              {statusLabel}
-            </span>
-          </div>
-          {#if statusHint}<p class="health-hint">{statusHint}</p>{/if}
-        </div>
-
-        {#if isActive}
-          <div class="health-item">
-            <div class="health-head">
-              <span class="stat-label-text">{m.ember_health_reachability()}</span>
-              <span class="badge" class:tone-success={reachabilityTone === 'ok'} class:tone-warning={reachabilityTone === 'warn'} class:tone-muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
-            </div>
-            <p class="health-hint">{reachabilityHint}</p>
-            {#if relayedFix}<p class="health-hint">{relayedFix}</p>{/if}
-            <div class="health-tool"><PortTest /></div>
-          </div>
-
-          <div class="health-item">
-            <div class="health-head">
-              <span class="stat-label-text">{m.ember_health_sharing()}</span>
-              <span class="badge" class:tone-success={sharingTone === 'ok'} class:tone-warning={sharingTone === 'warn'} class:tone-muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
-            </div>
-            <p class="health-hint">{sharingHint}</p>
-          </div>
-        {/if}
-      </div>
-
-      <div class="status-readings">
-        {#if isActive}
-          <div class="stat-group stat-group-grid">
-            <div class="stat-tile">
-              <span class="stat-label" title={m.ember_overview_contacts()}>{m.ember_overview_contacts()}</span>
-              <span class="stat-value stat-numeric">{formatNumber(verifiedCount)}</span>
-            </div>
-            <div class="stat-tile">
-              <span class="stat-label" title={m.ember_stat_network_size()}>{m.ember_stat_network_size()}</span>
-              <span class="stat-value stat-numeric">{estimatedNodes}</span>
-            </div>
-            <div class="stat-tile" title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: publishedCount, total: publishedTotal }) : undefined}>
-              <span class="stat-label" title={m.ember_overview_published()}>{m.ember_overview_published()}</span>
-              <span class="stat-value stat-numeric">
-                {publishedTotal > 0 ? m.ember_overview_published_of({ published: publishedCount, total: publishedTotal }) : formatNumber(publishedCount)}
-              </span>
-            </div>
-            <div class="stat-tile">
-              <span class="stat-label" title={m.ember_stat_active_searches()}>{m.ember_stat_active_searches()}</span>
-              <span class="stat-value stat-numeric">{formatNumber(activeSearches)}</span>
-            </div>
-          </div>
-        {/if}
-
-        <!--
-          The readings behind the reachability verdict. Shown whatever the
-          overlay's state, because external IP, firewall and port mapping
-          describe this machine's connection rather than Ember. Same component
-          as the KAD page's panel, so the two cannot drift. The firewall and
-          IP come from KAD's own checks, which can disagree with Ember's
-          verdict above, so here they say so.
-        -->
-        <NetworkStatusTiles
-          kadSourced
-          relayTile={{
-            label: m.ember_relay_label(),
-            help: m.ember_relay_help(),
-            value: emberRelayValue,
-            title: emberRelayTitle,
-          }}
-        />
+  <!-- The answer to "is Ember working?" first and largest, with the four
+       numbers that back it up beside it. -->
+  <section
+    class="hero"
+    class:hero-ok={heroState === 'connected'}
+    class:hero-warn={heroState === 'connecting' || heroState === 'no_peers'}
+    aria-label={m.kad_stat_status()}
+  >
+    <div class="hero-status">
+      <span class="hero-icon" class:hero-icon-busy={joining} aria-hidden="true">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 2.5C11.5 5.5 14.5 6.5 14.5 11a4.5 4.5 0 0 1-9 0c0-1.6.7-2.8 1.6-3.7C8.3 6.2 8.8 5 8 3.5c1 .4 1.6 1 2 2z"/>
+          <path d="M10 16.3a2 2 0 0 0 2-2c0-1.2-1-1.9-2-3.1-1 1.2-2 1.9-2 3.1a2 2 0 0 0 2 2z"/>
+        </svg>
+      </span>
+      <div class="hero-text" aria-live="polite">
+        <span class="hero-eyebrow">{m.kad_stat_status()}</span>
+        <span class="hero-title">{statusLabel}</span>
+        {#if statusHint}<p class="hero-hint">{statusHint}</p>{/if}
       </div>
     </div>
 
     {#if isActive}
-      <div class="stats-actions">
-        <button type="button" class="ghost" onclick={() => copyText(diagnosticsText(), 'diagnostics')}>
-          {#if copiedKey === 'diagnostics'}{m.ember_copied()}
-          {:else if copiedKey === 'diagnostics:error'}{m.ember_copy_failed()}
-          {:else}{m.ember_copy_diagnostics()}{/if}
-        </button>
-      </div>
+      <!-- `dt` before `dd` for the reading order; the column is reversed so
+           the number sits above its label. -->
+      <dl class="hero-stats">
+        <div class="hero-stat">
+          <dt>{m.ember_overview_contacts()}</dt>
+          <dd>{formatNumber(verifiedCount)}</dd>
+        </div>
+        <div class="hero-stat">
+          <dt>{m.ember_stat_network_size()}</dt>
+          <dd>{estimatedNodes}</dd>
+        </div>
+        <div
+          class="hero-stat"
+          title={publishedTotal > 0 ? m.ember_overview_published_of_hint({ published: formatNumber(publishedCount), total: formatNumber(publishedTotal) }) : undefined}
+        >
+          <dt>{m.ember_overview_published()}</dt>
+          <dd>{publishedTotal > 0 ? m.ember_overview_published_of({ published: formatNumber(publishedCount), total: formatNumber(publishedTotal) }) : formatNumber(publishedCount)}</dd>
+        </div>
+        <div class="hero-stat">
+          <dt>{m.ember_stat_active_searches()}</dt>
+          <dd>{formatNumber(activeSearches)}</dd>
+        </div>
+      </dl>
     {/if}
+  </section>
+
+  {#if isActive}
+    <div class="health-cards">
+      <section class="health-card" aria-labelledby="ember-reachability-label">
+        <!-- Only the reachability verdict is announced. The sharing count moves
+             on every poll while a library publishes, and PortTest announces
+             its own result. -->
+        <div aria-live="polite">
+          <div class="health-head">
+            <span class="stat-label-text" id="ember-reachability-label">{m.ember_health_reachability()}</span>
+            <span class="badge" class:tone-success={reachabilityTone === 'ok'} class:tone-warning={reachabilityTone === 'warn'} class:tone-muted={reachabilityTone === 'muted'}>{reachabilityLabel}</span>
+          </div>
+          <p class="health-hint">{reachabilityHint}</p>
+          {#if relayedFix}<p class="health-hint">{relayedFix}</p>{/if}
+        </div>
+        <div class="health-tool"><PortTest /></div>
+      </section>
+
+      <section class="health-card" aria-labelledby="ember-sharing-label">
+        <div class="health-head">
+          <span class="stat-label-text" id="ember-sharing-label">{m.ember_health_sharing()}</span>
+          <span class="badge" class:tone-success={sharingTone === 'ok'} class:tone-warning={sharingTone === 'warn'} class:tone-muted={sharingTone === 'muted'}>{sharingPillLabel}</span>
+        </div>
+        {#if publishedTotal > 0}
+          <div
+            class="publish-meter"
+            class:meter-ok={sharingTone === 'ok'}
+            role="progressbar"
+            aria-label={m.ember_overview_published()}
+            aria-valuemin={0}
+            aria-valuemax={publishedTotal}
+            aria-valuenow={Math.min(publishedCount, publishedTotal)}
+            aria-valuetext={sharingPillLabel}
+          >
+            <span style:width="{(Math.min(publishedCount, publishedTotal) / publishedTotal) * 100}%"></span>
+          </div>
+        {/if}
+        <p class="health-hint">{sharingHint}</p>
+      </section>
+    </div>
+  {/if}
+
+  <!--
+    The readings behind the reachability verdict. Shown whatever the
+    overlay's state, because external IP, firewall and port mapping
+    describe this machine's connection rather than Ember. Same component
+    as the KAD page's panel, so the two cannot drift. The firewall and
+    IP come from KAD's own checks, which can disagree with Ember's
+    verdict above, so here they say so.
+  -->
+  <section class="stats-panel" aria-labelledby="ember-network-status-label">
+    <div class="panel-title" id="ember-network-status-label">{m.kad_network_status()}</div>
+    <NetworkStatusTiles
+      kadSourced
+      relayTile={{
+        label: m.ember_relay_label(),
+        help: m.ember_relay_help(),
+        value: emberRelayValue,
+        title: emberRelayTitle,
+      }}
+    />
   </section>
 
   <!-- Routing contacts and protocol tables: for diagnosing, not for knowing
@@ -1135,6 +1160,7 @@
   .header-actions {
     display: flex;
     align-items: center;
+    gap: 8px;
     flex-shrink: 0;
   }
 
@@ -1147,6 +1173,9 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    /* The hero lays itself out against the width the page has, which the
+       sidebar's collapse changes as much as the window does. */
+    container-type: inline-size;
     overflow-y: auto;
     padding: var(--workspace-padding);
     gap: 12px;
@@ -1289,62 +1318,192 @@
     container-type: inline-size;
   }
 
-  /* The verdicts beside the readings behind them while there is room. */
-  .status-body {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 0 28px;
-    align-items: start;
-  }
+  /* --- Hero: the status verdict and the headline numbers --- */
 
-  .status-body .health-list {
-    border-bottom: none;
-  }
-
-  @container (max-width: 720px) {
-    .status-body {
-      grid-template-columns: minmax(0, 1fr);
-    }
-
-    .status-body .health-list {
-      border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
-    }
-  }
-
-  /* Numeric readouts read at a glance, as on the KAD panel. */
-  .stat-tile .stat-numeric {
-    font-size: var(--font-size-xl);
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: -0.3px;
-  }
-
-  .stats-actions {
+  /* The state colours the card itself, faintly, so the answer reads before a
+     single word does: green when connected, amber while it is not yet. */
+  .hero {
+    --hero-tone: var(--text-muted);
     display: flex;
-    gap: 8px;
-    margin-top: 14px;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 18px 32px;
+    padding: 20px 22px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background:
+      linear-gradient(
+        120deg,
+        color-mix(in srgb, var(--hero-tone) 9%, var(--bg-secondary)) 0%,
+        var(--bg-secondary) 55%
+      );
+    box-shadow: var(--shadow-sm);
   }
 
-  .stats-actions button {
-    font-size: var(--font-size-sm);
-    padding: 7px 10px;
+  .hero.hero-ok {
+    --hero-tone: var(--success);
+  }
+
+  .hero.hero-warn {
+    --hero-tone: var(--warning);
+  }
+
+  .hero-status {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex: 1 1 280px;
+    min-width: 0;
+  }
+
+  .hero-icon {
+    position: relative;
+    flex-shrink: 0;
+    width: 52px;
+    height: 52px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    color: var(--hero-tone);
+    background: color-mix(in srgb, var(--hero-tone) 14%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--hero-tone) 28%, transparent);
+  }
+
+  .hero-icon svg {
+    width: 26px;
+    height: 26px;
+  }
+
+  /* While joining, a ring turns round the flame in place of the badge spinner
+     the status used to carry. */
+  .hero-icon-busy::after {
+    content: '';
+    position: absolute;
+    inset: -3px;
+    border-radius: 50%;
+    border: 2px solid transparent;
+    border-top-color: var(--hero-tone);
+    animation: hero-spin 1.1s linear infinite;
+  }
+
+  @keyframes hero-spin {
+    to { transform: rotate(360deg); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .hero-icon-busy::after {
+      animation: none;
+      border-color: color-mix(in srgb, var(--hero-tone) 45%, transparent);
+    }
+  }
+
+  .hero-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .hero-eyebrow {
+    font-size: var(--font-size-2xs);
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .hero-title {
+    margin-top: 2px;
+    font-size: var(--font-size-3xl);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: -0.3px;
+    color: var(--text-primary);
+  }
+
+  .hero-hint {
+    margin: 4px 0 0;
+    font-size: var(--font-size-md);
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+
+  .hero-stats {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, auto));
+    gap: 8px 28px;
+    margin: 0;
+    flex: 0 1 auto;
+  }
+
+  .hero-stat {
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .hero-stat dd {
+    margin: 0;
+    font-size: var(--font-size-3xl);
+    font-weight: 700;
+    line-height: 1.1;
+    letter-spacing: -0.4px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
     white-space: nowrap;
   }
 
-  /* --- Health: Ember's plain-language verdicts at the head of the panel --- */
-
-  .health-list {
-    display: flex;
-    flex-direction: column;
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+  /* Allowed to wrap: the German and Polish captions run well past the
+     English, and a clipped caption no longer says what the number is. */
+  .hero-stat dt {
+    font-size: var(--font-size-2xs);
+    font-weight: 600;
+    line-height: 1.3;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-muted);
   }
 
-  .health-item {
-    padding: 9px 0;
+  /* Below the status rather than beside it once the row is too narrow for
+     both, and two by two when even four across will not fit. */
+  @container (max-width: 860px) {
+    .hero-stats {
+      flex-basis: 100%;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      padding-top: 14px;
+      border-top: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
+    }
+
+    /* A quarter of the row can be narrower than "12,345 of 23,456". */
+    .hero-stat dd {
+      font-size: var(--font-size-2xl);
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
   }
 
-  .health-item + .health-item {
-    border-top: 1px dashed color-mix(in srgb, var(--border) 70%, transparent);
+  @container (max-width: 520px) {
+    .hero-stats {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  /* --- Health: reachability and sharing, side by side --- */
+
+  .health-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 12px;
+  }
+
+  .health-card {
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-sm);
+    min-width: 0;
   }
 
   .health-head {
@@ -1356,10 +1515,10 @@
 
   .stat-label-text {
     color: var(--text-muted);
-    font-weight: 500;
+    font-weight: 700;
     font-size: var(--font-size-2xs);
     text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.08em;
     white-space: nowrap;
   }
 
@@ -1374,14 +1533,35 @@
   }
 
   .health-hint {
-    margin: 5px 0 0;
+    margin: 8px 0 0;
     font-size: var(--font-size-sm);
     line-height: 1.45;
     color: var(--text-muted);
   }
 
   .health-tool {
-    margin-top: 8px;
+    margin-top: 12px;
+  }
+
+  /* How much of what you share is advertised, under the count it draws. */
+  .publish-meter {
+    height: 6px;
+    margin-top: 12px;
+    border-radius: var(--radius-pill);
+    background: var(--bg-tertiary);
+    overflow: hidden;
+  }
+
+  .publish-meter span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--warning);
+    transition: width var(--transition-normal) ease;
+  }
+
+  .publish-meter.meter-ok span {
+    background: var(--success);
   }
 
   /* --- Tables --- */
