@@ -3003,6 +3003,16 @@
     removeAskOpen = true;
   }
 
+  // The outbox can deliver the message while the question is up, and then the
+  // friend does get it.
+  $effect(() => {
+    const ask = removeAsk;
+    if (!removeAskOpen || !ask?.queued) return;
+    if (messages.find((msg) => msg.id === ask.id)?.delivery === 'delivered') {
+      removeAsk = { ...ask, queued: false };
+    }
+  });
+
   // The question is about a line in the conversation it was asked in.
   $effect(() => {
     void conversationKey;

@@ -3,6 +3,7 @@
   import {
     getServerList,
     getConnectedServer,
+    getLastServer,
     connectToServer,
     disconnectServer,
     addServer,
@@ -35,9 +36,11 @@
   import { serverLog, appendServerLog, clearServerLog } from '$lib/stores/serverLog';
   import IconX from '$lib/components/IconX.svelte';
   import { TableWindow } from '$lib/tableWindow.svelte';
+  import { pickBestServer } from '$lib/bestServer';
 
   let servers: ServerInfo[] = $state([]);
   let connectedServer: ServerInfo | null = $state(null);
+  let lastServer: { ip: string; port: number } | null = $state(null);
   let loading = $state(true);
   let error: string | null = $state(null);
   let successMsg: string | null = $state(null);
@@ -316,11 +319,14 @@
     refreshInProgress = true;
     pendingRefresh = false;
     try {
-      const [list, connected] = await Promise.allSettled([
+      const [list, connected, last] = await Promise.allSettled([
         withTimeout(getServerList(), 'get_server_list', 4000),
         withTimeout(getConnectedServer(), 'get_connected_server', 4000),
+        withTimeout(getLastServer(), 'get_last_server', 4000),
       ]);
       if (!mounted) return;
+      // Only a hint for "Connect to best server", which ranks without it.
+      if (last.status === 'fulfilled') lastServer = last.value;
       let hadFailure = false;
       if (list.status === 'fulfilled') {
         servers = list.value;
@@ -1079,15 +1085,8 @@
 
   let selectionCount = $derived(selectedServers.size);
   let failedServerCount = $derived(servers.filter((s) => s.fail_count >= 3).length);
-  /** What Connect does with no row picked: the server most likely to answer,
-   *  ranked the way the startup auto-connect ranks them. Priority means what
-   *  it does in eMule: High first, Low never chosen for you. */
-  let bestServer = $derived.by(() => {
-    const rank = { high: 0, normal: 1, low: 2 } as const;
-    const order = (a: ServerInfo, b: ServerInfo) =>
-      rank[a.priority] - rank[b.priority] || a.fail_count - b.fail_count || b.user_count - a.user_count;
-    return servers.filter((s) => s.priority !== 'low').sort(order)[0] ?? null;
-  });
+  /** What Connect does with no row picked. */
+  let bestServer = $derived(pickBestServer(servers, lastServer));
   let totalListedUsers = $derived(servers.reduce((sum, s) => sum + s.user_count, 0));
   let totalListedFiles = $derived(servers.reduce((sum, s) => sum + s.file_count, 0));
 

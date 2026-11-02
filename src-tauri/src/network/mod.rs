@@ -1077,6 +1077,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_key_record_holds: HashMap::new(),
         ember_key_record_queue: std::collections::VecDeque::new(),
         ember_key_records_ready: std::collections::VecDeque::new(),
+        ember_key_record_lookups: HashMap::new(),
         ember_store_loaded: false,
         ember_reach_witness: None,
         ember_udp_reachable_at: None,
@@ -1302,7 +1303,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_epoch_fetch_at: HashMap::new(),
         ember_channel_claim_searches: HashMap::new(),
         ember_pending_channel_claim: Vec::new(),
-        channel_claim_answered_at: HashMap::new(),
         channel_return_held_since: HashMap::new(),
     };
 
@@ -2945,7 +2945,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     None => {
                         emit_server_auto_connect_failed(
                             &app_handle,
-                            "no last server and eMule Sunrise not in list",
+                            "no last server in the list, no High priority server, and eMule Sunrise missing or Low priority",
                         );
                     }
                 }

@@ -709,10 +709,12 @@ pub async fn get_blocked_friends(
 /// card goes back to the name the friend chose.
 #[tauri::command]
 pub async fn update_friend_nickname(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
     nickname: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     // L20: same sanitisation pass as `add_friend` so a rename to
     // an injected bidi/zero-width payload doesn't slip past.
     let cleaned = crate::security::sanitize_display_name(&nickname);

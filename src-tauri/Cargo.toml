@@ -137,7 +137,12 @@ rustls = { version = "0.23", features = ["ring"] }
 # ASN.1/DER parser walks the actual certificate structure and cannot
 # be fooled that way.
 x509-cert = { version = "0.3", default-features = false }
-zip = "9"
+# Stored and Deflate only: backups are written Deflated, and the only zips read
+# are those backups and ipfilter.zip. Every other method fails as unsupported
+# instead of reaching the zstd (C), xz/lzma, PPMd, bzip2 or deflate64 decoders
+# with a third-party archive. `zlib-rs` is the backend flate2 already uses.
+# `time` stamps backup entries with the export time.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "time"] }
 fs2 = "0.4"
 maxminddb = "0.32"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }

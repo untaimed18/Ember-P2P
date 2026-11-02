@@ -2375,14 +2375,21 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let grants = ctx.grants.clone();
+    let mut progress = None;
+    let mut started_at = None;
     let served = super::attach_stream::serve_stream(
         super::attach::ROOM_XFER_STREAM_MSG_TYPE,
         recv,
         send,
         header,
-        |xfer_id| super::xfer::stream_grant_for(&grants, xfer_id, &peer_pubkey),
+        |xfer_id| {
+            let (grant, grant_progress) = super::xfer::stream_grant_for(&grants, xfer_id, &peer_pubkey)?;
+            progress = Some(grant_progress);
+            Some(grant)
+        },
         // Called only once the request's tag has verified.
         |xfer_id, position, _size| {
+            started_at.get_or_insert(position);
             super::xfer::note_stream_served(&grants, xfer_id, &peer_pubkey, position)
         },
         Some(limiter),
@@ -2393,8 +2400,12 @@ where
         Ok(bytes) => debug!("Ember Transfer: streamed {bytes} byte(s)"),
         Err(e) => debug!("Room transfer stream failed: {e}"),
     }
+    let counted = match (&served, progress, started_at) {
+        (Ok(sent), Some(progress), Some(from)) => progress.count_served(from, from.saturating_add(*sent)),
+        _ => 0,
+    };
     let peer = super::crypto::node_id_from_ed25519_bytes(&peer_pubkey);
-    note_sent_over_ember(credits, peer, served.as_ref().ok().copied()).await;
+    note_sent_over_ember(credits, peer, Some(counted).filter(|&bytes| bytes > 0)).await;
     served
 }
 

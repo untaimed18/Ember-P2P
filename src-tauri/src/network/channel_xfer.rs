@@ -2386,11 +2386,12 @@ pub(super) fn apply_xfer_done(
     }
     let send = state.xfer_send.remove(&xfer_id).expect("just checked");
     // What went as blocks counts against the member like an upload; what went
-    // over a stream was counted where it was served.
-    let blocks = send
-        .sent_blocks
-        .saturating_mul(ember::channel::XFER_BLOCK_SIZE as u64)
-        .min(send.size);
+    // over a stream was counted where it was served. Read from the grant, as
+    // the stream's last stretch may have landed since the tick synced it.
+    let stream_position = state.xfer_grants.lock().get(&xfer_id).map_or(0, |grant| {
+        grant.progress.position.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let blocks = send.block_bytes_to_count(stream_position);
     if let (Some(member), true) = (ember::crypto::node_id_from_ed25519_bytes(&send.peer), blocks > 0) {
         state.xfer_block_uploads.push((member, blocks));
     }

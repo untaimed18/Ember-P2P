@@ -295,9 +295,13 @@ timers, and an end-to-end test over two network loops; the receive path is
 covered by its parts' tests.
 
 **Done in 1.7.6:** "Load older" in a conversation. The newest 100 show as
-before, and each older page is read from the oldest one shown, that one's
-timestamp included, since messages can share one; rows already shown are
-dropped, and a page that brings nothing new marks the conversation's start.
+before, and each older page is read from before the oldest one shown, by its
+timestamp and its stored row, since timestamps are the sender's and can
+repeat. A message not read back from storage yet (one that just arrived) has
+no row, so a page read from it takes its timestamp in and drops the rows
+already shown. Rows that cannot be opened are passed over without counting
+toward the page, so a short page, or one that brings nothing new, marks the
+conversation's start.
 
 ## 3. Follow a publisher (feeds)
 
@@ -1027,8 +1031,11 @@ feed mirrors are not fetched with the per-feed switch off.
 
 ## Smaller follow-ups from the 1.7.6 fixes
 
-- **Check friend meets live.** 1.7.6 resends the first handshake message at 1
-  and 3 seconds and puts the sender's Noise key in the meet
+- **Check friend meets live.** 1.7.6 puts the sender's Noise key in the meet
+  and resends the first handshake message: the lower-key side as soon as it
+  refuses the peer's crossed dial (at most once a second and twice a dial),
+  and every dial once at 1 second, or at 1 and 3 seconds for a dial the peer
+  has crossed
   (`docs/ember-dht.md`, section 3). Tests replay the failure, but no meet has
   been tried between two real restricted NATs. Compare
   `ember_dht_friend_meets` against `ember_dht_friend_meets_converted` in

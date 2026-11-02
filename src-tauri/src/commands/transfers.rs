@@ -832,9 +832,51 @@ pub(crate) async fn cleanup_partial_files(db: &Arc<Database>, download_roots: &[
     }
 }
 
+/// Downloads cleaned at once within one folder. Each can spend seconds
+/// retrying a file that is still held open, so one at a time a long batch
+/// ran past the folder's budget on a folder that did answer.
+const PARTIAL_CLEANUP_CONCURRENCY: usize = 8;
+
+/// Run each download's cleanup, [`PARTIAL_CLEANUP_CONCURRENCY`] at a time,
+/// until `deadline`. Returns the ids whose cleanup did not finish.
+async fn clean_ids_until<Fut>(
+    cleanups: Vec<(&str, Fut)>,
+    deadline: tokio::time::Instant,
+) -> Vec<&str>
+where
+    Fut: std::future::Future<Output = ()>,
+{
+    use futures::StreamExt;
+    async fn cleaned<Fut: std::future::Future<Output = ()>>(id: &str, cleaning: Fut) -> &str {
+        cleaning.await;
+        id
+    }
+    let ids: Vec<&str> = cleanups.iter().map(|(id, _)| *id).collect();
+    let mut queue = cleanups.into_iter();
+    let mut running = futures::stream::FuturesUnordered::new();
+    let mut done = std::collections::HashSet::new();
+    let run = async {
+        loop {
+            while running.len() < PARTIAL_CLEANUP_CONCURRENCY {
+                let Some((id, cleaning)) = queue.next() else {
+                    break;
+                };
+                running.push(cleaned(id, cleaning));
+            }
+            let Some(id) = running.next().await else {
+                break;
+            };
+            done.insert(id);
+        }
+    };
+    let _ = tokio::time::timeout_at(deadline, run).await;
+    ids.into_iter().filter(|id| !done.contains(id)).collect()
+}
+
 /// [`cleanup_partial_files`] for many downloads at once: each folder is asked
 /// whether it can be reached once, and cleaned for all of them within one
-/// [`PARTIAL_CLEANUP_FOLDER_BUDGET`].
+/// [`PARTIAL_CLEANUP_FOLDER_BUDGET`]. Only the downloads a folder did not get
+/// through in time are left for when it answers.
 async fn cleanup_partial_files_many(
     db: &Arc<Database>,
     download_roots: &[String],
@@ -861,31 +903,34 @@ async fn cleanup_partial_files_many(
             crate::network::ed2k::part_tracker::suppress_met_saves(&paths(id)[1]);
         }
         let allowed = vec![root.clone()];
-        let cleanup = async {
-            let folder = std::path::PathBuf::from(root);
-            let reachable = tokio::task::spawn_blocking(move || {
+        let deadline = tokio::time::Instant::now() + PARTIAL_CLEANUP_FOLDER_BUDGET;
+        let folder = std::path::PathBuf::from(root);
+        let reachable = tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || {
                 crate::storage::part_folders::folder_reachable(&folder)
-            })
-            .await
-            .unwrap_or(false);
-            if reachable {
-                for id in ids {
-                    let [part_path, met_path] = paths(id);
+            }),
+        )
+        .await
+        .is_ok_and(|reached| reached.unwrap_or(false));
+        let unfinished = if reachable {
+            let allowed = &allowed;
+            let mut cleanups = Vec::with_capacity(ids.len());
+            for &id in ids.iter() {
+                let [part_path, met_path] = paths(id);
+                cleanups.push((id, async move {
                     tokio::join!(
-                        cleanup_one_partial(&part_path, &allowed, 6, 500),
-                        cleanup_one_partial(&met_path, &allowed, 6, 500),
+                        cleanup_one_partial(&part_path, allowed, 6, 500),
+                        cleanup_one_partial(&met_path, allowed, 6, 500),
                     );
-                }
+                }));
             }
-            reachable
+            clean_ids_until(cleanups, deadline).await
+        } else {
+            ids.clone()
         };
-        let cleaned = tokio::time::timeout(PARTIAL_CLEANUP_FOLDER_BUDGET, cleanup)
-            .await
-            .unwrap_or(false);
-        if cleaned {
-            return Vec::new();
-        }
-        ids.iter()
+        unfinished
+            .into_iter()
             .filter(|id| crate::storage::part_folders::may_hold_parts(id, Path::new(root)))
             .flat_map(|id| {
                 tracing::warn!("Removing {id}'s part files from {root} once it answers");
@@ -1507,8 +1552,6 @@ async fn save_web_sources(state: &AppState, file_hash: &str, added: Vec<String>,
 /// Lines the Add web mirror dialog may send at once: past the per-file cap
 /// already, with room for a few the cap would refuse to be reported as such.
 const MAX_WEB_SOURCE_LINES: usize = 20;
-/// How much of a refused line is echoed back for the dialog to name.
-const REFUSED_LINE_ECHO_CHARS: usize = 200;
 
 /// What adding web mirrors by hand did, for the dialog to say.
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -1521,7 +1564,8 @@ pub struct AddedWebSources {
     /// Valid mirrors left out because the download has as many as it keeps.
     pub over_limit: u32,
     /// Lines that can never be a mirror (not http or https, carrying a
-    /// password, naming this computer or the local network), shortened.
+    /// password, naming this computer or the local network), whole: the
+    /// dialog puts them back for the user to correct.
     pub refused: Vec<String>,
 }
 
@@ -1547,12 +1591,6 @@ pub async fn add_transfer_web_sources(
             "Enter at most 20 web mirrors at once",
         ));
     }
-    let lines: Vec<String> = urls
-        .iter()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
     if !web_sources::enabled() {
         return Err(coded(
             "transfers_web_sources_off",
@@ -1590,20 +1628,7 @@ pub async fn add_transfer_web_sources(
         ));
     };
 
-    let mut result = AddedWebSources::default();
-    let mut valid: Vec<String> = Vec::new();
-    for line in lines {
-        match web_sources::normalize_web_source_url(&line) {
-            None => result.refused.push(line.chars().take(REFUSED_LINE_ECHO_CHARS).collect()),
-            Some(url) if valid.contains(&url) => result.already += 1,
-            Some(url) => valid.push(url),
-        }
-    }
-    let registered = web_sources::register_replacing_retired(hash, valid);
-    // One given up on and asked for again is in use again: added, to the user.
-    result.added = (registered.added.len() + registered.revived.len()) as u32;
-    result.already += registered.already as u32;
-    result.over_limit = registered.over_limit as u32;
+    let (result, registered) = register_web_source_lines(hash, &urls);
     if result.added > 0 {
         tracing::info!(
             "Download of {file_hash} has {} web source(s) added by hand, {} tried again",
@@ -1613,6 +1638,30 @@ pub async fn add_transfer_web_sources(
         save_web_sources(&state, &file_hash, registered.added, registered.replaced).await;
     }
     Ok(result)
+}
+
+/// Register the dialog's lines as web sources of `hash` and count what each
+/// line came to.
+fn register_web_source_lines(
+    hash: [u8; 16],
+    lines: &[String],
+) -> (AddedWebSources, crate::network::ed2k::web_sources::Registered) {
+    use crate::network::ed2k::web_sources;
+    let mut result = AddedWebSources::default();
+    let mut valid: Vec<String> = Vec::new();
+    for line in lines.iter().map(|line| line.trim()).filter(|line| !line.is_empty()) {
+        match web_sources::normalize_web_source_url(line) {
+            None => result.refused.push(line.to_string()),
+            Some(url) if valid.contains(&url) => result.already += 1,
+            Some(url) => valid.push(url),
+        }
+    }
+    let registered = web_sources::register_replacing_retired(hash, valid);
+    // One given up on and asked for again is in use again: added, to the user.
+    result.added = (registered.added.len() + registered.revived.len()) as u32;
+    result.already += registered.already as u32;
+    result.over_limit = registered.over_limit as u32;
+    (result, registered)
 }
 
 #[tauri::command]
@@ -4503,6 +4552,54 @@ mod ipc_lifecycle_tests {
         assert!(!in_new(&b).exists());
         assert!(in_old(&kept).exists(), "a download not cleared keeps its part files");
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// One download whose files stay held does not keep the rest of the batch
+    /// from being cleaned, and only what was not cleaned is left for later.
+    #[tokio::test]
+    async fn a_batch_cleanup_leaves_only_the_unfinished_for_later() {
+        let ids: Vec<String> = (0..PARTIAL_CLEANUP_CONCURRENCY * 2).map(|i| format!("id{i}")).collect();
+        let cleanups: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let held = if id == "id0" { 60_000 } else { 50 };
+                (id.as_str(), async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(held)).await;
+                })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        let unfinished = clean_ids_until(cleanups, deadline).await;
+        assert_eq!(unfinished, ["id0"]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// The Add web mirror dialog's counts, and its refused lines handed back
+    /// whole so a corrected one is the address the user typed.
+    #[test]
+    fn adding_web_mirrors_counts_each_line_and_echoes_refused_ones_whole() {
+        use crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE;
+        let hash: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
+        let long_refused = format!("ftp://mirror.example/{}", "a".repeat(400));
+        let mut lines: Vec<String> = (0..MAX_WEB_SOURCES_PER_FILE + 2)
+            .map(|i| format!("https://m{i}.example/file"))
+            .collect();
+        lines.push("  https://m0.example/file#again  ".to_string());
+        lines.push("   ".to_string());
+        lines.push(long_refused.clone());
+        lines.push("http://user:pass@m9.example/file".to_string());
+
+        let (result, registered) = register_web_source_lines(hash, &lines);
+        assert_eq!(result.added as usize, MAX_WEB_SOURCES_PER_FILE);
+        assert_eq!(registered.added.len(), MAX_WEB_SOURCES_PER_FILE);
+        assert_eq!(result.already, 1, "the same mirror twice in one paste");
+        assert_eq!(result.over_limit, 2);
+        assert_eq!(result.refused, [long_refused, "http://user:pass@m9.example/file".to_string()]);
+
+        let (again, _) = register_web_source_lines(hash, &lines[..1]);
+        assert_eq!((again.added, again.already), (0, 1), "a mirror already in use");
+        crate::network::ed2k::web_sources::forget(&hash);
     }
 
     /// Resume is offered on a failed row only while its `.part` is there, in

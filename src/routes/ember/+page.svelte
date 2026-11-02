@@ -39,6 +39,12 @@
 
   let diag = $state<EmberDiagnostics | null>(null);
   let contacts = $state<EmberDhtContact[]>([]);
+  /** A contacts fetch has answered since Technical details was opened, so an
+   *  empty `contacts` means no peers rather than not asked yet or failing. */
+  let contactsLoaded = $state(false);
+  /** The last contacts fetch failed, so a panel with nothing loaded says so
+   *  rather than spinning while the call keeps failing. */
+  let contactsFailed = $state(false);
   let searches = $state<EmberDhtSearchEntry[]>([]);
   let storeEntries = $state<EmberDhtStoreEntry[]>([]);
   let contactFilter = $state('');
@@ -108,6 +114,10 @@
     detailsOpen = open;
     writeFlag(DETAILS_OPEN_KEY, open);
     if (open) void refreshLists();
+    else {
+      contactsLoaded = false;
+      contactsFailed = false;
+    }
   }
   let showRestartPrompt = $state(false);
   let restarting = $state(false);
@@ -156,6 +166,7 @@
     if (unmounted || inFlightLists) return;
     if (!diag?.ember_native_enabled) {
       contacts = [];
+      contactsLoaded = true;
       searches = [];
       storeEntries = [];
       return;
@@ -163,14 +174,27 @@
     if (!detailsOpen) return;
     inFlightLists = true;
     const tab = lowerTab;
+    let contactsFetched = false;
+    let contactsRefused = false;
     try {
       const [c, s, st] = await Promise.all([
-        getEmberDhtContacts().catch(() => contacts),
+        getEmberDhtContacts().then(
+          (list) => {
+            contactsFetched = true;
+            return list;
+          },
+          () => {
+            contactsRefused = true;
+            return contacts;
+          },
+        ),
         tab === 'searches' ? getEmberDhtSearches().catch(() => searches) : Promise.resolve(searches),
         tab === 'store' ? getEmberDhtStore().catch(() => storeEntries) : Promise.resolve(storeEntries),
       ]);
       if (!unmounted) {
         contacts = c;
+        if (contactsFetched && detailsOpen) contactsLoaded = true;
+        if (detailsOpen) contactsFailed = contactsRefused;
         searches = s;
         storeEntries = st;
       }
@@ -868,7 +892,11 @@
         />
       </div>
       <div class="panel-content scrollable scroll-shadows" bind:this={contactScrollEl}>
-        {#if diag === null}
+        {#if (diag === null && diagStale) || (contactsFailed && !contactsLoaded && contacts.length === 0)}
+          <div class="empty-state compact" role="status">
+            <p class="empty-title">{m.transfers_load_unavailable()}</p>
+          </div>
+        {:else if diag === null || (!contactsLoaded && contacts.length === 0)}
           <div class="empty-state compact">
             <div class="spinner lg"></div>
             <p>{m.common_loading()}</p>

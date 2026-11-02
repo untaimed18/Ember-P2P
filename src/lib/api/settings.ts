@@ -117,8 +117,9 @@ export const QUIT_REQUESTED_EVENT = 'ember:quit-requested';
 
 /** Answer {@link QUIT_REQUESTED_EVENT}: send pending Undo actions, then let
  *  the backend finish the exit it started. Any window can emit that event, so
- *  the backend ignores this unless it really is waiting on one. */
+ *  nothing is sent unless the backend really is waiting on one. */
 export async function finishRequestedQuit(): Promise<void> {
+  if (!(await invoke<boolean>('quit_flush_pending'))) return;
   await flushToastActionsBeforeExit();
   return invoke('finish_requested_quit');
 }

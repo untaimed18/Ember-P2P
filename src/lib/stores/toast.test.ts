@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import {
   addActionToast, addToast, clearAllToasts, flushToastActions, onPendingUndoChange, pauseToastDismiss,
-  removeToast, resumeToastDismiss, runLatestUndo, toasts,
+  reloadAfterToastActions, removeToast, resumeToastDismiss, runLatestUndo, toasts,
 } from './toast';
 
 describe('action toasts', () => {
@@ -117,6 +117,48 @@ describe('action toasts', () => {
     expect(get(toasts)).toHaveLength(1);
     vi.advanceTimersByTime(200);
     expect(get(toasts)).toHaveLength(0);
+  });
+
+  it('counts a repeat on the toast it folds into, so it can be shown and announced again', () => {
+    const first = addToast('error', 'Failed to mark spam');
+    expect(get(toasts)[0].repeats).toBeUndefined();
+    addToast('error', 'Failed to mark spam');
+    addToast('error', 'Failed to mark spam');
+    expect(get(toasts)).toEqual([expect.objectContaining({ id: first, repeats: 2 })]);
+  });
+
+  it('reloads only once what an Undo held back has been sent', async () => {
+    let land!: () => void;
+    const commit = new Promise<void>((resolve) => { land = resolve; });
+    const onExpire = vi.fn(() => commit);
+    addActionToast('info', 'Ignored', { label: 'Undo', run: vi.fn(), undo: true }, onExpire);
+    const reload = vi.fn();
+    reloadAfterToastActions(reload);
+    expect(onExpire).toHaveBeenCalledTimes(1);
+    await Promise.resolve();
+    expect(reload).not.toHaveBeenCalled();
+    land();
+    await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+  });
+
+  it('still flushes the rest and reloads when an expiry throws', async () => {
+    const pending: boolean[] = [];
+    onPendingUndoChange((p) => {
+      pending.push(p);
+    });
+    const throws = vi.fn(() => {
+      throw new Error('boom');
+    });
+    const after = vi.fn();
+    addActionToast('info', 'Ignored', { label: 'Undo', run: vi.fn(), undo: true }, throws);
+    addActionToast('info', 'Removed', { label: 'Undo', run: vi.fn(), undo: true }, after);
+    const reload = vi.fn();
+    reloadAfterToastActions(reload);
+    expect(throws).toHaveBeenCalledTimes(1);
+    expect(after).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    expect(pending.at(-1)).toBe(false);
+    onPendingUndoChange(null);
   });
 
   it('keeps toasts that differ in type or message apart', () => {

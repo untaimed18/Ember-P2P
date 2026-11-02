@@ -89,12 +89,10 @@ enum RuleQuery {
 impl RuleQuery {
     /// What these rules do for `port`, or `None` when the output cannot tell.
     fn state(&self, port: u16) -> Option<RuleState> {
+        let exe = std::env::current_exe().ok();
         match self {
-            RuleQuery::Rules(text) => {
-                let exe = std::env::current_exe().ok();
-                Some(rule_state_from_lines(text, port, exe.as_deref()))
-            }
-            RuleQuery::Netsh(text) => netsh_rule_state(text, port),
+            RuleQuery::Rules(text) => Some(rule_state_from_lines(text, port, exe.as_deref())),
+            RuleQuery::Netsh(text) => netsh_rule_state(text, port, exe.as_deref()),
         }
     }
 }
@@ -133,9 +131,9 @@ fn query_rules(rule_name: &str) -> Option<RuleQuery> {
 
     // Fallback for stripped-down Windows environments without the firewall
     // PowerShell module. netsh fails alike for a missing rule and a failed
-    // query, so a failure here is no answer. Its state, action and program
-    // fields are labelled in the display language too, so this reads the
-    // port alone.
+    // query, so a failure here is no answer. Its labels and its words for
+    // state and action are in the display language, so this reads each
+    // rule's port and program path alone.
     let output = Command::new(windows_system_path(NETSH))
         .args([
             "advfirewall",
@@ -143,6 +141,7 @@ fn query_rules(rule_name: &str) -> Option<RuleQuery> {
             "show",
             "rule",
             &format!("name={rule_name}"),
+            "verbose",
         ])
         .creation_flags(0x08000000)
         .output();
@@ -230,27 +229,52 @@ const NETSH_LOCAL_PORT_KEYS: &[&str] = &[
     "本機連接埠",
 ];
 
-/// What the local ports in `netsh advfirewall firewall show rule` output open
-/// for `port`. A value without a digit is netsh's word for any port, in
-/// whatever the display language. `None` when no line is labelled as a local
-/// port at all: the display language is one the labels are not known in, and
-/// the output says nothing either way.
-fn netsh_rule_state(text: &str, port: u16) -> Option<RuleState> {
+/// What the local ports in `netsh advfirewall firewall show rule … verbose`
+/// output open for `port` and `exe`. Rules are blocks between blank lines; one
+/// listing another program's path is skipped, and one listing no path is for
+/// any program, whose word for that is in the display language. With no `exe`
+/// to compare, every rule counts. A port value without a digit is netsh's word
+/// for any port. `None` when no line is labelled as a local port at all: the
+/// display language is one the labels are not known in, and the output says
+/// nothing either way.
+fn netsh_rule_state(text: &str, port: u16, exe: Option<&std::path::Path>) -> Option<RuleState> {
     let expected = port.to_string();
+    let exe = exe.map(|path| program_key(&path.to_string_lossy()));
     let mut labelled = false;
+    let mut every_port = false;
     let mut opens_this_port = false;
-    for (key, value) in text.lines().filter_map(|line| line.split_once(':')) {
-        let key: String = key.to_lowercase().split_whitespace().collect();
-        if !NETSH_LOCAL_PORT_KEYS.contains(&key.as_str()) {
+    let mut block: Vec<(String, &str)> = Vec::new();
+    for line in text.lines().chain(std::iter::once("")) {
+        if !line.trim().is_empty() {
+            if let Some((key, value)) = line.split_once(':') {
+                block.push((key.to_lowercase().split_whitespace().collect(), value.trim()));
+            }
             continue;
         }
-        labelled = true;
-        if !value.trim().is_empty() && !value.chars().any(|c| c.is_ascii_digit()) {
-            return Some(RuleState::OpensEveryPort);
+        let ports = block.iter().filter(|(key, _)| NETSH_LOCAL_PORT_KEYS.contains(&key.as_str()));
+        labelled |= ports.clone().next().is_some();
+        let program = block.iter().map(|(_, value)| *value).find(|value| value.contains('\\'));
+        let covers = match (program, &exe) {
+            (Some(program), Some(exe)) => program_key(program) == *exe,
+            _ => true,
+        };
+        if covers {
+            for (_, value) in ports {
+                if !value.is_empty() && !value.chars().any(|c| c.is_ascii_digit()) {
+                    every_port = true;
+                }
+                opens_this_port |= value.split(',').any(|listed| listed.trim() == expected);
+            }
         }
-        opens_this_port |= value.split(',').any(|listed| listed.trim() == expected);
+        block.clear();
     }
-    labelled.then_some(if opens_this_port { RuleState::OpensThisPort } else { RuleState::Missing })
+    labelled.then_some(if every_port {
+        RuleState::OpensEveryPort
+    } else if opens_this_port {
+        RuleState::OpensThisPort
+    } else {
+        RuleState::Missing
+    })
 }
 
 /// Delete this executable's rules under `rule_name`, leaving those another
@@ -271,6 +295,108 @@ fn delete_firewall_rule(rule_name: &str) {
         ])
         .creation_flags(0x08000000)
         .output();
+}
+
+/// Remove this executable's enabled inbound allow rules under `rule_name` that
+/// name their ports, once one opening every port sits beside them. netsh
+/// cannot single those out from the new rule, which shares their name and
+/// program, so this needs PowerShell; without it they stay, redundant.
+fn delete_pinned_rules(rule_name: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let removed = Command::new(windows_system_path(POWERSHELL))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &pinned_rules_script(rule_name, &exe.to_string_lossy())])
+        .creation_flags(0x08000000)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !removed {
+        debug!("Could not remove the port-pinned {rule_name} rule beside the every-port one; it stays, redundant");
+    }
+}
+
+/// The PowerShell [`delete_pinned_rules`] runs. The program path goes in
+/// base64, as in [`elevated_rules_script`].
+fn pinned_rules_script(rule_name: &str, exe: &str) -> String {
+    let escaped_name = rule_name.replace('\'', "''");
+    format!(
+        "$exe = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))\n\
+         Get-NetFirewallRule -DisplayName '{escaped_name}' -ErrorAction Stop | \
+         Where-Object {{ $_.Direction -eq 'Inbound' -and $_.Enabled -eq 'True' -and $_.Action -eq 'Allow' -and \
+         [Environment]::ExpandEnvironmentVariables([string]($_ | Get-NetFirewallApplicationFilter).Program) -eq $exe -and \
+         @(($_ | Get-NetFirewallPortFilter).LocalPort) -notcontains 'Any' }} | \
+         Remove-NetFirewallRule -ErrorAction Stop\n",
+        utf16_base64(exe)
+    )
+}
+
+/// PowerShell: whether a rule's program is a file missing from a drive or
+/// share that is there. A program on a drive that is not (a USB stick, an
+/// unreachable share) may come back, and `Any` is no file.
+const TEST_STALE_PROGRAM: &str = r"function Test-StaleProgram([string]$program) {
+  try {
+    ($program -match '^([a-z]:\\|\\\\[^\\]+\\[^\\]+)') -and
+      (Test-Path -LiteralPath ([IO.Path]::GetPathRoot($program))) -and
+      -not (Test-Path -LiteralPath $program -PathType Leaf)
+  } catch { $false }
+}
+";
+
+/// PowerShell removing the rules under Ember's names whose program is gone: a
+/// moved, uninstalled or development copy's. Each opens every port to
+/// whatever later sits at that path. Needs elevation.
+fn stale_rules_script() -> String {
+    format!(
+        "{TEST_STALE_PROGRAM}foreach ($name in '{RULE_NAME_TCP}', '{RULE_NAME_UDP}', '{RULE_NAME_QUIC_UDP}') {{ \
+         Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue | \
+         Where-Object {{ Test-StaleProgram ([Environment]::ExpandEnvironmentVariables([string]($_ | Get-NetFirewallApplicationFilter).Program)) }} | \
+         Remove-NetFirewallRule }}\n"
+    )
+}
+
+fn remove_stale_rules() {
+    let removed = Command::new(windows_system_path(POWERSHELL))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &stale_rules_script()])
+        .creation_flags(0x08000000)
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !removed {
+        debug!("Could not look for firewall rules left by Ember copies that are gone");
+    }
+}
+
+/// Whether this process runs elevated, without which no firewall rule can be
+/// added or deleted. `None` when the token could not be read.
+fn process_is_elevated() -> Option<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    static ELEVATED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ELEVATED.get_or_init(|| {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: the current-process pseudo handle needs no closing; `token`
+        // receives a handle closed below.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return None;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut written = 0u32;
+        // SAFETY: `elevation` is a TOKEN_ELEVATION of the size passed, and
+        // `token` was opened with TOKEN_QUERY.
+        let read = unsafe {
+            GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut written,
+            )
+        } != 0;
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(token) };
+        read.then_some(elevation.TokenIsElevated != 0)
+    })
 }
 
 /// Add an inbound allow for every `protocol` port of this executable.
@@ -345,6 +471,7 @@ fn add_firewall_rule(rule_name: &str, protocol: &str) -> AddRuleOutcome {
 /// Ensure inbound TCP and UDP rules open every port for this executable,
 /// replacing ones that name another program or do not open the configured
 /// ports, and widening ones that name ports when this run may change rules.
+/// An elevated run also removes the rules of Ember copies that are gone.
 ///
 /// QUIC typically binds UDP on `tcp_port`. While the UDP rule still names
 /// ports, opening that here at startup covers the common case before the
@@ -356,6 +483,9 @@ fn add_firewall_rule(rule_name: &str, protocol: &str) -> AddRuleOutcome {
 /// startup. Now we collapse both into a single actionable message so
 /// the user knows what to do without thinking they have a bug.
 pub fn ensure_firewall_rules(tcp_port: u16, udp_port: u16) {
+    if process_is_elevated() == Some(true) {
+        remove_stale_rules();
+    }
     // Each rule is its own few netsh/PowerShell launches, so TCP and UDP run
     // at once. QUIC follows UDP, which may already open its port.
     let (tcp_outcome, udp_outcome, quic_outcome) = std::thread::scope(|scope| {
@@ -419,9 +549,12 @@ fn dedicated_quic_udp_port(quic_udp_port: u16, kad_udp_port: u16) -> Option<u16>
 /// already opens it, and nothing when that rule was switched off: a rule of
 /// QUIC's own would open the UDP someone closed.
 fn ensure_quic_rule(port: u16) -> Option<AddRuleOutcome> {
-    if firewall_rule_state(RULE_NAME_UDP, port)
-        .is_some_and(|state| state.opens() || state == RuleState::TurnedOff)
-    {
+    // Under the UDP rule's lock, so a startup pass widening it is seen done.
+    let udp = {
+        let _udp = lock_rule(RULE_NAME_UDP);
+        firewall_rule_state(RULE_NAME_UDP, port)
+    };
+    if udp.is_some_and(|state| state.opens() || state == RuleState::TurnedOff) {
         return None;
     }
     ensure_one_rule(RULE_NAME_QUIC_UDP, "UDP", port)
@@ -561,7 +694,8 @@ fn strip_quotes(text: &str) -> String {
 
 /// The script the elevated PowerShell runs: replace `exe`'s TCP and UDP rules
 /// with ones opening every port, and remove its QUIC UDP rule, which the UDP
-/// rule now covers. Other executables' rules under the names are left alone.
+/// rule now covers. Other executables' rules under the names are left alone,
+/// unless their program is gone.
 /// The program path is the one value a user or a download folder can name,
 /// so it goes in base64 and is decoded into a variable: no character in it,
 /// quote or otherwise, can end a string and become script.
@@ -577,11 +711,12 @@ fn elevated_rules_script(exe: &str, netsh: &str) -> String {
         )
     };
     format!(
-        "$exe = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))\n{}{}{}",
+        "$exe = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))\n{}{}{}{}",
         utf16_base64(exe),
         rule(RULE_NAME_TCP, "TCP"),
         rule(RULE_NAME_UDP, "UDP"),
-        delete(RULE_NAME_QUIC_UDP)
+        delete(RULE_NAME_QUIC_UDP),
+        stale_rules_script()
     )
 }
 
@@ -592,8 +727,52 @@ fn elevated_rules_script(exe: &str, netsh: &str) -> String {
 /// failed" from "didn't need to try" for the single-line consolidated warning
 /// above.
 fn ensure_one_rule(rule_name: &str, protocol: &str, port: u16) -> Option<AddRuleOutcome> {
-    // Startup and the QUIC bind can both reach the QUIC rule; two check-then-
-    // add passes on one name at once would leave a duplicate rule.
+    let _held = lock_rule(rule_name);
+    let exists = firewall_rule_exists(rule_name);
+    let state = if exists { firewall_rule_state(rule_name, port) } else { None };
+    match rule_step(exists, state, process_is_elevated() != Some(false)) {
+        RuleStep::Leave => {
+            match state {
+                Some(RuleState::TurnedOff) => {
+                    info!("Windows Firewall {protocol} rule is disabled or set to block; leaving it as it was set")
+                }
+                Some(RuleState::OpensThisPort) => {
+                    debug!("Windows Firewall {protocol} rule opens port {port} only; widening it needs elevation")
+                }
+                _ => debug!("Windows Firewall {protocol} rule already opens every port for Ember"),
+            }
+            None
+        }
+        RuleStep::NeedsElevation => {
+            debug!("Firewall rule {rule_name} needs elevation: Ember is not running elevated");
+            Some(AddRuleOutcome::NeedsElevation)
+        }
+        RuleStep::Widen => {
+            // The pinned rule goes only once the new one is in: a failed add
+            // must not close the port it still opens.
+            debug!("Windows Firewall {protocol} rule opens port {port} only; widening it to every port");
+            match add_firewall_rule(rule_name, protocol) {
+                AddRuleOutcome::Added => {
+                    delete_pinned_rules(rule_name);
+                    Some(AddRuleOutcome::Added)
+                }
+                AddRuleOutcome::NeedsElevation => None,
+                AddRuleOutcome::Other => Some(AddRuleOutcome::Other),
+            }
+        }
+        RuleStep::Replace => {
+            info!("No {protocol} firewall rule opens port {port} for this Ember; adding one for every port");
+            delete_firewall_rule(rule_name);
+            Some(add_firewall_rule(rule_name, protocol))
+        }
+        RuleStep::Add => Some(add_firewall_rule(rule_name, protocol)),
+    }
+}
+
+/// Holds `rule_name`'s check-then-change passes one at a time: startup and
+/// the QUIC bind can both reach the QUIC rule, and two at once would leave a
+/// duplicate; the QUIC check reads the UDP rule while startup may replace it.
+fn lock_rule(rule_name: &str) -> std::sync::MutexGuard<'static, ()> {
     static RULE_LOCKS: [std::sync::Mutex<()>; 3] =
         [std::sync::Mutex::new(()), std::sync::Mutex::new(()), std::sync::Mutex::new(())];
     let lock = match rule_name {
@@ -601,40 +780,45 @@ fn ensure_one_rule(rule_name: &str, protocol: &str, port: u16) -> Option<AddRule
         RULE_NAME_UDP => &RULE_LOCKS[1],
         _ => &RULE_LOCKS[2],
     };
-    let _held = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    if firewall_rule_exists(rule_name) {
-        match firewall_rule_state(rule_name, port) {
-            Some(RuleState::OpensEveryPort) => {
-                debug!("Windows Firewall {protocol} rule already opens every port for Ember");
-                return None;
-            }
-            Some(RuleState::OpensThisPort) => {
-                // It still opens this port, so being refused elevation for
-                // the widening is no failure.
-                debug!("Windows Firewall {protocol} rule opens port {port} only; widening it to every port");
-                delete_firewall_rule(rule_name);
-                return match add_firewall_rule(rule_name, protocol) {
-                    AddRuleOutcome::NeedsElevation => None,
-                    outcome => Some(outcome),
-                };
-            }
-            Some(RuleState::TurnedOff) => {
-                info!("Windows Firewall {protocol} rule is disabled or set to block; leaving it as it was set");
-                return None;
-            }
-            Some(RuleState::Missing) | None => {}
-        }
-        info!("No {protocol} firewall rule opens port {port} for this Ember; adding one for every port");
-        delete_firewall_rule(rule_name);
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What [`ensure_one_rule`] does about one rule name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleStep {
+    /// Nothing: it opens every port, or someone switched it off.
+    Leave,
+    /// Add one opening every port, then remove the one naming this port.
+    Widen,
+    /// Remove this executable's rules, which do not open the port, and add one.
+    Replace,
+    /// Add one; none exists under the name.
+    Add,
+    /// It needs adding or replacing, which this run cannot do.
+    NeedsElevation,
+}
+
+/// The step for a rule that `exists` with `state` for the port, in a run that
+/// `can_change` rules (or may: the elevation could not be read). A rule still
+/// opening the port is left as it is by a run that cannot widen it, without
+/// trying: netsh's refusal is worded in the display language.
+fn rule_step(exists: bool, state: Option<RuleState>, can_change: bool) -> RuleStep {
+    match (exists, state) {
+        (true, Some(RuleState::OpensEveryPort | RuleState::TurnedOff)) => RuleStep::Leave,
+        (true, Some(RuleState::OpensThisPort)) if can_change => RuleStep::Widen,
+        (true, Some(RuleState::OpensThisPort)) => RuleStep::Leave,
+        _ if !can_change => RuleStep::NeedsElevation,
+        (true, _) => RuleStep::Replace,
+        (false, _) => RuleStep::Add,
     }
-    Some(add_firewall_rule(rule_name, protocol))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         both_rules, dedicated_quic_udp_port, elevated_rules_script, firewall_rule_has_port, netsh_rule_state,
-        rule_state_from_lines, utf16_base64, RuleState, POWERSHELL,
+        pinned_rules_script, rule_state_from_lines, rule_step, utf16_base64, RuleState, RuleStep, POWERSHELL,
+        TEST_STALE_PROGRAM,
     };
     use std::path::Path;
 
@@ -711,6 +895,7 @@ mod tests {
         assert!(!script.contains("localport"));
         assert!(script.contains("delete rule name='Ember P2P (QUIC UDP)' \"program=$exe\""));
         assert!(!script.contains("add rule name='Ember P2P (QUIC UDP)'"));
+        assert!(script.contains("Test-StaleProgram"), "rules of copies that are gone are removed too");
         assert_eq!(
             script.matches("delete rule").count(),
             script.matches("' \"program=$exe\" | Out-Null").count(),
@@ -751,31 +936,160 @@ mod tests {
                        Protocol:                             TCP\r\n\
                        LocalPort:                            4662\r\n\
                        RemotePort:                           Any\r\n";
-        assert_eq!(netsh_rule_state(english, 4662), Some(RuleState::OpensThisPort));
-        assert_eq!(netsh_rule_state(english, 4672), Some(RuleState::Missing), "another port");
+        assert_eq!(netsh_rule_state(english, 4662, None), Some(RuleState::OpensThisPort));
+        assert_eq!(netsh_rule_state(english, 4672, None), Some(RuleState::Missing), "another port");
         let german = "Regelname:                            Ember P2P (TCP)\n\
                       Lokaler Port:                         4661,4662\n\
                       Remoteport:                           Beliebig\n";
-        assert_eq!(netsh_rule_state(german, 4662), Some(RuleState::OpensThisPort));
+        assert_eq!(netsh_rule_state(german, 4662, None), Some(RuleState::OpensThisPort));
         let french = "Nom de la règle :                     Ember P2P (TCP)\n\
                       Port local :                          4662\n";
-        assert_eq!(netsh_rule_state(french, 4662), Some(RuleState::OpensThisPort));
+        assert_eq!(netsh_rule_state(french, 4662, None), Some(RuleState::OpensThisPort));
         let remote_only = "RemotePort:                           4662\n";
-        assert_eq!(netsh_rule_state(remote_only, 4662), None, "no local port label recognised");
+        assert_eq!(netsh_rule_state(remote_only, 4662, None), None, "no local port label recognised");
         let unknown = "Kural Adı:                            Ember P2P (TCP)\n\
                        Yerel Bağlantı Noktası:               4662\n";
-        assert_eq!(netsh_rule_state(unknown, 4662), None);
-        assert_eq!(netsh_rule_state("", 4662), None);
+        assert_eq!(netsh_rule_state(unknown, 4662, None), None);
+        assert_eq!(netsh_rule_state("", 4662, None), None);
     }
 
     #[test]
     fn netsh_reads_a_local_port_without_digits_as_every_port_in_any_language() {
         let english = "Rule Name:                            Ember P2P (TCP)\r\n\
                        LocalPort:                            Any\r\n";
-        assert_eq!(netsh_rule_state(english, 63291), Some(RuleState::OpensEveryPort));
+        assert_eq!(netsh_rule_state(english, 63291, None), Some(RuleState::OpensEveryPort));
         let german = "Regelname:                            Ember P2P (TCP)\n\
                       Lokaler Port:                         Beliebig\n";
-        assert_eq!(netsh_rule_state(german, 63291), Some(RuleState::OpensEveryPort));
+        assert_eq!(netsh_rule_state(german, 63291, None), Some(RuleState::OpensEveryPort));
+    }
+
+    /// Without PowerShell, another copy's rule under the same name must not
+    /// read as this copy's.
+    #[test]
+    fn netsh_pairs_each_rules_port_with_its_program() {
+        let exe = Path::new(r"C:\Program Files\Ember\ember.exe");
+        let rule = |ports: &str, program: &str| {
+            format!(
+                "Rule Name:                            Ember P2P (TCP)\r\n\
+                 ----------------------------------------------------------------------\r\n\
+                 Enabled:                              Yes\r\n\
+                 LocalPort:                            {ports}\r\n\
+                 RemotePort:                           Any\r\n\
+                 Program:                              {program}\r\n\
+                 Action:                               Allow\r\n"
+            )
+        };
+        let dev_every_port = rule("Any", r"D:\Dev\target\debug\ember.exe");
+        let ours_pinned = rule("4662", r"c:\program files\ember\EMBER.EXE");
+        let both = format!("\r\n{dev_every_port}\r\n{ours_pinned}\r\nOk.\r\n\r\n");
+        assert_eq!(netsh_rule_state(&both, 4662, Some(exe)), Some(RuleState::OpensThisPort));
+        assert_eq!(netsh_rule_state(&both, 63291, Some(exe)), Some(RuleState::Missing));
+        assert_eq!(
+            netsh_rule_state(&format!("{dev_every_port}\r\nOk.\r\n"), 4662, Some(exe)),
+            Some(RuleState::Missing),
+            "only another copy's rule",
+        );
+        assert_eq!(
+            netsh_rule_state(&rule("Any", r"C:\Program Files\Ember\ember.exe"), 63291, Some(exe)),
+            Some(RuleState::OpensEveryPort),
+        );
+        let german_any_program = "Regelname:                            Ember P2P (TCP)\n\
+                                  Lokaler Port:                         4662\n\
+                                  Programm:                             Beliebig\n";
+        assert_eq!(
+            netsh_rule_state(german_any_program, 4662, Some(exe)),
+            Some(RuleState::OpensThisPort),
+            "a rule naming no path is for any program",
+        );
+        assert_eq!(netsh_rule_state(&both, 63291, None), Some(RuleState::OpensEveryPort), "no exe to compare");
+    }
+
+    /// Widening only runs where it can succeed, and a run without elevation
+    /// leaves a rule that still opens the port without asking netsh, whose
+    /// refusal is worded in the display language.
+    #[test]
+    fn only_a_run_that_can_change_rules_widens_a_port_pinned_rule() {
+        let pinned = Some(RuleState::OpensThisPort);
+        assert_eq!(rule_step(true, pinned, true), RuleStep::Widen);
+        assert_eq!(rule_step(true, pinned, false), RuleStep::Leave);
+        for can_change in [true, false] {
+            assert_eq!(rule_step(true, Some(RuleState::OpensEveryPort), can_change), RuleStep::Leave);
+            assert_eq!(rule_step(true, Some(RuleState::TurnedOff), can_change), RuleStep::Leave);
+        }
+        assert_eq!(rule_step(true, Some(RuleState::Missing), true), RuleStep::Replace);
+        assert_eq!(rule_step(true, None, true), RuleStep::Replace);
+        assert_eq!(rule_step(false, None, true), RuleStep::Add);
+        assert_eq!(rule_step(true, Some(RuleState::Missing), false), RuleStep::NeedsElevation);
+        assert_eq!(rule_step(false, None, false), RuleStep::NeedsElevation);
+    }
+
+    /// After widening, only the rules naming ports go: the new one shares
+    /// their name and program.
+    #[test]
+    fn the_pinned_rule_removal_spares_the_every_port_rule_and_other_programs() {
+        let exe = r"C:\Users\O'Brien\AppData\Local\Ember\ember.exe";
+        let script = pinned_rules_script("Ember P2P (TCP)", exe);
+        assert!(!script.contains("Brien"), "the program path goes encoded: {script}");
+        assert!(script.contains(&utf16_base64(exe)));
+        assert!(script.contains("-DisplayName 'Ember P2P (TCP)'"));
+        assert!(script.contains("-notcontains 'Any'"));
+        assert!(script.contains(".Program) -eq $exe"));
+        assert!(script.contains("$_.Enabled -eq 'True' -and $_.Action -eq 'Allow'"));
+    }
+
+    /// The scripts PowerShell runs elevated or after widening parse, which
+    /// nothing else checks before a user's machine runs them.
+    #[test]
+    fn the_firewall_scripts_parse_as_powershell() {
+        let exe = r"C:\Program Files\Ember\ember.exe";
+        for script in [
+            elevated_rules_script(exe, r"C:\Windows\System32\netsh.exe"),
+            pinned_rules_script("Ember P2P (UDP)", exe),
+        ] {
+            let check = format!(
+                "$errors = $null\n\
+                 $script = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))\n\
+                 [void][Management.Automation.Language.Parser]::ParseInput($script, [ref]$null, [ref]$errors)\n\
+                 [Console]::Out.Write($errors.Count)",
+                utf16_base64(&script)
+            );
+            let out = std::process::Command::new(crate::security::filesystem::windows_system_path(POWERSHELL))
+                .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &utf16_base64(&check)])
+                .output()
+                .expect("powershell runs");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "0", "{script}");
+        }
+    }
+
+    /// A rule's program counts as gone only when its drive or share is there
+    /// and the file is not. Runs PowerShell.
+    #[test]
+    fn a_rule_is_stale_only_when_its_program_is_missing_from_a_drive_that_is_there() {
+        let here = std::env::current_exe().expect("test binary path");
+        let missing = here.with_file_name("ember-no-such-copy.exe");
+        let absent_drive = ('D'..='Z')
+            .map(|letter| format!(r"{letter}:\"))
+            .find(|root| !Path::new(root).exists())
+            .map(|root| format!(r"{root}Ember\ember.exe"));
+        let mut cases = vec![
+            (here.to_string_lossy().into_owned(), false),
+            (missing.to_string_lossy().into_owned(), true),
+            ("Any".to_string(), false),
+            (String::new(), false),
+            (r"ember.exe".to_string(), false),
+        ];
+        if let Some(path) = absent_drive {
+            cases.push((path, false));
+        }
+        let paths: Vec<String> = cases.iter().map(|(path, _)| format!("'{}'", path.replace('\'', "''"))).collect();
+        let script = format!("{TEST_STALE_PROGRAM}{} | ForEach-Object {{ Test-StaleProgram $_ }}", paths.join(", "));
+        let out = std::process::Command::new(crate::security::filesystem::windows_system_path(POWERSHELL))
+            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &utf16_base64(&script)])
+            .output()
+            .expect("powershell runs");
+        let answers: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+        let expected: Vec<String> = cases.iter().map(|(_, stale)| if *stale { "True" } else { "False" }.to_string()).collect();
+        assert_eq!(answers, expected, "{cases:?}");
     }
 
     #[test]

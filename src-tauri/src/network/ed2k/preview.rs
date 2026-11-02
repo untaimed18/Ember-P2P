@@ -225,6 +225,54 @@ pub(super) fn mark_sparse(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The bytes the filesystem has allocated to `file`: about what was written
+/// for a sparse file, the whole length for one that is not (FAT32 and exFAT
+/// have no sparse files, and a `.part` made before part files were sparse
+/// stays allocated).
+#[cfg(windows)]
+pub(in crate::network) fn allocated_bytes(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
+    };
+
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: `file` owns the handle for the duration of the call, and `info`
+    // is a FILE_STANDARD_INFO of the size passed.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileStandardInfo,
+            (&mut info as *mut FILE_STANDARD_INFO).cast(),
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(u64::try_from(info.AllocationSize).unwrap_or(0))
+}
+
+#[cfg(unix)]
+pub(in crate::network) fn allocated_bytes(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(file.metadata()?.blocks().saturating_mul(512))
+}
+
+/// [`allocated_bytes`] of the file at `path`, opened only to read its
+/// attributes, so a worker writing it is not in the way. Blocking.
+pub(in crate::network) fn allocated_bytes_at(path: &std::path::Path) -> std::io::Result<u64> {
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.access_mode(windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES);
+    }
+    #[cfg(not(windows))]
+    options.read(true);
+    allocated_bytes(&options.open(path)?)
+}
+
 /// Create a temporary preview file by copying filled ranges.
 pub fn create_preview_file(
     part_file_path: &Path,
@@ -602,6 +650,42 @@ mod tests {
         drop(file);
         let _ = std::fs::remove_file(&path);
         assert!(on_disk < 16 * 1024 * 1024, "{on_disk} bytes on disk for a {LEN}-byte part");
+    }
+
+    /// What a part file already holds on disk is not asked of the volume
+    /// again: a sparse one holds what was written, one that is not sparse
+    /// its whole length.
+    #[cfg(windows)]
+    #[test]
+    fn allocated_bytes_tells_a_sparse_part_from_an_allocated_one() {
+        const LEN: u64 = 64 * 1024 * 1024;
+        let open = |kind: &str| {
+            let path = std::env::temp_dir().join(format!(
+                "ember-allocated-part-test-{kind}-{}-{}.part",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            (path, file)
+        };
+        let (sparse_path, sparse) = open("sparse");
+        mark_sparse(&sparse).unwrap();
+        sparse.set_len(LEN).unwrap();
+        let (full_path, full) = open("full");
+        full.set_len(LEN).unwrap();
+
+        let (sparse_allocated, full_allocated) =
+            (allocated_bytes(&sparse).unwrap(), allocated_bytes(&full).unwrap());
+        drop((sparse, full));
+        let _ = std::fs::remove_file(sparse_path);
+        let _ = std::fs::remove_file(full_path);
+        assert!(sparse_allocated < LEN / 4, "{sparse_allocated} bytes for a sparse part");
+        assert!(full_allocated >= LEN, "{full_allocated} bytes for an allocated part");
     }
 
     fn spans(ranges: &[FilledRange]) -> Vec<(u64, u64)> {

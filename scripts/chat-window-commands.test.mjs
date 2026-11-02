@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -79,11 +79,13 @@ function chatWindowSources() {
   return seen;
 }
 
-/** A source file without its block comments and whole-line `//` comments: a
- *  trailing `//` may be inside a URL on a line that also names a command. */
+/** A source file without its whole-line block and `//` comments. Only ones that
+ *  start a line: a trailing `//` may be inside a URL on a line that also names
+ *  a command, and a `/*` inside a string (`'image/*'`) would hide everything up
+ *  to the next comment's end. */
 function withoutComments(file) {
   return readFileSync(file, "utf8")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^\s*\/\*[\s\S]*?\*\//gm, "")
     .replace(/^\s*\/\/.*$/gm, "");
 }
 
@@ -118,14 +120,112 @@ test("nothing the chat window's code can reach is refused to it", () => {
  *
  * `rust` is the file under `src-tauri/src` defining the command. `callers` are
  * the frontend functions that reach it, each with the files allowed to name
- * it: its definition, and a helper wrapping it.
+ * it: its definition, and a helper wrapping it. `labelCheck` marks the older
+ * commands that test `window.label()` inline instead of calling the guard.
+ *
+ * Every command that guards itself must be listed here, so a guard removed
+ * later fails the test rather than going unnoticed.
  */
 const MAIN_WINDOW_ONLY = [
   { command: "quit_app", rust: "commands/settings.rs", callers: [["quitApp", ["src/lib/api/settings.ts"]]] },
   {
+    command: "update_settings",
+    rust: "commands/settings.rs",
+    callers: [["updateSettings", ["src/lib/api/settings.ts"]]],
+  },
+  {
+    command: "pick_download_folder",
+    rust: "commands/settings.rs",
+    labelCheck: true,
+    callers: [["pickDownloadFolder", ["src/lib/api/settings.ts"]]],
+  },
+  {
+    command: "pick_preview_player",
+    rust: "commands/settings.rs",
+    labelCheck: true,
+    callers: [["pickPreviewPlayer", ["src/lib/api/settings.ts"]]],
+  },
+  {
+    command: "pick_shared_folder",
+    rust: "commands/sharing.rs",
+    labelCheck: true,
+    callers: [["addSharedFolder", ["src/lib/api/sharing.ts"]]],
+  },
+  {
+    command: "open_chat_window",
+    rust: "commands/chat_window.rs",
+    labelCheck: true,
+    callers: [
+      ["openChatWindow", ["src/lib/api/chatWindow.ts", "src/lib/chatPopout.ts"]],
+      ["showChatWindow", ["src/lib/chatPopout.ts", "src/lib/updateResume.ts"]],
+    ],
+  },
+  {
+    command: "pick_emule_folder",
+    rust: "commands/emule_import.rs",
+    labelCheck: true,
+    callers: [["pickEmuleFolder", ["src/lib/api/emuleImport.ts"]]],
+  },
+  {
+    command: "open_share_browser",
+    rust: "commands/share_browser.rs",
+    callers: [["openShareBrowser", ["src/lib/api/sharing.ts"]]],
+  },
+  {
+    command: "list_share_browser_children",
+    rust: "commands/share_browser.rs",
+    callers: [["listShareBrowserChildren", ["src/lib/api/sharing.ts"]]],
+  },
+  {
+    command: "navigate_share_browser",
+    rust: "commands/share_browser.rs",
+    callers: [["navigateShareBrowser", ["src/lib/api/sharing.ts"]]],
+  },
+  {
+    command: "share_browser_selection",
+    rust: "commands/share_browser.rs",
+    callers: [["shareBrowserSelection", ["src/lib/api/sharing.ts"]]],
+  },
+  {
+    command: "measure_share_browser_entries",
+    rust: "commands/share_browser.rs",
+    callers: [["measureShareBrowserEntries", ["src/lib/api/sharing.ts"]]],
+  },
+  {
+    command: "close_share_browser",
+    rust: "commands/share_browser.rs",
+    callers: [["closeShareBrowser", ["src/lib/api/sharing.ts"]]],
+  },
+  {
+    command: "connection_doctor_action",
+    rust: "commands/connection_doctor.rs",
+    callers: [["connectionDoctorAction", ["src/lib/api/connectionDoctor.ts"]]],
+  },
+  {
+    command: "open_feed_item",
+    rust: "commands/feeds.rs",
+    callers: [["openFeedItem", ["src/lib/api/feeds.ts"]]],
+  },
+  {
+    command: "show_feed_item",
+    rust: "commands/feeds.rs",
+    callers: [["showFeedItem", ["src/lib/api/feeds.ts"]]],
+  },
+  { command: "set_tray_labels", rust: "tray.rs", callers: [["setTrayLabels", ["src/lib/api/system.ts"]]] },
+  {
+    command: "quit_flush_pending",
+    rust: "commands/settings.rs",
+    callers: [["finishRequestedQuit", ["src/lib/api/settings.ts"]]],
+  },
+  {
     command: "finish_requested_quit",
     rust: "commands/settings.rs",
     callers: [["finishRequestedQuit", ["src/lib/api/settings.ts"]]],
+  },
+  {
+    command: "set_pending_undo",
+    rust: "commands/settings.rs",
+    callers: [["setPendingUndo", ["src/lib/api/settings.ts"]]],
   },
   { command: "hide_to_tray", rust: "commands/settings.rs", callers: [["hideToTray", ["src/lib/api/settings.ts"]]] },
   {
@@ -142,6 +242,12 @@ const MAIN_WINDOW_ONLY = [
     command: "set_friend_overrides",
     rust: "commands/settings.rs",
     callers: [["setFriendOverrides", ["src/lib/api/settings.ts"]]],
+  },
+  { command: "open_file", rust: "commands/transfers.rs", callers: [["openFile", ["src/lib/api/transfers.ts"]]] },
+  {
+    command: "delete_finished_downloads",
+    rust: "commands/transfers.rs",
+    callers: [["deleteFinishedDownloads", ["src/lib/api/transfers.ts"]]],
   },
   {
     command: "recover_archive",
@@ -172,6 +278,11 @@ const MAIN_WINDOW_ONLY = [
   { command: "remove_friend", rust: "commands/peers.rs", callers: [["removeFriend", ["src/lib/api/friends.ts"]]] },
   { command: "block_friend", rust: "commands/peers.rs", callers: [["blockFriend", ["src/lib/api/friends.ts"]]] },
   { command: "unblock_friend", rust: "commands/peers.rs", callers: [["unblockFriend", ["src/lib/api/friends.ts"]]] },
+  {
+    command: "update_friend_nickname",
+    rust: "commands/peers.rs",
+    callers: [["updateFriendNickname", ["src/lib/api/friends.ts"]]],
+  },
   {
     command: "accept_friend_request",
     rust: "commands/peers.rs",
@@ -312,16 +423,53 @@ function rustFunctionBody(file, name) {
   return text.slice(bodyStart, end < 0 ? undefined : end);
 }
 
+/** An inline `window.label()` refusal, before anything is awaited. */
+function refusesByLabel(body) {
+  const check = body.search(/if window\.label\(\) != "main" \{\s*return Err\(/);
+  const firstAwait = body.indexOf(".await");
+  return check >= 0 && (firstAwait < 0 || check < firstAwait);
+}
+
 test("main-window-only commands refuse every other window", () => {
   const registered = registeredCommands();
   // Only comments and `use` items may come before the guard.
   const guardFirst =
     /^(?:\s|\/\/[^\n]*|use\s[^;]+;)*(?:crate::commands::chat_window::)?require_main_window\(&window\)\?;/;
-  const unguarded = MAIN_WINDOW_ONLY.filter(({ command, rust }) => {
+  const unguarded = MAIN_WINDOW_ONLY.filter(({ command, rust, labelCheck }) => {
     assert.ok(registered.has(command), `${command} is not a registered command`);
-    return !guardFirst.test(rustFunctionBody(rust, command));
+    const body = rustFunctionBody(rust, command);
+    return labelCheck ? !refusesByLabel(body) : !guardFirst.test(body);
   }).map(({ command }) => command);
   assert.deepEqual(unguarded, [], "these must call require_main_window before doing anything");
+});
+
+/** Every `.rs` file under `dir`. */
+function rustFiles(dir) {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) return rustFiles(path);
+    return entry.name.endsWith(".rs") ? [path] : [];
+  });
+}
+
+test("every command that refuses other windows is listed as main-window-only", () => {
+  const listed = new Set(MAIN_WINDOW_ONLY.map(({ command }) => command));
+  const unlisted = [];
+  for (const file of rustFiles(rustRoot)) {
+    const text = readFileSync(file, "utf8");
+    const commands = [
+      ...text.matchAll(/#\[tauri::command[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?fn\s+([a-z][a-z0-9_]*)/g),
+    ];
+    for (const [i, m] of commands.entries()) {
+      const next = commands[i + 1]?.index ?? text.length;
+      const end = text.indexOf("\n}\n", m.index);
+      const body = text.slice(m.index, end < 0 || end > next ? next : end);
+      if (/require_main_window\(&window\)|window\.label\(\) != "main"/.test(body) && !listed.has(m[1])) {
+        unlisted.push(`${m[1]} in ${file.slice(rustRoot.length + 1).replaceAll("\\", "/")}`);
+      }
+    }
+  }
+  assert.deepEqual(unlisted, [], "list these in MAIN_WINDOW_ONLY, so removing their guard fails this test");
 });
 
 test("every main-window-only command is listed once", () => {

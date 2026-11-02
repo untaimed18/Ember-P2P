@@ -1088,7 +1088,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             }
                         };
 
-                        let we_are_unreachable = ember_tcp_firewalled(state);
+                        let we_are_unreachable = ember_tcp_firewalled_or_presumed(state);
                         {
                             let pfs = state.per_file_sources
                                 .entry(transfer_id.clone())

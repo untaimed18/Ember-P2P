@@ -1659,7 +1659,11 @@ impl EmberDht {
     /// Whether [`Self::remember_callback_client`] would take `publisher` from
     /// `addr` now.
     ///
-    /// A publisher already held is always refreshed. A newcomer is refused when
+    /// A publisher already held is refreshed unless it comes from an address
+    /// [`Self::callback_client_may_move`] refuses: its entry could not follow,
+    /// so callbacks would go to where it was, and it is refused like a
+    /// newcomer over the same caps so that it moves to another buddy. A
+    /// newcomer is refused when
     /// its address already holds [`MAX_CALLBACK_CLIENTS_PER_ADDR`] live entries
     /// or its /24 holds [`MAX_CALLBACK_CLIENTS_PER_SUBNET`], or when the table
     /// is full of publishers holding a live grant — a file whose record names
@@ -1669,7 +1673,7 @@ impl EmberDht {
     /// break, so they still make way.
     fn admits_callback_client(&self, publisher: EmberNodeId, addr: SocketAddr, now: Instant) -> bool {
         if self.callback_clients.contains_key(&publisher) {
-            return true;
+            return self.callback_client_may_move(publisher, addr, now);
         }
         let subnet = super::subnet_key_of(addr.ip());
         let mut live = 0usize;
@@ -1694,6 +1698,39 @@ impl EmberDht {
         from_addr < MAX_CALLBACK_CLIENTS_PER_ADDR
             && from_subnet < MAX_CALLBACK_CLIENTS_PER_SUBNET
             && (live < MAX_CALLBACK_CLIENTS || evictable)
+    }
+
+    /// Whether a held `publisher` may move to `addr`. The per-address and
+    /// per-/24 caps count each entry where it is now, so a move into an
+    /// address or /24 already at its cap is refused (the entry keeps its old
+    /// address); otherwise one host could admit a full address's worth, move
+    /// them elsewhere and admit as many again.
+    fn callback_client_may_move(&self, publisher: EmberNodeId, addr: SocketAddr, now: Instant) -> bool {
+        let Some(held) = self.callback_clients.get(&publisher) else {
+            return false;
+        };
+        if held.addr.ip() == addr.ip() {
+            return true;
+        }
+        let subnet = super::subnet_key_of(addr.ip());
+        let same_subnet = super::subnet_key_of(held.addr.ip()) == subnet;
+        let mut from_addr = 0usize;
+        let mut from_subnet = 0usize;
+        for (id, client) in &self.callback_clients {
+            if *id == publisher
+                || now.saturating_duration_since(client.last_seen) >= CALLBACK_CLIENT_TTL
+            {
+                continue;
+            }
+            if client.addr.ip() == addr.ip() {
+                from_addr += 1;
+            }
+            if super::subnet_key_of(client.addr.ip()) == subnet {
+                from_subnet += 1;
+            }
+        }
+        from_addr < MAX_CALLBACK_CLIENTS_PER_ADDR
+            && (same_subnet || from_subnet < MAX_CALLBACK_CLIENTS_PER_SUBNET)
     }
 
     /// Whether a `CALLBACK_REQ` naming `publisher` and `file_hash` is one we
@@ -2785,9 +2822,14 @@ impl EmberDht {
             // (hours apart for a small library) had every callback sent to a
             // mapping that no longer existed. The frame is authenticated, so
             // only the publisher itself can move it.
+            // A move refused over the caps leaves the entry as it was, and its
+            // next PROXY_STORE from here is refused so it finds another buddy.
+            let may_move = self.callback_client_may_move(msg.sender_id, from, Instant::now());
             if let Some(client) = self.callback_clients.get_mut(&msg.sender_id) {
-                client.addr = from;
-                client.noise_pub = remote_noise_pub;
+                if may_move {
+                    client.addr = from;
+                    client.noise_pub = remote_noise_pub;
+                }
             }
             match self.routing.add_contact(contact) {
                 AddResult::Added => out.learned_contact = true,
@@ -7005,6 +7047,52 @@ mod tests {
         ));
     }
 
+    /// The caps count each entry where it is now, so a host that moved a full
+    /// address's entries elsewhere to admit as many again must not be able to
+    /// move those too.
+    #[test]
+    fn a_held_publisher_does_not_move_into_an_address_at_its_cap() {
+        let mut buddy = dht(146);
+        let now = Instant::now();
+        let first_host = SocketAddr::from(([198, 51, 100, 9], 4672));
+        let second_host = SocketAddr::from(([203, 0, 113, 9], 4672));
+        let id = |i: usize| EmberNodeId([i as u8, 0x46, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        for i in 0..MAX_CALLBACK_CLIENTS_PER_ADDR {
+            buddy.remember_callback_client(id(i), first_host, [1; 32], [7; 16], Some([9; 16]), now);
+        }
+        for i in 0..MAX_CALLBACK_CLIENTS_PER_ADDR {
+            buddy.remember_callback_client(id(i), second_host, [1; 32], [7; 16], Some([9; 16]), now);
+            assert_eq!(buddy.callback_clients[&id(i)].addr, second_host);
+        }
+        let second_wave = MAX_CALLBACK_CLIENTS_PER_ADDR..2 * MAX_CALLBACK_CLIENTS_PER_ADDR;
+        for i in second_wave.clone() {
+            assert!(buddy.admits_callback_client(id(i), first_host, now));
+            buddy.remember_callback_client(id(i), first_host, [1; 32], [7; 16], Some([9; 16]), now);
+        }
+        for i in second_wave {
+            buddy.remember_callback_client(id(i), second_host, [1; 32], [7; 16], Some([9; 16]), now);
+            assert_eq!(buddy.callback_clients[&id(i)].addr, first_host);
+        }
+        assert!(!buddy.admits_callback_client(EmberNodeId([0xCE; 16]), first_host, now));
+
+        // An authenticated frame from the publisher moves it the same way.
+        let mut follower = dht(147);
+        let follower_id = follower.local_id;
+        let held_addr = client_addr(99);
+        buddy.remember_callback_client(follower_id, held_addr, [1; 32], [7; 16], Some([9; 16]), now);
+        let (_rid, ping) = follower.build_ping();
+        buddy.handle_message(&ping, second_host, follower.local_noise_pub, 5_000);
+        assert_eq!(
+            buddy.callback_clients[&follower_id].addr,
+            held_addr,
+            "a frame from an address at its cap leaves the entry where it was"
+        );
+        let open_host = client_addr(100);
+        let (_rid, ping) = follower.build_ping();
+        buddy.handle_message(&ping, open_host, follower.local_noise_pub, 5_001);
+        assert_eq!(buddy.callback_clients[&follower_id].addr, open_host);
+    }
+
     /// The refusal comes before anything is spent: a publisher we cannot
     /// remember would get records placed naming a buddy that bounces nobody.
     #[test]
@@ -7035,6 +7123,53 @@ mod tests {
         assert!(buddy
             .local_records(&record.keyword_hash, &[], &messages::ValueConstraints::default())
             .is_empty());
+    }
+
+    /// A held publisher whose move is refused over the caps is refused like a
+    /// newcomer would be from there: acking it while its callbacks went to
+    /// the address it left would keep it on a buddy that cannot reach it.
+    #[test]
+    fn a_held_publisher_refused_a_move_is_refused_its_proxy_stores() {
+        let mut publisher = dht(148);
+        let mut buddy = dht(149);
+        let publisher_id = publisher.local_id;
+        let held = addr(148, 4672);
+        let crowded = SocketAddr::from(([203, 0, 113, 9], 4672));
+        let proxy_for = |publisher: &mut EmberDht, buddy: &mut EmberDht, file_hash: [u8; 16]| {
+            let contact = SourceContact {
+                callback_token: Some(publisher.callback_token(&file_hash)),
+                ..firewalled_for_buddy(148, publisher, buddy, 2000)
+            };
+            let record = publisher.build_source_record(file_hash, [0u8; 32], 1, "fw.mkv", contact);
+            publisher
+                .build_proxy_store(record.keyword_hash, record.data.clone(), record.signature)
+                .1
+        };
+        let proxy = proxy_for(&mut publisher, &mut buddy, [0x71; 16]);
+        assert!(commit_inbound_proxy(&mut buddy, &proxy, held, publisher.local_noise_pub, 2000));
+        let seen = buddy.callback_clients[&publisher_id].last_seen;
+
+        let now = Instant::now();
+        for i in 0..MAX_CALLBACK_CLIENTS_PER_ADDR {
+            let id = EmberNodeId([i as u8, 0x48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            buddy.remember_callback_client(id, crowded, [1; 32], [7; 16], Some([9; 16]), now);
+        }
+        assert!(!buddy.admits_callback_client(publisher_id, crowded, now));
+        let proxy = proxy_for(&mut publisher, &mut buddy, [0x72; 16]);
+        assert!(
+            !commit_inbound_proxy(&mut buddy, &proxy, crowded, publisher.local_noise_pub, 2001),
+            "refused, so it moves to another buddy"
+        );
+        let client = &buddy.callback_clients[&publisher_id];
+        assert_eq!(client.addr, held);
+        assert_eq!(client.last_seen, seen, "and the refused address keeps nothing alive");
+        assert!(!client.files.contains_key(&[0x72; 16]));
+
+        let proxy = proxy_for(&mut publisher, &mut buddy, [0x73; 16]);
+        assert!(
+            commit_inbound_proxy(&mut buddy, &proxy, held, publisher.local_noise_pub, 2002),
+            "from where it is held it is still served"
+        );
     }
 
     /// A firewalled publisher fans a whole publish tick at one buddy before

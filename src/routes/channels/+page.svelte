@@ -2218,6 +2218,7 @@
     // those runs stack up and each one re-issues the whole set of lookups.
     // The Find button is a separate flag: a background walk must not lock it,
     // and a click during one should still report emptiness when that walk ends.
+    if (emberOff) return;
     if (gatherInFlight) {
       if (notifyEmpty) {
         pendingNotifyEmpty = true;
@@ -4877,7 +4878,7 @@
       <div class="modal-header">
         <div class="room-settings-heading">
           <span id="room-preview-title" class="modal-title room-preview-name"><bdi dir="auto">{ch.name}</bdi></span>
-          <span class="room-settings-room">{m.channels_public_badge()}</span>
+          <span class="room-settings-room">{ch.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}</span>
         </div>
         <button type="button" class="icon-close" onclick={() => (previewId = null)} title={m.common_close()} aria-label={m.common_close()}>
           <IconX size={15} />
@@ -5765,10 +5766,13 @@
     color: var(--text-primary);
   }
 
+  /* The padding keeps a row scrolled into view (arrow keys, Tab, a join) clear
+     of the sticky section header; sized to the tallest, Discover below Yours. */
   .list-scroll {
     flex: 1;
     min-height: 0;
     overflow: auto;
+    scroll-padding-top: 40px;
   }
 
   .list-empty { padding: 16px 10px; text-align: center; font-size: var(--font-size-sm); }

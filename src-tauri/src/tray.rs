@@ -261,8 +261,10 @@ pub struct SentLabels {
 /// The tray menu's labels in the frontend's language. `cancel_update` carries
 /// `{time}` where the countdown goes.
 #[tauri::command]
-pub fn set_tray_labels(labels: SentLabels) {
+pub fn set_tray_labels(window: tauri::WebviewWindow, labels: SentLabels) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     store(accept(&labels));
+    Ok(())
 }
 
 static ALT_SPEED_CHECKED: AtomicBool = AtomicBool::new(false);

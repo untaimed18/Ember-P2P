@@ -675,7 +675,7 @@ pub(crate) async fn client(rendezvous_url: &str) -> Result<reqwest::Client, Stri
     let (_, host, addrs) = crate::security::validate_fetch_url(rendezvous_url)
         .await
         .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
-    let built = crate::security::build_pinned_client(&host, &addrs)
+    let built = crate::security::build_pinned_client(&host, &rendezvous_pin(&addrs))
         .map_err(|e| format!("failed to build hardened rendezvous HTTP client: {e}"))?;
     {
         let mut cache = client_cache().write().await;
@@ -694,6 +694,21 @@ pub(crate) async fn client(rendezvous_url: &str) -> Result<reqwest::Client, Stri
         );
     }
     Ok(built)
+}
+
+/// The addresses a rendezvous client may connect to: IPv4 only when the
+/// server has any. The server refuses punch and presence registrations that
+/// sign an IPv4 address but arrive over IPv6, and IPv4 first in the pin list
+/// is not enough: the connector races IPv6 after a few hundred milliseconds
+/// without an IPv4 connection, and the pooled IPv6 one then carries every
+/// request for the life of the cached client.
+fn rendezvous_pin(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    let v4 = ipv4_only(addrs);
+    if v4.is_empty() {
+        addrs.to_vec()
+    } else {
+        v4
+    }
 }
 
 /// Reject non-HTTPS rendezvous URLs before we send any traffic. The
@@ -2579,7 +2594,8 @@ async fn offer_relay_ticket(
     .ok_or_else(|| "relay responder has no registered v2 identity".to_string())?;
     let current_epoch =
         crate::network::ember::crypto::pairwise_capability_epoch(current_timestamp());
-    for epoch in [current_epoch, current_epoch - 1] {
+    let (initiator_id, responder_id) = (&initiator_id, &responder_id);
+    with_previous_epoch_on_403(current_epoch, what, move |epoch| async move {
         let capability = match channel_id {
             Some(channel_id) => crate::network::ember::channel::derive_channel_presence_capability(
                 secret_key,
@@ -2643,11 +2659,8 @@ async fn offer_relay_ticket(
             .send()
             .await
             .map_err(|e| format!("{what}: {e}"))?;
-        if resp.status() == reqwest::StatusCode::FORBIDDEN && epoch == current_epoch {
-            continue;
-        }
         if !resp.status().is_success() {
-            return Err(format!("{what}: status {}", resp.status()));
+            return Ok(Err(resp.status()));
         }
         let body: serde_json::Value =
             serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
@@ -2663,12 +2676,38 @@ async fn offer_relay_ticket(
             .to_owned();
         validate_ticket_response_field(&ticket_id, "ticket_id")?;
         validate_ticket_response_field(&initiator_token, "initiator_token")?;
-        return Ok(FriendRelayTicketOffer {
+        Ok(Ok(FriendRelayTicketOffer {
             ticket_id,
             initiator_token,
-        });
+        }))
+    })
+    .await
+}
+
+/// `attempt` under `current_epoch`'s capability, then once under the previous
+/// epoch's if the server refused the first with 403. `attempt` answers `Ok(Err)`
+/// with the status of a request the server refused.
+async fn with_previous_epoch_on_403<T, F, Fut>(
+    current_epoch: i64,
+    what: &str,
+    mut attempt: F,
+) -> Result<T, String>
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<Result<T, reqwest::StatusCode>, String>>,
+{
+    let mut status = reqwest::StatusCode::FORBIDDEN;
+    for epoch in [current_epoch, current_epoch - 1] {
+        match attempt(epoch).await? {
+            Ok(value) => return Ok(value),
+            Err(reqwest::StatusCode::FORBIDDEN) => {}
+            Err(refused) => {
+                status = refused;
+                break;
+            }
+        }
     }
-    Err(format!("{what}: status {}", reqwest::StatusCode::FORBIDDEN))
+    Err(format!("{what}: status {status}"))
 }
 
 /// One page of the chat mailbox: at most 32 sealed entries of up to 4608
@@ -2846,6 +2885,19 @@ mod reachability_tests {
         let v4 = super::ipv4_only(&addrs);
         assert_eq!(v4, vec![addrs[1], addrs[3]]);
         assert!(super::ipv4_only(&addrs[..1]).is_empty());
+    }
+
+    /// The shared client never races to IPv6 when the server has an IPv4
+    /// address, and still reaches an IPv6-only server.
+    #[test]
+    fn the_rendezvous_client_is_pinned_to_ipv4_when_there_is_any() {
+        let addrs: Vec<std::net::SocketAddr> = ["[2a09:8280:1::1]:443", "66.241.124.1:443", "[2a09:8280:1::2]:443"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        assert_eq!(super::rendezvous_pin(&addrs), vec![addrs[1]]);
+        let v6_only = [addrs[0], addrs[2]];
+        assert_eq!(super::rendezvous_pin(&v6_only), v6_only.to_vec());
     }
 }
 
@@ -3927,6 +3979,52 @@ fn urlencoding_hex(value: &str) -> String {
 #[cfg(test)]
 mod relay_ticket_tests {
     use super::*;
+
+    /// Run [`with_previous_epoch_on_403`] against a server answering `answers`
+    /// in turn, and report the epochs it was asked under.
+    async fn offer_against(
+        answers: Vec<Result<&'static str, reqwest::StatusCode>>,
+    ) -> (Result<&'static str, String>, Vec<i64>) {
+        let answers = std::sync::Mutex::new(std::collections::VecDeque::from(answers));
+        let asked = std::sync::Mutex::new(Vec::new());
+        let result = with_previous_epoch_on_403(100, "relay ticket offer", |epoch| {
+            asked.lock().unwrap().push(epoch);
+            let answer = answers.lock().unwrap().pop_front().expect("asked past the last answer");
+            async move { Ok(answer) }
+        })
+        .await;
+        (result, asked.into_inner().unwrap())
+    }
+
+    /// For up to a heartbeat after a rollover the server holds only the
+    /// responder's previous-epoch capability, so a 403 is tried once more
+    /// under it, and nothing else is retried.
+    #[tokio::test]
+    async fn a_relay_offer_refused_with_403_is_retried_once_under_the_previous_epoch() {
+        let (result, asked) = offer_against(vec![Ok("ticket")]).await;
+        assert_eq!((result, asked), (Ok("ticket"), vec![100]));
+
+        let (result, asked) =
+            offer_against(vec![Err(reqwest::StatusCode::FORBIDDEN), Ok("ticket")]).await;
+        assert_eq!((result, asked), (Ok("ticket"), vec![100, 99]));
+
+        let forbidden = reqwest::StatusCode::FORBIDDEN;
+        let (result, asked) = offer_against(vec![Err(forbidden), Err(forbidden)]).await;
+        assert_eq!(result, Err("relay ticket offer: status 403 Forbidden".to_string()));
+        assert_eq!(asked, vec![100, 99], "two epochs, then it gives up");
+
+        let (result, asked) = offer_against(vec![Err(reqwest::StatusCode::CONFLICT)]).await;
+        assert_eq!(result, Err("relay ticket offer: status 409 Conflict".to_string()));
+        assert_eq!(asked, vec![100], "only a capability refusal is worth another epoch");
+
+        let (result, asked) = offer_against(vec![
+            Err(forbidden),
+            Err(reqwest::StatusCode::TOO_MANY_REQUESTS),
+        ])
+        .await;
+        assert_eq!(result, Err("relay ticket offer: status 429 Too Many Requests".to_string()));
+        assert_eq!(asked, vec![100, 99]);
+    }
 
     /// This mirrors the rendezvous server's `strip_invisible`, and a
     /// divergence is silent and total: the client signs over a string the

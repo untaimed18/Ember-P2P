@@ -787,6 +787,13 @@ impl FifoSet {
         evicted
     }
 
+    /// Put `key` back as the oldest entry, if absent and below `cap`.
+    fn insert_oldest(&mut self, key: String, cap: usize) {
+        if self.set.len() < cap && self.set.insert(key.clone()) {
+            self.order.push_front(key);
+        }
+    }
+
     fn remove(&mut self, key: &str) -> bool {
         if self.set.remove(key) {
             if let Some(pos) = self.order.iter().position(|x| x == key) {
@@ -1041,6 +1048,23 @@ pub struct SpamMarkEntry {
     pub server_ip: Option<String>,
 }
 
+/// Learned entries taken out of a [`SpamDatabase`], so they can be put back.
+#[derive(Debug, Default)]
+struct LearnedEntries {
+    filenames: Vec<String>,
+    similar_names: Vec<String>,
+    sizes: Vec<u64>,
+    source_ips: Vec<String>,
+    servers: Vec<LearnedServer>,
+}
+
+#[derive(Debug)]
+struct LearnedServer {
+    ip: String,
+    listed: bool,
+    ratio: Option<f32>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SpamDatabase {
@@ -1070,16 +1094,18 @@ impl SpamDatabase {
         self.spam_server_ips.contains(sip) || self.udp_server_spam_ratios.contains_key(sip)
     }
 
-    fn drop_mark_collateral(&mut self, mark: &SpamMarkEntry) {
-        self.drop_marks_collateral(std::slice::from_ref(mark));
+    fn drop_mark_collateral(&mut self, mark: &SpamMarkEntry) -> LearnedEntries {
+        self.drop_marks_collateral(std::slice::from_ref(mark))
     }
 
     /// Drop the filenames / similar names / sizes / source IPs / server IPs
     /// that `dropped` marks added, except what a mark still in `spam_marks`
-    /// references. Linear in the marks and learned lists, however many go.
-    fn drop_marks_collateral(&mut self, dropped: &[SpamMarkEntry]) {
+    /// references, returning what went. Linear in the marks and learned
+    /// lists, however many go.
+    fn drop_marks_collateral(&mut self, dropped: &[SpamMarkEntry]) -> LearnedEntries {
+        let mut removed = LearnedEntries::default();
         if dropped.is_empty() {
-            return;
+            return removed;
         }
         let mut names: HashSet<&str> = dropped.iter().map(|m| m.filename.as_str()).collect();
         let mut similar: HashSet<&str> =
@@ -1106,34 +1132,141 @@ impl SpamDatabase {
         similar.remove("");
         sizes.remove(&0);
         if !names.is_empty() {
+            removed.filenames = self
+                .spam_filenames
+                .iter()
+                .filter(|n| names.contains(n.as_str()))
+                .cloned()
+                .collect();
             self.spam_filenames.retain(|n| !names.contains(n.as_str()));
         }
         if !similar.is_empty() {
+            removed.similar_names = self
+                .spam_similar_names
+                .iter()
+                .filter(|n| similar.contains(n.as_str()))
+                .cloned()
+                .collect();
             self.spam_similar_names.retain(|n| !similar.contains(n.as_str()));
         }
         if !sizes.is_empty() {
+            removed.sizes = self.spam_sizes.iter().filter(|s| sizes.contains(s)).copied().collect();
             self.spam_sizes.retain(|s| !sizes.contains(s));
         }
         if !ips.is_empty() {
+            removed.source_ips = self
+                .spam_source_ips
+                .iter()
+                .filter(|ip| ips.contains(ip.as_str()))
+                .cloned()
+                .collect();
             self.spam_source_ips.retain(|ip| !ips.contains(ip));
         }
         if !servers.is_empty() {
+            removed.servers = servers
+                .iter()
+                .filter(|sip| self.has_server_reputation(sip))
+                .map(|sip| LearnedServer {
+                    ip: sip.to_string(),
+                    listed: self.spam_server_ips.contains(sip),
+                    ratio: self.udp_server_spam_ratios.get(*sip).copied(),
+                })
+                .collect();
             self.udp_server_spam_ratios
                 .retain(|sip, _| !servers.contains(sip.as_str()));
             self.spam_server_ips.retain(|sip| !servers.contains(sip));
+        }
+        removed
+    }
+
+    /// Put back entries taken out by [`Self::drop_marks_collateral`] or pushed
+    /// out at a cap, as the oldest of their kind, where absent and there is
+    /// room. With `only_named`, only those a mark in `spam_marks` names.
+    fn restore_learned(&mut self, learned: &LearnedEntries, only_named: bool) {
+        let named = |test: &dyn Fn(&SpamMarkEntry) -> bool| {
+            !only_named || self.spam_marks.iter().any(test)
+        };
+        let filenames: Vec<String> = learned
+            .filenames
+            .iter()
+            .filter(|n| named(&|m| &m.filename == *n))
+            .cloned()
+            .collect();
+        let similar_names: Vec<String> = learned
+            .similar_names
+            .iter()
+            .filter(|n| named(&|m| &m.similar_name == *n))
+            .cloned()
+            .collect();
+        let sizes: Vec<u64> = learned
+            .sizes
+            .iter()
+            .filter(|s| named(&|m| m.size == **s))
+            .copied()
+            .collect();
+        let source_ips: Vec<String> = learned
+            .source_ips
+            .iter()
+            .filter(|ip| named(&|m| m.source_ips.contains(*ip)))
+            .cloned()
+            .collect();
+        let servers: Vec<&LearnedServer> = learned
+            .servers
+            .iter()
+            .filter(|s| named(&|m| m.server_ip.as_deref() == Some(s.ip.as_str())))
+            .collect();
+        for name in filenames.into_iter().rev() {
+            if self.spam_filenames.len() < MAX_SPAM_FILENAMES && !self.spam_filenames.contains(&name) {
+                self.spam_filenames.insert(0, name);
+            }
+        }
+        for name in similar_names.into_iter().rev() {
+            if self.spam_similar_names.len() < MAX_SPAM_SIMILAR_NAMES
+                && !self.spam_similar_names.contains(&name)
+            {
+                self.spam_similar_names.insert(0, name);
+            }
+        }
+        for size in sizes.into_iter().rev() {
+            if self.spam_sizes.len() < MAX_SPAM_SIZES && !self.spam_sizes.contains(&size) {
+                self.spam_sizes.push_front(size);
+            }
+        }
+        for ip in source_ips.into_iter().rev() {
+            self.spam_source_ips.insert_oldest(ip, MAX_SPAM_SOURCE_IPS);
+        }
+        for server in servers.into_iter().rev() {
+            // Listed only with a ratio to redeem, as `learn_spam_server` keeps them.
+            if self.has_server_reputation(&server.ip)
+                || (server.listed && self.spam_server_ips.len() >= MAX_SPAM_SERVER_IPS)
+                || (server.ratio.is_some() && self.udp_server_spam_ratios.len() >= MAX_SERVER_RATIOS)
+            {
+                continue;
+            }
+            if server.listed {
+                self.spam_server_ips.insert_oldest(server.ip.clone(), MAX_SPAM_SERVER_IPS);
+            }
+            if let Some(ratio) = server.ratio {
+                self.udp_server_spam_ratios.insert(server.ip.clone(), ratio);
+            }
         }
     }
 
     /// Learn `sip` as a spam server: listed, and its ratio raised. The list and
     /// the ratio map are bounded separately, so whichever evicts a server takes
     /// it out of the other too; a listed server always has a ratio to redeem.
-    fn learn_spam_server(&mut self, sip: &str) {
-        for evicted in self
+    /// Returns the servers evicted to make room.
+    fn learn_spam_server(&mut self, sip: &str) -> Vec<LearnedServer> {
+        let mut evicted: Vec<LearnedServer> = self
             .spam_server_ips
             .insert_evicting(sip.to_string(), MAX_SPAM_SERVER_IPS)
-        {
-            self.udp_server_spam_ratios.remove(&evicted);
-        }
+            .into_iter()
+            .map(|ip| LearnedServer {
+                ratio: self.udp_server_spam_ratios.remove(&ip),
+                ip,
+                listed: true,
+            })
+            .collect();
         let entry = self
             .udp_server_spam_ratios
             .entry(sip.to_string())
@@ -1153,10 +1286,14 @@ impl SpamDatabase {
                 })
                 .map(|(k, _)| k.clone())
             {
-                self.udp_server_spam_ratios.remove(&lowest_key);
-                self.spam_server_ips.remove(&lowest_key);
+                evicted.push(LearnedServer {
+                    ratio: self.udp_server_spam_ratios.remove(&lowest_key),
+                    listed: self.spam_server_ips.remove(&lowest_key),
+                    ip: lowest_key,
+                });
             }
         }
+        evicted
     }
 }
 
@@ -1175,6 +1312,9 @@ pub struct SpamFilter {
     /// Deliberate changes made while `persist_blocked`, replayed onto the file
     /// once it can be read.
     held_changes: Vec<HeldUserChange>,
+    /// What the latest marks changed, newest last, for [`Self::undo_mark_spam`].
+    /// Not saved: an Undo is only offered for a few seconds after the mark.
+    mark_undos: VecDeque<MarkSpamUndo>,
     /// Monotonic mutation counter. Bumped on every change that sets `dirty`.
     /// `take_save_data` captures the value at snapshot time so `mark_saved`
     /// can refuse to clear the dirty flag if a concurrent mutation landed
@@ -1241,6 +1381,50 @@ pub enum PriorSpamVerdict {
     /// Already marked: the mark replaced the old one, and undo leaves it.
     Spam,
 }
+
+/// What one [`SpamFilter::apply_mark_spam`] changed, so undoing it takes back
+/// only what the mark learned and puts back what it pushed out at a cap.
+#[derive(Debug)]
+struct MarkSpamUndo {
+    hash: String,
+    /// Where the hash stood in the database the mark was applied to.
+    prior: PriorSpamVerdict,
+    /// The learned entries the mark added, not those already there. No server:
+    /// a ratio is shared, so `server` moves it back instead.
+    added: SpamMarkEntry,
+    server: Option<MarkedServer>,
+    /// Pushed out at a cap while no mark named them.
+    pushed_out: LearnedEntries,
+    /// Pushed out at a cap while a mark named them: back only while one does.
+    pushed_out_named: LearnedEntries,
+    /// Hashes pushed out at the cap, oldest first.
+    hashes: Vec<String>,
+    /// Marks that went with them, each with what only it had learned.
+    marks: Vec<(SpamMarkEntry, LearnedEntries)>,
+}
+
+/// The server whose ratio a mark raised.
+#[derive(Debug)]
+struct MarkedServer {
+    ip: String,
+    /// The mark listed it.
+    listed: bool,
+    /// It had a ratio before the mark.
+    had_ratio: bool,
+}
+
+impl MarkSpamUndo {
+    fn pushed_out_to(&mut self, named: bool) -> &mut LearnedEntries {
+        if named {
+            &mut self.pushed_out_named
+        } else {
+            &mut self.pushed_out
+        }
+    }
+}
+
+/// Marks [`SpamFilter::mark_undos`] keeps.
+const MARK_UNDOS_KEPT: usize = 32;
 
 /// Search keywords prepared once for scoring many rows of one search.
 pub struct SpamKeywords(HashSet<String>);
@@ -1337,6 +1521,7 @@ impl SpamFilter {
             dirty: false,
             persist_blocked,
             held_changes: Vec::new(),
+            mark_undos: VecDeque::new(),
             gen: 0,
         };
         filter.rebuild_similar_name_features();
@@ -1650,13 +1835,18 @@ impl SpamFilter {
             }
         }
         self.rebuild_similar_name_features();
+        // They describe the session's database; replaying the held marks
+        // records them again against this one.
+        self.mark_undos.clear();
         for change in std::mem::take(&mut self.held_changes) {
             match change {
                 HeldUserChange::MarkSpam {
                     result,
                     keywords,
                     server_ip,
-                } => self.apply_mark_spam(&result, &keywords, server_ip.as_deref()),
+                } => {
+                    self.apply_mark_spam(&result, &keywords, server_ip.as_deref());
+                }
                 HeldUserChange::MarkNotSpam(hash) => self.apply_mark_not_spam(&hash),
                 HeldUserChange::UndoMarkSpam(hash, prior) => {
                     self.apply_undo_mark_spam(&hash, prior)
@@ -1736,6 +1926,7 @@ impl SpamFilter {
     fn apply_reset(&mut self) {
         self.db = SpamDatabase::default();
         self.similar_name_features.clear();
+        self.mark_undos.clear();
         self.mark_dirty();
         info!("Spam filter database reset");
     }
@@ -2167,16 +2358,6 @@ impl SpamFilter {
         server_ip: Option<&str>,
     ) -> PriorSpamVerdict {
         self.begin_user_change();
-        let hash = normalize_hash(&result.file.hash);
-        let prior = if self.db.spam_hashes.contains(&hash) {
-            PriorSpamVerdict::Spam
-        } else if self.db.not_spam_hashes.contains(&hash) {
-            PriorSpamVerdict::NotSpam
-        } else if self.db.auto_not_spam_hashes.contains(&hash) {
-            PriorSpamVerdict::AutoNotSpam
-        } else {
-            PriorSpamVerdict::Unmarked
-        };
         if self.persist_blocked {
             self.hold(HeldUserChange::MarkSpam {
                 result: Box::new(result.clone()),
@@ -2184,13 +2365,12 @@ impl SpamFilter {
                 server_ip: server_ip.map(str::to_string),
             });
         }
-        self.apply_mark_spam(result, search_keywords, server_ip);
-        prior
+        self.apply_mark_spam(result, search_keywords, server_ip)
     }
 
     /// Take back a [`Self::mark_spam`] that returned `prior`: the hash and what
-    /// the mark learned from it go, and the hash returns to the not-spam set it
-    /// was in, if any.
+    /// the mark learned from it go, what it pushed out at a cap comes back,
+    /// and the hash returns to the not-spam set it was in, if any.
     pub fn undo_mark_spam(&mut self, file_hash: &str, prior: PriorSpamVerdict) {
         if normalize_hash(file_hash).is_empty() || prior == PriorSpamVerdict::Spam {
             return;
@@ -2204,15 +2384,36 @@ impl SpamFilter {
 
     fn apply_undo_mark_spam(&mut self, file_hash: &str, prior: PriorSpamVerdict) {
         let file_hash = normalize_hash(file_hash);
-        if file_hash.is_empty() || prior == PriorSpamVerdict::Spam {
+        if file_hash.is_empty() {
+            return;
+        }
+        // The mark's own record holds where the hash stood in the database it
+        // was applied to. A held mark replayed onto the file was applied to
+        // another database than the one `prior` came from.
+        let undo = self
+            .mark_undos
+            .iter()
+            .position(|u| u.hash == file_hash)
+            .and_then(|pos| Some((self.mark_undos.remove(pos)?, pos)));
+        let prior = undo.as_ref().map_or(prior, |(u, _)| u.prior);
+        if prior == PriorSpamVerdict::Spam {
             return;
         }
         self.db.spam_hashes.remove(&file_hash);
-        if let Some(pos) = self.db.spam_marks.iter().position(|m| m.hash == file_hash) {
-            let mark = self.db.spam_marks.remove(pos);
-            self.db.drop_mark_collateral(&mark);
-            self.rebuild_similar_name_features();
+        let mark = self
+            .db
+            .spam_marks
+            .iter()
+            .position(|m| m.hash == file_hash)
+            .map(|pos| self.db.spam_marks.remove(pos));
+        match (undo, mark) {
+            (Some((undo, later)), _) => self.take_back_mark(undo, later),
+            (None, Some(mark)) => {
+                self.db.drop_mark_collateral(&mark);
+            }
+            (None, None) => {}
         }
+        self.rebuild_similar_name_features();
         match prior {
             PriorSpamVerdict::NotSpam => {
                 self.db.not_spam_hashes.insert(file_hash.clone(), NOT_SPAM_HASHES_CAP);
@@ -2228,17 +2429,128 @@ impl SpamFilter {
         info!("Undid spam mark: {file_hash}");
     }
 
+    /// Reverse what `undo` recorded, once its hash and mark are gone. Records
+    /// from index `later` on in `mark_undos` are of marks made after it.
+    ///
+    /// What the mark added that another mark still names stays, and is handed
+    /// to the records of the marks naming it, as they would have recorded it
+    /// had this mark never been made; so is where the server stood before
+    /// it, to the next later mark of that server. Undoing those marks then
+    /// takes it back in whatever order they go.
+    fn take_back_mark(&mut self, undo: MarkSpamUndo, later: usize) {
+        self.db.drop_mark_collateral(&undo.added);
+        self.hand_over_added(&undo.added);
+        if let Some(server) = &undo.server {
+            let named = self
+                .db
+                .spam_marks
+                .iter()
+                .any(|m| m.server_ip.as_deref() == Some(server.ip.as_str()));
+            if server.had_ratio || named {
+                // The inverse of the raise in `learn_spam_server`.
+                if let Some(ratio) = self.db.udp_server_spam_ratios.get_mut(&server.ip) {
+                    *ratio = ((*ratio - 0.1) / 0.9).max(0.0);
+                }
+            } else {
+                self.db.udp_server_spam_ratios.remove(&server.ip);
+            }
+            if server.listed && !named {
+                self.db.spam_server_ips.remove(&server.ip);
+            }
+            if let Some(next) = self
+                .mark_undos
+                .iter_mut()
+                .skip(later)
+                .filter_map(|u| u.server.as_mut())
+                .find(|s| s.ip == server.ip)
+            {
+                next.listed |= server.listed;
+                next.had_ratio = server.had_ratio;
+            }
+        }
+        for hash in undo.hashes.into_iter().rev() {
+            if !self.db.is_not_spam(&hash) {
+                self.db.spam_hashes.insert_oldest(hash, MAX_SPAM_HASHES);
+            }
+        }
+        for (mark, learned) in undo.marks.into_iter().rev() {
+            if self.db.spam_hashes.contains(&mark.hash)
+                && self.db.spam_marks.len() < MAX_SPAM_HASHES
+                && !self.db.spam_marks.iter().any(|m| m.hash == mark.hash)
+            {
+                self.db.restore_learned(&learned, false);
+                self.db.spam_marks.insert(0, mark);
+            }
+        }
+        self.db.restore_learned(&undo.pushed_out, false);
+        self.db.restore_learned(&undo.pushed_out_named, true);
+    }
+
+    /// Record `added`'s entries still learned as added by each kept mark's
+    /// record whose mark names them.
+    fn hand_over_added(&mut self, added: &SpamMarkEntry) {
+        let db = &self.db;
+        for undo in &mut self.mark_undos {
+            let Some(mark) = db.spam_marks.iter().find(|m| m.hash == undo.hash) else {
+                continue;
+            };
+            if !added.filename.is_empty()
+                && mark.filename == added.filename
+                && db.spam_filenames.contains(&added.filename)
+            {
+                undo.added.filename = added.filename.clone();
+            }
+            if !added.similar_name.is_empty()
+                && mark.similar_name == added.similar_name
+                && db.spam_similar_names.contains(&added.similar_name)
+            {
+                undo.added.similar_name = added.similar_name.clone();
+            }
+            if added.size > 0 && mark.size == added.size && db.spam_sizes.contains(&added.size) {
+                undo.added.size = added.size;
+            }
+            for ip in &added.source_ips {
+                if mark.source_ips.contains(ip)
+                    && db.spam_source_ips.contains(ip)
+                    && !undo.added.source_ips.contains(ip)
+                {
+                    undo.added.source_ips.push(ip.clone());
+                }
+            }
+        }
+    }
+
     fn apply_mark_spam(
         &mut self,
         result: &SearchResult,
         search_keywords: &[String],
         server_ip: Option<&str>,
-    ) {
+    ) -> PriorSpamVerdict {
         let file_hash = normalize_hash(&result.file.hash);
+        let prior = if self.db.spam_hashes.contains(&file_hash) {
+            PriorSpamVerdict::Spam
+        } else if self.db.not_spam_hashes.contains(&file_hash) {
+            PriorSpamVerdict::NotSpam
+        } else if self.db.auto_not_spam_hashes.contains(&file_hash) {
+            PriorSpamVerdict::AutoNotSpam
+        } else {
+            PriorSpamVerdict::Unmarked
+        };
+        let mut undo = MarkSpamUndo {
+            hash: file_hash.clone(),
+            prior,
+            added: SpamMarkEntry::default(),
+            server: None,
+            pushed_out: LearnedEntries::default(),
+            pushed_out_named: LearnedEntries::default(),
+            hashes: Vec::new(),
+            marks: Vec::new(),
+        };
         if !file_hash.is_empty() {
-            self.db
+            undo.hashes = self
+                .db
                 .spam_hashes
-                .insert(file_hash.clone(), MAX_SPAM_HASHES);
+                .insert_evicting(file_hash.clone(), MAX_SPAM_HASHES);
             self.db.not_spam_hashes.remove(&file_hash);
             self.db.auto_not_spam_hashes.remove(&file_hash);
             // Reverse collateral for the previous mark of this hash (re-mark)
@@ -2248,7 +2560,7 @@ impl SpamFilter {
                 let old = self.db.spam_marks.remove(pos);
                 self.db.drop_mark_collateral(&old);
             }
-            self.drop_orphaned_marks();
+            undo.marks = self.drop_orphaned_marks();
         }
 
         let name = &result.file.name;
@@ -2256,9 +2568,12 @@ impl SpamFilter {
         let name_norm = normalized_from_canonical(&canonical);
         if !name_norm.is_empty() && !self.db.spam_filenames.contains(&name_norm) {
             if self.db.spam_filenames.len() >= MAX_SPAM_FILENAMES {
-                self.db.spam_filenames.remove(0);
+                let old = self.db.spam_filenames.remove(0);
+                let named = self.db.spam_marks.iter().any(|m| m.filename == old);
+                undo.pushed_out_to(named).filenames.push(old);
             }
             self.db.spam_filenames.push(name_norm.clone());
+            undo.added.filename = name_norm.clone();
         }
 
         let signature = signature_from_canonical(&canonical, &keyword_tokens(search_keywords));
@@ -2269,16 +2584,23 @@ impl SpamFilter {
         };
         if !stripped.is_empty() && !self.db.spam_similar_names.contains(&stripped) {
             if self.db.spam_similar_names.len() >= MAX_SPAM_SIMILAR_NAMES {
-                self.db.spam_similar_names.remove(0);
+                let old = self.db.spam_similar_names.remove(0);
+                let named = self.db.spam_marks.iter().any(|m| m.similar_name == old);
+                undo.pushed_out_to(named).similar_names.push(old);
             }
             self.db.spam_similar_names.push(stripped.clone());
+            undo.added.similar_name = stripped.clone();
         }
 
         if result.file.size > 0 && !self.db.spam_sizes.contains(&result.file.size) {
             if self.db.spam_sizes.len() >= MAX_SPAM_SIZES {
-                self.db.spam_sizes.pop_front();
+                if let Some(old) = self.db.spam_sizes.pop_front() {
+                    let named = self.db.spam_marks.iter().any(|m| m.size == old);
+                    undo.pushed_out_to(named).sizes.push(old);
+                }
             }
             self.db.spam_sizes.push_back(result.file.size);
+            undo.added.size = result.file.size;
         }
 
         let mut learned_ips: Vec<String> = Vec::new();
@@ -2291,9 +2613,17 @@ impl SpamFilter {
                 if !is_globally_routable_ip(&ip) {
                     continue;
                 }
-                self.db
+                if !self.db.spam_source_ips.contains(&ip) {
+                    undo.added.source_ips.push(ip.clone());
+                }
+                for old in self
+                    .db
                     .spam_source_ips
-                    .insert(ip.clone(), MAX_SPAM_SOURCE_IPS);
+                    .insert_evicting(ip.clone(), MAX_SPAM_SOURCE_IPS)
+                {
+                    let named = self.db.spam_marks.iter().any(|m| m.source_ips.contains(&old));
+                    undo.pushed_out_to(named).source_ips.push(old);
+                }
                 if !learned_ips.contains(&ip) {
                     learned_ips.push(ip);
                 }
@@ -2317,7 +2647,21 @@ impl SpamFilter {
             None
         };
         if let Some(ref sip) = server_ip_owned {
-            self.db.learn_spam_server(sip);
+            let listed = !self.db.spam_server_ips.contains(sip);
+            let had_ratio = self.db.udp_server_spam_ratios.contains_key(sip);
+            for old in self.db.learn_spam_server(sip) {
+                let named = self
+                    .db
+                    .spam_marks
+                    .iter()
+                    .any(|m| m.server_ip.as_deref() == Some(old.ip.as_str()));
+                undo.pushed_out_to(named).servers.push(old);
+            }
+            undo.server = Some(MarkedServer {
+                ip: sip.clone(),
+                listed,
+                had_ratio,
+            });
         }
 
         if !file_hash.is_empty() {
@@ -2331,13 +2675,20 @@ impl SpamFilter {
             });
             while self.db.spam_marks.len() > MAX_SPAM_HASHES {
                 let mark = self.db.spam_marks.remove(0);
-                self.db.drop_mark_collateral(&mark);
+                let learned = self.db.drop_mark_collateral(&mark);
+                undo.marks.push((mark, learned));
             }
+            self.mark_undos.retain(|u| u.hash != undo.hash);
+            if self.mark_undos.len() >= MARK_UNDOS_KEPT {
+                self.mark_undos.pop_front();
+            }
+            self.mark_undos.push_back(undo);
         }
 
         self.rebuild_similar_name_features();
         self.mark_dirty();
         info!("Marked as spam: {} ({})", name, result.file.hash);
+        prior
     }
 
     pub fn mark_not_spam(&mut self, file_hash: &str) {
@@ -2366,13 +2717,16 @@ impl SpamFilter {
             self.db.drop_mark_collateral(&mark);
             self.rebuild_similar_name_features();
         }
+        self.mark_undos.retain(|u| u.hash != file_hash);
         self.mark_dirty();
         info!("Marked as not spam: {file_hash}");
     }
 
-    /// Reverse collateral for marks whose hash left `spam_hashes` (FIFO cap).
-    fn drop_orphaned_marks(&mut self) {
+    /// Reverse collateral for marks whose hash left `spam_hashes` (FIFO cap),
+    /// returning each with what went with it.
+    fn drop_orphaned_marks(&mut self) -> Vec<(SpamMarkEntry, LearnedEntries)> {
         let known = self.db.spam_hashes.clone();
+        let mut dropped = Vec::new();
         let mut i = 0;
         while i < self.db.spam_marks.len() {
             if known.contains(&self.db.spam_marks[i].hash) {
@@ -2380,8 +2734,10 @@ impl SpamFilter {
                 continue;
             }
             let mark = self.db.spam_marks.remove(i);
-            self.db.drop_mark_collateral(&mark);
+            let learned = self.db.drop_mark_collateral(&mark);
+            dropped.push((mark, learned));
         }
+        dropped
     }
 
     /// Silently add a hash to the not-spam whitelist (e.g. on completed download).
@@ -5113,6 +5469,165 @@ mod tests {
         assert_eq!(twice, PriorSpamVerdict::Spam);
         filter.undo_mark_spam(&chosen, twice);
         assert!(filter.db.spam_hashes.contains(&chosen), "a re-mark's undo keeps the mark");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn from_udp_server(hash: &str, name: &str, server: &str) -> SearchResult {
+        let mut row = sample_result(hash, name);
+        row.result_origin = crate::search::merge::ORIGIN_SERVER_UDP.to_string();
+        row.origin_server_ip = Some(server.to_string());
+        row
+    }
+
+    /// Spam often comes from one server. Undoing one of its marks takes back
+    /// only that mark's raise, and the server stays listed for the other.
+    #[test]
+    fn undoing_a_mark_leaves_what_another_mark_raised_the_server_by() {
+        let dir = temp_dir("undo-server");
+        let mut filter = SpamFilter::load(&dir);
+        let server = "93.184.216.34";
+        filter.mark_spam(&from_udp_server(&"a1".repeat(16), "first fake.zip", server), &[], None);
+        let raised = filter.db.udp_server_spam_ratios[server];
+        let hash = "a2".repeat(16);
+        let prior = filter.mark_spam(&from_udp_server(&hash, "second fake.zip", server), &[], None);
+        assert!(filter.db.udp_server_spam_ratios[server] > raised);
+        filter.undo_mark_spam(&hash, prior);
+        assert!((filter.db.udp_server_spam_ratios[server] - raised).abs() < 1e-6);
+        assert!(filter.db.spam_server_ips.contains(server));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two marks that learned the same name, size, source and server leave
+    /// the filter as it was once both are undone, whichever goes first.
+    #[test]
+    fn undoing_two_marks_of_one_name_in_either_order_learns_nothing() {
+        for older_first in [true, false] {
+            let dir = temp_dir("undo-shared-name");
+            let mut filter = SpamFilter::load(&dir);
+            let server = "93.184.216.34";
+            let row = |hash: &str| {
+                let mut row = from_udp_server(hash, "Great Movie 2024 DVDRip x264 fake.avi", server);
+                row.file.size = 7_340_032;
+                row.source_addresses = vec!["9.9.9.9:4662".to_string()];
+                row
+            };
+            let before = serde_json::to_value(&filter.db).unwrap();
+            let (older, newer) = ("c1".repeat(16), "c2".repeat(16));
+            let older_prior = filter.mark_spam(&row(&older), &["movie".to_string()], None);
+            let newer_prior = filter.mark_spam(&row(&newer), &["movie".to_string()], None);
+            assert!(!filter.db.spam_similar_names.is_empty(), "the name's signature is learned");
+
+            let (first, second) = if older_first {
+                ((&older, older_prior), (&newer, newer_prior))
+            } else {
+                ((&newer, newer_prior), (&older, older_prior))
+            };
+            filter.undo_mark_spam(first.0, first.1);
+            assert_eq!(filter.db.spam_filenames.len(), 1, "the other mark still names it");
+            assert!(filter.db.spam_server_ips.contains(server));
+            filter.undo_mark_spam(second.0, second.1);
+            assert_eq!(
+                serde_json::to_value(&filter.db).unwrap(),
+                before,
+                "older undone first: {older_first}"
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// What was learned before a mark, by no mark kept today, stays when the
+    /// mark is undone; only what the mark added goes.
+    #[test]
+    fn undoing_a_mark_keeps_what_was_learned_before_it() {
+        let dir = temp_dir("undo-learned-before");
+        let mut filter = SpamFilter::load(&dir);
+        let server = "8.8.4.4";
+        filter.db.spam_filenames.push(normalize_filename("old fake.zip"));
+        filter.db.spam_sizes.push_back(4242);
+        filter.db.spam_source_ips.insert("8.8.8.8".to_string(), MAX_SPAM_SOURCE_IPS);
+        filter.db.learn_spam_server(server);
+        let ratio = filter.db.udp_server_spam_ratios[server];
+
+        let hash = "b1".repeat(16);
+        let mut row = from_udp_server(&hash, "old fake.zip", server);
+        row.file.size = 4242;
+        row.source_addresses = vec!["8.8.8.8:4662".to_string(), "9.9.9.9:4662".to_string()];
+        let prior = filter.mark_spam(&row, &[], None);
+        filter.undo_mark_spam(&hash, prior);
+        assert_eq!(filter.db.spam_filenames, vec![normalize_filename("old fake.zip")]);
+        assert_eq!(filter.db.spam_sizes, VecDeque::from([4242]));
+        assert!(filter.db.spam_source_ips.contains("8.8.8.8"));
+        assert!(!filter.db.spam_source_ips.contains("9.9.9.9"), "what the mark added goes");
+        assert!((filter.db.udp_server_spam_ratios[server] - ratio).abs() < 1e-6);
+        assert!(filter.db.spam_server_ips.contains(server));
+        assert!(filter.db.spam_similar_names.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Past the caps, a mark pushes out the oldest learned name and the oldest
+    /// marked hash with its mark; undoing it puts them back where they were.
+    #[test]
+    fn undoing_a_mark_puts_back_what_the_caps_pushed_out() {
+        let dir = temp_dir("undo-caps");
+        let mut filter = SpamFilter::load(&dir);
+        let hashes: Vec<String> = (1..=MAX_SPAM_HASHES).map(|i| format!("{i:032x}")).collect();
+        for hash in &hashes {
+            filter.db.spam_hashes.insert(hash.clone(), MAX_SPAM_HASHES);
+        }
+        filter.db.spam_marks.push(SpamMarkEntry {
+            hash: hashes[0].clone(),
+            size: 777,
+            source_ips: vec!["8.8.4.4".to_string()],
+            ..Default::default()
+        });
+        filter.db.spam_sizes.push_back(777);
+        filter.db.spam_source_ips.insert("8.8.4.4".to_string(), MAX_SPAM_SOURCE_IPS);
+        let names: Vec<String> = (0..MAX_SPAM_FILENAMES).map(|i| format!("learned{i} title")).collect();
+        filter.db.spam_filenames = names.clone();
+
+        let hash = "c4".repeat(16);
+        let prior = filter.mark_spam(&sample_result(&hash, "new fake.zip"), &[], None);
+        assert!(!filter.db.spam_hashes.contains(&hashes[0]));
+        assert!(!filter.db.spam_sizes.contains(&777));
+        assert_eq!(filter.db.spam_filenames[0], names[1]);
+
+        filter.undo_mark_spam(&hash, prior);
+        assert_eq!(filter.db.spam_hashes.iter().next(), Some(&hashes[0]));
+        assert_eq!(filter.db.spam_hashes.len(), MAX_SPAM_HASHES);
+        assert_eq!(filter.db.spam_marks.len(), 1);
+        assert_eq!(filter.db.spam_marks[0].hash, hashes[0]);
+        assert_eq!(filter.db.spam_sizes, VecDeque::from([777]));
+        assert!(filter.db.spam_source_ips.contains("8.8.4.4"));
+        assert_eq!(filter.db.spam_filenames, names);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// While saving is held, this session cannot see the file's verdicts. A
+    /// Mark spam and its Undo replayed onto the file once it reads leave the
+    /// file's own verdict on the hash: not spam stays not spam, spam stays spam.
+    #[test]
+    fn a_held_mark_and_undo_leave_the_files_own_verdict() {
+        let dir = temp_dir("held-undo");
+        let path = dir.join("search_spam.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut filter = SpamFilter::load(&dir);
+        let chosen = "c1".repeat(16);
+        let marked = "c2".repeat(16);
+        for hash in [&chosen, &marked] {
+            let prior = filter.mark_spam(&sample_result(hash, &format!("{hash}.bin")), &[], None);
+            assert_eq!(prior, PriorSpamVerdict::Unmarked);
+            filter.undo_mark_spam(hash, prior);
+        }
+        assert!(filter.take_save_data().is_none(), "still held");
+
+        std::fs::remove_dir(&path).unwrap();
+        let file = serde_json::json!({ "not_spam_hashes": [chosen], "spam_hashes": [marked] });
+        std::fs::write(&path, file.to_string()).unwrap();
+        filter.retry_blocked_load();
+        assert!(filter.db.not_spam_hashes.contains(&chosen));
+        assert!(!filter.db.spam_hashes.contains(&chosen));
+        assert!(filter.db.spam_hashes.contains(&marked));
+        assert!(filter.take_save_data().is_some(), "saving resumes");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -286,10 +286,11 @@ pub(super) async fn request_friend_transfer(
 ) -> FriendXferRequestOutcome {
     let now = std::time::Instant::now();
     let key = (friend, file_hash);
-    // Whether the friend can connect back to us: the shared TCP verdict, not
-    // `state.firewalled`, which an Ember-only node never clears after a failed
-    // UPnP pass and a router behind another NAT wrongly clears on success.
-    let firewalled = ember_tcp_firewalled(state);
+    // Whether the friend can connect back to us: the shared TCP verdict once
+    // there is one, rather than `state.firewalled`, which an Ember-only node
+    // never clears after a failed UPnP pass and a router behind another NAT
+    // wrongly clears on success.
+    let firewalled = ember_tcp_firewalled_or_presumed(state);
     let choose = |firewalled: bool| {
         friend_xfer_transport_choice(
             firewalled,
@@ -1864,6 +1865,22 @@ mod friend_transfer_tests {
         assert!(!ember_tcp_firewalled_with(false, FirewallStatus::Open, Some(false)), "KAD's open stands");
         assert!(ember_tcp_firewalled_with(false, FirewallStatus::Firewalled, Some(true)), "and its firewalled");
         assert!(ember_tcp_firewalled_with(true, FirewallStatus::Unknown, Some(true)), "LowID stands");
+    }
+
+    /// Asking a firewalled peer to call us back needs a reachable port, so
+    /// with nothing known yet the broker and the friend transport presume what
+    /// UPnP left us with, and any verdict overrides that.
+    #[test]
+    fn who_calls_back_presumes_the_upnp_guess_only_while_nothing_is_known() {
+        use crate::network::kad::firewall::FirewallStatus;
+        let unknown = FirewallStatus::Unknown;
+        assert!(ember_tcp_firewalled_or_presumed_with(false, unknown, None, true));
+        assert!(!ember_tcp_firewalled_or_presumed_with(false, unknown, None, false));
+        assert!(!ember_tcp_firewalled_or_presumed_with(false, unknown, Some(true), true), "the probe's open");
+        assert!(ember_tcp_firewalled_or_presumed_with(false, unknown, Some(false), false), "the probe's closed");
+        assert!(!ember_tcp_firewalled_or_presumed_with(false, FirewallStatus::Open, None, true), "KAD's open");
+        assert!(ember_tcp_firewalled_or_presumed_with(false, FirewallStatus::Firewalled, None, false));
+        assert!(ember_tcp_firewalled_or_presumed_with(true, unknown, None, false), "LowID");
     }
 
     /// A buddy that never endorsed the endpoint is not a callback destination.

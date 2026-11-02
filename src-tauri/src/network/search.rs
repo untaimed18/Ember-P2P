@@ -2202,6 +2202,9 @@ pub(super) fn release_ember_search_state(
         note_ember_target_lookup_ended(state, key);
         note_key_record_lookup_ended(state, key, false);
     }
+    if let Some(key) = state.ember_key_record_lookups.remove(&search_id) {
+        note_key_record_lookup_ended(state, key, false);
+    }
     drop_running_ember_companion(state, search_id);
     state.ember_search.remove(search_id);
     state

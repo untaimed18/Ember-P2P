@@ -191,9 +191,12 @@ fn extract_ipfilter_from_zip_with_limit(
         )
     })?;
 
-    let mut best_candidate: Option<(usize, i32)> = None;
+    // Ranked first by whether this build can decode the entry, so a
+    // best-named one in another method gives way to the next that is Stored
+    // or Deflate.
+    let mut best_candidate: Option<(usize, (bool, i32))> = None;
     for idx in 0..archive.len() {
-        let entry = archive.by_index(idx).map_err(|e| {
+        let entry = archive.by_index_raw(idx).map_err(|e| {
             coded_ctx(
                 "security_failed_to_inspect_archive_entry",
                 "Failed to inspect archive entry",
@@ -203,11 +206,16 @@ fn extract_ipfilter_from_zip_with_limit(
         if !entry.is_file() {
             continue;
         }
-        // A name that does not decode cannot be judged by its extension.
-        let Ok(name) = entry.name() else {
-            continue;
-        };
-        let name = name.to_ascii_lowercase();
+        let name = entry
+            .name()
+            .map_err(|e| {
+                coded_ctx(
+                    "security_failed_to_inspect_archive_entry",
+                    "Failed to inspect archive entry",
+                    format!("#{idx}: {e}"),
+                )
+            })?
+            .to_ascii_lowercase();
         let score = if name.ends_with("ipfilter.dat") {
             100
         } else if name.ends_with("ipfilter.p2p") {
@@ -225,6 +233,11 @@ fn extract_ipfilter_from_zip_with_limit(
         } else {
             continue;
         };
+        let decodable = matches!(
+            entry.compression(),
+            zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
+        );
+        let score = (decodable, score);
 
         if best_candidate
             .map(|(_, best_score)| score > best_score)
@@ -315,6 +328,57 @@ mod tests {
         let error = extract_ipfilter_from_zip_with_limit(&bytes, 1024)
             .expect_err("decompressed output over cap must fail");
         assert!(error.contains("security_extracted_ipfilter_too_large"));
+    }
+
+    /// A Stored archive whose `zstd` entries are relabelled as method 93.
+    fn zip_with_zstd_entries(entries: &[(&str, bool)]) -> Vec<u8> {
+        const ZSTD: u16 = 93;
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, _) in entries {
+            archive.start_file(*name, stored).unwrap();
+            archive.write_all(b"1.2.3.0 - 1.2.3.255 , 0 , x\n").unwrap();
+        }
+        let mut bytes = archive.finish().unwrap().into_inner();
+        // (signature, method offset, name-length offset, name offset)
+        for (magic, method_at, len_at, name_at) in
+            [(b"PK\x03\x04", 8, 26, 30), (b"PK\x01\x02", 10, 28, 46)]
+        {
+            let starts: Vec<usize> = (0..bytes.len() - 4)
+                .filter(|&i| &bytes[i..i + 4] == magic)
+                .collect();
+            for start in starts {
+                let len = u16::from_le_bytes([bytes[start + len_at], bytes[start + len_at + 1]]);
+                let name = &bytes[start + name_at..start + name_at + len as usize];
+                if entries.iter().any(|(n, zstd)| *zstd && n.as_bytes() == name) {
+                    bytes[start + method_at..start + method_at + 2]
+                        .copy_from_slice(&ZSTD.to_le_bytes());
+                }
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn non_deflate_ipfilter_entries_are_never_decoded() {
+        let bytes = zip_with_zstd_entries(&[("readme.txt", true), ("ipfilter.dat", false)]);
+        let extracted = extract_ipfilter_from_zip_with_limit(&bytes, 1024)
+            .expect("an unsupported entry that is not picked is only inspected");
+        assert_eq!(extracted, b"1.2.3.0 - 1.2.3.255 , 0 , x\n");
+
+        let bytes = zip_with_zstd_entries(&[("ipfilter.dat", true)]);
+        let error = extract_ipfilter_from_zip_with_limit(&bytes, 1024)
+            .expect_err("only Deflate and Stored entries are decoded");
+        assert!(error.contains("security_failed_to_read_selected_archive_entry"));
+    }
+
+    #[test]
+    fn a_best_named_entry_this_build_cannot_decode_gives_way_to_the_next() {
+        let bytes = zip_with_zstd_entries(&[("ipfilter.dat", true), ("guarding.p2p", false)]);
+        let extracted = extract_ipfilter_from_zip_with_limit(&bytes, 1024)
+            .expect("the Stored candidate is read instead");
+        assert_eq!(extracted, b"1.2.3.0 - 1.2.3.255 , 0 , x\n");
     }
 }
 

@@ -327,6 +327,13 @@
     void finish();
   }
 
+  // Picking again after a Skip is a new choice to import, whichever way the
+  // user got back to the import step.
+  $effect(() => {
+    void emuleSelection;
+    untrack(() => (skipImport = false));
+  });
+
   function changeImport() {
     skipImport = false;
     importFailed = false;

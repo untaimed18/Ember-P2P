@@ -446,6 +446,39 @@ fn an_owner_that_looks_before_signing_follows_a_freshly_re_signed_claim() {
     fx.finish();
 }
 
+/// An owner edit from the UI stamps the room as the owner pass does, so it
+/// waits for the same claim lookup: until one answers after the silence became
+/// claimable, or a stamp has ended the silence.
+#[test]
+fn an_owner_edit_waits_for_a_claim_lookup_after_a_claimable_silence() {
+    use crate::network::channel_membership::{note_channel_claim_answered, owner_edit_waits_for_claims};
+
+    let fx = SilentOwnerRoom::new();
+    let now = chrono::Utc::now().timestamp();
+    let id = fx.channel_id_hex();
+    let claimable_at = fx.last_word + 14 * 86_400;
+    assert!(owner_edit_waits_for_claims(&fx.db, &id, now), "nothing has looked yet");
+    note_channel_claim_answered(fx.room.channel_id, claimable_at - 60);
+    assert!(
+        owner_edit_waits_for_claims(&fx.db, &id, now),
+        "a lookup from before the silence was claimable says nothing about it"
+    );
+    note_channel_claim_answered(fx.room.channel_id, now - 5);
+    assert!(!owner_edit_waits_for_claims(&fx.db, &id, now), "one answered since");
+
+    let other = SilentOwnerRoom::new();
+    let other_id = other.channel_id_hex();
+    assert!(owner_edit_waits_for_claims(&other.db, &other_id, now));
+    other.db.stamp_owner_snapshot(&other_id, now).unwrap();
+    assert!(
+        !owner_edit_waits_for_claims(&other.db, &other_id, now + 1),
+        "the owner pass signed once its hold was over"
+    );
+
+    fx.finish();
+    other.finish();
+}
+
 /// Claims are re-signed every few hours for months, so one found long after
 /// the owner came back may as well have been made since: the owner stops
 /// looking once its return window closes, and forgets the silence.
@@ -2745,6 +2778,33 @@ fn a_publish_waits_for_its_target_lookup_only_where_storers_filter_by_proximity(
     ));
 }
 
+/// The queue also holds keys nothing waits on, and the top-up drains it from
+/// the front, so a key that starts a wait goes behind the keys already waiting
+/// and ahead of the rest — moving up if it was queued as one of the rest.
+#[test]
+fn a_key_a_publish_waits_on_is_looked_up_before_the_keys_nothing_waits_on() {
+    use std::collections::VecDeque;
+    let k = ember::dht::K_BUCKET_SIZE;
+    let now = 1_700_000_000i64;
+    let cache: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)> = HashMap::new();
+    let mut waits = HashMap::new();
+    let (refresh, forwarded) = ([0x10; 16], [0x11; 16]);
+    let mut queue = VecDeque::from([refresh, forwarded]);
+
+    let (first, second) = ([0x20; 16], [0x21; 16]);
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, first, now));
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, second, now + 1));
+    assert_eq!(queue, [first, second, refresh, forwarded], "first come, first asked, among the waiting");
+
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, forwarded, now + 2));
+    assert_eq!(queue, [first, second, forwarded, refresh], "moved up, not queued twice");
+
+    let late = [0x22; 16];
+    let lapsed = now + 2 + EMBER_PUBLISH_LOOKUP_WAIT_SECS;
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, late, lapsed));
+    assert_eq!(queue[0], late, "a wait past its limit holds no place ahead");
+}
+
 /// Files waiting on a lookup do not hold the per-tick budget: those that can
 /// go out fill it, the waiting are passed over, and no more new waits start a
 /// tick than the budget.
@@ -3289,6 +3349,43 @@ fn a_key_record_lookup_that_found_nobody_is_retried_then_dropped() {
     // A lookup for a key nothing holds changes nothing.
     note_key_record_lookup_ended_in(&mut holds, &mut queue, &mut ready, [0xEE; 16], true);
     assert_eq!(ready.len(), 1);
+}
+
+/// A key-record lookup's answer is published against once, at once, so it is
+/// kept with its hold rather than filed among the library's target sets,
+/// stamped as heard from like those.
+#[test]
+fn a_key_record_lookup_keeps_what_it_found_with_its_hold() {
+    let mut holds = HashMap::new();
+    let mut queue = std::collections::VecDeque::new();
+    let mut ready = std::collections::VecDeque::new();
+    let now = 1_700_000_000i64;
+    let record = key_epoch_record(7, 1, 3);
+    let key = record.keyword_hash;
+    hold_key_record_in(&mut holds, &mut queue, record, false, now);
+    queue.clear();
+    holds.get_mut(&key).unwrap().lookups = 1;
+
+    note_key_record_lookup_landed_in(&mut holds, &mut queue, &mut ready, key, &[], now + 5);
+    assert!(holds[&key].found.is_none());
+    assert_eq!(queue, [key], "found nobody: asked again");
+
+    queue.clear();
+    let answered = ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([0x77; 16]),
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(81, 2, 3, 4)), 4672),
+        noise_pub: [0x77; 32],
+        ed25519_pub: [0x77; 32],
+        last_seen: 0,
+        failed_queries: 2,
+    };
+    note_key_record_lookup_landed_in(&mut holds, &mut queue, &mut ready, key, &[answered], now + 10);
+    let (found, at) = holds[&key].found.as_ref().expect("kept with the hold");
+    assert_eq!(*at, now + 10);
+    assert_eq!(found[0].node_id, ember::dht::EmberNodeId([0x77; 16]));
+    assert_eq!((found[0].last_seen, found[0].failed_queries), (now + 10, 0));
+    assert_eq!(ready, [key]);
+    assert!(queue.is_empty());
 }
 
 #[test]

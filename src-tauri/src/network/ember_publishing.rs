@@ -1571,9 +1571,16 @@ pub(super) const EMBER_MAX_CONCURRENT_AWAITED_TARGET_LOOKUPS: usize = 8;
 
 /// Most awaited target lookups started in a minute, however fast they finish.
 ///
-/// About ten `FIND_NODE`s a walk makes this some twenty a second spread over
-/// the table, under one a second for each peer, where a peer admits about six
-/// lookup queries a second from one address (`MAX_LOOKUPS_PER_WINDOW`).
+/// A `FIND_NODE` walk ends only once the k closest nodes it knows of that can
+/// still answer all have, and half a bucket at least (`closest_have_responded`,
+/// `MIN_RESPONSES_TO_CONVERGE`), so it costs some twenty to thirty queries:
+/// this many walks a minute is forty to sixty queries a second over the table.
+/// Waits start from k verified contacts, and on an overlay of a few dozen nodes
+/// nearly every walk asks nearly every node, so each peer gets up to two a
+/// second from this alone, before presence walks, source lookups and keyword
+/// searches. A peer admits about twelve a second sustained from one address
+/// (`MAX_LOOKUPS_PER_WINDOW` over its trailing half window), which leaves one
+/// node well inside it; several of ours behind one shared address split it.
 pub(super) const EMBER_MAX_AWAITED_TARGET_LOOKUPS_PER_MIN: usize = 120;
 
 /// Awaited target lookups to start now, with `queued` keys waiting,
@@ -1843,8 +1850,23 @@ pub(super) fn ember_publish_awaits_lookup_in(
         EmberLookupGate::Ready => false,
         EmberLookupGate::Waiting => true,
         EmberLookupGate::WouldWait => {
-            if !in_flight && !queue.contains(&key) {
-                queue.push_back(key);
+            if !in_flight {
+                // Behind the keys already waiting and ahead of the rest: the
+                // queue also holds refresh keys, a buddy's forwarded keys and
+                // channel-record keys, which nothing is held back for, and the
+                // top-up drains it from the front.
+                if let Some(at) = queue.iter().position(|k| *k == key) {
+                    queue.remove(at);
+                }
+                let at = queue
+                    .iter()
+                    .rposition(|k| {
+                        waits.get(k).is_some_and(|&(since, ended)| {
+                            !ended && now.saturating_sub(since) < EMBER_PUBLISH_LOOKUP_WAIT_SECS
+                        })
+                    })
+                    .map_or(0, |last| last + 1);
+                queue.insert(at, key);
             }
             waits.insert(key, (now, false));
             true
@@ -1947,8 +1969,9 @@ pub(super) const KEY_RECORD_HOLD_SECS: i64 = 3 * 3600;
 pub(super) const KEY_RECORD_LOOKUP_TRIES: u8 = 2;
 
 /// Fewest and most key-record lookups started per maintenance cycle. Their own
-/// budget, beside the library's, so a large room's renewal neither waits
-/// behind the library's keys nor holds them back.
+/// budget, and their own in-flight map (`ember_key_record_lookups`), beside
+/// the library's, so a large room's renewal neither waits behind the library's
+/// keys nor holds them back.
 pub(super) const KEY_RECORD_MIN_LOOKUPS: usize = 2;
 pub(super) const KEY_RECORD_MAX_LOOKUPS: usize = 8;
 
@@ -1964,6 +1987,10 @@ pub(super) struct KeyRecordHold {
     pub held_at: i64,
     /// Lookups started for it.
     pub lookups: u8,
+    /// The nodes its own lookup found, and when. Kept here rather than in the
+    /// library's target cache: the set is published against once, at once,
+    /// and would only push library sets out of that cache.
+    pub found: Option<(Vec<ember::dht::EmberContact>, i64)>,
 }
 
 /// Whether a key-epoch record under `key` should also be held for a target
@@ -2008,6 +2035,7 @@ pub(super) fn hold_key_record_in(
         records: Vec::new(),
         held_at: now,
         lookups: 0,
+        found: None,
     });
     hold.held_at = now;
     hold.lookups = 0;
@@ -2064,6 +2092,48 @@ pub(super) fn note_key_record_lookup_ended(state: &mut NetworkState, key: [u8; 1
     );
 }
 
+/// One of [`start_key_record_lookups`]' own lookups for `key` has ended, and
+/// `contacts` answered it: kept with the hold for its publish.
+pub(super) fn note_key_record_lookup_landed(
+    state: &mut NetworkState,
+    key: [u8; 16],
+    contacts: &[ember::dht::EmberContact],
+) {
+    note_key_record_lookup_landed_in(
+        &mut state.ember_key_record_holds,
+        &mut state.ember_key_record_queue,
+        &mut state.ember_key_records_ready,
+        key,
+        contacts,
+        chrono::Utc::now().timestamp(),
+    );
+}
+
+pub(super) fn note_key_record_lookup_landed_in(
+    holds: &mut HashMap<[u8; 16], KeyRecordHold>,
+    queue: &mut VecDeque<[u8; 16]>,
+    ready: &mut VecDeque<[u8; 16]>,
+    key: [u8; 16],
+    contacts: &[ember::dht::EmberContact],
+    now: i64,
+) {
+    if let Some(hold) = holds.get_mut(&key).filter(|_| !contacts.is_empty()) {
+        // Heard from over a session on this walk, as the library's sets are
+        // filed (see `maybe_finish_ember_search`).
+        let found = contacts
+            .iter()
+            .cloned()
+            .map(|mut c| {
+                c.last_seen = now;
+                c.failed_queries = 0;
+                c
+            })
+            .collect();
+        hold.found = Some((found, now));
+    }
+    note_key_record_lookup_ended_in(holds, queue, ready, key, !contacts.is_empty());
+}
+
 /// Drop holds past [`KEY_RECORD_HOLD_SECS`], and the queued and ready keys
 /// they leave behind, so both stay within the holds.
 pub(super) fn prune_key_record_holds_in(
@@ -2078,7 +2148,10 @@ pub(super) fn prune_key_record_holds_in(
 }
 
 /// Key-record lookups to start this cycle with `queued` keys waiting: enough
-/// to reach every one within half its hold.
+/// to reach every one within half its hold, up to [`KEY_RECORD_MAX_LOOKUPS`]
+/// a cycle. That cap reaches some 720 keys in half a hold and 1440 in a whole
+/// one, so the tail of a renewal of more keys than that lapses with its hold
+/// and stays on our own table's closest; its members already hold the key.
 pub(super) fn key_record_lookups_this_cycle(queued: usize) -> usize {
     let cycles = (KEY_RECORD_HOLD_SECS as u64 / 2 / EMBER_MAINT_INTERVAL.as_secs()).max(1) as usize;
     queued.div_ceil(cycles).clamp(KEY_RECORD_MIN_LOOKUPS, KEY_RECORD_MAX_LOOKUPS)
@@ -2113,6 +2186,10 @@ pub(super) async fn start_ember_publish_target_lookups(
 
 /// Keep [`EMBER_MAX_CONCURRENT_AWAITED_TARGET_LOOKUPS`] lookups running while
 /// publishes wait on them. Runs every second.
+///
+/// The waiting keys are at the front of the queue (see
+/// [`ember_publish_awaits_lookup_in`]), so they go first; once they have all
+/// started, the keys behind them go at this rate too while any wait is open.
 pub(super) async fn top_up_awaited_target_lookups(socket: &UdpSocket, state: &mut NetworkState) {
     if state.ember_publish_target_queue.is_empty()
         || state.ember_publish_target_lookups.len() >= EMBER_MAX_CONCURRENT_AWAITED_TARGET_LOOKUPS
@@ -2164,7 +2241,9 @@ pub(super) async fn start_key_record_lookups(socket: &UdpSocket, state: &mut Net
             continue;
         }
         // Its end, whoever started it, reports here.
-        if state.ember_publish_target_lookups.values().any(|k| *k == key) {
+        if state.ember_publish_target_lookups.values().any(|k| *k == key)
+            || state.ember_key_record_lookups.values().any(|k| *k == key)
+        {
             continue;
         }
         match start_ember_background_find_node(state, ember::dht::EmberNodeId(key)) {
@@ -2173,7 +2252,7 @@ pub(super) async fn start_key_record_lookups(socket: &UdpSocket, state: &mut Net
                 if let Some(hold) = state.ember_key_record_holds.get_mut(&key) {
                     hold.lookups = hold.lookups.saturating_add(1);
                 }
-                state.ember_publish_target_lookups.insert(search_id, key);
+                state.ember_key_record_lookups.insert(search_id, key);
                 drive_ember_search(socket, state, search_id).await;
             }
             None => {
@@ -2183,6 +2262,27 @@ pub(super) async fn start_key_record_lookups(socket: &UdpSocket, state: &mut Net
             }
         }
     }
+}
+
+/// Where to publish what is held under `key`: the set its own lookup `found`,
+/// resolved against the table as a library set is, or else the library's set,
+/// which a library lookup for the same key filed.
+fn key_record_publish_targets(
+    state: &mut NetworkState,
+    key: [u8; 16],
+    found: Option<&(Vec<ember::dht::EmberContact>, i64)>,
+) -> Vec<ember::dht::EmberContact> {
+    let Some(found) = found else {
+        return ember_overlay_publish_targets_within(state, key, 0);
+    };
+    let own = HashMap::from([(key, found.clone())]);
+    let now = chrono::Utc::now().timestamp();
+    let mut targets =
+        ember_publish_targets_for(&own, &mut VecDeque::new(), 0, state.ember_dht.routing(), key, now);
+    // As `ember_overlay_publish_targets_within` finishes a library set.
+    targets.retain(|c| !ember_addr_banned(state, c.addr));
+    ember_top_up_session_targets(&state.ember_session_dht_contacts, &mut targets);
+    targets
 }
 
 /// Publish what is held under keys whose lookup has landed, from the search
@@ -2195,15 +2295,20 @@ pub(super) async fn publish_ready_key_records(socket: &UdpSocket, state: &mut Ne
         let Some(hold) = state.ember_key_record_holds.remove(&key) else {
             continue;
         };
+        let targets = key_record_publish_targets(state, key, hold.found.as_ref());
         let mut records = hold.records.into_iter();
         while let Some(record) = records.next() {
-            let targets = ember_overlay_publish_targets_within(state, key, 0);
-            let Some(publish_id) = state.ember_publish.start_publish_to(record.clone(), targets) else {
+            let Some(publish_id) = state.ember_publish.start_publish_to(record.clone(), targets.clone()) else {
                 // Too many publishes in flight: put the rest back for a later tick.
                 let rest: Vec<_> = std::iter::once(record).chain(records).collect();
                 state.ember_key_record_holds.insert(
                     key,
-                    KeyRecordHold { records: rest, held_at: hold.held_at, lookups: hold.lookups },
+                    KeyRecordHold {
+                        records: rest,
+                        held_at: hold.held_at,
+                        lookups: hold.lookups,
+                        found: hold.found,
+                    },
                 );
                 state.ember_key_records_ready.push_front(key);
                 return;
@@ -2307,9 +2412,11 @@ const OUTSIDE_PROBE_SETTLE: std::time::Duration = std::time::Duration::from_secs
 /// to notice a port opened or closed since. With a change of address or port
 /// it goes again sooner, though never more than once in
 /// [`OUTSIDE_PROBE_CHANGE_FLOOR`]: the server allows an address six probes an
-/// hour, and the connection doctor draws on the same allowance.
+/// hour, and the connection doctor draws on the same allowance, so an address
+/// that keeps changing must leave it at least two of them.
 const OUTSIDE_PROBE_REPEAT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-const OUTSIDE_PROBE_CHANGE_FLOOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const OUTSIDE_PROBE_CHANGE_FLOOR: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const _: () = assert!(3600 / OUTSIDE_PROBE_CHANGE_FLOOR.as_secs() <= 4);
 
 /// Ask the rendezvous server to dial us from outside, when nothing else has
 /// told us whether peers can reach our TCP port: no LowID or HighID from an
@@ -2375,6 +2482,11 @@ pub(super) fn maybe_probe_from_outside(state: &mut NetworkState, settings: &AppS
 /// library, so on a restricted NAT every callback after the first minute was
 /// dropped at our own router.
 const EMBER_BUDDY_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(20);
+/// How much earlier than [`EMBER_BUDDY_KEEPALIVE`] a tick may ping. Ticks run
+/// late by varying amounts, so two of them land a hair under 20 s apart about
+/// half the time, and a strict check would push that ping to the third tick,
+/// 30 s.
+const EMBER_BUDDY_KEEPALIVE_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Keep the path from our named buddy to us open; see [`EMBER_BUDDY_KEEPALIVE`].
 pub(super) async fn keep_named_buddy_reachable(socket: &UdpSocket, state: &mut NetworkState) {
@@ -2384,7 +2496,9 @@ pub(super) async fn keep_named_buddy_reachable(socket: &UdpSocket, state: &mut N
     let now = std::time::Instant::now();
     if state
         .ember_buddy_keepalive_at
-        .is_some_and(|at| now.saturating_duration_since(at) < EMBER_BUDDY_KEEPALIVE)
+        .is_some_and(|at| {
+            now.saturating_duration_since(at) < EMBER_BUDDY_KEEPALIVE - EMBER_BUDDY_KEEPALIVE_SLACK
+        })
     {
         return;
     }
@@ -2422,6 +2536,35 @@ pub(super) fn ember_tcp_firewalled(state: &NetworkState) -> bool {
         state.firewall_checker.tcp_status(),
         ember_outside_tcp_open(state),
     )
+}
+
+/// [`ember_tcp_firewalled`] for deciding whether a firewalled peer can call
+/// us back (the KAD LowID-to-LowID broker, a friend transfer's transport).
+/// With no verdict yet it takes `state.firewalled`, firewalled unless UPnP
+/// mapped the port: a callback to a port nobody can reach fails outright,
+/// where a broker or punch we did not need only costs a little time.
+pub(super) fn ember_tcp_firewalled_or_presumed(state: &NetworkState) -> bool {
+    ember_tcp_firewalled_or_presumed_with(
+        state.low_id,
+        state.firewall_checker.tcp_status(),
+        ember_outside_tcp_open(state),
+        state.firewalled,
+    )
+}
+
+pub(super) fn ember_tcp_firewalled_or_presumed_with(
+    low_id: bool,
+    tcp_status: crate::network::kad::firewall::FirewallStatus,
+    outside_tcp_open: Option<bool>,
+    presumed: bool,
+) -> bool {
+    if !low_id
+        && tcp_status == crate::network::kad::firewall::FirewallStatus::Unknown
+        && outside_tcp_open.is_none()
+    {
+        return presumed;
+    }
+    ember_tcp_firewalled_with(low_id, tcp_status, outside_tcp_open)
 }
 
 /// The buddy trailer we may write for `contact`, from the endorsement that

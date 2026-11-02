@@ -85,6 +85,57 @@ impl DiscoveryResult {
     }
 }
 
+/// Whether `folder`, a shared root, is gone from the very volume it was
+/// approved on while that volume is there, deleted or moved, rather than on
+/// one not plugged in or offline. Blocking.
+///
+/// Only a Windows path names its volume. Elsewhere an unplugged volume's
+/// mount point can vanish with it, so this never claims a folder is gone.
+pub(crate) fn folder_gone_from_present_volume(folder: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let recorded = crate::security::filesystem::approved_roots()
+            .ok()
+            .and_then(|roots| roots.recorded_target(folder));
+        folder_gone_from_recorded_volume(folder, recorded, crate::security::filesystem::volume_serial)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = folder;
+        false
+    }
+}
+
+/// [`folder_gone_from_present_volume`] for a folder whose approval recorded
+/// `recorded`: its canonical target and the serial of the volume that was
+/// on. `serial_of` reads the volume of a path, following junctions and mount
+/// points. The nearest ancestor of the target that answers must be on that
+/// same volume: another drive that took its letter, or a junction or mount
+/// point whose volume is missing, leaves the folder offline. With nothing
+/// recorded it is offline too.
+#[cfg(any(windows, test))]
+fn folder_gone_from_recorded_volume(
+    folder: &Path,
+    recorded: Option<(std::path::PathBuf, u64)>,
+    serial_of: impl Fn(&Path) -> std::io::Result<u64>,
+) -> bool {
+    let not_found = |path: &Path| matches!(serial_of(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    let Some((target, volume)) = recorded else {
+        return false;
+    };
+    if !not_found(folder) {
+        return false;
+    }
+    target
+        .ancestors()
+        .find_map(|path| match serial_of(path) {
+            Ok(serial) => Some(path != target && serial == volume),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(false),
+        })
+        .unwrap_or(false)
+}
+
 /// Whether an allowlist of `normalize_path_key` forms offers the file or
 /// folder at `key`: it is listed, or sits inside a listed folder. `..=at` as
 /// well, for a drive root, whose key keeps its separator.
@@ -1331,6 +1382,93 @@ impl FileIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shared folder deleted from the volume it was approved on, while that
+    /// volume is there, is gone; one that is there, or on a drive that is not,
+    /// is not.
+    #[test]
+    fn a_folder_is_gone_only_from_its_own_volume_while_it_is_there() {
+        let base = std::env::temp_dir().join(format!("ember-gone-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
+        let serial_of = crate::security::filesystem::volume_serial;
+        let volume = serial_of(&base).unwrap();
+        let deleted = base.join("deleted");
+        let recorded = |target: &Path, volume: u64| Some((target.to_path_buf(), volume));
+
+        assert!(!folder_gone_from_recorded_volume(&base, recorded(&base, volume), serial_of));
+        assert!(folder_gone_from_recorded_volume(&deleted, recorded(&deleted, volume), serial_of));
+        assert!(
+            !folder_gone_from_recorded_volume(&deleted, recorded(&deleted, volume ^ 1), serial_of),
+            "another volume is where it was"
+        );
+        assert!(!folder_gone_from_recorded_volume(&deleted, None, serial_of), "nothing recorded");
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !folder_gone_from_present_volume(&deleted),
+            "a folder never approved has nothing recorded"
+        );
+        #[cfg(windows)]
+        {
+            let absent_drive = ('D'..='Z')
+                .map(|letter| format!("{letter}:\\"))
+                .find(|root| !Path::new(root).exists());
+            if let Some(root) = absent_drive {
+                let shared = Path::new(&root).join("Shared");
+                assert!(!folder_gone_from_recorded_volume(&shared, recorded(&shared, volume), serial_of));
+            }
+        }
+    }
+
+    /// Volumes as a drive letter reused by another drive, and a junction to an
+    /// unplugged drive, leave them: neither makes a shared folder look deleted.
+    #[cfg(windows)]
+    #[test]
+    fn a_reused_drive_letter_or_dangling_junction_leaves_a_folder_offline() {
+        use std::collections::HashMap;
+        use std::io::{Error, ErrorKind};
+        let volumes: HashMap<&Path, u64> = HashMap::from([
+            (Path::new(r"E:\"), 0xB),
+            (Path::new(r"C:\"), 0xC),
+            (Path::new(r"C:\Media"), 0xC),
+        ]);
+        let serial_of = |path: &Path| {
+            volumes
+                .get(path)
+                .copied()
+                .ok_or_else(|| Error::from(ErrorKind::NotFound))
+        };
+        let on_drive_a = Some((std::path::PathBuf::from(r"E:\Music"), 0xA));
+        assert!(
+            !folder_gone_from_recorded_volume(Path::new(r"E:\Music"), on_drive_a, serial_of),
+            "drive B took E: while drive A is away"
+        );
+        let on_drive_b = Some((std::path::PathBuf::from(r"E:\Music"), 0xB));
+        assert!(
+            folder_gone_from_recorded_volume(Path::new(r"E:\Music"), on_drive_b, serial_of),
+            "deleted from drive B, which is there"
+        );
+        let through_junction = Some((std::path::PathBuf::from(r"F:\Movies"), 0xF));
+        assert!(
+            !folder_gone_from_recorded_volume(Path::new(r"C:\Media\Movies"), through_junction, serial_of),
+            "C:\\Media leads to F:, which is unplugged"
+        );
+        let unreadable = |path: &Path| {
+            if path == Path::new(r"E:\") {
+                Err(Error::from(ErrorKind::PermissionDenied))
+            } else {
+                Err(Error::from(ErrorKind::NotFound))
+            }
+        };
+        assert!(
+            !folder_gone_from_recorded_volume(
+                Path::new(r"E:\Music"),
+                Some((std::path::PathBuf::from(r"E:\Music"), 0xB)),
+                unreadable
+            ),
+            "a volume that cannot be read is not taken for there"
+        );
+    }
 
     /// A full frontier keeps the smallest keys, whatever order they arrive
     /// in, and remembers the smallest it let go: the walk stops there, so a

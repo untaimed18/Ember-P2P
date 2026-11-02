@@ -4583,17 +4583,26 @@ pub(super) async fn maybe_publish_owned_channel_records(
         // Back from a silence our nominee could have claimed the room in: look
         // for the claim before signing, so the copy found predates our return.
         if let Ok(Some(silence)) = db.channel_owner_pending_silence(&ch.channel_id, now) {
-            let held_since = *state.channel_return_held_since.entry(channel_id).or_insert(now);
+            let claimable_at = silence
+                .silent_from
+                .saturating_add(silence.claim_after_days.saturating_mul(86_400));
+            let held_since = ember::channel::owner_return_hold_start(
+                state.channel_return_held_since.get(&channel_id).copied(),
+                claimable_at,
+                now,
+            );
+            state.channel_return_held_since.insert(channel_id, held_since);
             if ember::channel::owner_return_waits_for_claims(
-                silence
-                    .silent_from
-                    .saturating_add(silence.claim_after_days.saturating_mul(86_400)),
-                state.channel_claim_answered_at.get(&channel_id).copied(),
+                claimable_at,
+                channel_claim_answered_at(&channel_id),
                 held_since,
                 now,
             ) {
                 continue;
             }
+        } else {
+            // Nothing pending: whatever stamp ended the silence, its hold is over.
+            state.channel_return_held_since.remove(&channel_id);
         }
         let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) else {
             continue;
@@ -5090,6 +5099,50 @@ impl Drop for RestoringRoom {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.0);
     }
+}
+
+/// When a claim lookup for a room last had an answer, by room. Process-wide so
+/// an owner edit from the UI waits on it as the owner pass does.
+fn claims_answered_at() -> &'static std::sync::Mutex<HashMap<[u8; 16], i64>> {
+    static ROOMS: std::sync::OnceLock<std::sync::Mutex<HashMap<[u8; 16], i64>>> = std::sync::OnceLock::new();
+    ROOMS.get_or_init(Default::default)
+}
+
+pub(crate) fn note_channel_claim_answered(channel_id: [u8; 16], at: i64) {
+    claims_answered_at()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(channel_id, at);
+}
+
+fn channel_claim_answered_at(channel_id: &[u8; 16]) -> Option<i64> {
+    claims_answered_at()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(channel_id)
+        .copied()
+}
+
+/// Whether an owner edit of a room of ours has to wait: we are back from a
+/// silence our nominee could have claimed the room in, and no claim lookup has
+/// answered since it became claimable. The edit's stamp ends the silence, so
+/// signing it first would refuse a claim copy re-signed after it that the
+/// members followed. The claim lookup this device makes for the room
+/// answering, or the owner pass signing once its hold is over, lets it through.
+pub(crate) fn owner_edit_waits_for_claims(db: &Database, channel_id: &str, now: i64) -> bool {
+    let Ok(Some(silence)) = db.channel_owner_pending_silence(channel_id, now) else {
+        return false;
+    };
+    let Some(id) = hex::decode(channel_id)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+    else {
+        return false;
+    };
+    let claimable_at = silence
+        .silent_from
+        .saturating_add(silence.claim_after_days.saturating_mul(86_400));
+    channel_claim_answered_at(&id).is_none_or(|at| at < claimable_at)
 }
 
 /// Rooms of ours with a rotated key stored whose snapshot has not committed

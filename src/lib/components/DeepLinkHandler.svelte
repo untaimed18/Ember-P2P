@@ -355,6 +355,10 @@
     }
   }
 
+  /** Batch answers for links not yet acknowledged, so a drain that stopped at
+   *  a failed acknowledgement does not ask about the rest of the batch again. */
+  const batchDecisions = new Map<string, Prepared>();
+
   let processing = false;
   let rerun = false;
   let deferredCount = $state(deferredIds.size);
@@ -395,6 +399,7 @@
     try {
       await ackPendingDeepLink(id);
       completedIds.delete(id);
+      batchDecisions.delete(id);
       return true;
     } catch (e) {
       console.warn('Failed to acknowledge completed deep link; retrying:', e);
@@ -429,25 +434,41 @@
           reviewRequestedId = null;
         }
         if (deferredChanged) syncDeferredCount();
+        for (const id of batchDecisions.keys()) {
+          if (!pendingIds.has(id)) batchDecisions.delete(id);
+        }
 
         const links = pending.filter(
           (link) => !deferredIds.has(link.id) || link.id === reviewRequestedId,
         );
         // A deferred link being reviewed is asked about on its own, as before.
         const prepared = await confirmFileBatch(
-          links.filter((link) => !completedIds.has(link.id) && link.id !== reviewRequestedId),
+          links.filter(
+            (link) =>
+              !completedIds.has(link.id) &&
+              link.id !== reviewRequestedId &&
+              !batchDecisions.has(link.id),
+          ),
         );
+        for (const [id, p] of prepared) {
+          if (p.decision !== undefined) batchDecisions.set(id, p);
+        }
         batchQueued = 0;
         for (const link of links) {
           if (destroyed) break;
           const reviewingDeferred = link.id === reviewRequestedId;
           if (!completedIds.has(link.id)) {
-            const result = await handlePayload(link.payload, link.id, prepared.get(link.id));
+            const result = await handlePayload(
+              link.payload,
+              link.id,
+              batchDecisions.get(link.id) ?? prepared.get(link.id),
+            );
             if (reviewingDeferred) reviewRequestedId = null;
             if (result === 'done') {
               if (deferredIds.delete(link.id)) syncDeferredCount();
               completedIds.add(link.id);
             } else {
+              batchDecisions.delete(link.id);
               // 'defer' (user dismissed) and 'fail' (usually transient — a busy
               // network task, a timed-out command) are both parked: the durable
               // entry is kept and surfaced in the pending banner so Review can

@@ -188,6 +188,7 @@ pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "ban_peer",
     "batch_unshare",
     "cancel_feed_download",
+    "cancel_finish_action",
     "clear_download_history",
     "confirm_dropped_folders",
     "create_feed",

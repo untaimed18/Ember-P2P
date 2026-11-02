@@ -49,20 +49,15 @@
     finishRequestedQuit,
     setPendingUndo,
   } from '$lib/api/settings';
-  import {
-    applyBackgroundCheckResult,
-    checkUpdateHandoff,
-    loadLastBackgroundCheckResult,
-    type SecureUpdateCheckResult,
-  } from '$lib/stores/updater';
+  import { checkUpdateHandoff, loadLastBackgroundCheckResult } from '$lib/stores/updater';
   import { setTrayLabels } from '$lib/api/system';
   import {
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
   } from '$lib/api/security';
   import {
-    addActionToast, addToast, clearAllToasts, onPendingUndoChange, setToastMessage, toastError, toastSuccess,
-    toastWarning, toasts,
+    addActionToast, addToast, clearAllToasts, flushToastActions, onPendingUndoChange, reloadAfterToastActions,
+    setToastMessage, toastError, toastSuccess, toastWarning, toasts,
   } from '$lib/stores/toast';
   import { get } from 'svelte/store';
   import { backupReminderDue, noteBackupReminderShown } from '$lib/backupReminder';
@@ -387,6 +382,12 @@
     };
     window.addEventListener('unhandledrejection', onUnhandledRejection);
 
+    // A reload runs no toast's expiry. Ember's own reloads send what Undo
+    // holds back first (`reloadAfterToastActions`); for any other, start
+    // sending it as the page goes, which is the best that can be done then.
+    const onPageHide = () => { void flushToastActions(); };
+    window.addEventListener('pagehide', onPageHide);
+
     // Register before consuming the native latch. A close can be prevented by
     // Tauri before this async registration resolves; the backend records that
     // request so it is still surfaced exactly once after the listener is live.
@@ -512,13 +513,21 @@
       })
       .catch((e) => console.error('Failed to consume the restore download-folder latch:', e));
 
-    listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
-      'security-policy-reset-required',
-      (event) => {
-        if (!mounted) return;
-        policyResetReason = event.payload?.reason || m.layout_policy_reset_unknown_reason();
-      },
-    )
+    // Any window can emit an app event, the popped-out chat included, so a
+    // listener whose event the backend alone should send asks the backend for
+    // the state rather than trusting the payload.
+    const readPolicyState = () => {
+      void getSecurityPolicyState()
+        .then((status) => {
+          if (mounted && status.resetRequired) {
+            policyResetReason = status.reason || m.layout_policy_reset_unknown_reason();
+          }
+        })
+        .catch((e) => console.error('Failed to read security-policy state:', e));
+    };
+    listen('security-policy-reset-required', () => {
+      if (mounted) readPolicyState();
+    })
       .then((fn) => { if (mounted) unlistenPolicyReset = fn; else fn(); })
       .catch((e) => console.error('Failed to register security-policy listener:', e));
 
@@ -574,8 +583,8 @@
     // for as long as Ember stays open (release builds only); they have no
     // setting. Their results are applied exactly as a silent check's would
     // be, and surface non-blockingly via <UpdateNotice />.
-    listen<SecureUpdateCheckResult>('ember:updater-check-result', (event) => {
-      if (mounted) void applyBackgroundCheckResult(event.payload);
+    listen('ember:updater-check-result', () => {
+      if (mounted) void loadLastBackgroundCheckResult();
     })
       .then((fn) => {
         if (!mounted) {
@@ -600,8 +609,10 @@
     }).catch((e) => console.error('Failed to set the tray labels:', e));
 
     // The tray and the status bar save speed limits without the Settings page.
-    listen<AppSettings>(SETTINGS_CHANGED_EVENT, (event) => {
-      if (mounted) setAppSettings(event.payload);
+    // Fetched rather than taken from the event: a forged one with a huge
+    // `settings_revision` would pin itself over every genuine update.
+    listen(SETTINGS_CHANGED_EVENT, () => {
+      if (mounted) void loadAppSettings();
     })
       .then((fn) => { if (mounted) unlistenSettingsChanged = fn; else fn(); })
       .catch((e) => console.error('Failed to register settings-changed listener:', e));
@@ -692,13 +703,7 @@
       .then((fn) => { if (mounted) unlistenDropRejected = fn; else fn(); })
       .catch((e) => console.error('Failed to register drop-rejected listener:', e));
 
-    void getSecurityPolicyState()
-      .then((status) => {
-        if (mounted && status.resetRequired) {
-          policyResetReason = status.reason || m.layout_policy_reset_unknown_reason();
-        }
-      })
-      .catch((e) => console.error('Failed to read security-policy state:', e));
+    readPolicyState();
 
     const revealApp = () => {
       if (!mounted || !splashVisible) return;
@@ -860,6 +865,7 @@
     return () => {
       mounted = false;
       window.removeEventListener('unhandledrejection', onUnhandledRejection);
+      window.removeEventListener('pagehide', onPageHide);
       if (revealTimer !== undefined) window.clearTimeout(revealTimer);
       if (hideTimer !== undefined) window.clearTimeout(hideTimer);
       if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
@@ -940,7 +946,7 @@
       {:else if initError}
         <div class="init-error">
           <p>{initError}</p>
-          <button onclick={() => location.reload()}>{m.layout_retry()}</button>
+          <button onclick={() => reloadAfterToastActions()}>{m.layout_retry()}</button>
         </div>
       {:else}
         <!--

@@ -12,6 +12,8 @@ export interface ToastItem {
   type: 'success' | 'error' | 'warning' | 'info';
   message: string;
   action?: ToastAction;
+  /** How many times the same toast was raised again while this one was up. */
+  repeats?: number;
 }
 
 let nextId = 0;
@@ -123,7 +125,14 @@ export function resumeToastDismiss() {
 function expire(id: number): void | Promise<unknown> {
   const onExpire = toastExpiry.get(id);
   toastExpiry.delete(id);
-  const result = onExpire?.();
+  // A throw is settled like a rejection, so the Undo flag still clears and a
+  // flush goes on to the other toasts.
+  let result: void | Promise<unknown>;
+  try {
+    result = onExpire?.();
+  } catch (e) {
+    result = Promise.reject(e);
+  }
   if (result instanceof Promise) {
     const settled: Promise<unknown> = result.catch(() => {}).finally(() => {
       inFlight.delete(settled);
@@ -208,10 +217,23 @@ export async function flushToastActionsBeforeExit(timeoutMs = 3500): Promise<voi
   clearTimeout(timer);
 }
 
+/** Reload the document (or run `reload`, which does) once what Undo toasts
+ *  hold back has been sent: a reload runs no toast's expiry, so the cancels
+ *  and removals behind them would never reach the backend. */
+export function reloadAfterToastActions(reload: () => void = () => location.reload()): void {
+  // Even if an expiry throws: this is the language switch and the Retry
+  // after a failed start, which must still reload.
+  void flushToastActionsBeforeExit()
+    .catch(() => {})
+    .finally(reload);
+}
+
 /**
  * A plain toast. The same type and message again while one is still on screen
  * restarts that one's countdown instead of stacking a copy: a repeated event
  * says nothing new, and the copies would push other toasts out of the cap.
+ * Its `repeats` count goes up, so the toast can show and announce that it
+ * happened again; a retry that fails the same way must not look like nothing.
  * A sticky toast stays sticky, and a sticky repeat makes a timed one sticky.
  */
 export function addToast(type: ToastItem['type'], message: string, durationMs = 5000) {
@@ -222,6 +244,7 @@ export function addToast(type: ToastItem['type'], message: string, durationMs = 
       if (durationMs <= 0) stickyToasts.add(existing.id);
       else armToastTimer(existing.id, durationMs);
     }
+    toasts.update((t) => t.map((x) => (x.id === existing.id ? { ...x, repeats: (x.repeats ?? 0) + 1 } : x)));
     return existing.id;
   }
   const id = nextId++;

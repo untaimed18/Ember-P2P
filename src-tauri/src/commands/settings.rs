@@ -1541,6 +1541,35 @@ async fn restore_previous_username_claim(state: &AppState, previous: &str) {
     }
 }
 
+/// Trim the Channel languages being saved, keep a second only beside a
+/// different first, and refuse a code that changed to one this build does not
+/// list. Returns whether either changed.
+///
+/// Refused only when it changes. A code this build does not list may be a
+/// later build's, kept as it was so a downgrade does not wipe the choice;
+/// it publishes as no language until a build that knows it runs again.
+fn settle_channel_languages(settings: &mut AppSettings, old_settings: &AppSettings) -> Result<bool, String> {
+    settings.channel_language = settings.channel_language.trim().to_string();
+    settings.channel_language_secondary = settings.channel_language_secondary.trim().to_string();
+    if settings.channel_language.is_empty() || settings.channel_language_secondary == settings.channel_language {
+        settings.channel_language_secondary.clear();
+    }
+    let primary_changed = settings.channel_language != old_settings.channel_language;
+    let secondary_changed =
+        settings.channel_language_secondary != old_settings.channel_language_secondary;
+    if (primary_changed && !settings.channel_language.is_empty() && settings.channel_language_code().is_none())
+        || (secondary_changed
+            && !settings.channel_language_secondary.is_empty()
+            && settings.channel_language_secondary_code().is_none())
+    {
+        return Err(coded(
+            "channels_language_invalid",
+            "That is not one of the languages a room can be marked with",
+        ));
+    }
+    Ok(primary_changed || secondary_changed)
+}
+
 #[tauri::command]
 pub async fn update_settings(
     app: tauri::AppHandle,
@@ -1693,25 +1722,7 @@ pub async fn update_settings(
     let username_changed = settings.channel_username != old_settings.channel_username
         && !settings.channel_username.is_empty();
 
-    // Refused only when it changes. A code this build does not list may be a
-    // later build's, kept as it was so a downgrade does not wipe the choice;
-    // it publishes as no language until a build that knows it runs again.
-    settings.channel_language = settings.channel_language.trim().to_string();
-    settings.channel_language_secondary = settings.channel_language_secondary.trim().to_string();
-    let primary_changed = settings.channel_language != old_settings.channel_language;
-    let secondary_changed =
-        settings.channel_language_secondary != old_settings.channel_language_secondary;
-    if (primary_changed && !settings.channel_language.is_empty() && settings.channel_language_code().is_none())
-        || (secondary_changed
-            && !settings.channel_language_secondary.is_empty()
-            && settings.channel_language_secondary_code().is_none())
-    {
-        return Err(coded(
-            "channels_language_invalid",
-            "That is not one of the languages a room can be marked with",
-        ));
-    }
-    let language_changed = primary_changed || secondary_changed;
+    let language_changed = settle_channel_languages(&mut settings, &old_settings)?;
 
     if settings.settings_revision != old_settings.settings_revision {
         return Err(coded(
@@ -2519,8 +2530,10 @@ pub const QUIT_REQUESTED_EVENT: &str = "ember:quit-requested";
 const PENDING_UNDO_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 
 #[tauri::command]
-pub fn set_pending_undo(pending: bool) {
+pub fn set_pending_undo(window: tauri::WebviewWindow, pending: bool) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     PENDING_UNDO.store(pending, std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 /// Exit Ember for a quit decided outside the window (the tray, "exit" as the
@@ -2564,6 +2577,19 @@ pub fn exit_app(app: &tauri::AppHandle) {
         tracing::warn!("The window did not finish its pending Undo actions in time; exiting");
         confirm_and_exit(&app);
     });
+}
+
+/// Whether an exit [`exit_app`] started is waiting on the window's pending
+/// Undo actions. Any window can emit [`QUIT_REQUESTED_EVENT`], so the main
+/// window asks this before committing them.
+#[tauri::command]
+pub fn quit_flush_pending(window: tauri::WebviewWindow) -> Result<bool, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
+    let pending = QUIT_FLUSH_STARTED.load(std::sync::atomic::Ordering::Acquire);
+    if !pending {
+        tracing::warn!("Ignoring a quit request that no exit in progress asked for");
+    }
+    Ok(pending)
 }
 
 /// The window's answer to [`QUIT_REQUESTED_EVENT`]: its pending Undo actions
@@ -4169,6 +4195,40 @@ mod tests {
         };
         soft_repair_settings(&mut settings);
         assert_eq!(settings.channel_username, "Ada1");
+    }
+
+    /// A second Channel language is saved only beside a different first, and
+    /// one this build does not list is refused only when it is newly chosen.
+    #[test]
+    fn a_second_channel_language_is_saved_only_beside_a_different_first() {
+        let langs = |first: &str, second: &str| AppSettings {
+            channel_language: first.to_string(),
+            channel_language_secondary: second.to_string(),
+            ..AppSettings::default()
+        };
+        let old = langs("", "");
+
+        let mut alone = langs(" ", "de");
+        assert_eq!(settle_channel_languages(&mut alone, &old), Ok(false));
+        assert_eq!(alone.channel_language_secondary, "");
+
+        let mut same = langs("de", " de ");
+        assert_eq!(settle_channel_languages(&mut same, &old), Ok(true));
+        assert_eq!((same.channel_language.as_str(), same.channel_language_secondary.as_str()), ("de", ""));
+
+        let mut pair = langs("de", "fr");
+        assert_eq!(settle_channel_languages(&mut pair, &old), Ok(true));
+        assert_eq!(pair.channel_language_secondary, "fr");
+        assert_eq!(pair.channel_languages().secondary, Some("fr"));
+
+        let err = settle_channel_languages(&mut langs("de", "xx"), &old).unwrap_err();
+        assert!(err.contains("channels_language_invalid"), "{err}");
+
+        let later_build = langs("de", "xx");
+        let mut kept = later_build.clone();
+        assert_eq!(settle_channel_languages(&mut kept, &later_build), Ok(false));
+        assert_eq!(kept.channel_language_secondary, "xx");
+        assert_eq!(kept.channel_languages().secondary, None, "published as no language");
     }
 
     /// An empty download folder used to skip the path-safety block instead of

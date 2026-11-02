@@ -485,18 +485,40 @@ fn retain_addressed_to(queued: Vec<QueuedPayload>, remote_noise_pub: &[u8; 32]) 
 
 /// When an unanswered message 1 goes again, measured from when it first went:
 /// one round trip is long past by the first, and the second covers a loss on
-/// a link that dropped the first resend too.
+/// a link that dropped the first resend too. Only the first is for every
+/// dial; the second only once the peer has dialled us during this one (see
+/// below), so a dead or made-up contact is sent message 1 twice, not three
+/// times.
 ///
-/// What this is for is a first datagram that could never arrive: a NAT only
-/// lets the peer's datagrams in once we have sent toward it, so when both ends
-/// dial at once (a friend meet, a punch) the first message 1 to reach a NAT
-/// that has not yet sent anything is dropped. The peer's own message 1 then
-/// reaches us while ours is pending, and if our key is the lower we keep our
-/// dial and refuse theirs (see `handle_ik_init`) — waiting on an answer to a
-/// message the peer never saw. Sent again once the peer has dialled us, it
-/// gets through, and the higher key answers it. A lost message 2 is answered
-/// the same way: the responder replays its cached reply to the same bytes.
+/// A lost message 1 or message 2 is recovered by the first: the responder
+/// answers the repeat with the reply it cached for the same bytes. The rest
+/// is for a first datagram that could never arrive: a NAT only lets the
+/// peer's datagrams in once we have sent toward it, so when both ends dial at
+/// once (a friend meet, a punch) the first message 1 to reach a NAT that has
+/// not yet sent anything is dropped. The peer's own message 1 then reaches us
+/// while ours is pending, and if our key is the lower we keep our dial and
+/// refuse theirs (see `handle_ik_init`) — waiting on an answer to a message
+/// the peer never saw. That refusal is when the peer's NAT is known to be
+/// open, so message 1 goes again right then, at most once per
+/// [`MSG1_CROSSED_RESEND_GAP`] and [`MSG1_CROSSED_RESENDS_MAX`] times a dial,
+/// whenever in the dial it comes; the schedule
+/// here only covers that resend being lost too.
 const MSG1_RESEND_AFTER: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+
+/// The least time between two resends of message 1 prompted by the peer's
+/// crossed dial. A refusal costs no crypto, so anyone able to put our peer's
+/// address on a packet could otherwise draw a message 1 per packet.
+const MSG1_CROSSED_RESEND_GAP: Duration = Duration::from_secs(1);
+
+/// The most resends of message 1 the peer's crossed dials can draw in one
+/// dial. A 1.7.6 peer sends its own message 1 at most twice, so anything past
+/// that is someone else using our dial as a reflector.
+const MSG1_CROSSED_RESENDS_MAX: u8 = 2;
+
+/// The smallest body an `IK_INIT` can have: the ephemeral key, the sealed
+/// static key and the tag of an empty payload. Anything shorter cannot be the
+/// peer's dial, and must not draw our larger message 1 back.
+const IK_MSG1_MIN_BODY: usize = 32 + (32 + 16) + 16;
 
 /// In-progress handshake awaiting a response.
 enum PendingHandshake {
@@ -511,6 +533,11 @@ enum PendingHandshake {
         msg1: Vec<u8>,
         /// How many of [`MSG1_RESEND_AFTER`] have gone.
         resends: u8,
+        /// When message 1 last went again because the peer's crossed dial
+        /// was refused, if it has.
+        crossed_resend_at: Option<Instant>,
+        /// How many times it has, up to [`MSG1_CROSSED_RESENDS_MAX`].
+        crossed_resends: u8,
         queued: Vec<QueuedPayload>,
         created: Instant,
         /// Static key this handshake was started for. `pending` is keyed by
@@ -959,15 +986,26 @@ struct RecentHandshake {
     /// different address would turn us into a free reflector for a packet an
     /// attacker captured.
     from: SocketAddr,
-    /// The answer we produced, if the handshake got that far.
-    response: Option<Vec<u8>>,
+    /// The answer we produced, if the handshake got that far: message 2, and
+    /// for an IK initiation that carried a payload, the return-routability
+    /// probe after it. Without the probe a replayed message 2 completes the
+    /// peer's handshake but leaves it nothing to answer, and the payload
+    /// waits on whatever frame it happens to send next.
+    response: Vec<Vec<u8>>,
+    /// For an IK initiation we refused on the crossed-dial tie-break, the key
+    /// our own dial was aimed at. A repeat of it is dropped only once that
+    /// dial has produced a session with that key: the peer's handshake was
+    /// settled by ours and nothing waits on an answer to it. While our dial is
+    /// still pending the tie-break refuses the repeat anyway, and if the dial
+    /// went nowhere the repeat is answered as though never seen.
+    refused_for: Option<[u8; 32]>,
 }
 
 /// Whether a handshake initiation is new, and if not, what we answered last
 /// time.
 enum HandshakeReplay {
     Fresh { digest: [u8; 32] },
-    Seen { response: Option<Vec<u8>> },
+    Seen { response: Vec<Vec<u8>> },
 }
 
 /// Wipe the long-lived secrets rather than leaving them in freed heap.
@@ -1148,26 +1186,50 @@ impl EmberTransport {
         // IK_INIT tagged as XX_MSG1, seeding the entry with an XX msg2. The
         // genuine initiator would then be answered with the wrong message
         // type and stall for the whole replay window.
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&[pkt_type]);
-        hasher.update(data);
-        let digest = *hasher.finalize().as_bytes();
+        let digest = handshake_digest(pkt_type, data);
 
         let now = Instant::now();
         if let Some(entry) = self.recent_handshakes.get(&digest) {
             if now.duration_since(entry.seen_at) < HANDSHAKE_REPLAY_TTL {
-                return HandshakeReplay::Seen {
-                    // Only the original sender gets the answer back. Anyone
-                    // else replaying this packet gets silence, exactly as
-                    // before this cache learned to re-send.
-                    response: if entry.from == from {
-                        entry.response.clone()
-                    } else {
-                        None
-                    },
-                };
+                match entry.refused_for {
+                    None => {
+                        return HandshakeReplay::Seen {
+                            // Only the original sender gets the answer back.
+                            // Anyone else replaying this packet gets silence,
+                            // exactly as before this cache learned to re-send.
+                            response: if entry.from == from {
+                                entry.response.clone()
+                            } else {
+                                Vec::new()
+                            },
+                        };
+                    }
+                    Some(target)
+                        if entry.from == from && self.sessions.contains_key(&(from, target)) =>
+                    {
+                        return HandshakeReplay::Seen {
+                            response: Vec::new(),
+                        };
+                    }
+                    Some(_) => {
+                        self.recent_handshakes.remove(&digest);
+                    }
+                }
             }
         }
+        self.record_handshake(digest, from, now, None);
+        HandshakeReplay::Fresh { digest }
+    }
+
+    /// Enter `digest` in the replay cache, evicting the oldest entries at the
+    /// cap.
+    fn record_handshake(
+        &mut self,
+        digest: [u8; 32],
+        from: SocketAddr,
+        now: Instant,
+        refused_for: Option<[u8; 32]>,
+    ) {
         while self.recent_handshakes.len() >= MAX_REPLAY_DIGESTS {
             // Rows that no longer match a live entry are skipped, not counted
             // as an eviction — each is popped at most once, so the loop stays
@@ -1189,18 +1251,35 @@ impl EmberTransport {
             RecentHandshake {
                 seen_at: now,
                 from,
-                response: None,
+                response: Vec::new(),
+                refused_for,
             },
         );
         self.recent_handshake_order.push_back((digest, now));
-        HandshakeReplay::Fresh { digest }
+    }
+
+    /// Note an IK initiation refused on the crossed-dial tie-break while our
+    /// own dial to `target` is pending, so the peer's resends of it are not
+    /// run as a fresh handshake once ours has completed. See
+    /// [`RecentHandshake::refused_for`].
+    fn note_refused_ik_init(&mut self, from: SocketAddr, data: &[u8], target: [u8; 32]) {
+        let digest = handshake_digest(PKT_IK_INIT, data);
+        let now = Instant::now();
+        let live = self
+            .recent_handshakes
+            .get(&digest)
+            .is_some_and(|entry| now.duration_since(entry.seen_at) < HANDSHAKE_REPLAY_TTL);
+        if !live {
+            self.recent_handshakes.remove(&digest);
+            self.record_handshake(digest, from, now, Some(target));
+        }
     }
 
     /// Remember the answer we produced, so a retransmission of the same
     /// initiation gets the same answer instead of silence.
-    fn remember_handshake_response(&mut self, digest: [u8; 32], response: Vec<u8>) {
+    fn remember_handshake_response(&mut self, digest: [u8; 32], response: Vec<Vec<u8>>) {
         if let Some(entry) = self.recent_handshakes.get_mut(&digest) {
-            entry.response = Some(response);
+            entry.response = response;
         }
     }
 
@@ -1680,14 +1759,29 @@ impl EmberTransport {
     pub fn due_msg1_resends(&mut self, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
         let mut due = Vec::new();
         for (addr, pending) in self.pending.iter_mut() {
-            let (msg1, resends, created) = match pending {
-                PendingHandshake::IkInitiator { msg1, resends, created, .. }
-                | PendingHandshake::XxInitiatorMsg1 { msg1, resends, created, .. } => (msg1, resends, created),
+            let (msg1, resends, created, crossed_resend_at) = match pending {
+                PendingHandshake::IkInitiator {
+                    msg1,
+                    resends,
+                    created,
+                    crossed_resend_at,
+                    ..
+                } => (msg1, resends, created, *crossed_resend_at),
+                PendingHandshake::XxInitiatorMsg1 { msg1, resends, created, .. } => (msg1, resends, created, None),
                 PendingHandshake::XxResponderMsg2 { .. } => continue,
             };
-            let Some(after) = MSG1_RESEND_AFTER.get(usize::from(*resends)) else {
+            let schedule = if crossed_resend_at.is_some() {
+                &MSG1_RESEND_AFTER[..]
+            } else {
+                &MSG1_RESEND_AFTER[..1]
+            };
+            let Some(after) = schedule.get(usize::from(*resends)) else {
                 continue;
             };
+            // Just sent in answer to the peer's dial; this one waits its turn.
+            if crossed_resend_at.is_some_and(|at| now.saturating_duration_since(at) < MSG1_CROSSED_RESEND_GAP) {
+                continue;
+            }
             if now.saturating_duration_since(*created) >= *after {
                 *resends += 1;
                 due.push((*addr, msg1.clone()));
@@ -2019,6 +2113,8 @@ impl EmberTransport {
                         first_message: first_message.to_vec(),
                         msg1: buf.clone(),
                         resends: 0,
+                        crossed_resend_at: None,
+                        crossed_resends: 0,
                         queued,
                         created: Instant::now(),
                         remote_noise_pub: *remote_pub,
@@ -2051,16 +2147,48 @@ impl EmberTransport {
         // lower key stays initiator, and the higher one answers as responder
         // and hands what it had queued to the session that produces. Each side
         // decides from its own key and the one it dialled, so they agree.
-        let initiator_in_flight = match self.pending.get(&from) {
-            Some(PendingHandshake::IkInitiator { remote_noise_pub, .. }) => {
-                *self.local_noise_public_key() < *remote_noise_pub
+        //
+        // The peer dialling us is also the moment its NAT is known to let our
+        // message 1 in, which it may not have when ours first went (see
+        // `MSG1_RESEND_AFTER`), so ours goes again now.
+        let local_noise_pub = self.local_noise_pub;
+        match self.pending.get_mut(&from) {
+            Some(PendingHandshake::IkInitiator {
+                remote_noise_pub,
+                msg1,
+                crossed_resend_at,
+                crossed_resends,
+                ..
+            }) if local_noise_pub < *remote_noise_pub => {
+                if data.len() < IK_MSG1_MIN_BODY {
+                    debug!("Ignoring IK init from {from}: too short to be a message 1");
+                    return IncomingResult::Rejected;
+                }
+                let target = *remote_noise_pub;
+                let now = Instant::now();
+                let resend = (*crossed_resends < MSG1_CROSSED_RESENDS_MAX
+                    && crossed_resend_at
+                        .is_none_or(|at| now.saturating_duration_since(at) >= MSG1_CROSSED_RESEND_GAP))
+                .then(|| msg1.clone());
+                if resend.is_some() {
+                    *crossed_resend_at = Some(now);
+                    *crossed_resends += 1;
+                }
+                self.note_refused_ik_init(from, data, target);
+                debug!("Ignoring IK init from {from}: our crossed dial keeps the tie");
+                return match resend {
+                    Some(packet) => IncomingResult::HandshakeResponse {
+                        to: from,
+                        packets: vec![packet],
+                    },
+                    None => IncomingResult::Rejected,
+                };
             }
-            Some(PendingHandshake::XxInitiatorMsg1 { .. }) => true,
-            _ => false,
-        };
-        if initiator_in_flight {
-            debug!("Ignoring IK init from {from}: an initiator handshake is in flight");
-            return IncomingResult::Rejected;
+            Some(PendingHandshake::XxInitiatorMsg1 { .. }) => {
+                debug!("Ignoring IK init from {from}: an initiator handshake is in flight");
+                return IncomingResult::Rejected;
+            }
+            _ => {}
         }
         // Do no crypto, re-emit no embedded payload, and replace no live
         // session for a repeat. Answering with the response we already
@@ -2069,18 +2197,14 @@ impl EmberTransport {
         let handshake_digest = match self.check_handshake_replay(PKT_IK_INIT, from, data) {
             HandshakeReplay::Fresh { digest } => digest,
             HandshakeReplay::Seen { response } => {
-                return match response {
-                    Some(packet) => {
-                        debug!("Re-sending cached IK response to {from}");
-                        IncomingResult::HandshakeResponse {
-                            to: from,
-                            packets: vec![packet],
-                        }
-                    }
-                    None => {
-                        debug!("Dropping replayed IK_INIT from {from}");
-                        IncomingResult::Rejected
-                    }
+                if response.is_empty() {
+                    debug!("Dropping replayed IK_INIT from {from}");
+                    return IncomingResult::Rejected;
+                }
+                debug!("Re-sending cached IK response to {from}");
+                return IncomingResult::HandshakeResponse {
+                    to: from,
+                    packets: response,
                 };
             }
         };
@@ -2197,7 +2321,7 @@ impl EmberTransport {
             );
         trace!("IK handshake completed (responder) with {from}");
 
-        self.remember_handshake_response(handshake_digest, resp_buf.clone());
+        let mut cached_answer = vec![resp_buf.clone()];
         let mut packets_to_send = vec![resp_buf];
         if crossed_initiator == Some(true) {
             if let Some(PendingHandshake::IkInitiator { first_message, queued, .. }) =
@@ -2253,6 +2377,7 @@ impl EmberTransport {
             match session.seal(&probe) {
                 Some(packet) => {
                     session.probe_nonce = Some(probe_nonce);
+                    cached_answer.push(packet.clone());
                     packets_to_send.push(packet);
                 }
                 // The payload stays deferred and is not lost: any
@@ -2287,15 +2412,18 @@ impl EmberTransport {
             // clears the same entry for the same reason.
             self.deferred_ik.remove(&(from, remote_noise_pub));
             // And forget the digest, or the replay cache would answer the
-            // peer's retransmit with the IK_RESP we just decided not to send —
-            // handing it the working half of a session we do not have, which is
-            // the exact state this branch exists to avoid. Forgetting makes a
-            // retransmit re-run the handshake, so the peer gets in as soon as a
-            // slot at this address frees up.
+            // peer's retransmit with silence for the whole replay window. The
+            // answer is cached only below, so it can never hand the peer the
+            // IK_RESP we just decided not to send — the working half of a
+            // session we do not have, which is the exact state this branch
+            // exists to avoid. Forgetting makes a retransmit re-run the
+            // handshake, so the peer gets in as soon as a slot at this address
+            // frees up.
             self.forget_handshake(&handshake_digest);
             debug!("IK responder: per-address session cap refused {from}; not answering");
             return IncomingResult::Rejected;
         }
+        self.remember_handshake_response(handshake_digest, cached_answer);
         if !keep_pending {
             self.pending.remove(&from);
         }
@@ -2717,26 +2845,22 @@ impl EmberTransport {
         let handshake_digest = match self.check_handshake_replay(PKT_XX_MSG1, from, data) {
             HandshakeReplay::Fresh { digest } => digest,
             HandshakeReplay::Seen { response } => {
-                return match response {
-                    Some(packet) => {
-                        debug!("Re-sending cached XX msg2 to {from}");
-                        // The cached answer is another 99 bytes to the same
-                        // unproven address, so it is charged like a fresh one.
-                        // Without this, one msg1 replayed inside the cache TTL
-                        // re-emitted msg2 without limit — the cheapest form of
-                        // the flood, since the attacker does no crypto at all.
-                        if !cookie_ok {
-                            self.spend_xx_msg2_budget();
-                        }
-                        IncomingResult::HandshakeResponse {
-                            to: from,
-                            packets: vec![packet],
-                        }
-                    }
-                    None => {
-                        debug!("Dropping replayed XX msg1 from {from}");
-                        IncomingResult::Rejected
-                    }
+                if response.is_empty() {
+                    debug!("Dropping replayed XX msg1 from {from}");
+                    return IncomingResult::Rejected;
+                }
+                debug!("Re-sending cached XX msg2 to {from}");
+                // The cached answer is another 99 bytes to the same unproven
+                // address, so it is charged like a fresh one. Without this,
+                // one msg1 replayed inside the cache TTL re-emitted msg2
+                // without limit — the cheapest form of the flood, since the
+                // attacker does no crypto at all.
+                if !cookie_ok {
+                    self.spend_xx_msg2_budget();
+                }
+                return IncomingResult::HandshakeResponse {
+                    to: from,
+                    packets: response,
                 };
             }
         };
@@ -2819,7 +2943,7 @@ impl EmberTransport {
         );
         trace!("XX handshake msg2 sent to {from}");
 
-        self.remember_handshake_response(handshake_digest, resp_buf.clone());
+        self.remember_handshake_response(handshake_digest, vec![resp_buf.clone()]);
         if !cookie_ok {
             self.spend_xx_msg2_budget();
         }
@@ -3247,6 +3371,15 @@ fn fresh_cookie_secret() -> [u8; 32] {
     secret
 }
 
+/// The replay-cache key for a handshake initiation's body. See
+/// [`EmberTransport::check_handshake_replay`] for why the type is in it.
+fn handshake_digest(pkt_type: u8, data: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&[pkt_type]);
+    hasher.update(data);
+    *hasher.finalize().as_bytes()
+}
+
 /// The retry cookie for `addr` under `secret`.
 ///
 /// Binding the tag to the full source address — not just the IP — is what
@@ -3493,10 +3626,12 @@ mod tests {
             other => panic!("expected Queued, got {}", variant_name(&other)),
         }
 
-        assert!(
-            matches!(low.process_incoming(&high_init, high_addr), IncomingResult::Rejected),
-            "the lower key keeps its own dial"
-        );
+        match low.process_incoming(&high_init, high_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => {
+                assert_eq!(packets, vec![low_init.clone()], "the lower key keeps its own dial");
+            }
+            _ => panic!("the lower key refuses the crossed dial and sends its own again"),
+        }
         let answer = match high.process_incoming(&low_init, low_addr) {
             IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
             _ => panic!("the higher key answers"),
@@ -3520,12 +3655,10 @@ mod tests {
         assert_eq!(released.app_payloads, vec![b"from low".to_vec()]);
     }
 
-    /// The friend meet through two NATs: the first message 1 is dropped by a NAT
-    /// that has sent nothing yet, and the peer's own dial then reaches a side
-    /// that keeps its dead one and refuses it. Resent once the peer has dialled,
-    /// the first gets through, and the higher key answers it.
-    #[test]
-    fn a_crossed_dial_whose_first_message_was_lost_completes_on_the_resend() {
+    /// Two transports whose keys order them, each with an IK dial to the other
+    /// started, lower key first: `(low, high, low_init, high_init, low_addr,
+    /// high_addr)`.
+    fn crossed_ik_dials() -> (EmberTransport, EmberTransport, Vec<u8>, Vec<u8>, SocketAddr, SocketAddr) {
         let (a_priv, a_pub) = make_keypair();
         let (b_priv, b_pub) = make_keypair();
         let ((low_priv, low_pub), (high_priv, high_pub)) = if a_pub < b_pub {
@@ -3537,8 +3670,7 @@ mod tests {
         let mut high = EmberTransport::new(high_priv, high_pub);
         let low_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
         let high_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
-
-        let lost = match low.prepare_outgoing(high_addr, Some(&high_pub), b"from low") {
+        let low_init = match low.prepare_outgoing(high_addr, Some(&high_pub), b"from low") {
             OutgoingResult::HandshakeStarted { packet } => packet,
             other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
         };
@@ -3546,17 +3678,31 @@ mod tests {
             OutgoingResult::HandshakeStarted { packet } => packet,
             other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
         };
-        // After the dial, so a whole resend delay has passed since it began.
-        let started = Instant::now();
-        assert!(
-            matches!(low.process_incoming(&high_init, high_addr), IncomingResult::Rejected),
-            "the lower key keeps the dial whose first message never arrived"
-        );
-        assert!(low.due_msg1_resends(started).is_empty(), "nothing is resent at once");
+        (low, high, low_init, high_init, low_addr, high_addr)
+    }
 
-        let resent = low.due_msg1_resends(started + MSG1_RESEND_AFTER[0]);
-        assert_eq!(resent, vec![(high_addr, lost)], "the same message 1, to the same peer");
-        let answer = match high.process_incoming(&resent[0].1, low_addr) {
+    /// The friend meet through two NATs: the first message 1 is dropped by a NAT
+    /// that has sent nothing yet, and the peer's own dial then reaches a side
+    /// that keeps its dead one and refuses it. Sent again the moment the peer
+    /// has dialled, however late in our dial that is, the first gets through,
+    /// and the higher key answers it.
+    #[test]
+    fn a_crossed_dial_whose_first_message_was_lost_completes_on_the_resend() {
+        let (mut low, mut high, lost, high_init, low_addr, high_addr) = crossed_ik_dials();
+        // The timed resends all went while the peer's NAT was still closed.
+        let started = Instant::now();
+        assert_eq!(low.due_msg1_resends(started + MSG1_RESEND_AFTER[0]).len(), 1);
+        assert!(low.due_msg1_resends(started + Duration::from_secs(20)).is_empty());
+
+        let resent = match low.process_incoming(&high_init, high_addr) {
+            IncomingResult::HandshakeResponse { to, packets } => {
+                assert_eq!(to, high_addr);
+                packets
+            }
+            _ => panic!("the lower key refuses the crossed dial and sends its own again"),
+        };
+        assert_eq!(resent, vec![lost], "the same message 1, to the same peer");
+        let answer = match high.process_incoming(&resent[0], low_addr) {
             IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
             _ => panic!("the higher key answers the resent message 1"),
         };
@@ -3573,6 +3719,69 @@ mod tests {
         assert_eq!(released.app_payloads, vec![b"from low".to_vec()]);
     }
 
+    /// A crossed dial refused again and again draws our message 1 at most once
+    /// per `MSG1_CROSSED_RESEND_GAP`: the refusal does no crypto, so anyone
+    /// able to forge the peer's address could otherwise draw one per packet.
+    #[test]
+    fn a_crossed_dial_resend_is_rate_limited() {
+        let (mut low, _high, low_init, high_init, _low_addr, high_addr) = crossed_ik_dials();
+        assert!(matches!(
+            low.process_incoming(&high_init, high_addr),
+            IncomingResult::HandshakeResponse { .. }
+        ));
+        assert!(
+            matches!(low.process_incoming(&high_init, high_addr), IncomingResult::Rejected),
+            "a second refusal inside the gap sends nothing"
+        );
+        let Some(PendingHandshake::IkInitiator { crossed_resend_at, .. }) = low.pending.get_mut(&high_addr) else {
+            panic!("the lower key's dial is still pending");
+        };
+        *crossed_resend_at = Some(Instant::now() - MSG1_CROSSED_RESEND_GAP);
+        match low.process_incoming(&high_init, high_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => assert_eq!(packets, vec![low_init]),
+            _ => panic!("once the gap has passed it goes again"),
+        }
+    }
+
+    /// Only a packet that could be the peer's message 1 draws ours back, and
+    /// only `MSG1_CROSSED_RESENDS_MAX` times a dial: a forged header-only
+    /// `IK_INIT` from the peer's address would otherwise be answered with a
+    /// message 1 many times its size, once a second for the dial's life.
+    #[test]
+    fn a_crossed_dial_resend_needs_a_whole_message_1_and_is_capped_per_dial() {
+        let (mut low, _high, low_init, high_init, _low_addr, high_addr) = crossed_ik_dials();
+        let header_only = vec![EMBER_MAGIC[0], EMBER_MAGIC[1], PKT_IK_INIT];
+        let mut short = high_init.clone();
+        short.truncate(HEADER_LEN + IK_MSG1_MIN_BODY - 1);
+        for forged in [&header_only, &short] {
+            assert!(
+                matches!(low.process_incoming(forged, high_addr), IncomingResult::Rejected),
+                "a {}-byte IK_INIT draws nothing",
+                forged.len()
+            );
+        }
+        let rewind = |low: &mut EmberTransport| {
+            let Some(PendingHandshake::IkInitiator { crossed_resend_at, .. }) = low.pending.get_mut(&high_addr) else {
+                panic!("the lower key's dial is still pending");
+            };
+            *crossed_resend_at = crossed_resend_at.map(|at| at - MSG1_CROSSED_RESEND_GAP);
+        };
+        for _ in 0..MSG1_CROSSED_RESENDS_MAX {
+            match low.process_incoming(&high_init, high_addr) {
+                IncomingResult::HandshakeResponse { packets, .. } => assert_eq!(packets, vec![low_init.clone()]),
+                _ => panic!("a whole message 1 from the peer draws ours"),
+            }
+            rewind(&mut low);
+        }
+        assert!(
+            matches!(low.process_incoming(&high_init, high_addr), IncomingResult::Rejected),
+            "past the cap nothing more goes, however long the gap"
+        );
+    }
+
+    /// A dial nobody has answered or dialled back is sent once more, not
+    /// twice: a dead or made-up contact costs two message 1s. Only a dial the
+    /// peer has crossed keeps the second resend, for a lost crossed resend.
     #[test]
     fn message_1_is_resent_on_schedule_and_then_left_alone() {
         let (a_priv, a_pub) = make_keypair();
@@ -3600,12 +3809,115 @@ mod tests {
         let first = started + MSG1_RESEND_AFTER[0];
         assert_eq!(sorted(alice.due_msg1_resends(first)), both, "both patterns go again");
         assert!(alice.due_msg1_resends(first).is_empty(), "each resend is handed out once");
-        let second = started + MSG1_RESEND_AFTER[1];
-        assert_eq!(sorted(alice.due_msg1_resends(second)), both);
         assert!(
-            alice.due_msg1_resends(second + Duration::from_secs(20)).is_empty(),
-            "and no more after the schedule runs out"
+            alice
+                .due_msg1_resends(started + MSG1_RESEND_AFTER[1] + Duration::from_secs(20))
+                .is_empty(),
+            "and no more for a dial the peer has not crossed"
         );
+
+        let (mut low, _high, low_init, high_init, _low_addr, high_addr) = crossed_ik_dials();
+        assert!(matches!(
+            low.process_incoming(&high_init, high_addr),
+            IncomingResult::HandshakeResponse { .. }
+        ));
+        // After the crossed resend, so each delay is measured from no earlier
+        // than it went.
+        let refused = Instant::now();
+        let after_gap = refused + MSG1_CROSSED_RESEND_GAP;
+        assert_eq!(low.due_msg1_resends(after_gap), vec![(high_addr, low_init.clone())]);
+        let second = refused + MSG1_RESEND_AFTER[1];
+        assert_eq!(
+            low.due_msg1_resends(second),
+            vec![(high_addr, low_init)],
+            "a crossed dial is resent on the whole schedule"
+        );
+        assert!(low.due_msg1_resends(second + Duration::from_secs(20)).is_empty());
+    }
+
+    /// The higher key's message 1, refused while our crossed dial was pending,
+    /// can be resent after our dial has completed. It is a handshake the
+    /// peer already gave up for ours, and run as a fresh one it spent a token,
+    /// staged a session nothing would use and deferred a payload nothing would
+    /// release.
+    #[test]
+    fn a_refused_crossed_init_resent_after_our_dial_completes_is_dropped() {
+        let (mut low, mut high, low_init, high_init, low_addr, high_addr) = crossed_ik_dials();
+        assert!(matches!(
+            low.process_incoming(&high_init, high_addr),
+            IncomingResult::HandshakeResponse { .. }
+        ));
+        let answer = match high.process_incoming(&low_init, low_addr) {
+            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            _ => panic!("the higher key answers"),
+        };
+        let _ = low.process_incoming(&answer[0], high_addr);
+        assert!(!low.pending.contains_key(&high_addr), "the lower key's dial completed");
+
+        let tokens = low.ik_tokens;
+        assert!(
+            matches!(low.process_incoming(&high_init, high_addr), IncomingResult::Rejected),
+            "the late resend is not run as a handshake"
+        );
+        assert_eq!(low.ik_tokens, tokens, "and costs no handshake token");
+        assert!(low.staged_sessions.is_empty());
+        assert!(low.deferred_ik.is_empty());
+    }
+
+    /// The refusal is recorded only against the dial that settled it. If our
+    /// dial went nowhere, the peer's resend is a handshake like any other.
+    #[test]
+    fn a_refused_crossed_init_is_answered_once_our_dial_is_abandoned() {
+        let (mut low, _high, _low_init, high_init, _low_addr, high_addr) = crossed_ik_dials();
+        assert!(matches!(
+            low.process_incoming(&high_init, high_addr),
+            IncomingResult::HandshakeResponse { .. }
+        ));
+        let Some(PendingHandshake::IkInitiator { remote_noise_pub, .. }) = low.pending.get(&high_addr) else {
+            panic!("the lower key's dial is still pending");
+        };
+        let high_pub = *remote_noise_pub;
+        assert!(low.abandon_stalled_handshake(&high_addr, &high_pub, Instant::now()));
+        assert!(matches!(
+            low.process_incoming(&high_init, high_addr),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+    }
+
+    /// A message 1 whose answer was lost entirely gets the whole answer again,
+    /// probe included. Message 2 alone completed the peer's handshake but gave
+    /// it nothing to answer, and the request it carried in message 1 waited on
+    /// whatever frame it happened to send next.
+    #[test]
+    fn a_resent_ik_init_gets_the_probe_again_and_its_payload_is_released() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"store this") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let started = Instant::now();
+        let lost = match bob.process_incoming(&init, alice_addr) {
+            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            _ => panic!("expected HandshakeComplete"),
+        };
+        assert_eq!(lost.len(), 2, "IK_RESP and the probe, both lost");
+
+        let resent = alice.due_msg1_resends(started + MSG1_RESEND_AFTER[0]);
+        assert_eq!(resent, vec![(bob_addr, init)]);
+        let replayed = bob.dispatch_incoming(&resent[0].1, alice_addr);
+        assert_eq!(replayed.responses, lost, "the same answer, probe and all");
+
+        let _ = alice.dispatch_incoming(&replayed.responses[0], bob_addr);
+        let probe_answer = alice.dispatch_incoming(&replayed.responses[1], bob_addr);
+        assert_eq!(probe_answer.responses.len(), 1, "the replayed probe is answered");
+        let released = bob.dispatch_incoming(&probe_answer.responses[0], alice_addr);
+        assert_eq!(released.app_payloads, vec![b"store this".to_vec()]);
     }
 
     #[test]
@@ -3831,8 +4143,7 @@ mod tests {
         match bob.process_incoming(&init, alice_addr) {
             IncomingResult::HandshakeResponse { packets, .. } => {
                 assert_eq!(
-                    packets,
-                    original_response[..1].to_vec(),
+                    packets, original_response,
                     "the repeat must get exactly the handshake answer we already sent"
                 );
             }

@@ -136,21 +136,37 @@ pub struct StreamProgress {
     /// can be one the recipient only claims, and a repeated request must not
     /// turn us into a source of traffic aimed wherever it likes.
     pub punched: AtomicBool,
+    /// How far completed serves have counted against the recipient.
+    pub counted: AtomicU64,
+}
+
+impl StreamProgress {
+    /// Of a serve that sent the file from `from` to `to`, the bytes no earlier
+    /// serve of the transfer counted: one served to the end again after a drop
+    /// re-sends what the first one counted.
+    pub fn count_served(&self, from: u64, to: u64) -> u64 {
+        use std::sync::atomic::Ordering;
+        let before = self.counted.fetch_max(to, Ordering::Relaxed);
+        to.saturating_sub(from.max(before))
+    }
 }
 
 pub type StreamGrants = Arc<parking_lot::Mutex<HashMap<[u8; 16], StreamGrant>>>;
 
 /// What to serve for `xfer_id` to the member whose key the QUIC handshake
-/// proved: `(path, size, root, capability)`, or nothing when the transfer was
-/// offered to someone else or has ended.
+/// proved: `(path, size, root, capability)` and the grant's progress, or
+/// nothing when the transfer was offered to someone else or has ended.
 pub fn stream_grant_for(
     grants: &StreamGrants,
     xfer_id: &[u8; 16],
     peer: &[u8; 32],
-) -> Option<(PathBuf, u64, [u8; 32], [u8; 32])> {
+) -> Option<((PathBuf, u64, [u8; 32], [u8; 32]), Arc<StreamProgress>)> {
     let map = grants.lock();
     let grant = map.get(xfer_id).filter(|g| g.peer == *peer)?;
-    Some((grant.path.clone(), grant.size, grant.root, grant.capability))
+    Some((
+        (grant.path.clone(), grant.size, grant.root, grant.capability),
+        grant.progress.clone(),
+    ))
 }
 
 /// Record how far a served stream has got. False once the grant is gone,
@@ -514,6 +530,22 @@ impl SendState {
         self.sent_blocks
             .saturating_mul(XFER_BLOCK_SIZE as u64)
             .max(self.streamed)
+            .min(self.size)
+    }
+
+    /// What went as blocks, to count against the recipient once it has the
+    /// file, with `stream_position` the furthest a served stream has got.
+    ///
+    /// A stream that reached the end was counted where it was served, from
+    /// where it started. Blocks only follow a stream that fell back, from what
+    /// it had verified, so after one that reached the end they re-sent bytes
+    /// it already counted.
+    pub fn block_bytes_to_count(&self, stream_position: u64) -> u64 {
+        if self.streamed.max(stream_position) >= self.size {
+            return 0;
+        }
+        self.sent_blocks
+            .saturating_mul(XFER_BLOCK_SIZE as u64)
             .min(self.size)
     }
 
@@ -1386,11 +1418,25 @@ mod tests {
     fn a_stream_grant_is_served_only_to_its_member() {
         let grants = grant_table([1u8; 32]);
         assert_eq!(
-            stream_grant_for(&grants, &[9u8; 16], &[1u8; 32]),
+            stream_grant_for(&grants, &[9u8; 16], &[1u8; 32]).map(|(grant, _)| grant),
             Some((PathBuf::from("offered.bin"), 10, [4u8; 32], [5u8; 32]))
         );
         assert!(stream_grant_for(&grants, &[9u8; 16], &[2u8; 32]).is_none());
         assert!(stream_grant_for(&grants, &[8u8; 16], &[1u8; 32]).is_none());
+    }
+
+    /// A transfer streamed to the end twice, after a drop or a second dial,
+    /// counts its bytes against the recipient once.
+    #[test]
+    fn a_stream_served_to_the_end_again_counts_only_new_bytes() {
+        let progress = StreamProgress::default();
+        assert_eq!(progress.count_served(0, 100), 100);
+        assert_eq!(progress.count_served(0, 100), 0, "the whole file again");
+        assert_eq!(progress.count_served(40, 100), 0, "resumed inside what was counted");
+
+        let progress = StreamProgress::default();
+        assert_eq!(progress.count_served(60, 100), 40, "resumed past a stream that failed");
+        assert_eq!(progress.count_served(0, 100), 0);
     }
 
     #[test]
@@ -1451,6 +1497,26 @@ mod tests {
         reporter.at = Instant::now().checked_sub(Duration::from_millis(1_100));
         assert_eq!(reporter.due(0, 30, false), None, "nothing moved");
         assert_eq!(reporter.due(1, 31, false), Some(1), "a whole step is reported at once");
+    }
+
+    /// Blocks count against the recipient unless a stream reached the end,
+    /// which was counted where it was served and covers what the blocks
+    /// re-sent after it fell back; blocks re-sent on their own stay capped at
+    /// the file.
+    #[test]
+    fn blocks_after_a_stream_that_reached_the_end_are_not_counted_again() {
+        let (mut send, _dir, _) = temp_send(4);
+        let size = send.size;
+        send.sent_blocks = 3;
+        assert_eq!(send.block_bytes_to_count(0), XFER_BLOCK_SIZE as u64 * 3);
+        send.sent_blocks = 9;
+        assert_eq!(send.block_bytes_to_count(0), size, "re-sent blocks stay within the file");
+
+        send.note_streamed(size / 2);
+        assert_eq!(send.block_bytes_to_count(0), size, "a stream that fell back counted nothing");
+        assert_eq!(send.block_bytes_to_count(size), 0, "read from the grant at the end");
+        send.note_streamed(size);
+        assert_eq!(send.block_bytes_to_count(0), 0);
     }
 
     /// A stream that stopped moving is not kept alive by being looked at.

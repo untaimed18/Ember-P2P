@@ -21,9 +21,9 @@
 
   --text-primary: #1a1c24;
   --text-secondary: #4a5068;
-  /* At least 4:1 on every surface up to `--bg-hover`, as in the dark theme,
-     while staying a clear step below `--text-secondary`. */
-  --text-muted: #687089;
+  /* At least 4.5:1 (WCAG AA for small text) on every surface and on a
+     selected row, while staying a clear step below `--text-secondary`. */
+  --text-muted: #5b6278;
   --text-accent: #245f9a;
 
   --accent: #2a6cb0;
@@ -40,10 +40,10 @@
   --on-success: #ffffff;
   --on-warning: #ffffff;
   --on-danger: #ffffff;
-  /* Status colours are text as often as fills, so each holds 4:1 on every
-     surface up to `--bg-hover`. */
-  --success: #1f8048;
-  --warning: #b45309;
+  /* Status colours are text as often as fills, so each holds 4.5:1 on every
+     surface and on a selected row. */
+  --success: #1b713f;
+  --warning: #9f4908;
   --danger: #c4453c;
   --danger-hover: #b03c34;
   --badge-success-text: color-mix(in srgb, var(--success) 85%, #000);
@@ -62,12 +62,12 @@
      directly since they already map to those meanings).
      Ember is rose rather than the obvious ember-orange: the friends-only
      badge in the same row is --warning orange, and two warm pills side by
-     side stop reading as separate states. Those also used as text hold 4:1
-     on every surface up to `--bg-hover`. */
-  --kad-color: #1f78b4;
+     side stop reading as separate states. Those also used as text hold 4.5:1
+     on every surface and on a selected row. */
+  --kad-color: #1b679b;
   --ed2k-color: #9b59b6;
   --ember-color: #c2185b;
-  --aich-color: #11804a;
+  --aich-color: #0f7142;
   /* File-type tiles (FileTypeIcon), one hue per Library type category. */
   --type-audio: #7c4ddb;
   --type-video: #d9486f;
@@ -77,9 +77,9 @@
   --type-program: #3d7a32;
   --type-disc: #5f6e84;
   --type-collection: #9a5b2f;
-  --priority-verylow: #737373;
-  --priority-low: #33739c;
-  --priority-auto: #4f7f2a;
+  --priority-verylow: #626262;
+  --priority-low: #2e688e;
+  --priority-auto: #446d24;
   --stat-ratio: #9c27b0;
   --ember-dht-color: #00838f;
   /* Room reaction chips: a star and a heart, and the glossy highlight across
@@ -90,9 +90,9 @@
 
   --border: #dadce0;
   --border-light: #c4c9d4;
-  /* A field's outline is how it is found, so it can be firmer than the quiet
-     dividers `--border` draws everywhere else. */
-  --input-border: #b8bfcc;
+  /* A field's outline is how it is found, so it holds 3:1 against the panels
+     and canvas around it, firmer than the quiet dividers `--border` draws. */
+  --input-border: #808ca3;
   /* Over a transparent track, so it has to carry against white panels. */
   --scrollbar-thumb: #b3b9c6;
 
@@ -547,7 +547,7 @@ select {
   cursor: pointer;
   padding-right: 28px;
   background-color: var(--bg-input);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%23687089' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%235b6278' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5l3 3 3-3'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 8px center;
   background-size: 12px;

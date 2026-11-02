@@ -573,12 +573,22 @@ pub(in crate::network) async fn on_source_retry_tick(
         |pd: &PendingDownload| !pd.control.is_cancelled() && !pd.control.is_paused();
     // One cached reading per download folder serves the whole tick,
     // including the start paths below.
-    let mut part_volumes = PartVolumes::new(
-        DiskSpaceMonitor::global(),
-        PathBuf::from(&settings.download_folder),
-    );
+    let current_folder = PathBuf::from(&settings.download_folder);
+    let folders = {
+        let mgr = transfer_manager.read().await;
+        PartVolumes::folders_of(
+            &current_folder,
+            mgr.active
+                .keys()
+                .chain(state.pending_downloads.keys())
+                .map(String::as_str),
+        )
+    };
+    DiskSpaceMonitor::global().resolve_volumes(folders).await;
+    let mut part_volumes = PartVolumes::new(DiskSpaceMonitor::global(), current_folder);
     {
         let mgr = transfer_manager.read().await;
+        part_volumes.promise_running(&mgr, &state.pending_downloads);
         for (tid, pd) in &state.pending_downloads {
             if !is_retry_candidate(pd) {
                 continue;
@@ -592,7 +602,7 @@ pub(in crate::network) async fn on_source_retry_tick(
             let completed = mgr.get_transfer(tid)
                 .map(|t| t.completed_size)
                 .unwrap_or(0);
-            let needed = remaining_download_bytes(pd.file_size, completed);
+            let needed = part_volumes.needed(tid, pd.file_size, completed);
             if !part_volumes.suffices(tid, needed) {
                 debug!("Skipping source retry for {} ({}): insufficient disk space", tid, pd.file_name);
                 insufficient_downloads.push((tid.clone(), pd.file_name.clone()));
@@ -641,7 +651,12 @@ pub(in crate::network) async fn on_source_retry_tick(
                     priority: priority_str_to_u32(&t.priority),
                 },
             );
-            let _ = try_start_pending_download_from_known_sources(
+            // One that does not fit stays pending, for the next tick to hold.
+            let needed = part_volumes.needed(&t.id, t.total_size, t.completed_size);
+            if !part_volumes.suffices(&t.id, needed) {
+                continue;
+            }
+            let started = try_start_pending_download_from_known_sources(
                 state,
                 &t.id,
                 transfer_manager,
@@ -664,6 +679,9 @@ pub(in crate::network) async fn on_source_retry_tick(
                 &stats_manager.epx_counters,
             )
             .await;
+            if started {
+                part_volumes.promise(&t.id, needed);
+            }
         }
     }
 
@@ -815,7 +833,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                     .map(|t| t.completed_size)
                     .unwrap_or(0)
             };
-            let needed = remaining_download_bytes(pending.file_size, completed);
+            let needed = part_volumes.needed(tid, pending.file_size, completed);
             if !part_volumes.suffices(tid, needed) {
                 warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
                 let freed = mark_download_insufficient(
@@ -852,6 +870,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 }
                 continue;
             }
+            part_volumes.promise(tid, needed);
             let source_count = ready_sources.len() as u32;
             {
                 // Canonical lock order: transfer_manager before
@@ -1029,7 +1048,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                     .map(|t| t.completed_size)
                     .unwrap_or(0)
             };
-            let needed = remaining_download_bytes(pending.file_size, completed);
+            let needed = part_volumes.needed(tid, pending.file_size, completed);
             if !part_volumes.suffices(tid, needed) {
                 warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
                 let freed = mark_download_insufficient(
@@ -1066,6 +1085,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 }
                 continue;
             }
+            part_volumes.promise(tid, needed);
             let source_count = live_sources.len() as u32;
             {
                 let mut mgr = transfer_manager.write().await;

@@ -704,6 +704,9 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                     .collect();
                 let _ = tx.send(infos);
             }
+            if let Some(key) = state.ember_key_record_lookups.remove(&search_id) {
+                note_key_record_lookup_landed(state, key, &contacts);
+            }
             // A publish-target lookup: file the closest nodes that answered
             // under the key they were found for. An empty result is not cached,
             // so a walk that reached nobody leaves the key queued rather than
@@ -874,9 +877,10 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                 // A look an owner back from a claimable silence can sign after
                 // (`owner_return_waits_for_claims`), once someone answered it.
                 if search.as_ref().is_some_and(|s| s.responded_count() > 0) {
-                    state
-                        .channel_claim_answered_at
-                        .insert(channel_id, chrono::Utc::now().timestamp());
+                    super::channel_membership::note_channel_claim_answered(
+                        channel_id,
+                        chrono::Utc::now().timestamp(),
+                    );
                 }
                 state
                     .ember_pending_channel_claim

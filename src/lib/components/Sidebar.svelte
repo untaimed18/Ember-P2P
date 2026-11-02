@@ -26,7 +26,7 @@
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
   import { appSettings } from '$lib/stores/settings';
-  import { runLatestUndo, toastError } from '$lib/stores/toast';
+  import { reloadAfterToastActions, runLatestUndo, toastError } from '$lib/stores/toast';
   import { openSupportPage } from '$lib/api/settings';
   import { translateError } from '$lib/i18n';
   import { onMount } from 'svelte';
@@ -194,23 +194,6 @@
     return parts.join(' · ');
   }
 
-  function chatsAriaLabel(open: boolean, unread: number): string {
-    const mod = shortcutModSymbol();
-    if (unread <= 0) return open ? m.sidebar_chats_close({ mod }) : m.sidebar_chats_open({ mod });
-    if (open) {
-      return plural(unread, {
-        one: () => m.sidebar_chats_close_unread_one({ mod, count: unread }),
-        oneShowsCount: true,
-        other: () => m.sidebar_chats_close_unread_other({ mod, count: unread }),
-      });
-    }
-    return plural(unread, {
-      one: () => m.sidebar_chats_open_unread_one({ mod, count: unread }),
-      oneShowsCount: true,
-      other: () => m.sidebar_chats_open_unread_other({ mod, count: unread }),
-    });
-  }
-
   // Pending incoming friend-request count. Mirrors the transfers badge
   // pattern so users notice new requests without leaving the current
   // page. Uses the same friends store the Friends page consumes, so
@@ -303,7 +286,7 @@
     const item = navItems.find((i) => i.href === href);
     if (item?.aliases?.includes(current)) return;
     goto(href).catch(() => {
-      window.location.href = href;
+      reloadAfterToastActions(() => { window.location.href = href; });
     });
   }
 
@@ -588,7 +571,8 @@
   <div class="sidebar-footer">
     <!-- Chats is opened as often as any page, so it is drawn as one: same row,
          same icon column, same count pill. It stays a toggle for the dock
-         rather than a link, which `aria-pressed` carries. -->
+         rather than a link, which `aria-pressed` carries, so its name stays
+         "Chats" either way; only the tooltip says Open or Close. -->
     <button
       type="button"
       class="chats-btn"
@@ -597,7 +581,6 @@
       title={$chatDockOpen
         ? m.sidebar_chats_close({ mod: shortcutModSymbol() })
         : m.sidebar_chats_open({ mod: shortcutModSymbol() })}
-      aria-label={chatsAriaLabel($chatDockOpen, totalUnreadChats)}
       aria-pressed={$chatDockOpen}
       aria-keyshortcuts={`${shortcutModAria()}+/`}
     >
@@ -610,18 +593,15 @@
       </span>
       <span class="nav-label">{m.sidebar_chats_label()}</span>
       {#if totalUnreadChats > 0}
+        {@const what = plural(totalUnreadChats, {
+          one: () => m.sidebar_chats_unread_title_one({ count: totalUnreadChats }),
+          oneShowsCount: true,
+          few: () => m.sidebar_chats_unread_title_few({ count: totalUnreadChats }),
+          other: () => m.sidebar_chats_unread_title_other({ count: totalUnreadChats }),
+        })}
         <!-- The accent pill Channels and Feeds use for unread, not the warning
              hue, which read as "something is wrong". -->
-        <span
-          class="nav-badge"
-          aria-hidden="true"
-          title={plural(totalUnreadChats, {
-            one: () => m.sidebar_chats_unread_title_one({ count: totalUnreadChats }),
-            oneShowsCount: true,
-            few: () => m.sidebar_chats_unread_title_few({ count: totalUnreadChats }),
-            other: () => m.sidebar_chats_unread_title_other({ count: totalUnreadChats }),
-          })}
-        >{navCount(totalUnreadChats)}</span>
+        <span class="nav-badge" title={what}><span aria-hidden="true">{navCount(totalUnreadChats)}</span><span class="sr-only">{what}</span></span>
       {/if}
     </button>
     <!-- The things opened now and then share one row of icons, each named for

@@ -696,6 +696,12 @@ pub async fn set_feed_items(
     }
     // Not while a Publish reads the items and drops those no longer shared.
     let _editing = edit_lock().lock().await;
+    let (db, key) = (state.db.clone(), salt.clone());
+    let now = blocking(move || db.feed_own_items(&key), "feeds_failed", "Could not read feeds").await?;
+    let out = with_added(out, &held, now);
+    if out.len() > FEED_ITEMS_MAX {
+        return Err(coded("feeds_too_many_items", "A feed holds at most 2,000 files"));
+    }
     let db = state.db.clone();
     let (found, out) = blocking(move || Ok((db.feed_own_set_items(&salt, &out)?, out)), "feeds_failed", "Could not save the feed").await?;
     if !found {
@@ -703,6 +709,15 @@ pub async fn set_feed_items(
     }
     saved.items = out;
     Ok(saved)
+}
+
+/// `out`, as the editor saves it, with the items listed `now` that were not
+/// when `held` was read: added from the Library while the save read it,
+/// which the editor's list never had and so cannot have left out.
+fn with_added(mut out: Vec<FeedItem>, held: &HashMap<String, String>, now: Vec<FeedItem>) -> Vec<FeedItem> {
+    let saving: std::collections::HashSet<String> = out.iter().map(|item| item.ed2k.clone()).collect();
+    out.extend(now.into_iter().filter(|item| !held.contains_key(&item.ed2k) && !saving.contains(&item.ed2k)));
+    out
 }
 
 /// Each of `inputs` as a feed item, from the Library: a file shared with
@@ -718,26 +733,38 @@ fn library_items(
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for input in inputs {
-        let ed2k = input.ed2k.trim().to_ascii_lowercase();
-        if !seen.insert(ed2k.clone()) {
+        if !seen.insert(input.ed2k.trim().to_ascii_lowercase()) {
             continue;
         }
-        let shared = index.get_by_hash(&ed2k).filter(|file| file.is_public_listable() && file.ember_file_hash.len() == 64);
-        let Some(file) = shared else {
-            let name = index.get_by_hash(&ed2k).map(|file| file.name.clone()).or_else(|| held.get(&ed2k).cloned());
-            dropped.push(name.unwrap_or(ed2k));
-            continue;
-        };
-        out.push(FeedItem {
-            ed2k,
-            name: file.name.clone(),
-            size: file.size as i64,
-            aich: file.aich_hash.clone(),
-            blake3: file.ember_file_hash.to_ascii_lowercase(),
-            note: clip(&crate::security::sanitize_remote_text(&input.note, 4096), FEED_NOTE_MAX),
-        });
+        match library_item(index, input, held) {
+            Ok(item) => out.push(item),
+            Err(name) => dropped.push(name),
+        }
     }
     out
+}
+
+/// One input of [`library_items`]: its feed item, or the name it is
+/// reported dropped by.
+fn library_item(
+    index: &crate::search::index::LocalIndex,
+    input: FeedItemInput,
+    held: &HashMap<String, String>,
+) -> Result<FeedItem, String> {
+    let ed2k = input.ed2k.trim().to_ascii_lowercase();
+    let shared = index.get_by_hash(&ed2k).filter(|file| file.is_public_listable() && file.ember_file_hash.len() == 64);
+    let Some(file) = shared else {
+        let name = index.get_by_hash(&ed2k).map(|file| file.name.clone()).or_else(|| held.get(&ed2k).cloned());
+        return Err(name.unwrap_or(ed2k));
+    };
+    Ok(FeedItem {
+        ed2k,
+        name: file.name.clone(),
+        size: file.size as i64,
+        aich: file.aich_hash.clone(),
+        blake3: file.ember_file_hash.to_ascii_lowercase(),
+        note: clip(&crate::security::sanitize_remote_text(&input.note, 4096), FEED_NOTE_MAX),
+    })
 }
 
 /// What adding Library files to a feed did.
@@ -765,43 +792,63 @@ pub async fn add_feed_items(
     if ed2ks.len() > FEED_ITEMS_MAX {
         return Err(coded("feeds_too_many_items", "A feed holds at most 2,000 files"));
     }
+    // Before the edit lock: a library scan can hold the index a while, and
+    // every Save and Publish waits on that lock.
+    let (found, loading) = {
+        let index = state.local_index.read().await;
+        let mut seen = std::collections::HashSet::new();
+        let found: Vec<(String, Result<FeedItem, String>)> = ed2ks
+            .into_iter()
+            .map(|ed2k| ed2k.trim().to_ascii_lowercase())
+            .filter(|ed2k| seen.insert(ed2k.clone()))
+            .map(|ed2k| {
+                let item = library_item(&index, FeedItemInput { ed2k: ed2k.clone(), note: String::new() }, &HashMap::new());
+                (ed2k, item)
+            })
+            .collect();
+        (found, crate::commands::sharing::startup_library_loading())
+    };
     // Across the read and the save, so a save from the editor in between is
-    // neither undone by this one nor undoes it.
+    // neither undone by this one nor undoes it (see `with_added`).
     let _editing = edit_lock().lock().await;
     let (db, key) = (state.db.clone(), salt.clone());
     let mut items = blocking(move || db.feed_own_items(&key), "feeds_failed", "Could not read feeds").await?;
-    let listed: std::collections::HashSet<String> = items.iter().map(|item| item.ed2k.clone()).collect();
-    let mut result = AddedFeedItems::default();
-    let inputs: Vec<FeedItemInput> = ed2ks
-        .into_iter()
-        .map(|ed2k| ed2k.trim().to_ascii_lowercase())
-        .filter(|ed2k| {
-            let new = !listed.contains(ed2k);
-            result.already += u32::from(!new);
-            new
-        })
-        .map(|ed2k| FeedItemInput { ed2k, note: String::new() })
-        .collect();
-    let fresh = {
-        let index = state.local_index.read().await;
-        library_items(&index, inputs, &HashMap::new(), &mut result.dropped)
-    };
-    if !result.dropped.is_empty() && crate::commands::sharing::startup_library_loading() {
+    let result = append_items(&mut items, found)?;
+    if !result.dropped.is_empty() && loading {
         return Err(library_loading());
     }
-    if fresh.is_empty() {
+    if result.added == 0 {
         return Ok(result);
+    }
+    let db = state.db.clone();
+    let found = blocking(move || db.feed_own_set_items(&salt, &items), "feeds_failed", "Could not save the feed").await?;
+    if !found {
+        return Err(coded("feeds_not_found", "That feed could not be found"));
+    }
+    Ok(result)
+}
+
+/// Add to the end of `items` the files of `found`, by eD2K hash, that it does
+/// not list yet, in the order found; those it lists stay where they are.
+fn append_items(items: &mut Vec<FeedItem>, found: Vec<(String, Result<FeedItem, String>)>) -> Result<AddedFeedItems, String> {
+    let listed: std::collections::HashSet<String> = items.iter().map(|item| item.ed2k.clone()).collect();
+    let mut result = AddedFeedItems::default();
+    let mut fresh = Vec::new();
+    for (ed2k, item) in found {
+        if listed.contains(&ed2k) {
+            result.already += 1;
+            continue;
+        }
+        match item {
+            Ok(item) => fresh.push(item),
+            Err(name) => result.dropped.push(name),
+        }
     }
     if items.len() + fresh.len() > FEED_ITEMS_MAX {
         return Err(coded("feeds_too_many_items", "A feed holds at most 2,000 files"));
     }
     result.added = fresh.len() as u32;
     items.extend(fresh);
-    let db = state.db.clone();
-    let found = blocking(move || db.feed_own_set_items(&salt, &items), "feeds_failed", "Could not save the feed").await?;
-    if !found {
-        return Err(coded("feeds_not_found", "That feed could not be found"));
-    }
     Ok(result)
 }
 
@@ -3512,7 +3559,7 @@ async fn spam_items<'a>(
     state: &AppState,
     items: impl IntoIterator<Item = &'a FeedItem>,
 ) -> std::collections::HashSet<String> {
-    use crate::search::spam::{BatchSpamContext, CommunityRating, SpamFilterProfile, SpamKeywords};
+    use crate::search::spam::SpamFilterProfile;
     let (enabled, profile) = {
         let config = state.config.read().await;
         (
@@ -3525,39 +3572,72 @@ async fn spam_items<'a>(
     }
     let results: Vec<crate::types::SearchResult> = items.into_iter().map(feed_item_result).collect();
     // A scan holds the index through a whole re-index, and the page asks
-    // every few seconds: a busy index exempts nothing rather than waiting.
-    let owned: Vec<String> = match state.local_index.try_read() {
-        Ok(index) => results
+    // every few seconds: a busy index is not waited for.
+    let owned: Option<Vec<String>> = state.local_index.try_read().ok().map(|index| {
+        results
             .iter()
             .map(|result| result.file.hash.clone())
             .filter(|hash| index.get_by_hash(hash).is_some())
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+            .collect()
+    });
     let filter = state.spam_filter.read().await;
-    // The page asks every few seconds, and scoring compares each name with
-    // every name the user marked spam: a feed's verdicts are kept until its
-    // items, the Library's copies of them, the filter or the profile change.
-    let key = {
+    feed_spam_verdict(&filter, profile, &results, owned, spam_verdicts())
+}
+
+/// [`spam_items`] once the Library is asked: `owned` is which of `results`
+/// it holds, or `None` while the index is busy.
+///
+/// The page asks every few seconds, and scoring compares each name with
+/// every name the user marked spam: a feed's verdicts are kept until its
+/// items, the Library's copies of them, the filter or the profile change.
+/// While the index is busy, the last verdict on the same items that knew
+/// the Library stands, or after a filter change the Library's copies last
+/// known for them, so the user's own files keep their exemption.
+fn feed_spam_verdict(
+    filter: &crate::search::spam::SpamFilter,
+    profile: crate::search::spam::SpamFilterProfile,
+    results: &[crate::types::SearchResult],
+    owned: Option<Vec<String>>,
+    verdicts: &parking_lot::Mutex<std::collections::VecDeque<SpamVerdict>>,
+) -> std::collections::HashSet<String> {
+    use crate::search::spam::{BatchSpamContext, CommunityRating, SpamKeywords};
+    let items = {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(&filter.generation().to_le_bytes());
-        hasher.update(format!("{profile:?}").as_bytes());
-        for result in &results {
+        for result in results {
             hasher.update(result.file.hash.as_bytes());
             hasher.update(&result.file.size.to_le_bytes());
             hasher.update(&(result.file.name.len() as u64).to_le_bytes());
             hasher.update(result.file.name.as_bytes());
         }
-        hasher.update(b"owned");
-        for hash in &owned {
-            hasher.update(hash.as_bytes());
-        }
         *hasher.finalize().as_bytes()
     };
-    if let Some(hit) = spam_verdicts().lock().iter().find(|(held, _)| *held == key) {
-        return hit.1.clone();
+    let scored = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&filter.generation().to_le_bytes());
+        hasher.update(format!("{profile:?}").as_bytes());
+        hasher.update(&items);
+        *hasher.finalize().as_bytes()
+    };
+    let mut owned = owned;
+    {
+        let held = verdicts.lock();
+        let same = || held.iter().rev().filter(move |verdict| verdict.scored == scored);
+        let hit = match &owned {
+            Some(owned) => same().find(|verdict| verdict.owned.as_ref() == Some(owned)),
+            None => same().find(|verdict| verdict.owned.is_some()).or_else(|| same().next()),
+        };
+        if let Some(hit) = hit {
+            return hit.spam.clone();
+        }
+        if owned.is_none() {
+            owned = held
+                .iter()
+                .rev()
+                .filter(|verdict| verdict.items == items)
+                .find_map(|verdict| verdict.owned.clone());
+        }
     }
-    let batch = BatchSpamContext::for_owned_hashes(owned);
+    let batch = BatchSpamContext::for_owned_hashes(owned.clone().unwrap_or_default());
     let keywords = SpamKeywords::new(&[]);
     let spam: std::collections::HashSet<String> = results
         .iter()
@@ -3568,22 +3648,31 @@ async fn spam_items<'a>(
         })
         .map(|result| result.file.hash.clone())
         .collect();
-    let mut cache = spam_verdicts().lock();
+    let mut cache = verdicts.lock();
     if cache.len() >= SPAM_VERDICTS_KEPT {
         cache.pop_front();
     }
-    cache.push_back((key, spam.clone()));
+    cache.push_back(SpamVerdict { scored, items, owned, spam: spam.clone() });
     spam
 }
 
 /// Verdict sets [`spam_items`] keeps: a few feeds' pages and passes at once.
 const SPAM_VERDICTS_KEPT: usize = 8;
 
-/// The verdicts of [`spam_items`]' last scorings, by what they were taken from.
-fn spam_verdicts() -> &'static parking_lot::Mutex<std::collections::VecDeque<([u8; 32], std::collections::HashSet<String>)>> {
-    static VERDICTS: std::sync::OnceLock<
-        parking_lot::Mutex<std::collections::VecDeque<([u8; 32], std::collections::HashSet<String>)>>,
-    > = std::sync::OnceLock::new();
+/// One scoring by [`feed_spam_verdict`]: what it was taken from (the items
+/// alone, and with the filter and profile), the Library copies it exempted
+/// (`None` when the index was busy and none were known), and its verdict.
+struct SpamVerdict {
+    scored: [u8; 32],
+    items: [u8; 32],
+    owned: Option<Vec<String>>,
+    spam: std::collections::HashSet<String>,
+}
+
+/// The verdicts of [`spam_items`]' last scorings.
+fn spam_verdicts() -> &'static parking_lot::Mutex<std::collections::VecDeque<SpamVerdict>> {
+    static VERDICTS: std::sync::OnceLock<parking_lot::Mutex<std::collections::VecDeque<SpamVerdict>>> =
+        std::sync::OnceLock::new();
     VERDICTS.get_or_init(Default::default)
 }
 
@@ -4545,6 +4634,66 @@ mod tests {
 
     const ROOM: u64 = u64::MAX;
 
+    /// An item named `{tag}.flac`, its eD2K hash `tag` over and over.
+    fn listed(tag: &str) -> FeedItem {
+        FeedItem { ed2k: tag.repeat(32), ..item(&format!("{tag}.flac"), 1) }
+    }
+
+    fn in_library(tag: &str) -> (String, Result<FeedItem, String>) {
+        (listed(tag).ed2k, Ok(listed(tag)))
+    }
+
+    fn names(items: &[FeedItem]) -> Vec<&str> {
+        items.iter().map(|item| item.name.as_str()).collect()
+    }
+
+    /// "Add to feed" appends the files the feed does not list, in the order
+    /// given, counts those it does, and names those the Library could not
+    /// give; past 2,000 items it adds nothing.
+    #[test]
+    fn adding_to_a_feed_appends_only_new_files_in_order() {
+        let mut items = vec![listed("a")];
+        let result = append_items(&mut items, vec![in_library("b"), in_library("a"), ("c".repeat(32), Err("c.mkv".into())), in_library("d")]).unwrap();
+        assert_eq!(result, AddedFeedItems { added: 2, already: 1, dropped: vec!["c.mkv".into()] });
+        assert_eq!(names(&items), ["a.flac", "b.flac", "d.flac"]);
+
+        let mut full: Vec<FeedItem> =
+            (0..FEED_ITEMS_MAX - 1).map(|i| FeedItem { ed2k: format!("{i:032x}"), ..item("x", 1) }).collect();
+        assert!(append_items(&mut full, vec![in_library("b"), in_library("d")]).is_err());
+        assert_eq!(full.len(), FEED_ITEMS_MAX - 1, "nothing added");
+        let result = append_items(&mut full, vec![in_library("b")]).unwrap();
+        assert_eq!((result.added, full.len()), (1, FEED_ITEMS_MAX), "up to the cap");
+    }
+
+    /// A Save from the editor keeps a file "Add to feed" put in while the
+    /// save read the Library, and still leaves out what the editor took out.
+    #[test]
+    fn a_save_keeps_a_file_added_while_it_ran() {
+        let path = std::env::temp_dir().join(format!("ember-feed-add-{}-{}.db", std::process::id(), rand::random::<u64>()));
+        let db = crate::storage::database::Database::open_at(&path).expect("open db");
+        let salt = "00".repeat(16);
+        assert!(db.feed_own_create(&salt, "T", "", false, 0, 10).unwrap());
+        db.feed_own_set_items(&salt, &[listed("a"), listed("b")]).unwrap();
+
+        // The save reads what the feed holds, then an Add lands.
+        let held: HashMap<String, String> =
+            db.feed_own_items(&salt).unwrap().into_iter().map(|item| (item.ed2k, item.name)).collect();
+        let mut items = db.feed_own_items(&salt).unwrap();
+        append_items(&mut items, vec![in_library("c")]).unwrap();
+        db.feed_own_set_items(&salt, &items).unwrap();
+
+        // The editor's list, which took "a" out and never had "c".
+        let out = with_added(vec![listed("b")], &held, db.feed_own_items(&salt).unwrap());
+        db.feed_own_set_items(&salt, &out).unwrap();
+        assert_eq!(names(&db.feed_own_items(&salt).unwrap()), ["b.flac", "c.flac"]);
+        assert_eq!(names(&with_added(vec![listed("c"), listed("b")], &held, out)), ["c.flac", "b.flac"], "not twice");
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
     /// A feed item is scored as a search result for the same file is: one
     /// whose hash the user marked spam is spam in a feed too, and an
     /// ordinary file beside it is not.
@@ -4573,6 +4722,79 @@ mod tests {
         };
         assert!(score(&fake), "the hash the user marked");
         assert!(!score(&honest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A feed's verdict is asked for again and again: it is kept while what it
+    /// was taken from holds, and a Mark spam, which moves the filter on, has
+    /// it scored again.
+    #[test]
+    fn a_feed_spam_verdict_is_kept_until_the_filter_changes() {
+        use crate::search::spam::{SpamFilter, SpamFilterProfile};
+        let dir = std::env::temp_dir().join(format!("ember-feed-spam-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut filter = SpamFilter::load(&dir);
+        let fake = "a".repeat(32);
+        let results = vec![feed_item_result(&FeedItem { ed2k: fake.clone(), ..item("Album.2026.FLAC.zip", 300) })];
+        let verdicts = parking_lot::Mutex::new(std::collections::VecDeque::new());
+        let verdict = |filter: &SpamFilter| {
+            feed_spam_verdict(filter, SpamFilterProfile::Balanced, &results, Some(Vec::new()), &verdicts)
+        };
+        assert!(verdict(&filter).is_empty());
+        assert!(verdict(&filter).is_empty());
+        assert_eq!(verdicts.lock().len(), 1, "asked again, the kept verdict answers");
+        filter.mark_spam(&results[0], &[], None);
+        assert!(verdict(&filter).contains(&fake), "scored again after the mark");
+        assert_eq!(verdicts.lock().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While the Library index is busy, a file the Library holds keeps the
+    /// exemption the last look at the Library gave it.
+    #[test]
+    fn a_busy_library_index_keeps_the_last_exemption() {
+        use crate::search::spam::{SpamFilter, SpamFilterProfile};
+        let dir = std::env::temp_dir().join(format!("ember-feed-spam-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut filter = SpamFilter::load(&dir);
+        let name = "Holiday Video Collection Uncut.avi";
+        filter.mark_spam(&feed_item_result(&FeedItem { ed2k: "a".repeat(32), ..item(name, 300) }), &[], None);
+        let held = "b".repeat(32);
+        let results = vec![feed_item_result(&FeedItem { ed2k: held.clone(), ..item(name, 300) })];
+        let verdicts = parking_lot::Mutex::new(std::collections::VecDeque::new());
+        let verdict = |owned: Option<Vec<String>>| {
+            feed_spam_verdict(&filter, SpamFilterProfile::Aggressive, &results, owned, &verdicts)
+        };
+        assert!(verdict(None).contains(&held), "busy, and the Library never seen: no exemption");
+        assert!(verdict(Some(vec![held.clone()])).is_empty(), "in the Library");
+        assert!(verdict(None).is_empty(), "busy: still exempt");
+        assert!(verdict(Some(Vec::new())).contains(&held), "gone from the Library");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Mark spam made while the Library index is busy does not take the
+    /// exemption from a file the Library was last seen to hold.
+    #[test]
+    fn a_filter_change_while_the_index_is_busy_keeps_the_exemption() {
+        use crate::search::spam::{SpamFilter, SpamFilterProfile};
+        let dir = std::env::temp_dir().join(format!("ember-feed-spam-busy-change-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut filter = SpamFilter::load(&dir);
+        let name = "Holiday Video Collection Uncut.avi";
+        let held = "b".repeat(32);
+        let results = vec![feed_item_result(&FeedItem { ed2k: held.clone(), ..item(name, 300) })];
+        let verdicts = parking_lot::Mutex::new(std::collections::VecDeque::new());
+        let verdict = |filter: &SpamFilter, owned: Option<Vec<String>>| {
+            feed_spam_verdict(filter, SpamFilterProfile::Aggressive, &results, owned, &verdicts)
+        };
+        assert!(verdict(&filter, Some(vec![held.clone()])).is_empty(), "in the Library");
+        filter.mark_spam(&feed_item_result(&FeedItem { ed2k: "a".repeat(32), ..item(name, 300) }), &[], None);
+        assert!(verdict(&filter, None).is_empty(), "busy after the mark: still exempt");
+        assert!(verdict(&filter, None).is_empty(), "and on the next poll");
+        assert!(verdict(&filter, Some(Vec::new())).contains(&held), "gone from the Library");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

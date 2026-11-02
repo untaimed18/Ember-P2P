@@ -98,8 +98,46 @@ const STAGED_RESTORE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 /// was written with, so archives made under the old 10-character rule still open.
 const MIN_PASSPHRASE_LEN: usize = 12;
 /// What [`passphrase_strength_bits`] must reach. Twelve random lowercase letters
-/// score about 56 bits; `Password1234` and a 12-digit number fall short.
+/// score about 56 bits; `Password2026`, `Qwerty123456!` and a 12-digit number
+/// fall short.
 const MIN_PASSPHRASE_BITS: f64 = 48.0;
+/// The base words guessers try first, in the languages Ember ships, matched
+/// case-insensitively and through the usual digit and symbol stand-ins
+/// (`P@ssw0rd`). Longest first, so the longer of two overlapping words wins.
+const COMMON_PASSPHRASE_WORDS: &[&str] = &[
+    "motdepasse",
+    "contrasena",
+    "qwertyuiop",
+    "asdfghjkl",
+    "iloveyou",
+    "password",
+    "passwort",
+    "football",
+    "princess",
+    "sunshine",
+    "welcome",
+    "letmein",
+    "zxcvbnm",
+    "dragon",
+    "monkey",
+    "master",
+    "shadow",
+    "qwerty",
+    "qwertz",
+    "azerty",
+    "passwd",
+    "parola",
+    "secret",
+    "admin",
+    "ember",
+    "haslo",
+    "senha",
+];
+/// A word from [`COMMON_PASSPHRASE_WORDS`] counts as one pick from a list of
+/// about a thousand, whatever its length.
+const COMMON_WORD_BITS: f64 = 10.0;
+/// A year from 1900 to 2099 counts as one pick of two hundred.
+const YEAR_BITS: f64 = 7.64;
 const MAX_PASSPHRASE_LEN: usize = 1024;
 const MAX_PATH_LEN: usize = 4 * 1024;
 
@@ -975,16 +1013,31 @@ fn build_archive(
 }
 
 /// A pessimistic guess at how many bits a passphrase is worth to someone
-/// guessing it offline against a stolen backup.
+/// guessing it offline against a stolen backup, and whether it holds a common
+/// word or a year.
 ///
 /// Each character is worth the alphabet its classes span, except one that
 /// repeats or steps from the one before (`aa`, `ab`, `ba`, `12`), or that ends
 /// a three-character run already seen earlier: those are worth nothing, so
-/// `aaaa…`, `1234…` and `passwordpassword` score as what they are. Words are
-/// not recognised, so a dictionary phrase scores higher than it deserves: this
-/// is a floor against patterns, not a strength meter.
-fn passphrase_strength_bits(passphrase: &str) -> f64 {
+/// `aaaa…`, `1234…` and `passwordpassword` score as what they are. A word from
+/// [`COMMON_PASSPHRASE_WORDS`] and a four-digit year each score as one token.
+/// Other words are not recognised, so a dictionary phrase scores higher than it
+/// deserves: this is a floor against patterns, not a strength meter.
+fn passphrase_strength_bits(passphrase: &str) -> (f64, bool) {
     let chars: Vec<char> = passphrase.chars().collect();
+    let plain: Vec<char> = chars
+        .iter()
+        .map(|&c| match c.to_ascii_lowercase() {
+            '@' | '4' => 'a',
+            '3' => 'e',
+            '1' | '!' => 'i',
+            '0' => 'o',
+            '$' | '5' => 's',
+            '7' => 't',
+            other => other,
+        })
+        .collect();
+    let digit_at = |i: usize| chars.get(i).is_some_and(char::is_ascii_digit);
     let mut pool = 0u32;
     if chars.iter().any(char::is_ascii_lowercase) {
         pool += 26;
@@ -999,11 +1052,33 @@ fn passphrase_strength_bits(passphrase: &str) -> f64 {
         pool += 33;
     }
     if pool == 0 {
-        return 0.0;
+        return (0.0, false);
     }
     let per_char = f64::from(pool).log2();
     let mut bits = 0.0;
-    for (i, &c) in chars.iter().enumerate() {
+    let mut common = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let word = COMMON_PASSPHRASE_WORDS.iter().find(|word| {
+            word.chars().count() <= plain.len() - i && word.chars().zip(&plain[i..]).all(|(a, &b)| a == b)
+        });
+        if let Some(word) = word {
+            bits += COMMON_WORD_BITS;
+            common = true;
+            i += word.chars().count();
+            continue;
+        }
+        let is_year = (i == 0 || !digit_at(i - 1))
+            && (i..i + 4).all(digit_at)
+            && !digit_at(i + 4)
+            && matches!((chars[i], chars[i + 1]), ('1', '9') | ('2', '0'));
+        if is_year {
+            bits += YEAR_BITS;
+            common = true;
+            i += 4;
+            continue;
+        }
+        let c = chars[i];
         let steps_from_previous = i > 0 && (c as i64 - chars[i - 1] as i64).abs() <= 1;
         let repeats_a_run = i >= 2 && {
             let run = &chars[i - 2..=i];
@@ -1012,8 +1087,9 @@ fn passphrase_strength_bits(passphrase: &str) -> f64 {
         if !steps_from_previous && !repeats_a_run {
             bits += per_char;
         }
+        i += 1;
     }
-    bits
+    (bits, common)
 }
 
 fn validate_passphrase(passphrase: &str) -> Result<(), String> {
@@ -1031,7 +1107,15 @@ fn validate_passphrase(passphrase: &str) -> Result<(), String> {
             "That passphrase is unreasonably long",
         ));
     }
-    if passphrase_strength_bits(passphrase) < MIN_PASSPHRASE_BITS {
+    let (bits, common) = passphrase_strength_bits(passphrase);
+    if bits < MIN_PASSPHRASE_BITS && common {
+        return Err(coded_ctx(
+            "backup_guessable_passphrase",
+            "Choose a less predictable passphrase",
+            "built on a common word or a year",
+        ));
+    }
+    if bits < MIN_PASSPHRASE_BITS {
         return Err(coded_ctx(
             "backup_weak_passphrase",
             "Choose a less predictable passphrase",
@@ -3327,15 +3411,24 @@ mod tests {
 
     #[test]
     fn predictable_passphrases_are_refused() {
+        for weak in ["aaaaaaaaaaaaaaaa", "123456789012", "abcdefghijklmnop", "abcxyzabcxyzabcxyz"] {
+            let err = validate_passphrase(weak).expect_err(weak);
+            assert!(err.contains("backup_weak_passphrase"), "{weak}: {err}");
+        }
+        // Told what is actually wrong with them, not that they are a pattern.
         for weak in [
-            "aaaaaaaaaaaaaaaa",
-            "123456789012",
-            "abcdefghijklmnop",
             "Password1234",
+            "Password2026",
+            "Password1234!",
+            "P@ssw0rd2026",
+            "Qwerty123456!",
+            "Welcome2024!",
+            "iloveyou1990",
+            "Ember2026Ember2026",
             "passwordpassword",
-            "abcxyzabcxyzabcxyz",
         ] {
-            assert!(validate_passphrase(weak).is_err(), "{weak} should be refused");
+            let err = validate_passphrase(weak).expect_err(weak);
+            assert!(err.contains("backup_guessable_passphrase"), "{weak}: {err}");
         }
         for strong in [
             "correct horse battery staple",

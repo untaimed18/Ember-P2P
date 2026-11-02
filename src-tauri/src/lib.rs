@@ -1467,15 +1467,19 @@ pub fn run() {
                             folder.clone(),
                             tokio::task::spawn_blocking(move || {
                                 match FileIndexer::refuse_unapproved_root(&f) {
-                                    Some(refused) => (true, refused),
-                                    None => (
-                                        false,
-                                        FileIndexer::discover_directory_page_in(
+                                    Some(refused) => (true, false, refused),
+                                    None => {
+                                        let result = FileIndexer::discover_directory_page_in(
                                             &f,
                                             cursor.as_deref(),
                                             scope.as_ref(),
-                                        ),
-                                    ),
+                                        );
+                                        let gone = result.saw_nothing()
+                                            && sharing::indexer::folder_gone_from_present_volume(
+                                                std::path::Path::new(&f),
+                                            );
+                                        (false, gone, result)
+                                    }
                                 }
                             }),
                         )
@@ -1501,16 +1505,20 @@ pub fn run() {
                 let mut unreachable_roots: Vec<String> = Vec::new();
                 for (folder, handle) in discovery_handles {
                     match handle.await {
-                        Ok((refused, result)) => {
+                        Ok((refused, gone, result)) => {
                             if refused {
                                 refused_roots.push(folder);
                                 continue;
                             }
                             // An unreachable folder (a drive not plugged in)
                             // says nothing about where its paging stood; a
-                            // `None` here erased the cursor it had.
+                            // `None` here erased the cursor it had. One deleted
+                            // from a drive that is there has nothing to keep
+                            // rows for, or they would be announced every session.
                             if result.saw_nothing() {
-                                unreachable_roots.push(folder);
+                                if !gone {
+                                    unreachable_roots.push(folder);
+                                }
                                 continue;
                             }
                             if result.reached_file_cap() {
@@ -2695,6 +2703,7 @@ pub fn run() {
             commands::settings::download_ipfilter,
             commands::settings::hide_to_tray,
             commands::settings::quit_app,
+            commands::settings::quit_flush_pending,
             commands::settings::finish_requested_quit,
             commands::settings::set_pending_undo,
             commands::settings::set_close_behavior,
@@ -2739,6 +2748,7 @@ pub fn run() {
             commands::server::set_server_priority,
             commands::server::get_server_list,
             commands::server::get_connected_server,
+            commands::server::get_last_server,
             commands::server::get_server_log,
             commands::server::clear_server_log,
             commands::server::download_server_met,

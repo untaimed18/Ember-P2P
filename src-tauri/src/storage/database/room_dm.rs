@@ -666,13 +666,12 @@ impl Database {
             .collect())
     }
 
-    /// A conversation's messages, oldest first: the newest `limit` before
-    /// `before` (Unix seconds), or the newest of all.
     /// A conversation's newest `limit` messages, oldest first, before the
     /// cursor: messages older than `before`, or with `before_seq` too, those at
     /// that timestamp with a lower row as well. Timestamps are the sender's and
     /// can repeat, so a cursor of the timestamp alone could not page past more
-    /// than `limit` sharing one.
+    /// than `limit` sharing one. Rows that do not open are passed over, not
+    /// counted, so fewer than `limit` means none older are left to show.
     pub fn dm_messages(
         &self,
         member: &str,
@@ -687,28 +686,27 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT message_id, direction, ts, status, body, rowid FROM room_dm_messages
              WHERE member_pubkey = ?1
-               AND (?2 IS NULL OR ts < ?2 OR (?4 IS NOT NULL AND ts = ?2 AND rowid < ?4))
-             ORDER BY ts DESC, rowid DESC LIMIT ?3",
+               AND (?2 IS NULL OR ts < ?2 OR (?3 IS NOT NULL AND ts = ?2 AND rowid < ?3))
+             ORDER BY ts DESC, rowid DESC",
         )?;
-        let rows = stmt
-            .query_map(params![member, before, limit as i64, before_seq], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut out: Vec<DmMessage> = rows
-            .into_iter()
-            .filter_map(|(message_id, direction, timestamp, status, body, seq)| {
-                let text = Self::open_dm_body(key, &message_id, &member, &direction, timestamp, &body)?;
-                Some(DmMessage { message_id, member_pubkey: member.clone(), direction, text, timestamp, status, seq })
-            })
-            .collect();
+        let mut rows = stmt.query(params![member, before, before_seq])?;
+        let mut out: Vec<DmMessage> = Vec::new();
+        while out.len() < limit {
+            let Some(row) = rows.next()? else {
+                break;
+            };
+            let (message_id, direction, timestamp, status, body, seq) = (
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            );
+            if let Some(text) = Self::open_dm_body(key, &message_id, &member, &direction, timestamp, &body) {
+                out.push(DmMessage { message_id, member_pubkey: member.clone(), direction, text, timestamp, status, seq });
+            }
+        }
         out.reverse();
         Ok(out)
     }
@@ -839,6 +837,26 @@ mod tests {
             page = db.dm_messages(ANN, 2, Some(oldest.timestamp), Some(oldest.seq)).unwrap();
         }
         assert_eq!(seen, vec!["older", "t0", "t1", "t2", "t3", "t4"]);
+        drop_db(db, path);
+    }
+
+    /// A row that does not open is passed over, so a page is short only at
+    /// the conversation's start: the screen hides Load older on a short one.
+    #[test]
+    fn a_row_that_does_not_open_does_not_cut_a_page_short() {
+        let (db, path) = db("unreadable");
+        for i in 0..5 {
+            db.dm_record_incoming(ANN, "Ann", ROOM, &format!("m{i}"), &format!("t{i}"), 100 + i, ROOM_DM_POLICY_ANYONE, 100 + i).unwrap();
+        }
+        db.conn.lock().execute("UPDATE room_dm_messages SET body = 'damaged' WHERE message_id = 'm3'", []).unwrap();
+
+        let page = db.dm_messages(ANN, 2, None, None).unwrap();
+        let texts: Vec<&str> = page.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["t2", "t4"]);
+        let older = db.dm_messages(ANN, 2, Some(page[0].timestamp), Some(page[0].seq)).unwrap();
+        let texts: Vec<&str> = older.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["t0", "t1"]);
+        assert!(db.dm_messages(ANN, 2, Some(older[0].timestamp), Some(older[0].seq)).unwrap().is_empty());
         drop_db(db, path);
     }
 

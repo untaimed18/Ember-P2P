@@ -29,8 +29,11 @@ ignore = [
     #
     # Why accepted:
     #   * Ember's own `zip` is 9.x, which fixes all three, and Ember never calls
-    #     `extract` anyway: backups, ipfilter.zip and archive recovery read
-    #     entries one at a time.
+    #     `extract` anyway. Its only `zip` readers are backup restore and the
+    #     ipfilter.zip picker (default host or a user-confirmed URL), which
+    #     read entries one at a time and decode only Stored and Deflate (see
+    #     Cargo.toml).
+    #     Archive recovery parses peers' zips itself and never uses `zip`.
     #   * The only `zip` < 9 left is 4.x inside `tauri-plugin-updater` (2.14
     #     still pins it). Its `extract` runs only on a zipped Windows update
     #     artifact, after the minisign check against the key in

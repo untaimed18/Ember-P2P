@@ -69,7 +69,7 @@
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { relaunch } from '@tauri-apps/plugin-process';
-  import { flushToastActionsBeforeExit } from '$lib/stores/toast';
+  import { flushToastActionsBeforeExit, reloadAfterToastActions } from '$lib/stores/toast';
   import BuyCoffeeButton from '$lib/components/BuyCoffeeButton.svelte';
   import EmberLinks from '$lib/components/EmberLinks.svelte';
   import {
@@ -1184,8 +1184,19 @@
       .catch((e) => console.error('Failed to register runtime-status listener:', e));
 
     let unlistenSettingsChanged: UnlistenFn | null = null;
-    listen<AppSettings>(SETTINGS_CHANGED_EVENT, (event) => {
-      if (!unmounted) foldQuickLimits(event.payload);
+    // Re-read rather than trusting the payload: any window can emit the
+    // event, and what is folded here is saved by the next Apply.
+    let settingsChangedSeq = 0;
+    listen(SETTINGS_CHANGED_EVENT, () => {
+      if (unmounted) return;
+      const seq = ++settingsChangedSeq;
+      getSettings()
+        .then((saved) => {
+          if (unmounted || seq !== settingsChangedSeq) return;
+          if (settings && saved.settings_revision < settings.settings_revision) return;
+          foldQuickLimits(saved);
+        })
+        .catch((e) => console.warn('Settings: re-reading changed settings failed', e));
     })
       .then((fn) => {
         if (unmounted) fn();
@@ -2148,7 +2159,7 @@
 
   function guardLanguageChange(change: () => void) {
     if (!hasUnsavedChanges) {
-      change();
+      reloadAfterToastActions(change);
       return;
     }
     pendingLanguageChange = change;
@@ -2163,7 +2174,7 @@
       APPLY_FIELDS.filter((field) => fieldsDirty([field])).map((field) => applyFields([field])),
     );
     if (antileechDraftDirty) await handleSaveAntileech();
-    if (applied.every(Boolean) && !hasUnsavedChanges) change?.();
+    if (applied.every(Boolean) && !hasUnsavedChanges) reloadAfterToastActions(() => change?.());
     // The failure may be under a field on another tab, out of sight.
     else toastError(m.settings_language_apply_failed());
   }
@@ -2656,7 +2667,7 @@
   {#if loadError}
     <div class="empty-state">
       <p class="empty-title" role="alert">{loadError}</p>
-      <button type="button" class="empty-action" onclick={() => { loadError = null; location.reload(); }}>{m.layout_retry()}</button>
+      <button type="button" class="empty-action" onclick={() => { loadError = null; reloadAfterToastActions(); }}>{m.layout_retry()}</button>
     </div>
   {:else if !settings}
     <div class="empty-state">
@@ -5617,7 +5628,7 @@
     const change = pendingLanguageChange;
     pendingLanguageChange = null;
     discardConfirmed = true;
-    change?.();
+    reloadAfterToastActions(() => change?.());
   }}
   oncancel={() => { pendingLanguageChange = null; }}
 />

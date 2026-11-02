@@ -3818,6 +3818,25 @@
     foldersToggleEl?.focus();
   }
 
+  // What the backdrop covers is out of reach while the panel is open, so Tab
+  // and a screen reader cannot wander under it. The header above stays live,
+  // as it is not dimmed, and the page's dialogs sit outside this layout.
+  $effect(() => {
+    const panel = foldersPanelEl;
+    if (!narrowLayout || !foldersPanelOpen || !panel?.parentElement) return;
+    const covered = Array.from(panel.parentElement.children).filter(
+      (el) => el !== panel && !el.classList.contains('sidebar-backdrop') && !el.hasAttribute('inert'),
+    );
+    for (const el of covered) el.setAttribute('inert', '');
+    return () => {
+      for (const el of covered) el.removeAttribute('inert');
+    };
+  });
+
+  function onFoldersPanelKeydown(e: KeyboardEvent) {
+    if (narrowLayout && foldersPanelOpen) trapTabKey(e, foldersPanelEl);
+  }
+
   /** Show one folder's files (`null`: all of them). In the slide-out panel the
    *  choice is the reason it was opened, so it closes on it. */
   function selectFolder(folder: string | null) {
@@ -4806,11 +4825,13 @@
     <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
     <div class="sidebar-backdrop" onclick={closeFoldersPanel}></div>
   {/if}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="sidebar"
     class:panel-open={narrowLayout && foldersPanelOpen}
     id="library-folders"
     bind:this={foldersPanelEl}
+    onkeydown={onFoldersPanelKeydown}
     style={narrowLayout ? undefined : `width: ${sidebarWidth}px; min-width: ${sidebarWidth}px;`}
   >
     <div class="sidebar-header">

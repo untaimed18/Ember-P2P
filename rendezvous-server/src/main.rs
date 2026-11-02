@@ -1880,19 +1880,28 @@ impl RelayTicketStore {
         self.remove(&ticket_id);
     }
 
-    /// For an offer of `ticket_id` from `initiator_id` to `responder_id`,
-    /// the ticket it replaces, if any. A pair holds one ticket at a time, and
-    /// an initiator offering again has given up on its earlier one (its wait
-    /// ran out, or the responder never joined), so that ticket is replaced
-    /// rather than refusing every retry for the rest of its TTL. Refused only
-    /// for an id already in use, and while the pair's ticket has a pre-upgrade
-    /// reservation outstanding: its rollback must still find it to release
-    /// the per-network count.
+    /// For an offer of `ticket_id` from `initiator_id` to `responder_id`
+    /// under `capability` for `epoch`, the ticket it replaces, if any. A pair
+    /// holds one ticket at a time, and an initiator offering the same
+    /// capability again has given up on its earlier one (its wait ran out, or
+    /// the responder never joined), so that ticket is replaced rather than
+    /// refusing every retry for the rest of its TTL. A different capability
+    /// in the same epoch is another purpose (a friend relay beside a room
+    /// relay, or another room), which replaces the earlier ticket only while
+    /// the responder has not accepted it (no role can join before), so neither
+    /// undoes a handshake under way. Capabilities change every epoch, so
+    /// across epochs a different one may be the same purpose retried after a
+    /// rollover, and is treated as a retry.
+    /// Also refused for an id already in use, and while the pair's ticket
+    /// has a pre-upgrade reservation outstanding: its rollback must still find
+    /// it to release the per-network count.
     fn offer_replaces(
         &self,
         ticket_id: &str,
         initiator_id: &str,
         responder_id: &str,
+        capability: &[u8; 32],
+        epoch: i64,
     ) -> Result<Option<String>, StatusCode> {
         if self.tickets.contains_key(ticket_id) {
             return Err(StatusCode::CONFLICT);
@@ -1907,7 +1916,10 @@ impl RelayTicketStore {
         match self.tickets.get(existing_id) {
             Some(existing)
                 if existing.initiator_reservation.is_some()
-                    || existing.responder_reservation.is_some() =>
+                    || existing.responder_reservation.is_some()
+                    || (existing.accepted
+                        && existing.epoch == epoch
+                        && existing.capability != *capability) =>
             {
                 Err(StatusCode::CONFLICT)
             }
@@ -5724,8 +5736,13 @@ async fn relay_mailbox_offer(
             return Err(StatusCode::CONFLICT);
         }
     }
-    let replaced =
-        tickets.offer_replaces(&ticket_id, &ticket.initiator_id, &ticket.responder_id)?;
+    let replaced = tickets.offer_replaces(
+        &ticket_id,
+        &ticket.initiator_id,
+        &ticket.responder_id,
+        &ticket.capability,
+        ticket.epoch,
+    )?;
     let (freed_tickets, freed_bytes) = replaced
         .as_ref()
         .and_then(|replaced_id| tickets.tickets.get(replaced_id))
@@ -9702,29 +9719,86 @@ mod relay_ticket_tests {
     #[test]
     fn an_offer_replaces_its_pairs_ticket_unless_it_is_mid_join() {
         let (initiator, responder) = ("31".repeat(32), "32".repeat(32));
+        let capability = [0; 32];
         let mut tickets = RelayTicketStore::default();
-        assert_eq!(tickets.offer_replaces(&"01".repeat(32), &initiator, &responder), Ok(None));
+        assert_eq!(
+            tickets.offer_replaces(&"01".repeat(32), &initiator, &responder, &capability, 0),
+            Ok(None)
+        );
         tickets.insert("01".repeat(32), ticket_with_parties(&initiator, &responder, true));
 
         assert_eq!(
-            tickets.offer_replaces(&"01".repeat(32), &"39".repeat(32), &responder),
+            tickets.offer_replaces(&"01".repeat(32), &"39".repeat(32), &responder, &capability, 0),
             Err(StatusCode::CONFLICT),
             "an id in use is never replaced"
         );
         assert_eq!(
-            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder),
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &capability, 0),
             Ok(Some("01".repeat(32)))
         );
         assert_eq!(
-            tickets.offer_replaces(&"02".repeat(32), &"39".repeat(32), &responder),
+            tickets.offer_replaces(&"02".repeat(32), &"39".repeat(32), &responder, &capability, 0),
             Ok(None),
             "another initiator's offer replaces nothing"
         );
         tickets.tickets.get_mut(&"01".repeat(32)).unwrap().responder_reservation = Some(4);
         assert_eq!(
-            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder),
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &capability, 0),
             Err(StatusCode::CONFLICT),
             "a reservation's rollback must still find its ticket"
+        );
+    }
+
+    /// A friend relay and a room relay to one person share the pair's slot.
+    #[test]
+    fn an_offer_for_another_purpose_replaces_only_a_ticket_nobody_has_taken_up() {
+        let (initiator, responder) = ("31".repeat(32), "32".repeat(32));
+        let (friend, room) = ([0xF1; 32], [0xC4; 32]);
+        let mut tickets = RelayTicketStore::default();
+        let mut pending = ticket_with_parties(&initiator, &responder, false);
+        pending.capability = friend;
+        tickets.insert("01".repeat(32), pending);
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &room, 0),
+            Ok(Some("01".repeat(32))),
+            "an offer the responder has not taken up yet"
+        );
+
+        tickets.mark_accepted(&"01".repeat(32));
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &room, 0),
+            Err(StatusCode::CONFLICT),
+            "accepted"
+        );
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &friend, 0),
+            Ok(Some("01".repeat(32))),
+            "a retry of the same offer still replaces it"
+        );
+    }
+
+    /// Capabilities are derived per epoch, so a retry after a rollover (or
+    /// after the client's previous-epoch fallback) comes under another one.
+    /// The server cannot tell it from another purpose, and lets it replace
+    /// the stalled ticket as any retry does.
+    #[test]
+    fn an_accepted_ticket_is_replaced_by_an_offer_under_the_next_epochs_capability() {
+        let (initiator, responder) = ("31".repeat(32), "32".repeat(32));
+        let (previous, current) = ([0xE1; 32], [0xE2; 32]);
+        let mut tickets = RelayTicketStore::default();
+        let mut accepted = ticket_with_parties(&initiator, &responder, false);
+        accepted.capability = previous;
+        accepted.epoch = 6;
+        tickets.insert("01".repeat(32), accepted);
+        tickets.mark_accepted(&"01".repeat(32));
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &current, 7),
+            Ok(Some("01".repeat(32)))
+        );
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &current, 6),
+            Err(StatusCode::CONFLICT),
+            "in the same epoch another capability is still another purpose"
         );
     }
 

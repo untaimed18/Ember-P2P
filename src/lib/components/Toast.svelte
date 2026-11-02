@@ -144,7 +144,14 @@
           </svg>
         {/if}
       </span>
-      <span class="toast-msg" id="toast-msg-{toast.id}">{toast.message}</span>
+      <!-- Re-created on a repeat, so the live region announces it again and
+           the count pulses: the same failure twice must not look like one. -->
+      {#key toast.repeats}
+        <span class="toast-msg" id="toast-msg-{toast.id}">{toast.message}</span>
+        {#if toast.repeats}
+          <span class="toast-repeat">×{toast.repeats + 1}</span>
+        {/if}
+      {/key}
       {#if toast.action}
         {@const action = toast.action}
         <button
@@ -255,6 +262,24 @@
   /* Backend error strings carry hashes and full Windows paths; without
      min-width:0 a flex item won't shrink below its min-content width. */
   .toast-msg { flex: 1; min-width: 0; line-height: 1.4; overflow-wrap: anywhere; }
+  .toast-repeat {
+    flex-shrink: 0;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--tone) 16%, transparent);
+    color: var(--tone-text);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    animation: toast-repeat-pulse 420ms ease-out;
+  }
+  @keyframes toast-repeat-pulse {
+    from { transform: scale(1.35); background: color-mix(in srgb, var(--tone) 40%, transparent); }
+    to { transform: scale(1); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .toast-repeat { animation: none; }
+  }
   .toast-action {
     flex-shrink: 0;
     padding: 4px 11px;

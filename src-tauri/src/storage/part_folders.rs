@@ -56,6 +56,18 @@ struct Located {
     held: HashSet<String>,
     /// Other part file owners this run created files for.
     owners: HashSet<String>,
+    /// Bytes of each download's `.part` known to be allocated on disk, and
+    /// since when (`None`: since before this run).
+    allocated: HashMap<String, PartAllocation>,
+}
+
+/// What [`note_part_allocation`] recorded of a download's `.part`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartAllocation {
+    pub bytes: u64,
+    /// Since when at least `bytes` have been allocated; `None` from before
+    /// this run. A free-space reading taken earlier still counts them free.
+    pub since: Option<std::time::Instant>,
 }
 
 fn located() -> &'static parking_lot::Mutex<Located> {
@@ -83,6 +95,7 @@ pub fn start_over_if_held(transfer_id: &str, current: &Path) -> bool {
     located
         .folders
         .insert(transfer_id.to_string(), current.to_path_buf());
+    located.allocated.remove(transfer_id);
     true
 }
 
@@ -97,6 +110,31 @@ pub fn note_part_owner(owner: &str) {
 pub fn known_this_run(owner: &str) -> bool {
     let located = located().lock();
     located.folders.contains_key(owner) || located.owners.contains(owner)
+}
+
+/// Remember that `bytes` of this download's `.part` are allocated on disk,
+/// as read at `at` (`None`: allocated before this run). No more than was
+/// noted before keeps the earlier time: that much was allocated since then.
+pub fn note_part_allocation(transfer_id: &str, bytes: u64, at: Option<std::time::Instant>) {
+    let mut located = located().lock();
+    let since = match located.allocated.get(transfer_id) {
+        Some(known) if bytes <= known.bytes => known.since.min(at),
+        _ => at,
+    };
+    located
+        .allocated
+        .insert(transfer_id.to_string(), PartAllocation { bytes, since });
+}
+
+/// Forget what was noted of this download's `.part`: it was made anew.
+pub fn forget_part_allocation(transfer_id: &str) {
+    located().lock().allocated.remove(transfer_id);
+}
+
+/// What is known of this download's `.part` allocation: read at startup or
+/// when a worker last opened it. Non-blocking.
+pub fn part_allocation(transfer_id: &str) -> Option<PartAllocation> {
+    located().lock().allocated.get(transfer_id).copied()
 }
 
 /// The folder this download's part files were last found in. Non-blocking.
@@ -886,6 +924,40 @@ mod tests {
         assert!(start_over_if_held(&held, Path::new(&new)));
         assert_eq!(folders.folder_to_resume_in(&held), Ok(PathBuf::from(&new)));
         assert!(!start_over_if_held(&held, Path::new(&new)), "once");
+    }
+
+    /// A download started over has a new `.part`: the old one's allocation no
+    /// longer stands for it.
+    #[test]
+    fn starting_a_held_download_over_forgets_its_old_allocation() {
+        let scratch = Scratch::new();
+        let new = scratch.folder("new");
+        let offline = scratch.offline("old");
+        let folders = DownloadFolders::new(&new, std::slice::from_ref(&offline));
+        let held = uuid();
+        note_located(&held, Path::new(&offline));
+        note_part_allocation(&held, 1 << 30, None);
+        assert_eq!(folders.folder_to_resume_in(&held), Err(PathBuf::from(&offline)));
+        assert!(start_over_if_held(&held, Path::new(&new)));
+        assert_eq!(part_allocation(&held), None);
+    }
+
+    /// No more than was allocated before keeps the earlier time, since that
+    /// much has been on disk since then; more is as new as its reading.
+    #[test]
+    fn an_allocation_is_dated_from_when_that_much_was_first_seen() {
+        let id = uuid();
+        let (first, later) = (std::time::Instant::now(), std::time::Instant::now() + Duration::from_secs(5));
+        note_part_allocation(&id, 100, None);
+        note_part_allocation(&id, 100, Some(later));
+        assert_eq!(part_allocation(&id), Some(PartAllocation { bytes: 100, since: None }), "since before this run");
+
+        let id = uuid();
+        note_part_allocation(&id, 100, Some(first));
+        note_part_allocation(&id, 200, Some(later));
+        assert_eq!(part_allocation(&id), Some(PartAllocation { bytes: 200, since: Some(later) }));
+        forget_part_allocation(&id);
+        assert_eq!(part_allocation(&id), None);
     }
 
     /// For Remove from List, an unrelated folder that is not connected does

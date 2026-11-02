@@ -609,6 +609,14 @@ pub fn owner_return_waits_for_claims(
         && now.saturating_sub(held_since) < OWNER_RETURN_LOOK_MAX_SECS
 }
 
+/// The `held_since` for [`owner_return_waits_for_claims`], from the hold start
+/// recorded for the room (`held`). One from before the silence became
+/// claimable was for an earlier silence, ended by a stamp the owner pass did
+/// not make (an owner edit), so this hold starts `now`.
+pub fn owner_return_hold_start(held: Option<i64>, claimable_at: i64, now: i64) -> i64 {
+    held.filter(|&at| at >= claimable_at).unwrap_or(now)
+}
+
 /// Whether a succession claim citing `witnessed_ts` is one the members could
 /// rightly have honoured while we, the owner, were silent from `silent_from`
 /// (our last stamp before going quiet) until `silent_until` (the first after).
@@ -8347,6 +8355,20 @@ mod tests {
             !owner_return_waits_for_claims(claimable_at, None, back, back + OWNER_RETURN_LOOK_MAX_SECS),
             "a network nobody answers holds it only so long"
         );
+    }
+
+    /// A hold the owner pass recorded for an earlier silence, ended by a stamp
+    /// it did not make, is not this silence's: this one is held in full.
+    #[test]
+    fn a_hold_left_from_an_earlier_silence_does_not_shorten_the_next() {
+        let claimable_at = 5_000_000;
+        let back = claimable_at + 86_400;
+        assert_eq!(owner_return_hold_start(None, claimable_at, back), back);
+        assert_eq!(owner_return_hold_start(Some(back - 60), claimable_at, back), back - 60, "this silence's");
+        let stale = claimable_at - 30 * 86_400;
+        let held_since = owner_return_hold_start(Some(stale), claimable_at, back);
+        assert_eq!(held_since, back);
+        assert!(owner_return_waits_for_claims(claimable_at, None, held_since, back));
     }
 
     #[test]

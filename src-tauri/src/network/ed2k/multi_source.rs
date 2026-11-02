@@ -2710,6 +2710,9 @@ impl MultiSourceDownload {
                     &allowed,
                     !resuming,
                 )?;
+                if !resuming {
+                    crate::storage::part_folders::forget_part_allocation(&tid);
+                }
                 if fs > 0 && f.metadata()?.len() != fs {
                     // Sparse, so the length costs no disk space until data
                     // arrives: a download that never progresses takes none,
@@ -2718,6 +2721,13 @@ impl MultiSourceDownload {
                     // files just takes the length as before.
                     let _ = super::preview::mark_sparse(&f);
                     f.set_len(fs)?;
+                }
+                if let Ok(allocated) = super::preview::allocated_bytes(&f) {
+                    crate::storage::part_folders::note_part_allocation(
+                        &tid,
+                        allocated,
+                        Some(std::time::Instant::now()),
+                    );
                 }
                 Ok(())
             })

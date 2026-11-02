@@ -390,6 +390,14 @@ pub async fn get_connected_server(
     .await
 }
 
+/// The server last logged in to, which startup auto-connect tries first and
+/// "Connect to best server" prefers too. `None` when none is on record.
+#[tauri::command]
+pub async fn get_last_server() -> Option<crate::network::ed2k::server_list::LastEd2kServer> {
+    let path = crate::storage::paths::resolve_data_dir().join("last_ed2k_server.json");
+    crate::network::ed2k::server_list::LastEd2kServer::load(&path)
+}
+
 /// The retained eD2K server log, oldest line first.
 ///
 /// Read straight out of the replay buffer rather than through the network

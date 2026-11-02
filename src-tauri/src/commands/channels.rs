@@ -3282,6 +3282,30 @@ fn owner_pins_fit(
         >= tail.pinned_msg_ids.len()
 }
 
+/// Refuse an owner edit while the room waits for a claim lookup
+/// ([`crate::network::channel_membership::owner_edit_waits_for_claims`]).
+async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str) -> Result<(), String> {
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let waits = tokio::task::spawn_blocking(move || {
+        crate::network::channel_membership::owner_edit_waits_for_claims(
+            &db,
+            &id,
+            chrono::Utc::now().timestamp(),
+        )
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?;
+    if waits {
+        return Err(coded(
+            "channels_owner_return_pending",
+            "Ember is checking whether this room was taken over while you were away. \
+             Try again in a few minutes.",
+        ));
+    }
+    Ok(())
+}
+
 async fn commit_channel_moderation_with(
     state: &AppState,
     owned: &OwnedChannel,
@@ -3291,6 +3315,7 @@ async fn commit_channel_moderation_with(
     mods: &[[u8; 32]],
     pin_fit: PinFit,
 ) -> Result<(), String> {
+    refuse_owner_edit_during_return(state, &owned.row.channel_id).await?;
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     let our_pk = state.identity.ed25519_public_key;
     let tail = owner_moderation_tail(state, owned).await;
@@ -3856,6 +3881,8 @@ async fn rotate_and_commit(
     bans: &[[u8; 32]],
     mods: &[[u8; 32]],
 ) -> Result<(), String> {
+    // Before a key is minted, which the commit refusing would take back.
+    refuse_owner_edit_during_return(state, &owned.row.channel_id).await?;
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     if private {
         // The snapshot the commit will sign, naming the epoch about to be
@@ -4733,6 +4760,9 @@ pub async fn rename_channel(
              or unpin a message.",
         ));
     }
+    // Before the registry grants the name: past it the snapshot's refusal
+    // would leave members on the old one.
+    refuse_owner_edit_during_return(&state, &channel_id).await?;
 
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     let url = rendezvous_url(&state).await;
@@ -5668,19 +5698,22 @@ async fn probe_public_member_counts(
     // file_hash, and MAX_FIND_VALUE_KEYS would truncate the rest to a
     // confirmed 0 the UI treated as authoritative. A few at a time so the
     // 64-slot search table is not filled by one Discover pass.
-    let keys: Vec<[u8; 16]> = wanted.keys().copied().collect();
+    // Unordered: an ordered buffer keeps a finished walk's slot until every
+    // walk ahead of it is done, so one slow key would stall the rest.
     let walks: Vec<_> = {
         use futures::StreamExt;
-        futures::stream::iter(keys.clone())
-            .map(|key| find_raw_keys_within(state, vec![key], PRESENCE_PROBE_TIMEOUT_MS))
-            .buffered(PRESENCE_PROBE_CONCURRENCY)
+        futures::stream::iter(wanted.keys().copied())
+            .map(|key| async move {
+                (key, find_raw_keys_within(state, vec![key], PRESENCE_PROBE_TIMEOUT_MS).await)
+            })
+            .buffer_unordered(PRESENCE_PROBE_CONCURRENCY)
             .collect()
             .await
     };
     let mut members: HashMap<String, HashMap<[u8; 32], (i64, bool)>> = HashMap::new();
     let mut answered: HashSet<String> = HashSet::new();
     let mut any_answer = false;
-    for (key, walk) in keys.into_iter().zip(walks) {
+    for (key, walk) in walks {
         let Some(blobs) = walk.unwrap_or(None) else {
             continue;
         };

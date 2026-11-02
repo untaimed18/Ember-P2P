@@ -993,7 +993,8 @@ pub(super) struct NetworkState {
     /// so resolving by ID alone lost most of a fresh answer within the minute
     /// it took to publish against it.
     pub(super) ember_publish_targets: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)>,
-    /// Keys waiting for such a lookup, oldest first. On a small table
+    /// Keys waiting for such a lookup, oldest first, behind those a publish
+    /// waits on (see [`ember_publish_awaits_lookup_in`]). On a small table
     /// publishing never blocks on this: a key with no cached set publishes
     /// from the table now and gets a better set for its next republish.
     pub(super) ember_publish_target_queue: std::collections::VecDeque<[u8; 16]>,
@@ -1014,6 +1015,9 @@ pub(super) struct NetworkState {
     /// Held keys whose lookup has landed, waiting for the search tick to
     /// publish them.
     pub(super) ember_key_records_ready: std::collections::VecDeque<[u8; 16]>,
+    /// In-flight key-record lookups, search id to key. Apart from
+    /// `ember_publish_target_lookups`, whose count bounds the library's.
+    pub(super) ember_key_record_lookups: HashMap<u32, [u8; 16]>,
     /// Whether this session managed to read `store_ember.dat` (or found there was
     /// none to read). Only the shutdown save consults it, to tell an empty store
     /// from a file it never got to open — see `bootstrap::save_store`.
@@ -1831,8 +1835,6 @@ pub(super) struct NetworkState {
     pub(super) ember_channel_claim_searches: HashMap<u32, [u8; 16]>,
     /// Claim blobs waiting to be verified against the owner's nomination.
     pub(super) ember_pending_channel_claim: Vec<([u8; 16], Vec<Vec<u8>>)>,
-    /// When a claim lookup for a room last had an answer, by room.
-    pub(super) channel_claim_answered_at: HashMap<[u8; 16], i64>,
     /// When the owner pass first held a room's snapshot for a claim lookup,
     /// by room; see [`ember::channel::owner_return_waits_for_claims`].
     pub(super) channel_return_held_since: HashMap<[u8; 16], i64>,
