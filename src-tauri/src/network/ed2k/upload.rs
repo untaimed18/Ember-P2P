@@ -9443,9 +9443,14 @@ impl UploadHandler {
         // The Ember hash this session's binding check passed for, and whether
         // SecIdent verified this session: together they keep the binding for
         // the Known Ember Peers tab without an address to tie them (see
-        // `CreditManager::note_session_proven_ember`).
+        // `CreditManager::note_session_bound_ember`).
         let mut session_bound_ember: Option<[u8; 16]> = None;
         let mut secident_verified_here = false;
+        // Our key-link challenge to this peer, the ones we answer, and a
+        // proof waiting for its user hash's first proven SecIdent key
+        // (`super::key_link`). A verified proof ties the user hash to the
+        // identity for Ember-stream credit (`key_link::link_proven_key`).
+        let mut key_link = super::key_link::KeyLinkSession::default();
         // Reactive Ember Ed25519 challenge-response state machine.
         // Driven by inbound `OP_EMBER_AUTH_CHALLENGE` /
         // `OP_EMBER_AUTH_RESPONSE` packets dispatched from the
@@ -11006,11 +11011,25 @@ impl UploadHandler {
                     ).await;
                     if verified_here {
                         secident_verified_here = true;
-                        if let Some(eh) = session_bound_ember {
-                            self.credit_manager
-                                .write()
-                                .await
-                                .note_session_proven_ember(peer_user_hash, eh);
+                        let proven_key = {
+                            let mut cm = self.credit_manager.write().await;
+                            if let Some(eh) = session_bound_ember {
+                                cm.note_session_bound_ember(peer_user_hash, eh);
+                            }
+                            cm.proven_public_key(&peer_user_hash).map(<[u8]>::to_vec)
+                        };
+                        // A key-link proof that came before this user hash
+                        // had a proven key is checked against it now.
+                        if let Some(signer) = proven_key.and_then(|key| {
+                            key_link.note_secident(&key, &peer_user_hash, &self.user_hash)
+                        }) {
+                            super::key_link::link_proven_key(
+                                &self.credit_manager,
+                                peer_user_hash,
+                                &signer,
+                                peer_addr,
+                            )
+                            .await;
                         }
                     }
                     if relayed
@@ -14571,6 +14590,19 @@ impl UploadHandler {
                             let _ = write_packet_async(&mut writer, OP_EMULEPROT, OP_EMBER_HELLOANSWER, &payload).await;
                             ul_sent_ember_hello = true;
                         }
+                        // Ask it to prove the key it advertised, once per
+                        // session; only an Ember peer gets here.
+                        if peer_ember_hash.is_some() && peer_user_hash != [0u8; 16] {
+                            if let Some(challenge) = key_link.challenge_payload(hello_caps.is_ember) {
+                                let _ = write_packet_async(
+                                    &mut writer,
+                                    OP_EMULEPROT,
+                                    super::messages::OP_EMBER_EXT,
+                                    &challenge,
+                                )
+                                .await;
+                            }
+                        }
 
                         // Offline identity-binding verification. Since
                         // the upload reader runs in a dedicated task
@@ -14598,7 +14630,7 @@ impl UploadHandler {
                                             CreditManager::ident_ip_of(peer_addr),
                                         );
                                         if secident_verified_here {
-                                            cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                            cm.note_session_bound_ember(peer_user_hash, *peer_eh);
                                         }
                                     }
                                     // Unlock mesh + first EPX once HELLO
@@ -14752,6 +14784,59 @@ impl UploadHandler {
                             }
                             Ok(_) => {}
                             Err(e) => debug!("Failed to parse Ember exchange from {peer_addr}: {e}"),
+                        }
+                    }
+                }
+
+                // Key-link challenge and proof (`super::key_link`). Ahead of the
+                // general `OP_EMBER_EXT` arm below, which requires friend
+                // privileges: the link is for any Ember peer's credit, and the
+                // frames grant nothing but that.
+                (OP_EMULEPROT, super::messages::OP_EMBER_EXT)
+                    if super::key_link::key_link_frame(proto, opcode, &payload).is_some() =>
+                {
+                    if let Some((sub_type, body)) =
+                        super::key_link::key_link_frame(proto, opcode, &payload)
+                    {
+                        let our_key = ed25519_dalek::SigningKey::from_bytes(&self.ed25519_secret_key);
+                        let step = {
+                            let cm = self.credit_manager.read().await;
+                            let peer = super::key_link::KeyLinkPeer {
+                                is_ember: hello_caps.is_ember,
+                                advertised_ember_hash: peer_ember_hash.as_ref(),
+                                user_hash: &peer_user_hash,
+                                proven_secident_key: cm.proven_public_key(&peer_user_hash),
+                            };
+                            let us = super::key_link::KeyLinkUs {
+                                user_hash: &self.user_hash,
+                                key: &our_key,
+                                credits: &cm,
+                            };
+                            key_link.on_frame(sub_type, body, peer, us)
+                        };
+                        match step {
+                            super::key_link::KeyLinkStep::Reply(proof) => {
+                                let _ = write_packet_async(
+                                    &mut writer,
+                                    OP_EMULEPROT,
+                                    super::messages::OP_EMBER_EXT,
+                                    &proof,
+                                )
+                                .await;
+                            }
+                            super::key_link::KeyLinkStep::Proven(signer) => {
+                                super::key_link::link_proven_key(
+                                    &self.credit_manager,
+                                    peer_user_hash,
+                                    &signer,
+                                    peer_addr,
+                                )
+                                .await;
+                            }
+                            super::key_link::KeyLinkStep::AwaitingSecIdent => {
+                                debug!("Key link: proof from {peer_addr} waits for SecIdent");
+                            }
+                            super::key_link::KeyLinkStep::Ignored => {}
                         }
                     }
                 }

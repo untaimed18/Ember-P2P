@@ -4454,12 +4454,12 @@
     return permanently
       ? plural(count, {
           one: () => m.transfers_confirm_delete_finished_permanent_one({ count: formatNumber(count) }),
-          oneShowsCount: true,
+          // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
           other: () => m.transfers_confirm_delete_finished_permanent_other({ count: formatNumber(count) }),
         })
       : plural(count, {
           one: () => m.transfers_confirm_delete_finished_bin_one({ count: formatNumber(count) }),
-          oneShowsCount: true,
+          // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
           other: () => m.transfers_confirm_delete_finished_bin_other({ count: formatNumber(count) }),
         });
   }
@@ -4589,7 +4589,7 @@
     if (filter) {
       return plural(count, {
         one: () => m.transfers_confirm_batch_cancel_filtered_one({ filter, count }),
-        oneShowsCount: true,
+        // Not `oneShowsCount`: the singular speaks of one download, so Russian 21, 31, … take `other`.
         few: () => m.transfers_confirm_batch_cancel_filtered_few({ count, filter }),
         other: () => m.transfers_confirm_batch_cancel_filtered_other({ count, filter }),
       });

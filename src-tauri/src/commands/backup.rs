@@ -132,6 +132,11 @@ struct BackupFile {
     /// Copied with SQLite's `VACUUM INTO` instead of read off disk, so rows
     /// still sitting in the write-ahead log make it into the backup.
     database: bool,
+    /// Listed under [`Manifest::extra_files`] rather than `files`. Readers
+    /// that predate a file refuse an archive whose `files` names it, but ignore
+    /// the extra list, so a file added since 1.7.5 goes there and an older
+    /// Ember restores the backup without it instead of rejecting the backup.
+    listed_apart: bool,
 }
 
 const fn plain(name: &'static str) -> BackupFile {
@@ -139,6 +144,16 @@ const fn plain(name: &'static str) -> BackupFile {
         name,
         secret: false,
         database: false,
+        listed_apart: false,
+    }
+}
+
+const fn plain_apart(name: &'static str) -> BackupFile {
+    BackupFile {
+        name,
+        secret: false,
+        database: false,
+        listed_apart: true,
     }
 }
 
@@ -147,6 +162,7 @@ const fn secret(name: &'static str) -> BackupFile {
         name,
         secret: true,
         database: false,
+        listed_apart: false,
     }
 }
 
@@ -171,6 +187,7 @@ const BACKUP_FILES: &[BackupFile] = &[
         name: "ember.db",
         secret: false,
         database: true,
+        listed_apart: false,
     },
     // eMule-compatible catalogues: known files, AICH recovery data, credits.
     plain("known.met"),
@@ -188,8 +205,9 @@ const BACKUP_FILES: &[BackupFile] = &[
     // The user's own ranges, put back on every list the daily update installs,
     // and whether the installed list is the default one that update replaces.
     // Without them a restored custom list or edit lasted until that update.
-    plain("ipfilter_edits.json"),
-    plain("ipfilter_update.json"),
+    // New in 1.7.6, so listed apart: see `BackupFile::listed_apart`.
+    plain_apart("ipfilter_edits.json"),
+    plain_apart("ipfilter_update.json"),
     plain("antileech.dat"),
     plain("reputation.json"),
     plain("search_spam.json"),
@@ -363,6 +381,10 @@ struct Manifest {
     /// refuse one written by a newer Ember instead of corrupting itself.
     schema_version: i64,
     files: Vec<ManifestEntry>,
+    /// Files [`BackupFile::listed_apart`]: verified and restored exactly like
+    /// `files`, but in a list older readers do not look at.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_files: Vec<ManifestEntry>,
     /// The app window's preferences, when the backup carries them; see
     /// [`WEBVIEW_PREFS_NAME`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -831,6 +853,7 @@ fn build_archive(
         .compression_method(zip::CompressionMethod::Deflated);
 
     let mut entries = Vec::new();
+    let mut extra_entries = Vec::new();
     let mut skipped = Vec::new();
     for spec in BACKUP_FILES {
         let bytes = if spec.database {
@@ -896,12 +919,17 @@ fn build_archive(
             .map_err(|e| coded_ctx("backup_export_failed", "Failed to add a file", e))?;
         zip.write_all(&bytes)
             .map_err(|e| coded_ctx("backup_export_failed", "Failed to add a file", e))?;
-        entries.push(ManifestEntry {
+        let entry = ManifestEntry {
             name: spec.name.to_string(),
             size: bytes.len() as u64,
             blake3: blake3::hash(&bytes).to_hex().to_string(),
             rewrap: spec.secret,
-        });
+        };
+        if spec.listed_apart {
+            extra_entries.push(entry);
+        } else {
+            entries.push(entry);
+        }
     }
 
     let webview_prefs = match webview_prefs {
@@ -932,6 +960,7 @@ fn build_archive(
         created_at: chrono::Utc::now().timestamp(),
         schema_version: db.schema_version(),
         files: entries,
+        extra_files: extra_entries,
         webview_prefs,
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)
@@ -1235,7 +1264,7 @@ async fn write_backup(
             Ok(BackupSummary {
                 path: dest.to_string_lossy().to_string(),
                 bytes,
-                files: manifest.files.len(),
+                files: manifest.files.len() + manifest.extra_files.len(),
                 created_at: manifest.created_at,
                 skipped,
             })
@@ -1317,7 +1346,7 @@ fn read_manifest(archive: &mut Archive) -> Result<Manifest, String> {
         ));
     }
     let mut seen = std::collections::HashSet::new();
-    for entry in &manifest.files {
+    for entry in manifest.files.iter().chain(&manifest.extra_files) {
         if !seen.insert(entry.name.as_str()) {
             return Err(coded_ctx(
                 "backup_corrupt_archive",
@@ -1375,7 +1404,7 @@ fn read_archive(
 
     let mut total = 0u64;
     let mut out = Vec::new();
-    for entry in &manifest.files {
+    for entry in manifest.files.iter().chain(&manifest.extra_files) {
         // A file this version no longer restores. Skipped before the
         // allow-list test and never read, so an archive from a version that
         // still backed it up restores cleanly rather than being rejected
@@ -1739,6 +1768,7 @@ pub async fn preview_backup(
                 manifest
                     .files
                     .iter()
+                    .chain(&manifest.extra_files)
                     .filter(|f| !is_legacy_ignored(&f.name))
             };
             // Sizes are the manifest's word, not the archive's; a crafted one
@@ -4330,6 +4360,7 @@ mod tests {
                     rewrap: false,
                 })
                 .collect(),
+            extra_files: Vec::new(),
             webview_prefs: None,
         }
     }
@@ -4750,6 +4781,53 @@ mod tests {
             read_webview_prefs(&zip_path, &manifest).unwrap(),
             Some(sample_prefs())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1.7.5 refuses an archive whose `files` names anything it does not know,
+    /// and it does not know the IP filter's edit and update files. Listed apart,
+    /// they leave `files` to names 1.7.5 restores, so going back a version
+    /// keeps the backup usable; this build still restores them.
+    #[test]
+    fn files_newer_than_1_7_5_are_listed_where_1_7_5_does_not_look() {
+        let dir = scratch("listed-apart");
+        let entry = |name: &str, bytes: &[u8]| ManifestEntry {
+            name: name.to_string(),
+            size: bytes.len() as u64,
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+            rewrap: false,
+        };
+        let mut manifest = manifest_for(&[("config.json", b"{}")]);
+        manifest.extra_files = vec![
+            entry("ipfilter_edits.json", b"[]"),
+            entry("ipfilter_update.json", b"{}"),
+        ];
+        let in_zip: &[(&str, &[u8])] = &[
+            ("config.json", b"{}"),
+            ("ipfilter_edits.json", b"[]"),
+            ("ipfilter_update.json", b"{}"),
+        ];
+        let zip_path = write_archive(&dir, in_zip, &manifest);
+
+        let mut raw = Vec::new();
+        open_archive(&zip_path)
+            .unwrap()
+            .by_name(MANIFEST_NAME)
+            .unwrap()
+            .read_to_end(&mut raw)
+            .unwrap();
+        let previous: PreviousManifest = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            previous
+                .files
+                .iter()
+                .all(|f| backup_file(&f.name).is_some_and(|spec| !spec.listed_apart)),
+            "every name 1.7.5 checks is one it knows"
+        );
+
+        let (_, read) = read_archive(&zip_path, &dir.join("entries")).unwrap();
+        let names: Vec<&str> = read.iter().map(|e| e.spec.name).collect();
+        assert_eq!(names, vec!["config.json", "ipfilter_edits.json", "ipfilter_update.json"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

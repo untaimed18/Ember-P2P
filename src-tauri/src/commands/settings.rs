@@ -2461,7 +2461,8 @@ pub async fn download_ipfilter(
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn hide_to_tray(app: tauri::AppHandle) -> Result<(), String> {
+pub fn hide_to_tray(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     if !crate::tray::reachable() {
         // Hidden with no visible tray icon, the window could not be reached
         // again; minimized, it stays on the taskbar and in the window switcher.
@@ -2685,9 +2686,11 @@ pub fn take_pending_known_met_notice() -> Result<Option<KnownMetNotice>, String>
 #[tauri::command]
 pub async fn set_close_behavior(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     behavior: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let normalized = behavior.trim().to_ascii_lowercase();
     if normalized != "ask" && normalized != "tray" && normalized != "exit" {
         return Err(coded(
@@ -2812,10 +2815,13 @@ pub(crate) async fn save_settings_change(
 #[tauri::command]
 pub async fn set_friend_overrides(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
     overrides: crate::types::FriendOverrides,
 ) -> Result<AppSettings, String> {
+    // Opens browsing to a friend and lets their files land without a prompt.
+    crate::commands::chat_window::require_main_window(&window)?;
     let key = user_hash_hex.trim().to_ascii_lowercase();
     let mut hash = [0u8; 16];
     if !crate::types::is_friend_override_key(&key) || hex::decode_to_slice(&key, &mut hash).is_err() {
@@ -3023,9 +3029,11 @@ fn validate_quick_limits(settings: &AppSettings) -> Result<(), String> {
 #[tauri::command]
 pub async fn set_quick_limits(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     patch: QuickLimitsPatch,
 ) -> Result<AppSettings, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     apply_quick_limits(&app, &state, patch).await
 }
 

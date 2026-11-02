@@ -520,7 +520,7 @@ pub async fn run_connection_check(state: tauri::State<'_, AppState>) -> Result<C
     // is from before whatever opened it, and lasts until a login asks again.
     let s = &gathered.signals;
     if s.low_id == Some(true) && s.probe_tcp == Some(TcpProbe::Open) && !s.tcp_listen_failed {
-        gathered.signals.logging_in_again = log_in_again(&state).await;
+        gathered.signals.logging_in_again = log_in_again(&state, false).await;
     }
     let (verdict, checks, helping, fixes) = assess(&gathered.signals);
     Ok(ConnectionReport {
@@ -554,7 +554,7 @@ pub async fn connection_doctor_action(
             // A server that gave a LowID tests the port only at a login, so
             // checking again logs in again too.
             let low_id = network_stats(&state).await?.ed2k_low_id == Some(true);
-            let logged_in_again = low_id && log_in_again(&state).await;
+            let logged_in_again = low_id && log_in_again(&state, false).await;
             let (tx, rx) = tokio::sync::oneshot::channel();
             state
                 .network_tx
@@ -599,13 +599,38 @@ async fn retest_ports(state: &AppState, low_id: bool) {
     let (tx, _) = tokio::sync::oneshot::channel();
     let _ = state.network_tx.try_send(NetworkCommand::RecheckFirewall { tx });
     if low_id {
-        log_in_again(state).await;
+        // New rules are exactly what a fresh login has to see, so they are
+        // not held back by the pause between checks.
+        log_in_again(state, true).await;
     }
 }
 
+/// How long after one login the doctor asks for another. A LowID that a fresh
+/// login does not clear is a real finding; logging in on every check hid it
+/// behind "logging in again" and dropped the server connection each time.
+const RELOGIN_PAUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+static LAST_RELOGIN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Run `ask` if a login may be asked for now, and record the login only when
+/// `ask` says it went out, so a login that could not be queued does not hold
+/// back the next one. `force` skips the pause but still records the login.
+fn take_relogin_slot(force: bool, ask: impl FnOnce() -> bool) -> bool {
+    let mut last = LAST_RELOGIN.lock().unwrap_or_else(|e| e.into_inner());
+    if !force && last.is_some_and(|at| at.elapsed() < RELOGIN_PAUSE) {
+        return false;
+    }
+    let asked = ask();
+    if asked {
+        *last = Some(std::time::Instant::now());
+    }
+    asked
+}
+
 /// Log in to the eD2K server we are on again, which is when a server tests our
-/// port and hands out an ID. Returns whether a login was asked for.
-async fn log_in_again(state: &AppState) -> bool {
+/// port and hands out an ID. Returns whether a login was asked for; at most one
+/// per [`RELOGIN_PAUSE`] unless `force`.
+async fn log_in_again(state: &AppState, force: bool) -> bool {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if state.network_tx.try_send(NetworkCommand::GetConnectedServerSnapshot { tx }).is_err() {
         return false;
@@ -613,16 +638,32 @@ async fn log_in_again(state: &AppState) -> bool {
     let Ok(Some(server)) = rx.await else {
         return false;
     };
-    let (tx, _) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::ConnectToServer { ip: server.ip, port: server.port, tx })
-        .is_ok()
+    take_relogin_slot(force, || {
+        let (tx, _) = tokio::sync::oneshot::channel();
+        state
+            .network_tx
+            .try_send(NetworkCommand::ConnectToServer { ip: server.ip, port: server.port, tx })
+            .is_ok()
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A LowID a fresh login did not clear stays on screen as a finding: the
+    /// next check inside the pause does not log in again and hide it.
+    #[test]
+    fn a_second_login_waits_out_the_pause_unless_forced() {
+        *LAST_RELOGIN.lock().unwrap() = None;
+        assert!(!take_relogin_slot(false, || false), "a login that was not queued");
+        assert!(take_relogin_slot(false, || true), "does not hold back the first that is");
+        assert!(!take_relogin_slot(false, || true), "a second check inside the pause does not log in");
+        assert!(take_relogin_slot(true, || true), "new firewall rules still get their login");
+        *LAST_RELOGIN.lock().unwrap() = Some(std::time::Instant::now() - RELOGIN_PAUSE);
+        assert!(take_relogin_slot(false, || true), "after the pause a check logs in again");
+        *LAST_RELOGIN.lock().unwrap() = None;
+    }
 
     fn reachable() -> Signals {
         Signals {

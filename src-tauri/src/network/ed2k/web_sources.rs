@@ -27,9 +27,20 @@ pub const MAX_WEB_SOURCES_PER_FILE: usize = 5;
 /// on its own between two retries.
 const MAX_CONSECUTIVE_FAILURES: u32 = 4;
 
-/// Corrupt parts a source may have mostly written before it is retired. One
-/// can be bad luck shared with a peer; two from the same mirror is the mirror.
+/// Corrupt parts a source may be charged for before it is retired. One can be
+/// bad luck; two from the same mirror is the mirror.
 pub const MAX_BAD_PARTS: u32 = 2;
+
+/// Whole parts a mirror may fail while sharing them with a peer before it is
+/// retired anyway. Below this a poisoning peer cannot cost an honest mirror its
+/// place; without a ceiling, a bad mirror on a file with no AICH data whose
+/// parts a peer always shares had the same part fail for ever.
+pub const MAX_SHARED_BAD_PARTS: u32 = 4;
+
+/// The narrowest range a failed check can name: one AICH block. A failed range
+/// no wider is block-granular evidence, from AICH narrowing or a part that
+/// small; a wider one is a whole part that only says some byte in it is wrong.
+const BLOCK_EVIDENCE: u64 = super::aich::AICH_BLOCK_SIZE as u64;
 
 /// Written ranges kept per source, merged. Past this a source stops being
 /// recorded rather than grow without bound, and goes unblamed for what it
@@ -51,8 +62,11 @@ struct WebSource {
     /// Kept here rather than in a worker, so a part judged after the worker
     /// moved on, or finished by a peer, is still held against the mirror.
     written: Vec<(u64, u64)>,
-    /// Corrupt parts this source wrote most of, over the session.
+    /// Corrupt parts this source was charged for, over the session.
     bad_parts: u32,
+    /// Corrupt parts it wrote most of with another source writing into them
+    /// too. Only suspicion: never retires it.
+    shared_bad_parts: u32,
 }
 
 impl WebSource {
@@ -64,6 +78,7 @@ impl WebSource {
             retired: false,
             written: Vec::new(),
             bad_parts: 0,
+            shared_bad_parts: 0,
         }
     }
 }
@@ -269,13 +284,18 @@ pub fn has_ready(file_hash: &[u8; 16]) -> bool {
     !ready(file_hash).is_empty()
 }
 
-/// Whether `url` has been given up on for `file_hash` this session.
+/// Whether `url` has been given up on for `file_hash` this session: retired,
+/// or no longer held at all because a new mirror took its place
+/// ([`register_replacing_retired`]) or the download let its sources go. Its
+/// worker stops on either. Read as "not retired", a replaced mirror retired
+/// for bad data kept fetching with its writes no longer recorded, so nothing
+/// it spoiled was ever charged to it.
 pub fn is_retired(file_hash: &[u8; 16], url: &str) -> bool {
     registry()
         .read()
         .get(file_hash)
         .and_then(|sources| sources.iter().find(|s| s.url == url))
-        .is_some_and(|s| s.retired)
+        .is_none_or(|s| s.retired)
 }
 
 /// How long a source rests after its `failures`-th failure in a row.
@@ -339,30 +359,87 @@ pub fn note_written(file_hash: &[u8; 16], url: &str, ranges: &[(u64, u64)]) {
     }
 }
 
-/// A part check failed over `[start, end)`, whoever finished the part. Every
-/// source that wrote at least half of it is charged a bad part, and retired
-/// at [`MAX_BAD_PARTS`]; what any source wrote there is forgotten, since it is
-/// downloaded again. Returns the URLs this retired, for the caller to stop
-/// keeping with the download, so a restart does not bring them back.
-pub fn note_corrupt_range(file_hash: &[u8; 16], start: u64, end: u64) -> Vec<String> {
-    let mut retired = Vec::new();
+/// What a failed part check did to the web sources of the file.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CorruptVerdict {
+    /// Retired by it, for the caller to stop keeping with the download, so a
+    /// restart does not bring them back.
+    pub retired: Vec<String>,
+    /// Wrote most of a whole part another source wrote into too, so only
+    /// suspected, with how many such parts they have now been suspected of.
+    pub suspected: Vec<(String, u32)>,
+}
+
+/// A part check failed over `[start, end)`, whoever finished the part.
+/// `peers_wrote`: a peer is on record for bytes there. What any source wrote
+/// there is forgotten, since it is downloaded again.
+///
+/// - A range of at most one AICH block (narrowed by AICH, or a part that
+///   small) charges a bad part to every mirror that wrote at least half of it.
+/// - A wider range is a whole part, and only says some byte in it is wrong.
+///   - With no peer on record there and mirrors having written most of it
+///     between them, every mirror that wrote into it is charged: nobody else
+///     can have sent the bad bytes, and sparing mirrors that split a part let
+///     a bad one fail the same part for ever.
+///   - With a peer there, a mirror that wrote all of it is charged, and one
+///     that wrote at least half is only suspected: the mirror is usually the
+///     faster one and writes most of a part it shares, so one poisoning peer
+///     could otherwise get an honest mirror retired and deleted, as a peer is
+///     blamed only for a part it wrote whole. Suspicion retires it at
+///     [`MAX_SHARED_BAD_PARTS`], so a bad mirror cannot fail parts for ever.
+///
+/// A source is retired at [`MAX_BAD_PARTS`].
+pub fn note_corrupt_range(file_hash: &[u8; 16], start: u64, end: u64, peers_wrote: bool) -> CorruptVerdict {
+    let mut verdict = CorruptVerdict::default();
+    let len = end.saturating_sub(start);
+    if len == 0 {
+        return verdict;
+    }
     let mut map = registry().write();
     let Some(sources) = map.get_mut(file_hash) else {
-        return retired;
+        return verdict;
     };
+    let whole_part = len > BLOCK_EVIDENCE;
+    let mirrors_wrote = sources
+        .iter()
+        .fold(0u64, |total, s| total.saturating_add(overlap(&s.written, start, end)));
+    // With no peer on record, the part is the mirrors' if they wrote most of
+    // it between them; otherwise most of it came from where nothing is on
+    // record (a resumed `.part`), which says nothing about them.
+    let mirrors_part = !peers_wrote && mirrors_wrote.saturating_mul(2) >= len;
     for source in sources.iter_mut() {
         let wrote = overlap(&source.written, start, end);
         remove_range(&mut source.written, start, end);
-        if wrote == 0 || wrote.saturating_mul(2) < end.saturating_sub(start) {
+        let most = wrote.saturating_mul(2) >= len;
+        let charged = if wrote == 0 {
+            false
+        } else if !whole_part {
+            most
+        } else if wrote == len || mirrors_part {
+            true
+        } else if !peers_wrote {
+            false
+        } else if most {
+            source.shared_bad_parts = source.shared_bad_parts.saturating_add(1);
+            verdict.suspected.push((source.url.clone(), source.shared_bad_parts));
+            if source.shared_bad_parts >= MAX_SHARED_BAD_PARTS && !source.retired {
+                source.retired = true;
+                verdict.retired.push(source.url.clone());
+            }
+            false
+        } else {
+            false
+        };
+        if !charged {
             continue;
         }
         source.bad_parts = source.bad_parts.saturating_add(1);
         if source.bad_parts >= MAX_BAD_PARTS && !source.retired {
             source.retired = true;
-            retired.push(source.url.clone());
+            verdict.retired.push(source.url.clone());
         }
     }
-    retired
+    verdict
 }
 
 /// A part check passed over `[start, end)`: what any source wrote there has its
@@ -474,7 +551,7 @@ mod tests {
         let part = 9_728_000u64;
         for _ in 0..MAX_BAD_PARTS {
             note_written(&hash, &bad, &[(0, part)]);
-            note_corrupt_range(&hash, 0, part);
+            note_corrupt_range(&hash, 0, part, false);
         }
         assert!(is_retired(&hash, &dead) && is_retired(&hash, &bad));
 
@@ -514,21 +591,136 @@ mod tests {
 
         note_written(&hash, &bad, &[(0, part / 2), (part / 2, part)]);
         note_written(&hash, &good, &[(part, part + 1000)]);
-        assert!(note_corrupt_range(&hash, 0, part).is_empty(), "one bad part rests nothing");
-        assert_eq!(bad_parts(&hash, &bad), 1);
+        assert_eq!(note_corrupt_range(&hash, 0, part, true), CorruptVerdict::default(), "one bad part rests nothing");
+        assert_eq!(bad_parts(&hash, &bad), 1, "it wrote all of it, so a peer on record does not matter");
         assert_eq!(bad_parts(&hash, &good), 0, "it wrote nothing there");
 
         note_written(&hash, &bad, &[(part, part + part / 4)]);
-        assert!(
-            note_corrupt_range(&hash, part, 2 * part).is_empty(),
+        assert_eq!(
+            note_corrupt_range(&hash, part, 2 * part, false),
+            CorruptVerdict::default(),
             "a quarter of a part says little about the mirror"
         );
         note_written(&hash, &bad, &[(0, part)]);
-        assert_eq!(note_corrupt_range(&hash, 0, part), vec![bad.clone()]);
+        assert_eq!(note_corrupt_range(&hash, 0, part, false).retired, vec![bad.clone()]);
         assert!(is_retired(&hash, &bad));
         assert!(!ready(&hash).contains(&bad));
-        assert!(note_corrupt_range(&hash, 0, part).is_empty(), "retired once");
+        assert!(note_corrupt_range(&hash, 0, part, false).retired.is_empty(), "retired once");
         forget(&hash);
+    }
+
+    /// The report this exists for: a mirror writes 90% of a part a poisoning
+    /// peer wrote the other 10% of, and the part fails with no AICH narrowing.
+    /// The mirror is only suspected, and outlasts more such parts than an
+    /// outright charge allows, but not for ever: a bad mirror that always
+    /// shares its parts with a peer must not fail them indefinitely.
+    #[test]
+    fn a_mirror_sharing_failed_parts_with_a_peer_is_retired_only_after_many() {
+        let hash = [0xCF; 16];
+        clear_for_tests(&hash);
+        let mirror = "https://mirror.example/f".to_string();
+        register(hash, [mirror.clone()]);
+        let part = 9_728_000u64;
+        let peer_share = part / 10;
+        for round in 1..MAX_SHARED_BAD_PARTS {
+            note_written(&hash, &mirror, &[(peer_share, part)]);
+            let verdict = note_corrupt_range(&hash, 0, part, true);
+            assert!(verdict.retired.is_empty(), "round {round}");
+            assert_eq!(verdict.suspected, vec![(mirror.clone(), round)]);
+        }
+        const { assert!(MAX_SHARED_BAD_PARTS > MAX_BAD_PARTS) };
+        assert_eq!(bad_parts(&hash, &mirror), 0);
+        assert!(!is_retired(&hash, &mirror));
+        assert!(ready(&hash).contains(&mirror));
+
+        note_written(&hash, &mirror, &[(peer_share, part)]);
+        let verdict = note_corrupt_range(&hash, 0, part, true);
+        assert_eq!(verdict.retired, vec![mirror.clone()], "the ceiling ends the loop");
+        assert!(is_retired(&hash, &mirror));
+        forget(&hash);
+    }
+
+    /// With no peer in a failed part, only mirrors can have sent the bad
+    /// bytes, so each that wrote into it is charged, however the part was
+    /// split. Sparing them let a bad mirror splitting a one-part file with a
+    /// good one fail that part for ever.
+    #[test]
+    fn mirrors_splitting_a_failed_part_without_a_peer_are_all_charged() {
+        let hash = [0xD0; 16];
+        clear_for_tests(&hash);
+        let a = "https://a.example/f".to_string();
+        let b = "https://b.example/f".to_string();
+        register(hash, [a.clone(), b.clone()]);
+        let part = 9_728_000u64;
+        // Uneven: the one that wrote less is charged too.
+        note_written(&hash, &a, &[(0, part * 3 / 5)]);
+        note_written(&hash, &b, &[(part * 3 / 5, part)]);
+        let verdict = note_corrupt_range(&hash, 0, part, false);
+        assert!(verdict.suspected.is_empty());
+        assert_eq!((bad_parts(&hash, &a), bad_parts(&hash, &b)), (1, 1));
+
+        note_written(&hash, &a, &[(0, part / 2)]);
+        note_written(&hash, &b, &[(part / 2, part)]);
+        let mut retired = note_corrupt_range(&hash, 0, part, false).retired;
+        retired.sort();
+        assert_eq!(retired, vec![a.clone(), b.clone()], "the download stops looping");
+        forget(&hash);
+    }
+
+    /// A peer's share keeps a mirror that wrote only part of a failed whole
+    /// part to suspicion, while a mirror that wrote the whole part is charged.
+    #[test]
+    fn a_mirror_that_wrote_a_whole_failed_part_is_charged_even_beside_a_peer() {
+        let hash = [0xD3; 16];
+        clear_for_tests(&hash);
+        let mirror = "https://mirror.example/f".to_string();
+        register(hash, [mirror.clone()]);
+        let part = 9_728_000u64;
+        note_written(&hash, &mirror, &[(0, part)]);
+        assert!(note_corrupt_range(&hash, 0, part, true).suspected.is_empty());
+        assert_eq!(bad_parts(&hash, &mirror), 1);
+        forget(&hash);
+    }
+
+    /// AICH narrowing names one block, so the mirror that wrote most of a
+    /// block it names is charged as before, a peer beside it or not.
+    #[test]
+    fn an_aich_narrowed_block_charges_the_mirror_that_wrote_most_of_it() {
+        let hash = [0xD1; 16];
+        clear_for_tests(&hash);
+        let mirror = "https://mirror.example/f".to_string();
+        register(hash, [mirror.clone()]);
+        let block = BLOCK_EVIDENCE;
+        let start = 5 * block;
+        note_written(&hash, &mirror, &[(start, start + block * 3 / 5)]);
+        assert_eq!(note_corrupt_range(&hash, start, start + block, true), CorruptVerdict::default());
+        assert_eq!(bad_parts(&hash, &mirror), 1);
+        note_written(&hash, &mirror, &[(start, start + block * 3 / 5)]);
+        assert_eq!(note_corrupt_range(&hash, start, start + block, true).retired, vec![mirror.clone()]);
+        forget(&hash);
+    }
+
+    /// A mirror that gave its place to a new one is as good as retired, so its
+    /// worker stops rather than fetch on with nothing it writes recorded.
+    #[test]
+    fn a_replaced_mirror_reads_as_retired() {
+        let hash = [0xD2; 16];
+        clear_for_tests(&hash);
+        let held: Vec<String> = (0..MAX_WEB_SOURCES_PER_FILE).map(|i| format!("https://m{i}.example/f")).collect();
+        register(hash, held.clone());
+        let part = 9_728_000u64;
+        for _ in 0..MAX_BAD_PARTS {
+            note_written(&hash, &held[0], &[(0, part)]);
+            note_corrupt_range(&hash, 0, part, true);
+        }
+        assert!(is_retired(&hash, &held[0]));
+        let registered = register_replacing_retired(hash, ["https://new.example/f".to_string()]);
+        assert_eq!(registered.replaced, vec![held[0].clone()]);
+        assert!(is_retired(&hash, &held[0]), "no longer held");
+        assert!(!is_retired(&hash, &held[1]));
+        assert!(!is_retired(&hash, "https://new.example/f"));
+        forget(&hash);
+        assert!(is_retired(&hash, &held[1]), "the download let its sources go");
     }
 
     /// A verified part's writes have their verdict, so they no longer count

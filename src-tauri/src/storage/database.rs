@@ -444,6 +444,10 @@ pub type CreditRowRef<'a> = (
     u32,
 );
 
+/// One `credit_key_links` row: user hash, the Ember node id its key-link
+/// proof named, and the SecIdent key the user hash was proven under then.
+pub type CreditKeyLink = ([u8; 16], [u8; 16], Vec<u8>);
+
 /// Borrowed `ember_credits` row, in `load_ember_credits` column order.
 pub type EmberCreditRowRef<'a> = (&'a [u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool);
 
@@ -3614,6 +3618,9 @@ impl Database {
             "language2",
             "TEXT NOT NULL DEFAULT ''",
         )?;
+        // Key links for Ember-stream credit, also outside the chain: a table
+        // 1.7.5 never names, so its backups and downgrades are untouched.
+        Self::ensure_credit_key_links_locked(&conn)?;
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -5920,6 +5927,24 @@ impl Database {
         Ok(())
     }
 
+    /// The Ember node id each peer's key signed a key-link proof for
+    /// (`CreditRecord::signed_ember_hash`), with the SecIdent key the user
+    /// hash was proven under on that session. What Ember-stream credit is
+    /// keyed on, so kept apart from `credit_ember_links`, whose rows builds
+    /// before 1.7.6 wrote from a replayable public key. A table of its own
+    /// for the reason that table is: no numbered migration, so a backup
+    /// still restores on 1.7.5, which never reads it.
+    fn ensure_credit_key_links_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS credit_key_links (
+                user_hash BLOB PRIMARY KEY,
+                ember_hash BLOB NOT NULL,
+                secident_key BLOB NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
     /// Content the Library has already decided about for the `[Ember-P2P]`
     /// tag on new shared files, by eD2K hash: tagged then, or already there
     /// when the setting was turned on. A table of its own, as
@@ -6009,6 +6034,62 @@ impl Database {
             for (user_hash, ember_hash) in links {
                 match ember_hash {
                     Some(eh) => upsert.execute(params![&user_hash[..], &eh[..]])?,
+                    None => delete.execute(params![&user_hash[..]])?,
+                };
+            }
+            for user_hash in removed {
+                delete.execute(params![&user_hash[..]])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every stored key link: `(user_hash, ember_hash, secident_key)`.
+    pub fn load_credit_key_links(&self) -> anyhow::Result<Vec<CreditKeyLink>> {
+        let conn = self.conn.lock();
+        Self::ensure_credit_key_links_locked(&conn)?;
+        let mut stmt =
+            conn.prepare("SELECT user_hash, ember_hash, secident_key FROM credit_key_links")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .filter_map(|row| {
+                let (user_hash, ember_hash, secident_key) = row.ok()?;
+                Some((user_hash.try_into().ok()?, ember_hash.try_into().ok()?, secident_key))
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// [`Self::save_credit_ember_links`] for the key links: `Some` stores one,
+    /// `None` and `removed` clear one, and `full_sync` first clears the table.
+    pub fn save_credit_key_links(
+        &self,
+        links: &[([u8; 16], Option<([u8; 16], Vec<u8>)>)],
+        removed: &[[u8; 16]],
+        full_sync: bool,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_credit_key_links_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        if full_sync {
+            tx.execute("DELETE FROM credit_key_links", [])?;
+        }
+        {
+            let mut upsert = tx.prepare(
+                "INSERT OR REPLACE INTO credit_key_links (user_hash, ember_hash, secident_key)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            let mut delete = tx.prepare("DELETE FROM credit_key_links WHERE user_hash = ?1")?;
+            for (user_hash, link) in links {
+                match link {
+                    Some((eh, key)) => upsert.execute(params![&user_hash[..], &eh[..], key])?,
                     None => delete.execute(params![&user_hash[..]])?,
                 };
             }
@@ -18870,6 +18951,65 @@ mod tests {
 
         db.save_credit_ember_links(&[(a, Some([0xA2; 16]))], &[], true).unwrap();
         assert_eq!(db.load_credit_ember_links().unwrap(), vec![(a, [0xA2; 16])]);
+    }
+
+    /// A database from before key links (1.7.5's) gets `credit_key_links` at
+    /// open, with the schema version left where 1.7.5 can still open it, and
+    /// its rows follow the flushed credit rows as the display links do.
+    #[test]
+    fn credit_key_links_are_added_at_open_without_a_schema_bump() {
+        let path = temp_db_path("key-links");
+        let db = Database::open_at(&path).expect("open");
+        db.save_credit_ember_links(&[([9u8; 16], Some([0x99; 16]))], &[], false).unwrap();
+        db.conn
+            .lock()
+            .execute_batch("DROP TABLE credit_key_links;")
+            .expect("back to 1.7.5");
+        drop(db);
+
+        let db = Database::open_at(&path).expect("reopen");
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 62, "1.7.5 has to open this database");
+        let tables: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'credit_key_links'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1, "created at open");
+        assert!(db.load_credit_key_links().unwrap().is_empty());
+        assert_eq!(
+            db.load_credit_ember_links().unwrap(),
+            vec![([9u8; 16], [0x99; 16])],
+            "the display links are untouched"
+        );
+
+        let (a, b, c) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+        db.save_credit_key_links(
+            &[(a, Some(([0xA1; 16], b"rsa-a".to_vec()))), (b, Some(([0xB1; 16], b"rsa-b".to_vec())))],
+            &[],
+            false,
+        )
+        .unwrap();
+        let mut links = db.load_credit_key_links().unwrap();
+        links.sort();
+        assert_eq!(
+            links,
+            vec![(a, [0xA1; 16], b"rsa-a".to_vec()), (b, [0xB1; 16], b"rsa-b".to_vec())]
+        );
+        db.save_credit_key_links(&[(a, None), (c, Some(([0xC1; 16], b"rsa-c".to_vec())))], &[b], false)
+            .unwrap();
+        assert_eq!(db.load_credit_key_links().unwrap(), vec![(c, [0xC1; 16], b"rsa-c".to_vec())]);
+        db.save_credit_key_links(&[(a, Some(([0xA2; 16], b"rsa-a".to_vec())))], &[], true).unwrap();
+        assert_eq!(db.load_credit_key_links().unwrap(), vec![(a, [0xA2; 16], b"rsa-a".to_vec())]);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     /// A download's part folder lives in a table of its own, not a column of

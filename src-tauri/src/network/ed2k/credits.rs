@@ -322,7 +322,23 @@ pub struct CreditRecord {
     /// is the friend-proven link and is what friend recognition reads; this
     /// never displaces it and nothing that grants, scores or recognises a
     /// peer reads this. Set by [`CreditManager::promote_proven_ember`].
+    ///
+    /// It proves only that the user hash's owner *presented* this identity's
+    /// public key, which anyone can replay; it is never evidence that the
+    /// owner holds the Ember key. Ember-stream credit reads
+    /// [`Self::signed_ember_hash`] instead.
     pub proven_ember_hash: Option<[u8; 16]>,
+    /// Ember identity whose key signed a key-link proof for this user hash
+    /// (`super::key_link`) that this record's proven SecIdent key co-signed.
+    /// Set by [`CreditManager::note_session_proven_ember`]; what Ember-stream
+    /// credit ([`CreditManager::add_downloaded_over_ember`]) is keyed on.
+    ///
+    /// Persisted in its own table beside the SecIdent key it was proven
+    /// under, and restored only while that is still this record's key
+    /// ([`CreditManager::restore_signed_ember_hash`]). The display table that
+    /// holds `proven_ember_hash` is never read for it: older builds wrote
+    /// rows there under the binding-only rule.
+    signed_ember_hash: Option<[u8; 16]>,
     /// Whether `public_key` has answered one of our challenges — eMule's
     /// "the key is in `CreditStruct`" (`CClientCredits::Verified`).
     ///
@@ -426,6 +442,7 @@ impl CreditRecord {
             client_software: String::new(),
             seen_ip: 0,
             proven_ember_hash: None,
+            signed_ember_hash: None,
             key_proven: false,
         }
     }
@@ -441,6 +458,15 @@ impl CreditRecord {
         }
     }
 
+    /// The key-link to write to disk: the Ember identity
+    /// [`Self::signed_ember_hash`] names and the SecIdent key it was proven
+    /// under, which a restore requires to still be the record's.
+    pub fn signed_ember_link(&self) -> Option<([u8; 16], &[u8])> {
+        let ember_hash = self.signed_ember_hash?;
+        let key = self.persisted_public_key();
+        (!key.is_empty()).then_some((ember_hash, key))
+    }
+
     /// Nothing here is worth keeping over a stranger's record: no bytes in
     /// either direction, no key that ever proved itself, no Ember link.
     /// Every Hello creates one of these, so they are what the
@@ -451,6 +477,7 @@ impl CreditRecord {
             && !self.crypto_verified_once
             && self.ember_hash.is_none()
             && self.proven_ember_hash.is_none()
+            && self.signed_ember_hash.is_none()
     }
 }
 
@@ -1453,6 +1480,30 @@ impl CreditManager {
         )
     }
 
+    /// Our SecIdent RSA signature over a key-link RSA input
+    /// (`super::key_link`). Signs nothing else: the input must be exactly
+    /// that length and carry the key-link domain, so this cannot be turned
+    /// into a general signer for our SecIdent key. Empty without a key.
+    pub(super) fn sign_key_link(&self, rsa_input: &[u8]) -> Vec<u8> {
+        if !self.crypto_available
+            || rsa_input.len() != super::key_link::KEY_LINK_RSA_INPUT_LEN
+            || !rsa_input.starts_with(super::key_link::KEY_LINK_DOMAIN)
+        {
+            return Vec::new();
+        }
+        secident_rsa_sign(&self.our_private_key, rsa_input)
+    }
+
+    /// The SecIdent key on record for `user_hash`, if it has answered one of
+    /// our challenges, in this run or one before
+    /// ([`CreditRecord::key_proven`]): the key whose holder owns the hash.
+    pub fn proven_public_key(&self, user_hash: &[u8; 16]) -> Option<&[u8]> {
+        self.credits
+            .get(user_hash)
+            .filter(|record| record.key_proven && !record.public_key.is_empty())
+            .map(|record| record.public_key.as_slice())
+    }
+
     pub fn verify_signature(
         &self,
         user_hash: &[u8; 16],
@@ -1586,14 +1637,38 @@ impl CreditManager {
         cm
     }
 
-    /// Whether `ember_hash` is proven to own `user_hash`: SecIdent vouched for
-    /// the link ([`CreditRecord::proven_ember_hash`]), and no other identity
-    /// holds the persisted friend link. A Noise session proves only the Ember
-    /// key; the user hash in its HELLO is still a claim without this.
+    /// Whether the owner of `user_hash` has presented `ember_hash` as its
+    /// Ember identity: a session (or address) that passed SecIdent for the
+    /// user hash also showed a public key hashing to `ember_hash`
+    /// ([`CreditRecord::proven_ember_hash`], restored from disk too), and no
+    /// other identity holds the persisted friend link.
+    ///
+    /// It does not show the owner holds that Ember key: a public key can be
+    /// replayed. That is enough to let a Noise session, which proves the key
+    /// itself, vouch for the user hash in its HELLO, since a forged link only
+    /// hands the forger's own hash to the real key holder. It is not enough to
+    /// credit the Ember identity's bytes to the hash; that is
+    /// [`Self::ember_key_proven_for`].
     pub fn ember_identity_proven_for(&self, user_hash: &[u8; 16], ember_hash: &[u8; 16]) -> bool {
         *ember_hash != [0u8; 16]
             && self.credits.get(user_hash).is_some_and(|record| {
                 record.proven_ember_hash == Some(*ember_hash)
+                    && record.ember_hash.is_none_or(|bound| bound == *ember_hash)
+            })
+    }
+
+    /// Whether `user_hash` is proven to belong to whoever holds the Ember key
+    /// of `ember_hash`: that key and the user hash's proven SecIdent key both
+    /// signed a key-link proof naming the hash
+    /// ([`Self::note_session_proven_ember`]), now or in an earlier run under
+    /// the SecIdent key the record still holds
+    /// ([`Self::restore_signed_ember_hash`]), and no other identity holds the
+    /// persisted friend link. Display links ([`Self::ember_identity_proven_for`])
+    /// never count.
+    pub fn ember_key_proven_for(&self, user_hash: &[u8; 16], ember_hash: &[u8; 16]) -> bool {
+        *ember_hash != [0u8; 16]
+            && self.credits.get(user_hash).is_some_and(|record| {
+                record.signed_ember_hash == Some(*ember_hash)
                     && record.ember_hash.is_none_or(|bound| bound == *ember_hash)
             })
     }
@@ -1632,9 +1707,35 @@ impl CreditManager {
     /// Put back a stored [`CreditRecord::proven_ember_hash`]. Like
     /// [`Self::insert_loaded_credit`] it leaves `last_seen` and the save
     /// state alone, and a link to a record no longer held is dropped.
+    ///
+    /// Display only: the stored table also holds links older builds made from
+    /// a replayable public key, so a restored link never earns Ember-stream
+    /// credit ([`CreditRecord::signed_ember_hash`] stays unset).
     pub fn restore_proven_ember_hash(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16]) {
         if let Some(record) = self.credits.get_mut(&user_hash) {
             record.proven_ember_hash = Some(ember_hash);
+        }
+    }
+
+    /// Put back a stored [`CreditRecord::signed_ember_hash`], proven in an
+    /// earlier run under the SecIdent key `secident_key`. Taken only if the
+    /// record still holds that key as its proven one: a record that expired
+    /// and came back, perhaps under someone else's key, does not inherit it.
+    /// Leaves `last_seen` and the save state alone, like
+    /// [`Self::restore_proven_ember_hash`].
+    pub fn restore_signed_ember_hash(
+        &mut self,
+        user_hash: [u8; 16],
+        ember_hash: [u8; 16],
+        secident_key: &[u8],
+    ) {
+        if ember_hash == [0u8; 16] || secident_key.is_empty() {
+            return;
+        }
+        if let Some(record) = self.credits.get_mut(&user_hash) {
+            if record.key_proven && record.public_key == secident_key {
+                record.signed_ember_hash = Some(ember_hash);
+            }
         }
     }
 
@@ -1687,7 +1788,10 @@ impl CreditManager {
     /// itself: its Ember binding, and SecIdent for `user_hash`. The session
     /// ties the two as a shared address does there, and it is the only tie a
     /// relayed or IPv6 session has, since both record address 0.
-    pub fn note_session_proven_ember(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16]) {
+    ///
+    /// Display only, like the address tie: the binding is a public key anyone
+    /// can replay, so this never earns Ember-stream credit.
+    pub fn note_session_bound_ember(&mut self, user_hash: [u8; 16], ember_hash: [u8; 16]) {
         if user_hash == [0u8; 16] || ember_hash == [0u8; 16] {
             return;
         }
@@ -1698,6 +1802,65 @@ impl CreditManager {
             self.mark_credit_unsaved(user_hash);
             if let Some(record) = self.credits.get_mut(&user_hash) {
                 record.proven_ember_hash = Some(ember_hash);
+            }
+        }
+    }
+
+    /// Tie `user_hash` to the Ember identity of `signer` for Ember-stream
+    /// credit. `signer` comes from a key-link proof (`super::key_link`) whose
+    /// two signatures cover the same statement, "this Ember key and this
+    /// SecIdent key belong to user hash `user_hash`": one by the Ember key,
+    /// one by the SecIdent key on record for the hash. The link is keyed on
+    /// the hash derived from the Ember key that signed, never on the one the
+    /// session advertised.
+    ///
+    /// Requires the record's key to be proven (SecIdent verified it, in this
+    /// run or an earlier one) and to be the key the proof's RSA signature
+    /// was checked against, so a proof never applies to a record holding
+    /// another. SecIdent need not have run on the proof's own session.
+    /// The newest proof for an identity wins: the same key holder proving a
+    /// second user hash (a reinstall, say) moves the link rather than leaving
+    /// both, which would credit neither. Saved with the record
+    /// ([`CreditRecord::signed_ember_link`]); it also fills the display link.
+    pub fn note_session_proven_ember(
+        &mut self,
+        user_hash: [u8; 16],
+        signer: &super::key_link::ProvenEmberKey,
+    ) {
+        let ember_hash = signer.ember_hash();
+        if user_hash == [0u8; 16] || ember_hash == [0u8; 16] {
+            return;
+        }
+        let proven = self.credits.get(&user_hash).is_some_and(|record| {
+            record.key_proven && signer.secident_key_matches(&record.public_key)
+        });
+        if !proven {
+            return;
+        }
+        if self.credits.get(&user_hash).and_then(|r| r.proven_ember_hash) != Some(ember_hash) {
+            self.mark_credit_unsaved(user_hash);
+            if let Some(record) = self.credits.get_mut(&user_hash) {
+                record.proven_ember_hash = Some(ember_hash);
+            }
+        }
+        let superseded: Vec<[u8; 16]> = self
+            .credits
+            .iter()
+            .filter(|(other, record)| {
+                **other != user_hash && record.signed_ember_hash == Some(ember_hash)
+            })
+            .map(|(other, _)| *other)
+            .collect();
+        for other in superseded {
+            self.mark_credit_unsaved(other);
+            if let Some(record) = self.credits.get_mut(&other) {
+                record.signed_ember_hash = None;
+            }
+        }
+        if self.credits.get(&user_hash).and_then(|r| r.signed_ember_hash) != Some(ember_hash) {
+            self.mark_credit_unsaved(user_hash);
+            if let Some(record) = self.credits.get_mut(&user_hash) {
+                record.signed_ember_hash = Some(ember_hash);
             }
         }
     }
@@ -1727,14 +1890,14 @@ impl CreditManager {
             })
     }
 
-    /// The one eD2K user hash the Ember identity `ember_hash` is proven to own
-    /// ([`Self::ember_identity_proven_for`]), or `None` when none is, or when
-    /// more than one is and the bytes could belong to either.
+    /// The one eD2K user hash proven to belong to the holder of the Ember key
+    /// of `ember_hash` ([`Self::ember_key_proven_for`]), or `None` when none
+    /// is, or when more than one is and the bytes could belong to either.
     fn proven_user_hash_of(&self, ember_hash: &[u8; 16]) -> Option<[u8; 16]> {
         let mut proven = self
             .credits
             .keys()
-            .filter(|user_hash| self.ember_identity_proven_for(user_hash, ember_hash));
+            .filter(|user_hash| self.ember_key_proven_for(user_hash, ember_hash));
         let first = *proven.next()?;
         proven.next().is_none().then_some(first)
     }
@@ -1742,10 +1905,19 @@ impl CreditManager {
     /// Bytes the Ember identity `ember_hash` sent us over one of Ember's own
     /// streams (a feed, a chat file, a room transfer), each checked against
     /// what was offered before it was kept. Credited to the eD2K user hash
-    /// that identity is proven to own, so its uploads earn it the same place
-    /// in our queue as bytes sent over eD2K would; nothing for an identity
-    /// with no proven user hash. Judged by the record's stored state: the
-    /// stream itself proved the identity, and SecIdent the link.
+    /// that identity's key holder is proven to own, so its uploads earn it the
+    /// same place in our queue as bytes sent over eD2K would.
+    ///
+    /// The stream proved the identity; the link must have been proven by a
+    /// key-link proof that the Ember key and the user hash's proven SecIdent
+    /// key both signed, naming that user hash and ours
+    /// ([`Self::note_session_proven_ember`]), this run or an earlier one.
+    /// Presenting the identity's public key is not enough, and display links
+    /// (including every link builds before 1.7.6 stored) do not count, so
+    /// nothing is credited for an identity without such a proof, and a
+    /// stranger who replays a publisher's key, or relays its SecIdent
+    /// answers, can neither take its bytes nor, by making the match ambiguous
+    /// or replacing the link, void them.
     pub fn add_downloaded_over_ember(&mut self, ember_hash: &[u8; 16], bytes: u64) -> bool {
         match self.proven_user_hash_of(ember_hash) {
             Some(user_hash) if bytes > 0 => self.add_downloaded(user_hash, 0, bytes),
@@ -2253,6 +2425,7 @@ impl CreditManager {
                 // which is the primary store, does.
                 seen_ip: 0,
                 proven_ember_hash: None,
+                signed_ember_hash: None,
                 // Settled by `insert_loaded_credit` once the anchor is known.
                 key_proven: false,
             };
@@ -2593,6 +2766,13 @@ fn normalize_public_key_to_spki(pub_der: &[u8]) -> Option<Vec<u8>> {
     Some(spki.as_ref().to_vec())
 }
 
+/// The longest peer key a SecIdent answer signs over, the one-byte length its
+/// `OP_PUBLICKEY` frame carries. Held here as well as at the wire parser
+/// because the key link rests on it: no SecIdent answer may reach the
+/// key link's RSA input length, or a peer could have us sign one.
+const MAX_SECIDENT_PEER_KEY_LEN: usize = 255;
+const _: () = assert!(MAX_SECIDENT_PEER_KEY_LEN + 9 < super::key_link::KEY_LINK_RSA_INPUT_LEN);
+
 fn sign_challenge(
     private_key_der: &[u8],
     peer_public_key: &[u8],
@@ -2600,6 +2780,22 @@ fn sign_challenge(
     challenge_ip: u32,
     challenge_ip_kind: Option<u8>,
 ) -> Vec<u8> {
+    if peer_public_key.len() > MAX_SECIDENT_PEER_KEY_LEN {
+        return Vec::new();
+    }
+    let mut msg = Vec::with_capacity(peer_public_key.len() + 9);
+    msg.extend_from_slice(peer_public_key);
+    msg.extend_from_slice(&challenge.to_le_bytes());
+    if let Some(kind) = challenge_ip_kind {
+        msg.extend_from_slice(&challenge_ip.to_le_bytes());
+        msg.push(kind);
+    }
+    secident_rsa_sign(private_key_der, &msg)
+}
+
+/// SecIdent's signature primitive, eMule's `RSASSA_PKCS1v15_SHA_Signer`:
+/// RSA PKCS#1 v1.5 over SHA-1, with our PKCS#8 private key. Empty on failure.
+fn secident_rsa_sign(private_key_der: &[u8], msg: &[u8]) -> Vec<u8> {
     use rsa::pkcs1v15::SigningKey;
     use rsa::pkcs8::DecodePrivateKey;
     use rsa::signature::SignerMut;
@@ -2611,22 +2807,35 @@ fn sign_challenge(
         Err(_) => return Vec::new(),
     };
     let mut signing_key = SigningKey::<Sha1>::new(key);
-
-    let mut msg = Vec::with_capacity(peer_public_key.len() + 9);
-    msg.extend_from_slice(peer_public_key);
-    msg.extend_from_slice(&challenge.to_le_bytes());
-    if let Some(kind) = challenge_ip_kind {
-        msg.extend_from_slice(&challenge_ip.to_le_bytes());
-        msg.push(kind);
-    }
-
-    match signing_key.try_sign(&msg) {
+    match signing_key.try_sign(msg) {
         Ok(sig) => {
             let bytes: Box<[u8]> = sig.into();
             bytes.into_vec()
         }
         Err(_) => Vec::new(),
     }
+}
+
+/// Check a [`secident_rsa_sign`] signature against a peer's SecIdent public
+/// key, PKCS#1 DER as eMule sends it or SPKI.
+pub(super) fn secident_rsa_verify(public_key_der: &[u8], msg: &[u8], signature: &[u8]) -> bool {
+    use rsa::pkcs1::DecodeRsaPublicKey;
+    use rsa::pkcs1v15::{Signature, VerifyingKey};
+    use rsa::signature::Verifier;
+    use rsa::RsaPublicKey;
+    use sha1::Sha1;
+
+    let key = match RsaPublicKey::from_pkcs1_der(public_key_der).or_else(|_| {
+        use rsa::pkcs8::DecodePublicKey;
+        RsaPublicKey::from_public_key_der(public_key_der)
+    }) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let Ok(sig) = Signature::try_from(signature) else {
+        return false;
+    };
+    VerifyingKey::<Sha1>::new(key).verify(msg, &sig).is_ok()
 }
 
 fn verify_challenge(
@@ -2638,23 +2847,6 @@ fn verify_challenge(
     local_ip_for_remoteclient: u32,
     signature: &[u8],
 ) -> bool {
-    use rsa::pkcs1::DecodeRsaPublicKey;
-    use rsa::pkcs1v15::{Signature, VerifyingKey};
-    use rsa::signature::Verifier;
-    use rsa::RsaPublicKey;
-    use sha1::Sha1;
-
-    // eMule sends raw PKCS#1 RSA public key DER {n, e}. Try PKCS#1 first,
-    // then fall back to SPKI for forward compatibility.
-    let key = match RsaPublicKey::from_pkcs1_der(public_key_der).or_else(|_| {
-        use rsa::pkcs8::DecodePublicKey;
-        RsaPublicKey::from_public_key_der(public_key_der)
-    }) {
-        Ok(k) => k,
-        Err(_) => return false,
-    };
-    let verifying_key = VerifyingKey::<Sha1>::new(key);
-
     let mut msg = Vec::with_capacity(our_public_key.len() + 9);
     msg.extend_from_slice(our_public_key);
     msg.extend_from_slice(&challenge.to_le_bytes());
@@ -2668,13 +2860,8 @@ fn verify_challenge(
         msg.extend_from_slice(&challenge_ip.to_le_bytes());
         msg.push(kind);
     }
-
-    let sig = match Signature::try_from(signature) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    verifying_key.verify(&msg, &sig).is_ok()
+    // eMule sends raw PKCS#1 RSA public key DER {n, e}; SPKI is taken too.
+    secident_rsa_verify(public_key_der, &msg, signature)
 }
 
 #[cfg(test)]
@@ -4093,13 +4280,13 @@ mod tests {
             None,
             "address 0 vouches for nothing"
         );
-        cm.note_session_proven_ember(relayed, ember);
+        cm.note_session_bound_ember(relayed, ember);
         assert_eq!(cm.get_record(&relayed).and_then(|r| r.proven_ember_hash), Some(ember));
         assert!(cm.is_dirty(), "the link is saved");
 
         let unverified = [0x46u8; 16];
         cm.get_or_create(unverified);
-        cm.note_session_proven_ember(unverified, ember);
+        cm.note_session_bound_ember(unverified, ember);
         assert_eq!(
             cm.get_record(&unverified).and_then(|r| r.proven_ember_hash),
             None,
@@ -4107,37 +4294,415 @@ mod tests {
         );
     }
 
+    use super::super::key_link::tests::{
+        exchange as key_link_exchange, identity as ember_identity, proof_with_rsa, rsa_sig_by,
+        Identity, Prover,
+    };
+    use super::super::key_link::{KeyLinkError, KeyLinkSession, ProvenEmberKey};
+
+    /// Our own eD2K user hash in the key-link exchanges below.
+    const OUR_USER_HASH: [u8; 16] = [0x0E; 16];
+
+    /// SecIdent proving `rsa_key` for `user_hash`.
+    fn secident_verified(cm: &mut CreditManager, user_hash: [u8; 16], rsa_key: &[u8]) {
+        assert!(cm.set_public_key(user_hash, rsa_key.to_vec()));
+        cm.set_ident_state(user_hash, IdentState::Verified);
+    }
+
+    /// `prover`'s key-link proof, checked as the session loops check it:
+    /// against the proven key `cm` holds for its user hash.
+    fn key_link_proof(cm: &CreditManager, prover: &Prover) -> Result<ProvenEmberKey, KeyLinkError> {
+        let key = cm.proven_public_key(&prover.user_hash).expect("a proven key on record");
+        key_link_exchange(prover, OUR_USER_HASH, prover.id.ember_hash, key)
+    }
+
+    /// Another client of the same Ember key holder: a new user hash and
+    /// SecIdent key pair (a reinstall, say).
+    fn same_ember_key(prover: &Prover, user_hash: [u8; 16]) -> Prover {
+        Prover {
+            id: Identity {
+                key: prover.id.key.clone(),
+                pubkey: prover.id.pubkey,
+                ember_hash: prover.id.ember_hash,
+            },
+            user_hash,
+            credits: CreditManager::with_generated_keys(),
+        }
+    }
+
     /// Bytes over Ember's own streams count on the eD2K record of the user hash
-    /// the sender's identity is proven to own, and on no record otherwise: not
-    /// one it only claims, and not when two records are proven for it.
+    /// the sender's key holder is proven to own, and on no record otherwise:
+    /// not one it only claims, and not after the link moved to another hash.
     #[test]
     fn ember_stream_bytes_count_only_for_a_proven_user_hash() {
-        let ember = [0x73u8; 16];
+        let owner = Prover::new([0x45u8; 16]);
+        let ember = owner.id.ember_hash;
         let mut cm = CreditManager::new();
-        let owner = [0x45u8; 16];
 
         assert!(!cm.add_downloaded_over_ember(&ember, 4 << 20), "no user hash at all");
-        cm.note_bound_ember_hash(owner, ember, 0);
+        cm.note_bound_ember_hash(owner.user_hash, ember, 0);
         assert!(!cm.add_downloaded_over_ember(&ember, 4 << 20), "a binding alone is a claim");
-        assert_eq!(cm.get_record(&owner).map_or(0, |r| r.downloaded), 0);
+        assert_eq!(cm.get_record(&owner.user_hash).map_or(0, |r| r.downloaded), 0);
 
-        cm.set_ident_state(owner, IdentState::Verified);
-        cm.note_session_proven_ember(owner, ember);
+        secident_verified(&mut cm, owner.user_hash, &owner.rsa());
+        let signed = key_link_proof(&cm, &owner).expect("signed");
+        cm.note_session_proven_ember(owner.user_hash, &signed);
         assert!(cm.add_downloaded_over_ember(&ember, 4 << 20));
         assert!(cm.add_uploaded_over_ember(&ember, 1 << 20));
         assert!(!cm.add_downloaded_over_ember(&ember, 0), "nothing to count");
-        let record = cm.get_record(&owner).unwrap();
+        let record = cm.get_record(&owner.user_hash).unwrap();
         assert_eq!((record.downloaded, record.uploaded), (4 << 20, 1 << 20));
-        assert!(cm.get_score_ratio(&owner, 0) > MIN_CREDIT_RATIO, "and it ranks them as eD2K bytes would");
+        assert!(
+            cm.get_score_ratio(&owner.user_hash, 0) > MIN_CREDIT_RATIO,
+            "and it ranks them as eD2K bytes would"
+        );
 
         assert!(!cm.add_downloaded_over_ember(&[0x74; 16], 4 << 20), "another identity");
 
-        let second = [0x46u8; 16];
-        cm.note_bound_ember_hash(second, ember, 0);
-        cm.set_ident_state(second, IdentState::Verified);
-        cm.note_session_proven_ember(second, ember);
-        assert!(!cm.add_downloaded_over_ember(&ember, 4 << 20), "two proven records: neither is credited");
-        assert_eq!(cm.get_record(&owner).unwrap().downloaded, 4 << 20);
+        // The same key holder proving a second user hash moves the link.
+        let second = same_ember_key(&owner, [0x46u8; 16]);
+        secident_verified(&mut cm, second.user_hash, &second.rsa());
+        let again = key_link_proof(&cm, &second).expect("signed");
+        cm.note_session_proven_ember(second.user_hash, &again);
+        assert!(!cm.ember_key_proven_for(&owner.user_hash, &ember));
+        assert!(cm.add_downloaded_over_ember(&ember, 2 << 20));
+        assert_eq!(cm.get_record(&owner.user_hash).unwrap().downloaded, 4 << 20);
+        assert_eq!(cm.get_record(&second.user_hash).unwrap().downloaded, 2 << 20);
+    }
+
+    /// A session that passed SecIdent for its own user hash and replays a
+    /// publisher's public key, without a key-link proof from that key, gets
+    /// the display link and nothing else.
+    #[test]
+    fn a_replayed_ember_key_without_a_key_link_proof_does_not_create_the_link() {
+        let publisher = ember_identity();
+        let attacker = Prover::new([0xA7u8; 16]);
+        let mut cm = CreditManager::new();
+        secident_verified(&mut cm, attacker.user_hash, &attacker.rsa());
+
+        // The binding passes, SecIdent passed: the old rule's whole proof.
+        assert!(crate::network::ember::crypto::verify_ember_hash_binding(
+            &publisher.pubkey,
+            &publisher.ember_hash
+        ));
+        cm.note_bound_ember_hash(attacker.user_hash, publisher.ember_hash, 0);
+        cm.note_session_bound_ember(attacker.user_hash, publisher.ember_hash);
+        assert!(
+            cm.ember_identity_proven_for(&attacker.user_hash, &publisher.ember_hash),
+            "shown on Known Ember Peers"
+        );
+        assert!(!cm.ember_key_proven_for(&attacker.user_hash, &publisher.ember_hash));
+        assert!(!cm.add_downloaded_over_ember(&publisher.ember_hash, 4 << 20));
+
+        // It cannot prove the key it replays with its own.
+        assert_eq!(
+            key_link_exchange(&attacker, OUR_USER_HASH, publisher.ember_hash, &attacker.rsa()),
+            Err(KeyLinkError::BindingMismatch)
+        );
+
+        // A link loaded from the display table (written by a build that
+        // trusted the binding) counts for nothing.
+        let loaded = [0xA8u8; 16];
+        secident_verified(&mut cm, loaded, b"loaded-rsa");
+        cm.restore_proven_ember_hash(loaded, publisher.ember_hash);
+        assert!(cm.ember_identity_proven_for(&loaded, &publisher.ember_hash));
+        assert!(!cm.ember_key_proven_for(&loaded, &publisher.ember_hash));
+        assert!(!cm.add_downloaded_over_ember(&publisher.ember_hash, 4 << 20));
+        assert_eq!(cm.get_record(&attacker.user_hash).unwrap().downloaded, 0);
+        assert_eq!(cm.get_record(&loaded).unwrap().downloaded, 0);
+    }
+
+    /// A verified proof links only a record whose proven SecIdent key is the
+    /// one that co-signed it, keyed on the hash of the Ember key that signed.
+    #[test]
+    fn a_key_link_proof_links_only_under_the_key_that_co_signed_it() {
+        let owner = Prover::new([0xB1u8; 16]);
+        let ember = owner.id.ember_hash;
+        let mut cm = CreditManager::new();
+
+        cm.get_or_create(owner.user_hash);
+        let signed =
+            key_link_exchange(&owner, OUR_USER_HASH, ember, &owner.rsa()).expect("signed");
+        assert_eq!(signed.ember_hash(), ember);
+        cm.note_session_proven_ember(owner.user_hash, &signed);
+        assert!(!cm.ember_key_proven_for(&owner.user_hash, &ember), "no proven key on record");
+        assert!(!cm.add_downloaded_over_ember(&ember, 1 << 20));
+
+        let other = [0xB2u8; 16];
+        secident_verified(&mut cm, other, &Prover::new(other).rsa());
+        cm.note_session_proven_ember(other, &signed);
+        assert!(!cm.ember_key_proven_for(&other, &ember), "a record holding another key");
+
+        secident_verified(&mut cm, owner.user_hash, &owner.rsa());
+        cm.note_session_proven_ember(owner.user_hash, &signed);
+        assert!(cm.ember_key_proven_for(&owner.user_hash, &ember));
+        assert_eq!(cm.get_record(&owner.user_hash).and_then(|r| r.proven_ember_hash), Some(ember));
+        assert!(cm.add_downloaded_over_ember(&ember, 1 << 20));
+        assert_eq!(cm.get_record(&owner.user_hash).unwrap().downloaded, 1 << 20);
+
+        // A friend link held by another identity still wins.
+        cm.set_ember_hash(owner.user_hash, ember_identity().ember_hash);
+        assert!(!cm.ember_key_proven_for(&owner.user_hash, &ember));
+    }
+
+    /// The attack from the first audit: a stranger pairs a publisher's public
+    /// key with its own SecIdent-verified user hash. Whether or not the
+    /// publisher has proven its own hash, the stranger gets none of the
+    /// publisher's bytes, and the publisher keeps all of its own. Relaying
+    /// our challenge to the publisher does not help: the proof it gets back
+    /// names the publisher's user hash and key.
+    #[test]
+    fn a_stranger_cannot_steal_or_wipe_a_publishers_ember_credit() {
+        let publisher = Prover::new([0xC2u8; 16]);
+        let stranger = Prover::new([0xC1u8; 16]);
+        let mut cm = CreditManager::new();
+
+        secident_verified(&mut cm, stranger.user_hash, &stranger.rsa());
+        cm.note_bound_ember_hash(stranger.user_hash, publisher.id.ember_hash, 0);
+        cm.note_session_bound_ember(stranger.user_hash, publisher.id.ember_hash);
+        assert!(!cm.add_downloaded_over_ember(&publisher.id.ember_hash, 8 << 20), "steal: nothing to take");
+        assert_eq!(cm.get_record(&stranger.user_hash).unwrap().downloaded, 0);
+
+        let mut our_session_with_stranger = KeyLinkSession::default();
+        let nonce = our_session_with_stranger.start_challenge().unwrap();
+        let relayed = publisher.prove(&nonce, stranger.user_hash);
+        assert_eq!(
+            our_session_with_stranger.accept_proof(
+                &relayed,
+                Some(&publisher.id.ember_hash),
+                &stranger.user_hash,
+                &OUR_USER_HASH,
+                cm.proven_public_key(&stranger.user_hash),
+            ),
+            Err(KeyLinkError::BadSignature),
+            "steal: a relayed proof names the publisher, not the stranger"
+        );
+
+        secident_verified(&mut cm, publisher.user_hash, &publisher.rsa());
+        let signed = key_link_proof(&cm, &publisher).expect("the publisher signs");
+        cm.note_session_proven_ember(publisher.user_hash, &signed);
+        assert!(cm.add_downloaded_over_ember(&publisher.id.ember_hash, 8 << 20), "wipe: still credited");
+        assert!(cm.add_uploaded_over_ember(&publisher.id.ember_hash, 1 << 20));
+        let record = cm.get_record(&publisher.user_hash).unwrap();
+        assert_eq!((record.downloaded, record.uploaded), (8 << 20, 1 << 20));
+        let record = cm.get_record(&stranger.user_hash).unwrap();
+        assert_eq!((record.downloaded, record.uploaded), (0, 0));
+    }
+
+    /// The relayed-SecIdent wipe (audit2-P1). The publisher's key is proven
+    /// for its user hash and its Ember key linked. A stranger claims the
+    /// publisher's user hash and passes SecIdent by relaying one of the
+    /// publisher's own SecIdent answers, then proves its own Ember key over
+    /// the digest of the publisher's (public) RSA key. It has no RSA
+    /// signature by the publisher's key over its own Ember key, so whatever
+    /// it carries the proof is refused, and the publisher's link and credit
+    /// stand.
+    #[test]
+    fn a_relayed_secident_answer_cannot_replace_a_publishers_link() {
+        let publisher = Prover::new([0xF1u8; 16]);
+        let stranger = Prover::new([0xF2u8; 16]);
+        let mut cm = CreditManager::new();
+        secident_verified(&mut cm, publisher.user_hash, &publisher.rsa());
+        let signed = key_link_proof(&cm, &publisher).expect("the publisher links");
+        cm.note_session_proven_ember(publisher.user_hash, &signed);
+
+        // The relayed SecIdent answer passes: the record is Verified again,
+        // at the stranger's address.
+        cm.set_ident_state(publisher.user_hash, IdentState::Verified);
+        let record_key = cm.proven_public_key(&publisher.user_hash).unwrap().to_vec();
+
+        let mut publisher_ledger = CreditManager::with_generated_keys();
+        assert!(publisher_ledger.set_public_key(OUR_USER_HASH, b"our key".to_vec()));
+        let relayed_secident = publisher_ledger.create_signature_for_peer(&OUR_USER_HASH, 7, 0, None);
+        let rsa_candidates: [&dyn Fn(&[u8; 32]) -> Vec<u8>; 3] = [
+            &|nonce| {
+                rsa_sig_by(&stranger.credits, &stranger.id, nonce, publisher.user_hash, OUR_USER_HASH, &record_key)
+            },
+            &|_| relayed_secident.clone(),
+            &|nonce| publisher.prove(nonce, OUR_USER_HASH)[97..].to_vec(),
+        ];
+        for rsa_sig in rsa_candidates {
+            let mut session = KeyLinkSession::default();
+            let nonce = session.start_challenge().unwrap();
+            let proof = proof_with_rsa(
+                &stranger.id,
+                &nonce,
+                publisher.user_hash,
+                OUR_USER_HASH,
+                &record_key,
+                &rsa_sig(&nonce),
+            );
+            let taken = session.accept_proof(
+                &proof,
+                Some(&stranger.id.ember_hash),
+                &publisher.user_hash,
+                &OUR_USER_HASH,
+                Some(&record_key),
+            );
+            assert!(
+                matches!(taken, Err(KeyLinkError::BadRsaSignature | KeyLinkError::RsaSignatureLength)),
+                "{taken:?}"
+            );
+        }
+
+        assert!(cm.ember_key_proven_for(&publisher.user_hash, &publisher.id.ember_hash));
+        assert!(!cm.ember_key_proven_for(&publisher.user_hash, &stranger.id.ember_hash));
+        assert!(cm.add_downloaded_over_ember(&publisher.id.ember_hash, 6 << 20));
+        assert!(!cm.add_uploaded_over_ember(&stranger.id.ember_hash, 6 << 20));
+        let record = cm.get_record(&publisher.user_hash).unwrap();
+        assert_eq!((record.downloaded, record.uploaded), (6 << 20, 0));
+    }
+
+    /// The first-contact relay. We have never met the publisher, so SecIdent
+    /// takes the first key it sees for the publisher's user hash: a stranger
+    /// claims that hash with its own RSA key, then relays our nonce to the
+    /// real publisher while claiming our user hash there. The publisher's
+    /// proof is co-signed by the publisher's RSA key, not the stranger's on
+    /// record, so no link is made whichever lands first.
+    #[test]
+    fn the_first_contact_relay_cannot_link_a_publisher_to_a_strangers_key() {
+        let publisher = Prover::new([0xE1u8; 16]);
+        let stranger_rsa = Prover::new(publisher.user_hash).rsa();
+
+        for proof_first in [false, true] {
+            let mut cm = CreditManager::new();
+            let mut session = KeyLinkSession::default();
+            if !proof_first {
+                secident_verified(&mut cm, publisher.user_hash, &stranger_rsa);
+            }
+            let nonce = session.start_challenge().unwrap();
+            let relayed = publisher.prove(&nonce, OUR_USER_HASH);
+            let taken = session.accept_proof(
+                &relayed,
+                Some(&publisher.id.ember_hash),
+                &publisher.user_hash,
+                &OUR_USER_HASH,
+                cm.proven_public_key(&publisher.user_hash),
+            );
+            if proof_first {
+                assert_eq!(taken, Ok(None), "kept for SecIdent");
+                secident_verified(&mut cm, publisher.user_hash, &stranger_rsa);
+                let key = cm.proven_public_key(&publisher.user_hash).unwrap().to_vec();
+                assert_eq!(session.note_secident(&key, &publisher.user_hash, &OUR_USER_HASH), None);
+            } else {
+                assert_eq!(taken, Err(KeyLinkError::BadSignature));
+            }
+            assert!(!cm.add_downloaded_over_ember(&publisher.id.ember_hash, 8 << 20));
+        }
+    }
+
+    /// First contact: the proof lands before SecIdent has proven any key for
+    /// the user hash. It is kept, not refused, and the link is made once
+    /// SecIdent proves the key that co-signed it.
+    #[test]
+    fn a_proof_before_first_secident_links_once_secident_passes() {
+        let owner = Prover::new([0xE2u8; 16]);
+        let mut cm = CreditManager::new();
+        cm.get_or_create(owner.user_hash);
+
+        let mut session = KeyLinkSession::default();
+        let nonce = session.start_challenge().unwrap();
+        let proof = owner.prove(&nonce, OUR_USER_HASH);
+        assert_eq!(
+            session.accept_proof(
+                &proof,
+                Some(&owner.id.ember_hash),
+                &owner.user_hash,
+                &OUR_USER_HASH,
+                cm.proven_public_key(&owner.user_hash),
+            ),
+            Ok(None)
+        );
+        assert!(!cm.add_downloaded_over_ember(&owner.id.ember_hash, 1 << 20), "nothing yet");
+
+        // SecIdent proves the key, as the session loops then report it.
+        secident_verified(&mut cm, owner.user_hash, &owner.rsa());
+        let key = cm.proven_public_key(&owner.user_hash).unwrap().to_vec();
+        let signer = session
+            .note_secident(&key, &owner.user_hash, &OUR_USER_HASH)
+            .expect("the kept proof verifies");
+        cm.note_session_proven_ember(owner.user_hash, &signer);
+        assert!(cm.ember_key_proven_for(&owner.user_hash, &owner.id.ember_hash));
+        assert!(cm.add_downloaded_over_ember(&owner.id.ember_hash, 1 << 20));
+        assert_eq!(cm.get_record(&owner.user_hash).unwrap().downloaded, 1 << 20);
+    }
+
+    /// A peer whose key was proven in an earlier session (here, restored
+    /// after a restart, so SecIdent is not Verified now and need not run
+    /// again) links on a session where SecIdent never runs.
+    #[test]
+    fn a_key_proven_in_an_earlier_session_links_without_secident_now() {
+        let owner = Prover::new([0xE3u8; 16]);
+        let mut cm = CreditManager::new();
+        let mut loaded = CreditRecord::new(owner.user_hash);
+        loaded.public_key = owner.rsa();
+        loaded.crypto_verified_once = true;
+        loaded.ident_state = IdentState::Needed;
+        cm.insert_loaded_credit(loaded);
+        assert_ne!(cm.get_record(&owner.user_hash).unwrap().ident_state, IdentState::Verified);
+
+        let signed = key_link_proof(&cm, &owner).expect("checked against the key on record");
+        cm.note_session_proven_ember(owner.user_hash, &signed);
+        assert!(cm.ember_key_proven_for(&owner.user_hash, &owner.id.ember_hash));
+        assert!(cm.add_downloaded_over_ember(&owner.id.ember_hash, 2 << 20));
+    }
+
+    /// A key link is saved with the SecIdent key it was proven under and
+    /// comes back after a restart, still earning credit; a display link from
+    /// the old table does not, and neither does a saved link whose record no
+    /// longer holds that key.
+    #[test]
+    fn a_saved_key_link_reloads_and_counts_and_an_old_weak_link_does_not() {
+        let owner = Prover::new([0xD1u8; 16]);
+        let ember = owner.id.ember_hash;
+        let mut cm = CreditManager::new();
+        secident_verified(&mut cm, owner.user_hash, &owner.rsa());
+        cm.note_session_proven_ember(owner.user_hash, &key_link_proof(&cm, &owner).unwrap());
+        let record = cm.get_record(&owner.user_hash).unwrap().clone();
+        let (saved_ember, saved_key) = record.signed_ember_link().expect("saved");
+        assert_eq!((saved_ember, saved_key), (ember, owner.rsa().as_slice()));
+        let saved_key = saved_key.to_vec();
+
+        // A restart: the record comes back as stored, its session state reset
+        // as the loader does, then the link tables.
+        let reload = |signed: Option<&[u8]>, weak: Option<[u8; 16]>| {
+            let mut cm = CreditManager::new();
+            let mut loaded = CreditRecord::new(owner.user_hash);
+            loaded.public_key = record.persisted_public_key().to_vec();
+            loaded.crypto_verified_once = true;
+            loaded.ident_state = IdentState::Needed;
+            cm.insert_loaded_credit(loaded);
+            if let Some(eh) = weak {
+                cm.restore_proven_ember_hash(owner.user_hash, eh);
+            }
+            if let Some(key) = signed {
+                cm.restore_signed_ember_hash(owner.user_hash, ember, key);
+            }
+            cm
+        };
+
+        let mut cm = reload(Some(&saved_key), None);
+        assert!(cm.ember_key_proven_for(&owner.user_hash, &ember));
+        assert!(cm.add_downloaded_over_ember(&ember, 3 << 20), "a reloaded key link counts");
+        assert_eq!(cm.get_record(&owner.user_hash).unwrap().downloaded, 3 << 20);
+
+        let mut cm = reload(None, Some(ember));
+        assert!(cm.ember_identity_proven_for(&owner.user_hash, &ember), "still shown");
+        assert!(!cm.add_downloaded_over_ember(&ember, 3 << 20), "an old weak link does not count");
+
+        let mut cm = reload(Some(b"someone-else-rsa"), None);
+        assert!(!cm.ember_key_proven_for(&owner.user_hash, &ember));
+        assert!(!cm.add_downloaded_over_ember(&ember, 3 << 20), "another key's link does not count");
+
+        let mut cm = CreditManager::new();
+        cm.restore_signed_ember_hash(owner.user_hash, ember, &saved_key);
+        assert!(cm.get_record(&owner.user_hash).is_none(), "no record, nothing restored");
+        cm.get_or_create(owner.user_hash);
+        cm.restore_signed_ember_hash(owner.user_hash, ember, &saved_key);
+        assert!(
+            !cm.ember_key_proven_for(&owner.user_hash, &ember),
+            "a record without a proven key takes none"
+        );
     }
 
     /// Our standing with a peer is eMule's formula from its side: a peer we

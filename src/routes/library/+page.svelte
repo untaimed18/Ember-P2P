@@ -1176,7 +1176,7 @@
     }
     toastWarning(plural(unshared, {
       one: () => m.library_copied_unshared_one({ count: formatNumber(unshared) }),
-      oneShowsCount: true,
+      // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
       other: () => m.library_copied_unshared_other({ count: formatNumber(unshared) }),
     }));
   }
@@ -2194,13 +2194,13 @@
       const question = $appSettings?.delete_permanently
         ? plural(targets.length, {
             one: () => m.library_confirm_delete_one_permanent({ size, count }),
-            oneShowsCount: true,
+            // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
             few: () => m.library_confirm_delete_few_permanent({ count, size }),
             other: () => m.library_confirm_delete_other_permanent({ count, size }),
           })
         : plural(targets.length, {
             one: () => m.library_confirm_delete_one({ size, count }),
-            oneShowsCount: true,
+            // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
             few: () => m.library_confirm_delete_few({ count, size }),
             other: () => m.library_confirm_delete_other({ count, size }),
           });
@@ -3589,7 +3589,7 @@
       const confirmed = await askConfirm(
         plural(sharedCount, {
           one: () => m.library_confirm_unshare_folder_one({ name: displayName, count: formatNumber(sharedCount) }),
-          oneShowsCount: true,
+          // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
           other: () => m.library_confirm_unshare_folder_other({ count: formatNumber(sharedCount), name: displayName }),
         }),
         m.library_unshare_folder_title(),

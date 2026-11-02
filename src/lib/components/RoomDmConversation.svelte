@@ -25,7 +25,16 @@
     type RoomDmMessageEvent,
     type RoomDmStatusEvent,
   } from '$lib/api/roomDm';
-  import { dmTabKey, dmThreads, keepDmTab, refreshDmThreads, viewingDm } from '$lib/stores/roomDm';
+  import {
+    cancelHeldDmAnswer,
+    declineDmRequest,
+    dmAnswersHeld,
+    dmTabKey,
+    dmThreads,
+    keepDmTab,
+    refreshDmThreads,
+    viewingDm,
+  } from '$lib/stores/roomDm';
   import { activeChatHash } from '$lib/stores/friends';
   import { appSettings } from '$lib/stores/settings';
   import { toastError } from '$lib/stores/toast';
@@ -65,9 +74,14 @@
    *  a declined conversation offers to write: doing so lifts the refusal. */
   let declinedHere = $state(false);
   let justDeclined = $derived(declinedHere && thread?.state === 'declined');
+  /** A Decline or Ignore of this request waiting out its Undo, here or in
+   *  another window: answered as far as this view goes. */
+  let heldAnswer = $derived(thread?.state === 'request' ? ($dmAnswersHeld.get(who) ?? null) : null);
 
   /** Why nothing can be written here, or null when something can. */
   let blocked = $derived.by((): string | null => {
+    if (heldAnswer === 'decline') return m.channels_dm_you_declined({ name: shownName });
+    if (heldAnswer === 'ignore') return m.channels_dm_ignoring_toast({ name: shownName });
     if (thread?.state === 'request') return null;
     if (justDeclined) return m.channels_dm_you_declined({ name: shownName });
     if (thread?.is_friend) return m.channels_dm_is_friend();
@@ -270,16 +284,20 @@
     }
   }
 
-  async function answer(accept: boolean) {
+  /** Behind an Undo, as from the Channels banner: what they wrote goes with
+   *  it. Once sent, the state change marks it declined here. */
+  function decline() {
+    if (answering) return;
+    declineDmRequest(who, shownName);
+  }
+
+  async function accept() {
     if (answering) return;
     answering = true;
+    cancelHeldDmAnswer(who);
     try {
-      await answerRoomDmRequest(who, accept);
-      if (accept) keepDmTab(who, shownName);
-      else {
-        declinedHere = true;
-        messages = [];
-      }
+      await answerRoomDmRequest(who, true);
+      keepDmTab(who, shownName);
       await refreshDmThreads();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
@@ -332,14 +350,14 @@
 </script>
 
 <div class="dm">
-  {#if thread?.state === 'request'}
+  {#if thread?.state === 'request' && !heldAnswer}
     <div class="dm-banner" role="region" aria-label={m.channels_dm_request_banner({ name: shownName })}>
       <span>{m.channels_dm_request_banner({ name: shownName })}</span>
       <div class="dm-banner-actions">
-        <button type="button" class="primary" disabled={answering} onclick={() => void answer(true)}>
+        <button type="button" class="primary" disabled={answering} onclick={() => void accept()}>
           {m.channels_dm_accept()}
         </button>
-        <button type="button" class="ghost" disabled={answering} onclick={() => void answer(false)}>
+        <button type="button" class="ghost" disabled={answering} onclick={decline}>
           {m.channels_dm_decline()}
         </button>
       </div>

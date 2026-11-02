@@ -22,8 +22,18 @@
     isChannelLanguage,
   } from '$lib/channelLanguages';
   import { appSettings, loadAppSettings } from '$lib/stores/settings';
-  import { closeDmTab, dmPreview, dmRequests, keepDmTab, openPrivateChat, refreshDmThreads } from '$lib/stores/roomDm';
-  import { answerRoomDmRequest, dropRoomDmRequest, type RoomDmThread } from '$lib/api/roomDm';
+  import {
+    cancelHeldDmAnswer,
+    declineDmRequest,
+    dmPreview,
+    dmRequests,
+    ignoreDmMemberSilently,
+    ignoreDmRequester,
+    keepDmTab,
+    openPrivateChat,
+    refreshDmThreads,
+  } from '$lib/stores/roomDm';
+  import { answerRoomDmRequest, type RoomDmThread } from '$lib/api/roomDm';
   import {
     copyToClipboard,
     disambiguatedMemberName,
@@ -41,7 +51,7 @@
     xferSecondsLeft,
     type RateSamples,
   } from '$lib/xferRate';
-  import { addActionToast, toast, toastError, toastSuccess } from '$lib/stores/toast';
+  import { toast, toastError, toastSuccess } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import {
@@ -123,10 +133,8 @@
     hideChannel,
     ignoredMembers,
     ignoredKeysForChannel,
-    ignoreMemberEverywhere,
     ignoreScopeFor,
     forgetChannelIgnores,
-    pushIgnoredNow,
     notifyLevelOf,
     refreshChannels,
     unhideChannel,
@@ -1518,6 +1526,7 @@
   async function answerDmRequest(member: string, accept: boolean, name = '') {
     if (answeringDm) return;
     answeringDm = member;
+    if (accept) cancelHeldDmAnswer(member);
     try {
       await answerRoomDmRequest(member, accept);
       if (accept) keepDmTab(member, name);
@@ -1529,68 +1538,19 @@
     }
   }
 
-  /** Ignore everywhere, and remove any request of theirs here without a word
-   *  to them: a decline would tell them they were refused, where silence
-   *  looks like being offline. The request goes only once the backend holds
-   *  the ignore, so nothing they send meanwhile opens a new one; if the
-   *  ignore could not be saved, the request stays. */
   async function ignoreEverywhereSilently(member: string, name: string) {
     const holdsBanner = answeringDm === null;
     if (holdsBanner) answeringDm = member;
-    const hadRequest = $dmRequests.some((t) => t.member_pubkey === member.toLowerCase());
-    ignoreMemberEverywhere(member, name);
     try {
-      await pushIgnoredNow();
-      await dropRoomDmRequest(member);
-      if (hadRequest) closeDmTab(member);
-    } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
+      await ignoreDmMemberSilently(member, name);
     } finally {
       if (holdsBanner) answeringDm = null;
-      void refreshDmThreads();
     }
   }
 
-  /** Requests declined or ignored from their banner while the Undo is still
-   *  on offer. The answer goes out only when the toast does, since both drop
-   *  what they wrote; until then the banner is only hidden. */
-  let dmAnswersHeld = $state<string[]>([]);
-  let shownDmRequests = $derived($dmRequests.filter((r) => !dmAnswersHeld.includes(r.member_pubkey)));
+  // A Decline or Ignore from a banner waits behind an Undo in the DM store,
+  // which hides the request everywhere until it is sent or taken back.
   let dmRequestsOpen = $state(false);
-
-  function holdDmAnswer(member: string, message: string, answer: () => Promise<void>) {
-    dmAnswersHeld = [...dmAnswersHeld, member];
-    const release = () => {
-      dmAnswersHeld = dmAnswersHeld.filter((key) => key !== member);
-    };
-    addActionToast(
-      'info',
-      message,
-      { label: m.common_undo(), undo: true, run: release },
-      async () => {
-        try {
-          await answer();
-          await refreshDmThreads();
-        } finally {
-          release();
-        }
-      },
-    );
-  }
-
-  function declineDmRequest(member: string, name: string) {
-    holdDmAnswer(member, m.channels_dm_declined_toast({ name }), async () => {
-      try {
-        await answerRoomDmRequest(member, false);
-      } catch (e) {
-        toastError(translateError(e, m.error_operation_failed()));
-      }
-    });
-  }
-
-  function ignoreDmRequester(member: string, name: string) {
-    holdDmAnswer(member, m.channels_dm_ignoring_toast({ name }), () => ignoreEverywhereSilently(member, name));
-  }
 
   function askRemoveDeletedElsewhere(room: RoomDeletedElsewhere) {
     removeElsewhereTarget = room;
@@ -3079,7 +3039,7 @@
     const count = selected?.newer_lines ?? 0;
     return plural(count, {
       one: () => m.channels_newer_lines_one({ count }),
-      oneShowsCount: true,
+      // Not `oneShowsCount`: the singular speaks of one message, so Russian 21, 31, … take `other`.
       other: () => m.channels_newer_lines_other({ count }),
     });
   });
@@ -3327,7 +3287,7 @@
         <button class="primary" disabled={answeringDm !== null} onclick={() => void answerDmRequest(request.member_pubkey, true, request.name)}>
           {m.channels_dm_accept()}
         </button>
-        <button class="ghost" disabled={answeringDm !== null} onclick={() => declineDmRequest(request.member_pubkey, requestName)}>
+        <button class="ghost" disabled={answeringDm !== null} onclick={() => declineDmRequest(request.member_pubkey, request.name)}>
           {m.channels_dm_decline()}
         </button>
         <!-- Sends them nothing: the request goes, and whatever they send
@@ -3343,10 +3303,10 @@
     </div>
   {/snippet}
 
-  {#if shownDmRequests.length > 1}
+  {#if $dmRequests.length > 1}
     <div class="banner dm-request-group">
       <div class="dm-request-group-head">
-        <span>{m.channels_dm_requests_title({ count: shownDmRequests.length })}</span>
+        <span>{m.channels_dm_requests_title({ count: $dmRequests.length })}</span>
         <button
           class="ghost"
           aria-expanded={dmRequestsOpen}
@@ -3356,14 +3316,14 @@
       </div>
       {#if dmRequestsOpen}
         <div id="dm-request-list" class="dm-request-list">
-          {#each shownDmRequests as request (request.member_pubkey)}
+          {#each $dmRequests as request (request.member_pubkey)}
             {@render dmRequestRow(request, 'dm-request-item')}
           {/each}
         </div>
       {/if}
     </div>
   {:else}
-    {#each shownDmRequests as request (request.member_pubkey)}
+    {#each $dmRequests as request (request.member_pubkey)}
       {@render dmRequestRow(request, 'banner dm-request-banner')}
     {/each}
   {/if}

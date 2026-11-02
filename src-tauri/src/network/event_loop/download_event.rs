@@ -118,6 +118,21 @@ fn record_source_failure(
     }
 }
 
+/// Judge the web mirrors that wrote into `[part_start, part_end)`, which failed
+/// verification. Whether a peer wrote there too comes from `blackbox`, so this
+/// runs before the blackbox marks the range corrupt and stops naming them.
+fn charge_web_sources(
+    blackbox: &ed2k::corruption_blackbox::CorruptionBlackBox,
+    file_hash: &[u8; 16],
+    part_start: u64,
+    part_end: u64,
+) -> ed2k::web_sources::CorruptVerdict {
+    let peers_wrote = !blackbox
+        .corrupted_part_contributors(file_hash, part_start, part_end)
+        .is_empty();
+    ed2k::web_sources::note_corrupt_range(file_hash, part_start, part_end, peers_wrote)
+}
+
 /// Failed moves of a verified download into `Downloads` before it is left
 /// Failed instead of re-queued.
 const COMPLETION_MOVE_ATTEMPTS: u32 = 2;
@@ -1744,10 +1759,13 @@ pub(in crate::network) async fn on_download_event(
     }
     if let DownloadEvent::PartCorrupted { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
         // Web mirrors are not in the corruption blackbox, which tracks peers
-        // by address. Each is charged for the parts it wrote most of, whoever
-        // finished them, and one retired for it is dropped from the download
-        // for good.
-        let retired = ed2k::web_sources::note_corrupt_range(file_hash, part_start, part_end);
+        // by address. One retired for this is dropped from the download for
+        // good.
+        let ed2k::web_sources::CorruptVerdict { retired, suspected } =
+            charge_web_sources(&state.corruption_blackbox, file_hash, part_start, part_end);
+        for (url, times) in suspected {
+            debug!("Web source {url} shared a part that failed verification ({times} so far); not charged");
+        }
         if !retired.is_empty() {
             let db_web = db.clone();
             let fh = hex::encode(file_hash);
@@ -2370,5 +2388,52 @@ mod friend_transfer_only_tests {
                 "{outcome:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod web_source_blame_tests {
+    use super::*;
+    use ed2k::corruption_blackbox::CorruptionBlackBox;
+    use ed2k::web_sources;
+
+    const PART: u64 = 9_728_000;
+
+    /// A peer on record for a tenth of a part a mirror wrote the rest of: the
+    /// part failing whole, again and again, never retires the mirror.
+    #[test]
+    fn a_peer_writing_into_a_mirrors_part_keeps_the_mirror_from_being_charged() {
+        let hash = [0xE1; 16];
+        web_sources::clear_for_tests(&hash);
+        let mirror = "https://mirror.example/f".to_string();
+        web_sources::register(hash, [mirror.clone()]);
+        let mut blackbox = CorruptionBlackBox::new();
+        for _ in 0..web_sources::MAX_BAD_PARTS + 1 {
+            blackbox.record_data(hash, 0, PART / 10, Ipv4Addr::new(203, 0, 113, 7));
+            web_sources::note_written(&hash, &mirror, &[(PART / 10, PART)]);
+            let verdict = charge_web_sources(&blackbox, &hash, 0, PART);
+            assert!(verdict.retired.is_empty());
+            assert_eq!(verdict.suspected.len(), 1);
+            let _ = blackbox.corrupted_part(&hash, 0, PART);
+        }
+        assert_eq!(web_sources::bad_parts(&hash, &mirror), 0);
+        assert!(!web_sources::is_retired(&hash, &mirror));
+        web_sources::forget(&hash);
+    }
+
+    /// With no peer on record, the mirror that wrote most of the part is the
+    /// one charged, and retired at the limit.
+    #[test]
+    fn a_mirror_alone_in_a_failed_part_is_charged() {
+        let hash = [0xE2; 16];
+        web_sources::clear_for_tests(&hash);
+        let mirror = "https://mirror.example/f".to_string();
+        web_sources::register(hash, [mirror.clone()]);
+        let blackbox = CorruptionBlackBox::new();
+        web_sources::note_written(&hash, &mirror, &[(PART / 10, PART)]);
+        assert_eq!(charge_web_sources(&blackbox, &hash, 0, PART), Default::default());
+        web_sources::note_written(&hash, &mirror, &[(PART / 10, PART)]);
+        assert_eq!(charge_web_sources(&blackbox, &hash, 0, PART).retired, vec![mirror.clone()]);
+        web_sources::forget(&hash);
     }
 }

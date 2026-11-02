@@ -520,7 +520,7 @@
             <span class="hint">
               {plural(preview.credits, {
                 one: () => m.emule_import_credits_desc_one({ count: preview.credits }),
-                oneShowsCount: true,
+                // Not `oneShowsCount`: the singular speaks of one peer, so Russian 21, 31, … take `other`.
                 few: () => m.emule_import_credits_desc_few({ count: preview.credits }),
                 other: () => m.emule_import_credits_desc_other({ count: preview.credits }),
               })}
@@ -718,7 +718,7 @@
             <li class="warn">
               {plural(movedCount, {
                 one: () => m.emule_import_summary_moved_one({ count: movedCount }),
-                oneShowsCount: true,
+                // Not `oneShowsCount`: the singular speaks of one download, so Russian 21, 31, … take `other`.
                 few: () => m.emule_import_summary_moved_few({ count: movedCount }),
                 other: () => m.emule_import_summary_moved_other({ count: movedCount }),
               })}

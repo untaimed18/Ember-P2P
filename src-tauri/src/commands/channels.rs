@@ -1691,10 +1691,12 @@ pub async fn forget_channel(
 
 #[tauri::command]
 pub async fn claim_channel_username(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     name: String,
 ) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let display = claim_username_on_registry(&state, &name).await?;
     persist_channel_username(&state, &display).await?;
     // Taking up Channels this session: the identity's list of rooms is read
@@ -4016,9 +4018,11 @@ async fn reseal_current_epoch_to_member(
 /// invite handed out before this stops working, which is the point.
 #[tauri::command]
 pub async fn rotate_channel_room_key(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4082,10 +4086,12 @@ pub(crate) async fn rekey_recovered_room(
 /// patches their build — they already hold the key either way.
 #[tauri::command]
 pub async fn set_channel_invite_policy(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     owner_only: bool,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4136,10 +4142,12 @@ pub async fn set_channel_invite_policy(
 /// rather than against a patched one.
 #[tauri::command]
 pub async fn set_channel_slow_mode(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     secs: u16,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4190,10 +4198,12 @@ pub async fn set_channel_slow_mode(
 /// `ModerationTail::announce_only`). Reactions stay open.
 #[tauri::command]
 pub async fn set_channel_announce_only(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     announce_only: bool,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4249,10 +4259,12 @@ fn parse_channel_language(code: Option<&str>) -> Result<Option<&'static str>, St
 /// owner-signed moderation snapshot like the posting rule.
 #[tauri::command]
 pub async fn set_channel_language(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     language: Option<String>,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4600,11 +4612,13 @@ async fn apply_local_mod_ban(
 
 #[tauri::command]
 pub async fn update_channel_moderation(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     topic: String,
     welcome: String,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4638,10 +4652,12 @@ const RENAME_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// room — so one who is offline picks it up when they are back.
 #[tauri::command]
 pub async fn rename_channel(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     name: String,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4815,10 +4831,12 @@ pub async fn rename_channel(
 
 #[tauri::command]
 pub async fn ban_channel_member(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5015,10 +5033,12 @@ pub async fn ban_channel_member(
 
 #[tauri::command]
 pub async fn unban_channel_member(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5087,10 +5107,12 @@ async fn refuse_protected_ban_target(
 
 #[tauri::command]
 pub async fn add_channel_moderator(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5142,10 +5164,12 @@ pub async fn add_channel_moderator(
 
 #[tauri::command]
 pub async fn remove_channel_moderator(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5177,11 +5201,14 @@ pub async fn remove_channel_moderator(
 /// member can check a later claim against them.
 #[tauri::command]
 pub async fn set_channel_successor_nominee(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: Option<String>,
     claim_after_days: Option<u16>,
 ) -> Result<ChannelInfo, String> {
+    // A hand-off, only deferred: guarded as `transfer_channel_ownership` is.
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5316,9 +5343,11 @@ async fn register_nominee_with_registry(
 /// record before following it.
 #[tauri::command]
 pub async fn claim_channel_ownership(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(

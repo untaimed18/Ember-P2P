@@ -344,6 +344,12 @@ fn evaluate_swap(
         return false;
     }
 
+    // Higher priority target always wins, whatever our standing with the peer:
+    // the user ranked that file, and credit only breaks ties between equals.
+    if target.priority > assigned.priority {
+        return true;
+    }
+
     // High-credit peers are less likely to be swapped: require the target to
     // have meaningfully fewer sources before swapping a valuable peer away.
     let source_advantage = assigned
@@ -351,11 +357,6 @@ fn evaluate_swap(
         .saturating_sub(target.active_source_count + 1);
     if credit_ratio > 5.0 && source_advantage < 3 && has_needed_parts_on_assigned {
         return false;
-    }
-
-    // Higher priority target always wins
-    if target.priority > assigned.priority {
-        return true;
     }
 
     // Same priority: prefer the file with fewer sources
@@ -415,6 +416,21 @@ mod tests {
         assert!(a4af.process_swaps(&only_target).is_empty());
         let only_assigned: HashMap<_, _> = [(FILE_B, downloading(7, 4))].into_iter().collect();
         assert!(a4af.process_swaps(&only_assigned).is_empty());
+    }
+
+    /// Our standing with a peer keeps it on a file only against an equal: a
+    /// file the user ranked higher still takes it, however much we have sent
+    /// that peer.
+    #[test]
+    fn a_higher_priority_file_takes_a_source_we_rank_high_with() {
+        let assigned = downloading(5, 4);
+        let higher = downloading(7, 3);
+        assert!(evaluate_swap(&higher, &assigned, 0, true, 9.0));
+
+        // Between equals the standing still holds the source where it is.
+        let equal = downloading(5, 2);
+        assert!(!evaluate_swap(&equal, &assigned, 0, true, 9.0));
+        assert!(evaluate_swap(&equal, &assigned, 0, true, 1.0));
     }
 
     /// A peer is usually a source for several of our files at once — that is why

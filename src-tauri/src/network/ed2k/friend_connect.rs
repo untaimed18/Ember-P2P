@@ -1162,6 +1162,14 @@ pub async fn run_friend_session_over_transport(
                                                 },
                                             }).await;
                                         }
+                                        // Key-link frames belong to plain eD2K
+                                        // sessions, where SecIdent runs; neither
+                                        // side sends one on a friend session.
+                                        Some((
+                                            super::messages::EMBER_EXT_KEY_LINK_CHALLENGE
+                                            | super::messages::EMBER_EXT_KEY_LINK_PROOF,
+                                            _,
+                                        )) => {}
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.
                                         Some((other, _)) => debug!(

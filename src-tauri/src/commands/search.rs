@@ -945,6 +945,7 @@ pub async fn find_sources(
 
 #[tauri::command]
 pub async fn publish_note(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     file_hash: String,
     file_name: Option<String>,
@@ -952,6 +953,8 @@ pub async fn publish_note(
     rating: u8,
     comment: String,
 ) -> Result<String, String> {
+    // Publishes to KAD under this identity.
+    crate::commands::chat_window::require_main_window(&window)?;
     if rating > 5 {
         return Err(coded(
             "search_rating_range",

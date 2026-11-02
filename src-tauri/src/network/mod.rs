@@ -1773,6 +1773,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
             Err(e) => warn!("Could not load Known Ember Peers links: {e}"),
         }
+        match db.load_credit_key_links() {
+            Ok(links) => {
+                for (user_hash, ember_hash, secident_key) in links {
+                    cm.restore_signed_ember_hash(user_hash, ember_hash, &secident_key);
+                }
+            }
+            Err(e) => warn!("Could not load Ember key links: {e}"),
+        }
         // Ember credit records live in a separate v15 table, loaded the
         // same way as the eMule table above.
         if let Ok(records) = db.load_ember_credits() {

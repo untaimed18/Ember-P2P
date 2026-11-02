@@ -1151,8 +1151,10 @@ async fn record_answer(
 
 /// "Not now": no silent install for the next 24 hours.
 #[tauri::command]
-pub async fn silent_update_postpone() {
+pub async fn silent_update_postpone(window: tauri::WebviewWindow) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     postpone().await;
+    Ok(())
 }
 
 /// The tray's cancel entry does the same as "Not now".
@@ -1169,7 +1171,9 @@ pub async fn postpone() {
 /// "Skip this version": never install it silently. The ordinary notice still
 /// offers it, and the next release is handled normally.
 #[tauri::command]
-pub async fn silent_update_skip(version: String) {
+pub async fn silent_update_skip(window: tauri::WebviewWindow, version: String) -> Result<(), String> {
+    // Keeps a security update from installing silently.
+    crate::commands::chat_window::require_main_window(&window)?;
     let version: String = version.chars().take(64).collect();
     ANSWERS.lock().skipped_version = Some(version.clone());
     if let Err(error) = record_answer(move |record| record.skipped_version = Some(version)).await {
@@ -1177,6 +1181,7 @@ pub async fn silent_update_skip(version: String) {
     }
     INSTALL_NOW.store(false, Ordering::Release);
     RECORD_DIRTY.store(true, Ordering::Release);
+    Ok(())
 }
 
 /// Lift a "Not now" early, from Settings → About.

@@ -351,6 +351,7 @@ fn friend_name_to_store(nickname: &str, name_is_theirs: bool) -> String {
 
 #[tauri::command]
 pub async fn add_friend(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
     nickname: Option<String>,
@@ -359,6 +360,9 @@ pub async fn add_friend(
     // not kept as the user's label once they say what they are called.
     name_is_theirs: Option<bool>,
 ) -> Result<(), String> {
+    // Completes a pending friend request, the grant `accept_friend_request`
+    // keeps to the main window.
+    crate::commands::chat_window::require_main_window(&window)?;
     let ParsedFriendCode {
         canonical,
         hash,

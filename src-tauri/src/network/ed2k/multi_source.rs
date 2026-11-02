@@ -719,6 +719,32 @@ async fn take_source_answer(
     }
 }
 
+/// Record what one download session has proven once SecIdent verified
+/// `user_hash` on it: the binding it passed (display only), and a key-link
+/// proof that waited for the user hash's first proven key, checked against
+/// that key now and linked if it verifies.
+async fn note_session_ember_links(
+    credit_mgr: &RwLock<CreditManager>,
+    user_hash: [u8; 16],
+    our_user_hash: &[u8; 16],
+    bound: Option<[u8; 16]>,
+    key_link: &mut super::key_link::KeyLinkSession,
+    addr: SocketAddr,
+) {
+    let proven_key = {
+        let mut cm = credit_mgr.write().await;
+        if let Some(ember_hash) = bound {
+            cm.note_session_bound_ember(user_hash, ember_hash);
+        }
+        cm.proven_public_key(&user_hash).map(<[u8]>::to_vec)
+    };
+    if let Some(signer) =
+        proven_key.and_then(|key| key_link.note_secident(&key, &user_hash, our_user_hash))
+    {
+        super::key_link::link_proven_key(credit_mgr, user_hash, &signer, addr).await;
+    }
+}
+
 /// Persist a snapshot after releasing the tracker lock. The shared
 /// per-path coordinator in `part_tracker` preserves snapshot order.
 async fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
@@ -7080,9 +7106,14 @@ async fn download_parts_from_source(
     // The Ember hash this session's binding check passed for, and whether
     // SecIdent verified this session: together they keep the binding for the
     // Known Ember Peers tab without an address to tie them (see
-    // `CreditManager::note_session_proven_ember`).
+    // `CreditManager::note_session_bound_ember`).
     let mut session_bound_ember: Option<[u8; 16]> = None;
     let mut secident_verified_here = false;
+    // Our key-link challenge to this peer, the ones we answer, and the Ember
+    // key whose proof verified (`super::key_link`). With SecIdent that proof
+    // ties the user hash to the identity for Ember-stream credit
+    // (`CreditManager::note_session_proven_ember`).
+    let mut key_link = super::key_link::KeyLinkSession::default();
     // Strict proof-of-possession flag. `true` iff
     // `perform_ember_auth_buffered` completed successfully on THIS
     // TCP session — the peer signed a fresh random nonce we issued
@@ -7114,6 +7145,60 @@ async fn download_parts_from_source(
     // dispatch arms see them in their original arrival order.
     let mut auth_deferred: std::collections::VecDeque<(u8, u8, Vec<u8>)> =
         std::collections::VecDeque::new();
+
+    // Challenge the peer to prove its Ember key (`super::key_link`), once,
+    // when its HELLO has named one.
+    macro_rules! send_key_link_challenge {
+        () => {
+            if peer_ember_hash.is_some() && peer_user_hash != [0u8; 16] {
+                if let Some(challenge) = key_link.challenge_payload(hello_caps.is_ember) {
+                    let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_EXT, &challenge)
+                        .await;
+                }
+            }
+        };
+    }
+    // A key-link frame, from whichever read loop it lands in: answer the
+    // peer's challenge, or take its proof of ours. The proof is checked
+    // against the proven SecIdent key on record for the peer's user hash;
+    // without one yet it waits for `note_session_ember_links`. Without a
+    // credit ledger there is neither our SecIdent key nor a link to make.
+    macro_rules! on_key_link_frame {
+        ($sub_type:expr, $body:expr) => {
+            if let Some(cm) = &credit_mgr {
+                let our_key = ed25519_dalek::SigningKey::from_bytes(&ed25519_secret_key);
+                let step = {
+                    let ledger = cm.read().await;
+                    let peer = super::key_link::KeyLinkPeer {
+                        is_ember: hello_caps.is_ember,
+                        advertised_ember_hash: peer_ember_hash.as_ref(),
+                        user_hash: &peer_user_hash,
+                        proven_secident_key: ledger.proven_public_key(&peer_user_hash),
+                    };
+                    let us = super::key_link::KeyLinkUs {
+                        user_hash,
+                        key: &our_key,
+                        credits: &ledger,
+                    };
+                    key_link.on_frame($sub_type, $body, peer, us)
+                };
+                match step {
+                    super::key_link::KeyLinkStep::Reply(proof) => {
+                        let _ =
+                            write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_EXT, &proof)
+                                .await;
+                    }
+                    super::key_link::KeyLinkStep::Proven(signer) => {
+                        super::key_link::link_proven_key(cm, peer_user_hash, &signer, addr).await;
+                    }
+                    super::key_link::KeyLinkStep::AwaitingSecIdent => {
+                        debug!("Key link: proof from source {} waits for SecIdent", _src_idx);
+                    }
+                    super::key_link::KeyLinkStep::Ignored => {}
+                }
+            }
+        };
+    }
 
     // Handle pre-file-control packets which may arrive before file requests.
     // Bumped from 3 → 12 iterations because `perform_ember_auth_buffered`
@@ -7300,8 +7385,16 @@ async fn download_parts_from_source(
                 .await
                 {
                     secident_verified_here = true;
-                    if let (Some(eh), Some(cm)) = (session_bound_ember, &credit_mgr) {
-                        cm.write().await.note_session_proven_ember(peer_user_hash, eh);
+                    if let Some(cm) = &credit_mgr {
+                        note_session_ember_links(
+                            cm,
+                            peer_user_hash,
+                            user_hash,
+                            session_bound_ember,
+                            &mut key_link,
+                            addr,
+                        )
+                        .await;
                     }
                 }
             }
@@ -7542,7 +7635,7 @@ async fn download_parts_from_source(
                                             CreditManager::ident_ip_of(addr),
                                         );
                                         if secident_verified_here {
-                                            cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                            cm.note_session_bound_ember(peer_user_hash, *peer_eh);
                                         }
                                     }
                                 }
@@ -7690,6 +7783,13 @@ async fn download_parts_from_source(
                             }
                         }
                     }
+                }
+            }
+            (OP_EMULEPROT, OP_EMBER_EXT)
+                if super::key_link::key_link_frame(proto, opcode, &payload).is_some() =>
+            {
+                if let Some((sub_type, body)) = super::key_link::key_link_frame(proto, opcode, &payload) {
+                    on_key_link_frame!(sub_type, body);
                 }
             }
             _ => {
@@ -7955,6 +8055,10 @@ async fn download_parts_from_source(
             sent_ember_hello = true;
         }
     }
+    // A peer whose HELLO came before the file request is challenged now, so
+    // the vanilla request sequence still goes first; one whose HELLO comes
+    // later, from the file-status wait below.
+    send_key_link_challenge!();
 
     // Read responses (consume deferred packet first, then any packets)
     // captured by `perform_ember_auth_buffered` that haven't been
@@ -8182,8 +8286,16 @@ async fn download_parts_from_source(
             .await
             {
                 secident_verified_here = true;
-                if let (Some(eh), Some(cm)) = (session_bound_ember, &credit_mgr) {
-                    cm.write().await.note_session_proven_ember(peer_user_hash, eh);
+                if let Some(cm) = &credit_mgr {
+                    note_session_ember_links(
+                        cm,
+                        peer_user_hash,
+                        user_hash,
+                        session_bound_ember,
+                        &mut key_link,
+                        addr,
+                    )
+                    .await;
                 }
             }
             continue;
@@ -8210,6 +8322,10 @@ async fn download_parts_from_source(
                 }
                 debug!("Peer comment from source {} during file-status: rating={rating}, comment='{comment}'", _src_idx);
             }
+            continue;
+        }
+        if let Some((sub_type, body)) = super::key_link::key_link_frame(proto, opcode, &_payload) {
+            on_key_link_frame!(sub_type, body);
             continue;
         }
         // Ember-only; gated on HELLO + hash↔pubkey binding.
@@ -8345,6 +8461,7 @@ async fn download_parts_from_source(
                     .await;
                     sent_ember_hello = true;
                 }
+                send_key_link_challenge!();
 
                 // Binding + optional full PoP (mirrors the pre-control
                 // site — see the long comment there for the rationale).
@@ -8367,7 +8484,7 @@ async fn download_parts_from_source(
                                         CreditManager::ident_ip_of(addr),
                                     );
                                     if secident_verified_here {
-                                        cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                        cm.note_session_bound_ember(peer_user_hash, *peer_eh);
                                     }
                                 }
                             }
@@ -9109,6 +9226,15 @@ async fn download_parts_from_source(
                         )
                         .await;
                     }
+                    Ok((proto, opcode, payload))
+                        if super::key_link::key_link_frame(proto, opcode, &payload).is_some() =>
+                    {
+                        if let Some((sub_type, body)) =
+                            super::key_link::key_link_frame(proto, opcode, &payload)
+                        {
+                            on_key_link_frame!(sub_type, body);
+                        }
+                    }
                     Ok((proto, opcode, _)) => {
                         debug!("Source {} waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping", _src_idx);
                     }
@@ -9435,6 +9561,10 @@ async fn download_parts_from_source(
                     }
                     debug!("Peer comment from source {} while queued: rating={rating}, comment='{comment}'", _src_idx);
                 }
+            } else if let Some((sub_type, body)) =
+                super::key_link::key_link_frame(proto, opcode, &payload)
+            {
+                on_key_link_frame!(sub_type, body);
             } else {
                 info!("Source {} ({}) queue wait: unhandled packet proto=0x{:02X} op=0x{:02X} ({} bytes)",
                     _src_idx, addr, proto, opcode, payload.len());
@@ -11222,6 +11352,15 @@ async fn download_parts_from_source(
                     // logging it as "unexpected" misled us into thinking
                     // the in-session re-queue had a bug.
                     (OP_EDONKEYHEADER, OP_REASKACK) => {}
+                    (OP_EMULEPROT, OP_EMBER_EXT)
+                        if super::key_link::key_link_frame(proto, opcode, &payload).is_some() =>
+                    {
+                        if let Some((sub_type, body)) =
+                            super::key_link::key_link_frame(proto, opcode, &payload)
+                        {
+                            on_key_link_frame!(sub_type, body);
+                        }
+                    }
                     _ => {
                         info!("During data transfer, unexpected packet proto=0x{:02X} op=0x{:02X} ({} bytes) from source {} ({})",
                         proto, opcode, payload.len(), _src_idx, addr);

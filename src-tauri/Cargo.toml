@@ -202,6 +202,9 @@ windows-sys = { version = "0.61", features = [
     # the types `MIB_IF_ROW2` and `GetIfEntry2` are declared with.
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    # `RasEnumConnectionsW`, so a PPP route is judged by its connection's
+    # device type: a VPN's, or PPPoE broadband's (see `src/vpn.rs`).
+    "Win32_NetworkManagement_Rras",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",

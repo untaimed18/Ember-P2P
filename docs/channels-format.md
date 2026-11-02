@@ -1738,11 +1738,102 @@ The receiver checks the record exactly as one found in the DHT and takes it
 only for a feed it follows whose publisher is the friend who sent it; a head
 signed by anyone else, or forwarded, is ignored. Older builds log the sub-type as unknown and ignore it.
 
+**Key link, from 1.7.6.** `EMBER_EXT_KEY_LINK_CHALLENGE` (`0x15`) and
+`EMBER_EXT_KEY_LINK_PROOF` (`0x16`) tie a peer's Ember identity to its eD2K
+user hash, so bytes it sends or takes over Ember's own streams (feeds, chat
+files, room transfers) count in the eD2K credit ledger. Unlike the other
+sub-types they ride plain eD2K sessions, download and upload alike, to any
+peer whose `OP_EMBER_HELLO` showed it is an Ember client, friend or not; a
+plain eMule peer never sends that HELLO and never sees either. Friend
+sessions carry neither.
+
+- CHALLENGE body: `nonce(32)`, fresh from the OS RNG. Each side sends at most
+  one per session, after the peer's HELLO named an Ember identity: a
+  downloader once its file request is on the wire, an uploader as soon as the
+  HELLO arrives.
+- PROOF body: `ember_pubkey(32) || ed25519_sig(64) || rsa_sig_len(1) ||
+  rsa_sig(rsa_sig_len)`. `rsa_sig_len` must be 48, the signature size of the
+  RSA-384 keys eMule, aMule and Ember use for SecIdent; any other value, and
+  any body that is not exactly 145 bytes, is refused.
+
+Both signatures cover one statement, the 151 bytes
+`"ember-ed2k-key-link-v1\0" || nonce(32) || prover_user_hash(16) ||
+challenger_user_hash(16) || prover_ember_pubkey(32) ||
+BLAKE3(prover_secident_pubkey)(32)`, the SecIdent public key hashed exactly
+as its `OP_PUBLICKEY` carries it:
+
+- `ed25519_sig` is by the Ember key, over the statement.
+- `rsa_sig` is by the prover's SecIdent RSA key, with SecIdent's own
+  primitive (PKCS#1 v1.5 over SHA-1), over the statement followed by zero
+  bytes to 320 in all. No SecIdent signer, in any Ember or eMule version,
+  signs more than 264 bytes (a peer key of at most 255, the challenge, and
+  the 5-byte IP tail), so no SecIdent answer is, or can be steered into
+  being, a key-link RSA signature; Ember's signer also refuses any input but
+  that exact 320-byte form under this domain.
+
+The prover always names its own user hash, its own Ember and SecIdent keys,
+and the user hash the session's peer sent in Hello, and never signs anything
+else under that prefix. A client without a SecIdent key pair answers
+nothing. A session answers at most two challenges.
+
+The challenger takes a proof only as the answer to its one outstanding nonce,
+which any proof spends; an unsolicited or second proof is ignored. The Ember
+key must hash to the identity the peer's HELLO advertised; the statement is
+rebuilt with the session's peer user hash as prover, the challenger's own as
+challenger, and the digest of the SecIdent key on record for the peer's user
+hash, which must be one SecIdent has proven, on this session or any earlier
+one (`CreditManager::proven_public_key`); the Ed25519 signature must verify
+by the Ember key and the RSA signature by that record key. SecIdent need not
+run on the proof's own session, so a peer already verified at its address
+(for which SecIdent is skipped) still links. Only at first contact, when no
+key for the user hash has been proven yet, is the proof kept (nonce, length
+and binding already checked) and checked when SecIdent proves a key on that
+session; it is dropped if that key did not sign it. However a proof
+verifies, it goes through one call that makes the link
+(`CreditManager::note_session_proven_ember`, which also requires the record
+still to hold that proven key); a later proof from the same Ember key for
+another user hash moves it.
+
+Each key endorses the other, which rules out, in turn: a replayed Ember
+public key (no Ed25519 signature); our nonce relayed to the real key holder
+by a stranger under its own user hash (the statement names the key holder's
+user hash and the stranger's); the same relay by a stranger that reached us
+first under the key holder's user hash with its own RSA key (the key
+holder's RSA signature is not by the key on record); and a stranger that
+passes SecIdent for the key holder's user hash by relaying one of its
+SecIdent answers, which SecIdent v1 allows, then proves its own Ember key
+(it has no signature by the key holder's RSA key over that Ember key, and a
+SecIdent answer cannot serve as one), so it can neither take the user hash's
+link nor replace it.
+
+The link is stored in `credit_key_links` with the SecIdent key it was proven
+under and is restored only while the user hash still holds that key; the older
+`credit_ember_links` table, which builds before 1.7.6 filled from a public
+key alone, is shown on Known Ember Peers and never earns credit. Both tables
+sit outside the numbered schema, so a 1.7.6 backup restores on 1.7.5.
+
+A peer that never answers, or whose user hash never has a key proven, just
+never gets the link: nothing waits on it and no session is dropped. 1.7.5
+logs both sub-types as unknown and ignores them, on every session loop; a
+1.7.5 downloader that meets an uploader's challenge before its own file
+request takes it as the end of its pre-request reads and skips it in the
+file-status wait, as it would any packet it does not expect there.
+
+What remains is what SecIdent itself guarantees: the link ties an Ember key
+to whoever holds the RSA key on record for the user hash, and that key is
+first-come for a user hash never seen before. Someone who holds both the
+Ember private key and that RSA key can make the link, as they can already
+collect that user hash's eD2K credit; a stranger who is first to claim an
+unseen user hash under its own RSA key can link only its own Ember key to
+it, never another client's.
+
 ---
 
 ## What freezes at the end of the beta
 
-Frozen in 1.7.5; the beta ended in 1.7.6, which changed none of it.
+Frozen in 1.7.5; the beta ended in 1.7.6, which changed none of it and added
+only a member's second language, in two bytes 1.7.5 writes as zero and never
+reads (see kind 2 above).
 
 **Fixed from then on:**
 
@@ -1791,10 +1882,12 @@ Frozen in 1.7.5; the beta ended in 1.7.6, which changed none of it.
   except the owner's own key copy and rotates every private room once.
   Sending membership traffic under a throwaway DHT identity is not part of
   the format and can come later (`docs/post-1.7.5.md` item 1).
-- A member's language in their presence record: byte 67 in a public room,
-  the nickname pad's last byte in a private room's seal, a
-  `CHANNEL_LANGUAGES` wire id with 0 for none, and the rule that only the
-  member's own presence record sets or clears it.
+- A member's languages in their presence record: the first in byte 67 of a
+  public room's record and the nickname pad's last byte in a private room's
+  seal, and, from 1.7.6, the second in byte 68 and the pad byte before the
+  last; each a `CHANNEL_LANGUAGES` wire id with 0 for none, a second kept only
+  beside a different first, and the rule that only the member's own presence
+  record sets or clears them.
 - The `CHANNEL_LANGUAGES` wire ids 1 to 37 as tabled under
   [DHT channel records](#dht-channel-records), and the rule that the list
   only grows at its end.

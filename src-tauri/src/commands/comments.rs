@@ -5,11 +5,14 @@ use crate::network::NetworkCommand;
 
 #[tauri::command]
 pub async fn set_file_comment(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     file_hash: String,
     rating: u8,
     comment: String,
 ) -> Result<(), String> {
+    // Published to peers under this identity.
+    crate::commands::chat_window::require_main_window(&window)?;
     if rating > 5 {
         return Err(coded(
             "comments_invalid_rating",

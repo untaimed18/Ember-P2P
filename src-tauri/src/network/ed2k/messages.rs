@@ -415,6 +415,34 @@ pub const EMBER_EXT_STATUS: u8 = 0x13;
 /// if signed by the friend who sent it. A peer that predates this ignores it.
 pub const EMBER_EXT_FEED_HEAD: u8 = 0x14;
 
+/// [`OP_EMBER_EXT`] sub-type on an eD2K session: "prove you hold the Ember key
+/// your HELLO advertised". Body is a fresh 32-byte random nonce.
+///
+/// Sent at most once per session, and only to a peer whose `OP_EMBER_HELLO`
+/// showed it is an Ember client, so a plain eMule peer never sees one. Not
+/// friend-gated: it is how a stranger's Ember identity gets tied to its eD2K
+/// user hash for Ember-stream credit
+/// ([`crate::network::ed2k::key_link`]). A peer that predates it ignores it
+/// and never gets the link.
+pub const EMBER_EXT_KEY_LINK_CHALLENGE: u8 = 0x15;
+
+/// [`OP_EMBER_EXT`] sub-type: the answer to [`EMBER_EXT_KEY_LINK_CHALLENGE`].
+/// Body is `ember_pubkey(32) || ed25519_sig(64) || rsa_sig_len(1) ||
+/// rsa_sig(rsa_sig_len)`, `rsa_sig_len` always 48 (RSA-384). Both signatures
+/// cover `"ember-ed2k-key-link-v1\0" || nonce(32) || prover_user_hash(16) ||
+/// challenger_user_hash(16) || prover_ember_pubkey(32) ||
+/// BLAKE3(prover_secident_pubkey)(32)`: the Ed25519 one by the Ember key, the
+/// RSA one by the prover's SecIdent key (SecIdent's PKCS#1 v1.5 / SHA-1, over
+/// the statement zero-padded to 320 bytes, longer than anything SecIdent
+/// signs).
+///
+/// Taken only as the answer to our one outstanding nonce, from an Ember key
+/// that hashes to the identity the peer advertised, and checked against the
+/// SecIdent key proven for the peer's user hash, in this session or an
+/// earlier one; at first contact it waits for SecIdent to prove one. A
+/// session answers at most two challenges.
+pub const EMBER_EXT_KEY_LINK_PROOF: u8 = 0x16;
+
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
 /// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1) || noise_pub(32)`.
@@ -3523,6 +3551,14 @@ mod tests {
             EMBER_EXT_BROWSE_SUMMARY,
             EMBER_EXT_DHT_MEET,
             EMBER_EXT_BROWSE_SCOPE_AWARE,
+            EMBER_EXT_CHAT_EXPIRE,
+            EMBER_EXT_MAILBOX_AWARE,
+            EMBER_EXT_CHAT_ID,
+            EMBER_EXT_ATTACH_WAITS,
+            EMBER_EXT_STATUS,
+            EMBER_EXT_FEED_HEAD,
+            EMBER_EXT_KEY_LINK_CHALLENGE,
+            EMBER_EXT_KEY_LINK_PROOF,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {
