@@ -16,9 +16,9 @@ import { getLocale } from '$lib/paraglide/runtime';
  * the plural.
  *
  * `few` and `many` are optional and fall back to `other`. A group only carries
- * `_few` where a locale needs a distinct form for it: Russian 2–4, 22–24, …
- * Russian `_other` strings are written in the form that `many` (0, 5–20, …)
- * takes, so no group needs a separate `_many` yet.
+ * `_few` where a locale needs a distinct form for it: Russian and Polish 2–4,
+ * 22–24, … Their `_other` strings are written in the form that `many`
+ * (0, 5–20, …) takes, so no group needs a separate `_many` yet.
  */
 export interface PluralForms {
   one: () => string;

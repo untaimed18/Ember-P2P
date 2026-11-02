@@ -388,7 +388,7 @@ eMule users and eD2K servers see your nickname followed by `[https://emberp2p.or
 - **Close to Tray** — Choose what the title-bar X does: ask each time, minimize to tray, or exit. The tray icon stays available either way, and its tooltip carries the current up/down rates. On a Linux desktop with nothing to show the icon (stock GNOME without the AppIndicator extension), closing to the tray minimizes the window instead of hiding it. A separate **Minimize to the tray** switch (Settings > General, off by default) hides the window in the tray when it is minimized rather than leaving it on the taskbar.
 - **Keyboard Shortcuts** — `?` opens a shortcut cheat sheet, Alt+1–9 then Alt+0 jump to the first ten sidebar pages, and Ctrl+, opens Settings.
 - **Statistics** — Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.
-- **Internationalization** — UI strings via Paraglide (`en`, `es`, `fr`, `pt-BR`, `de`, `zh-CN`, `it`, `ru`, `zh-TW`), with a Settings language picker whose **System** option follows the OS locale; see [docs/i18n.md](docs/i18n.md).
+- **Internationalization** — UI strings via Paraglide (`en`, `es`, `fr`, `pt-BR`, `de`, `zh-CN`, `it`, `ru`, `zh-TW`, `pl`), with a Settings language picker whose **System** option follows the OS locale; see [docs/i18n.md](docs/i18n.md).
 - **GeoIP** — Country identification for connected peers from a bundled MaxMind database.
 
 ## Getting Started

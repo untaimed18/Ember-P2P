@@ -886,12 +886,12 @@ impl SpamParam {
 ///
 /// The English is what logs and the `explain_spam_result` diagnostics read, and
 /// what a UI older than the backend falls back to. The code plus its numeric
-/// parameters are what the UI translates, so the eight non-English locales stop
+/// parameters are what the UI translates, so the nine non-English locales stop
 /// reading English in the spam tooltip.
 ///
 /// One table for both halves is what keeps them honest: a variant cannot
 /// compile without a code and a template, and `scripts/backend-codes.test.mjs`
-/// parses this table to require both a translation in all nine locales and the
+/// parses this table to require both a translation in all ten locales and the
 /// same `{placeholders}` on each side.
 macro_rules! spam_reason_codes {
     ($($variant:ident => $code:literal, $message:literal;)+) => {

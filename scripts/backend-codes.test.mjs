@@ -9,7 +9,7 @@ import test from "node:test";
  * the backend produced: a transfer's failure text, its health text, and the
  * spam tooltip. They are driven by stable codes now, which fixes the fragility
  * but moves the risk: a code the frontend has no row for renders the backend's
- * English, silently, in all eight non-English locales. That is exactly how the
+ * English, silently, in all nine non-English locales. That is exactly how the
  * spam tooltip stayed untranslated for as long as it did — `error-codes.test.mjs`
  * only ever scanned `coded()` construction sites, so this family was invisible
  * to it.

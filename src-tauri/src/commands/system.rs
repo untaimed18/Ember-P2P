@@ -5,7 +5,7 @@
 //!
 //! Every notification names something only the renderer knows how to say: a
 //! friend's nickname, a room's name, a message preview, a file name — wrapped
-//! in one of nine locales that the backend has no handle on (the active locale
+//! in one of ten locales that the backend has no handle on (the active locale
 //! lives in the webview, in `localStorage`, via Paraglide). So the renderer
 //! composes the title and body and this command performs the OS call.
 //!

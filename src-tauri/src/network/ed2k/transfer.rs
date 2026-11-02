@@ -1457,12 +1457,12 @@ pub(crate) fn failure_kind_name(kind: &SourceFailureKind) -> String {
 /// The English stays because logs, download history, and a UI older than the
 /// backend it is talking to all read it. The code is what the UI translates,
 /// which is what stops a re-wording here from silently dropping a row back to
-/// English for the eight non-English locales.
+/// English for the nine non-English locales.
 ///
 /// Both come out of one table on purpose: a variant cannot compile without a
 /// code and a sentence, `ALL` is generated from the same list so it cannot go
 /// stale, and `scripts/backend-codes.test.mjs` parses this table to require a
-/// translation in all nine locales before a new variant can ship.
+/// translation in all ten locales before a new variant can ship.
 macro_rules! transfer_failure_codes {
     ($($variant:ident => $code:literal, $message:literal;)+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1758,7 +1758,7 @@ mod tests {
     }
 
     /// The classifier is the only producer of a download failure, so its output
-    /// is what decides whether the eight non-English locales see a translation.
+    /// is what decides whether the nine non-English locales see a translation.
     /// Walks one raw error per branch and pins the code, not the wording.
     #[test]
     fn the_classifier_emits_a_code_for_every_branch_it_has() {

@@ -19,13 +19,16 @@ describe('pluralCategory', () => {
     expect(pluralCategory(3, 'ru')).toBe('few');
     expect(pluralCategory(5, 'ru')).toBe('many');
     expect(pluralCategory(21, 'ru')).toBe('one');
+    expect(pluralCategory(3, 'pl')).toBe('few');
+    expect(pluralCategory(5, 'pl')).toBe('many');
+    expect(pluralCategory(21, 'pl')).toBe('many');
     expect(pluralCategory(1, 'zh-CN')).toBe('other');
   });
 });
 
 describe('plural', () => {
   it('uses the singular for exactly one in every locale', () => {
-    for (const locale of ['en', 'es', 'fr', 'pt-BR', 'de', 'zh-CN', 'it', 'ru', 'zh-TW']) {
+    for (const locale of ['en', 'es', 'fr', 'pt-BR', 'de', 'zh-CN', 'it', 'ru', 'zh-TW', 'pl']) {
       expect(plural(1, all, locale)).toBe('one');
     }
   });
@@ -33,6 +36,15 @@ describe('plural', () => {
   it('picks the Russian few and many forms', () => {
     for (const n of [2, 3, 4, 22, 34, 102]) expect(plural(n, all, 'ru')).toBe('few');
     for (const n of [0, 5, 11, 12, 14, 20, 25, 111]) expect(plural(n, all, 'ru')).toBe('many');
+  });
+
+  it('picks the Polish few and many forms', () => {
+    for (const n of [2, 3, 4, 22, 34, 102]) expect(plural(n, all, 'pl')).toBe('few');
+    // Unlike Russian, Polish 21, 31, … are `many`, not `one`.
+    for (const n of [0, 5, 11, 12, 14, 20, 21, 25, 111]) expect(plural(n, all, 'pl')).toBe('many');
+    expect(plural(21, { ...all, oneShowsCount: true }, 'pl')).toBe('many');
+    // A group without `_few` sends 2–4 to `other` as it does in Russian.
+    expect(plural(3, twoForm, 'pl')).toBe('other');
   });
 
   it('falls back to other when a group has no few or many form', () => {
