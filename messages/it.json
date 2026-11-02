@@ -250,8 +250,6 @@
   "sidebar_logo_title": "Vai alla rete Ember",
   "sidebar_collapse": "Comprimi barra laterale ({mod}+B)",
   "sidebar_expand": "Espandi barra laterale ({mod}+B)",
-  "sidebar_collapse_label": "Comprimi",
-  "sidebar_expand_label": "Espandi",
   "sidebar_collapse_aria": "Comprimi barra laterale",
   "sidebar_expand_aria": "Espandi barra laterale",
   "sidebar_about": "Informazioni",

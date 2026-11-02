@@ -250,8 +250,6 @@
   "sidebar_logo_title": "Przejdź do sieci Ember",
   "sidebar_collapse": "Zwiń pasek boczny ({mod}+B)",
   "sidebar_expand": "Rozwiń pasek boczny ({mod}+B)",
-  "sidebar_collapse_label": "Zwiń",
-  "sidebar_expand_label": "Rozwiń",
   "sidebar_collapse_aria": "Zwiń pasek boczny",
   "sidebar_expand_aria": "Rozwiń pasek boczny",
   "sidebar_about": "Informacje",

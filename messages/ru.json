@@ -250,8 +250,6 @@
   "sidebar_logo_title": "Перейти в сеть Ember",
   "sidebar_collapse": "Свернуть боковую панель ({mod}+B)",
   "sidebar_expand": "Развернуть боковую панель ({mod}+B)",
-  "sidebar_collapse_label": "Свернуть",
-  "sidebar_expand_label": "Развернуть",
   "sidebar_collapse_aria": "Свернуть боковую панель",
   "sidebar_expand_aria": "Развернуть боковую панель",
   "sidebar_about": "О программе",

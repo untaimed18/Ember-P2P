@@ -250,8 +250,6 @@
   "sidebar_logo_title": "前往 Ember 网络",
   "sidebar_collapse": "收起侧边栏 ({mod}+B)",
   "sidebar_expand": "展开侧边栏 ({mod}+B)",
-  "sidebar_collapse_label": "收起",
-  "sidebar_expand_label": "展开",
   "sidebar_collapse_aria": "收起侧边栏",
   "sidebar_expand_aria": "展开侧边栏",
   "sidebar_about": "关于",

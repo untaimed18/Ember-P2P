@@ -250,8 +250,6 @@
   "sidebar_logo_title": "Zum Ember-Netzwerk",
   "sidebar_collapse": "Seitenleiste einklappen ({mod}+B)",
   "sidebar_expand": "Seitenleiste ausklappen ({mod}+B)",
-  "sidebar_collapse_label": "Einklappen",
-  "sidebar_expand_label": "Ausklappen",
   "sidebar_collapse_aria": "Seitenleiste einklappen",
   "sidebar_expand_aria": "Seitenleiste ausklappen",
   "sidebar_about": "Info",

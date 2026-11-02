@@ -250,8 +250,6 @@
   "sidebar_logo_title": "Go to Ember Network",
   "sidebar_collapse": "Collapse sidebar ({mod}+B)",
   "sidebar_expand": "Expand sidebar ({mod}+B)",
-  "sidebar_collapse_label": "Collapse",
-  "sidebar_expand_label": "Expand",
   "sidebar_collapse_aria": "Collapse sidebar",
   "sidebar_expand_aria": "Expand sidebar",
   "sidebar_about": "About",

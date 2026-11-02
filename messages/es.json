@@ -250,8 +250,6 @@
   "sidebar_logo_title": "Ir a la red Ember",
   "sidebar_collapse": "Contraer barra lateral ({mod}+B)",
   "sidebar_expand": "Expandir barra lateral ({mod}+B)",
-  "sidebar_collapse_label": "Contraer",
-  "sidebar_expand_label": "Expandir",
   "sidebar_collapse_aria": "Contraer barra lateral",
   "sidebar_expand_aria": "Expandir barra lateral",
   "sidebar_about": "Acerca de",

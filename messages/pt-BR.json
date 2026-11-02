@@ -250,8 +250,6 @@
   "sidebar_logo_title": "Ir para a rede Ember",
   "sidebar_collapse": "Recolher barra lateral ({mod}+B)",
   "sidebar_expand": "Expandir barra lateral ({mod}+B)",
-  "sidebar_collapse_label": "Recolher",
-  "sidebar_expand_label": "Expandir",
   "sidebar_collapse_aria": "Recolher barra lateral",
   "sidebar_expand_aria": "Expandir barra lateral",
   "sidebar_about": "Sobre",

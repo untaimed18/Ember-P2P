@@ -250,8 +250,6 @@
   "sidebar_logo_title": "Aller au réseau Ember",
   "sidebar_collapse": "Réduire la barre latérale ({mod}+B)",
   "sidebar_expand": "Développer la barre latérale ({mod}+B)",
-  "sidebar_collapse_label": "Réduire",
-  "sidebar_expand_label": "Développer",
   "sidebar_collapse_aria": "Réduire la barre latérale",
   "sidebar_expand_aria": "Développer la barre latérale",
   "sidebar_about": "À propos",
