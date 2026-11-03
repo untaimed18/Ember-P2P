@@ -127,7 +127,6 @@
   let confirmLabel = $state('');
   let confirmCancelLabel = $state('');
   let confirmResolver: ((decision: ConfirmDecision) => void) | null = null;
-
   function openConfirmation(title: string, message: string, label: string, cancelLabel: string): Promise<ConfirmDecision> {
     if (destroyed) return Promise.resolve('defer');
     confirmTitle = title;
@@ -160,14 +159,17 @@
    * links waiting are files, ask once for all of them. Anything else keeps
    * its own dialog, and a lone file link is asked about as before.
    */
-  async function confirmFileBatch(links: PendingDeepLink[]): Promise<Map<string, Prepared>> {
+  async function confirmFileBatch(
+    links: PendingDeepLink[],
+    known?: Map<string, DeepLinkPreview>,
+  ): Promise<Map<string, Prepared>> {
     const prepared = new Map<string, Prepared>();
     if (links.length < 2) return prepared;
     const files: { id: string; preview: DeepLinkPreview }[] = [];
     for (const link of links) {
       if (destroyed) return prepared;
       // A link that fails to preview is left to its own turn, which reports it.
-      const preview = await previewDeepLink(link.payload.trim()).catch(() => null);
+      const preview = known?.get(link.id) ?? (await previewDeepLink(link.payload.trim()).catch(() => null));
       if (!preview) continue;
       prepared.set(link.id, { preview });
       if (preview.kind === 'file') files.push({ id: link.id, preview });
@@ -181,6 +183,25 @@
     );
     for (const f of files) prepared.set(f.id, { preview: f.preview, decision });
     return prepared;
+  }
+
+  /** Reviewing a parked file link brings back every parked file link, to be
+   *  asked about together as they were when they arrived. Empty when the
+   *  link under review is not a file, which is then asked about alone. */
+  async function deferredFileLinks(pending: PendingDeepLink[], reviewId: string): Promise<Map<string, DeepLinkPreview>> {
+    const files = new Map<string, DeepLinkPreview>();
+    const reviewed = pending.find((link) => link.id === reviewId);
+    if (!reviewed) return files;
+    const first = await previewDeepLink(reviewed.payload.trim()).catch(() => null);
+    if (first?.kind !== 'file') return files;
+    for (const link of pending) {
+      if (destroyed) break;
+      if (!deferredIds.has(link.id) || completedIds.has(link.id)) continue;
+      const preview =
+        link.id === reviewId ? first : await previewDeepLink(link.payload.trim()).catch(() => null);
+      if (preview?.kind === 'file') files.set(link.id, preview);
+    }
+    return files;
   }
 
   function resolveConfirmation(decision: ConfirmDecision) {
@@ -439,17 +460,21 @@
           if (!pendingIds.has(id)) batchDecisions.delete(id);
         }
 
+        const reviewFiles = reviewRequestedId
+          ? await deferredFileLinks(pending, reviewRequestedId)
+          : new Map<string, DeepLinkPreview>();
         const links = pending.filter(
-          (link) => !deferredIds.has(link.id) || link.id === reviewRequestedId,
+          (link) => !deferredIds.has(link.id) || link.id === reviewRequestedId || reviewFiles.has(link.id),
         );
-        // A deferred link being reviewed is asked about on its own, as before.
+        // A lone deferred link under review is asked about on its own.
         const prepared = await confirmFileBatch(
           links.filter(
             (link) =>
               !completedIds.has(link.id) &&
-              link.id !== reviewRequestedId &&
+              (link.id !== reviewRequestedId || reviewFiles.size > 1) &&
               !batchDecisions.has(link.id),
           ),
+          reviewFiles,
         );
         for (const [id, p] of prepared) {
           if (p.decision !== undefined) batchDecisions.set(id, p);
@@ -542,6 +567,8 @@
   });
 </script>
 
+<!-- Can appear unasked, and Ignore is permanent: a stray Enter must land on
+     neither button. -->
 <ConfirmDialog
   bind:open={confirmOpen}
   title={confirmTitle || m.deeplink_confirm_title()}
@@ -549,7 +576,7 @@
   confirmLabel={confirmLabel || m.deeplink_confirm_open()}
   cancelLabel={confirmCancelLabel || m.deeplink_confirm_ignore()}
   isolateMessage={true}
-  focusCancel
+  focusDialog
   onconfirm={() => resolveConfirmation('accept')}
   oncancel={() => resolveConfirmation('reject')}
   ondismiss={() => resolveConfirmation('defer')}

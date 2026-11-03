@@ -341,10 +341,12 @@
 
   // No "off" state: the backend forces the overlay on at load and on every
   // settings save, so a diagnostics reply never reports it disabled.
-  type HeroState = 'loading' | 'connecting' | 'connected' | 'no_peers';
+  type HeroState = 'loading' | 'unavailable' | 'connecting' | 'connected' | 'no_peers';
   let heroState: HeroState = $derived(
     diag === null
-      ? 'loading'
+      ? diagStale
+        ? 'unavailable'
+        : 'loading'
       : isConnected
         ? 'connected'
         : joining
@@ -356,15 +358,17 @@
   let statusLabel = $derived(
     heroState === 'loading'
       ? m.common_loading()
-      : heroState === 'connected'
-        ? m.ember_status_connected()
-        : heroState === 'connecting'
-          ? m.ember_status_connecting()
-          : m.ember_status_no_peers(),
+      : heroState === 'unavailable'
+        ? m.transfers_load_unavailable()
+        : heroState === 'connected'
+          ? m.ember_status_connected()
+          : heroState === 'connecting'
+            ? m.ember_status_connecting()
+            : m.ember_status_no_peers(),
   );
 
   let statusHint = $derived(
-    heroState === 'loading'
+    heroState === 'loading' || heroState === 'unavailable'
       ? ''
       : heroState === 'connected'
         ? m.ember_status_connected_hint()
@@ -765,7 +769,7 @@
   <section
     class="hero"
     class:hero-ok={heroState === 'connected'}
-    class:hero-warn={heroState === 'connecting' || heroState === 'no_peers'}
+    class:hero-warn={heroState === 'connecting' || heroState === 'no_peers' || heroState === 'unavailable'}
     aria-label={m.kad_stat_status()}
   >
     <div class="hero-status">
@@ -1056,6 +1060,10 @@
               </div>
             </div>
           {/each}
+        </div>
+      {:else if diag === null && diagStale}
+        <div class="empty-state compact" role="status">
+          <p class="empty-title">{m.transfers_load_unavailable()}</p>
         </div>
       {:else if !isActive}
         <div class="empty-state compact">

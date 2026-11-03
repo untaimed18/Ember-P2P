@@ -124,7 +124,12 @@
     try {
       // Parsed afresh: the count above trails typing and the clipboard fill.
       const parsed = await parseEd2kLinks(value).catch(() => null);
-      if (!parsed || parsed.links.length === 0 || !open || text.trim() !== value) return;
+      if (!open || text.trim() !== value) return;
+      if (!parsed || parsed.links.length === 0) {
+        submitError = parsed ? m.transfers_add_links_none_found() : m.error_operation_failed();
+        requestAnimationFrame(() => textareaEl?.focus());
+        return;
+      }
       try {
         await onsubmit(value);
       } catch (e: unknown) {

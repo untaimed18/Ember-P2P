@@ -4982,7 +4982,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             describe_panic(&*panic_info)
         );
         let _ = app_handle.emit("network-error", serde_json::json!({
-            "message": "Internal error in network task. The application may need to be restarted.",
+            "message": crate::commands::errors::coded(
+                "network_task_panicked",
+                "Internal error in network task. The application may need to be restarted.",
+            ),
         }));
     }
 

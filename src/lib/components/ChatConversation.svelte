@@ -106,6 +106,7 @@
     formatClockTime,
     formatDateTime,
     insertMention,
+    isAppFocused,
     isAppVisible,
     mentionTokenAt,
     shortPubkey,
@@ -335,10 +336,13 @@
   );
   let inputText = $state('');
   let loading = $state(false);
+  /** A send is in flight for the conversation on screen. */
   let sending = $state(false);
-  /** Which send owns `sending`. A send that outlives a conversation switch
-   *  must not unlock the composer of a send started in the next one. */
-  let sendSeq = 0;
+  /** Sends still out, by conversation key, with the composer text each took.
+   *  One can outlive a switch away and back, so `sending` is re-read from here
+   *  on every switch rather than reset. */
+  const sendsInFlight = new Map<string, string>();
+  let destroyed = false;
   let sendError: string | null = $state(null);
   let loadError: string | null = $state(null);
   // Non-blocking notice shown above the (successfully loaded) message list when
@@ -742,6 +746,19 @@
   /** What the save would send, in the unit the backend caps. */
   let editBytes = $derived(editingId === null ? 0 : utf8.encode(editDraft.trim()).length);
 
+  /**
+   * What the backend caps a new message at, in UTF-8 bytes. `maxlength` only
+   * caps characters, so a message of multi-byte glyphs (emoji, CJK) can be
+   * under 4096 chars yet over the byte limit. A room line has to fit one
+   * relayed datagram, which leaves it less than 4096, and a reply's signed
+   * reference rides in the same frame.
+   */
+  let composerMaxBytes = $derived(
+    isChannel ? CHANNEL_LINE_MAX_TEXT_BYTES - (replyTarget ? REPLY_REFERENCE_BYTES : 0) : MAX_MESSAGE_BYTES,
+  );
+  let composerBytes = $derived(utf8.encode(inputText.trim()).length);
+  let composerOverLimit = $derived(composerBytes > composerMaxBytes);
+
   /** Seconds left of the backend's edit window, by the same clock as `canEdit`. */
   function editSecondsLeft(msg: ConvMessage): number {
     return EDIT_WINDOW_SECS - (editClockNow / 1000 - msg.timestamp);
@@ -827,6 +844,12 @@
   }
 
   function onEditKeydown(e: KeyboardEvent, msg: ConvMessage) {
+    // The Channels page steps rooms on Alt+↑/↓, and the switch drops the edit.
+    // The key keeps its in-field meaning (caret by paragraph on macOS).
+    if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.stopPropagation();
+      return;
+    }
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
@@ -1256,9 +1279,8 @@
     const friend = friendHash;
     if (key) {
       sendError = null;
-      sendSeq++;
-      sending = false;
-      inputText = getDraft(key);
+      sending = sendsInFlight.has(key);
+      inputText = sendsInFlight.get(key) ?? getDraft(key);
       if (channel) {
         loadRoomDraft(channel);
       } else {
@@ -1299,6 +1321,8 @@
       markerResolved = false;
       unreadDividerSeen = false;
       unreadDividerAbove = false;
+      readHeldForFocus = false;
+      awayDividerPlaced = false;
       // Scroll position belongs to the conversation being left, not the one
       // being opened: `loadMessages` lands this one on its own unread marker,
       // or with nothing unread where the reader last left it, or at the bottom.
@@ -1344,17 +1368,18 @@
         // running them together raced: clearing `read` in the database first
         // meant the snapshot came back with nothing unread and the divider had
         // nothing to sit above. The badge waits for this to succeed.
-        if (gen === loadGen) void markAsRead();
+        if (gen === loadGen) markReadIfFocused();
       })();
     }
     return () => {
       loadGen++;
+      flushMarkAsRead();
       if (unlisten) { unlisten(); unlisten = null; }
       if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
       if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
       if (unlistenRead) { unlistenRead(); unlistenRead = null; }
       if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
-      if (key) setDraft(key, inputText);
+      if (key) setDraft(key, draftToKeep(key));
       flushRoomDraft();
       releaseChannelOnScreen?.();
       releaseChannelOnScreen = null;
@@ -1382,10 +1407,16 @@
     const key = conversationKey;
     if (!key) return;
     return registerDraftFlusher(() => {
-      setDraft(key, inputText);
+      setDraft(key, draftToKeep(key));
       flushRoomDraft();
     });
   });
+
+  /** What to keep as `key`'s draft: nothing while the composer still holds
+   *  the text a send in flight took, which comes back if that send fails. */
+  function draftToKeep(key: string): string {
+    return sendsInFlight.get(key) === inputText ? '' : inputText;
+  }
 
   // A room's draft also outlives a restart, sealed with the chat key on disk.
   // Friend drafts stay in memory only (see `chatTabs`).
@@ -1532,8 +1563,8 @@
           // Not while the open is still seeking back for the first unread line:
           // clearing `read` now would stop that seek short and misplace the
           // divider. The read after the load covers this line too.
-          if (event.payload.direction === 'received' && isAppVisible() && markerResolved) {
-            markAsRead();
+          if (event.payload.direction === 'received' && markerResolved) {
+            noteReceivedLive(event.payload.id, event.payload.sender_pubkey);
           }
         });
       } catch (e) {
@@ -1664,13 +1695,8 @@
           }];
           commitLiveMessages(next, direction === 'sent' || wasPinned);
           noteMissedMessage(wasPinned, direction);
-          // Only acknowledge what the user can actually see. A mounted
-          // conversation in a minimized window would otherwise mark the
-          // message read and suppress its badge, losing it entirely. Held
-          // until the unread divider is placed, as in the room listener.
-          if (direction === 'received' && isAppVisible() && markerResolved) {
-            markAsRead();
-          }
+          // Held until the unread divider is placed, as in the room listener.
+          if (direction === 'received' && markerResolved) noteReceivedLive(next[next.length - 1].id);
       });
     } catch (e) {
       console.warn('ChatConversation: failed to register chat listener', e);
@@ -1794,7 +1820,11 @@
             !existingPositiveIds.has(message.id)
             && !liveSig.has(`${message.timestamp}|${message.direction}|${message.message}`),
         );
-        messages = [...filteredSnapshot, ...reconciledLive];
+        // In row order: a live line can be older than the newest stored one.
+        // Live lines without a row yet keep their order, after every stored one.
+        messages = [...filteredSnapshot, ...reconciledLive].sort((a, b) =>
+          a.id < 0 || b.id < 0 ? Number(a.id < 0) - Number(b.id < 0) : a.id - b.id,
+        );
       }
       const earlyDeliveredInSnapshot = new Set(
         snapshot
@@ -1938,6 +1968,9 @@
     if (unlistenRead) { unlistenRead(); unlistenRead = null; }
     if (unlistenAttach) { unlistenAttach(); unlistenAttach = null; }
     liveError = false;
+    // A page of history still out belongs to the generation just retired, and
+    // its own `finally` no longer resets these.
+    loadingOlder = false;
     olderError = false;
     const listenerOk = await setupListener(gen, hash, channel);
     if (gen !== loadGen) return;
@@ -1947,12 +1980,76 @@
     // the rest, so it has to be registered again too.
     if (!channel && gen === loadGen) await setupAttachments(gen, hash);
     // Live lines held back while the first load had not placed the divider.
-    if (gen === loadGen) void markAsRead();
+    if (gen === loadGen) markReadIfFocused();
   }
 
-  async function markAsRead() {
-    const channel = channelId;
-    const h = friendHash;
+  /** Received lines left unread because the window did not have focus, to be
+   *  marked once it does. */
+  let readHeldForFocus = false;
+  /** The divider was moved to a line that arrived while the window was in the
+   *  background; later ones in the same absence leave it there. */
+  let awayDividerPlaced = false;
+
+  /** Mark read now when the user can see it, else once the window has focus.
+   *  Visible is not enough: a window behind another app is not being read,
+   *  and for a friend the read sends a Seen receipt and starts the
+   *  disappearing timers. */
+  function markReadIfFocused() {
+    if (isAppFocused()) void markAsRead();
+    else readHeldForFocus = true;
+  }
+
+  /** A live line from somebody else, once the divider is placed: read at once
+   *  when the user is looking, else left unread, with the divider above it
+   *  unless an earlier one is still to be seen. */
+  function noteReceivedLive(id: number, sender?: string) {
+    if (isAppFocused()) {
+      scheduleMarkAsRead();
+      return;
+    }
+    readHeldForFocus = true;
+    if (awayDividerPlaced || (sender && ignoredSenders.includes(sender.toLowerCase()))) return;
+    if (unreadMarkerId !== null && !unreadDividerSeen) return;
+    awayDividerPlaced = true;
+    unreadMarkerId = id;
+    unreadDividerSeen = false;
+  }
+
+  /** Lines arriving in a burst are marked read together, at most once per
+   *  window, rather than one round trip each. */
+  const MARK_READ_COALESCE_MS = 300;
+  let markReadTimer: ReturnType<typeof setTimeout> | null = null;
+  let markReadPending: { channel: string; friend: string } | null = null;
+
+  function scheduleMarkAsRead() {
+    markReadPending = { channel: channelId, friend: friendHash };
+    if (!markReadTimer) {
+      markReadTimer = setTimeout(() => {
+        if (isAppFocused()) {
+          flushMarkAsRead();
+          return;
+        }
+        // Focus went in the meantime: the window's return marks these.
+        markReadTimer = null;
+        markReadPending = null;
+        readHeldForFocus = true;
+      }, MARK_READ_COALESCE_MS);
+    }
+  }
+
+  /** Send a coalesced read now. Run as a conversation is left, against the one
+   *  it was scheduled for. */
+  function flushMarkAsRead() {
+    if (markReadTimer) {
+      clearTimeout(markReadTimer);
+      markReadTimer = null;
+    }
+    const pending = markReadPending;
+    markReadPending = null;
+    if (pending && isAppFocused()) void markAsRead(pending.channel, pending.friend);
+  }
+
+  async function markAsRead(channel = channelId, h = friendHash) {
     if (channel) {
       try {
         await markChannelMessagesRead(channel);
@@ -2152,21 +2249,31 @@
     });
   });
 
-  // Messages that arrived while the window was hidden were deliberately left
-  // unread; clear them once the user actually comes back to the conversation.
+  // Messages that arrived while the window was hidden or behind another app
+  // were deliberately left unread; clear them once the user actually comes
+  // back to the conversation.
   $effect(() => {
     if (typeof document === 'undefined') return;
-    const onVisibilityChange = () => {
+    const onReturn = () => {
+      if (!isAppFocused()) return;
+      awayDividerPlaced = false;
       // Mid-open is left to the read that follows the load, for the reason the
       // live listeners give.
-      if (document.visibilityState === 'visible') {
-        if (markerResolved) void markAsRead();
-      } else {
-        stopOutgoingTyping();
+      if (markerResolved && readHeldForFocus) {
+        readHeldForFocus = false;
+        void markAsRead();
       }
     };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') onReturn();
+      else stopOutgoingTyping();
+    };
     document.addEventListener('visibilitychange', onVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('focus', onReturn);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('focus', onReturn);
+    };
   });
 
   function scrollToBottom(instant = false) {
@@ -2820,25 +2927,23 @@
     if (slowModeLeft > 0) return;
     const channel = channelId;
     const reply = channel ? replyTarget : null;
-    // Guard on UTF-8 byte length to match the backend's limit. `maxlength`
-    // only caps characters, so a message of multi-byte glyphs (emoji, CJK)
-    // can be under 4096 chars yet over the byte limit and be rejected
-    // server-side with a generic error. A room line has to fit one relayed
-    // datagram, which leaves it less than 4096, and a reply's signed reference
-    // rides in the same frame.
     const maxBytes = channel
       ? CHANNEL_LINE_MAX_TEXT_BYTES - (reply ? REPLY_REFERENCE_BYTES : 0)
       : MAX_MESSAGE_BYTES;
-    if (new TextEncoder().encode(text).length > maxBytes) {
+    if (utf8.encode(text).length > maxBytes) {
       sendError = m.chat_message_too_long({ max: maxBytes });
       return;
     }
     const waitSecs = slowModeSecs;
     const h = friendHash;
     const key = conversationKey;
-    const seq = ++sendSeq;
+    const raw = inputText;
+    sendsInFlight.set(key, raw);
     sending = true;
     sendError = null;
+    // Off the draft while it is out, so leaving and coming back cannot offer
+    // it to be sent twice. A failure puts it back.
+    clearDraft(key);
     if (channel) {
       // The line landing takes the indicator down on every receiver, so a stop
       // here would only spend a datagram per member. The next keystroke starts
@@ -2862,27 +2967,24 @@
             messages = [...messages, withEarlyRoomDelivery(fromChannelRow(sent))];
           }
           if (reply && replyTarget?.msgId === reply.msgId) replyTarget = null;
-          inputText = '';
+          if (inputText === raw) inputText = '';
           scrollToBottom();
           if (waitSecs > 0) {
             nextSendAt = Date.now() + waitSecs * 1000;
             slowModeNow = Date.now();
           }
         }
-        clearDraft(key);
         discardRoomDraft(channel);
         return;
       }
       await deliverToFriend(h, text);
-      // Only clear the live editor if we're still viewing this friend — on a
-      // tab switch the main $effect already stashed/restored drafts, so
-      // touching inputText here would wipe the NEW conversation's draft.
-      if (h === friendHash) inputText = '';
-      // Drop the (now-sent) draft for the friend we actually sent to. The
-      // main $effect's cleanup may have re-stashed it during a tab switch, so
-      // clear it explicitly; `clearDraft` is a no-op when there's no entry.
-      clearDraft(h);
+      // Only while the composer still shows this friend and what was sent: a
+      // switch put another conversation's draft there.
+      if (key === conversationKey && inputText === raw) inputText = '';
     } catch (e: unknown) {
+      const shown = !destroyed && key === conversationKey;
+      // Left meanwhile, so nothing on screen holds the text any more.
+      if (!shown && !getDraft(key)) setDraft(key, raw);
       const failed = translateError(e, m.chat_failed_to_send());
       if (channel) {
         // The backend carries the seconds still owed in the error's context, so
@@ -2903,20 +3005,20 @@
           setPendingReply(channel, null);
           if (channel === channelId && replyTarget?.msgId === reply.msgId) replyTarget = null;
         }
-        if (channel === channelId) sendError = failed;
+        if (shown) sendError = failed;
         else toastError(failed);
         // Still in the composer, so it is a draft again: the write the send
         // cancelled has to happen after all.
         if (channel === channelId && roomDraftReady === channel) queueRoomDraftWrite(channel, inputText);
-      } else if (h === friendHash) {
+      } else if (shown) {
         sendError = failed;
       } else {
         toastError(failed);
       }
     } finally {
-      // A switch already released the composer for the next conversation, and
-      // a send started there owns it now.
-      if (seq === sendSeq) sending = false;
+      sendsInFlight.delete(key);
+      // Another conversation's composer, on screen now, has sends of its own.
+      if (key === conversationKey) sending = false;
       // A disabled/readonly composer (and a clicked Send button) drop the
       // caret; put it back so the next message can be typed without a click.
       const stillHere = channel ? channel === channelId : h === friendHash;
@@ -2979,7 +3081,10 @@
     );
     if (at) {
       inputText = at.text;
+      sendError = null;
       notifyOutgoingTyping(at.text);
+    } else {
+      sendError = m.chat_emoji_no_room();
     }
     tick().then(() => {
       chatInputEl?.focus();
@@ -3553,6 +3658,7 @@
   );
 
   onDestroy(() => {
+    destroyed = true;
     if (unlisten) { unlisten(); unlisten = null; }
     if (unlistenDelivery) { unlistenDelivery(); unlistenDelivery = null; }
     if (unlistenTyping) { unlistenTyping(); unlistenTyping = null; }
@@ -4440,6 +4546,8 @@
           bind:this={chatInputEl}
           onkeydown={handleKeydown}
           oninput={(e) => {
+            // About the text as it was, which has just changed.
+            sendError = null;
             refreshMentionToken();
             notifyOutgoingTyping(e.currentTarget.value);
           }}
@@ -4456,10 +4564,21 @@
           maxlength={COMPOSER_MAX_CHARS}
           rows="1"
           readonly={sending}
+          aria-invalid={composerOverLimit || undefined}
         ></textarea>
         <!-- The count changes every second, and even a polite region reads out
              each change, so only the start and end of the wait are spoken. -->
         <span class="sr-only" role="status" aria-live="polite">{slowModeAnnouncement}</span>
+        <!-- As the edit box does: only near the cap, in bytes, with crossing it
+             spoken from a region that stays mounted rather than every count. -->
+        <span class="sr-only" aria-live="polite">
+          {composerOverLimit ? m.chat_message_too_long({ max: composerMaxBytes }) : ''}
+        </span>
+        {#if composerBytes > composerMaxBytes * 0.8}
+          <span class="conv-byte-count" class:over={composerOverLimit}>
+            {m.channels_edit_bytes({ used: composerBytes, max: composerMaxBytes })}
+          </span>
+        {/if}
         {#if slowModeLeft > 0}
           <span class="conv-slow-mode" aria-hidden="true">
             {m.chat_slow_mode_wait({ seconds: slowModeLeft })}
@@ -6640,6 +6759,20 @@
     font-variant-numeric: tabular-nums;
     color: var(--text-secondary);
     white-space: nowrap;
+  }
+
+  .conv-byte-count {
+    align-self: flex-end;
+    padding: 0 4px 8px;
+    font-size: var(--font-size-xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  .conv-byte-count.over {
+    color: var(--danger);
+    font-weight: 600;
   }
 
   /* The field and its tools in one rounded box. Controls sit on the bottom

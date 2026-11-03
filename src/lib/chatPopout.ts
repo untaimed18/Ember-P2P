@@ -3,7 +3,7 @@ import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { goto } from '$app/navigation';
 import * as m from '$lib/paraglide/messages';
-import { translateError } from '$lib/i18n';
+import { getLocale, translateError } from '$lib/i18n';
 import {
   activeChatTab,
   chatDockOpen,
@@ -314,8 +314,22 @@ export async function initChatWindowSide(): Promise<() => void> {
     };
     void emit(PRESENCE_EVENT, presence).catch(() => {});
   };
-  const stash = () => {
-    void emit(STASH_EVENT, { activeHash: get(activeChatTab), drafts: takeFriendDrafts() }).catch(() => {});
+  const stash = () =>
+    emit(STASH_EVENT, { activeHash: get(activeChatTab), drafts: takeFriendDrafts() }).catch(() => {});
+
+  // A language change reloads only the main window; this one keeps the
+  // locale it loaded in until it reloads too. Checked on focus rather than
+  // when the stored choice changes, which is while the main window is itself
+  // reloading and could not take the drafts. They go to it first, and it
+  // hands them back once the reloaded window asks.
+  const loadedLocale = getLocale();
+  let reloading = false;
+  const followLocale = (): boolean => {
+    if (reloading) return true;
+    if (getLocale() === loadedLocale) return false;
+    reloading = true;
+    void stash().finally(() => location.reload());
+    return true;
   };
 
   let boundsTimer: ReturnType<typeof setTimeout> | undefined;
@@ -345,14 +359,15 @@ export async function initChatWindowSide(): Promise<() => void> {
   };
 
   const onFocus = () => {
-    report();
     // Changed in the main window while this one was in the background.
+    if (followLocale()) return;
+    report();
     initTheme();
     void loadAppSettings().catch(() => {});
   };
   const onBlur = () => {
     report();
-    stash();
+    void stash();
   };
   window.addEventListener('focus', onFocus);
   window.addEventListener('blur', onBlur);

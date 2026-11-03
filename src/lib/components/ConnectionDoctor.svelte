@@ -14,7 +14,7 @@
   } from '$lib/api/connectionDoctor';
   import { translateError } from '$lib/i18n';
   import { toastsFor } from '$lib/stores/toast';
-  const { toast } = toastsFor('network');
+  const { toast, toastError } = toastsFor('network');
   import { copyToClipboard } from '$lib/utils';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import * as m from '$lib/paraglide/messages';
@@ -188,7 +188,7 @@
         void run();
       }
     } catch (e) {
-      if (!destroyed) toast(translateError(e, m.error_operation_failed()));
+      if (!destroyed) toastError(translateError(e, m.error_operation_failed()));
     } finally {
       acting = null;
     }
@@ -224,7 +224,8 @@
 
   async function copyReport() {
     if (!report) return;
-    toast((await copyToClipboard(reportText(report))) ? m.doctor_copied() : m.error_operation_failed());
+    if (await copyToClipboard(reportText(report))) toast(m.doctor_copied());
+    else toastError(m.error_operation_failed());
   }
 
   const statusIcon: Record<string, string> = { pass: '✓', warn: '!', fail: '✕', skip: '–' };

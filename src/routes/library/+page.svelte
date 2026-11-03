@@ -118,6 +118,7 @@
   import { serviceAvailableFor } from '$lib/webServices';
   import { BP_SM, MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import { createMaxWaitDebounce } from '$lib/debounce';
+  import { createSortMemo, sortWithMemo } from '$lib/sortMemo';
   import { isShortcutLetter } from '$lib/shortcutKey';
   import {
     applySharedFileStats,
@@ -170,12 +171,20 @@
   let confirmOpen = $state(false);
   let confirmTitle = $state('');
   let confirmMessage = $state('');
+  let confirmLabel = $state<string | undefined>(undefined);
+  let confirmDanger = $state(true);
   let confirmResolver: ((confirmed: boolean) => void) | null = null;
 
-  function askConfirm(message: string, title: string): Promise<boolean> {
+  function askConfirm(
+    message: string,
+    title: string,
+    opts: { confirmLabel?: string; danger?: boolean } = {},
+  ): Promise<boolean> {
     confirmResolver?.(false);
     confirmMessage = message;
     confirmTitle = title;
+    confirmLabel = opts.confirmLabel;
+    confirmDanger = opts.danger ?? true;
     confirmOpen = true;
     return new Promise<boolean>((resolve) => {
       confirmResolver = resolve;
@@ -204,10 +213,25 @@
   /** Bumped whenever an action or event decides `stoppedByUser`, so the
    *  mount-time `getHashingPaused` answer cannot undo a Resume made first. */
   let hashingStateEpoch = 0;
-  let fileByPath = $derived.by(() => {
-    const map = new Map<string, FileInfo>();
-    for (const f of files) map.set(f.path, f);
+  /** Where each path sits in `treeFiles`, and so in `files`: upload counters
+   *  replace rows in place without moving any, so this is not rebuilt for them. */
+  let rowIndexByPath = $derived.by(() => {
+    const map = new Map<string, number>();
+    for (let i = 0; i < treeFiles.length; i++) map.set(treeFiles[i].path, i);
     return map;
+  });
+  let fileByPath = $derived.by(() => {
+    const index = rowIndexByPath;
+    const rows = files;
+    return {
+      get(path: string): LibraryRow | undefined {
+        const i = index.get(path);
+        if (i === undefined) return undefined;
+        const row = rows[i];
+        return row?.path === path ? row : rows.find((f) => f.path === path);
+      },
+      has: (path: string) => index.has(path),
+    };
   });
   let selectedFile = $derived(selectedPath ? (fileByPath.get(selectedPath) ?? null) : null);
   let selectedHash = $derived.by(() => selectedFile?.hash || null);
@@ -311,13 +335,7 @@
     renameDialog.error = null;
     try {
       const { path: newPath, warning } = await renameLibraryFile(path, value);
-      if (selectedPath === path) selectedPath = newPath;
-      if (checkedPaths.has(path)) {
-        const next = new Set(checkedPaths);
-        next.delete(path);
-        next.add(newPath);
-        checkedPaths = next;
-      }
+      followRenamedPaths([{ from: path, to: newPath }]);
       renameDialog.busy = false;
       closeRename();
       await refresh();
@@ -760,6 +778,7 @@
           other: () => m.library_confirm_remove_missing_other({ count: formatNumber(count) }),
         }),
         m.library_remove_missing_title(),
+        { confirmLabel: m.common_remove() },
       );
       if (!confirmed) return;
       let removed = 0;
@@ -789,6 +808,7 @@
       const confirmed = await askConfirm(
         m.library_confirm_remove_missing_one({ count: formatNumber(1) }),
         m.library_remove_missing_title(),
+        { confirmLabel: m.common_remove() },
       );
       if (!confirmed) return;
       const removed = await removeMissingFiles([f.path]);
@@ -1072,6 +1092,7 @@
       // Unshared files stay listed, as Not shared, so they can be shared again
       // from here.
       const listed = snapshot.files;
+      const previousIndex = movedAway ? rowIndexByPath : null;
       if (listed) {
         files = listed.map(withMatchKeys);
         treeFiles = files;
@@ -1095,16 +1116,19 @@
       // bulk-bar count and later bulk ops could reference ghost paths.
       if (listed && (checkedPaths.size > 0 || selectedPath)) {
         const present = new Set(listed.map((f) => f.path));
+        const moved = movedAway && previousIndex ? movedPathsIn(listed, present, previousIndex, movedAway) : null;
+        const follow = (p: string): string | null => (present.has(p) ? p : (moved?.get(p) ?? null));
         if (checkedPaths.size > 0) {
-          let removed = false;
+          let changed = false;
           const nextChecked = new Set<string>();
           for (const p of checkedPaths) {
-            if (present.has(p)) nextChecked.add(p);
-            else removed = true;
+            const now = follow(p);
+            if (now !== null) nextChecked.add(now);
+            if (now !== p) changed = true;
           }
-          if (removed) {
+          if (changed) {
             checkedPaths = nextChecked;
-            if (lastClickedPath && !present.has(lastClickedPath)) lastClickedPath = null;
+            if (lastClickedPath && !present.has(lastClickedPath)) lastClickedPath = follow(lastClickedPath);
           }
         }
         // `selectedFile`/the details drawer derive from `selectedPath`
@@ -1113,7 +1137,7 @@
         // computing its current index as -1 and jumping to row 0
         // unexpectedly, and Space/Enter/Delete acting as if nothing is
         // selected until the user clicks a row again.
-        if (selectedPath && !present.has(selectedPath)) selectedPath = null;
+        if (selectedPath && !present.has(selectedPath)) selectedPath = follow(selectedPath);
       }
     } catch (e) {
       if (!mounted || gen !== loadGen) return;
@@ -1298,12 +1322,42 @@
    *  when `f` is in it, as for the other bulk actions, less those no
    *  category can move. */
   function categoryMoveTargets(f: FileInfo): FileInfo[] {
-    const rows = checkedCount > 1 && checkedPaths.has(f.path) ? getCheckedFiles() : [f];
+    const rows = ctxActsOnChecked(f) ? getCheckedFiles() : [f];
     return rows.filter((row) => categorySubdirOfFile(row) !== null);
   }
 
   /** The backend's cap on one move request. */
   const MAX_CATEGORY_MOVE_BATCH = 5_000;
+
+  /** Path to hash of each file a category move is running for, so a reload
+   *  can keep the open file and the checked rows on them. */
+  let movedAway: Map<string, string> | null = null;
+
+  /** Old path to new for the files of `moved` that `listed` no longer has.
+   *  The move reports counts, not paths, so each is found by its hash among
+   *  the rows that were not there before. */
+  function movedPathsIn(
+    listed: FileInfo[],
+    present: Set<string>,
+    previous: Map<string, number>,
+    moved: Map<string, string>,
+  ): Map<string, string> {
+    const arrived = new Map<string, string[]>();
+    for (const f of listed) {
+      if (!f.hash || previous.has(f.path)) continue;
+      const paths = arrived.get(f.hash);
+      if (paths) paths.push(f.path);
+      else arrived.set(f.hash, [f.path]);
+    }
+    const out = new Map<string, string>();
+    if (arrived.size === 0) return out;
+    for (const [from, hash] of moved) {
+      if (present.has(from)) continue;
+      const to = arrived.get(hash)?.shift();
+      if (to !== undefined) out.set(from, to);
+    }
+    return out;
+  }
 
   async function moveToCategory(targets: FileInfo[], category: string) {
     // Waits on the other bulk actions as they wait on each other: a delete or
@@ -1311,6 +1365,7 @@
     // find paths already gone and report failures for files that moved.
     if (targets.length === 0 || bulkBusy) return;
     bulkBusy = true;
+    movedAway = new Map(targets.filter((t) => !!t.hash).map((t) => [t.path, t.hash]));
     const folder = categoryDestinationLabel(categorySubdir(category, categoryFolders));
     try {
       const report = { moved: 0, unchanged: 0, recategorized: 0, failed: [] as string[], warning: null as string | null };
@@ -1359,6 +1414,7 @@
       toastError(toErr(e));
     } finally {
       await refresh();
+      movedAway = null;
       bulkBusy = false;
     }
   }
@@ -1452,6 +1508,7 @@
       const confirmed = await askConfirm(
         m.library_copy_all_confirm({ count: formatNumber(targets.length) }),
         m.library_copy_all_confirm_title(),
+        { confirmLabel: m.common_copy(), danger: false },
       );
       if (!confirmed) return;
     }
@@ -1530,7 +1587,31 @@
     addFolderOpen = true;
   }
 
+  /** Folders with a priority change running, and the pick made since for
+   *  each. Arrowing through the closed select fires a change per step; one
+   *  runs at a time per folder and only the latest waiting one follows it. */
+  const folderPriorityBusy = new Set<string>();
+  const folderPriorityNext = new Map<string, { priority: string; el?: HTMLSelectElement }>();
+
   async function handleSetFolderPriority(path: string, priority: string, el?: HTMLSelectElement) {
+    if (folderPriorityBusy.has(path)) {
+      folderPriorityNext.set(path, { priority, el });
+      return;
+    }
+    folderPriorityBusy.add(path);
+    try {
+      await applyFolderPriority(path, priority, el);
+    } finally {
+      folderPriorityBusy.delete(path);
+      const next = folderPriorityNext.get(path);
+      folderPriorityNext.delete(path);
+      if (next && mounted && next.priority !== (folderPriorities[path] ?? '')) {
+        void handleSetFolderPriority(path, next.priority, next.el);
+      }
+    }
+  }
+
+  async function applyFolderPriority(path: string, priority: string, el?: HTMLSelectElement) {
     const previous = folderPriorities[path] ?? '';
     try {
       const count = await setFolderPriority(path, priority);
@@ -1556,7 +1637,8 @@
         // itself changes; it never reconciles against the DOM. `folderPriorities`
         // is untouched on failure, so without this the select would keep showing
         // the rejected choice permanently — a later refresh doesn't clear it.
-        if (el) el.value = previous;
+        // A pick still waiting to run is left showing.
+        if (el && !folderPriorityNext.has(path)) el.value = previous;
       }
     }
   }
@@ -1572,7 +1654,7 @@
             other: () => m.library_confirm_remove_folder_other({ name: displayName, count: formatNumber(stats) }),
           })
         : m.library_confirm_remove_folder_empty({ name: displayName });
-      const confirmed = await askConfirm(body, m.library_remove_folder_title());
+      const confirmed = await askConfirm(body, m.library_remove_folder_title(), { confirmLabel: m.common_remove() });
       if (!confirmed || !mounted) return;
       await removeSharedFolder(path);
       if (!mounted) return;
@@ -1796,7 +1878,7 @@
 
   let libraryTotalSize = $derived.by(() => {
     let bytes = 0;
-    for (const f of files) bytes += f.size;
+    for (const f of treeFiles) bytes += f.size;
     return bytes;
   });
 
@@ -1825,7 +1907,7 @@
   /** Counts per sharing state, for the labels in the sharing-state filter. */
   let shareScopeCounts = $derived.by(() => {
     const counts: Record<Exclude<ShareScopeFilter, 'all'>, number> = { not_shared: 0, friends_only: 0, unpublished: 0, hashing: 0 };
-    for (const f of files) {
+    for (const f of treeFiles) {
       const scope = shareScopeOf(f);
       if (scope) counts[scope]++;
     }
@@ -1845,7 +1927,7 @@
   let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || sizeFilter !== 'any' || showDuplicatesOnly || showMissingOnly || showNeverRequestedOnly || shareScopeFilter !== 'all');
   let libraryHashedCount = $derived.by(() => {
     let hashed = 0;
-    for (const f of files) if (f.hash) hashed++;
+    for (const f of treeFiles) if (f.hash) hashed++;
     return hashed;
   });
   let allHashedFilesSelected = $derived.by(() => {
@@ -1877,47 +1959,52 @@
   let checkedCount = $derived.by(() => {
     return checkedPaths.size;
   });
+  // The selection counts read no upload counter, so they walk `treeFiles` and
+  // are not redone on every `shared-file-stats` tick.
   let checkedHashedCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash) n++;
     return n;
   });
   /** What the selection weighs, for the bulk bar: worth knowing before a
    *  Delete or a collection. */
   let checkedTotalSize = $derived.by(() => {
     let bytes = 0;
-    for (const p of checkedPaths) bytes += fileByPath.get(p)?.size ?? 0;
+    for (const p of checkedPaths) {
+      const i = rowIndexByPath.get(p);
+      if (i !== undefined) bytes += treeFiles[i].size;
+    }
     return bytes;
   });
   let checkedRestrictCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared && !f.friends_only) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && f.shared && !f.friends_only) n++;
     return n;
   });
   let checkedUnrestrictCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared && f.friends_only) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && f.shared && f.friends_only) n++;
     return n;
   });
   let checkedUnshareCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
     return n;
   });
   let checkedShareCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
     return n;
   });
   /** Checked, hashed files the tag could go on, and ones it could come off. */
   let checkedTaggableCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !hasEmberTag(f.name)) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && !hasEmberTag(f.name)) n++;
     return n;
   });
   let checkedUntaggableCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && hasEmberTag(f.name)) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && hasEmberTag(f.name)) n++;
     return n;
   });
   // Selections persist across filter changes and bulk actions operate on the
@@ -1930,7 +2017,7 @@
     const visible = new Set(sortedFiles.map((f) => f.path));
     let n = 0;
     for (const p of checkedPaths) {
-      if (!visible.has(p) && fileByPath.has(p)) n++;
+      if (!visible.has(p) && rowIndexByPath.has(p)) n++;
     }
     return n;
   });
@@ -2086,14 +2173,29 @@
       {
         label: m.common_undo(),
         undo: true,
-        run: () => {
-          void runBulkBatches(copies, shareLibraryFiles)
-            .catch((e: unknown) => toastError(toErr(e)))
-            .finally(() => refresh());
-        },
+        // Waits its turn like the tag's Undo: `runBulkBatches` reports into
+        // the one progress slot, which a running bulk action is using.
+        run: () => void whenBulkIdle().then(() => reshareCopies(copies)),
       },
       () => {},
     );
+  }
+
+  async function reshareCopies(copies: FileInfo[]) {
+    if (bulkBusy) return;
+    bulkBusy = true;
+    try {
+      const count = await runBulkBatches(copies, shareLibraryFiles);
+      toastSuccess(plural(count, {
+        one: () => m.library_shared_one({ count: formatNumber(count) }),
+        oneShowsCount: true,
+        other: () => m.library_shared_other({ count: formatNumber(count) }),
+      }));
+    } catch (e: unknown) { toastError(toErr(e)); }
+    finally {
+      await refresh();
+      bulkBusy = false;
+    }
   }
 
   async function bulkShare() {
@@ -2209,6 +2311,7 @@
       const confirmed = await askConfirm(
         hidden.length > 0 ? `${question}\n\n${deleteHiddenNote(hidden)}` : question,
         m.library_delete_files_title(),
+        { confirmLabel: m.common_delete() },
       );
       if (!confirmed) return;
       let deleted = 0;
@@ -2266,7 +2369,7 @@
    *  when `f` is in it, as for the other bulk actions, less those it would
    *  not change. */
   function emberTagTargets(f: FileInfo, add: boolean): FileInfo[] {
-    const rows = checkedCount > 1 && checkedPaths.has(f.path) ? getCheckedFiles() : [f];
+    const rows = ctxActsOnChecked(f) ? getCheckedFiles() : [f];
     return rows.filter((row) => !!row.hash && hasEmberTag(row.name) !== add);
   }
 
@@ -2409,11 +2512,42 @@
     while (bulkBusy) await new Promise((resolve) => setTimeout(resolve, 200));
   }
 
-  /** Keep the open file and the checked rows on files that were renamed. */
+  /** Keep the open file and the checked rows on files that were renamed.
+   *
+   *  The rows are renamed here too rather than left to the reload: until it
+   *  landed, the open file's new path named no row, so the drawer closed and
+   *  the comment being written was reset. */
   function followRenamedPaths(renamed: { from: string; to: string }[]) {
     if (renamed.length === 0) return;
     const to = new Map(renamed.map((r) => [r.from, r.to]));
+    const rename = (rows: LibraryRow[]): LibraryRow[] =>
+      rows.map((row) => {
+        const path = to.get(row.path);
+        if (path === undefined) return row;
+        const name = path.replace(/^.*[/\\]/, '');
+        const ext = extensionFromPath(name);
+        const extension = ext.toLowerCase() === row.extension.toLowerCase() ? row.extension : ext;
+        return {
+          ...row,
+          path,
+          name,
+          extension,
+          matchName: name.toLowerCase(),
+          matchType: fileTypeKey(extension),
+          matchPath: normalizePathForMatch(path),
+        };
+      });
+    // Renamed in step so that `rowIndexByPath`, built from `treeFiles`, still
+    // finds each row at its index in `files`.
+    if (files === treeFiles) {
+      files = rename(files);
+      treeFiles = files;
+    } else {
+      files = rename(files);
+      treeFiles = rename(treeFiles);
+    }
     if (selectedPath && to.has(selectedPath)) selectedPath = to.get(selectedPath) ?? selectedPath;
+    if (lastClickedPath && to.has(lastClickedPath)) lastClickedPath = to.get(lastClickedPath) ?? lastClickedPath;
     if (renamed.some((r) => checkedPaths.has(r.from))) {
       checkedPaths = new Set([...checkedPaths].map((p) => to.get(p) ?? p));
     }
@@ -2469,8 +2603,32 @@
 
   const priorityOrder: Record<string, number> = { verylow: 0, low: 1, normal: 2, high: 3, release: 4, auto: 5 };
 
+  const sortMemo = createSortMemo();
+
+  /** Everything the comparator below reads besides the path, or `null` for
+   *  the upload counters, which `shared-file-stats` moves about once a second. */
+  function sortOrderKey(field: SortField): ((f: LibraryRow) => string) | null {
+    switch (field) {
+      case 'requests':
+      case 'accepted':
+      case 'bytes_transferred':
+        return null;
+      case 'name':
+        return (f) => f.name;
+      case 'extension':
+        return (f) => `${f.matchType}\0${f.extension}\0${f.name}`;
+      default: {
+        const key = field;
+        return (f) => `${f[key]}\0${f.name}`;
+      }
+    }
+  }
+
+  // An upload tick hands over a new `files` with only counters changed; unless
+  // the sort is on one of those, the last order is kept and only the rows are
+  // swapped in, instead of collating every name again.
   let sortedFiles = $derived.by(() => {
-    const copy = [...filteredFiles];
+    const field = sortField;
     const dir = sortAsc ? 1 : -1;
     // The Type column shows the category label where there is one, so sort by
     // that label rather than the raw extension.
@@ -2484,9 +2642,9 @@
       }
       return label;
     };
-    copy.sort((a, b) => {
+    const compare = (a: LibraryRow, b: LibraryRow): number => {
       let cmp = 0;
-      switch (sortField) {
+      switch (field) {
         case 'name': cmp = compareFileNames(a.name, b.name); break;
         case 'size': cmp = a.size - b.size; break;
         case 'extension': cmp = compareFileNames(typeSortKey(a), typeSortKey(b)) || compareFileNames(a.extension, b.extension); break;
@@ -2504,15 +2662,15 @@
       // dates don't render in arbitrary order. The tiebreakers always read
       // ascending regardless of the primary sort direction so names stay A→Z.
       if (cmp === 0) {
-        if (sortField !== 'name') {
+        if (field !== 'name') {
           const byName = compareFileNames(a.name, b.name);
           if (byName !== 0) return byName;
         }
         return compareFileNames(a.path, b.path);
       }
       return dir * cmp;
-    });
-    return copy;
+    };
+    return sortWithMemo(filteredFiles, compare, sortMemo, `${field}:${dir}`, (f) => f.path, sortOrderKey(field));
   });
 
   // One pass over the library builds the whole sidebar: the tree's top level
@@ -2580,8 +2738,9 @@
   let topFiles = $derived.by(() => {
     const bestByHash = new Map<string, FileInfo>();
     for (const file of files) {
+      if (topValueFor(file) <= 0) continue;
       const hash = file.hash.trim().toLowerCase();
-      if (!hash || topValueFor(file) <= 0) continue;
+      if (!hash) continue;
       const existing = bestByHash.get(hash);
       if (!existing || topValueFor(file) > topValueFor(existing)) {
         bestByHash.set(hash, file);
@@ -2856,7 +3015,7 @@
    *  of, narrowed to files a feed can list: shared with everyone, with the
    *  Ember digest a follower checks them by. */
   function feedTargets(f: FileInfo): FileInfo[] {
-    const rows = checkedCount > 1 && checkedPaths.has(f.path) ? getCheckedFiles() : [f];
+    const rows = ctxActsOnChecked(f) ? getCheckedFiles() : [f];
     return rows.filter((row) => !!row.hash && row.shared && !row.friends_only && row.ember_file_hash.length === 64);
   }
 
@@ -2913,6 +3072,13 @@
     }
   }
   let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
+
+  /** Whether `f`'s menu acts on the whole checked selection: it does when
+   *  `f` is one of several checked rows, as the bulk bar would. */
+  function ctxActsOnChecked(f: FileInfo): boolean {
+    return checkedCount > 1 && checkedPaths.has(f.path);
+  }
+
   /** What had focus when the menu opened, so it can be handed back rather
    *  than dropped on the body when the menu unmounts. */
   let ctxReturnFocus: HTMLElement | null = null;
@@ -3115,6 +3281,8 @@
   function onPageKeyDown(e: KeyboardEvent) {
     if (!mounted) return;
     if ((ctxMenu || folderCtx) && e.key === 'Escape') { closeCtxAndRefocus(); e.preventDefault(); e.stopPropagation(); return; }
+    // Tab leaves the menu, so the menu goes with it, as the column menu does.
+    if ((ctxMenu || folderCtx) && e.key === 'Tab') { closeCtxAndRefocus(); return; }
     if ((ctxMenu || folderCtx) && handleCtxMenuKey(e)) return;
     // A menu that is open owns the keyboard: Delete or F2 here would act on
     // the selected row, which is often not the one right-clicked.
@@ -3319,6 +3487,8 @@
     // actions were unaffected either way, but copy_link, send_to_friend and
     // republish would carry the ed2k identity the file no longer has.
     const f = fileByPath.get(ctxMenu.file.path) ?? ctxMenu.file;
+    // The bulk versions below act on the checked rows, which then include `f`.
+    const multi = ctxActsOnChecked(f);
     closeCtxAndRefocus();
     try {
       switch (action) {
@@ -3384,19 +3554,25 @@
           break;
         }
         case 'delete':
-          await deleteOneFile(f);
+          if (multi) await bulkDelete();
+          else await deleteOneFile(f);
           break;
         case 'priority':
-          if (extra) await applyFilePriority(f, extra as FileInfo['priority']);
+          if (!extra) break;
+          if (multi) await bulkSetPriority(extra as FileInfo['priority']);
+          else await applyFilePriority(f, extra as FileInfo['priority']);
           break;
         case 'copy_link':
-          await copyFileLink(f, extra === 'aich' || extra === 'sources' ? extra : undefined);
+          if (multi && !extra) await bulkCopyLinks();
+          else await copyFileLink(f, extra === 'aich' || extra === 'sources' ? extra : undefined);
           break;
         case 'unshare':
-          await unshareOneFile(f);
+          if (multi) await bulkUnshare();
+          else await unshareOneFile(f);
           break;
         case 'share':
-          await shareOneFile(f);
+          if (multi) await bulkShare();
+          else await shareOneFile(f);
           break;
         case 'send_to_friend': {
           if (!extra) break;
@@ -3406,7 +3582,8 @@
           break;
         }
         case 'friends_only':
-          await applyFriendsOnly(f, !f.friends_only);
+          if (multi) await bulkFriendsOnly(!f.friends_only);
+          else await applyFriendsOnly(f, !f.friends_only);
           break;
         case 'republish': {
           if (!f.hash || !f.shared) break;
@@ -3451,6 +3628,7 @@
           ? m.library_confirm_delete_single_permanent({ name: f.name })
           : m.library_confirm_delete_single({ name: f.name }),
         m.library_delete_file_title(),
+        { confirmLabel: m.common_delete() },
       );
       if (!confirmed) return;
       await deleteSharedFile(f.path, f.hash || undefined);
@@ -3594,6 +3772,7 @@
           other: () => m.library_confirm_unshare_folder_other({ count: formatNumber(sharedCount), name: displayName }),
         }),
         m.library_unshare_folder_title(),
+        { confirmLabel: m.library_bulk_unshare() },
       );
       if (!confirmed) return;
       await unshareFolder(path);
@@ -3788,6 +3967,11 @@
     }
   });
 
+  /** Heights of the bars under the table. Where the details drawer lies over
+   *  the table it stops above them, so Delete and Clear stay in reach. */
+  let bulkBarHeight = $state(0);
+  let statusBarHeight = $state(0);
+
   // --- Narrow window: the sidebar becomes a slide-out panel ---
   let narrowLayout = $state(false);
   let foldersPanelOpen = $state(false);
@@ -3893,9 +4077,13 @@
   $effect(() => {
     const incoming = $incomingCollection;
     if (incoming) {
+      const previous = untrack(() => loadedCollection);
       loadedCollection = incoming;
       collectionsOpen = true;
       markIncomingCollectionPresented();
+      if (previous && previous !== incoming) {
+        toastInfo(m.library_collection_replaced({ name: incoming.name, previous: previous.name }));
+      }
     }
   });
 
@@ -4210,7 +4398,8 @@
   bind:open={confirmOpen}
   title={confirmTitle}
   message={confirmMessage}
-  danger={true}
+  {confirmLabel}
+  danger={confirmDanger}
   onconfirm={() => settleConfirm(true)}
   oncancel={() => settleConfirm(false)}
 />
@@ -5160,7 +5349,7 @@
   ></div>
 
   <!-- Main: file list -->
-  <div class="file-list-area">
+  <div class="file-list-area" class:drawer-open={!!selectedFile}>
     {#if stoppingHashing || scanning || hashProgress}
       <div class="scan-banner">
         <span class="spinner xs"></span>
@@ -5320,7 +5509,7 @@
     {/if}
 
     {#if checkedCount > 0}
-      <div class="bulk-action-bar">
+      <div class="bulk-action-bar" bind:offsetHeight={bulkBarHeight}>
         <span class="bulk-count">{plural(checkedCount, { one: () => m.library_bulk_count_one({ count: formatNumber(checkedCount) }), oneShowsCount: true, other: () => m.library_bulk_count_other({ count: formatNumber(checkedCount) }) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
         {#if checkedHiddenCount > 0}
           <button
@@ -5376,7 +5565,7 @@
       </div>
     {/if}
 
-    <div class="status-bar">
+    <div class="status-bar" bind:offsetHeight={statusBarHeight}>
       {#if hasActiveLibraryFilters && filteredFiles.length !== files.length}
         <span>{m.library_status_showing({ shown: formatNumber(filteredFiles.length), total: formatNumber(files.length) })}</span>
         <span class="status-sep">&middot;</span>
@@ -5391,7 +5580,11 @@
 
   <!-- Side drawer for file details + comments -->
   {#if selectedFile}
-    <div class="detail-drawer" transition:fly={{ x: 24, duration: prefersReducedMotion.current ? 0 : 200 }}>
+    <div
+      class="detail-drawer"
+      style:--drawer-clear="{(checkedCount > 0 ? bulkBarHeight : 0) + statusBarHeight}px"
+      transition:fly={{ x: 24, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="drawer-header">
         <FileTypeIcon kind={selectedKind} size={40} />
         <div class="drawer-header-text">
@@ -5695,7 +5888,7 @@
               {/if}
               {#if selectedMedia.bitrate}
                 <span class="meta-label">{m.library_meta_bitrate()}</span>
-                <span class="meta-value">{m.library_meta_bitrate_value({ kbps: selectedMedia.bitrate })}</span>
+                <span class="meta-value">{m.library_meta_bitrate_value({ kbps: formatNumber(selectedMedia.bitrate) })}</span>
               {/if}
               {#if selectedMedia.codec}
                 <span class="meta-label">{m.library_meta_codec()}</span>
@@ -5789,11 +5982,12 @@
                     {m.library_comment_emule_limit({ count: formatNumber(ourComment.length), limit: formatNumber(EMULE_COMMENT_LIMIT) })}
                   </div>
                 {/if}
-                {#if commentSaveState !== 'idle'}
-                  <div class="comment-save-state" class:error={commentSaveState === 'error'}>
-                    {commentSaveMessage}
-                  </div>
-                {/if}
+                <!-- Always in the page, so screen readers hear what is put in it. -->
+                <div class="comment-save-state" class:error={commentSaveState === 'error'} role="status">
+                  {#if commentSaveState !== 'idle'}
+                    <span class="comment-save-msg">{commentSaveMessage}</span>
+                  {/if}
+                </div>
               </div>
               {#if commentInfo?.peer_comments?.length}
                 <div class="comment-peers">
@@ -5834,6 +6028,9 @@
   {@const tagAddTargets = emberTagTargets(ctxMenu.file, true)}
   {@const tagRemoveTargets = emberTagTargets(ctxMenu.file, false)}
   {@const feedTargetCount = feedsAvailable ? feedTargets(ctxMenu.file).length : 0}
+  {@const multi = ctxActsOnChecked(ctxMenu.file)}
+  {@const bulkLocked = multi && bulkBusy}
+  <!-- `bulkLocked`: the bulk actions drop a request made while another runs. -->
   <div class="ctx-menu" role="menu" bind:this={ctxMenuEl} use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
@@ -5849,14 +6046,14 @@
       onclick={() => ctxAction('rename')}
     >{m.library_rename()}</button>
     {#if tagAddTargets.length > 0}
-      <button class="ctx-item" role="menuitem" title={m.library_bulk_tag_title()} onclick={() => ctxAction('tag_add')}>
+      <button class="ctx-item" role="menuitem" disabled={bulkBusy} title={m.library_bulk_tag_title()} onclick={() => ctxAction('tag_add')}>
         {tagAddTargets.length > 1
           ? m.library_ctx_tag_count({ count: formatNumber(tagAddTargets.length) })
           : m.library_bulk_tag()}
       </button>
     {/if}
     {#if tagRemoveTargets.length > 0}
-      <button class="ctx-item" role="menuitem" title={m.library_bulk_untag_title()} onclick={() => ctxAction('tag_remove')}>
+      <button class="ctx-item" role="menuitem" disabled={bulkBusy} title={m.library_bulk_untag_title()} onclick={() => ctxAction('tag_remove')}>
         {tagRemoveTargets.length > 1
           ? m.library_ctx_untag_count({ count: formatNumber(tagRemoveTargets.length) })
           : m.library_bulk_untag()}
@@ -5903,6 +6100,7 @@
               <button
                 class="ctx-item"
                 role="menuitem"
+                disabled={bulkBusy}
                 title={isHere ? m.library_move_already_here() : undefined}
                 onclick={() => ctxAction('move_category', category)}
               >
@@ -5966,15 +6164,20 @@
         onclick={(e) => clickHoverSub(e, 'priority')}
         onkeydown={(e) => onSubmenuKey(e, 'priority')}
       >
-        {m.library_col_priority()}
-        <span class="ctx-hint">{priorityLabel(ctxMenu.file.priority)}</span>
+        {#if multi}
+          {m.library_ctx_priority_count({ count: formatNumber(checkedHashedCount) })}
+        {:else}
+          {m.library_col_priority()}
+          <span class="ctx-hint">{priorityLabel(ctxMenu.file.priority)}</span>
+        {/if}
         {#if ctxPrioritySub}
           <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
             {#each ['verylow', 'low', 'normal', 'high', 'release'] as prio}
               <button
                 class="ctx-item"
                 role="menuitemradio"
-                aria-checked={ctxMenu.file.priority === prio}
+                aria-checked={!multi && ctxMenu.file.priority === prio}
+                disabled={bulkLocked}
                 onclick={() => ctxAction('priority', prio)}
               >{priorityLabel(prio)}</button>
             {/each}
@@ -5982,7 +6185,8 @@
             <button
               class="ctx-item"
               role="menuitemradio"
-              aria-checked={ctxMenu.file.priority === 'auto'}
+              aria-checked={!multi && ctxMenu.file.priority === 'auto'}
+              disabled={bulkLocked}
               onclick={() => ctxAction('priority', 'auto')}
             >{m.library_priority_auto()}</button>
           </div>
@@ -6003,7 +6207,9 @@
         {m.servers_copy_ed2k_link()}
         {#if ctxCopySub}
           <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
-            <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.library_copy_link_plain()}</button>
+            <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>
+              {multi ? m.library_ctx_copy_links_count({ count: formatNumber(checkedHashedCount) }) : m.library_copy_link_plain()}
+            </button>
             {#if ctxMenu.file.aich_hash}
               <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link', 'aich')}>{m.library_copy_link_aich()}</button>
             {/if}
@@ -6114,18 +6320,27 @@
           class="ctx-item"
           role="menuitemcheckbox"
           aria-checked={!!ctxMenu.file.friends_only}
+          disabled={bulkLocked}
           onclick={() => ctxAction('friends_only')}
           title={m.library_friends_only_hint()}
-        >{m.library_friends_only_toggle()}</button>
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>{m.library_bulk_unshare()}</button>
+        >{multi
+          ? m.library_ctx_friends_only_count({ count: formatNumber(ctxMenu.file.friends_only ? checkedUnrestrictCount : checkedRestrictCount) })
+          : m.library_friends_only_toggle()}</button>
+        <button class="ctx-item" role="menuitem" disabled={bulkLocked} onclick={() => ctxAction('unshare')}>
+          {multi ? m.library_ctx_unshare_count({ count: formatNumber(checkedUnshareCount) }) : m.library_bulk_unshare()}
+        </button>
       {:else}
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>{m.library_bulk_share()}</button>
+        <button class="ctx-item" role="menuitem" disabled={bulkLocked} onclick={() => ctxAction('share')}>
+          {multi ? m.library_ctx_share_count({ count: formatNumber(checkedShareCount) }) : m.library_bulk_share()}
+        </button>
       {/if}
     {:else}
       <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_hashing_in_progress()}</button>
     {/if}
     <div class="ctx-sep" role="separator"></div>
-    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.common_delete()}</button>
+    <button class="ctx-item ctx-danger" role="menuitem" disabled={bulkLocked} onclick={() => ctxAction('delete')}>
+      {multi ? m.library_ctx_delete_count({ count: formatNumber(checkedCount) }) : m.common_delete()}
+    </button>
   </div>
 {/if}
 
@@ -7706,13 +7921,16 @@
   }
   .comment-save:hover { opacity: 0.85; }
   .comment-save-state {
-    margin-top: 6px;
     font-size: var(--font-size-xs);
     color: var(--success);
     font-weight: 600;
   }
   .comment-save-state.error {
     color: var(--danger);
+  }
+  .comment-save-msg {
+    display: block;
+    margin-top: 6px;
   }
   .comment-limit-note {
     margin-top: 6px;
@@ -8148,14 +8366,22 @@
   /* Overlay the detail drawer earlier so the file table keeps usable width
      on 16" / mid laptop layouts (shared breakpoint --bp-lg ≈ 1200). */
   @media (max-width: 1200px) {
-    .shared-layout { position: relative; }
+    .shared-layout {
+      position: relative;
+      --drawer-w: min(90vw, 480px);
+    }
     .detail-drawer {
       position: absolute;
-      inset: 0 0 0 auto;
-      width: min(90vw, 480px);
+      inset: 0 0 var(--drawer-clear, 0px) auto;
+      width: var(--drawer-w);
       min-width: 0;
       z-index: 1100;
       box-shadow: var(--shadow-panel-left);
+    }
+    /* What lies under the drawer cannot be scrolled out from under it, so the
+       table gives up that width and keeps its scrollbar beside the drawer. */
+    .file-list-area.drawer-open :global(.library-virtual-table-root) {
+      margin-right: var(--drawer-w);
     }
   }
 
@@ -8193,7 +8419,7 @@
       z-index: 1049;
       background: var(--overlay-bg);
     }
-    .detail-drawer { width: min(100vw, 480px); }
+    .shared-layout { --drawer-w: min(100vw, 480px); }
     .modal-body { padding: 12px; }
     .modal-footer,
     .modal-header { padding-left: 12px; padding-right: 12px; }

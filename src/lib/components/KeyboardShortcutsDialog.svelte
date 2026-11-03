@@ -109,20 +109,20 @@
     {
       title: () => m.shortcuts_section_dialogs(),
       shortcuts: [
-        { keys: ['Esc'], label: () => m.shortcuts_modal_close() },
-        { keys: [modifierKey, 'Enter'], label: () => m.shortcuts_modal_confirm() },
-        { keys: ['Tab'], label: () => m.shortcuts_modal_cycle_focus() },
-        { keys: ['Enter'], label: () => m.shortcuts_modal_submit_form() },
+        { keys: [m.shortcuts_key_esc()], label: () => m.shortcuts_modal_close() },
+        { keys: [modifierKey, m.shortcuts_key_enter()], label: () => m.shortcuts_modal_confirm() },
+        { keys: [m.shortcuts_key_tab()], label: () => m.shortcuts_modal_cycle_focus() },
+        { keys: [m.shortcuts_key_enter()], label: () => m.shortcuts_modal_submit_form() },
       ],
     },
     {
       title: () => m.shortcuts_section_tables(),
       shortcuts: [
         { keys: [m.shortcuts_key_click()], label: () => m.shortcuts_table_sort() },
-        { keys: ['Shift', m.shortcuts_key_click()], label: () => m.shortcuts_table_multiselect() },
+        { keys: [m.shortcuts_key_shift(), m.shortcuts_key_click()], label: () => m.shortcuts_table_multiselect() },
         { keys: [m.shortcuts_key_double_click()], label: () => m.shortcuts_table_open() },
         { keys: [m.shortcuts_key_right_click()], label: () => m.shortcuts_table_context() },
-        { keys: ['Shift', 'F10'], label: () => m.shortcuts_table_context() },
+        { keys: [m.shortcuts_key_shift(), 'F10'], label: () => m.shortcuts_table_context() },
       ],
     },
     {
@@ -133,14 +133,14 @@
         { keys: [modifierKey, 'A'], label: () => m.shortcuts_library_select_all() },
         { keys: [modifierKey, 'D'], label: () => m.shortcuts_library_clear_selection() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_library_copy_links() },
-        { keys: ['Enter'], label: () => m.shortcuts_library_open() },
+        { keys: [m.shortcuts_key_enter()], label: () => m.shortcuts_library_open() },
         { keys: ['F2'], label: () => m.shortcuts_library_rename() },
-        { keys: ['Delete'], label: () => m.shortcuts_library_delete() },
-        { keys: ['Space'], label: () => m.shortcuts_library_toggle_check() },
+        { keys: [m.shortcuts_key_delete()], label: () => m.shortcuts_library_delete() },
+        { keys: [m.shortcuts_key_space()], label: () => m.shortcuts_library_toggle_check() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_library_navigate() },
-        { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_search_extend() },
-        { keys: ['Home / End'], label: () => m.shortcuts_library_jump_ends() },
-        { keys: ['PgUp / PgDn'], label: () => m.shortcuts_library_page() },
+        { keys: [m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_search_extend() },
+        { keys: [m.shortcuts_key_home_end()], label: () => m.shortcuts_library_jump_ends() },
+        { keys: [m.shortcuts_key_page_up_down()], label: () => m.shortcuts_library_page() },
       ],
     },
     {
@@ -150,11 +150,11 @@
         { keys: [modifierKey, 'F'], label: () => m.search_filter_results() },
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_search_copy_links() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_search_navigate() },
-        { keys: ['Shift', '↑ / ↓'], label: () => m.shortcuts_search_extend() },
-        { keys: ['Home / End'], label: () => m.shortcuts_search_jump_ends() },
-        { keys: ['PgUp / PgDn'], label: () => m.shortcuts_library_page() },
-        { keys: ['Space'], label: () => m.shortcuts_library_toggle_check() },
-        { keys: ['Enter'], label: () => m.shortcuts_search_download() },
+        { keys: [m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_search_extend() },
+        { keys: [m.shortcuts_key_home_end()], label: () => m.shortcuts_search_jump_ends() },
+        { keys: [m.shortcuts_key_page_up_down()], label: () => m.shortcuts_library_page() },
+        { keys: [m.shortcuts_key_space()], label: () => m.shortcuts_library_toggle_check() },
+        { keys: [m.shortcuts_key_enter()], label: () => m.shortcuts_search_download() },
       ],
     },
     {
@@ -163,21 +163,21 @@
         { keys: ['/'], label: () => m.shortcuts_library_focus_search() },
         { keys: [modifierKey, 'F'], label: () => m.shortcuts_library_focus_search() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_settings_sections() },
-        { keys: ['Enter'], label: () => m.shortcuts_settings_apply() },
-        { keys: ['Esc'], label: () => m.shortcuts_settings_revert() },
+        { keys: [m.shortcuts_key_enter()], label: () => m.shortcuts_settings_apply() },
+        { keys: [m.shortcuts_key_esc()], label: () => m.shortcuts_settings_revert() },
       ],
     },
     {
       title: () => m.shortcuts_section_transfers(),
       shortcuts: [
         { keys: ['↑ / ↓'], label: () => m.shortcuts_transfers_navigate() },
-        { keys: ['Home / End'], label: () => m.shortcuts_transfers_jump_ends() },
+        { keys: [m.shortcuts_key_home_end()], label: () => m.shortcuts_transfers_jump_ends() },
         { keys: [modifierKey, 'A'], label: () => m.shortcuts_transfers_select_all() },
-        { keys: ['Space'], label: () => m.shortcuts_transfers_pause_resume() },
+        { keys: [m.shortcuts_key_space()], label: () => m.shortcuts_transfers_pause_resume() },
         { keys: [modifierKey, 'V'], label: () => m.shortcuts_transfers_paste_links() },
         { keys: ['F2'], label: () => m.shortcuts_transfers_rename() },
-        { keys: ['Delete / Backspace'], label: () => m.shortcuts_transfers_delete() },
-        { keys: ['Shift', 'Delete'], label: () => m.shortcuts_transfers_delete_files() },
+        { keys: [m.shortcuts_key_delete_backspace()], label: () => m.shortcuts_transfers_delete() },
+        { keys: [m.shortcuts_key_shift(), m.shortcuts_key_delete()], label: () => m.shortcuts_transfers_delete_files() },
       ],
     },
     {
@@ -185,19 +185,19 @@
       shortcuts: [
         { keys: [modifierKey, '/'], label: () => m.shortcuts_toggle_chat() },
         { keys: [modifierKey, 'K'], label: () => m.shortcuts_chat_switcher() },
-        { keys: [modifierKey, 'Tab'], label: () => m.shortcuts_chat_cycle_tabs() },
+        { keys: [modifierKey, m.shortcuts_key_tab()], label: () => m.shortcuts_chat_cycle_tabs() },
         { keys: [modifierKey, 'W'], label: () => m.shortcuts_chat_close_tab() },
-        { keys: ['Esc'], label: () => m.shortcuts_chat_close_dock() },
+        { keys: [m.shortcuts_key_esc()], label: () => m.shortcuts_chat_close_dock() },
       ],
     },
     {
       title: () => m.shortcuts_section_channels(),
       shortcuts: [
         { keys: ['Alt', '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
-        { keys: ['Alt', 'Shift', '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
+        { keys: ['Alt', m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
         { keys: [modifierKey, 'K'], label: () => m.shortcuts_channels_search() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_channels_search_navigate() },
-        { keys: ['Enter'], label: () => m.shortcuts_channels_search_open() },
+        { keys: [m.shortcuts_key_enter()], label: () => m.shortcuts_channels_search_open() },
         { keys: [modifierKey, 'F'], label: () => m.shortcuts_channels_find_messages() },
         { keys: ['↑'], label: () => m.shortcuts_channels_edit_last() },
       ],
@@ -255,7 +255,7 @@
         {/each}
       </div>
       <div class="shortcut-footer">
-        <span class="shortcut-hint">{m.shortcuts_dialog_hint_press()} <kbd>Esc</kbd> {m.shortcuts_dialog_hint_to_close()}</span>
+        <span class="shortcut-hint">{m.shortcuts_dialog_hint_press()} <kbd>{m.shortcuts_key_esc()}</kbd> {m.shortcuts_dialog_hint_to_close()}</span>
       </div>
     </div>
   </div>

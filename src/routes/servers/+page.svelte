@@ -46,8 +46,10 @@
   let error: string | null = $state(null);
   let successMsg: string | null = $state(null);
   let confirmRemoveAll = $state(false);
-  /** Read when the dialog opens: the list empties while it is still fading out. */
-  let removeAllCount = $state(0);
+  /** Taken when the dialog opens: the list empties while it is still fading
+   *  out, and a refresh while it is open must not widen what gets removed. */
+  let removeAllSnapshot: ServerInfo[] = $state([]);
+  let removeAllCount = $derived(removeAllSnapshot.length);
   let confirmRemoveOpen = $state(false);
   let pendingRemoveServers: ServerInfo[] = $state([]);
 
@@ -607,7 +609,7 @@
   }
 
   function handleRemoveAll() {
-    removeAllCount = servers.length;
+    removeAllSnapshot = [...servers];
     confirmRemoveAll = true;
   }
 
@@ -630,7 +632,7 @@
 
   async function doRemoveAll() {
     error = null;
-    const results = await removeServersBounded([...servers]);
+    const results = await removeServersBounded(removeAllSnapshot);
     const removed = results.filter((r) => r.status === 'fulfilled').length;
     const failedCount = results.filter((r) => r.status === 'rejected').length;
     selectedServer = null;

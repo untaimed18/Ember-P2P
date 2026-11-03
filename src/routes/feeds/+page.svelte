@@ -423,6 +423,12 @@
         await openOwnFeed(text);
       } else {
         toastError(translateError(e, m.error_operation_failed()));
+        // A link opened from outside is already off the address, so the
+        // composer is the only place left to retry it from.
+        if (!followLink.trim() || followLink.trim() === text) {
+          followLink = text;
+          if (tab === 'following') compose = 'follow';
+        }
       }
     } finally {
       following = false;

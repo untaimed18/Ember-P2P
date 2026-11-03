@@ -116,7 +116,8 @@
     if (stats.entries.length === 0) return false;
     const firstVisible = Math.floor(ipScrollTop / IP_ROW_HEIGHT);
     const visibleCount = Math.max(1, Math.ceil(ipViewportHeight / IP_ROW_HEIGHT));
-    const lastVisible = firstVisible + visibleCount;
+    // A viewport taller than what is left of the list is covered by its end.
+    const lastVisible = Math.min(total, firstVisible + visibleCount);
     const winEnd = listOffset + stats.entries.length;
     return firstVisible >= listOffset && lastVisible <= winEnd;
   }
@@ -149,13 +150,19 @@
     });
   });
 
+  // Also re-checked whenever new stats land, since a reload can come back
+  // with a different window than the one the viewport is over.
   $effect(() => {
     void ipScrollTop;
     void ipViewportHeight;
+    void stats;
     untrack(() => {
       if (!stats) return;
       if (windowCoversViewport()) return;
-      scheduleStatsFetch({ quiet: true, offset: desiredListOffset(), debounceMs: 50 });
+      const offset = desiredListOffset();
+      // Fetching the window already held would bring back the same rows.
+      if (offset === listOffset) return;
+      scheduleStatsFetch({ quiet: true, offset, debounceMs: 50 });
     });
   });
 
@@ -171,6 +178,7 @@
 
   onMount(() => {
     void loadUpdateInfo();
+    const clock = setInterval(() => { nowSecs = Math.floor(Date.now() / 1000); }, 60_000);
     // An automatic update that lands while the page is open: show it.
     let unlistenAutoUpdate: (() => void) | null = null;
     void listen<number>('ipfilter-auto-updated', (event) => {
@@ -196,6 +204,7 @@
     })();
     return () => {
       unmounted = true;
+      clearInterval(clock);
       clearTimeout(flashTimer);
       clearTimeout(fetchTimer);
       unlistenAutoUpdate?.();
@@ -208,11 +217,14 @@
   // its state loads.
   let autoUpdate = $state(get(appSettings)?.ip_filter_auto_update ?? true);
   let autoUpdateSaving = $state(false);
+  /** Unix seconds, advanced once a minute so "List updated …" keeps up. */
+  let nowSecs = $state(Math.floor(Date.now() / 1000));
 
   async function loadUpdateInfo() {
     try {
       const info = await getIpFilterUpdateInfo();
       if (unmounted) return;
+      nowSecs = Math.floor(Date.now() / 1000);
       updateInfo = info;
       if (!autoUpdateSaving) autoUpdate = info.autoUpdate;
     } catch {
@@ -265,7 +277,9 @@
     const seq = ++loadStatsSeq;
     const quiet = opts?.quiet === true;
     const total = stats?.matched_count ?? 0;
-    let offset = opts?.offset ?? 0;
+    // Reloads after an action keep the rows under the viewport; only a new
+    // search or sort asks for the top, and it passes 0 for that.
+    let offset = opts?.offset ?? desiredListOffset();
     if (total > 0) offset = Math.min(offset, Math.max(0, total - 1));
     if (!quiet) {
       loading = true;
@@ -286,6 +300,7 @@
     // surface a single error immediately — the network is already up by then.
     const retryDelaysMs = stats ? [] : [300, 600, 1000, 1500, 2500];
     let lastErr: unknown = null;
+    let askedForTail = false;
     for (let attempt = 0; ; attempt++) {
       try {
         const result = await getIpFilterStats({
@@ -296,6 +311,14 @@
           limit: IP_STATS_PAGE,
         });
         if (unmounted || seq !== loadStatsSeq) return;
+        const matched = result.matched_count ?? 0;
+        if (result.entries.length === 0 && offset > 0 && matched > 0 && !askedForTail) {
+          // The list shrank past the window (a smaller list replaced it): ask
+          // for its tail instead, which is where the scroll position clamps to.
+          askedForTail = true;
+          offset = Math.max(0, matched - IP_STATS_PAGE);
+          continue;
+        }
         listOffset = offset;
         if (togglesInFlight > 0 && stats) {
           stats = { ...result, enabled: stats.enabled, block_private: stats.block_private };
@@ -704,8 +727,8 @@
           <span class="inline-sep">&middot;</span>
           <span class="inline-stat" title={autoUpdateTitle}>
             {autoUpdate && !updateInfo.fromDefault
-              ? m.security_list_updated_paused({ when: formatRelativeTime(updateInfo.updatedAt) })
-              : m.security_list_updated({ when: formatRelativeTime(updateInfo.updatedAt) })}
+              ? m.security_list_updated_paused({ when: formatRelativeTime(updateInfo.updatedAt, nowSecs) })
+              : m.security_list_updated({ when: formatRelativeTime(updateInfo.updatedAt, nowSecs) })}
           </span>
         {/if}
       </div>
@@ -719,7 +742,10 @@
 
     {#if showAddForm}
       <div class="add-form">
-        <div class="add-form-inner">
+        <form
+          class="add-form-inner"
+          onsubmit={(e) => { e.preventDefault(); void handleAddRange(); }}
+        >
           <label class="add-field">
             <span class="add-field-label">{m.security_start_ip()}</span>
             <input bind:value={newStartIp} placeholder={m.security_start_ip_placeholder()} class="ip-input" aria-label={m.security_start_ip()} />
@@ -733,8 +759,8 @@
             <span class="add-field-label">{m.security_description_optional()}</span>
             <input bind:value={newDescription} placeholder={m.security_description_placeholder()} class="desc-input" aria-label={m.security_description_optional()} />
           </label>
-          <button class="add-form-submit" onclick={handleAddRange} disabled={addingRange}>{m.common_add()}</button>
-        </div>
+          <button type="submit" class="add-form-submit" disabled={addingRange}>{m.common_add()}</button>
+        </form>
       </div>
     {/if}
 

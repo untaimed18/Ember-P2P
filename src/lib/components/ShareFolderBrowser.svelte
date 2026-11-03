@@ -11,6 +11,7 @@
     type FileTypeFilter,
   } from '$lib/fileTypes';
   import { isShortcutLetter } from '$lib/shortcutKey';
+  import { shortcutModSymbol } from '$lib/platform';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import { inertBackground, trapTabKey } from '$lib/a11y';
@@ -47,7 +48,7 @@
     (/Win/i.test(navigator.platform) || /Windows/i.test(navigator.userAgent));
   const IS_MAC =
     typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform);
-  const SHARE_SHORTCUT = IS_MAC ? '⌘↩' : 'Ctrl+Enter';
+  const SHARE_SHORTCUT = IS_MAC ? '⌘↩' : `${shortcutModSymbol()}+${m.chat_key_enter()}`;
   const LAST_PATH_KEY = 'share-browser-last-path';
 
   let overlayEl: HTMLDivElement | undefined = $state(undefined);
@@ -825,7 +826,9 @@
   }
 
   async function shareSelected() {
-    if (sessionId == null || shareIds.length === 0 || sharing) return;
+    // `shareDisabled` covers a listing still loading: Ctrl+Enter then would
+    // share what was ticked in the folder being left.
+    if (sessionId == null || shareDisabled) return;
     sharing = true;
     error = null;
     try {
@@ -903,9 +906,9 @@
         const count = entry.shared_count ?? 0;
         if (count === 0) return m.library_explorer_partial_none();
         return plural(count, {
-          one: () => m.library_explorer_partial_one({ count }),
+          one: () => m.library_explorer_partial_one({ count: formatNumber(count) }),
           oneShowsCount: true,
-          other: () => m.library_explorer_partial_other({ count }),
+          other: () => m.library_explorer_partial_other({ count: formatNumber(count) }),
         });
       }
       case 'inherited': return m.library_explorer_inherited();

@@ -4,6 +4,7 @@
   import {
     formatBytes,
     formatCalendarDate,
+    formatClockTime,
     formatDateTime,
     formatDecimal,
     formatNumber,
@@ -48,6 +49,13 @@
 
   /** Retry / Refresh clicks still in flight, which show as a busy button. */
   let manualLoads = $state(0);
+
+  // A failed poll keeps the last figures on screen, which then look live. After
+  // this many misses in a row the page says how old they are.
+  const STALE_AFTER_FAILURES = 2;
+  let failedLoads = $state(0);
+  /** Unix seconds of the last load that brought stats. */
+  let lastLoadedAt = $state(0);
 
   async function loadStats(opts: { force?: boolean } = {}) {
     if (unmounted) return;
@@ -94,14 +102,18 @@
         elapsedAtFetch = statsResult.value.session_elapsed_secs ?? 0;
         tickAtFetch = tickCounter;
         error = null;
-      } else if (!stats) {
+        failedLoads = 0;
+        lastLoadedAt = Math.floor(Date.now() / 1000);
+      } else {
+        failedLoads++;
         // Only surface a blocking error screen on the very first load.
         // Once we have data, a transient poll failure must not blank the
         // whole dashboard — keep showing the last-known stats.
-        error = translateError(statsResult.reason, m.error_operation_failed());
+        if (!stats) error = translateError(statsResult.reason, m.error_operation_failed());
       }
     } catch (e) {
       if (unmounted || seq < appliedSeq) return;
+      failedLoads++;
       if (!stats) error = translateError(e, m.error_operation_failed());
     } finally {
       if (!unmounted) loading = false;
@@ -267,6 +279,9 @@
       </button>
     </div>
   {:else if stats}
+    {#if failedLoads >= STALE_AFTER_FAILURES && lastLoadedAt > 0}
+      <p class="stale-hint" role="status">{m.stats_stale_since({ time: formatClockTime(lastLoadedAt) })}</p>
+    {/if}
 
     <!-- Hero cards -->
     <div class="hero-row">
@@ -545,6 +560,12 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+  }
+
+  .stale-hint {
+    margin: 0;
+    font-size: var(--font-size-sm);
+    color: var(--warning);
   }
 
   /* ---- Hero row ---- */

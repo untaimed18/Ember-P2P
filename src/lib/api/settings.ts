@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
 import type { AppSettings, FriendOverrides, FriendStatus, WebService } from '$lib/types';
 import { flushToastActionsBeforeExit } from '$lib/stores/toast';
+import { withTimeout } from '$lib/utils';
 
 export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
 export type LiveApplyOutcome = 'applied' | 'deferred' | 'failed';
@@ -87,12 +88,27 @@ export async function pickPreviewPlayer(): Promise<string | null> {
   return invoke<string | null>('pick_preview_player', { title: m.picker_preview_player() });
 }
 
+// Both downloads go through `fetch_pinned_get` (security/mod.rs), which follows
+// up to 5 redirects: six hops of a 5 s DNS check plus a 60 s request each
+// (`build_pinned_client`, whose ceiling covers reading the body). The command
+// then waits up to 5 s for the network task to take the result. That is 395 s;
+// the rest is margin for the parse and the disk writes.
+const PINNED_DOWNLOAD_TIMEOUT_MS = (6 * (5 + 60) + 5 + 25) * 1000;
+
 export async function downloadNodesDat(): Promise<NodesDatDownloadResult> {
-  return invoke('download_nodes_dat');
+  return withTimeout(
+    invoke<NodesDatDownloadResult>('download_nodes_dat'),
+    'download_nodes_dat',
+    PINNED_DOWNLOAD_TIMEOUT_MS,
+  );
 }
 
 export async function downloadIpfilter(): Promise<IpFilterDownloadResult> {
-  return invoke('download_ipfilter');
+  return withTimeout(
+    invoke<IpFilterDownloadResult>('download_ipfilter'),
+    'download_ipfilter',
+    PINNED_DOWNLOAD_TIMEOUT_MS,
+  );
 }
 
 /** Hide the main window to the system tray. The Tauri-side handler keeps

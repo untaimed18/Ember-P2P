@@ -1013,6 +1013,11 @@
                   onkeydown={(e) => {
                     // Clear first, close second: otherwise Escape reaches the
                     // modal and throws away the filter and selection with it.
+                    // Mid-composition, Escape belongs to the IME alone.
+                    if (e.key === 'Escape' && (e.isComposing || e.keyCode === 229)) {
+                      e.stopPropagation();
+                      return;
+                    }
                     if (e.key === 'Escape' && filterQuery) {
                       e.preventDefault();
                       e.stopPropagation();

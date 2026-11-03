@@ -36,6 +36,7 @@
     viewingDm,
   } from '$lib/stores/roomDm';
   import { activeChatHash } from '$lib/stores/friends';
+  import { clearDraft, getDraft, registerDraftFlusher, setDraft } from '$lib/stores/chatTabs';
   import { appSettings } from '$lib/stores/settings';
   import { toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
@@ -57,11 +58,21 @@
 
   // Fixed for this instance: the dock remounts for another member.
   const who = untrack(() => member.toLowerCase());
+  const tabKey = dmTabKey(who);
 
   let messages = $state<RoomDmMessage[]>([]);
   let loading = $state(true);
-  let draft = $state('');
+  /** Kept in the dock's draft map under the tab key, as a friend's is, so a
+   *  switch, Escape or pop-out does not lose it. */
+  let draft = $state(getDraft(tabKey));
   let sending = $state(false);
+  /** The draft a send in flight took; not kept as the draft meanwhile. */
+  let sendingDraft: string | null = null;
+  let mounted = true;
+
+  function saveDraft() {
+    setDraft(tabKey, draft === sendingDraft ? '' : draft);
+  }
   let answering = $state(false);
   let listEl: HTMLDivElement | undefined = $state();
 
@@ -222,8 +233,8 @@
     void load();
     // Tells the chat window's presence report, and through it the main
     // window, which conversation is on screen.
-    const tabKey = dmTabKey(who);
     activeChatHash.set(tabKey);
+    const unregisterFlusher = registerDraftFlusher(saveDraft);
     const onSeen = () => void markReadIfSeen();
     document.addEventListener('visibilitychange', onSeen);
     window.addEventListener('focus', onSeen);
@@ -260,27 +271,37 @@
     })();
     return () => {
       alive = false;
+      mounted = false;
       unlisten.forEach((fn) => fn());
       document.removeEventListener('visibilitychange', onSeen);
       window.removeEventListener('focus', onSeen);
+      unregisterFlusher();
+      saveDraft();
       if (get(activeChatHash) === tabKey) activeChatHash.set(null);
     };
   });
 
   async function send() {
-    const text = draft.trim();
+    const raw = draft;
+    const text = raw.trim();
     if (!text || tooLong || sending || blocked) return;
     sending = true;
+    sendingDraft = raw;
+    clearDraft(tabKey);
     try {
       const sent = await sendRoomDm(who, text);
       messages = merged(messages, [sent]);
-      draft = '';
+      // Not what was typed since pressing Send.
+      if (draft === raw) draft = '';
       void refreshDmThreads();
       await scrollToEnd(true);
     } catch (e) {
+      // Closed meanwhile: keep it as the draft for when it is opened again.
+      if (!mounted && !getDraft(tabKey)) setDraft(tabKey, raw);
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       sending = false;
+      sendingDraft = null;
     }
   }
 

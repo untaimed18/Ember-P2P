@@ -69,7 +69,10 @@ pub(in crate::network) async fn on_bootstrap_tick(
             // conditions that persist for the session and must stay
             // on screen even once KAD finishes bootstrapping.
             let _ = app_handle.emit("network-error", serde_json::json!({
-                "message": "Unable to connect to the KAD network. Try Bootstrap on the KAD Network page and use the default nodes.dat.",
+                "message": crate::commands::errors::coded(
+                    "network_kad_no_peers",
+                    "Unable to connect to the KAD network. Try Bootstrap on the KAD Network page and use the default nodes.dat.",
+                ),
                 "transient": true,
             }));
         }

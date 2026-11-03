@@ -699,7 +699,7 @@
             ondragend={onDragEnd}
           >
             <span class="header-content" title={col.label()}>
-              {col.label()}{col.sortField ? arrow(col.sortField) : ''}
+              {col.label()}{#if col.sortField}<span aria-hidden="true">{arrow(col.sortField)}</span>{/if}
             </span>
             <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
             <div

@@ -413,6 +413,15 @@ export function setLocalCategory(ids: ReadonlySet<string>, category: string) {
   transfers.update((list) => list.map((t) => (ids.has(t.id) ? { ...t, category } : t)));
 }
 
+/** When the page last renamed each download; see `categorySetAt`. */
+const renamedAt = new Map<string, number>();
+
+/** Show the name the backend has just accepted for this download. */
+export function setLocalFileName(id: string, fileName: string) {
+  renamedAt.set(id, Date.now());
+  transfers.update((list) => list.map((t) => (t.id === id ? { ...t, file_name: fileName } : t)));
+}
+
 function eventContext(now: number): RowEventContext {
   return { now, reversibleStateEnteredAt, reversibleStateLeftAt, sourceCountsUpdatedAt };
 }
@@ -1166,8 +1175,12 @@ function mergePolledRow(
   const categorySet = categorySetAt.get(apiItem.id);
   const snapshotPredatesCategory = categorySet != null && categorySet > pollStartedAt;
   if (categorySet != null && !snapshotPredatesCategory) categorySetAt.delete(apiItem.id);
+  const renamed = renamedAt.get(apiItem.id);
+  const snapshotPredatesRename = renamed != null && renamed > pollStartedAt;
+  if (renamed != null && !snapshotPredatesRename) renamedAt.delete(apiItem.id);
   const row = snapCompletedDownload({
     ...apiItem,
+    file_name: snapshotPredatesRename ? eventItem.file_name : apiItem.file_name,
     category: snapshotPredatesCategory ? eventItem.category : apiItem.category,
     status,
     ...mergeProgressCounters(apiItem, eventItem),
@@ -1197,7 +1210,8 @@ function mergePolledRow(
       snapshotPredatesReversibleEntry ||
       snapshotPredatesReversibleLeave ||
       preserveFreshEventCounts ||
-      snapshotPredatesCategory,
+      snapshotPredatesCategory ||
+      snapshotPredatesRename,
   };
 }
 
@@ -1248,6 +1262,7 @@ export function forgetTransfer(id: string) {
   reversibleStateLeftAt.delete(id);
   sourceCountsUpdatedAt.delete(id);
   categorySetAt.delete(id);
+  renamedAt.delete(id);
   missingFromApiSince.delete(id);
   lastApiCompleted.delete(id);
   progressRewindHold.delete(id);
@@ -1278,6 +1293,7 @@ export function cleanupTransferStore() {
   reversibleStateLeftAt.clear();
   sourceCountsUpdatedAt.clear();
   categorySetAt.clear();
+  renamedAt.clear();
   lastApiCompleted.clear();
   progressRewindHold.clear();
   announcedTerminal.clear();

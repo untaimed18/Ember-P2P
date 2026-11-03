@@ -15,7 +15,7 @@ import { ignoreMemberEverywhere, pushIgnoredNow } from '$lib/stores/channels';
 import { addActionToast, removeToast, toastError } from '$lib/stores/toast';
 import { notify } from '$lib/notifications';
 import { translateError } from '$lib/i18n';
-import { isAppVisible } from '$lib/utils';
+import { isAppFocused } from '$lib/utils';
 import { chatWindowShows, isChatWindow } from '$lib/windowRole';
 import * as m from '$lib/paraglide/messages';
 
@@ -129,12 +129,13 @@ export function openPrivateChat(member: string, name: string): void {
 
 /** Whether the user is looking at this conversation now: in the dock, in
  *  the chat window when this is it, or, from the main window, in a chat
- *  window that says it shows it. */
+ *  window that says it shows it. Focused, not merely visible: what arrives
+ *  while the window sits behind another app stays unread. */
 export function viewingDm(member: string): boolean {
   const key = dmTabKey(member);
-  if (isChatWindow()) return get(activeChatTab) === key && isAppVisible();
+  if (isChatWindow()) return get(activeChatTab) === key && isAppFocused();
   if (chatWindowShows(key)) return true;
-  return get(chatDockOpen) && get(activeChatTab) === key && isAppVisible();
+  return get(chatDockOpen) && get(activeChatTab) === key && isAppFocused();
 }
 
 /** A tab for a conversation that has something to read, so its unread count

@@ -72,7 +72,10 @@
   let settingsFor: FriendInfo | null = $state(null);
   $effect(() => {
     const open = settingsFor;
-    if (open && !$friendsListStore.some((f) => f.user_hash === open.user_hash)) settingsFor = null;
+    if (!open) return;
+    const fresh = $friendsListStore.find((f) => f.user_hash === open.user_hash);
+    if (!fresh) settingsFor = null;
+    else if (fresh !== open) settingsFor = fresh;
   });
   /** Whether a friend has any setting of their own, for the dot on the gear. */
   function hasOverrides(hash: string): boolean {
@@ -423,6 +426,9 @@
     const addParam = $page.url.searchParams.get('add');
     if (!addParam) return;
     showAddForm = true;
+    untrack(() => {
+      if (newHash.trim() !== addParam.trim()) newNickname = '';
+    });
     newHash = addParam;
     addError = null;
     untrack(() => {
@@ -863,6 +869,7 @@
   }
 
   function editKeydown(e: KeyboardEvent) {
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') saveEdit();
     else if (e.key === 'Escape') {
       e.preventDefault();
@@ -872,6 +879,7 @@
   }
 
   function addFormKeydown(e: KeyboardEvent) {
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') handleAdd();
     else if (e.key === 'Escape') {
       e.preventDefault();
@@ -892,14 +900,27 @@
   // menu on the Transfers page. `<details>` only closes on its own summary, so
   // selecting an item, clicking elsewhere, or pressing Escape closes it here.
   function closeCardMenu(from: HTMLElement) {
-    (from.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open');
+    const menu = from.closest('details');
+    if (menu) closeDetails(menu);
+  }
+
+  /** Focus left on a now-hidden item is lost, and a dialog opened from the
+   *  menu would have nowhere to return it, so it goes back to the summary. */
+  function closeDetails(menu: HTMLDetailsElement) {
+    if (menu.contains(document.activeElement)) menu.querySelector('summary')?.focus();
+    menu.open = false;
   }
 
   function closeCardMenus(keepContaining?: Element | null) {
     for (const el of document.querySelectorAll<HTMLDetailsElement>('.card-more[open]')) {
       if (keepContaining && el.contains(keepContaining)) continue;
-      el.open = false;
+      closeDetails(el);
     }
+  }
+
+  function onCardMenuToggle(e: Event) {
+    const menu = e.currentTarget as HTMLDetailsElement;
+    if (menu.open) closeCardMenus(menu);
   }
 
   function onCardMenuPointerDown(e: PointerEvent) {
@@ -1336,7 +1357,7 @@
             placeholder={m.common_search_placeholder()}
             aria-label={m.common_search()}
             onkeydown={(e) => {
-              if (e.key !== 'Escape' || !searchQuery) return;
+              if (e.key !== 'Escape' || !searchQuery || e.isComposing || e.keyCode === 229) return;
               e.preventDefault();
               e.stopPropagation();
               searchQuery = '';
@@ -1604,7 +1625,7 @@
             <IconGear size={15} weight={1.3} />
           </button>
 
-          <details class="card-more">
+          <details class="card-more" ontoggle={onCardMenuToggle}>
             <summary class="card-more-btn" title={m.common_more()} aria-haspopup="menu" aria-label={m.common_more()}>
               <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                 <circle cx="3.5" cy="8" r="1.4"/>

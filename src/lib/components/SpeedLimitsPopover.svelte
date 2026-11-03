@@ -255,11 +255,11 @@
       </p>
       <div class="limits-inputs">
         {#if altOn}
-          <SpeedInput bind:value={draft.altUp} label={m.statusbar_limits_upload()} idScope="limits-alt" />
-          <SpeedInput bind:value={draft.altDown} label={m.statusbar_limits_download()} idScope="limits-alt" />
+          <SpeedInput bind:value={draft.altUp} label={m.statusbar_limits_upload()} />
+          <SpeedInput bind:value={draft.altDown} label={m.statusbar_limits_download()} />
         {:else}
-          <SpeedInput bind:value={draft.up} label={m.statusbar_limits_upload()} idScope="limits-normal" />
-          <SpeedInput bind:value={draft.down} label={m.statusbar_limits_download()} idScope="limits-normal" />
+          <SpeedInput bind:value={draft.up} label={m.statusbar_limits_upload()} />
+          <SpeedInput bind:value={draft.down} label={m.statusbar_limits_download()} />
         {/if}
       </div>
 

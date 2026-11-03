@@ -413,13 +413,14 @@
     }
   }
 
-  // Lazily checked the first time the Backup section is opened (or on load if
-  // it is the active one), matching how the Security section defers its own
-  // snapshot. A staged restore survives restarts, so this has to be shown
-  // whenever the user comes back - not just after the import that created it.
+  // Lazily checked the first time the Backup section is on screen (opened, on
+  // load as the active one, or matching a filter), matching how the Security
+  // section defers its own snapshot. A staged restore survives restarts, so
+  // this has to be shown whenever the user comes back - not just after the
+  // import that created it.
   let pendingRestoreChecked = false;
   $effect(() => {
-    if (activeSection !== 'backup' || pendingRestoreChecked) return;
+    if (!sectionOnScreen('backup') || pendingRestoreChecked) return;
     pendingRestoreChecked = true;
     void refreshPendingRestore();
   });
@@ -658,7 +659,10 @@
     if (!settings || !speedResult) return;
     settings.max_upload_speed = speedResult.recommended_upload_limit;
     settings.max_download_speed = speedResult.recommended_download_limit;
-    void applyFields(['max_upload_speed', 'max_download_speed']);
+    // Not inline: each field shows the error saved under its own name, and
+    // this one would be saved under the pair, under neither.
+    const fields = ['max_upload_speed', 'max_download_speed'] as const;
+    if (fieldsDirty(fields)) void enqueueSave(() => saveFields(fields));
   }
 
   // ---------------------------------------------------------------------
@@ -900,10 +904,10 @@
     }
   });
   /// The import group scans eMule's folder when it mounts, so it waits until
-  /// its section is first opened rather than running on every Settings visit.
+  /// its section is first on screen rather than running on every Settings visit.
   let importOpened = $state(false);
   $effect(() => {
-    if (activeSection === 'backup') importOpened = true;
+    if (sectionOnScreen('backup')) importOpened = true;
   });
 
   /**
@@ -926,7 +930,15 @@
   /// Set by the effect below, which is the only thing that can count matches
   /// (it has to read the DOM). Drives the result count and the empty state.
   let filterMatchCount = $state(0);
+  /// The sections with a match, set by the same effect.
+  let filterShownSections: SettingsSection[] = $state([]);
   let cardsGridEl: HTMLDivElement | undefined = $state(undefined);
+
+  /** The section's card is on screen: it is the open tab, or it has a match
+   *  while filtering. What a section loads lazily waits for this. */
+  function sectionOnScreen(section: SettingsSection): boolean {
+    return filtering ? filterShownSections.includes(section) : activeSection === section;
+  }
 
   /**
    * Show only the fields that match, and only the sections that still have
@@ -943,9 +955,17 @@
     const grid = cardsGridEl;
     if (!grid) return;
     // Referenced so the effect re-runs once the sections have rendered their
-    // contents, not just when the query changes.
+    // contents, not just when the query changes, including what a section
+    // loads once it is on screen.
     void settings;
+    void antileechLoaded;
+    void pendingRestore;
+    void importOpened;
     const cards = grid.querySelectorAll<HTMLElement>('.card');
+    const setShown = (ids: Set<string>) => {
+      const next = sections.filter((s) => ids.has(panelId(s)));
+      if (next.join() !== untrack(() => filterShownSections.join())) filterShownSections = next;
+    };
     if (!query) {
       for (const card of cards) {
         card.removeAttribute('data-filtered');
@@ -958,9 +978,11 @@
         }
       }
       filterMatchCount = 0;
+      setShown(new Set());
       return;
     }
     let matches = 0;
+    const shownIds = new Set<string>();
     for (const card of cards) {
       // A section whose own name matches keeps all of its fields, so
       // searching "backup" shows the Backup section rather than only the
@@ -1026,11 +1048,16 @@
           block.setAttribute('data-filtered', 'out');
         }
       }
-      if (cardMatches > 0) card.removeAttribute('data-filtered');
-      else card.setAttribute('data-filtered', 'out');
+      if (cardMatches > 0) {
+        card.removeAttribute('data-filtered');
+        shownIds.add(card.id);
+      } else {
+        card.setAttribute('data-filtered', 'out');
+      }
       matches += cardMatches;
     }
     filterMatchCount = matches;
+    setShown(shownIds);
   });
 
   function sectionLabel(id: SettingsSection): string {
@@ -1632,6 +1659,18 @@
     return enqueueSave(() => saveFields(fields, { reportInline: true }));
   }
 
+  /** Put typed fields back as they are saved. Whether there was a change to
+   *  put back. */
+  function revertTyped(fields: readonly ApplyField[]): boolean {
+    if (!fieldsDirty(fields)) return false;
+    const current = settings as unknown as Record<string, unknown> | null;
+    const saved = savedSettings;
+    if (!current || !saved) return false;
+    for (const key of fields) current[key] = cloneValue(fieldValue(saved, key));
+    if (applyError?.fields === fields.join(',')) applyError = null;
+    return true;
+  }
+
   /** Enter applies a typed field; Escape puts it back as it is saved. */
   function applyOnEnter(event: KeyboardEvent, fields: readonly ApplyField[]) {
     if (event.isComposing || !fieldsDirty(fields)) return;
@@ -1640,11 +1679,7 @@
       void applyFields(fields);
     } else if (event.key === 'Escape') {
       event.preventDefault();
-      const current = settings as unknown as Record<string, unknown> | null;
-      const saved = savedSettings;
-      if (!current || !saved) return;
-      for (const key of fields) current[key] = cloneValue(fieldValue(saved, key));
-      if (applyError?.fields === fields.join(',')) applyError = null;
+      revertTyped(fields);
     }
   }
 
@@ -1847,18 +1882,30 @@
   /// window disappearance), then call Tauri's `relaunch()` which kills
   /// the current process and spawns a fresh one. If `relaunch` fails for
   /// any reason (rare — usually only when the user lacks permission to
-  /// re-spawn) we surface the error and let them restart manually.
-  async function performRestart() {
+  /// re-spawn) we surface the error and let them restart manually. Typed
+  /// changes not applied yet are offered for applying first, as a language
+  /// change offers them.
+  function performRestart() {
     showRestartPrompt = false;
+    guardUnsavedExit('restart', () => void restartNow());
+  }
+
+  async function restartNow() {
+    if (restarting) return;
     restarting = true;
     try {
       // Brief delay so the overlay has time to paint before the process
       // dies — purely cosmetic, matches the wizard. Spent sending anything
-      // still behind an Undo toast.
-      await Promise.all([new Promise(r => setTimeout(r, 600)), flushToastActionsBeforeExit()]);
+      // still behind an Undo toast, and letting saves already asked for land.
+      await Promise.all([
+        new Promise(r => setTimeout(r, 600)),
+        flushToastActionsBeforeExit(),
+        saveQueue,
+      ]);
       await relaunch();
     } catch (e) {
       restarting = false;
+      discardConfirmed = false;
       showSaveMsg(
         m.settings_restart_failed({ error: translateError(e) }),
         true,
@@ -2156,33 +2203,50 @@
     new Intl.ListFormat(getLocale(), { type: 'conjunction' }).format(pendingSections.map(sectionLabel)),
   );
 
-  // Changing the language reloads the page, which drops every typed change
-  // not applied yet, so it asks first.
-  let languageConfirmOpen = $state(false);
-  let pendingLanguageChange: (() => void) | null = null;
+  // Changing the language reloads the page and a restart ends it, either of
+  // which drops every typed change not applied yet, so both ask first.
+  type UnsavedExit = 'language' | 'restart';
+  let unsavedConfirmOpen = $state(false);
+  let unsavedExitKind: UnsavedExit = $state('language');
+  let pendingExit: (() => void) | null = null;
   /** The user chose to discard, so the reload must not ask again. */
   let discardConfirmed = false;
 
-  function guardLanguageChange(change: () => void) {
+  function guardUnsavedExit(kind: UnsavedExit, proceed: () => void) {
     if (!hasUnsavedChanges) {
-      reloadAfterToastActions(change);
+      proceed();
       return;
     }
-    pendingLanguageChange = change;
-    languageConfirmOpen = true;
+    pendingExit = proceed;
+    unsavedExitKind = kind;
+    // A prompt that asked for the restart is still closing and handing focus
+    // back to its opener; opening alongside it would lose focus to that.
+    void tick().then(() => (unsavedConfirmOpen = true));
   }
 
-  async function applyThenChangeLanguage() {
-    const change = pendingLanguageChange;
-    pendingLanguageChange = null;
+  function guardLanguageChange(change: () => void) {
+    guardUnsavedExit('language', () => reloadAfterToastActions(change));
+  }
+
+  async function applyThenExit() {
+    const proceed = pendingExit;
+    const kind = unsavedExitKind;
+    pendingExit = null;
     // One field at a time: a failure is shown under the field it was for.
     const applied = await Promise.all(
       APPLY_FIELDS.filter((field) => fieldsDirty([field])).map((field) => applyFields([field])),
     );
     if (antileechDraftDirty) await handleSaveAntileech();
-    if (applied.every(Boolean) && !hasUnsavedChanges) reloadAfterToastActions(() => change?.());
+    if (applied.every(Boolean) && !hasUnsavedChanges) proceed?.();
     // The failure may be under a field on another tab, out of sight.
-    else toastError(m.settings_language_apply_failed());
+    else toastError(kind === 'restart' ? m.settings_restart_apply_failed() : m.settings_language_apply_failed());
+  }
+
+  function discardThenExit() {
+    const proceed = pendingExit;
+    pendingExit = null;
+    discardConfirmed = true;
+    proceed?.();
   }
 
   // In-app routing (the sidebar uses `goto`) would otherwise discard typed
@@ -2414,11 +2478,11 @@
     }
   }
 
-  // Lazy-load the snapshot the first time the Security section is opened
-  // (or on initial load if it's the active section). Avoids paying the
-  // backend round-trip just to render the rest of Settings.
+  // Lazy-load the snapshot the first time the Security section is on screen
+  // (opened, on initial load as the active section, or matching a filter).
+  // Avoids paying the backend round-trip just to render the rest of Settings.
   $effect(() => {
-    if (activeSection === 'security' && !antileechLoaded) {
+    if (sectionOnScreen('security') && !antileechLoaded) {
       loadAntileech();
     }
   });
@@ -2640,9 +2704,9 @@
 <div class="page-header sticky-header">
   <h2>{m.settings_title()}</h2>
   <div class="header-actions">
-    {#if saveMessage}
-      <span class="save-status" class:warning={saveIsWarning} role="status">{saveMessage}</span>
-    {/if}
+    <!-- Always present: a live region added together with its text is often
+         not announced. -->
+    <span class="save-status" class:warning={saveIsWarning} class:idle={!saveMessage} role="status">{saveMessage ?? ''}</span>
   </div>
   {#if restartReason}
     <!-- Stays until the restart, or until the change is undone: "Later" on
@@ -4027,7 +4091,7 @@
             <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
               <div class="apply-input">
                 <div class="apply-grow">
-                  <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} />
+                  <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} onescape={() => revertTyped(['max_upload_speed'])} />
                 </div>
                 {@render applyButton(['max_upload_speed'], m.settings_max_upload_speed())}
               </div>
@@ -4036,7 +4100,7 @@
             <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
               <div class="apply-input">
                 <div class="apply-grow">
-                  <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} />
+                  <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} onescape={() => revertTyped(['max_download_speed'])} />
                 </div>
                 {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
               </div>
@@ -4079,13 +4143,13 @@
             <div class="field nested alt-speed-limits" class:is-inactive={!settings.alt_speed_enabled}>
               <div class="apply-input">
                 <div class="apply-grow">
-                  <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} idScope="alt" onenter={() => void applyFields(['alt_max_upload_speed'])} />
+                  <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} onenter={() => void applyFields(['alt_max_upload_speed'])} onescape={() => revertTyped(['alt_max_upload_speed'])} />
                 </div>
                 {@render applyButton(['alt_max_upload_speed'], m.settings_alt_max_upload_speed())}
               </div>
               <div class="apply-input">
                 <div class="apply-grow">
-                  <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} idScope="alt" onenter={() => void applyFields(['alt_max_download_speed'])} />
+                  <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} onenter={() => void applyFields(['alt_max_download_speed'])} onescape={() => revertTyped(['alt_max_download_speed'])} />
                 </div>
                 {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
               </div>
@@ -4220,17 +4284,12 @@
                     </div>
 
                     <div class="schedule-limits">
-                      <!-- `idScope` keeps each rule's two fields from colliding
-                           with every other rule's, and with the manual limits
-                           above, which all share these labels. -->
                       <SpeedInput
                         label={m.settings_max_upload_speed()}
-                        idScope={rule.id}
                         bind:value={rule.max_upload_speed}
                       />
                       <SpeedInput
                         label={m.settings_max_download_speed()}
-                        idScope={rule.id}
                         bind:value={rule.max_download_speed}
                       />
                     </div>
@@ -5675,20 +5734,17 @@
 />
 
 <ConfirmDialog
-  bind:open={languageConfirmOpen}
+  bind:open={unsavedConfirmOpen}
   title={m.settings_language_unsaved_title()}
-  message={m.settings_language_unsaved_message({ sections: pendingSectionNames })}
-  confirmLabel={m.settings_language_apply_switch()}
-  altLabel={m.settings_language_discard_switch()}
+  message={unsavedExitKind === 'restart'
+    ? m.settings_restart_unsaved_message({ sections: pendingSectionNames })
+    : m.settings_language_unsaved_message({ sections: pendingSectionNames })}
+  confirmLabel={unsavedExitKind === 'restart' ? m.settings_restart_apply_restart() : m.settings_language_apply_switch()}
+  altLabel={unsavedExitKind === 'restart' ? m.settings_restart_discard_restart() : m.settings_language_discard_switch()}
   cancelLabel={m.common_keep_editing()}
-  onconfirm={() => void applyThenChangeLanguage()}
-  onalt={() => {
-    const change = pendingLanguageChange;
-    pendingLanguageChange = null;
-    discardConfirmed = true;
-    reloadAfterToastActions(() => change?.());
-  }}
-  oncancel={() => { pendingLanguageChange = null; }}
+  onconfirm={() => void applyThenExit()}
+  onalt={discardThenExit}
+  oncancel={() => { pendingExit = null; }}
 />
 
 <!--
@@ -5758,6 +5814,11 @@
   .save-status.warning {
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 12%, transparent);
+  }
+
+  .save-status.idle {
+    padding: 0;
+    background: none;
   }
 
   /* ── Card grid ─────────────────────────────────── */

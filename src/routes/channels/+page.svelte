@@ -1196,6 +1196,14 @@
       // The room settings drafts need no guard here: they live in a modal,
       // and the check above already stands down while one is open.
       if (target?.closest('.add-form')) return;
+      // So would a message being edited in the open room; go back to it, as
+      // Reply does, to be saved or cancelled first.
+      const edit = document.querySelector<HTMLElement>('.bubble-edit-input');
+      if (edit) {
+        e.preventDefault();
+        edit.focus();
+        return;
+      }
       const rooms = joinedInOrder;
       if (rooms.length === 0) return;
       e.preventDefault();
@@ -1240,7 +1248,7 @@
   const roomShortcutHints = [
     { keys: [shortcutModSymbol(), 'K'], label: () => m.shortcuts_channels_search() },
     { keys: ['Alt', '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
-    { keys: ['Alt', 'Shift', '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
+    { keys: ['Alt', m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
   ];
 
   /** Ctrl/⌘+F: opens the room's message search, or returns to it if open. */

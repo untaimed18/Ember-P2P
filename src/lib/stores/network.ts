@@ -214,7 +214,24 @@ function warnUpnpFailedUnlessReachable(message: string) {
   });
 }
 
-function syncServerStatus(stats: NetworkStats) {
+// Bumped by every `server-status-changed` event. A stats read snapshots it
+// before awaiting, and one that resolves after a bump carries the server state
+// from before that event, so its status and HighID/LowID must not land.
+let serverStatusEventSeq = 0;
+
+/** `stats` with the server fields kept from `current` when the read started
+ *  before the latest server event. */
+function withoutStaleServerFields(
+  stats: NetworkStats,
+  current: NetworkStats,
+  seqAtStart: number,
+): NetworkStats {
+  if (seqAtStart === serverStatusEventSeq) return stats;
+  return { ...stats, server_status: current.server_status, ed2k_low_id: current.ed2k_low_id };
+}
+
+function syncServerStatus(stats: NetworkStats, seqAtStart: number) {
+  if (seqAtStart !== serverStatusEventSeq) return;
   const s = stats.server_status;
   if (s === 'connected' || s === 'connecting' || s === 'disconnected') {
     setServerStatus(s);
@@ -424,8 +441,11 @@ export async function initNetworkStore() {
       lastEventUpdate = Date.now();
       // Only a transient error may be auto-cleared by a later connect. The
       // others ("TCP port already in use", UDP bind failure, task panic)
-      // describe conditions that outlive the bootstrap and must stay visible.
-      networkErrorIsTransient = event.payload?.transient === true;
+      // describe conditions that outlive the bootstrap and must stay visible,
+      // so a transient one never replaces them.
+      const transient = event.payload?.transient === true;
+      if (transient && !networkErrorIsTransient && get(networkError) !== null) return;
+      networkErrorIsTransient = transient;
       networkError.set(translateError(message, message));
     }));
     // Fatal network errors come directly from the network-task supervisor
@@ -441,10 +461,11 @@ export async function initNetworkStore() {
       const translated = typeof event.payload === 'string'
         ? translateError(event.payload, event.payload)
         : m.error_network_task_panicked();
+      networkErrorIsTransient = false;
       networkError.set(translated);
-      // Long duration (15 s) — fatal failures deserve more than the
-      // default 8 s of a regular error toast.
-      toastError(m.toast_network_stopped({ message: translated }));
+      // Sticky: the network stays down until a restart, so the notice must
+      // stay until the user dismisses it.
+      addToast('error', m.toast_network_stopped({ message: translated }), 0);
     }));
     // Non-fatal warnings from network start-up / ongoing operation (e.g.
     // UDP port already in use → auto-rebound to a different port). These
@@ -496,6 +517,7 @@ export async function initNetworkStore() {
       // handshake before it announces the connection, and re-announcing the
       // same status is how a reconnect to a different server arrives — so every
       // one of these is worth a re-read, not only the transitions.
+      serverStatusEventSeq += 1;
       if (status) setServerStatus(status, true);
       // So is the HighID/LowID, which is the last server's until a poll brings
       // this one's: show none meanwhile, and let the next tick ask at once.
@@ -542,13 +564,14 @@ export async function initNetworkStore() {
   }
 
   try {
+    const seqAtStart = serverStatusEventSeq;
     const stats = await getNetworkStats();
     if (myEpoch !== storeEpoch) return;
     lastPollOkAt = Date.now();
     lastNetworkUpdate = lastPollOkAt;
-    syncServerStatus(stats);
+    syncServerStatus(stats, seqAtStart);
     networkStats.update((current) => {
-      const merged = { ...stats };
+      const merged = withoutStaleServerFields({ ...stats }, current, seqAtStart);
       if (!merged.external_ip && current.external_ip) {
         merged.external_ip = current.external_ip;
       }
@@ -661,6 +684,7 @@ export function startStatsPoll() {
     statsPumpOnNextVisible = false;
     statsPollInFlight = true;
     const epoch = storeEpoch;
+    const seqAtStart = serverStatusEventSeq;
     try {
       // The deadline lives here rather than in the API wrapper: at a 3 s
       // cadence a response older than one tick has nothing left to tell us,
@@ -669,9 +693,9 @@ export function startStatsPoll() {
       if (epoch !== storeEpoch) return;
       lastPollOkAt = Date.now();
       lastNetworkUpdate = lastPollOkAt;
-      syncServerStatus(stats);
+      syncServerStatus(stats, seqAtStart);
       networkStats.update((current) => {
-        const merged = { ...stats };
+        const merged = withoutStaleServerFields({ ...stats }, current, seqAtStart);
         if (!merged.external_ip && current.external_ip) {
           merged.external_ip = current.external_ip;
         }

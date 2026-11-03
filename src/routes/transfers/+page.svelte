@@ -11,7 +11,7 @@
   import {
     addUserCategory, countDownloadCategories, isCategoryTaken, removeUserCategory, setCategoryFolder,
   } from '$lib/categorySettings';
-  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
+  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, setLocalFileName, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
   import { removeToast, setToastMessage, toastsFor } from '$lib/stores/toast';
   const { addActionToast, toastError, toastSuccess, toastWarning } = toastsFor('downloads');
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
@@ -47,7 +47,7 @@
   import { menuKeyDownloadId } from '$lib/transfersMenuKey';
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
-  import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { ctxMenuPosition, ctxSubmenuPlacement, resolveSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
@@ -555,6 +555,7 @@
       clearTimeout(knownCopyTimer);
       knownCopyTimer = undefined;
     }
+    if (moreMenuReflow) window.removeEventListener('resize', moreMenuReflow);
   });
 
   let searchStatus: Map<string, string> = $state(new Map());
@@ -1006,6 +1007,17 @@
   });
   let allDownloads = $derived(downloadPartition.all);
   let activeDownloads = $derived(downloadPartition.active);
+  /** `transfersLoaded` waits on the network task restoring the last session;
+   *  one that never answers must not leave the list loading for good. */
+  const RESTORE_WAIT_MS = 15_000;
+  let restoreWaitExpired = $state(false);
+  $effect(() => {
+    if ($transfersLoaded) return;
+    restoreWaitExpired = false;
+    const timer = setTimeout(() => (restoreWaitExpired = true), RESTORE_WAIT_MS);
+    return () => clearTimeout(timer);
+  });
+  let downloadsLoading = $derived(!$transfersLoaded && !restoreWaitExpired);
   /// The live download whose sources the Download Clients tab is showing.
   let expandedClientsParent = $derived(
     expandedTransferId ? (activeDownloads.find((d) => d.id === expandedTransferId) ?? null) : null,
@@ -1426,14 +1438,16 @@
   let knownCopiedHash = $state<string | null>(null);
   let knownCopyTimer: ReturnType<typeof setTimeout> | undefined;
   async function copyKnownHash(hash: string) {
-    if (await copyToClipboard(hash)) {
-      knownCopiedHash = hash;
-      if (knownCopyTimer !== undefined) clearTimeout(knownCopyTimer);
-      knownCopyTimer = setTimeout(() => {
-        knownCopiedHash = null;
-        knownCopyTimer = undefined;
-      }, 1400);
+    if (!(await copyToClipboard(hash))) {
+      transferError = m.search_copy_failed();
+      return;
     }
+    knownCopiedHash = hash;
+    if (knownCopyTimer !== undefined) clearTimeout(knownCopyTimer);
+    knownCopyTimer = setTimeout(() => {
+      knownCopiedHash = null;
+      knownCopyTimer = undefined;
+    }, 1400);
   }
 
   // Manual bans, keyed by lowercase user hash to the id the ban was stored
@@ -2652,6 +2666,28 @@
     });
   }
 
+  /** The row shown after `id` that is not leaving with `leaving`, else the
+   *  one before it: where the highlight goes when its row is removed. */
+  function survivingNeighbour(id: string, leaving: ReadonlySet<string>): string | null {
+    const list = filteredSelectableDownloads;
+    const idx = list.findIndex((t) => t.id === id);
+    if (idx < 0) return null;
+    for (let i = idx + 1; i < list.length; i++) if (!leaving.has(list[i].id)) return list[i].id;
+    for (let i = idx - 1; i >= 0; i--) if (!leaving.has(list[i].id)) return list[i].id;
+    return null;
+  }
+
+  /** A confirm dialog keeps the focus through its outro and then hands it back
+   *  to its opener, which a removed row no longer is; this runs before that. */
+  function focusDownloadRowAfterDialog(id: string | null, fallback: HTMLElement | null = null) {
+    requestAnimationFrame(() => {
+      const row = id
+        ? downloadsScrollEl?.querySelector<HTMLElement>(`tr[data-transfer-id="${CSS.escape(id)}"]`)
+        : null;
+      (row ?? fallback)?.focus({ preventScroll: true });
+    });
+  }
+
   /** Cancel deletes a finished download's file, so on one it says so. */
   function cancelLabel(rows: Transfer[]): string {
     const completed = rows.filter((t) => t.status === 'completed').length;
@@ -3110,10 +3146,7 @@
     renameDialog.busy = true;
     renameDialog.error = null;
     try {
-      const name = await renameTransfer(id, value);
-      transfers.update((list) =>
-        list.map((t) => (t.id === id ? { ...t, file_name: name } : t)),
-      );
+      setLocalFileName(id, await renameTransfer(id, value));
       renameDialog = { open: false, id: '', value: '', error: null, busy: false };
     } catch (e: unknown) {
       renameDialog.busy = false;
@@ -3608,10 +3641,12 @@
     closePaneCtx();
     closeUploadsPaneCtx();
     // Match ctx/column menus: native <details> stays open on outside click.
+    // A click inside is left to it: on its <summary> the native toggle,
+    // which runs after this, would reopen one closed here.
     document
       .querySelectorAll<HTMLDetailsElement>('.toolbar-more[open]')
       .forEach((d) => {
-        d.open = false;
+        if (!target || !d.contains(target)) d.open = false;
       });
   }
 
@@ -3966,12 +4001,19 @@
         : m.transfers_already_in_list({ name: only.name }));
       return;
     }
-    showInfo(m.transfers_paste_summary({
+    const summary = m.transfers_paste_summary({
       total: queued + already + ignored,
       queued,
       already,
       ignored,
-    }));
+    });
+    if (failed === 0) {
+      showInfo(summary);
+      return;
+    }
+    const withError = m.transfers_paste_summary_with_error({ summary, error: toErrorMsg(firstError) });
+    if (queued === 0 && already === 0) throw new Error(withError);
+    transferError = withError;
   }
 
   /** The Add eD2K Links dialog: the header button opens it; Ctrl+V and the
@@ -4034,6 +4076,7 @@
    *  3 sources", "Server returned no sources") and as sources on the row. So a
    *  network that is down is reported here, once, and never waited on. */
   async function runFindSourcesWithStatus(t: Transfer): Promise<void> {
+    searchFoundIds.delete(t.id);
     searchStatus.set(t.id, m.transfers_src_asking());
     searchStatus = new Map(searchStatus);
     const ask = await findSources(t.id, t.file_hash, t.total_size);
@@ -4161,6 +4204,7 @@
   function discardWithUndo(cancelIds: string[], removeIds: string[], clear = false) {
     const all = new Set([...cancelIds, ...removeIds]);
     if (all.size === 0) return;
+    const successor = focusedDlId && all.has(focusedDlId) ? survivingNeighbour(focusedDlId, all) : null;
     let snapshots: Transfer[] = [];
     transfers.update((list) => {
       snapshots = list.filter((x) => all.has(x.id));
@@ -4169,8 +4213,9 @@
     for (const id of all) holdDownloadRemoved(id);
     const wasChecked = checkedDownloadIds.filter((id) => all.has(id));
     checkedDownloadIds = checkedDownloadIds.filter((id) => !all.has(id));
-    if (focusedDlId && all.has(focusedDlId)) focusedDlId = null;
-    if (lastClickedDlId && all.has(lastClickedDlId)) lastClickedDlId = null;
+    if (focusedDlId && all.has(focusedDlId)) focusedDlId = successor;
+    if (lastClickedDlId && all.has(lastClickedDlId)) lastClickedDlId = successor;
+    if (successor) focusDownloadRowEl(successor);
 
     const byId = new Map(snapshots.map((s) => [s.id, s] as const));
     const toPause = cancelIds.filter((id) => {
@@ -4708,6 +4753,45 @@
       more.open = true;
     }
     menuKeydown(e, more.querySelector<HTMLElement>('.toolbar-more-menu'));
+  }
+
+  /** The More menu is fixed, so a short pane's `overflow: hidden` cannot cut
+   *  it off: right-aligned under its button, or above it when that has more room. */
+  function placeMoreMenu(more: HTMLDetailsElement) {
+    const menu = more.querySelector<HTMLElement>('.toolbar-more-menu');
+    const button = more.querySelector('summary');
+    if (!more.open || !menu || !button) return;
+    menu.style.maxHeight = '';
+    menu.style.overflowY = '';
+    const rect = button.getBoundingClientRect();
+    const gap = 4;
+    const margin = 8;
+    const width = menu.offsetWidth;
+    const height = menu.offsetHeight;
+    const placement = resolveSubmenuPlacement(
+      { top: rect.bottom + gap, bottom: rect.top - gap, left: rect.left, right: rect.right },
+      { width, height },
+      { width: window.innerWidth, height: window.innerHeight },
+    );
+    const shown = placement.maxHeight ?? height;
+    if (placement.maxHeight !== null) {
+      menu.style.maxHeight = `${placement.maxHeight}px`;
+      menu.style.overflowY = 'auto';
+    }
+    menu.style.top = `${placement.flipUp ? rect.top - gap - shown : rect.bottom + gap}px`;
+    menu.style.left = `${Math.max(margin, Math.min(rect.right - width, window.innerWidth - width - margin))}px`;
+  }
+
+  let moreMenuReflow: (() => void) | null = null;
+  function onMoreToggle(e: Event & { currentTarget: HTMLDetailsElement }) {
+    const more = e.currentTarget;
+    if (moreMenuReflow) window.removeEventListener('resize', moreMenuReflow);
+    moreMenuReflow = null;
+    if (!more.open) return;
+    const reflow = () => placeMoreMenu(more);
+    moreMenuReflow = reflow;
+    reflow();
+    window.addEventListener('resize', reflow);
   }
 
   /** Tabbing out of the More menu closes it, as leaving a menu does. */
@@ -5449,6 +5533,28 @@
     });
   });
 
+  // A "found" status outlives the sources it reported once they all drop
+  // away, and would otherwise block every later status for that row.
+  const lastSourceCounts = new Map<string, number>();
+  $effect(() => {
+    const counts = allDownloads.map((t) => [t.id, t.sources ?? 0] as const);
+    untrack(() => {
+      let mutated = false;
+      const seen = new Set<string>();
+      for (const [id, count] of counts) {
+        seen.add(id);
+        if (count === 0 && (lastSourceCounts.get(id) ?? 0) > 0 && searchFoundIds.delete(id)) {
+          mutated = searchStatus.delete(id) || mutated;
+        }
+        lastSourceCounts.set(id, count);
+      }
+      for (const id of lastSourceCounts.keys()) {
+        if (!seen.has(id)) lastSourceCounts.delete(id);
+      }
+      if (mutated) searchStatus = new Map(searchStatus);
+    });
+  });
+
   // Same idea for `reputationMap` / `reputationInFlight`. The known-
   // clients ledger is the only producer of hashes for these caches;
   // when a peer leaves the ledger (eviction in the credit manager,
@@ -5632,10 +5738,13 @@
     lastClickedDlId = checkedDownloadIds[0] ?? null;
     return;
   }
+  // A control that has focus keeps its own keys: Space and Delete there must
+  // not act on a download selection made elsewhere.
+  const onControl = !!target?.closest('button, a[href], summary, select, [role="button"], [role="menuitem"], [role="tab"]');
   // Space pauses the selection, or resumes it when nothing in it is running —
   // one key for the toggle, as in most download managers.
   if (e.key === ' ' && !e.ctrlKey && !e.metaKey && !e.altKey && selectedBatchTransfers.length > 0) {
-    if (target?.closest('button, a[href], summary, select, [role="button"], [role="menuitem"], [role="tab"]')) return;
+    if (onControl) return;
     // A checkbox reached with the keyboard keeps Space for ticking; one just
     // clicked does not, or Space would untick the row the user meant to
     // pause. Told apart by the last pointer press rather than
@@ -5702,12 +5811,12 @@
       await tick();
       ctxMenuEl?.querySelector<HTMLElement>('.ctx-item:not([disabled])')?.focus();
     });
-  } else if (e.key === 'Delete' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && selectedDownloadIds.length > 0) {
+  } else if (e.key === 'Delete' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && !onControl && selectedDownloadIds.length > 0) {
     // Shift+Delete is Cancel, as a file manager's is the stronger Delete: it
     // also deletes the files of finished downloads, behind Cancel's prompt.
     e.preventDefault();
     openCancelConfirm(selectedBatchTransfers);
-  } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
+  } else if ((e.key === 'Delete' || e.key === 'Backspace') && !onControl && selectedDownloadIds.length > 0) {
     e.preventDefault();
     const cancelIds = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
     const removeIds = selectedBatchTransfers.filter((t) => isFinished(t)).map((t) => t.id);
@@ -5885,7 +5994,7 @@
         </div>
         <span class="toolbar-sep"></span>
         <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-        <details class="toolbar-more" onkeydown={onMoreKeydown} onfocusout={onMoreFocusout}>
+        <details class="toolbar-more" onkeydown={onMoreKeydown} onfocusout={onMoreFocusout} ontoggle={onMoreToggle}>
           <summary class="tb-btn" title={m.common_more()} aria-haspopup="menu">{m.common_more()}</summary>
           <div class="toolbar-more-menu" role="menu">
             <button type="button" role="menuitem" onclick={(e) => runFromMore(e, () => void handlePauseAll())}>{m.transfers_pause_all()}</button>
@@ -6275,7 +6384,14 @@
           {#if !completedFirst}
             {@render completedDownloadRows()}
           {/if}
-          {#if allDownloads.length === 0}
+          {#if allDownloads.length === 0 && downloadsLoading}
+            <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
+              <div class="empty-state compact">
+                <div class="spinner"></div>
+                <p class="empty-sub">{m.transfers_loading_short()}</p>
+              </div>
+            </td></tr>
+          {:else if allDownloads.length === 0}
             <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
               <div class="empty-state compact">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
@@ -6305,7 +6421,7 @@
     {#if checkedDownloadIds.length > 0}
       <div class="selection-footer">
         <div class="selection-meta">
-          <strong>{m.transfers_selected_count({ count: selectedDownloadCount })}</strong>
+          <strong>{m.transfers_selected_count({ count: formatNumber(selectedDownloadCount) })}</strong>
         </div>
         <div class="selection-actions">
           <button class="tb-btn" disabled={selectedPausableCount === 0} onclick={handleBatchPauseDownloads} title={m.transfers_batch_pause_title()}>{m.common_pause()}</button>
@@ -6477,7 +6593,7 @@
           aria-controls="bottom-pane-content"
           tabindex={bottomView === 'uploading' ? 0 : -1}
           onclick={() => bottomView = 'uploading'}
-        >{m.transfers_tab_uploading({ count: filteredActiveUploads.length })}</button>
+        >{m.transfers_tab_uploading({ count: formatNumber(filteredActiveUploads.length) })}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'queued'}
@@ -6487,7 +6603,7 @@
           tabindex={bottomView === 'queued' ? 0 : -1}
           onclick={() => bottomView = 'queued'}
           title={m.transfers_tab_queued_title()}
-        >{uploadQueueLoaded && !uploadQueueLoadFailed ? m.transfers_tab_queued_count({ count: uploadQueueClients.length }) : m.transfers_tab_queued()}</button>
+        >{uploadQueueLoaded && !uploadQueueLoadFailed ? m.transfers_tab_queued_count({ count: formatNumber(uploadQueueClients.length) }) : m.transfers_tab_queued()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_clients'}
@@ -6915,13 +7031,13 @@
                 </span>
               {:else}
                 <span class="known-stat">
-                  <strong>{knownStats.total}</strong>
+                  <strong>{formatNumber(knownStats.total)}</strong>
                   {peersNoun(knownStats.total)}
                 </span>
               {/if}
               {#if knownStats.friends > 0}
                 <span class="known-stat known-stat-friends" title={m.transfers_known_friends_title()}>
-                  <strong>{knownStats.friends}</strong>
+                  <strong>{formatNumber(knownStats.friends)}</strong>
                   {plural(knownStats.friends, {
                     one: m.transfers_known_friends_one,
                     oneShowsCount: true,
@@ -6938,7 +7054,7 @@
               </span>
               {#if knownFilter && filteredKnownClients.length !== knownStats.total}
                 <span class="known-stat known-stat-match" aria-live="polite">
-                  {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
+                  {m.transfers_known_showing_label()} <strong>{formatNumber(filteredKnownClients.length)}</strong>
                 </span>
               {/if}
             </div>
@@ -7459,7 +7575,7 @@
   >
     <div class="ctx-header" role="presentation">
       {#if ctxMulti}
-        {m.transfers_selected_count({ count: ctxTargets.length })}
+        {m.transfers_selected_count({ count: formatNumber(ctxTargets.length) })}
       {:else}
         <bdi dir="auto">{ctxTransfer.file_name}</bdi>
       {/if}
@@ -7763,9 +7879,11 @@
     const id = confirmCancel.id;
     // Re-read: a download can finish while the dialog is open, and the
     // backend still cancels a finished row, recording it in the download
-    // history as cancelled over its completed entry.
-    if ($transfers.some((x) => x.id === id && isFinished(x))) return;
-    discardWithUndo([id], []);
+    // history as cancelled over its completed entry. It leaves the list as
+    // a finished row in a batch cancel does.
+    if ($transfers.some((x) => x.id === id && isFinished(x))) discardWithUndo([], [id]);
+    else discardWithUndo([id], []);
+    focusDownloadRowAfterDialog(focusedDlId);
   }}
 />
 <ConfirmDialog
@@ -7845,9 +7963,10 @@
     // To the list, not the filter box: a text field there keeps Ctrl+Z for
     // its own undo, and the Undo toast that just appeared is what the
     // shortcut is for.
-    requestAnimationFrame(() => {
-      (selectAllDownloadsCheckbox ?? document.querySelector<HTMLInputElement>('.filter-input'))?.focus();
-    });
+    focusDownloadRowAfterDialog(
+      focusedDlId,
+      selectAllDownloadsCheckbox ?? document.querySelector<HTMLInputElement>('.filter-input'),
+    );
   }}
 />
 
@@ -8677,9 +8796,7 @@
     display: none;
   }
   .toolbar-more-menu {
-    position: absolute;
-    right: 0;
-    top: calc(100% + 4px);
+    position: fixed;
     z-index: 9999;
     min-width: 160px;
     padding: 4px;

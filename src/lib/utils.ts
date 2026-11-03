@@ -24,12 +24,27 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
- * True when the app window is actually on screen. Used to decide whether the
- * user can be considered to have *seen* something (e.g. an incoming chat
- * message) rather than merely having the relevant view mounted.
+ * True when the app window is on screen, which includes sitting behind
+ * another application. Right for "is this drawn" questions such as whether an
+ * in-app toast would repeat what the view already shows; too loose for
+ * whether the user has *seen* something — use {@link isAppFocused} for that.
  */
 export function isAppVisible(): boolean {
   return typeof document === 'undefined' || document.visibilityState === 'visible';
+}
+
+/**
+ * True when the app window is on screen *and* has focus: the test for the user
+ * having seen something (an incoming message marked read, an unread badge
+ * held back). Each window answers for its own document, so a popped-out chat
+ * window is judged by its own focus.
+ */
+export function isAppFocused(): boolean {
+  if (typeof document === 'undefined') return true;
+  return (
+    document.visibilityState === 'visible'
+    && (typeof document.hasFocus !== 'function' || document.hasFocus())
+  );
 }
 
 /** Alias for formatBytes -- used in file-size contexts. */
