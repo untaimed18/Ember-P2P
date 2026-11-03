@@ -101,8 +101,8 @@ const MAX_STAGED_SESSIONS: usize = 256;
 /// round trip after our msg2, well inside this, and queuing is the behaviour
 /// that delivers both sides' first message. Past it the handshake is not
 /// progressing, and dialling costs the attacker its hold — once our own
-/// `IkInitiator` is pending, `handle_xx_msg1` refuses further inbound msg1s from
-/// that address, so the stall cannot be renewed.
+/// dial is pending, IK or XX, `handle_xx_msg1` refuses further inbound msg1s
+/// from that address, so the stall cannot be renewed.
 const XX_RESPONDER_QUEUE_GRACE: Duration = Duration::from_secs(3);
 
 /// Outgoing payloads one address may park behind an in-progress handshake.
@@ -127,7 +127,7 @@ const MAX_XX_COOKIE_RETRIES: u8 = 2;
 ///
 /// Comfortably past the usual UDP mapping lifetime of 30 s to a few minutes, since
 /// erring long only makes the reachability rule more cautious.
-const DIAL_MEMORY: Duration = Duration::from_secs(600);
+pub(crate) const DIAL_MEMORY: Duration = Duration::from_secs(600);
 /// Cap on remembered addresses, evicting the oldest. Ten minutes of Ember dialling
 /// is far below this; it exists so the map cannot grow without bound.
 const MAX_DIALLED_ADDRS: usize = 4096;
@@ -240,26 +240,178 @@ const XX_UNVALIDATED_MSG2_BURST: u32 = 64;
 ///
 /// Far looser than the XX budget above, because this is the *primary* path —
 /// every peer that knows our static key arrives on it — where XX is the
-/// fallback taken only when the key is unknown. Sixty-four a second is orders
-/// of magnitude above real first-contact rates (a few dozen a *minute* on a
-/// busy node, mostly sessions re-forming after an idle timeout) and still
-/// bounds the flood case to a few milliseconds of CPU per second. The burst
-/// covers the one legitimate spike there is: coming online and being dialled
-/// by everyone who already held our contact.
+/// fallback taken only when the key is unknown. Sized from the work rather
+/// than from honest demand, because the demand side is the one an attacker
+/// controls: an IK responder is about 200 µs of X25519 and hashing, so 256 a
+/// second is around 5% of one core, and a bucket much smaller than the CPU
+/// can afford is one a few kilobytes a second of spoofed datagrams can keep
+/// empty. Honest first contact is orders of magnitude below it (a few dozen a
+/// *minute* on a busy node, mostly sessions re-forming after an idle
+/// timeout). The burst covers the one legitimate spike there is: coming
+/// online and being dialled by everyone who already held our contact.
 ///
 /// XX message 1 draws on the same bucket once it reaches the Noise responder,
 /// cookie or no cookie: it is the same work.
 ///
-/// Unlike the XX budget, a token is spent on every initiation we look at,
-/// including one that turns out to be malformed. That is deliberate but it is
-/// not free: the work being rationed *is* the read that decides whether the
-/// packet was genuine, so there is no point at which we know it was junk and
-/// have not already paid. The cost is that a flood of garbage can empty the
-/// bucket and leave honest first contact to retry — the usual bargain, and
-/// the better half of it, since the alternative is spending the CPU and
-/// degrading every established session along with it.
-const IK_HANDSHAKE_PER_SEC: u32 = 64;
-const IK_HANDSHAKE_BURST: u32 = 256;
+/// Every source prefix also has a bucket of its own
+/// ([`HANDSHAKE_PREFIX_PER_SEC`]), charged first, so a flood from one /24 or
+/// /48 — spoofed within it or not — is refused there and leaves this budget
+/// to everyone else.
+///
+/// The work being rationed *is* the read that decides whether the packet was
+/// genuine, so there is no point at which we know it was junk and have not
+/// already paid. What can be chosen is who pays: an initiation that fails to
+/// read is charged to [`MALFORMED_HANDSHAKE_PER_SEC`] and its token here is
+/// handed back, so junk sprayed across random prefixes spends a budget of its
+/// own instead of the one honest first contact needs. Only once that is spent
+/// too does junk come out of this bucket, which keeps the total CPU bounded.
+const IK_HANDSHAKE_PER_SEC: u32 = 256;
+const IK_HANDSHAKE_BURST: u32 = 1024;
+
+/// Sustained handshakes one source prefix (IPv4 /24, IPv6 /48) may start, and
+/// the burst above it. A prefix rather than an address because spoofing within
+/// one's own /24 is the cheap case and a per-address bucket would hand it 256
+/// of them. Eight a second is far past what the peers behind one prefix
+/// generate, and the burst covers a NAT pool whose users all come back at once.
+const HANDSHAKE_PREFIX_PER_SEC: u32 = 8;
+const HANDSHAKE_PREFIX_BURST: u32 = 32;
+
+/// Prefix buckets held at once, oldest first out. A bucket that has refilled
+/// is the same as no bucket, so losing one only ever returns a prefix to its
+/// full burst; the cap is what keeps random-prefix spoofing from growing the
+/// table.
+const MAX_HANDSHAKE_PREFIXES: usize = 4096;
+
+/// Initiations that fail to read we will absorb without charging the main
+/// handshake budget, per second, plus the burst above it. A failed IK read
+/// stops after its first Diffie-Hellman, about a fifth of a full responder,
+/// so this costs at most as much CPU as the main budget does.
+const MALFORMED_HANDSHAKE_PER_SEC: u32 = 1024;
+const MALFORMED_HANDSHAKE_BURST: u32 = 1024;
+
+/// Bytes an `IK_INIT` adds around its payload, header included.
+const IK_MSG1_OVERHEAD: usize = HEADER_LEN + IK_MSG1_MIN_BODY;
+/// Bytes an `XX_MSG3` adds around its payload: the header, the sealed static
+/// key and the payload tag.
+const XX_MSG3_OVERHEAD: usize = HEADER_LEN + (32 + 16) + 16;
+/// Bytes a transport packet adds around its payload: the header, the nonce and
+/// the tag.
+const TRANSPORT_PACKET_OVERHEAD: usize = HEADER_LEN + 8 + 16;
+
+/// A token bucket: `rate` tokens a second, holding at most `burst`.
+#[derive(Clone, Copy, Debug)]
+struct TokenBucket {
+    tokens: u32,
+    refilled_at: Instant,
+}
+
+impl TokenBucket {
+    fn full(burst: u32, now: Instant) -> Self {
+        Self {
+            tokens: burst,
+            refilled_at: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant, rate: u32, burst: u32) {
+        let elapsed_ms = now.saturating_duration_since(self.refilled_at).as_millis() as u64;
+        let earned = elapsed_ms * u64::from(rate) / 1000;
+        if earned == 0 {
+            return;
+        }
+        let refilled = u64::from(self.tokens).saturating_add(earned);
+        if refilled >= u64::from(burst) {
+            self.tokens = burst;
+            self.refilled_at = now;
+        } else {
+            self.tokens = refilled as u32;
+            // Advanced by what was earned rather than to `now`, so the part of
+            // a token still accruing carries over instead of being rounded away.
+            self.refilled_at += Duration::from_millis(earned * 1000 / u64::from(rate));
+        }
+    }
+
+    fn has_token(&mut self, now: Instant, rate: u32, burst: u32) -> bool {
+        self.refill(now, rate, burst);
+        self.tokens > 0
+    }
+
+    fn take(&mut self, now: Instant, rate: u32, burst: u32) -> bool {
+        if !self.has_token(now, rate, burst) {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+
+    fn give_back(&mut self, burst: u32) {
+        self.tokens = self.tokens.saturating_add(1).min(burst);
+    }
+
+    fn is_full(&mut self, now: Instant, rate: u32, burst: u32) -> bool {
+        self.refill(now, rate, burst);
+        self.tokens >= burst
+    }
+}
+
+/// The prefix a source's handshakes are budgeted under: its /24, or its /48.
+fn handshake_prefix(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, 0))
+        }
+        IpAddr::V6(v6) => {
+            let mut octets = [0u8; 16];
+            octets[..6].copy_from_slice(&v6.octets()[..6]);
+            IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+    }
+}
+
+/// X25519 public keys of small order, as libsodium lists them, compared with
+/// the top bit cleared since X25519 ignores it. Any of these makes every
+/// Diffie-Hellman against it a known constant.
+const LOW_ORDER_X25519: [[u8; 32]; 7] = [
+    [0; 32],
+    [
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ],
+    [
+        0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a,
+        0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00,
+    ],
+    [
+        0x5f, 0x9c, 0x95, 0xbc, 0xa3, 0x50, 0x8c, 0x24, 0xb1, 0xd0, 0xb1, 0x55, 0x9c, 0x83, 0xef, 0x5b,
+        0x04, 0x44, 0x5c, 0xc4, 0x58, 0x1c, 0x8e, 0x86, 0xd8, 0x22, 0x4e, 0xdd, 0xd0, 0x9f, 0x11, 0x57,
+    ],
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ],
+    [
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ],
+    [
+        0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ],
+];
+
+/// Whether `key` is an X25519 point of small order (all-zero included).
+///
+/// A peer holding no private key can still complete a handshake against such
+/// a key, and a Noise_IK message 1 sealed to one is readable by anyone on the
+/// path, since the `es` exchange that keys it is a constant. The responder
+/// side already refuses these through `extract_remote_static`; this is the
+/// cheap form for a key we have only been *told* about, which gossip can name
+/// by the thousand.
+pub(crate) fn noise_key_is_low_order(key: &[u8; 32]) -> bool {
+    let mut masked = *key;
+    masked[31] &= 0x7f;
+    LOW_ORDER_X25519.contains(&masked)
+}
 
 /// Largest Ember UDP datagram we will parse. Valid Noise handshake and
 /// transport packets are far smaller than this; the cap prevents an oversized
@@ -313,6 +465,13 @@ struct NoiseSession {
     /// could only derive from our handshake reply. Sessions default to
     /// `false` so a new code path has to opt in deliberately.
     addr_validated: bool,
+    /// Built by the peer's handshake when its dial crossed ours and won the
+    /// tie, at an address we had just dialled. `handle_ik_init` seals our first
+    /// message and queue into it before it is proven, so later sends follow
+    /// them there rather than dialling again: a dial's answer would replace
+    /// the session the peer is about to send on, and its frames on it would be
+    /// lost. See [`EmberTransport::outgoing_session_mut`].
+    crossing: bool,
     /// Nonce of the return-routability probe we sealed onto this session,
     /// until its `Pong` comes back. The probe is ours, not the caller's, so
     /// its answer is swallowed rather than surfaced — otherwise it looks
@@ -353,6 +512,7 @@ impl NoiseSession {
             established: now,
             ik_authenticated,
             addr_validated: false,
+            crossing: false,
             probe_nonce: None,
             send_nonce: 0,
             recv_high: 0,
@@ -372,8 +532,16 @@ impl NoiseSession {
     /// Frame + encrypt `message` as a transport packet, advancing the send
     /// nonce. Returns the wire bytes (`magic | type | nonce(8 LE) | ciphertext`)
     /// or `None` on an (unexpected) encrypt error.
+    ///
+    /// Also `None` once the nonce space is spent. A nonce must never repeat
+    /// under one key, so the counter stops at its ceiling rather than wrapping,
+    /// and the caller drops the session so the next send re-handshakes.
     fn seal(&mut self, message: &[u8]) -> Option<Vec<u8>> {
         let nonce = self.send_nonce;
+        if nonce == u64::MAX {
+            warn!("Ember transport: send nonce exhausted; the session must be re-keyed");
+            return None;
+        }
         let mut buf = vec![0u8; HEADER_LEN + 8 + message.len() + 16];
         buf[0] = EMBER_MAGIC[0];
         buf[1] = EMBER_MAGIC[1];
@@ -384,7 +552,7 @@ impl NoiseSession {
             .write_message(nonce, message, &mut buf[HEADER_LEN + 8..])
         {
             Ok(len) => {
-                self.send_nonce = self.send_nonce.wrapping_add(1);
+                self.send_nonce += 1;
                 buf.truncate(HEADER_LEN + 8 + len);
                 Some(buf)
             }
@@ -580,6 +748,22 @@ enum PendingHandshake {
     /// window would silently drop the payload.
     XxResponderMsg2 {
         state: snow::HandshakeState,
+        /// The handshake the first message 1 of this attempt started, once a
+        /// later one has replaced it in `state`. Message 3 is read against
+        /// both.
+        ///
+        /// Message 1 is unauthenticated, so a later one from this address may
+        /// be a forgery, and replacing the state outright let one spoofed
+        /// packet strand a genuine handshake whose message 3 was already on
+        /// its way. The genuine later case is also real — an initiator that
+        /// acts on a retry cookie sends a new message 1 — which is why the
+        /// newest is kept too. Keeping the first, not the one before last, is
+        /// what a stream of forgeries cannot displace.
+        ///
+        /// Reading message 3 against the wrong transcript fails at its `s`
+        /// token before anything is mixed, so a miss leaves either state as it
+        /// was (see `handle_xx_msg3`).
+        earlier: Option<Box<snow::HandshakeState>>,
         queued: Vec<QueuedPayload>,
         created: Instant,
     },
@@ -794,6 +978,13 @@ fn slots_at(
 /// QUIC rides it too when it shares the port, and every QUIC dial opens the same
 /// mapping a Noise packet would. The QUIC half writes from quinn's driver tasks
 /// once per datagram, so the lock is held only for a map update.
+///
+/// Every reader but [`EmberTransport::may_have_dialled`] treats an entry as
+/// permission — the `block_private_ips` exemption, the known-peer rate budget,
+/// session-contact admission — so only a send that *we* chose to make may
+/// write one. That rules out QUIC's answers to a stranger's Initial (a Retry,
+/// a refusal, a stateless reset), which any spoofed datagram can draw; see
+/// `udp_mux::SharedQuicSocket`.
 #[derive(Clone, Default)]
 pub struct DialLog(std::sync::Arc<parking_lot::Mutex<DialLogInner>>);
 
@@ -807,8 +998,8 @@ struct DialLogInner {
     /// holds each resident address at most once and cannot outgrow it.
     order: VecDeque<IpAddr>,
     /// Until when a dial the cap pushed out would still have been inside
-    /// [`DIAL_MEMORY`]. The QUIC half also logs replies to unvalidated
-    /// sources, so spoofed Initials can fill the log. Read only by
+    /// [`DIAL_MEMORY`]. Gossip chooses many of the addresses a search dials,
+    /// so the log can be filled from outside. Read only by
     /// [`EmberTransport::may_have_dialled`]: every other caller treats
     /// "dialled" as permission, which a flood must not be able to grant.
     saturated_until: Option<Instant>,
@@ -950,9 +1141,19 @@ pub struct EmberTransport {
     /// bucket rather than a shared one: the two ration different things — XX
     /// rations bytes we reflect, IK rations CPU we spend — and sharing would
     /// let a flood on either path close the other, which is the whole network
-    /// for a peer that only knows one of them.
-    ik_tokens: u32,
-    ik_refilled_at: Instant,
+    /// for a peer that only knows one of them. See [`IK_HANDSHAKE_PER_SEC`].
+    handshake_budget: TokenBucket,
+    /// Per-prefix shares of `handshake_budget`, and their insertion order for
+    /// capped eviction without a scan. See [`HANDSHAKE_PREFIX_PER_SEC`].
+    ///
+    /// Unlike the msg2 bucket above, this is state a spoofer allocates, which
+    /// is why it is capped and why an evicted entry costs nothing worse than
+    /// a fresh burst for that prefix.
+    prefix_budgets: HashMap<IpAddr, TokenBucket>,
+    prefix_budget_order: VecDeque<IpAddr>,
+    /// What initiations that failed to read are charged instead of
+    /// `handshake_budget`. See [`MALFORMED_HANDSHAKE_PER_SEC`].
+    malformed_budget: TokenBucket,
 }
 
 /// An application payload that arrived inside a Noise_IK message 1 from an
@@ -1052,33 +1253,65 @@ impl EmberTransport {
             cookie_rotated_at: Instant::now(),
             xx_msg2_tokens: XX_UNVALIDATED_MSG2_BURST,
             xx_msg2_refilled_at: Instant::now(),
-            ik_tokens: IK_HANDSHAKE_BURST,
-            ik_refilled_at: Instant::now(),
+            handshake_budget: TokenBucket::full(IK_HANDSHAKE_BURST, Instant::now()),
+            prefix_budgets: HashMap::new(),
+            prefix_budget_order: VecDeque::new(),
+            malformed_budget: TokenBucket::full(MALFORMED_HANDSHAKE_BURST, Instant::now()),
         }
     }
 
     /// Whether we may run the Noise responder for one fresh IK initiation or
-    /// XX message 1, charging it if so. See [`IK_HANDSHAKE_PER_SEC`].
+    /// XX message 1 from `from`, charging its prefix and the shared budget if
+    /// so. See [`IK_HANDSHAKE_PER_SEC`].
     ///
     /// Charged on take, unlike [`Self::xx_msg2_budget_available`] and its
     /// separate spend: there the token pays for a packet that may still not be
     /// sent, here it pays for the crypto we are about to do either way.
-    fn take_handshake_token(&mut self) -> bool {
+    ///
+    /// The prefix is asked first and the shared budget is only touched when it
+    /// agrees, so a prefix over its share is refused without costing anyone
+    /// else a token.
+    fn take_handshake_token(&mut self, from: SocketAddr) -> bool {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.ik_refilled_at);
-        let earned = (elapsed.as_millis() as u64 * u64::from(IK_HANDSHAKE_PER_SEC)) / 1000;
-        // Sub-token intervals leave the clock alone so the remainder carries;
-        // see `refill_xx_msg2_budget`.
-        if earned > 0 {
-            let refilled = u64::from(self.ik_tokens).saturating_add(earned);
-            self.ik_tokens = refilled.min(u64::from(IK_HANDSHAKE_BURST)) as u32;
-            self.ik_refilled_at = now;
+        let prefix = handshake_prefix(from.ip());
+        if !self.prefix_budgets.contains_key(&prefix) {
+            while self.prefix_budgets.len() >= MAX_HANDSHAKE_PREFIXES {
+                let Some(oldest) = self.prefix_budget_order.pop_front() else {
+                    break;
+                };
+                self.prefix_budgets.remove(&oldest);
+            }
+            self.prefix_budgets
+                .insert(prefix, TokenBucket::full(HANDSHAKE_PREFIX_BURST, now));
+            self.prefix_budget_order.push_back(prefix);
         }
-        if self.ik_tokens == 0 {
+        let Some(prefix_budget) = self.prefix_budgets.get_mut(&prefix) else {
+            return false;
+        };
+        if !prefix_budget.has_token(now, HANDSHAKE_PREFIX_PER_SEC, HANDSHAKE_PREFIX_BURST) {
             return false;
         }
-        self.ik_tokens -= 1;
+        if !self
+            .handshake_budget
+            .take(now, IK_HANDSHAKE_PER_SEC, IK_HANDSHAKE_BURST)
+        {
+            return false;
+        }
+        prefix_budget.tokens -= 1;
         true
+    }
+
+    /// Re-charge a handshake token spent on an initiation that failed to read:
+    /// to the malformed allowance while it lasts, handing the shared token
+    /// back. Its prefix stays charged, so junk from one prefix still runs out.
+    fn charge_malformed_handshake(&mut self) {
+        let now = Instant::now();
+        if self
+            .malformed_budget
+            .take(now, MALFORMED_HANDSHAKE_PER_SEC, MALFORMED_HANDSHAKE_BURST)
+        {
+            self.handshake_budget.give_back(IK_HANDSHAKE_BURST);
+        }
     }
 
     /// Accrue msg2 budget for the time since the last refill.
@@ -1387,8 +1620,16 @@ impl EmberTransport {
     /// count as a live path to `remote_noise_pub`. Channel relay and transfer
     /// delivery use this so they never call `prepare_outgoing` in a way that
     /// starts a handshake and then claim the frame was sent.
+    ///
+    /// Only a session whose address is proven counts. `prepare_outgoing` seals
+    /// to no other session but a crossing one (see
+    /// [`Self::outgoing_session_mut`]), which this leaves out until it is proven
+    /// too: a caller choosing between direct delivery and a relay loses nothing
+    /// by waiting one round trip.
     pub fn has_live_session(&self, addr: &SocketAddr, remote_noise_pub: &[u8; 32]) -> bool {
-        self.sessions.contains_key(&(*addr, *remote_noise_pub))
+        self.sessions
+            .get(&(*addr, *remote_noise_pub))
+            .is_some_and(|session| session.addr_validated)
     }
 
     /// Whether the one session identified by `remote_noise_pub` completed
@@ -1464,6 +1705,19 @@ impl EmberTransport {
             // What `encode_message` returns for a frame it refused to build.
             return OutgoingResult::Error("empty message".to_string());
         }
+        // The receiver drops an oversized datagram before decrypting it, so a
+        // message that cannot fit even the leanest packet would look sent and
+        // never arrive.
+        if message.len() + TRANSPORT_PACKET_OVERHEAD > MAX_EMBER_DATAGRAM_BYTES {
+            return OutgoingResult::Error(format!(
+                "message of {} bytes cannot fit one Ember datagram",
+                message.len()
+            ));
+        }
+        if remote_noise_pub.is_some_and(noise_key_is_low_order) {
+            debug!("Not dialling {peer}: its claimed Noise key is a low-order point");
+            return OutgoingResult::Error("low-order Noise static key".to_string());
+        }
         self.note_dialled(peer.ip());
 
         // Fast path: an established session for the identity we were asked to
@@ -1482,17 +1736,15 @@ impl EmberTransport {
 
         // A responder-side pending is not ours — see `XX_RESPONDER_QUEUE_GRACE`.
         // Once it has sat unfinished past the grace window, stop queuing behind
-        // it and dial the identity the caller named instead. This is the
-        // priority rule the module already applies in the other direction:
-        // `handle_xx_msg1` refuses an inbound msg1 that would clobber a
-        // handshake *we* started. Nothing better can be done for a caller that
-        // named no key, so those still queue.
-        let stalled_inbound_handshake = remote_noise_pub.is_some()
-            && matches!(
-                self.pending.get(&peer),
-                Some(PendingHandshake::XxResponderMsg2 { created, .. })
-                    if created.elapsed() >= XX_RESPONDER_QUEUE_GRACE
-            );
+        // it and dial the peer ourselves: IK to the identity the caller named,
+        // or XX for a caller that named none. This is the priority rule the
+        // module already applies in the other direction: `handle_xx_msg1`
+        // refuses an inbound msg1 that would clobber a handshake *we* started.
+        let stalled_inbound_handshake = matches!(
+            self.pending.get(&peer),
+            Some(PendingHandshake::XxResponderMsg2 { created, .. })
+                if created.elapsed() >= XX_RESPONDER_QUEUE_GRACE
+        );
         // Carried across rather than dropped. The payloads parked behind that
         // stalled handshake were accepted from callers who were told `Queued`
         // and treat it as sent, so discarding them here loses them silently —
@@ -1572,13 +1824,13 @@ impl EmberTransport {
 
         // Start new handshake
         if self.pending.len() >= MAX_PENDING {
-            self.evict_oldest_pending();
+            self.evict_one_pending();
         }
 
         if let Some(remote_pub) = remote_noise_pub {
             self.start_ik_handshake(peer, remote_pub, message, carried_from_stalled)
         } else {
-            self.start_xx_handshake(peer, message)
+            self.start_xx_handshake(peer, message, carried_from_stalled)
         }
     }
 
@@ -1611,33 +1863,38 @@ impl EmberTransport {
 
     /// The session `prepare_outgoing` should seal to.
     ///
-    /// A named static key selects only that session. No key — a ping auto-reply
-    /// that just decrypted a frame — prefers a unique session at the address,
-    /// then a validated one, then the most recently active.
+    /// A named static key selects only that session. No key selects the most
+    /// recently active session at the address.
+    ///
+    /// Either way, only a session whose address is proven. An IK responder
+    /// session is built from message 1 alone, and past the replay window a
+    /// captured `IK_INIT` builds one again, under keys the real peer never
+    /// derived. Sealing to it black-holed everything we sent the peer until
+    /// some fault was noticed, while the peer kept the session it actually had.
+    /// Passing it over makes `prepare_outgoing` dial the peer instead: a
+    /// replayer cannot answer that, the real peer can, and its answer replaces
+    /// the unproven session. In the honest case the session proves itself one
+    /// round trip after it forms, when the peer answers our probe or sends its
+    /// next frame, and sends inside that window cost an extra handshake.
+    ///
+    /// The one exception is a [`NoiseSession::crossing`] session, which our
+    /// first message has already gone into.
     fn outgoing_session_mut(
         &mut self,
         peer: SocketAddr,
         remote_noise_pub: Option<&[u8; 32]>,
     ) -> Option<&mut NoiseSession> {
+        let sendable = |session: &NoiseSession| session.addr_validated || session.crossing;
         if let Some(want) = remote_noise_pub {
-            return self.sessions.get_mut(&(peer, *want));
+            return self
+                .sessions
+                .get_mut(&(peer, *want))
+                .filter(|session| sendable(session));
         }
-        let mut unique: Option<(SocketAddr, [u8; 32])> = None;
-        let mut best: Option<((SocketAddr, [u8; 32]), bool, Instant)> = None;
-        let mut count = 0usize;
-        for (slot, session) in slots_at(&self.sessions, peer) {
-            count += 1;
-            unique = Some(*slot);
-            let rank = (session.addr_validated, session.last_activity);
-            if best.is_none_or(|(_, validated, activity)| rank > (validated, activity)) {
-                best = Some((*slot, rank.0, rank.1));
-            }
-        }
-        let slot = if count == 1 {
-            unique?
-        } else {
-            best.map(|(slot, _, _)| slot)?
-        };
+        let slot = slots_at(&self.sessions, peer)
+            .filter(|(_, session)| sendable(session))
+            .max_by_key(|(_, session)| session.last_activity)
+            .map(|(slot, _)| *slot)?;
         self.sessions.get_mut(&slot)
     }
 
@@ -1836,6 +2093,12 @@ impl EmberTransport {
         self.deferred_ik
             .retain(|_, d| now.duration_since(d.stored) < DEFERRED_IK_PAYLOAD_TTL);
         self.dialled.prune(now);
+        self.prefix_budgets.retain(|_, bucket| {
+            !bucket.is_full(now, HANDSHAKE_PREFIX_PER_SEC, HANDSHAKE_PREFIX_BURST)
+        });
+        let live_prefixes = &self.prefix_budgets;
+        self.prefix_budget_order
+            .retain(|prefix| live_prefixes.contains_key(prefix));
         // Swept alongside the map it indexes. Stale rows are harmless at pop
         // time but would otherwise accumulate for the life of the process, since
         // eviction is the only other thing that drains them and it only runs at
@@ -2091,15 +2354,28 @@ impl EmberTransport {
             Err(e) => return OutgoingResult::Error(format!("noise init: {e}")),
         };
 
-        // IK message 1 can carry a payload (our DHT request)
-        let mut buf = vec![0u8; HEADER_LEN + first_message.len() + 256];
+        // IK message 1 can carry a payload (our DHT request), but only one that
+        // still fits a datagram around the handshake's own 99 bytes. A frame
+        // sized for a transport packet does not, and sent anyway it was dropped
+        // unread by the receiver's size cap. Such a message goes behind an
+        // empty message 1 instead and leaves on the session as an ordinary
+        // transport packet, which every responder already accepts.
+        let embedded = first_message.len() + IK_MSG1_OVERHEAD <= MAX_EMBER_DATAGRAM_BYTES;
+        let payload: &[u8] = if embedded { first_message } else { &[] };
+        let mut buf = vec![0u8; HEADER_LEN + payload.len() + 256];
         buf[0] = EMBER_MAGIC[0];
         buf[1] = EMBER_MAGIC[1];
         buf[2] = PKT_IK_INIT;
-        match initiator.write_message(first_message, &mut buf[HEADER_LEN..]) {
+        match initiator.write_message(payload, &mut buf[HEADER_LEN..]) {
             Ok(len) => {
                 buf.truncate(HEADER_LEN + len);
                 let mut queued = carried;
+                if !embedded {
+                    queued.push(QueuedPayload {
+                        to: Some(*remote_pub),
+                        bytes: first_message.to_vec(),
+                    });
+                }
                 // Same ceiling the queuing path enforces, applied here because
                 // a superseded handshake's queue arrives all at once.
                 if queued.len() > MAX_QUEUED_PER_HANDSHAKE {
@@ -2110,7 +2386,7 @@ impl EmberTransport {
                     peer,
                     PendingHandshake::IkInitiator {
                         state: initiator,
-                        first_message: first_message.to_vec(),
+                        first_message: payload.to_vec(),
                         msg1: buf.clone(),
                         resends: 0,
                         crossed_resend_at: None,
@@ -2151,6 +2427,14 @@ impl EmberTransport {
         // The peer dialling us is also the moment its NAT is known to let our
         // message 1 in, which it may not have when ours first went (see
         // `MSG1_RESEND_AFTER`), so ours goes again now.
+        //
+        // Below the smallest message 1 there is nothing to read, and refusing it
+        // here keeps a runt from costing a handshake token, a replay-cache
+        // entry, or our larger message 1 on a crossed dial.
+        if data.len() < IK_MSG1_MIN_BODY {
+            debug!("Ignoring IK init from {from}: too short to be a message 1");
+            return IncomingResult::Rejected;
+        }
         let local_noise_pub = self.local_noise_pub;
         match self.pending.get_mut(&from) {
             Some(PendingHandshake::IkInitiator {
@@ -2160,10 +2444,6 @@ impl EmberTransport {
                 crossed_resends,
                 ..
             }) if local_noise_pub < *remote_noise_pub => {
-                if data.len() < IK_MSG1_MIN_BODY {
-                    debug!("Ignoring IK init from {from}: too short to be a message 1");
-                    return IncomingResult::Rejected;
-                }
                 let target = *remote_noise_pub;
                 let now = Instant::now();
                 let resend = (*crossed_resends < MSG1_CROSSED_RESENDS_MAX
@@ -2214,7 +2494,7 @@ impl EmberTransport {
         // why this one sits so far above honest traffic. A retransmit was
         // already answered from the replay cache without reaching here, so a
         // drop costs a peer one attempt, not a handshake.
-        if !self.take_handshake_token() {
+        if !self.take_handshake_token(from) {
             trace!("Dropping IK init from {from}: over the handshake budget");
             self.forget_handshake(&handshake_digest);
             return IncomingResult::Rejected;
@@ -2240,6 +2520,7 @@ impl EmberTransport {
             Ok(len) => len,
             Err(e) => {
                 debug!("IK read_message failed from {from}: {e}");
+                self.charge_malformed_handshake();
                 return IncomingResult::Rejected;
             }
         };
@@ -2324,6 +2605,7 @@ impl EmberTransport {
         let mut cached_answer = vec![resp_buf.clone()];
         let mut packets_to_send = vec![resp_buf];
         if crossed_initiator == Some(true) {
+            session.crossing = true;
             if let Some(PendingHandshake::IkInitiator { first_message, queued, .. }) =
                 self.pending.get(&from)
             {
@@ -2629,13 +2911,24 @@ impl EmberTransport {
 
     /// Only reached when the caller named no static key — that is what makes
     /// XX the right pattern — so the queued first message is addressed to
-    /// whoever answers.
-    fn start_xx_handshake(&mut self, peer: SocketAddr, first_message: &[u8]) -> OutgoingResult {
-        let first = QueuedPayload {
+    /// whoever answers. `carried` is as for [`Self::start_ik_handshake`], and
+    /// keeps the identities its payloads were addressed to.
+    fn start_xx_handshake(
+        &mut self,
+        peer: SocketAddr,
+        first_message: &[u8],
+        carried: Vec<QueuedPayload>,
+    ) -> OutgoingResult {
+        let mut queued = carried;
+        queued.push(QueuedPayload {
             to: None,
             bytes: first_message.to_vec(),
-        };
-        match self.write_xx_msg1(peer, vec![first], &[], 0) {
+        });
+        if queued.len() > MAX_QUEUED_PER_HANDSHAKE {
+            let excess = queued.len() - MAX_QUEUED_PER_HANDSHAKE;
+            queued.drain(0..excess);
+        }
+        match self.write_xx_msg1(peer, queued, &[], 0) {
             Ok(packet) => {
                 trace!("Started XX handshake with {peer}");
                 OutgoingResult::HandshakeStarted { packet }
@@ -2869,7 +3162,7 @@ impl EmberTransport {
         // is reusable for its whole lifetime, so without this a host at its
         // own address could stream fresh ephemerals at the network task
         // unmetered. Same bucket as IK, since it is the same CPU.
-        if !self.take_handshake_token() {
+        if !self.take_handshake_token(from) {
             trace!("Dropping XX msg1 from {from}: over the handshake budget");
             self.forget_handshake(&handshake_digest);
             return IncomingResult::Rejected;
@@ -2909,8 +3202,8 @@ impl EmberTransport {
         };
         resp_buf.truncate(HEADER_LEN + resp_len);
 
-        if self.pending.len() >= MAX_PENDING {
-            self.evict_oldest_pending();
+        if self.pending.len() >= MAX_PENDING && !self.pending.contains_key(&from) {
+            self.evict_one_pending();
         }
         // Carry the age and the queued payloads of the attempt this replaces.
         //
@@ -2928,15 +3221,22 @@ impl EmberTransport {
         //
         // Measuring from the oldest unfinished attempt instead means a genuine
         // retransmit still refreshes the crypto state while the clock — and the
-        // queue — survive.
-        let (created, queued) = match self.pending.remove(&from) {
-            Some(PendingHandshake::XxResponderMsg2 { created, queued, .. }) => (created, queued),
-            _ => (Instant::now(), Vec::new()),
+        // queue — survive. The first attempt's state survives too; see
+        // `PendingHandshake::XxResponderMsg2::earlier`.
+        let (created, queued, earlier) = match self.pending.remove(&from) {
+            Some(PendingHandshake::XxResponderMsg2 {
+                state,
+                earlier,
+                created,
+                queued,
+            }) => (created, queued, Some(earlier.unwrap_or_else(|| Box::new(state)))),
+            _ => (Instant::now(), Vec::new(), None),
         };
         self.pending.insert(
             from,
             PendingHandshake::XxResponderMsg2 {
                 state: responder,
+                earlier,
                 queued,
                 created,
             },
@@ -3049,8 +3349,13 @@ impl EmberTransport {
         let deliverable = retain_addressed_to(queued, &remote_noise_pub);
 
         // Write message 3 (includes initiator's static key + first deliverable
-        // queued message as payload)
-        let payload = deliverable.first().map(|v| v.as_slice()).unwrap_or(&[]);
+        // queued message as payload). A first message too large to fit beside
+        // the handshake goes as a transport packet with the rest, behind an
+        // empty message 3, for the reason given in `start_ik_handshake`.
+        let embedded = deliverable
+            .first()
+            .is_some_and(|first| first.len() + XX_MSG3_OVERHEAD <= MAX_EMBER_DATAGRAM_BYTES);
+        let payload = if embedded { deliverable[0].as_slice() } else { &[] };
         let mut resp_buf = vec![0u8; HEADER_LEN + payload.len() + 256];
         resp_buf[0] = EMBER_MAGIC[0];
         resp_buf[1] = EMBER_MAGIC[1];
@@ -3078,9 +3383,9 @@ impl EmberTransport {
         // proven (see `handle_ik_resp`).
         let mut session = NoiseSession::new(transport, remote_noise_pub, false).validated();
 
-        // Send remaining queued messages (skip first, it was in msg3 payload)
+        // Send remaining queued messages (skipping the first if it rode in msg3)
         let mut packets = vec![resp_buf];
-        for msg in deliverable.iter().skip(1) {
+        for msg in deliverable.iter().skip(usize::from(embedded)) {
             if let Some(pkt) = session.seal(msg) {
                 packets.push(pkt);
             }
@@ -3116,15 +3421,25 @@ impl EmberTransport {
         // too), and an attacker holding that position can strand us just by
         // dropping msg3. Closing it means snapshotting the responder state
         // around the read, which costs a clone on every inbound msg3.
+        //
+        // The same property is what makes the second read below safe: a genuine
+        // msg3 read against the other transcript fails at its `s` block, before
+        // anything is mixed, so whichever state it belongs to is still intact.
         let mut payload_buf = vec![0u8; data.len()];
-        let payload_len = match self.pending.get_mut(&from) {
-            Some(PendingHandshake::XxResponderMsg2 { state, .. }) => {
+        let (payload_len, read_by_earlier) = match self.pending.get_mut(&from) {
+            Some(PendingHandshake::XxResponderMsg2 { state, earlier, .. }) => {
                 match state.read_message(data, &mut payload_buf) {
-                    Ok(len) => len,
-                    Err(e) => {
-                        debug!("XX msg3 read failed from {from}: {e}");
-                        return IncomingResult::Rejected;
-                    }
+                    Ok(len) => (len, false),
+                    Err(e) => match earlier
+                        .as_mut()
+                        .map(|earlier| earlier.read_message(data, &mut payload_buf))
+                    {
+                        Some(Ok(len)) => (len, true),
+                        _ => {
+                            debug!("XX msg3 read failed from {from}: {e}");
+                            return IncomingResult::Rejected;
+                        }
+                    },
                 }
             }
             Some(_) => {
@@ -3137,11 +3452,19 @@ impl EmberTransport {
             }
         };
 
-        let Some(PendingHandshake::XxResponderMsg2 { state, queued, .. }) =
-            self.pending.remove(&from)
+        let Some(PendingHandshake::XxResponderMsg2 {
+            state,
+            earlier,
+            queued,
+            ..
+        }) = self.pending.remove(&from)
         else {
             debug!("XX msg3 from {from}: pending handshake changed shape mid-dispatch");
             return IncomingResult::Rejected;
+        };
+        let state = match (read_by_earlier, earlier) {
+            (true, Some(earlier)) => *earlier,
+            _ => state,
         };
 
         let remote_noise_pub = match extract_remote_static(&state, &self.local_noise_key) {
@@ -3349,18 +3672,37 @@ impl EmberTransport {
         }
     }
 
-    fn evict_oldest_pending(&mut self) {
-        if let Some(oldest) = self
+    /// Free one pending slot when the table is full.
+    ///
+    /// A responder-side entry goes first, newest first, on the rule
+    /// [`Self::evict_one_session`] applies: it was created by an
+    /// unauthenticated message 1 that anyone can forge from any address, while
+    /// our own dials carry payloads callers were told are queued. Shedding the
+    /// newest lets a flood of forged msg1s cannibalise itself rather than the
+    /// older handshakes, genuine ones among them, that were already waiting.
+    /// Only when no responder entry is left does our oldest dial go.
+    fn evict_one_pending(&mut self) {
+        let newest_responder = self
             .pending
             .iter()
-            .min_by_key(|(_, p)| match p {
-                PendingHandshake::IkInitiator { created, .. } => *created,
-                PendingHandshake::XxInitiatorMsg1 { created, .. } => *created,
-                PendingHandshake::XxResponderMsg2 { created, .. } => *created,
+            .filter_map(|(addr, p)| match p {
+                PendingHandshake::XxResponderMsg2 { created, .. } => Some((addr, *created)),
+                _ => None,
             })
-            .map(|(k, _)| *k)
-        {
-            self.pending.remove(&oldest);
+            .max_by_key(|(_, created)| *created)
+            .map(|(addr, _)| *addr);
+        let victim = newest_responder.or_else(|| {
+            self.pending
+                .iter()
+                .min_by_key(|(_, p)| match p {
+                    PendingHandshake::IkInitiator { created, .. } => *created,
+                    PendingHandshake::XxInitiatorMsg1 { created, .. } => *created,
+                    PendingHandshake::XxResponderMsg2 { created, .. } => *created,
+                })
+                .map(|(k, _)| *k)
+        });
+        if let Some(victim) = victim {
+            self.pending.remove(&victim);
         }
     }
 }
@@ -3480,9 +3822,9 @@ mod tests {
 
     use super::*;
 
-    /// The QUIC half logs replies to sources nobody validated, so a flood of
-    /// spoofed Initials can push real dials out of the log. A real dial it can
-    /// no longer vouch for must not turn into an unsolicited witness.
+    /// Gossip chooses many of the addresses a search dials, so a flood of them
+    /// can push real dials out of the log. A real dial it can no longer vouch
+    /// for must not turn into an unsolicited witness.
     #[test]
     fn a_dial_log_that_had_to_forget_a_live_dial_treats_everyone_as_dialled() {
         let log = DialLog::default();
@@ -3854,12 +4196,12 @@ mod tests {
         let _ = low.process_incoming(&answer[0], high_addr);
         assert!(!low.pending.contains_key(&high_addr), "the lower key's dial completed");
 
-        let tokens = low.ik_tokens;
+        let tokens = low.handshake_budget.tokens;
         assert!(
             matches!(low.process_incoming(&high_init, high_addr), IncomingResult::Rejected),
             "the late resend is not run as a handshake"
         );
-        assert_eq!(low.ik_tokens, tokens, "and costs no handshake token");
+        assert_eq!(low.handshake_budget.tokens, tokens, "and costs no handshake token");
         assert!(low.staged_sessions.is_empty());
         assert!(low.deferred_ik.is_empty());
     }
@@ -4139,6 +4481,7 @@ mod tests {
             }
             _ => panic!("expected HandshakeComplete"),
         };
+        let generation = bob.sessions[&(alice_addr, alice_pub)].generation;
 
         match bob.process_incoming(&init, alice_addr) {
             IncomingResult::HandshakeResponse { packets, .. } => {
@@ -4150,15 +4493,13 @@ mod tests {
             _ => panic!("expected the cached answer to be re-sent"),
         }
 
-        // The session Bob established on the first copy is untouched, so he
-        // can still encrypt to Alice on the fast path.
-        assert!(
-            matches!(
-                bob.prepare_outgoing(alice_addr, Some(&alice_pub), b"after"),
-                OutgoingResult::Ready { .. }
-            ),
+        // The session Bob established on the first copy is untouched.
+        assert_eq!(
+            bob.sessions.get(&(alice_addr, alice_pub)).map(|s| s.generation),
+            Some(generation),
             "the replay must not have disturbed the live session"
         );
+        assert!(bob.staged_sessions.is_empty());
     }
 
     #[test]
@@ -4637,7 +4978,10 @@ mod tests {
         // initiations: that loop takes long enough to earn tokens back while
         // it runs, so where it landed would be a matter of how fast the
         // machine is.
-        while bob.take_handshake_token() {}
+        bob.handshake_budget = TokenBucket {
+            tokens: 0,
+            refilled_at: Instant::now(),
+        };
 
         assert!(
             matches!(
@@ -5026,15 +5370,19 @@ mod tests {
         };
         // A cookie waives the reflection budget, not the CPU one: with the
         // handshake bucket empty, even a proven msg1 is refused.
-        let (tokens, refilled) = (bob.ik_tokens, bob.ik_refilled_at);
-        bob.ik_tokens = 0;
-        bob.ik_refilled_at = Instant::now();
+        let held = bob.handshake_budget;
+        bob.handshake_budget = TokenBucket {
+            tokens: 0,
+            refilled_at: Instant::now(),
+        };
         assert!(matches!(
             bob.process_incoming(&proven, alice_addr),
             IncomingResult::Rejected
         ));
-        bob.ik_tokens = tokens.max(1);
-        bob.ik_refilled_at = refilled;
+        bob.handshake_budget = TokenBucket {
+            tokens: held.tokens.max(1),
+            ..held
+        };
         let msg2 = match bob.process_incoming(&proven, alice_addr) {
             IncomingResult::HandshakeResponse { packets, .. } => {
                 let packet = packets.into_iter().next().expect("msg2");
@@ -5407,10 +5755,10 @@ mod tests {
             IncomingResult::HandshakeComplete { .. }
         ));
 
-        assert!(matches!(
-            bob.prepare_outgoing(alice_addr, Some(&mallory_pub), b"for mallory"),
-            OutgoingResult::Ready { .. }
-        ));
+        assert!(
+            !bob.has_live_session(&alice_addr, &mallory_pub),
+            "an unproven session is not a live path even to its own identity"
+        );
         assert!(
             matches!(
                 bob.prepare_outgoing(alice_addr, Some(&alice_pub), b"for alice"),
@@ -6370,6 +6718,501 @@ mod tests {
             EMBER_MAGIC[1],
             0x10,
         ]));
+    }
+
+    /// An `IK_INIT` of random bytes, long enough to reach the Noise read and
+    /// fail it there.
+    fn junk_ik_init() -> Vec<u8> {
+        let mut packet = vec![EMBER_MAGIC[0], EMBER_MAGIC[1], PKT_IK_INIT];
+        let mut body = vec![0u8; IK_MSG1_MIN_BODY + 40];
+        OsRng.fill_bytes(&mut body);
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    /// A bucket that cannot refill during the test: its clock is in the future.
+    fn frozen_bucket(tokens: u32) -> TokenBucket {
+        TokenBucket {
+            tokens,
+            refilled_at: Instant::now() + Duration::from_secs(3600),
+        }
+    }
+
+    #[test]
+    fn a_token_bucket_carries_the_part_of_a_token_it_has_not_earned_yet() {
+        let start = Instant::now();
+        let mut bucket = TokenBucket {
+            tokens: 0,
+            refilled_at: start,
+        };
+        bucket.refill(start + Duration::from_millis(200), 8, 32);
+        assert_eq!(bucket.tokens, 1);
+        assert_eq!(bucket.refilled_at, start + Duration::from_millis(125));
+        bucket.refill(start + Duration::from_millis(250), 8, 32);
+        assert_eq!(bucket.tokens, 2, "the 75 ms left over counted toward the next token");
+        bucket.refill(start + Duration::from_secs(60), 8, 32);
+        assert_eq!(bucket.tokens, 32, "and it stops at its burst");
+    }
+
+    #[test]
+    fn handshakes_are_budgeted_per_24_and_per_48() {
+        let prefix = |ip: &str| handshake_prefix(ip.parse().unwrap());
+        assert_eq!(prefix("203.0.113.77"), prefix("203.0.113.1"));
+        assert_ne!(prefix("203.0.113.77"), prefix("203.0.114.77"));
+        assert_eq!(prefix("::ffff:203.0.113.77"), prefix("203.0.113.9"));
+        assert_eq!(prefix("2001:db8:1:ffff::1"), prefix("2001:db8:1::2"));
+        assert_ne!(prefix("2001:db8:1::1"), prefix("2001:db8:2::1"));
+    }
+
+    /// One prefix flooding valid initiations is refused at its own share, so
+    /// it spends no more of the shared budget than that share, and a first
+    /// contact from anywhere else completes.
+    #[test]
+    fn a_flood_from_one_prefix_leaves_the_handshake_budget_to_everyone_else() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        bob.handshake_budget = frozen_bucket(IK_HANDSHAKE_BURST);
+        let flooded = handshake_prefix("1.2.3.0".parse().unwrap());
+        bob.prefix_budgets
+            .insert(flooded, frozen_bucket(HANDSHAKE_PREFIX_BURST));
+        bob.prefix_budget_order.push_back(flooded);
+
+        let (flood_priv, flood_pub) = make_keypair();
+        let mut flooder = EmberTransport::new(flood_priv, flood_pub);
+        let sent = HANDSHAKE_PREFIX_BURST as u16 * 2;
+        let mut answered = 0u32;
+        for i in 0..sent {
+            // A dial per address, so every message 1 is distinct.
+            let target: SocketAddr = format!("5.6.7.8:{}", 3000 + i).parse().unwrap();
+            let init = match flooder.prepare_outgoing(target, Some(&bob_pub), b"flood") {
+                OutgoingResult::HandshakeStarted { packet } => packet,
+                other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+            };
+            let from: SocketAddr = format!("1.2.3.{}:{}", i % 250 + 1, 1000 + i).parse().unwrap();
+            if !matches!(bob.process_incoming(&init, from), IncomingResult::Rejected) {
+                answered += 1;
+            }
+        }
+        assert_eq!(answered, HANDSHAKE_PREFIX_BURST, "the prefix gets its share and no more");
+        assert_eq!(
+            bob.handshake_budget.tokens,
+            IK_HANDSHAKE_BURST - HANDSHAKE_PREFIX_BURST,
+            "refusals at the prefix cost the shared budget nothing"
+        );
+
+        let (alice_priv, alice_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let init = match alice.prepare_outgoing("5.6.7.8:2000".parse().unwrap(), Some(&bob_pub), b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        assert!(matches!(
+            bob.process_incoming(&init, "9.9.9.9:1000".parse().unwrap()),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+    }
+
+    /// Junk sprayed from a different prefix every packet gets past every
+    /// prefix share, but fails to read, and is charged to the malformed
+    /// allowance: the shared budget is untouched, so a genuine first contact
+    /// still finds a token even when only a handful were left.
+    #[test]
+    fn junk_across_random_prefixes_does_not_spend_the_handshake_budget() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        bob.handshake_budget = frozen_bucket(1);
+        for i in 0..200u32 {
+            let from = SocketAddr::from(([10, (i >> 8) as u8, i as u8, 7], 4000));
+            assert!(matches!(bob.process_incoming(&junk_ik_init(), from), IncomingResult::Rejected));
+        }
+        assert_eq!(bob.handshake_budget.tokens, 1, "every junk token was handed back");
+
+        let (alice_priv, alice_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let init = match alice.prepare_outgoing("5.6.7.8:2000".parse().unwrap(), Some(&bob_pub), b"hi") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        assert!(matches!(
+            bob.process_incoming(&init, "9.9.9.9:1000".parse().unwrap()),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+    }
+
+    /// The malformed allowance is what keeps junk's CPU bounded, so once it is
+    /// spent junk comes out of the shared budget like anything else.
+    #[test]
+    fn junk_past_the_malformed_allowance_is_charged_to_the_handshake_budget() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        bob.handshake_budget = frozen_bucket(5);
+        bob.malformed_budget = frozen_bucket(1);
+        let _ = bob.process_incoming(&junk_ik_init(), "10.0.1.7:4000".parse().unwrap());
+        assert_eq!((bob.handshake_budget.tokens, bob.malformed_budget.tokens), (5, 0));
+        let _ = bob.process_incoming(&junk_ik_init(), "10.0.2.7:4000".parse().unwrap());
+        assert_eq!(bob.handshake_budget.tokens, 4);
+    }
+
+    /// Below the smallest message 1 there is nothing to read, so a runt costs
+    /// no token, no replay-cache entry and no prefix bucket.
+    #[test]
+    fn a_runt_ik_init_costs_nothing() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        bob.handshake_budget = frozen_bucket(5);
+        let mut runt = junk_ik_init();
+        runt.truncate(HEADER_LEN + IK_MSG1_MIN_BODY - 1);
+        assert!(matches!(
+            bob.process_incoming(&runt, "1.2.3.4:1000".parse().unwrap()),
+            IncomingResult::Rejected
+        ));
+        assert_eq!(bob.handshake_budget.tokens, 5);
+        assert!(bob.recent_handshakes.is_empty());
+        assert!(bob.prefix_budgets.is_empty());
+    }
+
+    #[test]
+    fn the_prefix_table_is_bounded() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        for i in 0..(MAX_HANDSHAKE_PREFIXES as u32 + 10) {
+            let _ = bob.take_handshake_token(SocketAddr::from(([10, (i >> 8) as u8, i as u8, 1], 4000)));
+        }
+        assert_eq!(bob.prefix_budgets.len(), MAX_HANDSHAKE_PREFIXES);
+        assert_eq!(bob.prefix_budget_order.len(), MAX_HANDSHAKE_PREFIXES);
+        bob.cleanup();
+        assert!(bob.prefix_budget_order.len() == bob.prefix_budgets.len());
+    }
+
+    /// A session built from message 1 alone is not sent into and not reported
+    /// live: sending to the peer dials it instead. Once the peer answers our
+    /// probe the session is proven, and both change.
+    #[test]
+    fn an_unproven_responder_session_is_not_sent_into() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"request") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let handshake = bob.dispatch_incoming(&init, alice_addr);
+        assert!(bob.sessions.contains_key(&(alice_addr, alice_pub)));
+        assert!(!bob.has_live_session(&alice_addr, &alice_pub));
+        assert!(matches!(
+            bob.prepare_outgoing(alice_addr, Some(&alice_pub), b"early"),
+            OutgoingResult::HandshakeStarted { .. }
+        ));
+
+        for packet in &handshake.responses {
+            for answer in alice.dispatch_incoming(packet, bob_addr).responses {
+                let _ = bob.dispatch_incoming(&answer, alice_addr);
+            }
+        }
+        assert!(bob.has_live_session(&alice_addr, &alice_pub));
+        assert!(matches!(
+            bob.prepare_outgoing(alice_addr, Some(&alice_pub), b"later"),
+            OutgoingResult::Ready { .. }
+        ));
+    }
+
+    /// A captured `IK_INIT` replayed once its sender's dial is long gone builds
+    /// a session the real peer never shares. Our next send dials the peer
+    /// rather than sealing into it, the peer answers, and its session replaces
+    /// the replayed one: the payload arrives instead of vanishing.
+    #[test]
+    fn a_replayed_ik_init_does_not_black_hole_what_we_send_the_peer() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let captured = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"old request") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        alice.pending.clear();
+        let _ = bob.dispatch_incoming(&captured, alice_addr);
+        let replayed = bob.sessions[&(alice_addr, alice_pub)].generation;
+
+        let dial = match bob.prepare_outgoing(alice_addr, Some(&alice_pub), b"for alice") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected Bob to dial Alice, got {}", variant_name(&other)),
+        };
+        let mut delivered = Vec::new();
+        for packet in alice.dispatch_incoming(&dial, bob_addr).responses {
+            for answer in bob.dispatch_incoming(&packet, alice_addr).responses {
+                delivered.extend(alice.dispatch_incoming(&answer, bob_addr).app_payloads);
+            }
+        }
+        assert_eq!(delivered, vec![b"for alice".to_vec()]);
+        assert!(bob.has_live_session(&alice_addr, &alice_pub));
+        assert_ne!(bob.sessions[&(alice_addr, alice_pub)].generation, replayed);
+    }
+
+    /// A forged message 1 from the initiator's address, arriving between our
+    /// message 2 and its message 3, does not strand the genuine handshake.
+    #[test]
+    fn a_spoofed_xx_msg1_does_not_strand_an_inbound_handshake() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let (mallory_priv, mallory_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let mut mallory = EmberTransport::new(mallory_priv, mallory_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let msg1 = match alice.prepare_outgoing(bob_addr, None, b"genuine") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let msg2 = match bob.process_incoming(&msg1, alice_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => packets.into_iter().next().unwrap(),
+            other => panic!("expected msg2, got {}", incoming_variant_name(&other)),
+        };
+        for forged in distinct_xx_msg1s(&mut mallory, 2) {
+            assert!(matches!(
+                bob.process_incoming(&forged, alice_addr),
+                IncomingResult::HandshakeResponse { .. }
+            ));
+        }
+        let msg3 = match alice.process_incoming(&msg2, bob_addr) {
+            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            other => panic!("expected msg3, got {}", incoming_variant_name(&other)),
+        };
+        match bob.process_incoming(&msg3[0], alice_addr) {
+            IncomingResult::HandshakeComplete {
+                remote_noise_pub,
+                decrypted_payload,
+                ..
+            } => {
+                assert_eq!(remote_noise_pub, alice_pub);
+                assert_eq!(decrypted_payload.as_deref(), Some(b"genuine".as_slice()));
+            }
+            other => panic!("the genuine msg3 must complete, got {}", incoming_variant_name(&other)),
+        }
+    }
+
+    /// A full pending table sheds the handshakes a forged message 1 can
+    /// create, newest first, before any dial of ours.
+    #[test]
+    fn pending_eviction_sheds_inbound_handshakes_before_our_dials() {
+        let (bob_priv, bob_pub) = make_keypair();
+        let (peer_priv, peer_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let mut mallory = EmberTransport::new(peer_priv, peer_pub);
+        let dial: SocketAddr = "7.7.7.7:7000".parse().unwrap();
+        let older: SocketAddr = "1.1.1.1:1000".parse().unwrap();
+        let newer: SocketAddr = "2.2.2.2:2000".parse().unwrap();
+
+        assert!(matches!(
+            bob.prepare_outgoing(dial, Some(&peer_pub), b"ours"),
+            OutgoingResult::HandshakeStarted { .. }
+        ));
+        let forged = distinct_xx_msg1s(&mut mallory, 2);
+        let _ = bob.process_incoming(&forged[0], older);
+        let _ = bob.process_incoming(&forged[1], newer);
+        if let Some(PendingHandshake::XxResponderMsg2 { created, .. }) = bob.pending.get_mut(&older) {
+            *created -= Duration::from_millis(50);
+        }
+        if let Some(PendingHandshake::IkInitiator { created, .. }) = bob.pending.get_mut(&dial) {
+            *created -= Duration::from_millis(100);
+        }
+
+        bob.evict_one_pending();
+        assert!(!bob.pending.contains_key(&newer), "the newest inbound handshake goes first");
+        bob.evict_one_pending();
+        assert!(!bob.pending.contains_key(&older));
+        assert!(bob.pending.contains_key(&dial), "our dial outlives every inbound handshake");
+        bob.evict_one_pending();
+        assert!(bob.pending.is_empty());
+    }
+
+    /// A caller that names no key no longer queues forever behind an inbound
+    /// handshake that has stalled past the grace window: it dials XX itself,
+    /// carrying what was queued, and both payloads reach the peer.
+    #[test]
+    fn an_unkeyed_caller_dials_past_a_stalled_inbound_handshake() {
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let (mallory_priv, mallory_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let mut mallory = EmberTransport::new(mallory_priv, mallory_pub);
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let forged = distinct_xx_msg1s(&mut mallory, 1).remove(0);
+        let _ = bob.process_incoming(&forged, alice_addr);
+        assert!(matches!(
+            bob.prepare_outgoing(alice_addr, None, b"first"),
+            OutgoingResult::Queued
+        ));
+        if let Some(PendingHandshake::XxResponderMsg2 { created, .. }) = bob.pending.get_mut(&alice_addr) {
+            *created -= XX_RESPONDER_QUEUE_GRACE;
+        }
+        let msg1 = match bob.prepare_outgoing(alice_addr, None, b"second") {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected Bob's own XX dial, got {}", variant_name(&other)),
+        };
+        assert_eq!(msg1[2], PKT_XX_MSG1);
+
+        let msg2 = match alice.process_incoming(&msg1, bob_addr) {
+            IncomingResult::HandshakeResponse { packets, .. } => packets.into_iter().next().unwrap(),
+            other => panic!("expected msg2, got {}", incoming_variant_name(&other)),
+        };
+        let packets = match bob.process_incoming(&msg2, alice_addr) {
+            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
+            other => panic!("expected msg3, got {}", incoming_variant_name(&other)),
+        };
+        let mut delivered = Vec::new();
+        for packet in &packets {
+            match alice.process_incoming(packet, bob_addr) {
+                IncomingResult::HandshakeComplete { decrypted_payload, .. } => {
+                    delivered.extend(decrypted_payload)
+                }
+                IncomingResult::Message { payload, .. } => delivered.push(payload),
+                other => panic!("unexpected {}", incoming_variant_name(&other)),
+            }
+        }
+        assert_eq!(delivered, vec![b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    /// Every key on the list makes X25519 non-contributory, with the ignored
+    /// top bit set or not, and ordinary keys are not on it.
+    #[test]
+    fn low_order_noise_keys_are_recognised_and_never_dialled() {
+        let ours = x25519_dalek::StaticSecret::from(make_keypair().0);
+        for key in LOW_ORDER_X25519 {
+            let mut high = key;
+            high[31] |= 0x80;
+            for candidate in [key, high] {
+                assert!(noise_key_is_low_order(&candidate), "{candidate:02x?}");
+                assert!(
+                    !ours
+                        .diffie_hellman(&x25519_dalek::PublicKey::from(candidate))
+                        .was_contributory(),
+                    "{candidate:02x?} is not actually low-order"
+                );
+            }
+        }
+        for _ in 0..64 {
+            assert!(!noise_key_is_low_order(&make_keypair().1));
+        }
+
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let peer: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        assert!(matches!(
+            bob.prepare_outgoing(peer, Some(&[0; 32]), b"hi"),
+            OutgoingResult::Error(_)
+        ));
+        assert!(bob.pending.is_empty());
+        assert!(!bob.recently_dialled(peer.ip()));
+    }
+
+    /// A first message sized for a transport packet cannot also carry a
+    /// handshake's overhead. It goes behind an empty message 1 (or 3) and
+    /// arrives as a transport packet, and no datagram exceeds the cap.
+    #[test]
+    fn a_full_size_first_message_still_arrives_over_ik_and_xx() {
+        let big = vec![0x42u8; MAX_EMBER_DATAGRAM_BYTES - TRANSPORT_PACKET_OVERHEAD];
+        let alice_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let bob_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let init = match alice.prepare_outgoing(bob_addr, Some(&bob_pub), &big) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        assert!(init.len() <= MAX_EMBER_DATAGRAM_BYTES);
+        let mut delivered = Vec::new();
+        for packet in bob.dispatch_incoming(&init, alice_addr).responses {
+            for flushed in alice.dispatch_incoming(&packet, bob_addr).responses {
+                assert!(flushed.len() <= MAX_EMBER_DATAGRAM_BYTES);
+                delivered.extend(bob.dispatch_incoming(&flushed, alice_addr).app_payloads);
+            }
+        }
+        assert_eq!(delivered, vec![big.clone()], "over IK");
+
+        let (alice_priv, alice_pub) = make_keypair();
+        let (bob_priv, bob_pub) = make_keypair();
+        let mut alice = EmberTransport::new(alice_priv, alice_pub);
+        let mut bob = EmberTransport::new(bob_priv, bob_pub);
+        let msg1 = match alice.prepare_outgoing(bob_addr, None, &big) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        let mut delivered = Vec::new();
+        for msg2 in bob.dispatch_incoming(&msg1, alice_addr).responses {
+            for packet in alice.dispatch_incoming(&msg2, bob_addr).responses {
+                assert!(packet.len() <= MAX_EMBER_DATAGRAM_BYTES);
+                delivered.extend(bob.dispatch_incoming(&packet, alice_addr).app_payloads);
+            }
+        }
+        assert_eq!(delivered, vec![big], "over XX");
+
+        assert!(matches!(
+            alice.prepare_outgoing(
+                bob_addr,
+                Some(&bob_pub),
+                &vec![0x42; MAX_EMBER_DATAGRAM_BYTES - TRANSPORT_PACKET_OVERHEAD + 1]
+            ),
+            OutgoingResult::Error(_)
+        ));
+    }
+
+    /// The send nonce stops at its ceiling: the session is dropped and the
+    /// next send re-handshakes, so no nonce is ever used twice under one key.
+    #[test]
+    fn an_exhausted_send_nonce_tears_the_session_down() {
+        let (mut alice, _bob, _alice_addr, bob_addr) = established_pair();
+        let slot = *alice.sessions.keys().next().unwrap();
+        let bob_pub = slot.1;
+        alice.sessions.get_mut(&slot).unwrap().send_nonce = u64::MAX - 1;
+        assert!(matches!(
+            alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"last"),
+            OutgoingResult::Ready { .. }
+        ));
+        assert!(matches!(
+            alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"one too many"),
+            OutgoingResult::Error(_)
+        ));
+        assert!(!alice.sessions.contains_key(&slot));
+        assert!(matches!(
+            alice.prepare_outgoing(bob_addr, Some(&bob_pub), b"fresh"),
+            OutgoingResult::HandshakeStarted { .. }
+        ));
+    }
+
+    /// The higher key of a crossed dial answers the peer's handshake and seals
+    /// its own first message into the session that produced. Its next send
+    /// follows it there rather than dialling again, which would replace the
+    /// session the peer is about to send on; the session still is not reported
+    /// live before it is proven.
+    #[test]
+    fn a_crossed_dials_session_is_sent_into_before_it_is_proven() {
+        let (_low, mut high, low_init, _high_init, low_addr, _high_addr) = crossed_ik_dials();
+        assert!(matches!(
+            high.process_incoming(&low_init, low_addr),
+            IncomingResult::HandshakeComplete { .. }
+        ));
+        let (_, low_pub) = *high.sessions.keys().next().unwrap();
+        assert!(!high.has_live_session(&low_addr, &low_pub));
+        assert!(matches!(
+            high.prepare_outgoing(low_addr, Some(&low_pub), b"more"),
+            OutgoingResult::Ready { .. }
+        ));
     }
 
     fn variant_name(r: &OutgoingResult) -> &'static str {

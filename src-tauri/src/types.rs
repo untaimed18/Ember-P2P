@@ -1116,8 +1116,11 @@ pub struct EmberDiagnostics {
     /// Slice 14: inbound STORE frames rejected as short-window signature replays.
     #[serde(default)]
     pub ember_dht_store_replays: u32,
-    /// Slice 15: true when we are LowID/firewalled but still self-publishing
-    /// Ember DHT source records (UDP Noise path is usable).
+    /// Slice 15: true when our TCP port is firewalled (LowID, or KAD, the
+    /// server or the outside-in probe found it closed) and Ember DHT source
+    /// records go out naming an endorsed buddy that relays callbacks. A closed
+    /// UDP port alone does not set it: with TCP open the records carry our own
+    /// address.
     #[serde(default)]
     pub ember_dht_firewalled_publishing: bool,
     /// True when firewalled with no HighID buddy yet — source STORE is skipped.
@@ -1138,6 +1141,13 @@ pub struct EmberDiagnostics {
     /// PROXY_STORE requests we accepted and fanned out as a HighID buddy.
     #[serde(default)]
     pub ember_dht_buddy_forwards: u32,
+    /// Storers that took a record we fanned out as someone's buddy. Kept
+    /// apart from `ember_dht_stores_acked`, which is about our own records.
+    #[serde(default)]
+    pub ember_dht_buddy_forward_stores_acked: u32,
+    /// Storers that refused or never answered one of those records.
+    #[serde(default)]
+    pub ember_dht_buddy_forward_stores_failed: u32,
     /// Firewalled Ember users we are relaying for right now: publishers whose
     /// PROXY_STORE we accepted within the callback window, whose searchers'
     /// callback requests we still pass on. Live, not a session total.

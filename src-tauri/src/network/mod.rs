@@ -1194,6 +1194,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_dht_maint_pings: HashMap::new(),
         ember_source_publish_at: HashMap::new(),
         ember_named_source_buddy: None,
+        ember_records_buddy: None,
         ember_source_publish_unix: HashMap::new(),
         ember_keyword_publish_at: HashMap::new(),
         ember_keyword_publish_unix: HashMap::new(),

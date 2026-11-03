@@ -664,7 +664,17 @@ the `CHANNEL_KIND_*` constants). Per kind:
 | 8 | `CHANNEL_KIND_SETTINGS` | channel key | publisher is the channel key; key is `settings_key`; within `MAX_STORE_RECORD_BYTES`; `settings_fields` | `CHANNEL_GOVERNANCE_TTL`, 30 days |
 
 `record_ttl` falls back to `KEYWORD_RECORD_TTL` (24 hours) for any other kind,
-but `channel_store_ok` refuses those first. The `extra` each kind carries:
+but `channel_store_ok` refuses those first.
+
+The 16 room-index shard keys hold room listings (kind 1) and nothing else,
+off the wire and when stored records are restored. A full shard drops a listing
+for a newer one only once the old listing has gone 13 hours unsigned: two of its
+owner's 6-hour re-signs plus the skew tolerance. A key holding records only its
+owner can make (kinds 3, 4, 5, 7, 8, and feed heads) serves them ahead of
+records filed there freely, and when full, drops a freely filed record to take
+one of them (see `docs/ember-dht.md`, "Keys are not all bound alike").
+
+The `extra` each kind carries:
 
 - **1, index.** Empty. The room name is the record name; flag
   `CHANNEL_FLAG_PRIVATE` (`0x01`).
@@ -1529,12 +1539,14 @@ a tie). One publisher may hold at most 16 records under a shard key
 keeps, for withdrawals of deleted ones), against 150 under other keys; a
 replacement of one it holds is always taken. A shard key holding its 1,000
 records (`MAX_RECORDS_PER_KEY`) drops its stalest listing for one signed
-after it, rather than refusing every newcomer. Each is dated by the earlier
-of its stamp and when it was stored (the date its expiry is aged from), so a
-stamp up to the hour's skew tolerance ahead of the clock buys nothing. Junk
-filling a shard must be re-signed more often than real feeds are to keep
-them out, and lapses within
-a week when it is not. Older builds file it as an unknown type for 24 hours.
+after it, but only a listing gone 3 hours unsigned: two of the publisher's
+hourly re-signs (`FEED_LISTING_RESIGN_SECS`) plus the hour's skew tolerance,
+so a listing whose publisher is running is never displaced, however often junk
+is re-signed. Each is dated by the earlier of its stamp and when it was stored
+(the date its expiry is aged from), so a stamp ahead of the clock buys nothing.
+Junk filling a full shard keeps newcomers out only while it is re-signed, and
+lapses within a week when it is not. Older builds file it as an unknown type
+for 24 hours.
 
 **The publisher** signs its listing anew with every publish and every hourly
 republish while the feed is listed. Each listing or withdrawal of a feed is

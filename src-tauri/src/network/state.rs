@@ -1454,6 +1454,11 @@ pub(super) struct NetworkState {
     /// every record naming the old one is republished rather than left
     /// pointing searchers at it until its own republish comes round.
     pub(super) ember_named_source_buddy: Option<ember::dht::EmberNodeId>,
+    /// The buddy, endpoint and key the source records already out name, kept
+    /// through a gap in which none is named: the same buddy coming back as it
+    /// was is not a change, and making the whole library due again for it
+    /// re-proxied everything after every blip.
+    pub(super) ember_records_buddy: Option<(ember::dht::EmberNodeId, std::net::Ipv4Addr, u16, [u8; 32])>,
     /// Unix-second copy of the source-publish stamps, written to known.met
     /// so a restart does not treat the whole library as never-published.
     pub(super) ember_source_publish_unix: HashMap<[u8; 16], u32>,
@@ -1869,4 +1874,9 @@ pub(super) struct EmberSearchRequest {
     /// the search treats differently from a lost reply — see
     /// [`ember::dht::search::QueryFailure::HandshakeNeverCompleted`].
     pub(super) handshake_to: Option<(std::net::SocketAddr, [u8; 32])>,
+    /// Where the query went. An answer is taken only from there: the reply's
+    /// sender id is whatever key it was signed with, and a host holding many
+    /// keys could otherwise answer for ones it had gossiped at addresses in
+    /// other /24s, from its own, and pass for that many independent nodes.
+    pub(super) sent_to: std::net::SocketAddr,
 }

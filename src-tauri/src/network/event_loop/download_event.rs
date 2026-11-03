@@ -158,6 +158,52 @@ fn forget_completion_move_failures(transfer_id: &str) {
     }
 }
 
+/// Drop the Ember digest a download failed its completion check on when only
+/// remote say-so stood behind it, and return whether it did: the download is
+/// then re-queued to finish on its ed2k hash and any AICH pin, which that check
+/// saw match before it reported the digest (`ember_pin_refuted`).
+///
+/// A DHT plurality, and the digest on a search row a click pins, are claims
+/// planted records can choose, and enforcing one failed a download whose every
+/// other check had passed. A digest hashed here stays enforced, as does one a
+/// feed's download was given: its publisher signed it into the list. The
+/// download's own copy goes with the pin, or its next start pins it again, and
+/// the digest is remembered as refuted so the next walk does not either.
+fn drop_refuted_remote_ember_pin(
+    pins: &mut HashMap<[u8; 16], EmberDigestPin>,
+    mgr: &mut TransferManager,
+    transfer_id: &str,
+    from_feed: bool,
+) -> bool {
+    if from_feed {
+        return false;
+    }
+    let Some(transfer) = mgr
+        .active
+        .get_mut(transfer_id)
+        .or_else(|| mgr.queue.iter_mut().find(|t| t.id == transfer_id))
+    else {
+        return false;
+    };
+    let Some(file_hash) = parse_ed2k_hash16(&transfer.file_hash) else {
+        return false;
+    };
+    let pin = pins.get(&file_hash).copied();
+    if pin.is_some_and(|pin| pin.provenance == EmberDigestProvenance::Local) {
+        return false;
+    }
+    pins.remove(&file_hash);
+    let own = parse_ember_file_hash(transfer.ember_file_hash.as_deref().unwrap_or_default());
+    let refuted = pin.map_or(own, |pin| pin.digest);
+    if refuted != [0u8; 32] {
+        note_refuted_ember_digest(file_hash, refuted);
+        if own == refuted {
+            transfer.ember_file_hash = None;
+        }
+    }
+    true
+}
+
 /// Scope of a finished download's known.met record. An existing record is the
 /// user's own decision about this content and wins either way: re-downloading
 /// something they restricted must not republish it, and a friend's restriction
@@ -1026,7 +1072,10 @@ pub(in crate::network) async fn on_download_event(
         // disk is full (Insufficient), which is transfer-level —
         // or the Ember BLAKE3 pin missed. That last one is also
         // transfer-level: the ed2k parts already matched, so
-        // searching more sources cannot change the digest.
+        // searching more sources cannot change the digest. A remote
+        // pin that missed is dropped instead, and the download
+        // re-queued to finish without it
+        // (`drop_refuted_remote_ember_pin`).
         // `is_user_cancel` was resolved above, before the
         // `transfer:source-failed` emit it also gates.
         let is_disk_full = *failure_kind == SourceFailureKind::InsufficientDisk
@@ -1036,7 +1085,37 @@ pub(in crate::network) async fn on_download_event(
                 == ed2k::transfer::TransferFailureCode::EmberContentHashMismatch;
         let is_aich_pin_fail = ed2k::transfer::is_expected_aich_mismatch(error)
             || failure_code == ed2k::transfer::TransferFailureCode::AichHashMismatch;
-        if (is_ember_pin_fail || is_aich_pin_fail) && !is_user_cancel {
+        let remote_pin_dropped = is_ember_pin_fail
+            && !is_aich_pin_fail
+            && !is_user_cancel
+            && drop_refuted_remote_ember_pin(
+                &mut state.ember_content_hashes,
+                &mut *transfer_manager.write().await,
+                transfer_id,
+                crate::sharing::feed_downloads::is_private(transfer_id)
+                    || crate::sharing::feed_files::is_internal_fetch(transfer_id),
+            );
+        if remote_pin_dropped {
+            warn!("Dropped the remote Ember digest {transfer_id} failed on; re-queuing it to finish on its ed2k hash");
+            let cleared = transfer_manager
+                .read()
+                .await
+                .get_transfer(transfer_id)
+                .is_some_and(|t| t.ember_file_hash.is_none());
+            if cleared {
+                // Awaited: left to run detached, the clear could land after a
+                // later save of this transfer and wipe a digest pinned since.
+                let (db, id) = (db.clone(), transfer_id.clone());
+                let result = tokio::task::spawn_blocking(move || db.clear_transfer_ember_file_hash(&id))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r);
+                if let Err(e) = result {
+                    warn!("Could not forget the refuted Ember digest of {transfer_id}: {e}");
+                }
+            }
+        }
+        if (is_ember_pin_fail || is_aich_pin_fail) && !is_user_cancel && !remote_pin_dropped {
             state.pending_downloads.remove(transfer_id);
             // A remote-derived digest that fails the content check is
             // worse than no digest at all: every later start for this
@@ -2283,6 +2362,56 @@ mod requeue_tests {
         assert!(row.failure_code.is_none() && row.failure_reason.is_none());
         assert_eq!(row.health, crate::types::TransferHealth::Healthy);
         assert!(mgr.clear_retry_context("running").is_none(), "nothing left to clear");
+    }
+
+    /// A download that failed only on an Ember digest from the DHT or a clicked
+    /// row drops it, its own copy included, so its next start finishes on the
+    /// ed2k hash. A digest hashed here, or a feed's, is still enforced.
+    #[test]
+    fn a_refuted_remote_ember_pin_is_dropped_and_a_local_or_feed_one_kept() {
+        let file = [0xD1; 16];
+        let (clicked, planted) = ([0xAA; 32], [0xEE; 32]);
+        let pinned = |digest: [u8; 32], provenance: EmberDigestProvenance| {
+            HashMap::from([(file, EmberDigestPin { digest, provenance })])
+        };
+        let row_for = |id: &str| Transfer {
+            file_hash: hex::encode(file),
+            ..checking(id)
+        };
+        let mut mgr = TransferManager::new(3);
+        let mut row = row_for("clicked");
+        row.ember_file_hash = Some(hex::encode(clicked));
+        mgr.active.insert("clicked".into(), row);
+
+        let mut pins = pinned(clicked, EmberDigestProvenance::UserSelected);
+        assert!(!drop_refuted_remote_ember_pin(&mut pins, &mut mgr, "clicked", true), "a feed's");
+        assert!(pins.contains_key(&file));
+        assert!(mgr.get_transfer("clicked").unwrap().ember_file_hash.is_some());
+
+        let mut pins = pinned(clicked, EmberDigestProvenance::Local);
+        assert!(!drop_refuted_remote_ember_pin(&mut pins, &mut mgr, "clicked", false), "hashed here");
+        assert!(pins.contains_key(&file));
+
+        let mut pins = pinned(clicked, EmberDigestProvenance::UserSelected);
+        assert!(drop_refuted_remote_ember_pin(&mut pins, &mut mgr, "clicked", false));
+        assert!(pins.is_empty());
+        assert_eq!(mgr.get_transfer("clicked").unwrap().ember_file_hash, None, "or a restart pins it again");
+
+        mgr.active.insert("searched".into(), row_for("searched"));
+        let mut pins = pinned(planted, EmberDigestProvenance::Corroborated(2));
+        assert!(drop_refuted_remote_ember_pin(&mut pins, &mut mgr, "searched", false));
+        assert!(pins.is_empty());
+
+        // The records behind it are still out there; the next walk's plurality
+        // does not pin it again, though another digest or a click may.
+        seed_ember_content_hash(&mut pins, file, planted, EmberDigestProvenance::Corroborated(5));
+        assert!(pins.is_empty(), "a refuted digest is not corroborated again");
+        seed_ember_content_hash(&mut pins, file, [0x77; 32], EmberDigestProvenance::Corroborated(2));
+        assert_eq!(pins[&file].digest, [0x77; 32]);
+        seed_ember_content_hash(&mut pins, file, planted, EmberDigestProvenance::UserSelected);
+        assert_eq!(pins[&file].digest, planted, "a click is the user's to make");
+
+        assert!(!drop_refuted_remote_ember_pin(&mut HashMap::new(), &mut mgr, "gone", false));
     }
 
     /// A peer without one file is still asked for the others it shares.

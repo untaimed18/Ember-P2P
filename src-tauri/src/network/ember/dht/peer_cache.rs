@@ -303,6 +303,31 @@ impl BootstrapCache {
         before - self.offered.len()
     }
 
+    /// Whether the remembered entry for `held`'s node should be offered to the
+    /// table even though the table already holds that node as `held`.
+    ///
+    /// True when `held` is a lead at another endpoint that has already missed
+    /// a ping, and the book's entry has answered us in some session. Anyone
+    /// can name a node id at an address of their choosing, and a gossiped
+    /// lead used to keep the address we had actually reached that node at
+    /// from ever being tried. A lead that has missed a ping is the point at
+    /// which [`super::routing::RoutingTable::add_contact`] lets another
+    /// endpoint take its place, so a seed offered any earlier would be a
+    /// no-op counted as dialled.
+    ///
+    /// [`Self::seed_batch`] applies this when handed the held contacts rather
+    /// than only their ids.
+    pub fn supersedes_held(&self, held: &EmberContact) -> bool {
+        if held.is_verified() || held.failed_queries == 0 {
+            return false;
+        }
+        self.entries.get(&held.node_id).is_some_and(|entry| {
+            entry.contact.is_verified()
+                && entry.contact.noise_pub != [0u8; 32]
+                && (entry.contact.addr != held.addr || entry.contact.noise_pub != held.noise_pub)
+        })
+    }
+
     /// Record that the routing table accepted these addresses, so their silence
     /// counts against them at shutdown. See the `dialled` field.
     pub fn note_offered(&mut self, admitted: impl Iterator<Item = EmberNodeId>) {
@@ -419,7 +444,7 @@ impl BootstrapCache {
     pub fn seed_batch(
         &mut self,
         local_id: &EmberNodeId,
-        held: &HashSet<EmberNodeId>,
+        held: &impl SeedHeld,
         max: usize,
     ) -> Vec<EmberContact> {
         if max == 0 {
@@ -430,7 +455,7 @@ impl BootstrapCache {
             .values()
             .filter(|entry| {
                 !self.offered.contains_key(&entry.contact.node_id)
-                    && !held.contains(&entry.contact.node_id)
+                    && !held.holds(self, &entry.contact.node_id)
             })
             .collect();
         ranked.sort_by_key(|entry| self.rank(local_id, entry));
@@ -449,6 +474,29 @@ impl BootstrapCache {
             self.offered.insert(contact.node_id, now);
         }
         batch
+    }
+}
+
+/// What the table already holds, as [`BootstrapCache::seed_batch`] reads it.
+pub trait SeedHeld {
+    /// Whether the book's entry for `id` stays back because the table holds
+    /// that node already.
+    fn holds(&self, book: &BootstrapCache, id: &EmberNodeId) -> bool;
+}
+
+/// By id alone: anything held keeps the book's entry back.
+impl SeedHeld for HashSet<EmberNodeId> {
+    fn holds(&self, _book: &BootstrapCache, id: &EmberNodeId) -> bool {
+        self.contains(id)
+    }
+}
+
+/// With the contact held, so a failing lead at another endpoint does not
+/// keep back an address that has answered us; see
+/// [`BootstrapCache::supersedes_held`].
+impl SeedHeld for HashMap<EmberNodeId, EmberContact> {
+    fn holds(&self, book: &BootstrapCache, id: &EmberNodeId) -> bool {
+        self.get(id).is_some_and(|held| !book.supersedes_held(held))
     }
 }
 
@@ -1032,5 +1080,76 @@ mod tests {
             .filter(|e| e.misses > 0)
             .count();
         assert_eq!(charged, 1, "the four never dialled owe nothing");
+    }
+
+    /// Someone named a node we have reached before at an address of their
+    /// own. Once that lead has missed a ping, the address we know is offered
+    /// in its place instead of being held back as already in the table.
+    #[test]
+    fn a_failing_lead_at_another_address_does_not_hold_back_the_known_one() {
+        let local = EmberNodeId([0; 16]);
+        let mut cache = cache_started_at(1_000);
+        let known = contact(1, 900);
+        cache.load(vec![CachedContact::new(known.clone())]);
+
+        let planted = EmberContact {
+            addr: SocketAddr::from(([66, 6, 6, 6], 4672)),
+            noise_pub: [0x66; 32],
+            last_seen: 0,
+            ..known.clone()
+        };
+        assert!(
+            !cache.supersedes_held(&planted),
+            "an untried lead gets its ping first"
+        );
+
+        let untried: HashMap<EmberNodeId, EmberContact> =
+            HashMap::from([(planted.node_id, planted.clone())]);
+        assert!(cache.seed_batch(&local, &untried, 4).is_empty());
+
+        let struck = EmberContact { failed_queries: 1, ..planted };
+        assert!(cache.supersedes_held(&struck));
+        let held: HashMap<EmberNodeId, EmberContact> =
+            HashMap::from([(struck.node_id, struck.clone())]);
+        cache.rearm_offers();
+        let batch = cache.seed_batch(&local, &held, 4);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].addr, known.addr, "the address we reached it at");
+        assert_eq!(batch[0].noise_pub, known.noise_pub);
+
+        let by_id: HashSet<EmberNodeId> = held.keys().copied().collect();
+        cache.rearm_offers();
+        assert!(
+            cache.seed_batch(&local, &by_id, 4).is_empty(),
+            "a caller passing only ids keeps the old rule"
+        );
+    }
+
+    /// The book only speaks over the table for an address that has answered
+    /// us, and never over a contact that has.
+    #[test]
+    fn the_book_does_not_override_hearsay_with_hearsay_or_a_proven_contact() {
+        let mut cache = cache_started_at(1_000);
+        let heard_of = contact(1, 0);
+        cache.load(vec![CachedContact::new(heard_of.clone())]);
+        let other_lead = EmberContact {
+            addr: SocketAddr::from(([66, 6, 6, 6], 4672)),
+            failed_queries: 1,
+            ..heard_of.clone()
+        };
+        assert!(!cache.supersedes_held(&other_lead), "the book's entry is a lead too");
+
+        let reached = contact(2, 900);
+        cache.load(vec![CachedContact::new(reached.clone())]);
+        let elsewhere = EmberContact {
+            addr: SocketAddr::from(([66, 6, 6, 7], 4672)),
+            last_seen: 1_200,
+            failed_queries: 1,
+            ..reached.clone()
+        };
+        assert!(!cache.supersedes_held(&elsewhere), "the table's copy has answered");
+
+        let same_endpoint = EmberContact { last_seen: 0, failed_queries: 2, ..reached };
+        assert!(!cache.supersedes_held(&same_endpoint), "nothing better to offer");
     }
 }

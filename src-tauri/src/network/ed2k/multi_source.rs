@@ -247,6 +247,27 @@ pub(super) fn final_verify_retry_delay(prior: u32) -> std::time::Duration {
     std::time::Duration::from_secs(FINAL_VERIFY_RETRY_BASE_SECS << (prior - 1))
 }
 
+/// Whether a finished file's digests show its Ember pin `ember_expected` to be
+/// wrong: the file is the one its ed2k hash and, when pinned, its AICH root
+/// name, and its BLAKE3 is not the pin.
+///
+/// Only once the ed2k hash matched: if both are wrong the bytes are, and that
+/// is the ed2k mismatch path's to repair. Read as a bad pin, a corrupt block
+/// failed the download for good and dropped a pin nothing had shown to be
+/// wrong. Only once the AICH pin matched too, so a mismatch reported this way
+/// says every other check passed, which is what lets the event loop drop a
+/// remote pin and finish on the others; an AICH miss is reported as that.
+pub(super) fn ember_pin_refuted(
+    digests: &super::hash::FileDigests,
+    expected_ed2k: &str,
+    expected_aich: Option<[u8; 20]>,
+    ember_expected: [u8; 32],
+) -> bool {
+    digests.ed2k == expected_ed2k
+        && expected_aich.is_none_or(|aich| digests.aich == Some(aich))
+        && digests.ember.is_some_and(|got| got != ember_expected)
+}
+
 /// What a failed final whole-file check does to the gap list.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FinalVerifyRecovery {
@@ -5462,18 +5483,12 @@ impl MultiSourceDownload {
                     },
                     job_cancel.as_ref(),
                 )?;
-                // Only once the ed2k hash matched: if both are wrong the bytes
-                // are, and that is the ed2k mismatch path's to repair. Read
-                // as a bad pin, a corrupt block failed the download for good
-                // and dropped a pin nothing had shown to be wrong.
-                if let Some(got) = digests.ember.filter(|_| digests.ed2k == expected_ed2k) {
-                    if got != ember_expected {
-                        anyhow::bail!(
-                            "ember blake3 mismatch: expected={} got={}",
-                            hex::encode(ember_expected),
-                            hex::encode(got)
-                        );
-                    }
+                if ember_pin_refuted(&digests, &expected_ed2k, expected_aich, ember_expected) {
+                    anyhow::bail!(
+                        "ember blake3 mismatch: expected={} got={}",
+                        hex::encode(ember_expected),
+                        hex::encode(digests.ember.unwrap_or_default())
+                    );
                 }
                 Ok::<_, anyhow::Error>((digests.ed2k, identity, digests.aich, digests.part_hashes))
             })
@@ -15095,6 +15110,32 @@ mod final_verify_recovery_tests {
             final_verify_recovery(Some(Vec::new()), false, 3),
             FinalVerifyRecovery::Reopen(vec![0, 1, 2])
         );
+    }
+
+    /// An Ember mismatch is reported only for a file every other check
+    /// accepts, so the event loop may finish it on those once a remote pin is
+    /// dropped; a file failing its ed2k hash or AICH pin is reported as that.
+    #[test]
+    fn an_ember_mismatch_means_every_other_check_passed() {
+        let digests = |ed2k: &str, aich: Option<[u8; 20]>, ember: [u8; 32]| crate::network::ed2k::hash::FileDigests {
+            ed2k: ed2k.to_string(),
+            part_hashes: Vec::new(),
+            aich,
+            ember: Some(ember),
+        };
+        let (pin, other) = ([0xAA; 32], [0xBB; 32]);
+        let aich = Some([0x11; 20]);
+
+        assert!(ember_pin_refuted(&digests("ab", None, other), "ab", None, pin));
+        assert!(ember_pin_refuted(&digests("ab", aich, other), "ab", aich, pin));
+        assert!(!ember_pin_refuted(&digests("ab", aich, pin), "ab", aich, pin), "the pin matched");
+        assert!(!ember_pin_refuted(&digests("cd", None, other), "ab", None, pin), "the bytes are wrong");
+        assert!(
+            !ember_pin_refuted(&digests("ab", Some([0x22; 20]), other), "ab", aich, pin),
+            "an AICH miss is the AICH pin's failure"
+        );
+        let unpinned = crate::network::ed2k::hash::FileDigests { ember: None, ..digests("ab", None, other) };
+        assert!(!ember_pin_refuted(&unpinned, "ab", None, [0u8; 32]), "nothing was pinned");
     }
 
     struct TwoPartFile {

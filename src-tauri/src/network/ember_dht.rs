@@ -1786,13 +1786,15 @@ pub(super) async fn run_ember_maintenance(
     //      measuring all leads let two answered FIND_NODEs pin the gate shut
     //      while the verified count was still nearly zero and leave the rest of
     //      the address book — the entries with real history — undialled.
-    let held: HashSet<ember::dht::EmberNodeId> = state
-        .ember_dht
-        .contacts()
-        .into_iter()
+    //      Keyed by id with the contact held there, table entries last so they
+    //      win over a cached or session copy of the same node.
+    let held: HashMap<ember::dht::EmberNodeId, ember::dht::EmberContact> = state
+        .ember_session_dht_contacts
+        .values()
+        .cloned()
         .chain(state.ember_dht.cached_contacts())
-        .map(|c| c.node_id)
-        .chain(state.ember_session_dht_contacts.values().map(|c| c.node_id))
+        .chain(state.ember_dht.contacts())
+        .map(|c| (c.node_id, c))
         .collect();
     // Cache entries count too, or a seed the table parked there is neither
     // re-offered (it is in `held`, which includes the cache) nor counted as
@@ -2443,7 +2445,7 @@ pub(super) async fn handle_ember_dht_message(
         Vec::new()
     };
     refresh_ember_advertised_buddy(state);
-    let inbound = state.ember_dht.handle_incoming(
+    let mut inbound = state.ember_dht.handle_incoming(
         payload,
         from,
         remote_noise_pub,
@@ -2454,6 +2456,14 @@ pub(super) async fn handle_ember_dht_message(
     // Read now, before the handlers below consume the pending query a
     // FOUND_NODE answers.
     let leads_asked_for = ember_leads_were_asked_for(state, &inbound, from, now);
+    // A FOUND_NODE or PEER_LIST joins the table only as the answer to a request
+    // of ours. An unasked one is charged to no lookup budget, so merging it let
+    // any session peer fill buckets with leads of its choosing, aim our
+    // maintenance pings at them and have them saved to `nodes_ember.dat`.
+    // An ANNOUNCE_PEER's dump the engine has merged already.
+    if leads_asked_for {
+        state.ember_dht.merge_gossip_reply(&mut inbound);
+    }
     if ember_reply_was_solicited(state, &inbound, from) {
         if let Some(id) = inbound.sender_id {
             state.ember_dht.note_answered(id, std::time::Instant::now());
@@ -2520,7 +2530,11 @@ pub(super) async fn handle_ember_dht_message(
             .ember_dht_gossip_refused
             .saturating_add(inbound.gossip_refused);
     }
-    remember_ember_lan_gossip(state, &inbound.gossip_leads, from);
+    // The session map feeds lookups and publish targets as the table does, so
+    // it takes the same leads the table would.
+    if leads_asked_for || inbound.announce_peer_received {
+        remember_ember_lan_gossip(state, &inbound.gossip_leads, from);
+    }
 
     // A PING from a public address we have neither a contact for nor ever dialled
     // is evidence our own UDP port is open to the internet: it cannot be an
@@ -2541,8 +2555,9 @@ pub(super) async fn handle_ember_dht_message(
     //
     // Two sources answer it, and neither is complete on its own. The transport
     // records every address Ember dialled, which covers searches and both bridges,
-    // and every address QUIC sent to while it shares this socket (relays, sources,
-    // friend punches, attachments, room streams).
+    // and every QUIC connection we opened while it shares this socket (relays,
+    // sources, friend punches, attachments, room streams) — never a Retry or other
+    // answer to a stranger.
     // But Ember rides the KAD socket, so a KAD query to the same host opens the very
     // mapping in question — `has_recent_ip` is KAD's own record of that, written
     // only for outbound requests.
@@ -2710,10 +2725,12 @@ pub(super) async fn handle_ember_dht_message(
                     );
                     None
                 } else {
-                    let targets =
-                        ember_overlay_publish_targets_within(state, key, EMBER_FORWARDED_TARGET_QUEUE_MAX);
+                    let targets = ember_forwarded_publish_targets(state, key);
                     state.ember_publish.start_publish_to(forward, targets)
                 };
+                // Refused as well when the record carries no callback token, or
+                // its publisher's /24 or its file already holds its share of
+                // our forwards; the publisher hears nothing and its ask expires.
                 if state.ember_dht.commit_proxy_store(
                     publisher,
                     from,
@@ -2726,6 +2743,7 @@ pub(super) async fn handle_ember_dht_message(
                         .ember_dht_buddy_forwards
                         .saturating_add(1);
                     if let Some(publish_id) = publish_id {
+                        ember_commit_forwarded_publish(state, key, publish_id);
                         drive_ember_publish(socket, state, publish_id).await;
                     }
                     let ack_bytes =
@@ -2856,10 +2874,15 @@ pub(super) async fn handle_ember_dht_message(
     // peer, or cost a lookup token to send (ANNOUNCE_PEER). An unsolicited
     // FOUND_NODE or PEER_LIST is charged to nothing, so one peer sending them
     // as fast as the frame gate allows used up the shared probe budget with
-    // leads it chose and starved the probes of real ones. Their contacts are
-    // still merged into the table, unverified.
+    // leads it chose and starved the probes of real ones.
     if leads_asked_for {
-        probe_ember_gossip_leads(socket, state, &inbound.gossip_leads, inbound.sender_id).await;
+        probe_ember_gossip_leads(
+            socket,
+            state,
+            &inbound.gossip_leads,
+            inbound.sender_id.map(|id| (id, from)),
+        )
+        .await;
     }
 
     if inbound.pong_received {
@@ -2957,9 +2980,9 @@ pub(super) async fn handle_ember_dht_message(
 
     // A FOUND_NODE either answers a single-hop dev `FIND_NODE` (resolve
     // its waiter directly) or advances an iterative lookup (feed it to
-    // the search, then drive the next round). The engine already merged
-    // the contacts into the routing table. Unmatched request_ids are
-    // unsolicited and ignored.
+    // the search, then drive the next round). Its contacts were merged
+    // into the routing table above if it answered one of those. Unmatched
+    // request_ids are unsolicited and ignored.
     if let Some((rid, contacts)) = inbound.found_node {
         // Bound to the address the query went to, like the PONG path above. A
         // wrong-sender answer is put back rather than consumed, so the peer we
@@ -2984,10 +3007,12 @@ pub(super) async fn handle_ember_dht_message(
         } else if let Some((search_id, per_search_req_id)) = state
             .ember_dht_search_requests
             .get(&rid)
+            .filter(|req| req.sent_to == from)
             .map(|req| (req.search_id, req.per_search_req_id))
         {
             // `process_response` gates on `(per_search_req_id, from_id)`,
-            // so a forged or misrouted answer can't advance the search.
+            // so a forged or misrouted answer can't advance the search, and
+            // only an answer from the address the query went to gets here.
             //
             // Only drop the wire-id entry once the answer is accepted.
             // Removing first meant a wrong-sender reply — request ids come
@@ -3109,6 +3134,7 @@ pub(super) async fn handle_ember_dht_message(
         if let Some((search_id, per_search_req_id)) = state
             .ember_dht_search_requests
             .get(&rid)
+            .filter(|req| req.sent_to == from)
             .map(|req| (req.search_id, req.per_search_req_id))
         {
             // Same rule as FOUND_NODE above: keep the correlation entry until

@@ -2040,15 +2040,30 @@ enum PreSessionPermit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuicIncomingAddressPolicy {
+    /// Blocked, and nothing proves the source sent it: drop without a reply.
+    Ignore,
+    /// Blocked, at an address that has proven itself: refuse.
+    Refuse,
     Retry,
     ApplyAdmissionLimits,
 }
 
-fn quic_incoming_address_policy(remote_address_validated: bool) -> QuicIncomingAddressPolicy {
-    if remote_address_validated {
-        QuicIncomingAddressPolicy::ApplyAdmissionLimits
-    } else {
-        QuicIncomingAddressPolicy::Retry
+/// What to do with an inbound QUIC connection, before any per-IP accounting.
+///
+/// The ban list and IP filter come before Retry. A Retry is a send to an
+/// address nothing has validated, and answering a blocked one gives it a
+/// reply it was never owed — anything that treats "we sent to it" as a signal
+/// would then count it. A blocked source with an unproven address gets
+/// nothing at all, since a refusal would be the same send.
+fn quic_incoming_address_policy(
+    remote_address_validated: bool,
+    blocked: bool,
+) -> QuicIncomingAddressPolicy {
+    match (blocked, remote_address_validated) {
+        (true, false) => QuicIncomingAddressPolicy::Ignore,
+        (true, true) => QuicIncomingAddressPolicy::Refuse,
+        (false, false) => QuicIncomingAddressPolicy::Retry,
+        (false, true) => QuicIncomingAddressPolicy::ApplyAdmissionLimits,
     }
 }
 
@@ -2566,27 +2581,38 @@ pub async fn run_quic_accept_loop(
             Some(inc) = accept_or_wait(legacy_endpoint.as_deref()) => inc,
         };
 
-        if quic_incoming_address_policy(incoming.remote_address_validated())
-            == QuicIncomingAddressPolicy::Retry
-        {
-            let remote = incoming.remote_address();
-            if let Err(error) = incoming.retry() {
-                debug!("QUIC accept: failed to issue Retry to {remote}: {error}");
-            }
-            continue;
-        }
-
         let remote_ip = incoming.remote_address().ip();
         // Before any per-IP accounting or handshake work: the operator's filter
         // and ban list apply to this transport exactly as they do to inbound
-        // eD2K TCP. `refuse()` rather than `retry()` — a blocked peer is not
-        // being asked to prove its address, it is being turned away.
-        if let Some(peer_v4) = quic_peer_ipv4(remote_ip) {
-            if let Some(reason) = address_policy.inbound_refusal(peer_v4) {
-                debug!("QUIC accept: refusing inbound from {remote_ip}: {reason}");
+        // eD2K TCP. A blocked peer is not asked to prove its address, it is
+        // turned away.
+        let refusal =
+            quic_peer_ipv4(remote_ip).and_then(|peer_v4| address_policy.inbound_refusal(peer_v4));
+        match quic_incoming_address_policy(incoming.remote_address_validated(), refusal.is_some()) {
+            QuicIncomingAddressPolicy::Ignore => {
+                debug!(
+                    "QUIC accept: dropping unvalidated inbound from {remote_ip}: {}",
+                    refusal.unwrap_or_default()
+                );
+                incoming.ignore();
+                continue;
+            }
+            QuicIncomingAddressPolicy::Refuse => {
+                debug!(
+                    "QUIC accept: refusing inbound from {remote_ip}: {}",
+                    refusal.unwrap_or_default()
+                );
                 incoming.refuse();
                 continue;
             }
+            QuicIncomingAddressPolicy::Retry => {
+                let remote = incoming.remote_address();
+                if let Err(error) = incoming.retry() {
+                    debug!("QUIC accept: failed to issue Retry to {remote}: {error}");
+                }
+                continue;
+            }
+            QuicIncomingAddressPolicy::ApplyAdmissionLimits => {}
         }
         {
             let mut counts = pending_ip_counts.lock();
@@ -4209,15 +4235,29 @@ mod tests {
     #[test]
     fn unvalidated_quic_incoming_retries_before_ip_accounting() {
         let mut pending_by_ip = HashMap::<IpAddr, usize>::new();
-        let policy = quic_incoming_address_policy(false);
+        let policy = quic_incoming_address_policy(false, false);
         if policy == QuicIncomingAddressPolicy::ApplyAdmissionLimits {
             pending_by_ip.insert("203.0.113.99".parse().unwrap(), 1);
         }
         assert_eq!(policy, QuicIncomingAddressPolicy::Retry);
         assert!(pending_by_ip.is_empty());
         assert_eq!(
-            quic_incoming_address_policy(true),
+            quic_incoming_address_policy(true, false),
             QuicIncomingAddressPolicy::ApplyAdmissionLimits
+        );
+    }
+
+    /// A banned or filtered source is never sent a Retry: unvalidated, it gets
+    /// nothing at all, and only a source that proved its address is refused.
+    #[test]
+    fn a_blocked_quic_incoming_is_turned_away_before_any_retry() {
+        assert_eq!(
+            quic_incoming_address_policy(false, true),
+            QuicIncomingAddressPolicy::Ignore
+        );
+        assert_eq!(
+            quic_incoming_address_policy(true, true),
+            QuicIncomingAddressPolicy::Refuse
         );
     }
 

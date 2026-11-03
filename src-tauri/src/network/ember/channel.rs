@@ -910,6 +910,12 @@ pub fn all_index_keys() -> [[u8; 16]; INDEX_SHARD_COUNT as usize] {
     keys
 }
 
+/// Whether `key` is one of the public-index shard keys.
+pub fn is_index_key(key: &[u8; 16]) -> bool {
+    static KEYS: std::sync::OnceLock<[[u8; 16]; INDEX_SHARD_COUNT as usize]> = std::sync::OnceLock::new();
+    KEYS.get_or_init(all_index_keys).contains(key)
+}
+
 pub fn presence_epoch(unix_seconds: i64) -> i64 {
     unix_seconds.div_euclid(PRESENCE_EPOCH_SECS)
 }
@@ -6565,6 +6571,8 @@ mod tests {
         assert_eq!(index_key(0), index_key(INDEX_SHARD_COUNT));
         let id = [0x11u8; 16];
         assert_eq!(index_key_for_channel(&id), index_key(index_shard(&id)));
+        assert!(keys.iter().all(is_index_key));
+        assert!(!is_index_key(&[0x11u8; 16]));
     }
 
     #[test]

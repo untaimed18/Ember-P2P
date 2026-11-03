@@ -593,6 +593,7 @@ async fn drive_ember_search_once(socket: &UdpSocket, state: &mut NetworkState, s
                 deadline: std::time::Instant::now() + budget,
                 sent_unix: chrono::Utc::now().timestamp(),
                 handshake_to: behind_handshake.then_some((contact.addr, contact.noise_pub)),
+                sent_to: contact.addr,
             },
         );
         }
@@ -935,9 +936,10 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
 /// Each blob is re-verified (`from_value_blob` checks the publisher
 /// signature), filtered to source records whose embedded file hash matches
 /// the download we asked about, self-filtered against our own external IP
-/// and Noise key, and counted for diagnostics. When a record carries a Noise pubkey and
-/// UDP port, it is cached under that UDP endpoint so later Ember dials
-/// (bridge / native) can find it. Dedup / ban / cap handling is left to
+/// and Noise key, and counted for diagnostics. When a HighID record a second
+/// responder or our own store vouches for carries a Noise pubkey and UDP port,
+/// it is cached under that UDP endpoint so later Ember dials (bridge / native)
+/// can find it. Dedup / ban / cap handling is left to
 /// `handle_epx_sources` downstream; the drain path applies the same
 /// `ip_filter` / banlist gates before writing SourceManager.
 pub(super) fn parse_ember_source_records(
@@ -962,15 +964,30 @@ pub(super) fn parse_ember_source_records(
     // responder is not an honest storer that checked it: it can mint keys and
     // name any host. Records two independent responders returned, or our own
     // store bound to the storer's address, go first, and the rest are capped
-    // per responder, so one node answering a popular hash cannot aim every
-    // downloader of it at a victim.
+    // per responder and in all, so one node answering a popular hash cannot
+    // aim every downloader of it at a victim. Unvouched records take turns by
+    // responder, so the first to answer does not take the whole allowance.
     let vouched = |record: &ember::dht::search::SearchResultRecord| {
         record.confirmed_by.is_some() || record.from_local_store
     };
-    let mut order: Vec<&ember::dht::search::SearchResultRecord> = held.iter().collect();
-    order.sort_by_key(|record| !vouched(record));
+    let mut nth_from: HashMap<EmberResponder, usize> = HashMap::new();
+    let mut order: Vec<(usize, &ember::dht::search::SearchResultRecord)> = held
+        .iter()
+        .map(|record| {
+            if vouched(record) {
+                return (0, record);
+            }
+            let nth = nth_from
+                .entry(EmberResponder::of(record.from_node, record.from_subnet))
+                .or_insert(0);
+            *nth += 1;
+            (*nth, record)
+        })
+        .collect();
+    order.sort_by_key(|(turn, _)| *turn);
     let mut unconfirmed_from: HashMap<(EmberResponder, bool), usize> = HashMap::new();
-    for held_record in order {
+    let mut unconfirmed_highid = 0usize;
+    for (_, held_record) in order {
         let Some(rec) = ember::dht::publish::SignedRecord::from_value_blob(&held_record.data)
         else {
             continue;
@@ -1012,20 +1029,30 @@ pub(super) fn parse_ember_source_records(
         // responder answering early could fill every slot with them. Under a
         // quota of their own, so a storer listing its firewalled sources first
         // does not crowd out the HighID ones it holds.
+        let firewalled = sc.flags & ember::SOURCE_FLAG_FIREWALLED != 0;
         if !vouched(held_record) {
+            if !firewalled && unconfirmed_highid >= MAX_UNCONFIRMED_HIGHID_SOURCES_PER_LOOKUP {
+                continue;
+            }
             let responder = EmberResponder::of(held_record.from_node, held_record.from_subnet);
-            let firewalled = sc.flags & ember::SOURCE_FLAG_FIREWALLED != 0;
             let taken = unconfirmed_from.entry((responder, firewalled)).or_insert(0);
             if *taken >= MAX_UNCONFIRMED_SOURCES_PER_RESPONDER {
                 continue;
             }
             *taken += 1;
+            if !firewalled {
+                unconfirmed_highid += 1;
+            }
         }
         if sc.udp_port != 0 && sc.noise_pub != [0u8; 32] {
             // Firewalled contacts skip the STORE IP-bind, so their claimed
             // address is unauthenticated. Caching that (ip, udp) → noise_pub
-            // would let a publisher eclipse Noise_IK to a third party.
-            if sc.flags & ember::SOURCE_FLAG_FIREWALLED == 0 {
+            // would let a publisher eclipse Noise_IK to a third party. A
+            // HighID record only one responder vouches for is that
+            // responder's say-so, bind or not: the cache holds one key per
+            // endpoint, so it could replace a host's real key or crowd others
+            // out.
+            if !firewalled && vouched(held_record) {
                 let _ = cache_bound_ember_noise_key(
                     noise_keys,
                     sc.ip,
@@ -1706,6 +1733,12 @@ const MAX_EMBER_SOURCES_PER_LOOKUP: usize = 50;
 /// returned, and as many firewalled ones besides. Enough for the honest
 /// storer that happens to hold a key alone.
 pub(super) const MAX_UNCONFIRMED_SOURCES_PER_RESPONDER: usize = 10;
+/// HighID sources no other responder also returned that one lookup dials in
+/// all, whoever returned them: KAD's whole answer (`SEARCHFINDSOURCE_TOTAL`).
+/// Two responders' worth, so a swarm only one storer near the key holds is
+/// still reached, while hosts answering from many /24s cannot aim a lookup at
+/// more addresses than that.
+pub(super) const MAX_UNCONFIRMED_HIGHID_SOURCES_PER_LOOKUP: usize = 2 * MAX_UNCONFIRMED_SOURCES_PER_RESPONDER;
 
 /// One publisher's digest claim and the responders that carried it.
 #[derive(Debug, Clone, Default)]
@@ -1842,8 +1875,16 @@ fn corroborated_ember_digests(publisher_digests: &EmberDigestVotes) -> Vec<([u8;
 ///
 /// A file has one content digest, so two corroborated claims mean at least one
 /// set of records is planted, and nothing here can tell which.
+///
+/// A rival needs only the responders, not the publishers: a file with one
+/// real publisher, whose records every storer near it holds, is outvoted on
+/// publishers by two keys planted on those same storers, and a rule that
+/// asked both claims for two publishers pinned the planted one.
 pub(super) fn ember_digest_contested(publisher_digests: &EmberDigestVotes) -> bool {
-    corroborated_ember_digests(publisher_digests).len() > 1
+    ember_digest_tallies(publisher_digests)
+        .filter(|(_, _, responders)| *responders >= MIN_EMBER_DIGEST_RESPONDERS)
+        .nth(1)
+        .is_some()
 }
 
 /// The corroborated digest, when exactly one digest is — see
@@ -1872,6 +1913,9 @@ pub(super) fn corroborated_ember_digest(publisher_digests: &EmberDigestVotes) ->
 pub(super) fn corroborated_ember_digest_with_count(
     publisher_digests: &EmberDigestVotes,
 ) -> Option<([u8; 32], usize)> {
+    if ember_digest_contested(publisher_digests) {
+        return None;
+    }
     match corroborated_ember_digests(publisher_digests).as_slice() {
         [only] => Some(*only),
         _ => None,
@@ -1915,6 +1959,42 @@ pub(super) struct EmberDigestPin {
     pub(super) provenance: EmberDigestProvenance,
 }
 
+/// Files whose finished bytes this session showed some remote digest to be
+/// wrong — ed2k hash and AICH root matching, BLAKE3 not — with the digests
+/// shown wrong.
+///
+/// Dropping such a pin is not enough on its own: the records that made it are
+/// still on the storers, and the next source lookup for the download re-queued
+/// to finish without it would corroborate it again, and fail the file again,
+/// after another whole-file read each time. Cleared when full: a refuted digest
+/// re-pinned after that costs one more verification, and nothing worse.
+fn refuted_ember_digests() -> &'static std::sync::Mutex<HashMap<[u8; 16], HashSet<[u8; 32]>>> {
+    static REFUTED: std::sync::OnceLock<std::sync::Mutex<HashMap<[u8; 16], HashSet<[u8; 32]>>>> =
+        std::sync::OnceLock::new();
+    REFUTED.get_or_init(Default::default)
+}
+
+/// Files [`refuted_ember_digests`] remembers at most.
+const MAX_REFUTED_EMBER_FILES: usize = 4096;
+
+/// Remember that `file_hash`'s bytes refuted `digest`, so no DHT plurality pins
+/// it for that file again this session (see [`refuted_ember_digests`]).
+pub(super) fn note_refuted_ember_digest(file_hash: [u8; 16], digest: [u8; 32]) {
+    let Ok(mut refuted) = refuted_ember_digests().lock() else {
+        return;
+    };
+    if refuted.len() >= MAX_REFUTED_EMBER_FILES && !refuted.contains_key(&file_hash) {
+        refuted.clear();
+    }
+    refuted.entry(file_hash).or_default().insert(digest);
+}
+
+fn ember_digest_refuted(file_hash: &[u8; 16], digest: &[u8; 32]) -> bool {
+    refuted_ember_digests()
+        .lock()
+        .is_ok_and(|refuted| refuted.get(file_hash).is_some_and(|digests| digests.contains(digest)))
+}
+
 /// Record `digest` as the expected content hash for `file_hash`, keeping
 /// whichever of the incumbent and the newcomer rests on better evidence.
 ///
@@ -1928,6 +2008,9 @@ pub(super) fn seed_ember_content_hash(
     provenance: EmberDigestProvenance,
 ) {
     if digest == [0u8; 32] {
+        return;
+    }
+    if matches!(provenance, EmberDigestProvenance::Corroborated(_)) && ember_digest_refuted(&file_hash, &digest) {
         return;
     }
     let pin = EmberDigestPin { digest, provenance };
@@ -2120,6 +2203,32 @@ mod ember_digest_corroboration_tests {
         }
         assert!(ember_digest_contested(&votes));
         assert_eq!(corroborated_ember_digest_with_count(&votes), None);
+    }
+
+    /// A file with one real publisher, whose record every storer near it
+    /// returns, against two keys planted on those same storers naming a
+    /// fake digest: the planted digest clears the publisher bar alone, and
+    /// must still pin nothing.
+    #[test]
+    fn two_planted_keys_cannot_outvote_a_single_real_publisher() {
+        let mut votes = EmberDigestVotes::new();
+        for node in [1u8, 2] {
+            note_ember_digest_vote(&mut votes, [0x01; 32], [0xAA; 32], &held_from(node, None));
+            note_ember_digest_vote(&mut votes, [0x02; 32], [0xEE; 32], &held_from(node, None));
+            note_ember_digest_vote(&mut votes, [0x03; 32], [0xEE; 32], &held_from(node, None));
+        }
+        assert!(ember_digest_contested(&votes), "the real digest is vouched for too");
+        assert_eq!(corroborated_ember_digest_with_count(&votes), None);
+
+        // One responder alone naming a rival is no rival.
+        let mut votes = EmberDigestVotes::new();
+        for node in [1u8, 2] {
+            note_ember_digest_vote(&mut votes, [0x01; 32], [0xAA; 32], &held_from(node, None));
+            note_ember_digest_vote(&mut votes, [0x02; 32], [0xAA; 32], &held_from(node, None));
+        }
+        note_ember_digest_vote(&mut votes, [0x03; 32], [0xEE; 32], &held_from(9, None));
+        assert!(!ember_digest_contested(&votes));
+        assert_eq!(corroborated_ember_digest_with_count(&votes).map(|(digest, _)| digest), Some([0xAA; 32]));
     }
 
     const FILE: [u8; 16] = [0xF1; 16];
@@ -2435,9 +2544,9 @@ mod ember_source_self_filter_tests {
         let held = vec![ember::dht::search::SearchResultRecord {
             data: blob,
             from_node: ember::dht::EmberNodeId([1; 16]),
-            confirmed_by: None,
-            from_subnet: None,
-            confirmed_subnet: None,
+            confirmed_by: Some(ember::dht::EmberNodeId([2; 16])),
+            from_subnet: Some(1),
+            confirmed_subnet: Some(2),
             from_local_store: false,
         }];
 
@@ -2463,6 +2572,105 @@ mod ember_source_self_filter_tests {
             "stale external IP"
         );
         assert_eq!(parse(None, [0x5Du8; 32]), (1, 1), "a peer's record is kept");
+    }
+
+    /// A HighID source record for `file_hash` at `81.7.(net).(host)`, carrying
+    /// a Noise key and UDP port, as `from` returned it.
+    fn noise_source(
+        file_hash: [u8; 16],
+        net: u8,
+        host: u8,
+        from: u8,
+        confirmed_by: Option<u8>,
+    ) -> ember::dht::search::SearchResultRecord {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[host ^ net; 32]);
+        let rec = ember::dht::publish::SignedRecord::source(
+            file_hash,
+            [0u8; 32],
+            1,
+            "big.iso",
+            ember::dht::publish::SourceContact {
+                ip: Ipv4Addr::new(81, 7, net, host),
+                tcp_port: 4662,
+                udp_port: 4672,
+                flags: 0,
+                noise_pub: [host; 32],
+                ..Default::default()
+            },
+            &sk,
+        );
+        let mut data = rec.data.clone();
+        data.extend_from_slice(&rec.signature);
+        ember::dht::search::SearchResultRecord {
+            data,
+            from_node: ember::dht::EmberNodeId([from; 16]),
+            confirmed_by: confirmed_by.map(|n| ember::dht::EmberNodeId([n; 16])),
+            from_subnet: Some(u64::from(from)),
+            confirmed_subnet: confirmed_by.map(u64::from),
+            from_local_store: false,
+        }
+    }
+
+    /// Only a HighID record a second responder or our own store vouches for
+    /// may put a Noise key in the cache: one responder's record could name
+    /// any host's endpoint with a key of its choosing.
+    #[test]
+    fn only_vouched_records_cache_a_noise_key() {
+        let file_hash = [0x65u8; 16];
+        let mut local = noise_source(file_hash, 3, 3, 1, None);
+        local.from_local_store = true;
+        let held = vec![
+            noise_source(file_hash, 1, 1, 1, None),
+            noise_source(file_hash, 2, 2, 1, Some(2)),
+            local,
+        ];
+        let mut noise_keys = HashMap::new();
+        let sources = parse_ember_source_records(
+            &held,
+            file_hash,
+            None,
+            &[0u8; 32],
+            &mut crate::types::EmberDiagnostics::default(),
+            &mut noise_keys,
+            &HashSet::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(sources.len(), 3, "every source is still offered");
+        assert!(!noise_keys.contains_key(&(Ipv4Addr::new(81, 7, 1, 1), 4672)));
+        assert_eq!(noise_keys[&(Ipv4Addr::new(81, 7, 2, 2), 4672)].0, [2; 32]);
+        assert_eq!(noise_keys[&(Ipv4Addr::new(81, 7, 3, 3), 4672)].0, [3; 32]);
+    }
+
+    /// Many responders, each within its own allowance, still get only KAD's
+    /// twenty unvouched HighID sources dialled between them, taken in turns so
+    /// each is heard; vouched sources come first and on top of that.
+    #[test]
+    fn unvouched_sources_are_capped_per_lookup_and_shared_out() {
+        let file_hash = [0x66u8; 16];
+        let mut held = Vec::new();
+        for from in 1..=4u8 {
+            held.extend((1..=MAX_UNCONFIRMED_SOURCES_PER_RESPONDER as u8).map(|host| noise_source(file_hash, from, host, from, None)));
+        }
+        held.extend((1..=5u8).map(|host| noise_source(file_hash, 9, host, 1, Some(5))));
+
+        let sources = parse_ember_source_records(
+            &held,
+            file_hash,
+            None,
+            &[0u8; 32],
+            &mut crate::types::EmberDiagnostics::default(),
+            &mut HashMap::new(),
+            &HashSet::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(sources.len(), 5 + MAX_UNCONFIRMED_HIGHID_SOURCES_PER_LOOKUP);
+        for host in 1..=5u8 {
+            assert!(sources.iter().any(|s| s.ip == Ipv4Addr::new(81, 7, 9, host)), "vouched");
+        }
+        for from in 1..=4u8 {
+            let theirs = sources.iter().filter(|s| s.ip.octets()[2] == from).count();
+            assert_eq!(theirs, MAX_UNCONFIRMED_HIGHID_SOURCES_PER_LOOKUP / 4, "responder {from}'s turn");
+        }
     }
 }
 

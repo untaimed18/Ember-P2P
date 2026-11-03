@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tracing::{info, warn};
@@ -57,6 +57,47 @@ fn backup_before_overwrite(path: &Path) {
     let bak = path.with_file_name(name);
     if let Err(e) = std::fs::copy(path, &bak) {
         tracing::debug!("Could not back up {} before overwrite: {e}", path.display());
+    }
+}
+
+/// Keep a copy of a file that loaded only in part, as `<name>.partial`, so the
+/// bytes past the damage outlive the save that replaces it.
+///
+/// One copy, which the next partial load overwrites. A copy per load, named by
+/// the time as this used to be, left another file the size of the store behind
+/// on every launch that met the same damage, and nothing ever removed them.
+fn keep_partial_copy(path: &Path) -> std::io::Result<PathBuf> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".partial");
+    let copy = path.with_file_name(name);
+    std::fs::copy(path, &copy)?;
+    Ok(copy)
+}
+
+/// Remove the `<name>.bak.<unix seconds>` copies earlier builds made of a
+/// file that loaded only in part. The plain `<name>.bak` is
+/// [`backup_before_overwrite`]'s and stays.
+fn clear_stamped_partial_copies(path: &Path) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{name}.bak.");
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let stamped = file_name
+            .to_str()
+            .and_then(|n| n.strip_prefix(&prefix))
+            .is_some_and(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()));
+        if stamped {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -274,6 +315,7 @@ pub fn load_nodes_with_state(
     path: &Path,
 ) -> Result<(Vec<CachedContact>, NodesFileState), NodesLoadError> {
     crate::security::recover_interrupted_replace(path);
+    clear_stamped_partial_copies(path);
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_NODES_EMBER_BYTES {
             return Err(NodesLoadError::Corrupt(format!(
@@ -426,18 +468,9 @@ pub fn load_nodes_with_state(
              likely a corrupted or truncated file. Backing up before next save.",
             contacts.len(),
         );
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let bak = path.with_extension(format!("dat.bak.{ts}"));
-        if let Err(e) = std::fs::copy(path, &bak) {
-            warn!(
-                "Failed to back up partial nodes_ember.dat to {}: {e}",
-                bak.display(),
-            );
-        } else {
-            info!("Backed up partial nodes_ember.dat to {}", bak.display());
+        match keep_partial_copy(path) {
+            Ok(copy) => info!("Backed up partial nodes_ember.dat to {}", copy.display()),
+            Err(e) => warn!("Failed to back up partial nodes_ember.dat: {e}"),
         }
         NodesFileState::Truncated {
             recovered: contacts.len(),
@@ -554,6 +587,7 @@ pub fn save_store(
 /// malformed file yields whatever parsed cleanly before the damage.
 pub fn load_store(path: &Path) -> anyhow::Result<Vec<super::store::PersistedRecord>> {
     crate::security::recover_interrupted_replace(path);
+    clear_stamped_partial_copies(path);
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_STORE_EMBER_BYTES {
             anyhow::bail!(
@@ -649,18 +683,9 @@ pub fn load_store(path: &Path) -> anyhow::Result<Vec<super::store::PersistedReco
              likely a corrupted or truncated file. Backing up before next save.",
             out.len()
         );
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let bak = path.with_extension(format!("dat.bak.{ts}"));
-        if let Err(e) = std::fs::copy(path, &bak) {
-            warn!(
-                "Failed to back up partial store_ember.dat to {}: {e}",
-                bak.display(),
-            );
-        } else {
-            info!("Backed up partial store_ember.dat to {}", bak.display());
+        match keep_partial_copy(path) {
+            Ok(copy) => info!("Backed up partial store_ember.dat to {}", copy.display()),
+            Err(e) => warn!("Failed to back up partial store_ember.dat: {e}"),
         }
     }
     info!(
@@ -783,8 +808,8 @@ mod tests {
     }
 
     /// A file that lost half its contacts to truncation must not then lose the
-    /// rest to the session that recovered them. The timestamped backup keeps
-    /// the bytes, but nothing ever reads it back, so writing a smaller set over
+    /// rest to the session that recovered them. The partial copy keeps the
+    /// bytes, but nothing ever reads it back, so writing a smaller set over
     /// the live file is what makes the loss permanent — one launch at a time,
     /// which is the ratchet the whole bootstrap cache exists to break.
     #[test]
@@ -1018,6 +1043,48 @@ mod tests {
             MAX_PERSISTED_CONTACTS,
             "the loader must stop at the ceiling the save path writes under"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every launch that meets the same damaged store file keeps one copy of
+    /// it, not one more each time, and the stamped copies earlier builds left
+    /// are cleared; the save path's own backup is not touched.
+    #[test]
+    fn a_partial_store_load_keeps_one_rolling_copy() {
+        let dir = temp_nodes_dir("store-partial");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store_ember.dat");
+        let records: Vec<super::super::store::PersistedRecord> = (0..4u8)
+            .map(|i| super::super::store::PersistedRecord {
+                key: [i; 16],
+                data: vec![i; 200],
+                signature: [i; 64],
+                publisher_key: [i; 32],
+                created_at: 1000,
+                attributed_ip: None,
+            })
+            .collect();
+        save_store(&path, &records, true).unwrap();
+        let whole = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() - 100]).unwrap();
+        for leftover in ["store_ember.dat.bak.1700000000", "store_ember.dat.bak", "store_ember.dat.bak.notes"] {
+            std::fs::write(dir.join(leftover), b"x").unwrap();
+        }
+
+        for _ in 0..3 {
+            assert_eq!(load_store(&path).unwrap().len(), 3);
+        }
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["store_ember.dat", "store_ember.dat.bak", "store_ember.dat.bak.notes", "store_ember.dat.partial"]
+        );
+        assert_eq!(std::fs::read(dir.join("store_ember.dat.partial")).unwrap(), whole[..whole.len() - 100]);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -562,6 +562,16 @@ pub(super) fn name_bytes_from_record_data(data: &[u8]) -> Option<&[u8]> {
     data.get(RECORD_HEADER_LEN..RECORD_HEADER_LEN + name_len)
 }
 
+/// The buddy address a source record body's signed trailer names; `None` for
+/// any other record type, a malformed contact block, or a contact without one.
+pub(super) fn source_buddy_ip_from_record_data(data: &[u8]) -> Option<Ipv4Addr> {
+    if data.first() != Some(&RECORD_TYPE_SOURCE) {
+        return None;
+    }
+    let name_len = name_bytes_from_record_data(data)?.len();
+    decode_source_contact(data, RECORD_HEADER_LEN + name_len)?.buddy.map(|buddy| buddy.ip)
+}
+
 /// Whether a record body `data_len` bytes long may carry a name the publisher
 /// shortened to fit [`messages::MAX_STORE_RECORD_BYTES`]. The clamp backs off
 /// to a UTF-8 boundary and then to the end of a word, so a clamped body can end
@@ -2755,7 +2765,7 @@ impl SignedRecord {
         if data.len() < 115 + name_len {
             return false;
         }
-        if data[0] == RECORD_TYPE_SOURCE && data.len() < 115 + name_len + SOURCE_CONTACT_WIRE_LEN {
+        if data[0] == RECORD_TYPE_SOURCE && decode_source_contact(data, 115 + name_len).is_none() {
             return false;
         }
         if matches!(data[0], RECORD_TYPE_CHANNEL | RECORD_TYPE_FEED | RECORD_TYPE_FEED_LISTING)
@@ -3709,6 +3719,9 @@ pub struct PublishOperation {
     /// STOREs handed to the transport. A target whose STORE could not be
     /// sent is failed without counting here.
     pub sent: usize,
+    /// A record fanned out as a publisher's buddy, whose STOREs are charged
+    /// to each storer's forwarding share as they are sent.
+    pub forwarded: bool,
     /// Outstanding request IDs mapped to node IDs.
     pub pending_requests: HashMap<u32, EmberNodeId>,
     pub started_at: Instant,
@@ -3731,6 +3744,7 @@ impl PublishOperation {
             acked: Vec::new(),
             failed: Vec::new(),
             sent: 0,
+            forwarded: false,
             pending_requests: HashMap::new(),
             started_at: Instant::now(),
             complete: false,
@@ -5647,6 +5661,67 @@ mod tests {
         let mut buf = Vec::new();
         encode_source_contact(&mut buf, &zero);
         assert_eq!(buf.len(), SOURCE_CONTACT_WIRE_LEN, "port 0 is not written");
+    }
+
+    /// The cheap authenticity check refuses what `from_wire` refuses: a source
+    /// whose contact flags a QUIC port it has no room for, and which would
+    /// otherwise take a result slot only to be dropped at the far end.
+    #[test]
+    fn a_source_flagging_a_quic_port_it_lacks_is_not_authentic() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x5C; 32]);
+        let contact = SourceContact {
+            ip: Ipv4Addr::new(203, 0, 113, 7),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: crate::network::ember::SOURCE_FLAG_FIREWALLED,
+            noise_pub: [0x33; 32],
+            quic_port: Some(4711),
+            ..SourceContact::default()
+        };
+        let blob = |record: &SignedRecord| [record.data.as_slice(), &record.signature].concat();
+        let good = SignedRecord::source([1; 16], [0; 32], 10, "q.iso", contact, &sk);
+        assert!(SignedRecord::value_blob_is_authentic(&blob(&good)));
+        assert_eq!(
+            source_buddy_ip_from_record_data(&good.data),
+            None,
+            "no buddy named"
+        );
+
+        let plain = SignedRecord::source([1; 16], [0; 32], 10, "q.iso", SourceContact { quic_port: None, ..contact }, &sk);
+        let mut data = plain.data.clone();
+        data[RECORD_HEADER_LEN + "q.iso".len() + 8] |= SOURCE_CONTACT_FLAG_QUIC_PORT;
+        let signature = crypto::sign(&sk, &data);
+        assert!(SignedRecord::from_wire(&data, signature).is_none());
+        let mut forged = data.clone();
+        forged.extend_from_slice(&signature);
+        assert!(!SignedRecord::value_blob_is_authentic(&forged));
+    }
+
+    #[test]
+    fn a_source_records_trailer_names_its_buddy() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x5D; 32]);
+        let buddy_ip = Ipv4Addr::new(198, 51, 100, 9);
+        let contact = SourceContact {
+            ip: Ipv4Addr::new(10, 0, 0, 7),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: crate::network::ember::SOURCE_FLAG_FIREWALLED,
+            noise_pub: [0x33; 32],
+            callback_token: Some([0x55; 16]),
+            buddy: Some(SourceBuddy {
+                ip: buddy_ip,
+                udp_port: 4672,
+                noise_pub: [0x66; 32],
+                ed25519_pub: [0x77; 32],
+                endorsed_until: 1_900_000_000,
+                endorsement: [0x88; 64],
+            }),
+            ..SourceContact::default()
+        };
+        let record = SignedRecord::source([2; 16], [0; 32], 10, "b.iso", contact, &sk);
+        assert_eq!(source_buddy_ip_from_record_data(&record.data), Some(buddy_ip));
+        let keyword = SignedRecord::keyword("b", [2; 16], [0; 32], 10, "b.iso", &sk);
+        assert_eq!(source_buddy_ip_from_record_data(&keyword.data), None);
     }
 
     #[test]

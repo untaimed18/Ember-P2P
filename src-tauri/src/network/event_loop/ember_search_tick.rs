@@ -351,6 +351,10 @@ pub(in crate::network) async fn on_ember_search_tick(
     if !state.ember_pending_source_injections.is_empty() {
         let entries = std::mem::take(&mut state.ember_pending_source_injections);
         let we_are_unreachable = ember_tcp_firewalled(state);
+        // Publishers refuse to connect back to a well-known port, so on one
+        // the callback path is closed to us as surely as when firewalled.
+        let no_connect_back =
+            we_are_unreachable || !ember_callback_port_accepted(advertised_tcp_port(state));
 
         // Firewalled records that name a usable buddy, when we can
         // accept a TCP connect-back, take the Ember CALLBACK_REQ
@@ -386,7 +390,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                     .is_some_and(|b| state.ember_dht.buddy_endpoint_corroborated(&b));
                 if ember_source_uses_callback(
                     src,
-                    we_are_unreachable,
+                    no_connect_back,
                     buddy_blocked_or_banned,
                     buddy_corroborated,
                     now_ts,

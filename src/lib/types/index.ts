@@ -516,7 +516,7 @@ export interface EmberDiagnostics {
   ember_dht_refused_per_ip?: number;
   /** Slice 14: STORE frames rejected as short-window signature replays. */
   ember_dht_store_replays: number;
-  /** Slice 15: LowID/firewalled but still publishing Ember DHT sources. */
+  /** Slice 15: TCP firewalled, publishing Ember DHT sources through an endorsed buddy. */
   ember_dht_firewalled_publishing: boolean;
   /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
   ember_dht_waiting_buddy: boolean;
@@ -530,6 +530,10 @@ export interface EmberDiagnostics {
   ember_dht_buddy_publishes: number;
   /** PROXY_STORE requests accepted and fanned out as a buddy. */
   ember_dht_buddy_forwards: number;
+  /** Storers that took a record we fanned out as a buddy (not our own records). */
+  ember_dht_buddy_forward_stores_acked?: number;
+  /** Storers that refused or never answered one of those records. */
+  ember_dht_buddy_forward_stores_failed?: number;
   /** Firewalled sources parked because the named buddy never signed for that endpoint. */
   ember_dht_buddy_unendorsed?: number;
   /** Requests sent asking a reachable peer to relay for us while firewalled. */

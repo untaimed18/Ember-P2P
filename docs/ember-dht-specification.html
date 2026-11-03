@@ -813,9 +813,11 @@ footer.doc-end {
 <p>
   <code>encode_message</code> serializes version, type, request id, sender id,
   public key, payload length, and payload, then appends a 64-byte
-  Ed25519 signature over every preceding byte. <code>decode_message</code>
-  verifies that signature and the <code>sender_id == BLAKE3(pubkey)[..16]</code>
-  binding <em>before</em> constructing a <code>DhtMessage</code>. An invalid
+  Ed25519 signature over every preceding byte, the domain tag
+  <code>ember-dht-frame-v&lt;frame version&gt;</code> (<code>ember-dht-frame-v4</code>
+  today), and, from v4, the sender's own Noise static key. <code>decode_message</code>
+  checks the <code>sender_id == BLAKE3(pubkey)[..16]</code> binding, then the
+  signature, <em>before</em> constructing a <code>DhtMessage</code>. An invalid
   frame never becomes a message object. This build always includes the public
   key on the wire.
 </p>
@@ -916,12 +918,26 @@ footer.doc-end {
   <thead><tr><th>Limit</th><th>Value</th><th>Why</th></tr></thead>
   <tbody>
     <tr><td>SESSION_TIMEOUT</td><td>900 s</td><td>Must outlive the 600 s liveness-ping interval; 300 s forced a fresh handshake on every ping</td></tr>
-    <tr><td>MAX_SESSIONS</td><td>4096</td><td>LRU eviction when full</td></tr>
+    <tr><td>MAX_SESSIONS</td><td>4096</td><td>When full, the newest unvalidated session goes first; LRU among validated ones only after that</td></tr>
     <tr><td>MAX_SESSIONS_PER_ADDR</td><td>4</td><td>Claimants coexist; keyed on (address, static key)</td></tr>
-    <tr><td>Pending handshakes</td><td>512</td><td>Caps unauthenticated work</td></tr>
+    <tr><td>Pending handshakes</td><td>512</td><td>Caps unauthenticated work; inbound responder entries are evicted before our own dials, newest first</td></tr>
+    <tr><td>Handshake budget</td><td>256/s, burst 1,024</td><td>Shared by IK and XX responders (about 200 µs each); each source /24 (IPv6 /48) also has its own 8/s, burst 32, checked first, and an init that fails to read is charged to a separate 1,024/s allowance and its prefix, so spoofed junk cannot shut out first contact</td></tr>
     <tr><td>MAX_EMBER_DATAGRAM_BYTES</td><td>4096</td><td>Hard drop before decryption; sender sees a “successful” send</td></tr>
   </tbody>
 </table>
+<p>
+  We seal only into a session whose address is proven: a session we answered as
+  responder is not sent on until the peer's first frame decrypts in it, and a
+  send meanwhile dials the peer, whose validated session replaces it (the one
+  exception is the session a lost crossing leaves, which already holds our first
+  message). A first message too large to ride in the IK or XX handshake goes as
+  a transport packet behind an empty handshake message. Contact lists drop
+  low-order Noise keys at decode, and we never dial one. The send nonce stops at
+  its ceiling and the session is dropped for a fresh handshake. Only QUIC
+  connections we open are recorded as dials; a Retry or other answer to a
+  stranger is not, and the QUIC accept loop refuses banned or filtered sources
+  before any Retry.
+</p>
 <p>
   Sessions are keyed on <code>(address, static key)</code>, so claimants at one
   address coexist instead of ranking for a single live slot. Four matches the
@@ -1119,8 +1135,9 @@ footer.doc-end {
   <span class="c-green">sender_pub</span>  32 B    Ed25519 public key; always present in this build<br>
   <span class="c-muted">payload_len</span> u16 LE  ≤ MAX_DELIVERABLE_PAYLOAD<br>
   <span class="c-white">payload</span>     N B    message-specific<br>
-  <span class="c-red">signature</span>   64 B    Ed25519 over every preceding byte
-                        plus the sender's own Noise static key (v4, not sent)
+  <span class="c-red">signature</span>   64 B    Ed25519 over every preceding byte, the domain
+                        tag "ember-dht-frame-v" + version, and the sender's
+                        own Noise static key (v4, not sent)
 </div>
 <p>
   The encoder always includes the sender’s 32-byte Ed25519 public key

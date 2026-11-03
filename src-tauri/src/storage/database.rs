@@ -5059,6 +5059,15 @@ impl Database {
         Ok(())
     }
 
+    /// Forget the Ember digest a download is held to, after its completion
+    /// check refuted a digest only remote say-so stood behind. Narrow, unlike
+    /// `save_transfer`, so it cannot race the status writes.
+    pub fn clear_transfer_ember_file_hash(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE transfers SET ember_file_hash = NULL WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn get_incomplete_downloads(&self) -> anyhow::Result<Vec<Transfer>> {
         self.get_incomplete_downloads_page(usize::MAX, 0)

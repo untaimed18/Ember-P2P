@@ -4769,8 +4769,13 @@ fn highid_source_records_cache_bound_noise_keys() {
     let mut diag = crate::types::EmberDiagnostics::default();
     let mut noise_keys = HashMap::new();
     let mut content_hashes = HashMap::new();
+    // Returned by a second /24 as well: a key is cached only from a record
+    // an honest storer vouches for.
+    let mut held = held_records(&[blob]);
+    held[0].confirmed_by = Some(ember::dht::EmberNodeId([0x7F; 16]));
+    held[0].confirmed_subnet = Some(0x7F);
     parse_ember_source_records(
-        &held_records(&[blob]),
+        &held,
         file_hash,
         None,
         &[0u8; 32],

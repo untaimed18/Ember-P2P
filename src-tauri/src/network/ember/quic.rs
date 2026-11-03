@@ -194,6 +194,9 @@ pub fn build_client_config(
     // generous windows and stream caps as inbound ones, instead of
     // running on whatever Quinn picked as a "safe" default.
     client_config.transport_config(build_transport_config());
+    // Random to the peer like quinn's own, but recognisable to the shared
+    // socket as a dial of ours; see `udp_mux::initial_dst_cid`.
+    client_config.initial_dst_cid_provider(Arc::new(super::udp_mux::initial_dst_cid));
 
     Ok(client_config)
 }

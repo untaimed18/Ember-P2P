@@ -614,8 +614,8 @@ a certainty, which is not the same as gone.
   still will not have all of them findable under it.
 - Gossip contacts are unverified until the node hears from them directly
   (same as Kademlia). Admission is bounded by the diversity caps in
-  [`scale.rs`](../src-tauri/src/network/ember/dht/scale.rs), but there is
-  no reputation scoring on gossip itself.
+  [`scale.rs`](../src-tauri/src/network/ember/dht/scale.rs), and probing them
+  is rationed by the introducer's record (see Hardening below).
 - The diversity caps now apply to *residents* as well as to admission.
   `RoutingTable::enforce_scale_quotas` runs on the maintenance tick and
   demotes over-quota contacts to their bucket's replacement cache once the
@@ -720,9 +720,14 @@ against KAD.
 ### Integrity and downloads
 
 - ~~Surface BLAKE3 verify pass/fail in the transfer UI.~~ Pass is the Ember
-  badge on a completed row (`ember_verified`). Fail is a permanent download
-  failure with a red Ember badge; a mismatch no longer reopens parts that
-  already matched the ed2k hash, and the download is not re-queued.
+  badge on a completed row (`ember_verified`). A mismatch never reopens parts
+  that already matched the ed2k hash, and is reported only once the ed2k hash
+  and any AICH pin have matched. Against a digest hashed here or one a feed's
+  signed list gave, it is a permanent failure with a red Ember badge. Against
+  one only remote say-so stood behind (a DHT corroboration, or the digest on a
+  row a click pinned), the pin is dropped with the download's own copy, the
+  digest is remembered as refuted for the session so no walk pins it again, and
+  the download is re-queued to finish on its ed2k hash and AICH.
 - ~~Seed `emberFileHash` from more UI entry points when the digest is
   already known.~~ ed2k `eh=` links, friend-browse trailers, file-offer
   trailers, paste/deep-link, library copy, and friend accept all pass it
@@ -737,7 +742,25 @@ against KAD.
   The *routing table* is anchored on something scarce. Its caps are keyed on
   address and /24, not on identity, so a keypair buys nothing on its own — and
   `enforce_scale_quotas` closed the last hole, where a share admitted under the
-  cold-start tier was kept for the life of the process.
+  cold-start tier was kept for the life of the process. An address, though, is
+  free to *claim*: unproven leads count toward those caps too, so leads gossiped
+  at a peer's address or /24 from node ids in other buckets used to hold the
+  share the peer itself needed. A verified newcomer now takes it back from a lead
+  holding it in any bucket (`RoutingTable::lead_holding`), not only its own.
+
+  *Lookups* keep the same limits on their shortlist: at most 3 entries per /24
+  and 2 per address (`MAX_SHORTLIST_ENTRIES_PER_SUBNET`, `_PER_IP`), and the
+  per-referrer quota is the responder's /24's, so one host's ground keys cannot
+  fill the closest set a walk ends on or publishes to.
+
+  *Keys* are not all bound alike. Room governance, key epochs, owned-rooms lists
+  and feed heads can only be made by the key's owner; sources, room listings and
+  claims and feed listings have their key checked against their body; keyword
+  and presence records go wherever their signer files them. A responder serves a
+  key's records in that order, and a full key makes room for an owner-made
+  record by dropping the newest loosely filed record of whoever holds the most
+  there (`store::key_binding`), so keyword records filed under a room's handoff
+  or epoch key can neither bury nor shut out the record it exists for.
 
   **Gossip is now scored, which was the remaining gap here.** Naming a contact
   was free and unpriced: a peer could hand out addresses that never answer,
@@ -747,8 +770,10 @@ against KAD.
   them, and eleven consecutive `Too many active Ember searches` in two
   milliseconds is what that looks like from inside.
   [`dht/gossip.rs`](../src-tauri/src/network/ember/dht/gossip.rs) tracks, per
-  introducer, how many of the leads we *probed* went on to answer, and trickles
-  the probes for one whose leads almost never do.
+  introducer /24 (IPv6 /48), how many of the leads we *probed* went on to
+  answer, and trickles the probes for one whose leads almost never do. Leads an
+  `ANNOUNCE_PEER` names are probed at once at most every 20 seconds per /24;
+  past that they wait for the maintenance tick.
 
   Four properties are deliberate, because each is a way this could cost more
   than the problem:
@@ -773,11 +798,15 @@ against KAD.
   introducer gauge beside it separate "nobody is naming anyone reachable" from
   "a few peers are naming a great many unreachable ones".
 
-  What this does *not* price is identity rotation: a Sybil can spend a fresh
-  keypair per round to reset its record. That costs it a keypair per round of
-  leads and buys it no more than it had before, so it is a rate limit rather
-  than a defence — the volume half still needs something scarcer, which is the
-  proof-of-work note below.
+  Being keyed on the introducer's /24, a fresh keypair no longer resets the
+  record; only a fresh /24 does, which is a rate limit rather than a defence —
+  the volume half still needs something scarcer, which is the proof-of-work
+  note below.
+
+  A lead that has missed a ping no longer holds its node id against every other
+  claim: a lead naming another address or key replaces it (keeping its strikes,
+  so rotating endpoints cannot keep an unanswering id alive), and a saved
+  address that answered us in an earlier session is offered ahead of it.
 
   The *store* is not, and its caps cannot be fixed the same way. They —
   `MAX_RECORDS_PER_PUBLISHER_PER_KEY` (150), `MAX_KEYS_PER_PUBLISHER` (6,250),
@@ -809,8 +838,14 @@ against KAD.
     others* — a user's own searches walk outward, and their own records enter
     through `store_own_record`, which never touches this path. Poisoning costs
     the network aggregate index quality, not the operator anything they would
-    notice, and the magnitude is already bounded by `MAX_STORE_BYTES` and
-    `MAX_STORE_IDENTITIES_PER_ADDR` (8).
+    notice, and the magnitude is bounded by `MAX_STORE_BYTES` and by the
+    key-cap rule: at the 50,000-key cap a key we do not hold displaces only a
+    key one publisher alone holds with no owner-made record on it
+    (`key_is_displaceable`), so planted keys cannot push out keys honest
+    publishers share. (`MAX_STORE_IDENTITIES_PER_ADDR` limits frame senders per
+    address, not the publisher keys records carry.) Name keys a lookup can match
+    are charged to the store's byte budget with their record, but not to the
+    publisher's share, which counts the record alone.
   - The cost lands on planned work. It makes record *validity* depend on the
     tokenizer, so the "richer keyword indexing (stemming, more than space-split
     tokens)" item under Search and publish stops being a drop-in change: new
@@ -850,11 +885,15 @@ against KAD.
   correctness. A keyword row's availability and the digest a download enforces
   are both votes among publishers, and a single responder can answer with as
   many freshly keyed records as it likes. A digest that wins that vote pins a
-  BLAKE3 the real file does not have: every eD2K part verifies, the content check
-  fails, and the download is failed rather than re-queued. So the searcher
-  counts responders as well as publishers. On its own word, one node's answer
-  contributes at most `MAX_PUBLISHERS_PER_FILE_PER_NODE` (5) keyword records per
-  file and digest to a search (our own store's seed counts as one node); the rest
+  BLAKE3 the real file does not have: every eD2K part verifies and the content
+  check fails (a remote pin is then dropped and the download re-queued, see
+  Integrity, but the whole file was read for nothing). So the searcher
+  counts responders as well as publishers. On its own word, one responder's
+  answer — a responder being its /24 (IPv6 /48) wherever its address is known,
+  so keys on one host share one allowance — contributes at most
+  `MAX_PUBLISHERS_PER_FILE_PER_NODE` (5) keyword records per file and digest to
+  a search, across the main walk and its feeding walks, and at most its share of
+  the result budget (our own store's seed counts as one); the rest
   are held, and taken only when a node in another /24 returns the same record
   (each confirmer unlocking at most four shares' worth per file and digest) or
   the walk ends with that node the only one to have returned a record, our own
@@ -865,18 +904,69 @@ against KAD.
   `MIN_EMBER_DIGEST_RESPONDERS` (2) distinct responders, where a record two
   responders both returned counts as two. A responder is its /24 when the search
   knows the address (`EmberResponder`), because a node id is only a keypair and
-  one host answering under several keys used to corroborate a digest alone. That
-  bounds what a responder can fabricate in its own reply: the attack costs a
-  second node in another /24 on the searcher's shortlist, not a second keypair.
+  one host answering under several keys used to corroborate a digest alone. A
+  search answer is taken only from the address the query went to
+  (`EmberSearchRequest::sent_to`), and request ids step by a random amount, so a
+  host cannot answer from its own address for keys it gossiped elsewhere and
+  pass for nodes in other /24s. That bounds what a responder can fabricate in its
+  own reply: the attack costs a second node in another /24 on the searcher's
+  shortlist, not a second keypair.
 
   It does not bound what a node can STORE. The storers near a keyword return
   records planted on them as their own, so a fake digest planted there arrives
   with as many responders as the real one. What keeps that from choosing the pin
-  is that a contested file — more than one digest clearing both thresholds — is
-  not pinned at all, and its row carries no digest for a click to pin either.
-  Planting beside the real records can therefore suppress the optional BLAKE3
-  check, leaving the eD2K/AICH hashes to carry verification, but not choose it.
-  Neither rule bounds colluding nodes.
+  is that a contested file — more than one digest vouched for by
+  `MIN_EMBER_DIGEST_RESPONDERS` responders, however many publishers name each —
+  is not pinned at all, and its row carries no digest for a click to pin either.
+  (Requiring the rival to have two publishers as well let two planted keys
+  outvote a file's one real publisher.) Planting beside the real records can
+  therefore suppress the optional BLAKE3 check, leaving the eD2K/AICH hashes to
+  carry verification, but not choose it. Neither rule bounds colluding nodes.
+
+  A search also stops asking new nodes after 110 (`MAX_NODES_QUERIED_PER_SEARCH`)
+  and ends after 2,400 signature checks (`MAX_BLOBS_VERIFIED_PER_SEARCH`), so a
+  chain of fast-answering identities cannot keep one verifying for its whole
+  minute. A source lookup takes vouched sources first and at most 10 unvouched
+  HighID sources per responder and 20 per lookup, in turns, so one responder
+  cannot aim every downloader's dials at a host of its choice; Noise keys are
+  cached only from vouched HighID records or our own store.
+
+  A firewalled publisher's connect-backs are charged to the searcher, 8 a minute
+  per address and 16 per /24 through any buddy, within 32 in flight: the callback
+  token is in the public source record, and a per-buddy charge let one reader of
+  it spend every honest searcher's turn. A connect-back never goes to a port
+  below 1024. A buddy endorses at most 16 publishers per address and 64 per /24
+  within an endorsement's life, proxies a file for only as many publishers per
+  /24 as a storer allows one address, refuses records with no callback token,
+  and forwards at most 60 at once, 24 a minute per address and 32 per /24.
+  Storers grant the relayed (4×) source allowance only to a record that arrives
+  from the buddy its own trailer names; any other firewalled record takes its
+  sender's direct cap. We send no `CALLBACK_REQ` while our own TCP port is
+  below 1024, and such sources take the park/broker path instead.
+
+  On the publishing side, "Relayed" means our TCP port is firewalled and a buddy
+  is named; a node with TCP open and UDP closed publishes its own address and
+  asks no buddy. A `PROXY_STORE` the buddy refused (it acked something sent no
+  earlier) holds the file back 15 minutes, without the failed-round charge a
+  storer's refusal earns, since an ask lost on the way looks the same; a silent
+  buddy's is released at once, as skipping it already covers that. A buddy
+  whose key or IP address no longer matches its endorsement (a NAT-remapped
+  port does not count), or that is
+  skipped, has the endorsement dropped and is asked again at once (then at most
+  every 5 minutes); while we wait, no buddy is named. Buddy choice, asks,
+  proxied stores and the keepalive skip banned peers and addresses the IP
+  policy refuses. Strangers' forwarded stores get their own 24 a minute of each
+  storer's budget, their lookups are queued only once the commit succeeds, and
+  their results are counted apart from ours. Only answers to our own requests,
+  and `ANNOUNCE_PEER`, put gossiped contacts in the table or the session map.
+
+  Firewalled publishing has a ceiling the per-buddy rate sets: 24 `PROXY_STORE`s
+  a minute is 2,880 per 2-hour republish interval, up to 4 a minute going to
+  feed lists, so about 2,400 Library files keep the full cadence, and with the
+  6-hour record life up to about 8,640 stay listed at a slower one. A buddy also
+  remembers callbacks for only the 1,024 files a publisher proxied through it
+  most recently, so older files' searchers fall back to the park/broker path:
+  in practice about 1,024 callable files per buddy.
 
   **"If abuse appears" is now a number rather than a judgement.**
   `MAX_STORE_IDENTITIES_PER_ADDR` (8) is the only cap keyed on something a
@@ -896,10 +986,14 @@ against KAD.
   dial pending to that identity, it makes that node drop its initiator and seal
   the first message and queue into a session the real peer cannot read. The real
   `IK_RESP` then finds no pending handshake, and sends go into the unproven
-  session until a liveness fault or `SESSION_TIMEOUT`. With no dial pending the
-  same replay already installs an unproven session that sends go into; that
-  predates the settlement. Either needs a captured init and a way to send from
-  the peer's address, and for the crossing, timing against our dial.
+  session until a liveness fault or `SESSION_TIMEOUT`. It needs a captured init,
+  a way to send from the peer's address, and timing against our dial.
+
+  The case with no dial pending is closed (1.7.6): `prepare_outgoing` seals only
+  into a session whose address is proven, and otherwise dials the peer, whose
+  answer replaces the replayed session; `has_live_session` likewise counts only
+  a proven session. The session a lost crossing leaves is the one exception —
+  our first message is already in it — so the crossing replay below stays open.
 
   Not fixed in 1.7.1 because each narrow change found trades this for an honest
   fault. Keeping the initiator so the real `IK_RESP` can still complete it lets

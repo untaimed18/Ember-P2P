@@ -5,6 +5,7 @@
 //! way `command.rs` does.
 
 use super::*;
+use super::ember_publish::EmberProxyAskExpiry;
 
 /// Feed records we already hold for `key` into a lookup that has just started.
 ///
@@ -1324,15 +1325,20 @@ pub(super) async fn drive_ember_publish(socket: &UdpSocket, state: &mut NetworkS
             }
             continue;
         }
-        if let Some(op) = state.ember_publish.get_mut(publish_id) {
+        let forwarded = state.ember_publish.get_mut(publish_id).is_some_and(|op| {
             op.sent += 1;
-        }
+            op.forwarded
+        });
         // The storer charges a single STORE to the same per-node budget as a
         // batch, so the batch pacing has to see it too, or the batch that
         // follows overruns the budget and is refused whole, unacked.
+        let sent_at = std::time::Instant::now();
         state
             .ember_batch_publish
-            .note_records_sent(contact.node_id, std::time::Instant::now(), 1);
+            .note_records_sent(contact.node_id, sent_at, 1);
+        if forwarded {
+            state.ember_batch_publish.note_forwarded(contact.node_id, sent_at);
+        }
 
         let budget = if behind_handshake {
             EMBER_SEARCH_QUEUED_QUERY_TIMEOUT
@@ -1366,6 +1372,7 @@ pub(super) fn ember_publish_result(op: &ember::dht::publish::PublishOperation) -
 /// failed, or timed out. Safe to call after every batch / ack; a no-op
 /// while stores are still outstanding.
 pub(super) fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u32) {
+    let ours = state.ember_dht.ed25519_public_key();
     let result = match state.ember_publish.get_mut(publish_id) {
         Some(op) => {
             if !op.poll_complete() {
@@ -1373,22 +1380,35 @@ pub(super) fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u
             }
             let acked = op.acked.len() as u32;
             let failed = (op.targets.len().saturating_sub(op.acked.len())) as u32;
-            state.ember_diagnostics.ember_dht_stores_acked = state
-                .ember_diagnostics
-                .ember_dht_stores_acked
-                .saturating_add(acked);
-            state.ember_diagnostics.ember_dht_stores_failed = state
-                .ember_diagnostics
-                .ember_dht_stores_failed
-                .saturating_add(failed);
-            state.ember_diagnostics.ember_dht_replication_sum = state
-                .ember_diagnostics
-                .ember_dht_replication_sum
-                .saturating_add(acked as u64);
-            state.ember_diagnostics.ember_dht_publishes_completed = state
-                .ember_diagnostics
-                .ember_dht_publishes_completed
-                .saturating_add(1);
+            // A buddy's fan-out of someone else's record says nothing about how
+            // our own publishing is doing. Only a source record arrives that
+            // way, and only one signed by its publisher.
+            if op.record.record_type == ember::dht::publish::RECORD_TYPE_SOURCE
+                && op.record.publisher_key != ours
+            {
+                let diag = &mut state.ember_diagnostics;
+                diag.ember_dht_buddy_forward_stores_acked =
+                    diag.ember_dht_buddy_forward_stores_acked.saturating_add(acked);
+                diag.ember_dht_buddy_forward_stores_failed =
+                    diag.ember_dht_buddy_forward_stores_failed.saturating_add(failed);
+            } else {
+                state.ember_diagnostics.ember_dht_stores_acked = state
+                    .ember_diagnostics
+                    .ember_dht_stores_acked
+                    .saturating_add(acked);
+                state.ember_diagnostics.ember_dht_stores_failed = state
+                    .ember_diagnostics
+                    .ember_dht_stores_failed
+                    .saturating_add(failed);
+                state.ember_diagnostics.ember_dht_replication_sum = state
+                    .ember_diagnostics
+                    .ember_dht_replication_sum
+                    .saturating_add(acked as u64);
+                state.ember_diagnostics.ember_dht_publishes_completed = state
+                    .ember_diagnostics
+                    .ember_dht_publishes_completed
+                    .saturating_add(1);
+            }
             ember_publish_result(op)
         }
         None => return,
@@ -2505,6 +2525,9 @@ pub(super) async fn keep_named_buddy_reachable(socket: &UdpSocket, state: &mut N
     let Some(contact) = state.ember_dht.contact_for(&buddy).cloned() else {
         return;
     };
+    if ember_addr_ip_verdict(state, contact.addr).refuses() {
+        return;
+    }
     state.ember_buddy_keepalive_at = Some(now);
     super::channel_relay::ping_ember_udp_peer(socket, state, contact.addr, Some(&contact.noise_pub)).await;
 }
@@ -2581,6 +2604,12 @@ pub(super) fn ember_named_source_buddy(
     now: i64,
 ) -> Option<ember::dht::publish::SourceBuddy> {
     let endorsement = state.ember_dht.buddy_endorsement(&contact.node_id, now)?;
+    if state
+        .ember_proxy_buddies
+        .endorsement_dropped(&contact.node_id, &endorsement.signature)
+    {
+        return None;
+    }
     // A record lives six hours and is republished every two, and searchers
     // refuse an endorsement past its expiry. Naming one that dies before the
     // next republish left each record published in its last two hours
@@ -2799,6 +2828,46 @@ pub(super) fn retract_ember_publish(
     }
 }
 
+/// How long a file whose `PROXY_STORE` the buddy refused waits before it is
+/// offered again.
+pub(super) const EMBER_PROXY_REFUSED_RETRY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Settle the round of a source record whose `PROXY_STORE` ask expired
+/// unacked, by what the buddy's silence meant. Returns whether it closed a
+/// round that had placed something, which the caller owes
+/// [`note_ember_file_published`].
+///
+/// A refused file is held back [`EMBER_PROXY_REFUSED_RETRY`]. Released
+/// as it was, a file the buddy will never take (a per-file or per-/24 share
+/// already full, a record it cannot use) ranked first again on the next tick,
+/// and enough of them held every proxy slot each minute while the rest of a
+/// firewalled library never republished. Not charged as a failed round,
+/// though: an ask merely lost on the way looks the same from here, and three
+/// such charges parked a file for the whole republish interval. A buddy that
+/// went silent is no fault of the file's, and the skip deals with it.
+pub(super) fn settle_expired_proxy_ask(
+    mut schedule: EmberPublishSchedule<'_>,
+    reference: EmberRecordRef,
+    expiry: EmberProxyAskExpiry,
+    now: std::time::Instant,
+) -> bool {
+    match expiry {
+        EmberProxyAskExpiry::Refused => {
+            if untrack_ember_record_pending(schedule.reborrow(), reference) {
+                return true;
+            }
+            if reference.kind == EmberPublishKind::Source {
+                schedule.source_at.insert(reference.file_hash, now + EMBER_PROXY_REFUSED_RETRY);
+            }
+            false
+        }
+        EmberProxyAskExpiry::Silent
+        | EmberProxyAskExpiry::Skipped => {
+            untrack_ember_record_pending(schedule, reference)
+        }
+    }
+}
+
 pub(super) fn prune_ember_pending_proxy_overlay(state: &mut NetworkState) {
     let now = std::time::Instant::now();
     let expired: Vec<(ember::dht::EmberNodeId, u32, EmberRecordRef, std::time::Instant)> = state
@@ -2809,8 +2878,18 @@ pub(super) fn prune_ember_pending_proxy_overlay(state: &mut NetworkState) {
         .collect();
     for (buddy, rid, reference, asked_at) in expired {
         state.ember_pending_proxy_overlay.remove(&(buddy, rid));
-        state.ember_proxy_buddies.note_expired(buddy, asked_at, now);
-        drop_ember_record_pending(state, reference);
+        let expiry = state.ember_proxy_buddies.note_expired(buddy, asked_at, now);
+        if expiry == EmberProxyAskExpiry::Skipped {
+            let now_ts = chrono::Utc::now().timestamp();
+            if let Some(endorsement) = state.ember_dht.buddy_endorsement(&buddy, now_ts) {
+                state
+                    .ember_proxy_buddies
+                    .drop_endorsement(buddy, endorsement.signature, endorsement.expires_at);
+            }
+        }
+        if settle_expired_proxy_ask(state.publish_schedule(), reference, expiry, now) {
+            note_ember_file_published(state, reference.file_hash, reference.kind);
+        }
     }
 }
 
@@ -2868,9 +2947,9 @@ pub(super) fn ember_known_ipv4(state: &NetworkState) -> Option<std::net::Ipv4Add
 /// Whether the reachability verdict the last publish tick settled is out of
 /// date in a way the next tick would correct, so that tick is worth bringing
 /// forward: it had no IPv4 and one is known now, or it called for a relay and
-/// nothing does any more. Not while UDP is only assumed firewalled, the
-/// startup default before anything has measured it: a verdict settled then
-/// reads "relayed" and flips back once the check runs.
+/// TCP no longer reads firewalled, which is the only thing that does. An
+/// address found while UDP is only assumed firewalled, the startup default
+/// before anything has measured it, waits for the tick's own schedule.
 pub(super) fn ember_reachability_recheck_due_from(
     shown_no_ipv4: bool,
     shown_relayed: bool,
@@ -2880,9 +2959,26 @@ pub(super) fn ember_reachability_recheck_due_from(
     udp_measured: bool,
     udp_proven: bool,
 ) -> bool {
-    let udp_needs_help = udp_firewalled && !udp_proven;
-    let udp_assumed = udp_needs_help && !udp_measured;
-    (shown_no_ipv4 && ipv4_known && !udp_assumed) || (shown_relayed && !tcp_firewalled && !udp_needs_help)
+    let udp_assumed = udp_firewalled && !udp_proven && !udp_measured;
+    (shown_no_ipv4 && ipv4_known && !udp_assumed) || (shown_relayed && !tcp_firewalled)
+}
+
+/// The reachability flags the source publisher shows, as `(udp_unreachable,
+/// waiting_buddy, firewalled_publishing)`; all three false reads "Direct".
+///
+/// Only TCP decides between direct and relayed. A node whose TCP port is open
+/// puts its own address in its records and asks no buddy, however its UDP
+/// port stands, so it must not read "relayed".
+pub(super) fn ember_reachability_flags(
+    ipv4_known: bool,
+    tcp_firewalled: bool,
+    buddy_named: bool,
+) -> (bool, bool, bool) {
+    (
+        !ipv4_known,
+        ipv4_known && tcp_firewalled && !buddy_named,
+        ipv4_known && tcp_firewalled && buddy_named,
+    )
 }
 
 /// [`ember_reachability_recheck_due_from`] for the running state. Mirrors the
@@ -2926,9 +3022,143 @@ mod ember_reachability_recheck_tests {
     fn a_relayed_verdict_is_corrected_once_nothing_calls_for_a_relay() {
         assert!(due(false, true, true, false, false, true, false));
         assert!(due(false, true, true, false, true, true, true), "Ember proved UDP");
-        assert!(!due(false, true, true, false, true, true, false), "UDP measured firewalled");
+        // TCP open publishes direct however UDP stands, so only TCP keeps it.
+        assert!(due(false, true, true, false, true, true, false), "UDP measured firewalled");
+        assert!(due(false, true, true, false, true, false, false), "UDP only assumed");
         assert!(!due(false, true, true, true, false, true, false), "TCP firewalled");
-        assert!(!due(false, true, true, false, true, false, false), "UDP only assumed");
+        assert!(!due(false, true, true, true, true, false, false), "TCP and UDP firewalled");
+    }
+
+    #[test]
+    fn only_a_firewalled_tcp_port_reads_relayed() {
+        use super::ember_reachability_flags as flags;
+        // TCP open, UDP closed: published direct, no buddy, so "Direct".
+        assert_eq!(flags(true, false, false), (false, false, false));
+        assert_eq!(flags(true, true, false), (false, true, false), "waiting for a buddy");
+        assert_eq!(flags(true, true, true), (false, false, true), "relayed through one");
+        assert_eq!(flags(false, true, true), (true, false, false), "no address yet");
+    }
+}
+
+#[cfg(test)]
+mod ember_buddy_publish_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Maps {
+        unplaced: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+        placed: HashSet<([u8; 16], EmberPublishKind)>,
+        partial: HashMap<([u8; 16], EmberPublishKind), HashSet<[u8; 16]>>,
+        retry_keys: HashMap<[u8; 16], HashSet<[u8; 16]>>,
+        retries_spent: HashSet<[u8; 16]>,
+        attempts: HashMap<([u8; 16], EmberPublishKind), EmberPublishAttempts>,
+        source_at: HashMap<[u8; 16], std::time::Instant>,
+        keyword_at: HashMap<[u8; 16], std::time::Instant>,
+    }
+
+    impl Maps {
+        fn schedule(&mut self) -> EmberPublishSchedule<'_> {
+            EmberPublishSchedule {
+                unplaced: &mut self.unplaced,
+                placed: &mut self.placed,
+                partial: &mut self.partial,
+                retry_keys: &mut self.retry_keys,
+                retries_spent: &mut self.retries_spent,
+                attempts: &mut self.attempts,
+                source_at: &mut self.source_at,
+                keyword_at: &mut self.keyword_at,
+            }
+        }
+    }
+
+    fn source_ref(file: u8) -> EmberRecordRef {
+        EmberRecordRef {
+            file_hash: [file; 16],
+            kind: EmberPublishKind::Source,
+            key: ember::dht::publish::source_key(&[file; 16]),
+        }
+    }
+
+    /// A file the buddy turned away waits a while instead of taking a proxy
+    /// slot on every tick, without being charged a failed round, which an ask
+    /// lost on the way would earn too; one lost to a silent buddy is released
+    /// as it was.
+    #[test]
+    fn a_proxy_ask_the_buddy_refused_holds_its_file_back_a_while() {
+        let mut maps = Maps::default();
+        let refused = source_ref(1);
+        let start = std::time::Instant::now();
+        for round in 1..=EMBER_PUBLISH_MAX_ATTEMPTS + 1 {
+            let now = start + (EMBER_BATCH_ACK_TIMEOUT + std::time::Duration::from_secs(1)) * round;
+            track_ember_record_pending(maps.schedule(), refused);
+            assert!(!settle_expired_proxy_ask(maps.schedule(), refused, EmberProxyAskExpiry::Refused, now));
+            assert!(!maps.unplaced.contains_key(&(refused.file_hash, refused.kind)));
+            assert!(!maps.attempts.contains_key(&(refused.file_hash, refused.kind)), "no failed round");
+            assert_eq!(maps.source_at.get(&refused.file_hash), Some(&(now + EMBER_PROXY_REFUSED_RETRY)));
+        }
+
+        let lost = source_ref(2);
+        for expiry in [EmberProxyAskExpiry::Silent, EmberProxyAskExpiry::Skipped] {
+            track_ember_record_pending(maps.schedule(), lost);
+            assert!(!settle_expired_proxy_ask(maps.schedule(), lost, expiry, start));
+            assert!(!maps.attempts.contains_key(&(lost.file_hash, lost.kind)));
+            assert!(!maps.source_at.contains_key(&lost.file_hash));
+            assert!(!maps.unplaced.contains_key(&(lost.file_hash, lost.kind)));
+        }
+    }
+
+    fn buddy_contact(addr: SocketAddr, noise_pub: [u8; 32]) -> ember::dht::EmberContact {
+        ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([9; 16]),
+            addr,
+            noise_pub,
+            ed25519_pub: [9; 32],
+            last_seen: 1,
+            failed_queries: 0,
+        }
+    }
+
+    fn endorsement(ip: Ipv4Addr, udp_port: u16, noise_pub: [u8; 32]) -> ember::dht::engine::BuddyEndorsement {
+        ember::dht::engine::BuddyEndorsement {
+            ed25519_pub: [9; 32],
+            ip,
+            udp_port,
+            noise_pub,
+            expires_at: 1,
+            signature: [0; 64],
+        }
+    }
+
+    /// The buddy accepts only trailers naming the key and endpoint it has now,
+    /// so an endorsement that names others is no use to name.
+    #[test]
+    fn an_endorsement_is_stale_once_the_buddy_moves_or_changes_key() {
+        let public = Ipv4Addr::new(80, 1, 2, 3);
+        let held = endorsement(public, 4672, [5; 32]);
+        let at = |ip: Ipv4Addr, port: u16| SocketAddr::from((ip, port));
+        assert!(!ember_buddy_endorsement_is_stale(&held, &buddy_contact(at(public, 4672), [5; 32])));
+        assert!(ember_buddy_endorsement_is_stale(&held, &buddy_contact(at(public, 4672), [6; 32])), "new key");
+        assert!(
+            !ember_buddy_endorsement_is_stale(&held, &buddy_contact(at(public, 4673), [5; 32])),
+            "a port its NAT remapped is still its own view"
+        );
+        assert!(
+            ember_buddy_endorsement_is_stale(&held, &buddy_contact(at(Ipv4Addr::new(80, 1, 2, 4), 4672), [5; 32])),
+            "new address"
+        );
+        let mapped = SocketAddr::new(IpAddr::V6(Ipv4Addr::new(80, 1, 2, 4).to_ipv6_mapped()), 4672);
+        assert!(ember_buddy_endorsement_is_stale(&held, &buddy_contact(mapped, [5; 32])));
+        // On our LAN we reach it at its private address; it signs its public one.
+        let lan = at(Ipv4Addr::new(192, 168, 1, 7), 4672);
+        assert!(!ember_buddy_endorsement_is_stale(&held, &buddy_contact(lan, [5; 32])));
+        assert!(ember_buddy_endorsement_is_stale(&held, &buddy_contact(lan, [6; 32])));
+    }
+
+    #[test]
+    fn no_callback_is_asked_to_a_port_publishers_refuse() {
+        for (port, ok) in [(0u16, false), (80, false), (1023, false), (1024, true), (4662, true)] {
+            assert_eq!(ember_callback_port_accepted(port), ok, "port {port}");
+        }
     }
 }
 
@@ -2945,8 +3175,9 @@ mod ember_reachability_recheck_tests {
 /// `SOURCE_FLAG_FIREWALLED | SOURCE_FLAG_RELAY_CAPABLE` so downloaders
 /// route LowID↔LowID via the Ember broker instead of a doomed TCP dial.
 /// Ember-only nodes with no TCP proof do not advertise FIREWALLED just
-/// because UPnP failed at startup. UDP-unreachable still asks a buddy and
-/// still advertises relay, without parking the TCP contact.
+/// because UPnP failed at startup. A UDP-unreachable node with TCP open
+/// publishes its direct contact itself, adding only `SOURCE_FLAG_RELAY_CAPABLE`;
+/// it names no buddy and asks none.
 pub(super) async fn maybe_publish_ember_sources(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -2969,7 +3200,7 @@ pub(super) async fn maybe_publish_ember_sources(
     // rejects a HighID source, and consume only CALLBACK_REQs FIREWALLED
     // trailers.
     let udp_needs_help = state.udp_firewalled && !ember_udp_reachable(state);
-    let needs_buddy = firewalled_like || udp_needs_help;
+    let relay_capable = firewalled_like || udp_needs_help;
 
     // TTL-expire source records still held for a buddy ACK, genuinely before
     // anything can return early. It needs no peers, no external IP and no TCP
@@ -2999,10 +3230,18 @@ pub(super) async fn maybe_publish_ember_sources(
 
     let known_ipv4 = ember_known_ipv4(state);
     // The HighID named in the trailer — and the only contact we PROXY_STORE.
-    let (buddy_candidates, named_buddy) = if firewalled_like {
+    let EmberBuddyChoice {
+        candidates: buddy_candidates,
+        named: named_buddy,
+        reask: buddy_reask,
+    } = if firewalled_like {
         ember_source_buddy_choice(state)
     } else {
-        (Vec::new(), None)
+        EmberBuddyChoice {
+            candidates: Vec::new(),
+            named: None,
+            reask: Vec::new(),
+        }
     };
     let waiting_buddy = firewalled_like && named_buddy.is_none();
     // Set before any of the returns below, which is what makes them truthful on
@@ -3010,13 +3249,30 @@ pub(super) async fn maybe_publish_ember_sources(
     // "Direct". With no routable IPv4 yet, firewalled seeders can't satisfy
     // anti-reflection and HighID seeders have nothing to claim, so both are
     // still being worked out. A firewalled node with no buddy is not reported as
-    // "relayed / sharing still works" while its source STORE is skipped.
-    state.ember_diagnostics.ember_dht_udp_unreachable = known_ipv4.is_none();
-    state.ember_diagnostics.ember_dht_waiting_buddy = known_ipv4.is_some() && waiting_buddy;
-    state.ember_diagnostics.ember_dht_firewalled_publishing =
-        known_ipv4.is_some() && !waiting_buddy && needs_buddy;
+    // "relayed / sharing still works" while its source STORE is skipped, and
+    // one whose TCP port is open publishes its own address, however closed its
+    // UDP port, so it reads "Direct".
+    (
+        state.ember_diagnostics.ember_dht_udp_unreachable,
+        state.ember_diagnostics.ember_dht_waiting_buddy,
+        state.ember_diagnostics.ember_dht_firewalled_publishing,
+    ) = ember_reachability_flags(known_ipv4.is_some(), firewalled_like, named_buddy.is_some());
     state.ember_diagnostics.ember_dht_reachability_known = true;
-    crate::network::feed_reach::note_source_publishing(known_ipv4.is_some() && !waiting_buddy);
+    // Nobody is our buddy while we wait for one, so nobody is kept reachable
+    // for. The records already out still name the last one, so the next buddy
+    // named makes them due again only if it is another, or moved.
+    if waiting_buddy {
+        state.ember_named_source_buddy = None;
+    }
+    // Whether source records can be placed, for the feeds' reach: not at all
+    // with Ember off or no TCP port; left as it was while there is nobody to
+    // place them with yet or uploads are halting, which pass.
+    let halting = state.uploads_halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed);
+    if !settings.ember_native_enabled || tcp_port == 0 {
+        crate::network::feed_reach::note_source_publishing(false);
+    } else if !halting && ember_publishable_peer_count(state) > 0 {
+        crate::network::feed_reach::note_source_publishing(known_ipv4.is_some() && !waiting_buddy);
+    }
 
     // Not serving: the upload listener is refusing every inbound connection,
     // so a source record placed now names a node that will not hand the file
@@ -3048,6 +3304,13 @@ pub(super) async fn maybe_publish_ember_sources(
     if state.external_ip.is_none() {
         set_external_ip(state, Some(external_ip));
         state.stats.external_ip = external_ip.to_string();
+    }
+
+    // A buddy whose endorsement we stopped naming is asked for a new one now,
+    // rather than on the renewal cadence hours later: until it answers, the
+    // records naming it go nowhere.
+    if !buddy_reask.is_empty() {
+        ask_ember_buddy_endorsements(socket, state, &buddy_reask).await;
     }
 
     if waiting_buddy {
@@ -3084,8 +3347,14 @@ pub(super) async fn maybe_publish_ember_sources(
         // restart, so the records restored with their stamps name last
         // session's buddy, or, on a node that was reachable before, no buddy
         // and a direct address nobody can dial.
-        if named_id.is_some() && named_id != state.ember_named_source_buddy {
-            state.ember_source_publish_at.clear();
+        if let Some((contact, buddy)) = named_buddy.as_ref() {
+            let named = (contact.node_id, buddy.ip, buddy.udp_port, buddy.noise_pub);
+            if state.ember_records_buddy != Some(named) {
+                state.ember_source_publish_at.clear();
+                state.ember_records_buddy = Some(named);
+            }
+        }
+        if named_id.is_some() {
             state.ember_named_source_buddy = named_id;
         }
         if let Some((contact, _)) = named_buddy.as_ref() {
@@ -3097,8 +3366,9 @@ pub(super) async fn maybe_publish_ember_sources(
                 ask_ember_buddy_endorsements(socket, state, std::slice::from_ref(contact)).await;
             }
             // A buddy we are skipping is named only for want of another
-            // endorsement, and asks went out only while nobody was named, so
-            // one that kept endorsing but never acked a PROXY_STORE (a full
+            // endorsement, once it has endorsed us afresh, and asks went out
+            // only while nobody was named, so one that kept endorsing but
+            // never acked a PROXY_STORE (a full
             // publish table, a saturated uplink, a moved endpoint) stayed our
             // buddy for good while nothing was placed. Ask the others for a
             // replacement; the per-candidate pacing bounds this to one ask
@@ -3110,10 +3380,14 @@ pub(super) async fn maybe_publish_ember_sources(
                 ask_ember_buddy_endorsements(socket, state, &buddy_candidates).await;
             }
         }
-    } else if state.ember_named_source_buddy.take().is_some() {
-        // Reachable again: the records naming a buddy and flagged firewalled
-        // would keep searchers on the relay until their republish.
-        state.ember_source_publish_at.clear();
+    } else {
+        state.ember_named_source_buddy = None;
+        if state.ember_records_buddy.take().is_some() {
+            // Reachable again: the records naming a buddy and flagged
+            // firewalled would keep searchers on the relay until their
+            // republish.
+            state.ember_source_publish_at.clear();
+        }
     }
 
     // The endorsement ask above is wanted every tick, so this comes after it.
@@ -3252,7 +3526,7 @@ pub(super) async fn maybe_publish_ember_sources(
     }
     if firewalled_like {
         flags |= ember::SOURCE_FLAG_FIREWALLED | ember::SOURCE_FLAG_RELAY_CAPABLE;
-    } else if needs_buddy {
+    } else if relay_capable {
         flags |= ember::SOURCE_FLAG_RELAY_CAPABLE;
     }
 
@@ -3275,6 +3549,13 @@ pub(super) async fn maybe_publish_ember_sources(
     }
 
     for (file_hash, file_size, file_name, ember_file_hash) in due {
+        // Nothing is tracked or stamped for a file skipped here, so it stays
+        // due and goes out on a later tick against the nodes its lookup finds.
+        if ember_publish_awaits_lookup(state, ember::dht::publish::source_key(&file_hash)) {
+            state.ember_publish_pass.awaiting_lookup += 1;
+            continue;
+        }
+
         let mut file_contact = contact;
         if file_contact.buddy.is_some() {
             file_contact.callback_token = Some(state.ember_dht.callback_token(&file_hash));
@@ -3291,13 +3572,6 @@ pub(super) async fn maybe_publish_ember_sources(
             kind: EmberPublishKind::Source,
             key: record.keyword_hash,
         };
-
-        // Nothing is tracked or stamped for a file skipped here, so it stays
-        // due and goes out on a later tick against the nodes its lookup finds.
-        if ember_publish_awaits_lookup(state, record.keyword_hash) {
-            state.ember_publish_pass.awaiting_lookup += 1;
-            continue;
-        }
 
         // Overlay STORE names the buddy in the trailer. Hold it until that
         // buddy ACKs PROXY_STORE so FIND_VALUE cannot succeed while
@@ -3338,24 +3612,68 @@ pub(super) async fn maybe_publish_ember_sources(
     flush_ember_batch_publish(socket, state).await;
 }
 
+/// What [`ember_source_buddy_choice`] settled for this tick.
+pub(super) struct EmberBuddyChoice {
+    /// Contacts endorsement asks may go to, most recently seen first.
+    pub(super) candidates: Vec<ember::dht::EmberContact>,
+    /// The buddy to name, with the trailer its endorsement makes.
+    pub(super) named: Option<(ember::dht::EmberContact, ember::dht::publish::SourceBuddy)>,
+    /// Candidates whose endorsement we stopped naming, to be asked for a new
+    /// one at once.
+    pub(super) reask: Vec<ember::dht::EmberContact>,
+}
+
+/// Whether the endorsement `contact` signed for us no longer describes the
+/// key and endpoint we reach it at. The buddy accepts only a `PROXY_STORE`
+/// whose trailer names its current ones, and refuses the rest without an ack,
+/// so such an endorsement can only stall publishing until it lapses.
+///
+/// The address is compared only while we reach the buddy at a public one: on
+/// our LAN it signs the public self-view searchers reach it at, which is not
+/// the address we use. The port never is: a NAT that remaps the buddy's port
+/// leaves it signing its own view of it, which is what it checks trailers
+/// against, so the endorsement still works.
+pub(super) fn ember_buddy_endorsement_is_stale(
+    endorsement: &ember::dht::engine::BuddyEndorsement,
+    contact: &ember::dht::EmberContact,
+) -> bool {
+    if endorsement.noise_pub != contact.noise_pub {
+        return true;
+    }
+    let reached_at = match contact.addr.ip() {
+        IpAddr::V4(v4) => Some(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    };
+    match reached_at {
+        Some(ip) if !crate::security::is_special_use_v4(ip) => ip != endorsement.ip,
+        _ => false,
+    }
+}
+
 /// Contacts a firewalled publisher may name as its buddy, most recently seen
 /// first, and the first of them holding a live endorsement for us.
 ///
 /// A buddy that has let [`ember_publish::EMBER_BUDDY_SILENT_ROUNDS_BEFORE_SKIP`]
-/// rounds of asks in a row expire unanswered is left out of both for
-/// [`ember_publish::EMBER_BUDDY_SKIP`], so the next endorsed contact is named in
-/// its place and endorsement asks go to others. It is still named when no other
-/// endorsed contact is left: without a buddy no firewalled source publishes at
-/// all, which is never better than asking one that may yet answer.
-pub(super) fn ember_source_buddy_choice(
-    state: &mut NetworkState,
-) -> (
-    Vec<ember::dht::EmberContact>,
-    Option<(ember::dht::EmberContact, ember::dht::publish::SourceBuddy)>,
-) {
+/// rounds of asks in a row expire unanswered is left out of the candidates for
+/// [`ember_publish::EMBER_BUDDY_SKIP`], and the endorsement it held then is
+/// dropped (see [`prune_ember_pending_proxy_overlay`]), so the next endorsed
+/// contact is named in its place. One that endorses us afresh while skipped is
+/// still named when no other endorsed contact is left: without a buddy no
+/// firewalled source publishes at all, which is never better than asking one
+/// that has just answered.
+///
+/// Banned peers and those the IP policy refuses are never candidates: every
+/// frame to them is dropped on the way out, and theirs on the way in.
+pub(super) fn ember_source_buddy_choice(state: &mut NetworkState) -> EmberBuddyChoice {
     let now_ts = chrono::Utc::now().timestamp();
     let now = std::time::Instant::now();
     state.ember_dht.prune_buddy_endorsements(now_ts);
+    let engine = &state.ember_dht;
+    state
+        .ember_proxy_buddies
+        .forget_replaced_endorsements(now_ts, |id| {
+            engine.buddy_endorsement(id, now_ts).map(|e| e.signature)
+        });
     let mut c = state.ember_dht.contacts();
     for extra in state.ember_session_dht_contacts.values() {
         if !c.iter().any(|held| held.node_id == extra.node_id) {
@@ -3363,8 +3681,36 @@ pub(super) fn ember_source_buddy_choice(
         }
     }
     let local_id = state.ember_dht.local_id();
-    c.retain(|x| ember_buddy_candidate(x, local_id, state.ember_named_source_buddy));
+    c.retain(|x| {
+        ember_buddy_candidate(x, local_id, state.ember_named_source_buddy)
+            && !ember_addr_ip_verdict(state, x.addr).refuses()
+    });
     c.sort_by_key(|contact| std::cmp::Reverse(contact.last_seen));
+    for contact in &c {
+        let Some(endorsement) = state.ember_dht.buddy_endorsement(&contact.node_id, now_ts) else {
+            continue;
+        };
+        if ember_buddy_endorsement_is_stale(&endorsement, contact)
+            && !state
+                .ember_proxy_buddies
+                .endorsement_dropped(&contact.node_id, &endorsement.signature)
+        {
+            debug!(
+                "Ember: buddy {} moved or changed key since endorsing us; asking it again",
+                contact.addr
+            );
+            state.ember_proxy_buddies.drop_endorsement(
+                contact.node_id,
+                endorsement.signature,
+                endorsement.expires_at,
+            );
+        }
+    }
+    let reask: Vec<ember::dht::EmberContact> = c
+        .iter()
+        .filter(|x| state.ember_proxy_buddies.has_dropped_endorsement(&x.node_id))
+        .cloned()
+        .collect();
     let (live, skipped): (Vec<_>, Vec<_>) = c
         .into_iter()
         .partition(|x| !state.ember_proxy_buddies.is_skipped(&x.node_id, now));
@@ -3383,7 +3729,11 @@ pub(super) fn ember_source_buddy_choice(
             .and_then(|contact| endorsed(std::slice::from_ref(contact)))
     });
     let named = current.or_else(|| endorsed(&live)).or_else(|| endorsed(&skipped));
-    (live, named)
+    EmberBuddyChoice {
+        candidates: live,
+        named,
+        reask,
+    }
 }
 
 /// Whether `contact` may stand as our buddy.
@@ -3429,7 +3779,12 @@ pub(super) async fn ask_ember_buddy_endorsements(
         if !matches!(contact.addr.ip(), std::net::IpAddr::V4(ip)
             if !crate::security::is_special_use_v4(ip))
             || contact.addr.port() == 0
+            || ember_addr_ip_verdict(state, contact.addr).refuses()
         {
+            continue;
+        }
+        let replacing = state.ember_proxy_buddies.has_dropped_endorsement(&contact.node_id);
+        if replacing && !state.ember_proxy_buddies.may_reask(&contact.node_id, now) {
             continue;
         }
         let Some((_rid, frame)) = state
@@ -3438,6 +3793,9 @@ pub(super) async fn ask_ember_buddy_endorsements(
         else {
             continue;
         };
+        if replacing {
+            state.ember_proxy_buddies.note_reasked(contact.node_id, now);
+        }
         asked += 1;
         state.ember_diagnostics.ember_dht_buddy_endorse_asks =
             state.ember_diagnostics.ember_dht_buddy_endorse_asks.saturating_add(1);
@@ -3469,6 +3827,9 @@ pub(super) async fn ask_ember_source_buddy(
     record: &ember::dht::publish::SignedRecord,
     buddy: &ember::dht::EmberContact,
 ) -> Option<u32> {
+    if ember_addr_ip_verdict(state, buddy.addr).refuses() {
+        return None;
+    }
     let key = record.keyword_hash;
     let (rid, frame) =
         state
@@ -3513,6 +3874,15 @@ pub(super) async fn ask_ember_source_buddy(
     }
 }
 
+/// Whether a firewalled publisher would connect back to our eD2K TCP port at
+/// `tcp_port`. Buddies refuse to bounce, and publishers to dial, a port below
+/// 1024: a searcher's port is its own claim, and honouring it would let one aim
+/// a publisher's connection at a well-known service. A `CALLBACK_REQ` naming
+/// such a port only costs the buddy's forwarding allowance.
+pub(super) fn ember_callback_port_accepted(tcp_port: u16) -> bool {
+    tcp_port >= 1024
+}
+
 /// Send Ember `CALLBACK_REQ` to the HighID buddy named in a firewalled source record.
 ///
 /// `buddy_node_id` is the DHT identity the signed trailer named. It is required
@@ -3542,6 +3912,9 @@ pub(super) async fn send_ember_callback_req(
         return false;
     }
     if callback_token == [0u8; 16] {
+        return false;
+    }
+    if !ember_callback_port_accepted(searcher_tcp_port) {
         return false;
     }
     let addr = SocketAddr::new(std::net::IpAddr::V4(buddy_ip), buddy_udp);
@@ -3786,36 +4159,24 @@ pub(super) async fn maybe_publish_ember_keywords(
             files_with_no_keywords.push(file_hash);
             continue;
         }
-        let mut planned: Vec<(
-            EmberRecordRef,
-            ember::dht::publish::SignedRecord,
-            Vec<ember::dht::EmberContact>,
-        )> = Vec::new();
+        let mut planned: Vec<(String, EmberRecordRef, Vec<ember::dht::EmberContact>)> = Vec::new();
         // Every keyword is asked, so each one that needs a lookup queues it in
         // this pass rather than one per tick; the file then waits for all of
         // them, for the same all-or-nothing reason as below.
         let mut awaiting_lookup = false;
         for keyword in keywords {
-            let record = state.ember_dht.build_keyword_record_with_media(
-                &keyword,
-                file_hash,
-                ember_file_hash,
-                file_size,
-                &file_name,
-                media.as_ref(),
-            );
-            state.ember_dht.store_own_record(&record);
-            if ember_publish_awaits_lookup(state, record.keyword_hash) {
+            let key = ember::dht::search::keyword_hash(&keyword);
+            if ember_publish_awaits_lookup(state, key) {
                 awaiting_lookup = true;
                 continue;
             }
-            let targets = ember_overlay_publish_targets(state, record.keyword_hash);
+            let targets = ember_overlay_publish_targets(state, key);
             let reference = EmberRecordRef {
                 file_hash,
                 kind: EmberPublishKind::Keyword,
-                key: record.keyword_hash,
+                key,
             };
-            planned.push((reference, record, targets));
+            planned.push((keyword, reference, targets));
         }
         if awaiting_lookup {
             state.ember_publish_pass.awaiting_lookup += 1;
@@ -3836,7 +4197,22 @@ pub(super) async fn maybe_publish_ember_keywords(
         {
             continue;
         }
-        for (reference, record, targets) in planned {
+        // Signed and kept only now, with the file sure to go out. A file held
+        // back above comes round again on a later tick, and our own store
+        // answers FIND_VALUE and republishes what it holds, so each pass that
+        // skipped it still put fresh copies of its records into circulation
+        // that nothing had scheduled.
+        for (keyword, reference, targets) in planned {
+            let record = state.ember_dht.build_keyword_record_with_media(
+                &keyword,
+                file_hash,
+                ember_file_hash,
+                file_size,
+                &file_name,
+                media.as_ref(),
+            );
+            debug_assert_eq!(record.keyword_hash, reference.key);
+            state.ember_dht.store_own_record(&record);
             if state.ember_batch_publish.enqueue(
                 &targets,
                 reference,

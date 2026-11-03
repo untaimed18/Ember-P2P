@@ -2350,10 +2350,13 @@ async fn forget_known_paths_under_removed(state: &AppState, removed: &[String]) 
 /// Ask the network task to withdraw our Ember DHT publications for files that
 /// have stopped being offered.
 ///
-/// Best effort by design: the share state is already committed by the time this
-/// runs, so a saturated command channel must not fail the user's action. The
-/// cost of it not landing is bounded — the records lapse on their own TTL and
-/// the next reconcile darkens the badge.
+/// The share state is already committed by the time this runs, so a saturated
+/// command channel must not fail or stall the user's action — but it must not
+/// drop the withdrawal either. Nothing else retracts these files: the store
+/// keeps our signed records across restarts and republishes them to the
+/// closest nodes for as long as they are inside their TTL, and the reconcile
+/// that follows only darkens the badge. So a full channel hands the command to
+/// a task that waits for room instead of giving up on it.
 async fn unpublish_ember_files(
     network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
     file_hashes: Vec<String>,
@@ -2362,23 +2365,39 @@ async fn unpublish_ember_files(
         return;
     }
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if let Err(e) = bounded_send(
-        network_tx,
-        NetworkCommand::UnpublishEmberFiles { file_hashes, tx },
-    )
-    .await
-    {
-        warn!("Failed to withdraw Ember publications (best-effort): {e}");
-        return;
+    let command = NetworkCommand::UnpublishEmberFiles { file_hashes, tx };
+    match network_tx.try_send(command) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+            let network_tx = network_tx.clone();
+            tokio::spawn(async move {
+                if network_tx.send(command).await.is_err() {
+                    warn!("Ember publication withdrawal lost: the network task has stopped");
+                    return;
+                }
+                log_ember_unpublish_reply(rx.await.ok());
+            });
+            return;
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            warn!("Ember publication withdrawal lost: the network task has stopped");
+            return;
+        }
     }
     // Awaited directly rather than through `await_reply`: that mints a coded
     // error for the frontend to translate, and this reply is only ever logged.
     // The ack is here to make the ordering explicit — the retraction lands
     // before the reconcile that follows it — not to be reported.
     match tokio::time::timeout(crate::commands::errors::CMD_REPLY_TIMEOUT, rx).await {
-        Ok(Ok(count)) => debug!("Ember: withdrew publications for {count} file(s)"),
-        Ok(Err(_)) => warn!("Ember publication withdrawal was dropped by the network task"),
+        Ok(reply) => log_ember_unpublish_reply(reply.ok()),
         Err(_) => warn!("Ember publication withdrawal was not acknowledged in time"),
+    }
+}
+
+fn log_ember_unpublish_reply(count: Option<usize>) {
+    match count {
+        Some(count) => debug!("Ember: withdrew publications for {count} file(s)"),
+        None => warn!("Ember publication withdrawal was dropped by the network task"),
     }
 }
 
@@ -10415,6 +10434,38 @@ pub async fn open_shared_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A withdrawal that meets a full command channel is delivered once there
+    /// is room, without holding up the action that asked for it.
+    #[tokio::test]
+    async fn an_ember_withdrawal_outlasts_a_full_command_channel() {
+        let (network_tx, mut network_rx) = tokio::sync::mpsc::channel(1);
+        let (filler, _filler_rx) = tokio::sync::oneshot::channel();
+        network_tx
+            .try_send(NetworkCommand::UnpublishEmberFiles {
+                file_hashes: vec!["filler".into()],
+                tx: filler,
+            })
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            unpublish_ember_files(&network_tx, vec!["aa".repeat(16)]),
+        )
+        .await
+        .expect("a full channel must not stall the caller");
+
+        let mut delivered = Vec::new();
+        for _ in 0..2 {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), network_rx.recv()).await {
+                Ok(Some(NetworkCommand::UnpublishEmberFiles { file_hashes, tx })) => {
+                    let _ = tx.send(file_hashes.len());
+                    delivered.extend(file_hashes);
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(delivered, vec!["filler".to_string(), "aa".repeat(16)]);
+    }
 
     /// A snapshot taken earlier never replaces one taken later, whichever
     /// writer reaches the cache last; each cache keeps its own order.

@@ -76,7 +76,7 @@ const LISTING_FALLBACK_SECS: i64 = 15 * 60;
 /// listing with it. Most storers are builds that keep a head they cannot
 /// read for a day and never hand it on when they leave, so a day between
 /// republishes let a head vanish as its storers came and went.
-const REPUBLISH_SECS: i64 = 60 * 60;
+const REPUBLISH_SECS: i64 = crate::network::ember::feed::FEED_LISTING_RESIGN_SECS;
 /// How often a deleted feed's withdrawal is sent again.
 const WITHDRAWAL_RESEND_SECS: i64 = 24 * 3600;
 /// How often a deleted feed's tombstone head is signed and sent again, as

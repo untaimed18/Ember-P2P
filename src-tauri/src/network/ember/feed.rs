@@ -259,6 +259,10 @@ pub const FEED_LISTING_TTL_SECS: i64 = 7 * 24 * 3600;
 /// How long storers keep a head after it was signed (`CHANNEL_GOVERNANCE_TTL`
 /// in `dht::store`): what a deleted feed's tombstone must outlast.
 pub const FEED_HEAD_TTL_SECS: i64 = 30 * 24 * 3600;
+/// How often a publisher republishes a head nothing has changed, and signs
+/// its listing anew with it. Storers read a listing unsigned for two of
+/// these as one whose publisher stopped, so the two must not drift apart.
+pub const FEED_LISTING_RESIGN_SECS: i64 = 60 * 60;
 /// A listing signed this recently says its publisher is running: one
 /// signs it anew with every publish and hourly republish, and a republish
 /// that does not get through is tried again within minutes.
