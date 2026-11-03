@@ -13,7 +13,8 @@
     type ConnectionReport,
   } from '$lib/api/connectionDoctor';
   import { translateError } from '$lib/i18n';
-  import { toast } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toast } = toastsFor('network');
   import { copyToClipboard } from '$lib/utils';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import * as m from '$lib/paraglide/messages';

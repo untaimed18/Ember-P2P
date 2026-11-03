@@ -4448,6 +4448,8 @@
   "settings_notify_channel_message": "Un message arrive dans un salon",
   "settings_notify_channel_message_hint": "Désactivé par défaut, car les salons peuvent être très actifs. Les salons réglés sur « Désactivées » et les membres ignorés ne notifient jamais ; ceux réglés sur « Mentions uniquement » seulement quand on vous nomme ou vous répond.",
   "settings_notify_channel_manage": "Gérer les salons plus discrets",
+  "settings_popups_title": "Messages contextuels dans Ember",
+  "settings_popups_hint": "Les courts messages qu’Ember affiche dans sa fenêtre, comme « Téléchargement en file d’attente » ou « Lien copié ». Désactivez une zone pour les y masquer ; les avertissements, les erreurs et Annuler s’affichent toujours.",
   "notify_download_complete_title": "Téléchargement terminé",
   "notify_download_complete_body": "{name} ({size})",
   "notify_download_failed_title": "Téléchargement échoué : {name}",

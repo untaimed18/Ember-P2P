@@ -2451,6 +2451,18 @@
     settings.close_to_tray_behavior = behavior;
   }
 
+  /** The parts of the window whose confirmation toasts can be turned off,
+   *  named as the sidebar names them. See `toastsFor`. */
+  const popupAreas = [
+    { id: 'downloads', key: 'popups_downloads', label: m.nav_transfers },
+    { id: 'search', key: 'popups_search', label: m.nav_search },
+    { id: 'library', key: 'popups_library', label: m.nav_library },
+    { id: 'friends', key: 'popups_friends', label: m.nav_friends },
+    { id: 'channels', key: 'popups_channels', label: m.nav_channels },
+    { id: 'feeds', key: 'popups_feeds', label: m.nav_feeds },
+    { id: 'network', key: 'popups_network', label: m.nav_group_networks },
+  ] as const;
+
   /** The master switch, which every notification event depends on. */
   let notifyOff = $derived.by(() => {
     const current = settings;
@@ -3331,6 +3343,26 @@
                 ariaDescribedby="notify-channel-message-hint"
               />
             </div>
+          </div>
+
+          <!-- In-window toasts, apart from desktop notifications: the master
+               switch above does not govern them. -->
+          <div class="settings-group">
+            <h4 class="subsection-title" id="popups-title">{m.settings_popups_title()}</h4>
+            <p class="hint" id="popups-hint">{m.settings_popups_hint()}</p>
+            {#each popupAreas as area (area.key)}
+              <div class="field toggle-row">
+                <div class="toggle-info">
+                  <label class="toggle-title" id="popups-{area.id}-label" for="popups-{area.id}-switch">{area.label()}</label>
+                </div>
+                <ToggleSwitch
+                  id="popups-{area.id}-switch"
+                  bind:checked={settings[area.key]}
+                  ariaLabelledby="popups-{area.id}-label"
+                  ariaDescribedby="popups-hint"
+                />
+              </div>
+            {/each}
           </div>
         </div>
       </section>

@@ -6,7 +6,7 @@ import { getNetworkStats } from '$lib/api/kad';
 import { getServerLog } from '$lib/api/server';
 import { relatedSearchSupported as apiRelatedSearchSupported } from '$lib/api/search';
 import { isAppVisible, withTimeout } from '$lib/utils';
-import { addToast, removeToast, toast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+import { removeToast, toastsFor } from '$lib/stores/toast';
 import { appendServerLog, hydrateServerLog } from '$lib/stores/serverLog';
 import { friendDisplayName } from '$lib/stores/friends';
 import { notify } from '$lib/notifications';
@@ -18,6 +18,8 @@ import {
 } from '$lib/sharesBrowsed';
 import * as m from '$lib/paraglide/messages';
 import { translateError } from '$lib/i18n';
+
+const { addToast, toast, toastError, toastSuccess, toastWarning } = toastsFor('network');
 
 const STALE_NETWORK_MS = 12_000;
 const KNOWN_NETWORK_STATUSES = new Set<NetworkStats['status']>([

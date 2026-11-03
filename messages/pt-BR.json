@@ -4448,6 +4448,8 @@
   "settings_notify_channel_message": "Chega uma mensagem em uma sala",
   "settings_notify_channel_message_hint": "Desligado por padrão, porque salas podem ser movimentadas. Salas em “Desativadas” e membros ignorados nunca avisam; salas em “Só menções” avisam só quando você é citado ou recebe uma resposta.",
   "settings_notify_channel_manage": "Gerenciar salas silenciadas",
+  "settings_popups_title": "Avisos no Ember",
+  "settings_popups_hint": "As mensagens curtas que o Ember mostra na janela, como “Download na fila” ou “Link copiado”. Desative uma área para ocultá-las nela; avisos de alerta, erros e Desfazer continuam aparecendo.",
   "notify_download_complete_title": "Download concluído",
   "notify_download_complete_body": "{name} ({size})",
   "notify_download_failed_title": "Download falhou: {name}",

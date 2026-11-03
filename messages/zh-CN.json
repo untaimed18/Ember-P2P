@@ -4448,6 +4448,8 @@
   "settings_notify_channel_message": "房间里有新消息",
   "settings_notify_channel_message_hint": "默认关闭，因为房间可能很热闹。设为“关闭”的房间和被忽略的成员从不提醒；设为“仅提及”的房间只在有人提到你或回复你时提醒。",
   "settings_notify_channel_manage": "管理已调低提醒的房间",
+  "settings_popups_title": "Ember 内的弹出提示",
+  "settings_popups_hint": "Ember 在窗口中显示的简短消息，例如“下载已加入队列”或“链接已复制”。关闭某个区域即可在该处隐藏它们；警告、错误和撤销仍会显示。",
   "notify_download_complete_title": "下载完成",
   "notify_download_complete_body": "{name}（{size}）",
   "notify_download_failed_title": "下载失败：{name}",

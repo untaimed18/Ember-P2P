@@ -40,7 +40,8 @@
   import { disappearLabel } from '$lib/chatDisappear';
   import { deleteChatHistory } from '$lib/api/friends';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { toastError, toastSuccess } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toastError, toastSuccess } = toastsFor('friends');
   import { formatBytes } from '$lib/utils';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';

@@ -2051,6 +2051,25 @@ pub struct AppSettings {
     #[serde(default)]
     pub notify_channel_message: bool,
 
+    /// Show the confirmation and info pop-ups (toasts) each part of the window
+    /// raises: "Download queued", "Link copied" and the like. Off hides only
+    /// those for that part; warnings, errors and Undo offers always show.
+    /// Frontend-only, like `save_search_history`: the backend round-trips them.
+    #[serde(default = "default_true")]
+    pub popups_downloads: bool,
+    #[serde(default = "default_true")]
+    pub popups_search: bool,
+    #[serde(default = "default_true")]
+    pub popups_library: bool,
+    #[serde(default = "default_true")]
+    pub popups_friends: bool,
+    #[serde(default = "default_true")]
+    pub popups_channels: bool,
+    #[serde(default = "default_true")]
+    pub popups_feeds: bool,
+    #[serde(default = "default_true")]
+    pub popups_network: bool,
+
     /// Hold a system sleep inhibitor while a transfer is actually working, so
     /// an overnight download is not cut off by the OS idle timer. The display
     /// is left alone — only sleep is deferred, and only while there is work.
@@ -3132,6 +3151,13 @@ impl Default for AppSettings {
             // See the field docs: a room is chatty enough that this is the one
             // notification a user has to ask for.
             notify_channel_message: false,
+            popups_downloads: true,
+            popups_search: true,
+            popups_library: true,
+            popups_friends: true,
+            popups_channels: true,
+            popups_feeds: true,
+            popups_network: true,
             prevent_sleep_while_active: true,
             bandwidth_schedule_enabled: false,
             bandwidth_schedule: Vec::new(),

@@ -12,7 +12,8 @@
   import { downloadNodesDat } from '$lib/api/settings';
   import { goto } from '$app/navigation';
   import { networkError, networkStats, serverStatus } from '$lib/stores/network';
-  import { toastSuccess, toastError, toast as toastInfo } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toastSuccess, toastError, toast: toastInfo } = toastsFor('network');
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import type { KadContact, KadSearchEntry } from '$lib/types';

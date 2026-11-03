@@ -66,7 +66,8 @@
     incomingCollection,
     markIncomingCollectionPresented,
   } from '$lib/stores/collection';
-  import { addActionToast, toast as toastInfo, toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { addActionToast, toast: toastInfo, toastSuccess, toastError, toastWarning } = toastsFor('library');
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     formatSize,

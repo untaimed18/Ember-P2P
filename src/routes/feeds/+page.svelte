@@ -77,7 +77,8 @@
   } from '$lib/stores/feeds';
   import { noteUiActivity } from '$lib/uiStall';
   import { appSettings } from '$lib/stores/settings';
-  import { addActionToast, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { addActionToast, toastError, toastSuccess, toastWarning } = toastsFor('feeds');
   import { menuKeydown } from '$lib/a11y';
   import { codedErrorOf, transferFailureReasonText, translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';

@@ -51,7 +51,8 @@
     xferSecondsLeft,
     type RateSamples,
   } from '$lib/xferRate';
-  import { toast, toastError, toastSuccess } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toast, toastError, toastSuccess } = toastsFor('channels');
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import {

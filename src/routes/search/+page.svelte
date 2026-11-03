@@ -54,7 +54,8 @@
   import type { SearchResult, SpamExplanation } from '$lib/types';
   import { formatNumber, formatDecimal, formatSize, formatLiveSpeed, copyToClipboard, sizeUnitLabel, compareFileNames } from '$lib/utils';
   import { EMBER_DIAG_FAILURE_THRESHOLD, EMBER_JOIN_TIMEOUT_MS } from '$lib/emberJoin';
-  import { addActionToast, addToast, setToastMessage } from '$lib/stores/toast';
+  import { setToastMessage, toastsFor } from '$lib/stores/toast';
+  const { addActionToast, addToast } = toastsFor('search');
   import { inertBackground, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';

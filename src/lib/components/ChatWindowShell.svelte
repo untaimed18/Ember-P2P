@@ -5,7 +5,7 @@
   import { initFriendsStore, cleanupFriendsStore, friendsList, friendsListLoaded, refreshFriendsList } from '$lib/stores/friends';
   import { initRoomDmStore, cleanupRoomDmStore } from '$lib/stores/roomDm';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
+  import { loadAppSettings, clearAppSettings, setAppSettings, syncToastAreasWithSettings } from '$lib/stores/settings';
   import { SETTINGS_CHANGED_EVENT } from '$lib/api/settings';
   import type { AppSettings } from '$lib/types';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
@@ -48,6 +48,7 @@
     initTheme();
     let mounted = true;
     let teardown: (() => void) | null = null;
+    const stopToastAreaSync = syncToastAreasWithSettings();
     // Chatting here is using Ember: a silent update waits until nobody is.
     const stopActivityReporting = startUserActivityReporting();
 
@@ -99,6 +100,7 @@
       cleanupRoomDmStore();
       clearAllToasts();
       clearAppSettings();
+      stopToastAreaSync();
     };
   });
 </script>

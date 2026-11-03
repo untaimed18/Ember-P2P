@@ -12,7 +12,8 @@
     addUserCategory, countDownloadCategories, isCategoryTaken, removeUserCategory, setCategoryFolder,
   } from '$lib/categorySettings';
   import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
-  import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+  import { removeToast, setToastMessage, toastsFor } from '$lib/stores/toast';
+  const { addActionToast, toastError, toastSuccess, toastWarning } = toastsFor('downloads');
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';

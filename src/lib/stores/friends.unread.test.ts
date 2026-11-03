@@ -26,9 +26,7 @@ vi.mock('$lib/notifications', () => ({
 }));
 
 vi.mock('$lib/stores/toast', () => ({
-  toast: () => {},
-  toastError: () => {},
-  toastSuccess: () => {},
+  toastsFor: () => ({ toast: () => {}, toastError: () => {}, toastSuccess: () => {} }),
 }));
 
 const { cleanupFriendsStore, initFriendsStore, unreadCounts } = await import('./friends');

@@ -319,3 +319,34 @@ export function toast(message: string) { addToast('info', message); }
 export function toastSuccess(message: string) { addToast('success', message); }
 export function toastError(message: string) { addToast('error', message, 8000); }
 export function toastWarning(message: string) { addToast('warning', message, 6000); }
+
+/** Parts of the window whose confirmations Settings can turn off. */
+export type ToastArea = 'downloads' | 'search' | 'library' | 'friends' | 'channels' | 'feeds' | 'network';
+
+let hiddenAreas: ReadonlySet<ToastArea> = new Set();
+
+/** The areas whose confirmations are not shown. Kept by the settings store. */
+export function setHiddenToastAreas(areas: Iterable<ToastArea>): void {
+  hiddenAreas = new Set(areas);
+}
+
+/**
+ * The toast functions for code in `area`. While the user has turned that area
+ * off, its timed success and info toasts are dropped and return -1, an id no
+ * toast has. Warnings, errors, sticky notices and action toasts always show:
+ * they say something went wrong, or offer the only way back from it.
+ */
+export function toastsFor(area: ToastArea) {
+  const add = (type: ToastItem['type'], message: string, durationMs = 5000): number =>
+    hiddenAreas.has(area) && durationMs > 0 && (type === 'success' || type === 'info')
+      ? -1
+      : addToast(type, message, durationMs);
+  return {
+    addToast: add,
+    addActionToast,
+    toast: (message: string) => { add('info', message); },
+    toastSuccess: (message: string) => { add('success', message); },
+    toastError,
+    toastWarning,
+  };
+}

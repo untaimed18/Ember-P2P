@@ -4448,6 +4448,8 @@
   "settings_notify_channel_message": "Arriva un messaggio in una stanza",
   "settings_notify_channel_message_hint": "Disattivato per impostazione predefinita, perché le stanze possono essere molto attive. Le stanze impostate su «Disattivate» e i membri ignorati non notificano mai; quelle su «Solo menzioni» solo quando vieni nominato o qualcuno ti risponde.",
   "settings_notify_channel_manage": "Gestisci stanze più silenziose",
+  "settings_popups_title": "Avvisi in Ember",
+  "settings_popups_hint": "I brevi messaggi che Ember mostra nella sua finestra, come «Download in coda» o «Link copiato». Disattiva un’area per nasconderli lì; avvisi di attenzione, errori e Annulla compaiono comunque.",
   "notify_download_complete_title": "Download completato",
   "notify_download_complete_body": "{name} ({size})",
   "notify_download_failed_title": "Download fallito: {name}",

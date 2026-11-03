@@ -4448,6 +4448,8 @@
   "settings_notify_channel_message": "Eine Nachricht trifft in einem Raum ein",
   "settings_notify_channel_message_hint": "Standardmäßig aus, da Räume viel Verkehr haben können. Räume auf „Aus“ und ignorierte Mitglieder benachrichtigen nie; Räume auf „Nur Erwähnungen“ nur, wenn Sie genannt werden oder jemand Ihnen antwortet.",
   "settings_notify_channel_manage": "Leisere Räume verwalten",
+  "settings_popups_title": "Einblendungen in Ember",
+  "settings_popups_hint": "Die kurzen Meldungen, die Ember in seinem Fenster zeigt, etwa „Download eingereiht“ oder „Link kopiert“. Schalte einen Bereich aus, um sie dort auszublenden; Warnungen, Fehler und Rückgängig erscheinen weiterhin.",
   "notify_download_complete_title": "Download abgeschlossen",
   "notify_download_complete_body": "{name} ({size})",
   "notify_download_failed_title": "Download fehlgeschlagen: {name}",

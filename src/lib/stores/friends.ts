@@ -16,10 +16,12 @@ import {
   type IncomingFileOffer,
 } from '$lib/api/friends';
 import type { FriendStatus, StartDownloadResponse } from '$lib/types';
-import { toast, toastError, toastSuccess } from '$lib/stores/toast';
+import { toastsFor } from '$lib/stores/toast';
 import { notify, shouldNotify } from '$lib/notifications';
 import { chatWindowShows, isChatWindow } from '$lib/windowRole';
 import * as m from '$lib/paraglide/messages';
+
+const { toast, toastError, toastSuccess } = toastsFor('friends');
 
 export const onlineFriends = writable<Set<string>>(new Set());
 /** The status each online friend last sent, by lowercase hash. Only read

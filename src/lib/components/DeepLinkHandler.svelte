@@ -37,7 +37,8 @@
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
   import { cancelIncomingCollection, presentIncomingCollection } from '$lib/stores/collection';
-  import { toastSuccess, toastError } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toastSuccess, toastError } = toastsFor('downloads');
   import { codedErrorOf, translateError } from '$lib/i18n';
   import { serverMetDownloadedText } from '$lib/commandReplies';
   import { plural } from '$lib/plural';

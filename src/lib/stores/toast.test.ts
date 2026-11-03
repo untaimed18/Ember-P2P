@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import {
   addActionToast, addToast, clearAllToasts, flushToastActions, onPendingUndoChange, pauseToastDismiss,
-  reloadAfterToastActions, removeToast, resumeToastDismiss, runLatestUndo, toasts,
+  reloadAfterToastActions, removeToast, resumeToastDismiss, runLatestUndo, setHiddenToastAreas, toasts, toastsFor,
 } from './toast';
+import { hiddenToastAreas } from './settings';
+import type { AppSettings } from '$lib/types';
 
 describe('action toasts', () => {
   beforeEach(() => {
@@ -195,5 +197,61 @@ describe('action toasts', () => {
     // A toast whose time ran out while hovered keeps a short floor to be read.
     vi.advanceTimersByTime(1200);
     expect(onExpire).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('toast areas', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    setHiddenToastAreas([]);
+    clearAllToasts();
+    vi.useRealTimers();
+  });
+
+  it('drops a hidden area’s confirmations and keeps everything else', () => {
+    setHiddenToastAreas(['search']);
+    const search = toastsFor('search');
+    const onExpire = vi.fn();
+    search.toastSuccess('Download queued');
+    search.toast('Already in your library');
+    expect(search.addToast('info', 'Copied')).toBe(-1);
+    search.toastWarning('Enter a search');
+    search.toastError('Search failed');
+    search.addToast('info', 'Pinned notice', 0);
+    search.addActionToast('info', 'Marked as spam', { label: 'Undo', run: vi.fn() }, onExpire);
+    toastsFor('downloads').toastSuccess('Download started');
+    expect(get(toasts).map((t) => t.message)).toEqual([
+      'Enter a search',
+      'Search failed',
+      'Pinned notice',
+      'Marked as spam',
+      'Download started',
+    ]);
+  });
+
+  it('shows an area again once it is no longer hidden', () => {
+    const library = toastsFor('library');
+    setHiddenToastAreas(['library']);
+    library.toastSuccess('Shared');
+    setHiddenToastAreas([]);
+    library.toastSuccess('Shared');
+    expect(get(toasts).map((t) => t.message)).toEqual(['Shared']);
+  });
+
+  it('reads the hidden areas from settings, showing everything when they are unknown', () => {
+    expect(hiddenToastAreas(null)).toEqual([]);
+    const settings = {
+      popups_downloads: true,
+      popups_search: false,
+      popups_library: true,
+      popups_friends: false,
+      popups_channels: true,
+      popups_feeds: true,
+      popups_network: true,
+    } as AppSettings;
+    expect(hiddenToastAreas(settings)).toEqual(['search', 'friends']);
+    expect(hiddenToastAreas({} as AppSettings)).toEqual([]);
   });
 });

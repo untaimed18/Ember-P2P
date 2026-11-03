@@ -114,7 +114,8 @@
   import { prefersReducedMotion } from 'svelte/motion';
   import { fade, fly, slide } from 'svelte/transition';
   import { openExternalUrl } from '$lib/api/settings';
-  import { toast, toastError, toastSuccess } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toast, toastError, toastSuccess } = toastsFor('friends');
   import IconX from '$lib/components/IconX.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { passiveScroll } from '$lib/actions/passiveScroll';

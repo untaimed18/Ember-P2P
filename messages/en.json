@@ -4448,6 +4448,8 @@
   "settings_notify_channel_message": "A message arrives in a room",
   "settings_notify_channel_message_hint": "Off by default, because rooms can be busy. Rooms set to “Off” and ignored members never notify; rooms set to “Mentions only” notify only when you're named or replied to.",
   "settings_notify_channel_manage": "Manage quieter rooms",
+  "settings_popups_title": "Pop-ups in Ember",
+  "settings_popups_hint": "The short messages Ember shows in its window, such as “Download queued” or “Link copied”. Turn an area off to hide them there; warnings, errors and Undo still appear.",
   "notify_download_complete_title": "Download finished",
   "notify_download_complete_body": "{name} ({size})",
   "notify_download_failed_title": "Download failed: {name}",

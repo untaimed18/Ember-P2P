@@ -12,9 +12,11 @@ import {
 } from '$lib/api/channels';
 import { isAppVisible } from '$lib/utils';
 import { appSettings } from '$lib/stores/settings';
-import { toast } from '$lib/stores/toast';
+import { toastsFor } from '$lib/stores/toast';
 import { notify } from '$lib/notifications';
 import * as m from '$lib/paraglide/messages';
+
+const { toast } = toastsFor('channels');
 
 export const channels = writable<ChannelInfo[]>([]);
 export const activeChannelId = writable<string | null>(null);

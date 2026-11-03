@@ -1130,6 +1130,17 @@ export interface AppSettings {
    *  are excluded regardless. */
   notify_channel_message: boolean;
 
+  /** Show each part of the window's confirmation and info toasts. Off hides
+   *  only those; warnings, errors and Undo offers always show. See
+   *  `toastsFor` in `$lib/stores/toast`. */
+  popups_downloads: boolean;
+  popups_search: boolean;
+  popups_library: boolean;
+  popups_friends: boolean;
+  popups_channels: boolean;
+  popups_feeds: boolean;
+  popups_network: boolean;
+
   /** Hold a system sleep inhibitor while a transfer is working, so an
    *  overnight download survives the OS idle timer. Only the system is kept
    *  awake; the display is free to turn off. Honored where

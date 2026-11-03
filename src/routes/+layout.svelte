@@ -28,7 +28,7 @@
   import { chatDockOpen, closeDock, retainChatTabs } from '$lib/stores/chatTabs';
   import { initChannelsStore, cleanupChannelsStore, refreshChannels } from '$lib/stores/channels';
   import { CHANNELS_RECOVERED_EVENT } from '$lib/api/channels';
-  import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
+  import { loadAppSettings, clearAppSettings, setAppSettings, syncToastAreasWithSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
@@ -57,8 +57,10 @@
   } from '$lib/api/security';
   import {
     addActionToast, addToast, clearAllToasts, flushToastActions, onPendingUndoChange, reloadAfterToastActions,
-    setToastMessage, toastError, toastSuccess, toastWarning, toasts,
+    setToastMessage, toastError, toastSuccess, toastWarning, toasts, toastsFor,
   } from '$lib/stores/toast';
+  const channelToasts = toastsFor('channels');
+  const libraryToasts = toastsFor('library');
   import { get } from 'svelte/store';
   import { backupReminderDue, noteBackupReminderShown } from '$lib/backupReminder';
   import { afterNavigate, goto } from '$app/navigation';
@@ -327,6 +329,7 @@
     if (chatWindow) return;
     initTheme();
     const stopStallDetector = startStallDetector();
+    const stopToastAreaSync = syncToastAreasWithSettings();
     const splashStartedAt = performance.now();
     // The splash exists to mask the first paint, not to delay it. Once
     // the stores have initialized we want the app visible immediately;
@@ -435,7 +438,7 @@
     listen<{ count: number }>(CHANNELS_RECOVERED_EVENT, (event) => {
       const count = event.payload?.count ?? 0;
       if (count <= 0) return;
-      toastSuccess(
+      channelToasts.toastSuccess(
         plural(count, {
           one: () => m.layout_channels_recovered_one({ count }),
           oneShowsCount: true,
@@ -541,7 +544,7 @@
       if (!mounted) return;
       const count = event.payload?.count ?? 0;
       if (count <= 0) return;
-      toastSuccess(
+      libraryToasts.toastSuccess(
         plural(count, {
           one: () => m.library_folders_shared_one({ count }),
           oneShowsCount: true,
@@ -892,6 +895,7 @@
       cleanupFeedsStore();
       clearAllToasts();
       clearAppSettings();
+      stopToastAreaSync();
       if (unlistenClose) unlistenClose();
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();

@@ -4448,6 +4448,8 @@
   "settings_notify_channel_message": "W pokoju pojawi się wiadomość",
   "settings_notify_channel_message_hint": "Domyślnie wyłączone, bo w pokojach bywa tłoczno. Pokoje ustawione na „Wyłączone” i ignorowani członkowie nigdy nie wywołują powiadomień; pokoje ustawione na „Tylko wzmianki” powiadamiają tylko wtedy, gdy ktoś o tobie wspomni lub ci odpowie.",
   "settings_notify_channel_manage": "Zarządzaj cichszymi pokojami",
+  "settings_popups_title": "Dymki w Ember",
+  "settings_popups_hint": "Krótkie komunikaty, które Ember pokazuje w swoim oknie, np. „Pobieranie dodane do kolejki” lub „Skopiowano link”. Wyłącz obszar, aby je w nim ukryć; ostrzeżenia, błędy i Cofnij nadal będą się pojawiać.",
   "notify_download_complete_title": "Pobieranie zakończone",
   "notify_download_complete_body": "{name} ({size})",
   "notify_download_failed_title": "Pobieranie nie powiodło się: {name}",
