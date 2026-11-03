@@ -66,6 +66,7 @@
   import { isEmberBlake3Mismatch } from '$lib/emberIntegrity';
   import { uploadCapInForce, uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
   import { computeSegmentWindow, segmentRowOffset } from '$lib/segmentWindow';
+  import { createSortMemo, sortWithMemo } from '$lib/sortMemo';
   import { adoptRowHeight } from '$lib/rowWindow';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
@@ -2170,7 +2171,7 @@
 
   // One reused collator instead of the implicit per-comparison one
   // `String.prototype.localeCompare` allocates. `sortedActiveDownloads`
-  // re-sorts on every `$transfers` update, so the name/category branches
+  // can re-sort on every `$transfers` update, so the name/category branches
   // below were paying for a collator per comparison at flush rate. Default
   // options, so ordering is unchanged. Mirrors the search page's
   // `sortCollator`.
@@ -2209,11 +2210,30 @@
     return compareFileNames(a.file_name, b.file_name) || a.id.localeCompare(b.id);
   }
 
+  /** What `compareDownloads` reads of a row for the current sort, or `null`
+   *  when that moves with progress, so the order is only reused while it
+   *  cannot have changed. Plain memos, not `$state`: they only spare work. */
+  function downloadOrderKey(field: DlSortField): ((t: Transfer) => string) | null {
+    const primary: ((t: Transfer) => string | number) | null =
+      field === 'file_name' ? () => ''
+      : field === 'total_size' ? (t) => t.total_size
+      : field === 'priority' ? (t) => t.priority
+      : field === 'status' ? (t) => t.status
+      : field === 'category' ? (t) => t.category || ''
+      : field === 'started_at' ? (t) => t.started_at
+      : null;
+    return primary && ((t) => `${primary(t)}\u0000${t.file_name}`);
+  }
+  const activeSortMemo = createSortMemo();
+  const completedSortMemo = createSortMemo();
+
   let sortedActiveDownloads = $derived.by(() => {
-    return [...activeDownloads].sort(compareDownloads);
+    const token = `${dlSortField}:${dlSortAsc}`;
+    return sortWithMemo(activeDownloads, compareDownloads, activeSortMemo, token, (t) => t.id, downloadOrderKey(dlSortField));
   });
   let sortedCompletedDownloads = $derived.by(() => {
-    return [...completedDownloads].sort(compareDownloads);
+    const token = `${dlSortField}:${dlSortAsc}`;
+    return sortWithMemo(completedDownloads, compareDownloads, completedSortMemo, token, (t) => t.id, downloadOrderKey(dlSortField));
   });
 
   // --- Categories ---

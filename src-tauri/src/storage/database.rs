@@ -52,6 +52,18 @@ const UPDATE_TRANSFER_STATUS_SQL: &str = "UPDATE transfers
      END
      WHERE id = ?2";
 
+/// One download's progress for [`Database::update_transfer_progress_batch`].
+#[derive(Debug, Clone)]
+pub struct TransferProgressRow {
+    pub transfer_id: String,
+    pub transferred: u64,
+    pub progress: f64,
+    pub speed: u64,
+    /// The download folder holding the `.part`, when known; `None` keeps the
+    /// one on record.
+    pub part_folder: Option<String>,
+}
+
 /// Whether a row in `status` keeps `code` across a restart. Failed keeps any.
 /// Stopped keeps only "part files removed": that row was zeroed when its part
 /// files were found gone, and without the code a later start shows a plain
@@ -5580,8 +5592,8 @@ impl Database {
         Ok(())
     }
 
-    /// Progress update that refuses to reopen a row that has already reached a
-    /// terminal state.
+    /// Progress update for running downloads that refuses to reopen a row
+    /// that has already reached a terminal state.
     ///
     /// The periodic progress flush is fire-and-forget on the blocking pool and
     /// carries no sequence number, so it can be executed *after* the
@@ -5590,36 +5602,37 @@ impl Database {
     /// show — and the `.part.met` is gone by then, so nothing can repair it.
     /// Terminal states are only left via a deliberate re-queue, which writes
     /// its own progress.
-    /// `part_folder`, when known, is the download folder holding the
-    /// `.part` the progress is in; `None` keeps the one on record.
-    pub fn update_transfer_progress_if_active(
-        &self,
-        transfer_id: &str,
-        transferred: u64,
-        progress: f64,
-        speed: u64,
-        part_folder: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ///
+    /// All rows go in one transaction, so the flush costs one WAL fsync under
+    /// `synchronous=FULL` rather than one per running download.
+    pub fn update_transfer_progress_batch(&self, rows: &[TransferProgressRow]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let mut conn = self.conn.lock();
-        if part_folder.is_some() {
+        if rows.iter().any(|row| row.part_folder.is_some()) {
             Self::ensure_transfer_part_folders_locked(&conn)?;
         }
         // One transaction: progress on record without the folder it is in
         // would let a restart start the download over elsewhere.
         let tx = conn.transaction()?;
-        let updated = tx.execute(
-            "UPDATE transfers
-             SET transferred = ?1, progress = ?2, speed = ?3
-             WHERE id = ?4 AND status NOT IN ('completed', 'cancelled')",
-            params![
-                i64::try_from(transferred).unwrap_or(i64::MAX),
-                progress,
-                i64::try_from(speed).unwrap_or(i64::MAX),
-                transfer_id
-            ],
-        )?;
-        if let Some(folder) = part_folder.filter(|_| updated > 0) {
-            Self::upsert_part_folder(&tx, transfer_id, folder)?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE transfers
+                 SET transferred = ?1, progress = ?2, speed = ?3
+                 WHERE id = ?4 AND status NOT IN ('completed', 'cancelled')",
+            )?;
+            for row in rows {
+                let updated = stmt.execute(params![
+                    i64::try_from(row.transferred).unwrap_or(i64::MAX),
+                    row.progress,
+                    i64::try_from(row.speed).unwrap_or(i64::MAX),
+                    row.transfer_id
+                ])?;
+                if let Some(folder) = row.part_folder.as_deref().filter(|_| updated > 0) {
+                    Self::upsert_part_folder(&tx, &row.transfer_id, folder)?;
+                }
+            }
         }
         tx.commit()?;
         Ok(())
@@ -19021,6 +19034,69 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    /// The batched progress flush writes every running row in one go and
+    /// still refuses to reopen a finished or cancelled one.
+    #[test]
+    fn a_progress_batch_updates_running_rows_and_leaves_finished_ones() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-progress-batch-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        for (id, status) in [("t-a", "downloading"), ("t-b", "paused"), ("t-done", "completed"), ("t-gone", "cancelled")] {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority,
+                        category, expected_aich, ember_file_hash
+                     ) VALUES (?1, 'file.bin', ?2, '', '', 'download', ?3, 100, 0, 4, 4, 1, 'normal', '', NULL, NULL)",
+                    params![id, "55".repeat(16), status],
+                )
+                .unwrap();
+        }
+        let row = |id: &str, transferred: u64, folder: Option<&str>| TransferProgressRow {
+            transfer_id: id.to_string(),
+            transferred,
+            progress: 25.0 * transferred as f64,
+            speed: 7,
+            part_folder: folder.map(str::to_string),
+        };
+        db.update_transfer_progress_batch(&[
+            row("t-a", 1, Some("D:/a")),
+            row("t-b", 2, None),
+            row("t-done", 1, Some("D:/done")),
+            row("t-gone", 1, None),
+            row("t-missing", 1, Some("D:/missing")),
+        ])
+        .unwrap();
+        db.update_transfer_progress_batch(&[]).unwrap();
+
+        let stored = |id: &str| -> (i64, f64) {
+            db.conn
+                .lock()
+                .query_row("SELECT transferred, progress FROM transfers WHERE id = ?1", params![id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+        };
+        assert_eq!(stored("t-a"), (1, 25.0));
+        assert_eq!(stored("t-b"), (2, 50.0));
+        assert_eq!(stored("t-done"), (4, 100.0), "a completed row keeps 100%");
+        assert_eq!(stored("t-gone"), (4, 100.0));
+        let folders = db.download_part_folders().unwrap();
+        assert_eq!(folders.get("t-a").map(String::as_str), Some("D:/a"));
+        assert!(!folders.contains_key("t-done"));
+        assert!(!folders.contains_key("t-missing"), "no row, no folder");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     /// A download's part folder lives in a table of its own, not a column of
     /// `transfers`, so 1.7.1 does not raise the schema version 1.7.0 checks.
     #[test]
@@ -19051,9 +19127,16 @@ mod tests {
                 .unwrap();
         }
 
-        db.update_transfer_progress_if_active("t-active", 2, 50.0, 0, Some("D:/old")).unwrap();
-        db.update_transfer_progress_if_active("t-done", 2, 50.0, 0, Some("D:/old")).unwrap();
-        db.update_transfer_progress_if_active("t-active", 3, 75.0, 0, None).unwrap();
+        let progress_row = |id: &str, transferred: u64, progress: f64, folder: Option<&str>| TransferProgressRow {
+            transfer_id: id.to_string(),
+            transferred,
+            progress,
+            speed: 0,
+            part_folder: folder.map(str::to_string),
+        };
+        db.update_transfer_progress_batch(&[progress_row("t-active", 2, 50.0, Some("D:/old"))]).unwrap();
+        db.update_transfer_progress_batch(&[progress_row("t-done", 2, 50.0, Some("D:/old"))]).unwrap();
+        db.update_transfer_progress_batch(&[progress_row("t-active", 3, 75.0, None)]).unwrap();
         let folders = db.download_part_folders().unwrap();
         assert_eq!(folders.get("t-active").map(String::as_str), Some("D:/old"));
         assert!(!folders.contains_key("t-done"), "a finished row records no folder");

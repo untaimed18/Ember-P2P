@@ -786,8 +786,87 @@ async fn save_snapshot_now(snap: super::part_tracker::SaveSnapshot, context: &'s
 /// sockets to, mirroring eMule (which keeps a large per-file source pool but
 /// only a bounded number of live connections). The machine-wide ceiling is
 /// `GLOBAL_CONN_LIMITER` (eMule `maxconnections`).
-const MAX_CONCURRENT_SOURCES: usize = 50;
+///
+/// The cap is [`per_download_conn_cap`]: an even share of the download side of
+/// that ceiling, never under [`MIN_SOURCES_PER_DOWNLOAD`]. eMule has no
+/// per-file cap at all; a flat 50 left one running download using 50 of the
+/// ~375 connections downloads may hold at the default `maxconnections`.
+const MIN_SOURCES_PER_DOWNLOAD: usize = 50;
 const SOURCE_INJECTION_WAIT_SECS: u64 = 10;
+
+/// Multi-source download workers running now, each holding a
+/// [`RunningDownloadGuard`]. The divisor of [`per_download_conn_cap`].
+static RUNNING_DOWNLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct RunningDownloadGuard;
+
+impl RunningDownloadGuard {
+    fn enter() -> Self {
+        RUNNING_DOWNLOADS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for RunningDownloadGuard {
+    fn drop(&mut self) {
+        RUNNING_DOWNLOADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Live source connections one download may hold when `running` downloads
+/// share a configured `max_connections` of `max`.
+fn per_download_share(max: usize, running: usize) -> usize {
+    let download_side = max.saturating_sub(listener_reserve(max));
+    (download_side / running.max(1)).max(MIN_SOURCES_PER_DOWNLOAD)
+}
+
+/// [`per_download_share`] for the configured budget and the downloads running
+/// now. Read live, so it follows a settings change and downloads starting or
+/// ending.
+fn per_download_conn_cap() -> usize {
+    use std::sync::atomic::Ordering;
+    let max = GLOBAL_CONN_LIMITER
+        .get()
+        .map_or(FALLBACK_CONN_LIMIT, |l| l.desired_max.load(Ordering::Acquire));
+    per_download_share(max, RUNNING_DOWNLOADS.load(Ordering::Acquire))
+}
+
+/// How often a source waiting for a per-download permit re-reads
+/// [`per_download_conn_cap`], so a share that grew reaches it.
+const SOURCE_BUDGET_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One download's source-connection permits, resized to
+/// [`per_download_conn_cap`] as the share changes.
+struct SourceConnBudget {
+    sem: tokio::sync::Semaphore,
+    /// Permits the semaphore holds in total, handed out ones included.
+    size: std::sync::Mutex<usize>,
+}
+
+impl SourceConnBudget {
+    fn new(cap: usize) -> Self {
+        Self {
+            sem: tokio::sync::Semaphore::new(cap),
+            size: std::sync::Mutex::new(cap),
+        }
+    }
+
+    /// Grow to `target` at once. Shrinking only reclaims free permits; ones
+    /// backing a live connection come off on a later call, after it ends.
+    fn resize(&self, target: usize) {
+        let mut size = self.size.lock().unwrap_or_else(|p| p.into_inner());
+        if target > *size {
+            self.sem.add_permits(target - *size);
+            *size = target;
+        } else if target < *size {
+            *size -= self.sem.forget_permits(*size - target);
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.sem.available_permits() == 0
+    }
+}
 
 /// The machine-wide cap on client TCP connections, wired from
 /// `AppSettings::max_connections` (eMule's `maxconnections`). Installed at
@@ -1487,8 +1566,8 @@ impl Drop for PeerConnection {
 /// (hello / emule-info / file-status / hashset). The timer resets whenever a
 /// packet arrives, so a responsive peer is never cut off. Kept far below the
 /// 100s in-transfer no-data timeout (`DOWNLOADTIMEOUT_SECS`): a peer that
-/// accepts TCP then stalls the handshake would otherwise pin one of only
-/// `MAX_CONCURRENT_SOURCES` connection slots for the full transfer timeout,
+/// accepts TCP then stalls the handshake would otherwise pin one of the
+/// download's [`per_download_conn_cap`] connection slots for the full transfer timeout,
 /// starving queued live sources. eMule likewise uses a short establishment
 /// timeout and re-asks slow peers on a later cycle rather than holding the
 /// socket open.
@@ -2363,15 +2442,25 @@ async fn cancel_with_grace(control: &TransferControl) {
 /// Acquire a per-file source permit, aborting immediately on cancel/pause so
 /// waiters do not park forever behind pause holders (N4).
 async fn acquire_source_permit<'a>(
-    sem: &'a tokio::sync::Semaphore,
+    budget: &'a SourceConnBudget,
     control: &TransferControl,
 ) -> anyhow::Result<tokio::sync::SemaphorePermit<'a>> {
-    tokio::select! {
-        result = sem.acquire() => {
-            result.map_err(|_| anyhow::anyhow!("download cancelled"))
-        }
-        _ = control.wait_cancel_or_pause() => {
-            Err(anyhow::anyhow!("cancelled by user"))
+    budget.resize(per_download_conn_cap());
+    // Kept across rechecks, so a waiting source keeps its place in the queue.
+    let acquire = budget.sem.acquire();
+    let stop = control.wait_cancel_or_pause();
+    tokio::pin!(acquire, stop);
+    loop {
+        tokio::select! {
+            result = &mut acquire => {
+                return result.map_err(|_| anyhow::anyhow!("download cancelled"));
+            }
+            _ = &mut stop => {
+                return Err(anyhow::anyhow!("cancelled by user"));
+            }
+            _ = tokio::time::sleep(SOURCE_BUDGET_RECHECK) => {
+                budget.resize(per_download_conn_cap());
+            }
         }
     }
 }
@@ -3002,7 +3091,7 @@ impl MultiSourceDownload {
         // Progress aggregator channel: i64 signals used as a trigger
         // (value ignored); actual progress is read from the tracker to
         // avoid double-counting overlapping sources. Capacity 4096 (was
-        // 256): with up to MAX_CONCURRENT_SOURCES sources each pushing a
+        // 256): with up to `per_download_conn_cap` sources each pushing a
         // signal per ~180 KiB block, 256 was easily filled while the
         // aggregator was waiting on `event_tx_clone.send().await`,
         // back-pressuring every source coroutine.
@@ -3117,9 +3206,10 @@ impl MultiSourceDownload {
                 .await;
         });
 
-        // Semaphore to limit concurrent source connections (avoids overwhelming
+        // This download's share of source connections (avoids overwhelming
         // the network with dozens of simultaneous TCP handshakes to unreachable peers)
-        let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SOURCES));
+        let _running = RunningDownloadGuard::enter();
+        let conn_budget = Arc::new(SourceConnBudget::new(per_download_conn_cap()));
         let disk_full = Arc::new(AtomicBool::new(false));
 
         // Tracks "what stage did this peer reach?" per peer, so we
@@ -3263,7 +3353,7 @@ impl MultiSourceDownload {
             let src_ember_pubkey = self.ed25519_public_key;
             let src_ember_secret = self.ed25519_secret_key;
             let nick_for_src = self.nickname.read().await.clone();
-            let sem_clone = conn_semaphore.clone();
+            let sem_clone = conn_budget.clone();
             let qw = queue_wait_secs;
             let shared_out = shared_part_file.clone();
             let epx_payload = self.ember_payload.clone();
@@ -3291,7 +3381,8 @@ impl MultiSourceDownload {
             let handle = tokio::spawn(async move {
                 let freq_avail =
                     WireAvailabilityGuard::counted(&cs_clone, src_avail.clone(), &src_drop_tx);
-                if sem_clone.available_permits() == 0 {
+                sem_clone.resize(per_download_conn_cap());
+                if sem_clone.is_full() {
                     let _ = fail_etx
                         .send(DownloadEvent::SourceDetail {
                             transfer_id: fail_tid.clone(),
@@ -3819,7 +3910,7 @@ impl MultiSourceDownload {
                             let tid = self.transfer_id.clone();
                             let bi = self.shared_buddy_info.clone();
                             let ctrl = self.control.clone();
-                            let sem = conn_semaphore.clone();
+                            let sem = conn_budget.clone();
 
                             let fail_etx = event_tx.clone();
                             let fail_tid = self.transfer_id.clone();
@@ -4076,7 +4167,7 @@ impl MultiSourceDownload {
                             let tid = self.transfer_id.clone();
                             let bi = self.shared_buddy_info.clone();
                             let ctrl = self.control.clone();
-                            let sem = conn_semaphore.clone();
+                            let sem = conn_budget.clone();
 
                             let fail_etx = event_tx.clone();
                             let fail_tid = self.transfer_id.clone();
@@ -4482,7 +4573,7 @@ impl MultiSourceDownload {
                     let tid = self.transfer_id.clone();
                     let bi = self.shared_buddy_info.clone();
                     let ctrl = self.control.clone();
-                    let sem = conn_semaphore.clone();
+                    let sem = conn_budget.clone();
                     let fail_etx = event_tx.clone();
                     let fail_tid = self.transfer_id.clone();
                     let fail_ip = source.peer_ip.clone();
@@ -5097,7 +5188,7 @@ impl MultiSourceDownload {
                 let r_sx_oh = self.sx_overhead.clone();
                 let r_epx_oh = self.epx_overhead.clone();
                 let r_file_req_oh = self.file_req_overhead.clone();
-                let r_sem = conn_semaphore.clone();
+                let r_sem = conn_budget.clone();
                 // Clone the shared "peers that queued" set so this
                 // retry task can flag its peer when the task ends in
                 // a queue-related error. The outer loop drains the
@@ -9472,7 +9563,7 @@ async fn download_parts_from_source(
             if _global_conn_permit.is_some()
                 && elapsed >= QUEUE_DETACH_GRACE_SECS
                 && (active_count.load(Ordering::Relaxed) + queued_count.load(Ordering::Relaxed))
-                    >= MAX_CONCURRENT_SOURCES as u32
+                    >= per_download_conn_cap() as u32
                 && last_rank.is_some_and(|r| r > QUEUE_DETACH_RANK_THRESHOLD)
             {
                 debug!(
@@ -10136,7 +10227,7 @@ async fn download_parts_from_source(
                     if measured_speed < TRICKLE_SLOW_FLOOR_BPS {
                         let since = *slow_since.get_or_insert_with(std::time::Instant::now);
                         let file_at_budget =
-                            active_count.load(Ordering::Relaxed) >= MAX_CONCURRENT_SOURCES as u32;
+                            active_count.load(Ordering::Relaxed) >= per_download_conn_cap() as u32;
                         if since.elapsed() >= TRICKLE_SLOW_WINDOW
                             && (file_at_budget || global_dl_conn_contended())
                         {
@@ -13558,6 +13649,40 @@ mod tests {
     fn a_single_connection_budget_still_leaves_downloads_a_slot() {
         assert_eq!(listener_reserve(1), 0);
         assert_eq!(listener_reserve(0), 0);
+    }
+
+    /// One download may use the whole download side of the budget; several
+    /// split it evenly, and none drops under the old flat 50.
+    #[test]
+    fn each_download_gets_an_even_share_of_the_download_side_never_under_fifty() {
+        assert_eq!(per_download_share(500, 1), 375, "500 less the listener's 125");
+        assert_eq!(per_download_share(500, 0), 375, "no other download running");
+        assert_eq!(per_download_share(500, 5), 75);
+        assert_eq!(per_download_share(500, 10), MIN_SOURCES_PER_DOWNLOAD);
+        assert_eq!(per_download_share(2000, 1), 1500);
+        assert_eq!(per_download_share(100, 1), 75);
+        assert_eq!(per_download_share(60, 1), MIN_SOURCES_PER_DOWNLOAD, "45 is under the floor");
+        assert_eq!(per_download_share(1, 1), MIN_SOURCES_PER_DOWNLOAD);
+    }
+
+    /// A share that grows is granted at once; one that shrinks takes back free
+    /// permits now and permits in use only once they are returned.
+    #[test]
+    fn a_source_budget_grows_at_once_and_shrinks_as_connections_end() {
+        let budget = SourceConnBudget::new(2);
+        budget.resize(4);
+        let held: Vec<_> = (0..4).map(|_| budget.sem.try_acquire().unwrap()).collect();
+        assert!(budget.is_full());
+
+        budget.resize(1);
+        assert_eq!(budget.sem.available_permits(), 0, "nothing free to take back yet");
+        drop(held);
+        assert_eq!(budget.sem.available_permits(), 4, "returned permits wait for the next resize");
+        budget.resize(1);
+        assert_eq!(budget.sem.available_permits(), 1);
+
+        budget.resize(3);
+        assert_eq!(budget.sem.available_permits(), 3);
     }
 
     /// `yy` in the Sources column is the size of the source list, so committing

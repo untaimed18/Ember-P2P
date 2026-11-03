@@ -5,10 +5,6 @@
 
 use super::*;
 
-/// How often a download's progress is written to SQLite between terminal
-/// state changes; `start_network` explains why this is throttled.
-const DB_PROGRESS_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// Tell the UI, at most once per this many seconds, that downloads are being
 /// refused by the download folder. Every waiting download hits the same wall on
 /// each retry, and one notice says everything the next hundred would.
@@ -306,7 +302,7 @@ pub(in crate::network) async fn on_download_event(
     ed25519_secret_key: [u8; 32],
     a4af_shared: &Arc<RwLock<A4AFManager>>,
     aich_set_tx: &mpsc::Sender<ed2k::aich::AICHRecoveryHashSet>,
-    db_progress_last_persist: &mut HashMap<String, std::time::Instant>,
+    db_progress_batch: &mut DbProgressBatch,
     completed_digest_result_tx: &mpsc::UnboundedSender<CompletedDigests>,
     part_hashset_result_tx: &mpsc::UnboundedSender<([u8; 16], Vec<[u8; 16]>)>,
     pending_kad_callbacks: &upload_server::PendingKadCallbacks,
@@ -2027,7 +2023,7 @@ pub(in crate::network) async fn on_download_event(
     // event can't unwind the whole network loop (→ outer catch →
     // shutdown). Mirrors the handle_command_inner/handle_udp_packet_inner
     // catch_unwind pattern.
-    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, credit_manager, &settings.download_roots(), db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since, transfer_status_writes, completed_worker)).catch_unwind().await {
+    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, credit_manager, &settings.download_roots(), db_progress_batch, &mut state.callback_row_pending_since, transfer_status_writes, completed_worker)).catch_unwind().await {
         error!("handle_download_event panicked, dropping event: {}", describe_panic(&*p));
     }
 

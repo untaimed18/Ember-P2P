@@ -1555,10 +1555,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // values have no operational use — crash recovery rebuilds them from the
     // `.part.met` via `PartTracker::new` at `start_network` resume, and the
     // live UI reads from `transfer_manager` (commands/transfers.rs).
-    // Keep a per-transfer "last persisted at" map and only flush to SQLite
-    // once per `DB_PROGRESS_PERSIST_INTERVAL`, plus always at terminal
-    // state transitions (handled separately via `update_transfer_status`).
-    let mut db_progress_last_persist: HashMap<String, std::time::Instant> = HashMap::new();
+    // Collect each download's latest figure and flush them all to SQLite in
+    // one transaction once per `DB_PROGRESS_PERSIST_INTERVAL`, plus always at
+    // terminal state transitions (handled separately via `update_transfer_status`).
+    let mut db_progress_batch = DbProgressBatch::default();
     // Upload `transferred` is intentionally capped to the file size for UI
     // progress. Keep a separate raw counter for durable Library accounting so
     // retransmitted payload bytes are not silently discarded.
@@ -3331,7 +3331,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     ed25519_secret_key,
                     &a4af_shared,
                     &aich_set_tx,
-                    &mut db_progress_last_persist,
+                    &mut db_progress_batch,
                     &completed_digest_result_tx,
                     &part_hashset_result_tx,
                     &pending_kad_callbacks,
@@ -3693,7 +3693,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     channel_sweep_cutoff,
                     &mut credit_flush_handle,
                     &credit_save_ownership,
-                    &mut db_progress_last_persist,
                     &mut last_chat_expiry_sweep,
                     &mut nat_probe_in_flight,
                     &mut nat_probe_packet_tx,
@@ -4509,6 +4508,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'stats_timer' panicked: {}", describe_panic(&*__p));
                 }
+                // Progress events stop when a download stalls; what they left
+                // waiting is written here instead.
+                db_progress_batch.flush_due(&db);
             }
 
             Some(result) = known_met_save_result_rx.recv() => {

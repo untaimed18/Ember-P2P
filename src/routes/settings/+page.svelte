@@ -1411,7 +1411,7 @@
     // USS needs a non-zero upload cap, so applying Unlimited turns it off.
     if (s.max_upload_speed === 0) s.uss_enabled = false;
     s.max_download_speed = cn(s.max_download_speed, MAX_CONFIGURED_SPEED_BPS, 0);
-    s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 5);
+    s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 10);
     // 0 is Auto, not an empty box — `numericFields` above rejects those.
     if (s.max_concurrent_uploads !== 0) s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 5);
     s.max_sources_per_file = ci(s.max_sources_per_file, 50, 2000, 400);

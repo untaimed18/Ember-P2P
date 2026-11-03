@@ -739,6 +739,7 @@ pub(in crate::network) async fn on_source_retry_tick(
         }
     }
     drop(a4af_snap);
+    let persistent_set: HashSet<&String> = started_from_persistent.iter().collect();
 
     // First pass: check if SourceManager has accumulated sources for
     // any pending download (from server TCP/UDP responses). If so, start
@@ -747,7 +748,7 @@ pub(in crate::network) async fn on_source_retry_tick(
     {
         let sm = source_manager.read().await;
         for (tid, _) in &to_retry {
-            if started_from_persistent.contains(tid) || !may_start.contains(tid) { continue; }
+            if persistent_set.contains(tid) || !may_start.contains(tid) { continue; }
             if let Some(pd) = state.pending_downloads.get(tid) {
                 if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
                     if hash_bytes.len() == 16 {
@@ -1000,7 +1001,7 @@ pub(in crate::network) async fn on_source_retry_tick(
     }
 
     for tid in &started_from_sm {
-        if started_from_persistent.contains(tid) { continue; }
+        if persistent_set.contains(tid) { continue; }
         if let Some(pending) = state.pending_downloads.remove(tid) {
             let hash_bytes = match hex::decode(&pending.file_hash) {
                 Ok(b) if b.len() == 16 => {
@@ -1251,8 +1252,9 @@ pub(in crate::network) async fn on_source_retry_tick(
     // cached sources — replicate that one-shot kick here.
     {
         let mut warm_started: Vec<String> = started_from_persistent.clone();
+        let mut warm_seen: HashSet<String> = warm_started.iter().cloned().collect();
         for tid in &started_from_sm {
-            if !warm_started.contains(tid) {
+            if warm_seen.insert(tid.clone()) {
                 warm_started.push(tid.clone());
             }
         }
@@ -1366,8 +1368,9 @@ pub(in crate::network) async fn on_source_retry_tick(
         }
     }
 
+    let started: HashSet<&String> = started_from_sm.iter().chain(&started_from_persistent).collect();
     let mut to_retry: Vec<String> = to_retry.into_iter()
-        .filter(|(tid, _)| !started_from_sm.contains(tid) && !started_from_persistent.contains(tid))
+        .filter(|(tid, _)| !started.contains(tid))
         .map(|(tid, _)| tid)
         .collect();
 
@@ -1383,8 +1386,9 @@ pub(in crate::network) async fn on_source_retry_tick(
         // socket applied backpressure or the source list was large.
         let mut to_send: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
         let mut reask_ids = to_retry.clone();
+        let mut reask_seen: HashSet<String> = reask_ids.iter().cloned().collect();
         for tid in state.active_source_senders.keys() {
-            if !reask_ids.iter().any(|existing| existing == tid) {
+            if reask_seen.insert(tid.clone()) {
                 reask_ids.push(tid.clone());
             }
         }

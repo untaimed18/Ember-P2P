@@ -16104,7 +16104,7 @@ fn compute_part_hashes(file: &mut std::fs::File) -> anyhow::Result<Vec<[u8; 16]>
     let num_parts = file_size.div_ceil(PARTSIZE) as usize;
 
     let mut hashes = Vec::with_capacity(num_parts + 1);
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; super::hash::HASH_BUF_SIZE];
     let mut remaining = file_size;
 
     for _ in 0..num_parts {

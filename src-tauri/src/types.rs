@@ -3033,7 +3033,7 @@ impl Default for AppSettings {
             previous_download_folders: Vec::new(),
             max_upload_speed: 0,
             max_download_speed: 0,
-            max_concurrent_downloads: 5,
+            max_concurrent_downloads: 10,
             max_concurrent_uploads: default_max_uploads(),
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
