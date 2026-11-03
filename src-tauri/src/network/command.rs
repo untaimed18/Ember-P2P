@@ -350,7 +350,10 @@ async fn handle_command_inner(
             // so cancel can clear the UDP queue and emit `search-complete`.
             // Taking first used to skip both, leaving the old tab spinning and
             // leftover UDP packets tagged under the new request.
-            if let Some(active) = state.active_search_request.as_ref() {
+            if let Some(active) = state.active_search_request.as_mut() {
+                // Replaced rather than stopped: only this search can be
+                // continued, so the prior one's tab must not offer it.
+                active.continued = false;
                 let prior_id = active.request_id;
                 cancel_search_request(state, app_handle, prior_id);
             }

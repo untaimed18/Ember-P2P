@@ -6460,6 +6460,10 @@ impl UploadHandler {
             entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
             entry.peer_name = hello_caps.peer_name.clone();
             entry.client_software = client_software_from_caps(hello_caps);
+            // The slot just spent was this peer's turn. A row it queued
+            // meanwhile must not keep the older wait, or the peer outscores
+            // every waiter and takes the slot straight back.
+            entry.join_time = queue_join_time;
             if friend_slot_priority {
                 entry.is_friend_slot = true;
             }

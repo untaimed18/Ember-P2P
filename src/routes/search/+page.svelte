@@ -227,15 +227,28 @@
       if (!searching && announcedSearching) {
         announcedSearching = false;
         const tab = activeTab;
+        if (tab?.error) {
+          announceSearch(m.search_failed_with({ error: tab.error }));
+          return;
+        }
         const found = tab?.results.length ?? 0;
+        // The throttled snapshot may still lack the last batch; the count
+        // shown on screen is read from it.
+        if (tab && visibleResults !== tab.results) syncVisibleResults(tab.results, tab.id);
+        const shown = filteredResults.length;
+        const complete = plural(found, {
+          one: () => m.search_announce_complete_one({ count: formatNumber(found) }),
+          oneShowsCount: true,
+          other: () => m.search_announce_complete_other({ count: formatNumber(found) }),
+        });
         announceSearch(
-          tab?.error
-            ? m.search_failed_with({ error: tab.error })
-            : plural(found, {
-                one: () => m.search_announce_complete_one({ count: formatNumber(found) }),
+          shown < found
+            ? `${complete}. ${plural(shown, {
+                one: () => m.search_showing_filtered_one({ count: formatNumber(shown), total: formatNumber(found) }),
                 oneShowsCount: true,
-                other: () => m.search_announce_complete_other({ count: formatNumber(found) }),
-              }),
+                other: () => m.search_showing_filtered_other({ count: formatNumber(shown), total: formatNumber(found) }),
+              })}`
+            : complete,
         );
         return;
       }
@@ -3012,6 +3025,9 @@
    * the ones it already has; Stop works on it as on any search.
    */
   let searchMoreBusy = $state(false);
+  /** Search More runs Stop leaves resumable: the backend sets them aside under
+   *  the same id, so Stop keeps it instead of rotating it. */
+  const continuedRequestIds = new Set<number>();
   async function continueSearch() {
     const t = activeTab;
     if (!t || t.isSearching || !t.canSearchMore || searchMoreBusy) return;
@@ -3025,13 +3041,21 @@
       progress: null,
       error: null,
     }));
+    // Before the invoke: Stop is offered from here on, and must already know
+    // to keep this id.
+    continuedRequestIds.add(requestId);
     try {
       const outcome = await searchMore(requestId);
+      // Not in the set any more: Stop came while the invoke was out, and has
+      // settled the tab already.
       if (!outcome.started) {
-        patchSearchTabByRequestId(requestId, (tab) => ({ ...tab, isSearching: false }));
-        addToast('info', m.search_more_nothing_left());
+        if (continuedRequestIds.delete(requestId)) {
+          patchSearchTabByRequestId(requestId, (tab) => ({ ...tab, isSearching: false }));
+          addToast('info', m.search_more_nothing_left());
+        }
         return;
       }
+      if (!continuedRequestIds.has(requestId)) return;
       // There is no invoke left to wait on: `search-complete` ends it, and the
       // fallback covers that event going missing.
       searchInvokeSettled.add(requestId);
@@ -3047,6 +3071,7 @@
           : m.search_more_asking_server(),
       );
     } catch (e: unknown) {
+      continuedRequestIds.delete(requestId);
       patchSearchTabByRequestId(requestId, (tab) => ({ ...tab, isSearching: false, canSearchMore: true }));
       addToast('error', translateError(e, m.search_more_failed()));
     } finally {
@@ -3072,6 +3097,15 @@
       // means the search keeps running server-side while every result it finds
       // is discarded — the user should know the stop didn't reach the network.
       addToast('warning', m.search_stop_failed());
+    }
+    if (continuedRequestIds.delete(stoppedId)) {
+      // No `search_files` answer is left to discard, so the id stays and the
+      // `search-complete` the cancel emits says whether Search More can
+      // carry on.
+      flushPendingSearchResults(stoppedId);
+      patchSearchTabByRequestId(stoppedId, (tab) => ({ ...tab, isSearching: false, progress: null }));
+      forgetSettledRequest(stoppedId);
+      return;
     }
     // Same discard protocol as `performClearResults`: the backend answers a
     // cancel by resolving the pending `search_files` oneshot with everything it

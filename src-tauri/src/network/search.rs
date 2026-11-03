@@ -959,6 +959,10 @@ pub(super) struct ActiveSearchRequest {
     /// results — the page cap or the result cap stopped it, not the server —
     /// so Search More can ask it for further pages.
     pub(super) server_has_more: bool,
+    /// Running as a Search More. Stop sets such a request aside instead of
+    /// dropping it: the page keeps its id, since no `search_files` answer is
+    /// left to discard, and can ask the servers it has not reached yet.
+    pub(super) continued: bool,
 }
 
 impl ActiveSearchRequest {
@@ -992,6 +996,7 @@ impl ActiveSearchRequest {
             batch_spam: crate::search::spam::BatchSpamContext::default(),
             udp_search_expr: Vec::new(),
             server_has_more: false,
+            continued: false,
         }
     }
 
@@ -1142,6 +1147,7 @@ pub(super) fn start_search_more(
         "Search More for request {request_id}: {servers} server(s) not yet asked{}",
         if server_pages { ", plus the connected server's next pages" } else { "" }
     );
+    request.continued = true;
     state.active_search_request = Some(request);
     SearchMoreOutcome { started: true, servers, server_pages }
 }
@@ -2212,6 +2218,17 @@ pub(super) fn release_ember_search_state(
         .retain(|_, r| r.search_id != search_id);
 }
 
+/// Put a stopped Search More in the state the next Search More expects: no
+/// leg running. One stopped while waiting on a page the server had said was
+/// there keeps that page owed, so the next Search More asks for it again.
+fn settle_stopped_continuation(request: &mut ActiveSearchRequest) {
+    request.server_has_more |= request.server_pending;
+    request.server_pending = false;
+    request.udp_pending = false;
+    request.kad_pending = false;
+    request.ember_pending = false;
+}
+
 pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
     // Drop in-flight Ember DHT keyword lookups for this request so a
     // cancelled search stops walking (not just unmapping bookkeeping while
@@ -2301,24 +2318,31 @@ pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri
     }
     drop_queued_server_followup(state, request_id);
 
+    // A stopped search is not continued: the page has already let go of its
+    // id. A Search More is the exception, see `continued`.
+    if state
+        .finished_search
+        .as_ref()
+        .is_some_and(|finished| finished.request_id == request_id && !finished.continued)
+    {
+        state.finished_search = None;
+    }
     if state
         .active_search_request
         .as_ref()
         .is_some_and(|active| active.request_id == request_id)
     {
-        state.active_search_request = None;
+        let stopped = state.active_search_request.take();
         state.server_search_age = 0;
         state.server_udp_search_age = 0;
         state.udp_search_queue.clear();
-        let _ = app_handle.emit("search-complete", SearchCompleteEvent::done(request_id));
-    }
-    // A stopped search is not continued: the page has already let go of its id.
-    if state
-        .finished_search
-        .as_ref()
-        .is_some_and(|finished| finished.request_id == request_id)
-    {
-        state.finished_search = None;
+        let mut event = SearchCompleteEvent::done(request_id);
+        if let Some(mut request) = stopped.filter(|request| request.continued) {
+            settle_stopped_continuation(&mut request);
+            event.can_search_more = search_more_available(state, &request);
+            state.finished_search = Some(request);
+        }
+        let _ = app_handle.emit("search-complete", event);
     }
 }
 
@@ -2376,6 +2400,29 @@ mod tests {
             udp_pending: true,
             ..ActiveSearchRequest::new(request_id)
         }
+    }
+
+    #[test]
+    fn a_stopped_search_more_keeps_an_unread_server_page_owed() {
+        let mut request = ActiveSearchRequest {
+            server_pending: true,
+            kad_pending: true,
+            ember_pending: true,
+            continued: true,
+            ..active(3)
+        };
+        settle_stopped_continuation(&mut request);
+        assert!(request.server_has_more);
+        assert!(
+            !(request.server_pending || request.udp_pending || request.kad_pending || request.ember_pending),
+            "no leg may stay pending, or the next Search More never completes"
+        );
+
+        // Stopped after the server's leg had ended: what it said then stands.
+        let mut request = ActiveSearchRequest { continued: true, ..active(4) };
+        settle_stopped_continuation(&mut request);
+        assert!(!request.server_has_more);
+        assert!(!request.udp_pending);
     }
 
     /// The dropped re-sighting's name has to reach the batch context, or a
