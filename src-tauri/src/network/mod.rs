@@ -1010,6 +1010,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         last_server_session_low_id: false,
         preferred_ed2k_server: None,
         server_last_connect_attempt: None,
+        server_last_moved_at: None,
         pending_uss_pings: HashMap::new(),
         uss_host: None,
         uss_prev_host: None,

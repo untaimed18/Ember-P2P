@@ -1200,7 +1200,7 @@ pub(in crate::network) async fn on_upload_event(
             };
             // Cap both entry count and total payload bytes. The
             // receiving side's inbound frame reader
-            // (`read_packet_with_first_byte` in upload.rs) rejects
+            // (`read_packet_after_protocol` in upload.rs) rejects
             // any packet over 512 KiB outright with no partial
             // delivery, so an oversized answer silently loses the
             // *entire* browse response rather than a truncated

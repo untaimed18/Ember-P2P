@@ -155,6 +155,11 @@ pub struct ServerEntry {
     /// the per-server gate for the 4.5 h status cadence. Saved as wall-clock
     /// time (`ST_LASTPING`) so it outlasts a restart.
     pub last_udp_ping_at: i64,
+    /// The hostname of a server on a dynamic IP, empty for none: announced in
+    /// its welcome as `[emDynIP: host]` and saved as eMule's `ST_DYNIP`, so
+    /// the server can be followed when its address changes (eMule resolves it
+    /// before connecting).
+    pub dyn_host: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,13 +229,32 @@ impl ServerEntry {
             last_udp_source_reply_at: 0,
             last_udp_query_at: 0,
             last_udp_ping_at: 0,
+            dyn_host: String::new(),
         }
     }
 }
 
+/// eMule's `ST_DYNIP`: the hostname of a server on a dynamic IP.
+const ST_DYNIP: u8 = 0x85;
+
+/// `raw` as a server's dynamic hostname, or `None` when it is not one. eMule
+/// keeps only a non-empty name under 51 characters that is not an IPv4
+/// address; the character check keeps anything but a DNS name out of a
+/// later lookup.
+pub fn valid_dyn_host(raw: &str) -> Option<String> {
+    let host = raw.trim();
+    let is_name = !host.is_empty()
+        && host.len() <= 50
+        && host.parse::<Ipv4Addr>().is_err()
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        && host.bytes().any(|b| b.is_ascii_alphabetic());
+    is_name.then(|| host.to_ascii_lowercase())
+}
+
 fn apply_server_int_tag(entry: &mut ServerEntry, name_id: u8, v: u32) {
     match name_id {
-        0x0D | 0x85 => entry.fail_count = v,
+        // An integer under ST_DYNIP is an older Ember's fail count.
+        0x0D | ST_DYNIP => entry.fail_count = v,
         0x0E => {
             entry.priority = match v {
                 0 => ServerPriority::Normal,
@@ -458,6 +482,9 @@ fn read_met_entry(cursor: &mut Cursor<&[u8]>, source: MetSource) -> io::Result<S
             MetTagValue::Str(text) => match tag.id {
                 0x01 if entry.name.is_empty() => entry.name = text,
                 0x0B if entry.description.is_empty() => entry.description = text,
+                ST_DYNIP if entry.dyn_host.is_empty() => {
+                    entry.dyn_host = valid_dyn_host(&text).unwrap_or_default();
+                }
                 _ => {}
             },
             MetTagValue::Int(v) => match (tag.id, tag.name.as_deref()) {
@@ -858,6 +885,48 @@ impl ServerList {
 
     pub fn find_by_addr(&self, ip: &str, port: u16) -> Option<&ServerEntry> {
         self.servers.iter().find(|s| s.ip == ip && s.port == port)
+    }
+
+    /// Record the dynamic hostname a server announced. Returns whether that
+    /// changed anything, so the caller saves only when it did.
+    pub fn set_dyn_host(&mut self, ip: &str, port: u16, host: &str) -> bool {
+        match self.servers.iter_mut().find(|s| s.ip == ip && s.port == port) {
+            Some(server) if server.dyn_host != host => {
+                server.dyn_host = host.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Follow a server on a dynamic IP to `new_ip`. The entry keeps what it
+    /// knows of the server but starts over on connection failures, which were
+    /// the old address's. When `new_ip:port` is already listed, that entry is
+    /// kept, takes the hostname, and the old one goes. Returns whether
+    /// anything moved.
+    pub fn move_server(&mut self, ip: &str, port: u16, new_ip: &str) -> bool {
+        let Some(pos) = self.servers.iter().position(|s| s.ip == ip && s.port == port) else {
+            return false;
+        };
+        if ip == new_ip {
+            return false;
+        }
+        if let Some(existing) = self
+            .servers
+            .iter()
+            .position(|s| s.ip == new_ip && s.port == port)
+        {
+            let dyn_host = std::mem::take(&mut self.servers[pos].dyn_host);
+            self.servers[existing].dyn_host = dyn_host;
+            self.servers.remove(pos);
+            return true;
+        }
+        let server = &mut self.servers[pos];
+        server.ip = new_ip.to_string();
+        server.fail_count = 0;
+        server.last_failed_at = 0;
+        server.udp_consecutive_failures = 0;
+        true
     }
 
     /// Prefer the well-known Sunrise IP/port when present in the list; otherwise
@@ -1385,6 +1454,11 @@ impl ServerList {
                 tag_count += 1;
             }
 
+            if !entry.dyn_host.is_empty() {
+                write_met_string_tag(&mut tag_buf, ST_DYNIP, &entry.dyn_host);
+                tag_count += 1;
+            }
+
             // CT_SERVERPRIORITY (0x0E) - uint32 (eMule: 0=normal, 1=high, 2=low)
             {
                 let prio_val: u32 = match entry.priority {
@@ -1578,6 +1652,59 @@ fn write_met_uint16_tag(buf: &mut Vec<u8>, tag_id: u8, value: u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server's dynamic hostname is kept only when it is one, survives a
+    /// save as eMule's string `ST_DYNIP`, and an older Ember's integer under
+    /// the same tag still reads as its fail count.
+    #[test]
+    fn a_dynamic_hostname_is_validated_saved_and_read_back() {
+        assert_eq!(valid_dyn_host(" Server.Example.org "), Some("server.example.org".into()));
+        assert_eq!(valid_dyn_host("1.2.3.4"), None, "an address is not a name");
+        assert_eq!(valid_dyn_host(""), None);
+        assert_eq!(valid_dyn_host("a b.org"), None);
+        assert_eq!(valid_dyn_host(&format!("{}.org", "x".repeat(50))), None, "eMule keeps under 51");
+
+        let mut list = ServerList::new();
+        list.add(ServerEntry::new("45.1.2.3".into(), 4661));
+        assert!(list.set_dyn_host("45.1.2.3", 4661, "dyn.example.org"));
+        assert!(!list.set_dyn_host("45.1.2.3", 4661, "dyn.example.org"), "no change, no save");
+        let reread = ServerList::parse_server_met(&list.to_server_met_bytes().unwrap()).unwrap();
+        assert_eq!(reread.find_by_addr("45.1.2.3", 4661).unwrap().dyn_host, "dyn.example.org");
+
+        let mut legacy = vec![0x0E];
+        legacy.extend_from_slice(&1u32.to_le_bytes());
+        legacy.extend_from_slice(&u32::from_le_bytes([45, 1, 2, 3]).to_le_bytes());
+        legacy.extend_from_slice(&4661u16.to_le_bytes());
+        legacy.extend_from_slice(&1u32.to_le_bytes());
+        write_met_uint32_tag(&mut legacy, ST_DYNIP, 7);
+        let old = ServerList::parse_server_met(&legacy).unwrap();
+        let entry = old.find_by_addr("45.1.2.3", 4661).unwrap();
+        assert_eq!((entry.fail_count, entry.dyn_host.as_str()), (7, ""));
+    }
+
+    /// Following a server to its new address keeps what is known of it but
+    /// not the old address's failures; if the new address is listed already,
+    /// that entry stays and takes the hostname.
+    #[test]
+    fn a_moved_server_takes_its_entry_along() {
+        let mut list = ServerList::new();
+        let mut entry = ServerEntry::new("45.1.2.3".into(), 4661);
+        entry.name = "Dyn".into();
+        entry.dyn_host = "dyn.example.org".into();
+        entry.fail_count = 2;
+        list.add(entry);
+        assert!(list.move_server("45.1.2.3", 4661, "46.9.9.9"));
+        assert!(list.find_by_addr("45.1.2.3", 4661).is_none());
+        let moved = list.find_by_addr("46.9.9.9", 4661).unwrap();
+        assert_eq!((moved.name.as_str(), moved.fail_count), ("Dyn", 0));
+        assert!(!list.move_server("46.9.9.9", 4661, "46.9.9.9"));
+        assert!(!list.move_server("1.1.1.1", 4661, "2.2.2.2"), "unlisted");
+
+        list.add(ServerEntry::new("47.0.0.1".into(), 4661));
+        assert!(list.move_server("46.9.9.9", 4661, "47.0.0.1"));
+        assert_eq!(list.servers().len(), 1);
+        assert_eq!(list.find_by_addr("47.0.0.1", 4661).unwrap().dyn_host, "dyn.example.org");
+    }
 
     /// Two-server fixture: one High-priority entry and one Normal, used by
     /// cooldown tests that previously depended on `ServerList::hardcoded()`.

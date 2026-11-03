@@ -3930,7 +3930,7 @@ impl DirBrowseListing {
         let mut labels: Vec<String> = Vec::new();
         let mut groups: HashMap<String, Vec<BrowseEntry>> = HashMap::new();
         for (folder, entry) in files {
-            let label = UploadHandler::browse_label_for_peer(
+            let label = UploadHandler::name_for_peer(
                 &UploadHandler::browse_dir_label(&folder),
                 peer_supports_unicode,
             );
@@ -5163,7 +5163,7 @@ fn encode_shared_files_answer(
     // (which alone still allows a multi-MB payload for a large library),
     // also bound total encoded bytes: `write_packet_async` has no outbound
     // size limit of its own, and our own inbound frame reader
-    // (`read_packet_with_first_byte`) rejects anything over 512 KiB
+    // (`read_packet_after_protocol`) rejects anything over 512 KiB
     // outright, so sending an answer this same client couldn't itself
     // receive back is never useful. A truncated-but-delivered answer is
     // strictly better than one that's fully built, sent, and then dropped
@@ -7055,7 +7055,8 @@ impl UploadHandler {
             .unwrap_or_else(|| super::messages::OP_OTHER_SHARED_FILES.to_string())
     }
 
-    /// The directory label to send a peer that never claimed Unicode support.
+    /// A directory label or file name as sent to a peer: unchanged for one that
+    /// claimed Unicode support, folded to ASCII for one that did not.
     ///
     /// eMule picks the encoding per peer: `GetUnicodeSupport()` feeds
     /// `CFileDataIO::WriteString`, which writes raw UTF-8 only for a Unicode
@@ -7070,7 +7071,7 @@ impl UploadHandler {
     /// than turned into mojibake, and only for a peer that told us it cannot
     /// read anything else. eMule's own ANSI conversion substitutes for an
     /// unmappable character in the same way.
-    fn browse_label_for_peer(label: &str, peer_supports_unicode: bool) -> String {
+    fn name_for_peer(label: &str, peer_supports_unicode: bool) -> String {
         if peer_supports_unicode || label.is_ascii() {
             return label.to_string();
         }
@@ -8313,7 +8314,7 @@ impl UploadHandler {
                     preauth_deadline.expect("inbound streams have a pre-auth deadline"),
                     async {
                         if let Some(first) = first_inner_byte {
-                            read_packet_with_first_byte(&mut rd, first).await
+                            read_packet_after_protocol(&mut rd, first).await
                         } else {
                             read_packet_async_inner(&mut rd).await
                         }
@@ -8650,7 +8651,7 @@ impl UploadHandler {
                         let mut wr = StreamWriter::Plain(raw_writer);
                         let (proto, opcode, hd) = tokio::time::timeout_at(
                             preauth_deadline.expect("inbound TCP has a pre-auth deadline"),
-                            read_packet_with_first_byte(&mut rd, first_byte),
+                            read_packet_after_protocol(&mut rd, first_byte),
                         )
                         .await
                         .map_err(|_| anyhow::anyhow!("first eD2K frame timed out"))??;
@@ -11248,7 +11249,8 @@ impl UploadHandler {
                                     peer_part_status = Some((hash, hex));
                                 }
                             }
-                            let name_bytes = file.name.as_bytes();
+                            let name = Self::name_for_peer(&file.name, hello_caps.supports_unicode);
+                            let name_bytes = name.as_bytes();
                             let mut resp = Vec::with_capacity(16 + 2 + name_bytes.len());
                             resp.extend_from_slice(&hash);
                             resp.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
@@ -14080,7 +14082,7 @@ impl UploadHandler {
 
                                 let Some(answer) = build_multipacket_answer(
                                     &mpreq.file_hash,
-                                    &file.name,
+                                    &Self::name_for_peer(&file.name, hello_caps.supports_unicode),
                                     file.size,
                                     !file.is_partial,
                                     partial_bitmap.as_deref(),
@@ -16330,38 +16332,6 @@ fn zero_byte_session_failure(error: &anyhow::Error) -> String {
     }
 }
 
-async fn read_packet_with_first_byte<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-    first_byte: u8,
-) -> std::io::Result<(u8, u8, Vec<u8>)> {
-    let protocol = first_byte;
-    let length = reader.read_u32_le().await? as usize;
-    if length == 0 || length > 512 * 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "invalid packet length",
-        ));
-    }
-    let opcode = reader.read_u8().await?;
-    let payload_len = length - 1;
-    let mut payload = Vec::new();
-    if payload_len > 0 {
-        // Grow as bytes arrive instead of eagerly allocating the full declared
-        // length (up to 512 KiB) so a slow/hostile peer can't pin that memory
-        // per upload slot before sending anything.
-        payload.reserve(payload_len.min(64 * 1024));
-        let mut remaining = payload_len;
-        let mut chunk = [0u8; 32 * 1024];
-        while remaining > 0 {
-            let want = remaining.min(chunk.len());
-            reader.read_exact(&mut chunk[..want]).await?;
-            payload.extend_from_slice(&chunk[..want]);
-            remaining -= want;
-        }
-    }
-    Ok((protocol, opcode, payload))
-}
-
 fn is_connection_closed(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -16471,10 +16441,10 @@ mod unique_served_tests {
         type Server = UploadHandler;
         let folder = "Música";
 
-        let unicode = Server::browse_label_for_peer(folder, true);
+        let unicode = Server::name_for_peer(folder, true);
         assert_eq!(unicode, folder, "a Unicode peer gets the name unchanged");
 
-        let folded = Server::browse_label_for_peer(folder, false);
+        let folded = Server::name_for_peer(folder, false);
         assert!(folded.is_ascii(), "ASCII decodes the same in every codepage");
         assert_eq!(folded, "M_sica");
         assert_eq!(
@@ -16486,14 +16456,14 @@ mod unique_served_tests {
         // Folding is applied to the label, not the path, so it is the same
         // string on both sides of the exchange.
         assert_eq!(
-            Server::browse_label_for_peer(&folded, false),
+            Server::name_for_peer(&folded, false),
             folded,
             "already-ASCII labels are left alone, so the match is stable"
         );
 
         // An ASCII folder is untouched either way — the common case pays nothing.
-        assert_eq!(Server::browse_label_for_peer("Videos", false), "Videos");
-        assert_eq!(Server::browse_label_for_peer("Videos", true), "Videos");
+        assert_eq!(Server::name_for_peer("Videos", false), "Videos");
+        assert_eq!(Server::name_for_peer("Videos", true), "Videos");
     }
 
     fn browse_entry(folder: &str, name: &str) -> (String, BrowseEntry) {
@@ -17403,7 +17373,7 @@ mod browse_answer_tests {
 
     /// A pathologically large shared library must not produce a payload
     /// that can never be delivered: our own inbound frame reader
-    /// (`read_packet_with_first_byte`) rejects any packet over 512 KiB
+    /// (`read_packet_after_protocol`) rejects any packet over 512 KiB
     /// outright, so `encode_shared_files_answer`'s internal byte budget
     /// must keep the *encoded* payload comfortably under that regardless
     /// of how many files are passed in — and it must still emit a

@@ -1828,9 +1828,9 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 // Reading bit 2 meant a vanilla eMule advertising preview was
                 // always recorded as not supporting it.
                 caps.supports_preview = (int_val & (1 << ET_FEATURES_PREVIEW)) != 0;
-                caps.supports_crypt_layer |= (int_val & 0x08) != 0;
-                caps.requests_crypt_layer |= (int_val & 0x10) != 0;
-                caps.requires_crypt_layer |= (int_val & 0x20) != 0;
+                // No crypt-layer bits here: eMule carries those only in the
+                // Hello's CT_EMULE_MISCOPTIONS2, and bits 2-6 of this tag are
+                // unassigned, so a mod setting them must not change ours.
             }
             _ => {}
         }
@@ -3354,6 +3354,20 @@ pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// eMule's ET_FEATURES holds the SecIdent level and the preview bit and
+    /// nothing else; crypt preferences come from the Hello alone, so a mod
+    /// setting the unassigned bits changes nothing.
+    #[test]
+    fn emule_info_features_carry_no_crypt_preferences() {
+        let mut payload = vec![0x99, 0x01];
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        write_ed2k_tag(&mut payload, 0x27, &Ed2kTagValue::Uint32(0x80 | 0x38 | 0x01));
+        let caps = parse_emule_info(&payload);
+        assert!(caps.supports_preview);
+        assert_eq!(caps.secure_ident_level, 1);
+        assert!(!caps.supports_crypt_layer && !caps.requests_crypt_layer && !caps.requires_crypt_layer);
+    }
 
     /// Pins the two Hello capability words to the exact `u32` eMule expects.
     ///

@@ -761,6 +761,10 @@ pub(super) struct NetworkState {
     pub(super) preferred_ed2k_server: Option<(String, u16)>,
     /// Instant when the last server connect attempt was started
     pub(super) server_last_connect_attempt: Option<std::time::Instant>,
+    /// When a server was last followed to a new address by its hostname
+    /// (`follow_moved_server`), so DNS that flips between answers cannot turn
+    /// reconnecting into a loop.
+    pub(super) server_last_moved_at: Option<std::time::Instant>,
     /// Pending USS ping timestamps for RTT measurement (at most one in flight).
     pub(super) pending_uss_pings: HashMap<SocketAddr, std::time::Instant>,
     /// Currently selected USS ping target

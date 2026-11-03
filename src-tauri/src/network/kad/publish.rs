@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use digest::Digest;
 use md4::Md4;
 
+use super::lower_map::KAD_LOWER_MAP;
 use super::messages::*;
 use super::types::*;
 
@@ -946,27 +947,27 @@ pub(crate) fn is_kad_keyword_separator(c: char) -> bool {
 
 /// Length-preserving lowercase, matching what eMule hashes.
 ///
-/// `KadTagStrMakeLower` (`DataIO.cpp:483-514`) walks a fixed 1:1 UTF-16 map
-/// precomputed from `LCMapString(LANG_ENGLISH_US, LCMAP_LOWERCASE)`, and the
-/// comment above it states the requirement: *"All clients in the network have to
-/// use the same character mapping."*
+/// `KadTagStrMakeLower` (`DataIO.cpp`) maps each UTF-16 code unit through a
+/// fixed table eMule built once from `LCMapString(LANG_ENGLISH_US,
+/// LCMAP_LOWERCASE)`, and the comment above it states the requirement: *"All
+/// clients in the network have to use the same character mapping."* That table
+/// is [`KAD_LOWER_MAP`], so this is it exactly.
 ///
-/// `str::to_lowercase` is not that mapping. It implements full Unicode
-/// lowercasing, so `U+0130 İ` expands to two code points and a word-final `Σ`
-/// becomes `ς` rather than `σ` — either of which yields a different MD4 and so a
-/// different key. Mapping char by char and keeping any char whose lowercase is
-/// not a single char gives a 1:1 result and, incidentally, drops the final-sigma
-/// context rule, because that rule lives in `str::to_lowercase` alone.
+/// Neither `str::to_lowercase` nor `char::to_lowercase` is that mapping. Both
+/// follow the Unicode tables of the Rust release: `U+0130 İ`, the Kelvin sign,
+/// Cherokee, Georgian Mtavruli and every character outside the 16-bit range get
+/// lowercase forms eMule's table leaves alone, and `str::to_lowercase` turns a
+/// word-final `Σ` into `ς` rather than `σ` — each a different MD4, so a
+/// different key.
 pub(crate) fn kad_keyword_lowercase(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            let mut lower = c.to_lowercase();
-            match (lower.next(), lower.next()) {
-                (Some(single), None) => single,
-                _ => c,
-            }
+    let units: Vec<u16> = s
+        .encode_utf16()
+        .map(|unit| match KAD_LOWER_MAP.binary_search_by_key(&unit, |&(from, _)| from) {
+            Ok(i) => KAD_LOWER_MAP[i].1,
+            Err(_) => unit,
         })
-        .collect()
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 fn tokenize_keywords(text: &str, strip_trailing_extension: bool) -> Vec<String> {
@@ -1217,12 +1218,34 @@ mod tests {
         // Greek final sigma: `str::to_lowercase` would produce `ς` here, which
         // hashes differently from the `σ` every other client derives.
         assert_eq!(kad_keyword_lowercase("ΟΔΟΣ"), "οδοσ");
-        // `İ` lowercases to two code points in full Unicode; a 1:1 map cannot,
-        // so the character is left as-is rather than silently changing length.
-        let dotted = kad_keyword_lowercase("İ");
-        assert_eq!(dotted.chars().count(), 1);
+        // `İ` lowercases to two code points in full Unicode; eMule's table
+        // leaves it alone.
+        assert_eq!(kad_keyword_lowercase("İ"), "İ");
         // And the mapping the hash actually uses is the same one.
         assert_eq!(keyword_to_kad_id("UBUNTU"), keyword_to_kad_id("ubuntu"));
+    }
+
+    /// The table is eMule's: what it maps and, as much, what it leaves alone
+    /// that Rust's Unicode tables would lowercase.
+    #[test]
+    fn keyword_lowercase_follows_emules_table_not_rusts() {
+        assert!(
+            KAD_LOWER_MAP.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "sorted, for the binary search"
+        );
+        assert!(
+            KAD_LOWER_MAP.iter().all(|&(from, to)| from != to
+                && !(0xD800..=0xDFFF).contains(&from)
+                && !(0xD800..=0xDFFF).contains(&to)),
+            "only real changes, and never a surrogate"
+        );
+        assert_eq!(kad_keyword_lowercase("ÄÖÜ ÀÉÎ Ж Ω"), "äöü àéî ж ω");
+        assert_eq!(kad_keyword_lowercase("ＵＢＵＮＴＵ"), "ｕｂｕｎｔｕ");
+        // Lowercased by Rust, but not by eMule's table.
+        for kept in ["\u{212A}", "\u{13A0}", "\u{1C90}", "\u{10400}"] {
+            assert_ne!(kept.to_lowercase(), kept, "{kept:?} has a lowercase in Rust");
+            assert_eq!(kad_keyword_lowercase(kept), kept, "{kept:?} is left alone by eMule");
+        }
     }
 
     /// Ember normalises keywords before hashing them; KAD must not, because

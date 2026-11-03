@@ -622,13 +622,9 @@ pub(super) async fn initiate_server_connect(
     };
     let user_hash = state.user_hash;
     let nickname = settings.ed2k_nickname();
-    let obf_port = state
-        .server_list
-        .servers()
-        .iter()
-        .find(|s| s.ip == ip && s.port == port)
-        .map(|s| s.obfuscation_port_tcp)
-        .unwrap_or(0);
+    let entry = state.server_list.find_by_addr(&ip, port);
+    let obf_port = entry.map_or(0, |s| s.obfuscation_port_tcp);
+    let dyn_host = entry.map(|s| s.dyn_host.clone()).unwrap_or_default();
     let obfuscation_enabled = state.obfuscation_enabled;
     let ip_clone = ip.clone();
     let app_for_connect = app_handle.clone();
@@ -644,6 +640,16 @@ pub(super) async fn initiate_server_connect(
         serde_json::json!({ "status": "connecting" }),
     );
     state.pending_server_connect = Some(tokio::spawn(async move {
+        if let Some(new_ip) = resolve_moved_server(&dyn_host, &ip_clone, port).await {
+            return ServerConnectResult {
+                addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+                ip,
+                port,
+                login_tcp_port: tcp_port,
+                moved_to: Some(new_ip),
+                result: Err("the server has moved".to_string()),
+            };
+        }
         // One crypt→plain cycle per server. Prefer failing fast on a dead
         // preferred host so auto-reconnect can retry with backoff, then stop
         // after AUTO_CONNECT_MAX_FAILURES instead of walking the server list.
@@ -704,10 +710,38 @@ pub(super) async fn initiate_server_connect(
             ip,
             port,
             login_tcp_port: tcp_port,
+            moved_to: None,
             result: result.map(|(conn, session, _)| (conn, session)),
         }
     }));
     Ok(())
+}
+
+/// How long the lookup of a server's dynamic hostname may hold up a connect.
+const DYN_HOST_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Where a server on a dynamic IP is now: the public IPv4 its hostname
+/// resolves to, when that is not `ip`, the address it is listed under. A
+/// failed lookup, a private answer, or one that still includes `ip` (round-
+/// robin DNS) leaves it where it is listed.
+pub(super) async fn resolve_moved_server(dyn_host: &str, ip: &str, port: u16) -> Option<String> {
+    if dyn_host.is_empty() {
+        return None;
+    }
+    let addrs: Vec<IpAddr> = tokio::time::timeout(DYN_HOST_LOOKUP_TIMEOUT, tokio::net::lookup_host((dyn_host, port)))
+        .await
+        .ok()?
+        .ok()?
+        .map(|addr| addr.ip())
+        .filter(IpAddr::is_ipv4)
+        .collect();
+    if addrs.iter().any(|addr| addr.to_string() == ip) {
+        return None;
+    }
+    addrs
+        .into_iter()
+        .find(|addr| !crate::security::is_private_ip(*addr))
+        .map(|addr| addr.to_string())
 }
 
 /// Why a server is not dialed (`server_dial_refusal`).

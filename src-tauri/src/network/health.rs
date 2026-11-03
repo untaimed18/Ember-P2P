@@ -24,6 +24,10 @@ pub(crate) struct ServerConnectResult {
     /// `NetworkState::server_login_tcp_port` on success so a later
     /// STUN-confirmed remap can detect it needs a reconnect.
     pub(crate) login_tcp_port: u16,
+    /// The address a server on a dynamic IP has moved to, found by its
+    /// hostname before dialing. Nothing was dialed: the list entry moves and
+    /// the connection starts again there, through the usual checks.
+    pub(crate) moved_to: Option<String>,
     pub(crate) result: Result<(Ed2kServerConnection, ServerSession), String>,
 }
 
