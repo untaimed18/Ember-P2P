@@ -1322,8 +1322,15 @@
                   animate:flip={{ duration: serverWindow.active ? 0 : 180 }}
                 >
                   <td class="name-cell" title={server.name || m.servers_unnamed()}>
-                    <span class="server-icon" class:connected-icon={isConnected(server)}>S</span>
-                    <bdi dir="auto">{server.name || m.servers_unnamed()}</bdi>
+                    <span class="name-inner">
+                      <span class="server-icon" class:connected-icon={isConnected(server)} aria-hidden="true">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
+                          <rect x="2" y="2.5" width="12" height="4.5" rx="1"/><rect x="2" y="9" width="12" height="4.5" rx="1"/>
+                          <line x1="4.75" y1="4.75" x2="4.76" y2="4.75"/><line x1="4.75" y1="11.25" x2="4.76" y2="11.25"/>
+                        </svg>
+                      </span>
+                      <bdi dir="auto">{server.name || m.servers_unnamed()}</bdi>
+                    </span>
                   </td>
                   <td class="ip-cell">{server.ip} : {server.port}</td>
                   <td class="desc-cell" title={server.description}><bdi dir="auto">{server.description || '—'}</bdi></td>
@@ -1360,76 +1367,29 @@
       </div>
     </div>
 
-    <!-- Right side panel: Add Server, server.met, My Info -->
+    <!-- Right side panel: what we are connected to first, as it is what the
+         panel is read for; the forms used now and then below it. -->
     <div class="server-side-panel">
-      <!-- Add Server -->
-      <div class="side-section">
-        <div class="side-title">{m.servers_new_server()}</div>
-        <div class="form-stack">
-          <div class="form-field">
-            <label for="server-ip">{m.servers_ip_address()}</label>
-            <input
-              id="server-ip"
-              type="text"
-              bind:value={newIp}
-              placeholder="192.168.1.1"
-              onkeydown={handleKeydownAdd}
-            />
-          </div>
-          <div class="form-row">
-            <div class="form-field flex-1">
-              <label for="server-port">{m.servers_port()}</label>
-              <input
-                id="server-port"
-                type="text"
-                bind:value={newPort}
-                placeholder="4661"
-                maxlength="5"
-                onkeydown={handleKeydownAdd}
-              />
-            </div>
-            <div class="form-field flex-2">
-              <label for="server-name">{m.servers_name_label()}</label>
-              <input
-                id="server-name"
-                type="text"
-                bind:value={newName}
-                placeholder={m.servers_name_placeholder()}
-                onkeydown={handleKeydownAdd}
-              />
-            </div>
-          </div>
-          <button class="add-btn" onclick={handleAddServer} disabled={addingServer} aria-busy={addingServer}>{addingServer ? m.friends_adding() : m.servers_add_server()}</button>
-        </div>
-      </div>
-
-      <!-- Update server.met -->
-      <div class="side-section">
-        <div class="side-title">{m.servers_update_met_title()}</div>
-        <div class="form-stack">
-          <div class="form-field">
-            <label for="met-url">{m.servers_url_label()}</label>
-            <input
-              id="met-url"
-              type="text"
-              bind:value={serverMetUrl}
-              placeholder="https://upd.emule-security.org/server.met"
-              onkeydown={handleKeydownMet}
-            />
-          </div>
-          <button class="add-btn" onclick={handleUpdateServerMet} disabled={updatingMet} aria-busy={updatingMet}>{updatingMet ? m.servers_updating() : m.servers_update()}</button>
-        </div>
-      </div>
-
       <!-- My Info / Connected Server -->
-      <div class="side-section info-section">
-        <div class="side-title">{m.servers_my_info_title()}</div>
+      <div class="side-section">
+        <div class="side-head">
+          <div class="side-title">{m.servers_my_info_title()}</div>
+          {#if connectedServer}
+            <span class="badge connected" title={m.servers_info_status()}>
+              <span class="badge-glyph" aria-hidden="true">&#x2713;</span>{m.servers_status_connected()}
+            </span>
+          {:else if showConnecting}
+            <span class="badge connecting" title={m.servers_info_status()}>
+              <span class="spinner xs current" aria-hidden="true"></span>{m.servers_status_connecting()}
+            </span>
+          {:else}
+            <span class="badge disconnected" title={m.servers_info_status()}>
+              <span class="badge-glyph" aria-hidden="true">&#x2715;</span>{m.servers_status_disconnected()}
+            </span>
+          {/if}
+        </div>
         <div class="info-rows">
           {#if connectedServer}
-            <div class="info-row">
-              <span class="info-label">{m.servers_info_status()}</span>
-              <span class="badge connected">{m.servers_status_connected()}</span>
-            </div>
             <div class="info-row">
               <span class="info-label">{m.servers_info_server()}</span>
               <span class="info-value">{connectedServer.name || connectedServer.ip}</span>
@@ -1482,21 +1442,9 @@
               </div>
             {/if}
           {:else if showConnecting}
-            <div class="info-row">
-              <span class="info-label">{m.servers_info_status()}</span>
-              <span class="badge connecting"><span class="spinner xs current"></span> {m.servers_status_connecting()}</span>
-            </div>
-            <div class="info-row muted">
-              <span>{m.servers_establishing()}</span>
-            </div>
+            <p class="info-note">{m.servers_establishing()}</p>
           {:else}
-            <div class="info-row">
-              <span class="info-label">{m.servers_info_status()}</span>
-              <span class="badge disconnected">{m.servers_status_disconnected()}</span>
-            </div>
-            <div class="info-row muted">
-              <span>{m.servers_not_connected()}</span>
-            </div>
+            <p class="info-note">{m.servers_not_connected()}</p>
             {#if selectedServer || bestServer}
               <div class="info-actions">
                 {#if selectedServer}
@@ -1507,6 +1455,70 @@
               </div>
             {/if}
           {/if}
+        </div>
+      </div>
+
+      <!-- Add Server -->
+      <div class="side-section">
+        <div class="side-title">{m.servers_new_server()}</div>
+        <div class="form-stack">
+          <div class="form-field">
+            <label for="server-ip">{m.servers_ip_address()}</label>
+            <input
+              id="server-ip"
+              type="text"
+              bind:value={newIp}
+              placeholder="192.168.1.1"
+              onkeydown={handleKeydownAdd}
+            />
+          </div>
+          <div class="form-row">
+            <div class="form-field port-field">
+              <label for="server-port">{m.servers_port()}</label>
+              <input
+                id="server-port"
+                type="text"
+                inputmode="numeric"
+                bind:value={newPort}
+                placeholder="4661"
+                maxlength="5"
+                onkeydown={handleKeydownAdd}
+              />
+            </div>
+            <div class="form-field name-field">
+              <label for="server-name">{m.servers_name_label()}</label>
+              <input
+                id="server-name"
+                type="text"
+                bind:value={newName}
+                placeholder={m.servers_name_placeholder()}
+                onkeydown={handleKeydownAdd}
+              />
+            </div>
+          </div>
+          <button class="form-btn" onclick={handleAddServer} disabled={addingServer} aria-busy={addingServer}>{addingServer ? m.friends_adding() : m.servers_add_server()}</button>
+        </div>
+      </div>
+
+      <!-- Update server.met -->
+      <div class="side-section">
+        <div class="side-title">{m.servers_update_met_title()}</div>
+        <div class="form-stack">
+          <div class="form-field">
+            <label for="met-url">{m.servers_url_label()}</label>
+            <input
+              id="met-url"
+              type="url"
+              bind:value={serverMetUrl}
+              placeholder="https://upd.emule-security.org/server.met"
+              title={serverMetUrl}
+              onkeydown={handleKeydownMet}
+            />
+          </div>
+          <button class="form-btn secondary" onclick={handleUpdateServerMet} disabled={updatingMet} aria-busy={updatingMet}>
+            {#if updatingMet}<span class="spinner xs current" aria-hidden="true"></span>{/if}
+            {updatingMet ? m.servers_updating() : m.servers_update()}
+          </button>
         </div>
       </div>
     </div>
@@ -1636,6 +1648,11 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    min-height: 540px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-sm);
   }
 
   .server-upper {
@@ -1659,7 +1676,7 @@
     justify-content: space-between;
     padding: 0;
     border-bottom: 1px solid var(--border);
-    background: var(--bg-secondary);
+    background: var(--bg-surface);
     flex-shrink: 0;
   }
 
@@ -1777,8 +1794,9 @@
   }
 
   .server-table th {
-    padding: 6px 10px;
+    padding: 7px 10px;
     font-size: var(--font-size-xs);
+    white-space: nowrap;
     position: sticky;
     top: 0;
     z-index: 1;
@@ -1787,7 +1805,7 @@
   }
 
   .server-table td {
-    padding: 5px 10px;
+    padding: 7px 10px;
     font-size: var(--font-size-sm);
     cursor: default;
     /* Global app.css adds td border-bottom; keep only the header row line */
@@ -1852,10 +1870,12 @@
     opacity: 0.5;
   }
 
-  .name-cell {
+  /* The flex box sits inside the cell: a `td` laid out as flex stops being a
+     table cell, and its row no longer lines up with the others. */
+  .name-inner {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     white-space: nowrap;
     /* Names come from a remotely downloaded server.met and are capped at 4096
        chars backend-side, which is far past what this column can show. Clamp
@@ -1863,7 +1883,7 @@
     max-width: 260px;
   }
 
-  .name-cell bdi {
+  .name-inner bdi {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1873,14 +1893,17 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 18px;
-    height: 18px;
+    width: 20px;
+    height: 20px;
     border-radius: var(--radius-sm);
     background: var(--bg-tertiary);
     color: var(--text-muted);
-    font-size: var(--font-size-2xs);
-    font-weight: 700;
     flex-shrink: 0;
+  }
+
+  .server-icon svg {
+    width: 12px;
+    height: 12px;
   }
 
   .server-icon.connected-icon {
@@ -1931,17 +1954,36 @@
   }
 
   /* Side panel */
+  /* Never scrolls sideways: every field and value below fits or wraps. */
   .server-side-panel {
-    width: 300px;
+    width: 340px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
+    overflow-x: hidden;
     overflow-y: auto;
+    background: var(--bg-surface);
   }
 
   .side-section {
-    padding: 14px 16px;
+    padding: 16px;
     border-bottom: 1px solid var(--border);
+  }
+
+  .side-section:last-child {
+    border-bottom: 0;
+  }
+
+  .side-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .side-head .side-title {
+    margin-bottom: 0;
   }
 
   .side-title {
@@ -1950,23 +1992,26 @@
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text-muted);
-    margin-bottom: 10px;
+    margin-bottom: 12px;
   }
 
   .form-stack {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 12px;
   }
 
+  /* `min-width: 0` lets fields sharing a row shrink below their inputs'
+     default width, which together overflowed the panel. */
   .form-field {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 5px;
+    min-width: 0;
   }
 
   .form-field label {
-    font-size: var(--font-size-xs);
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     font-weight: 500;
   }
@@ -1974,65 +2019,103 @@
   .form-field input {
     font-size: var(--font-size-sm);
     padding: 7px 10px;
+    width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+  }
+
+  .form-field input::placeholder {
+    color: var(--text-muted);
   }
 
   .form-row {
     display: flex;
-    gap: 8px;
+    gap: 10px;
   }
 
-  .flex-1 { flex: 1; }
-  .flex-2 { flex: 2; }
-
-  .add-btn {
-    align-self: flex-end;
-    font-size: var(--font-size-sm);
-    padding: 5px 16px;
+  /* Five digits need no more; the name gets the rest of the row. */
+  .port-field {
+    flex: 0 0 96px;
   }
 
-  .info-section {
+  .name-field {
     flex: 1;
+  }
+
+  #server-port {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .form-btn {
+    align-self: flex-end;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--font-size-sm);
+    padding: 6px 16px;
   }
 
   .info-rows {
     display: flex;
     flex-direction: column;
-    gap: 6px;
   }
 
+  /* A label and its value, the value wrapping under its own end rather than
+     pushing the panel wider: server names come from a server.met. */
   .info-row {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     justify-content: space-between;
+    gap: 12px;
     font-size: var(--font-size-sm);
-    padding: 2px 0;
+    padding: 6px 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 55%, transparent);
   }
 
-  .info-row.muted {
-    justify-content: flex-start;
+  .info-row:last-child {
+    border-bottom: 0;
+  }
+
+  .info-note {
+    margin: 0;
     color: var(--text-muted);
-    font-style: italic;
-    padding: 8px 0;
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
   }
 
   .info-actions {
     display: flex;
-    padding-top: 2px;
+    padding-top: 12px;
   }
 
   .info-actions button {
     font-size: var(--font-size-sm);
-    padding: 5px 12px;
+    padding: 6px 14px;
   }
 
   .info-label {
+    flex-shrink: 0;
     color: var(--text-muted);
     font-weight: 500;
   }
 
   .info-value {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px 6px;
+    min-width: 0;
     color: var(--text-primary);
     font-weight: 600;
+    text-align: end;
+    overflow-wrap: anywhere;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .info-value .muted {
+    color: var(--text-muted);
+    font-weight: 500;
   }
 
   .info-value.mono {
@@ -2082,7 +2165,8 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: var(--bg-secondary);
+    padding-inline-end: 8px;
+    background: var(--bg-surface);
     border-bottom: 1px solid var(--border);
     flex-shrink: 0;
   }
@@ -2093,7 +2177,7 @@
     padding: 8px 16px;
     font-family: var(--font-mono);
     font-size: var(--font-size-xs);
-    background: var(--bg-primary);
+    background: color-mix(in srgb, var(--bg-primary) 70%, var(--bg-secondary));
     min-height: 0;
   }
 
@@ -2142,44 +2226,6 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-
-  .server-layout {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-sm);
-    min-height: 540px;
-  }
-
-  .panel-toolbar,
-  .log-toolbar {
-    background: var(--bg-surface);
-  }
-
-  .side-section {
-    padding: 16px;
-  }
-
-  .side-title {
-    margin-bottom: 12px;
-  }
-
-  .form-field label {
-    font-size: var(--font-size-sm);
-  }
-
-  .form-field input {
-    padding: 7px 10px;
-  }
-
-  .server-table td {
-    padding-top: 7px;
-    padding-bottom: 7px;
-  }
-
-  .log-area {
-    background: color-mix(in srgb, var(--bg-primary) 70%, var(--bg-secondary));
   }
 
   @media (max-width: 1200px) {

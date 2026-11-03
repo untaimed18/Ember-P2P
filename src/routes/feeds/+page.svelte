@@ -2678,7 +2678,6 @@
                             ></span>
                             {seenText(feed)}
                           </span>
-                          <span class="seen-sep" aria-hidden="true">·</span>
                           <button
                             type="button"
                             class="publisher-key"
@@ -4699,15 +4698,17 @@
     white-space: nowrap;
   }
 
+  /* Wraps rather than clips: the key drops below a status too long to share
+     its line, as it is in a narrow card or a longer language. */
   .discover-seen {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 6px;
+    gap: 3px 6px;
     min-width: 0;
     margin: 3px 0 0;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
-    white-space: nowrap;
   }
 
   .seen-state {
@@ -4715,11 +4716,6 @@
     align-items: center;
     gap: 5px;
     min-width: 0;
-    /* Room for the status dot's ring, which `overflow` would clip. */
-    padding-inline-start: 3px;
-    margin-inline-start: -3px;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
   .seen-state.active {
@@ -4736,10 +4732,6 @@
   }
 
   .seen-state .status-dot {
-    flex-shrink: 0;
-  }
-
-  .seen-sep {
     flex-shrink: 0;
   }
 
@@ -4791,14 +4783,16 @@
     padding-top: 12px;
   }
 
-  /* A short key, not a heading: it reads as part of the status line. */
+  /* A short key, not a heading: a quiet chip, so it reads apart from the
+     status beside it or above it without a separator. */
   .publisher-key {
     flex-shrink: 0;
     min-height: 0;
-    padding: 0 4px;
-    border: 0;
+    padding: 0 5px;
+    border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
     border-radius: var(--radius-sm);
     background: none;
+    white-space: nowrap;
     color: var(--text-muted);
     font: inherit;
     font-weight: 400;
