@@ -969,9 +969,15 @@
       const wholeCard = heading.includes(query);
       let cardMatches = 0;
       for (const field of card.querySelectorAll<HTMLElement>('.field')) {
-        // Likewise a group's heading: "power" finds the setting under Power.
-        const groupHeading = field.closest('.settings-group')?.querySelector(':scope > .subsection-title');
-        const wholeGroup = groupHeading?.textContent?.toLowerCase().includes(query) ?? false;
+        // Likewise a group's heading and the line explaining it: "power" finds
+        // the setting under Power. An area heading within a group counts the
+        // same for its own fields: "friends" finds the friend notifications.
+        const group = field.closest('.settings-group');
+        const groupText = Array.from(group?.querySelectorAll(':scope > .subsection-title, :scope > .hint') ?? [])
+          .map((el) => el.textContent ?? '')
+          .join(' ');
+        const subgroupText = field.closest('.settings-subgroup')?.querySelector(':scope > .subgroup-title')?.textContent ?? '';
+        const wholeGroup = `${groupText} ${subgroupText}`.toLowerCase().includes(query);
         const hit = wholeCard || wholeGroup || (field.textContent?.toLowerCase().includes(query) ?? false);
         if (hit) {
           field.removeAttribute('data-filtered');
@@ -988,7 +994,7 @@
       // a row: the test looks for a surviving *field*, and every field was
       // decided by the loop above. A container asking about its child
       // containers would have had to run innermost-first.
-      for (const box of card.querySelectorAll<HTMLElement>('.field-row, .settings-group')) {
+      for (const box of card.querySelectorAll<HTMLElement>('.field-row, .settings-group, .settings-subgroup, .notify-options')) {
         if (box.querySelector('.field:not([data-filtered])')) box.removeAttribute('data-filtered');
         else box.setAttribute('data-filtered', 'out');
       }
@@ -3224,8 +3230,12 @@
           </div>
         </div>
         <div class="card-body">
+          <!-- Two systems, kept apart: desktop notifications come from the
+               operating system and reach the user outside the window; pop-ups
+               are Ember's own, inside it. Neither group's switches govern the
+               other's. -->
           <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_delivery()}</h4>
+            <h4 class="subsection-title">{m.settings_group_desktop_notifications()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="notifications-enabled-label" for="notifications-enabled-switch">{m.settings_notifications_enabled_label()}</label>
@@ -3238,131 +3248,147 @@
                 ariaDescribedby="notifications-enabled-hint"
               />
             </div>
-            <div class="field toggle-row nested" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notifications-unfocused-label" for="notifications-unfocused-switch">{m.settings_notifications_unfocused_label()}</label>
-                <span class="hint" id="notifications-unfocused-hint">{m.settings_notifications_unfocused_hint()}</span>
+            <!-- Everything the switch above governs, indented under it and
+                 sorted by the part of Ember each event comes from. -->
+            <div class="nested notify-options" class:is-disabled={notifyOff}>
+              <div class="field toggle-row" class:is-disabled={notifyOff}>
+                <div class="toggle-info">
+                  <label class="toggle-title" id="notifications-unfocused-label" for="notifications-unfocused-switch">{m.settings_notifications_unfocused_label()}</label>
+                  <span class="hint" id="notifications-unfocused-hint">{m.settings_notifications_unfocused_hint()}</span>
+                </div>
+                <ToggleSwitch
+                  id="notifications-unfocused-switch"
+                  bind:checked={settings.notifications_only_when_unfocused}
+                  disabled={notifyOff}
+                  ariaLabelledby="notifications-unfocused-label"
+                  ariaDescribedby="notifications-unfocused-hint"
+                />
               </div>
-              <ToggleSwitch
-                id="notifications-unfocused-switch"
-                bind:checked={settings.notifications_only_when_unfocused}
-                disabled={notifyOff}
-                ariaLabelledby="notifications-unfocused-label"
-                ariaDescribedby="notifications-unfocused-hint"
-              />
+
+              <div class="settings-subgroup" role="group" aria-labelledby="notify-transfers-title">
+                <h5 class="subgroup-title" id="notify-transfers-title">{m.nav_transfers()}</h5>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-download-complete-label" for="notify-download-complete-switch">{m.settings_notify_download_complete()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-download-complete-switch"
+                    bind:checked={settings.notify_download_complete}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-download-complete-label"
+                  />
+                </div>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-download-failed-label" for="notify-download-failed-switch">{m.settings_notify_download_failed()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-download-failed-switch"
+                    bind:checked={settings.notify_download_failed}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-download-failed-label"
+                  />
+                </div>
+              </div>
+
+              <div class="settings-subgroup" role="group" aria-labelledby="notify-friends-title">
+                <h5 class="subgroup-title" id="notify-friends-title">{m.nav_friends()}</h5>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-friend-online-label" for="notify-friend-online-switch">{m.settings_notify_friend_online()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-friend-online-switch"
+                    bind:checked={settings.notify_friend_online}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-friend-online-label"
+                  />
+                </div>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-friend-message-label" for="notify-friend-message-switch">{m.settings_notify_friend_message()}</label>
+                    <span class="hint" id="notify-friend-message-hint">{m.settings_notify_friend_message_hint()}</span>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-friend-message-switch"
+                    bind:checked={settings.notify_friend_message}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-friend-message-label"
+                    ariaDescribedby="notify-friend-message-hint"
+                  />
+                </div>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-friend-request-label" for="notify-friend-request-switch">{m.settings_notify_friend_request()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-friend-request-switch"
+                    bind:checked={settings.notify_friend_request}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-friend-request-label"
+                  />
+                </div>
+              </div>
+
+              <div class="settings-subgroup" role="group" aria-labelledby="notify-library-title">
+                <h5 class="subgroup-title" id="notify-library-title">{m.nav_library()}</h5>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-shares-browsed-label" for="notify-shares-browsed-switch">{m.settings_notify_shares_browsed()}</label>
+                    <span class="hint" id="notify-shares-browsed-hint">{m.settings_notify_shares_browsed_hint()}</span>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-shares-browsed-switch"
+                    bind:checked={settings.notify_shares_browsed}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-shares-browsed-label"
+                    ariaDescribedby="notify-shares-browsed-hint"
+                  />
+                </div>
+              </div>
+
+              <div class="settings-subgroup" role="group" aria-labelledby="notify-channels-title">
+                <h5 class="subgroup-title" id="notify-channels-title">{m.nav_channels()}</h5>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-channel-message-label" for="notify-channel-message-switch">{m.settings_notify_channel_message()}</label>
+                    <span class="hint" id="notify-channel-message-hint">
+                      {m.settings_notify_channel_message_hint()}
+                      <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
+                        {m.settings_notify_channel_manage()}
+                      </button>
+                    </span>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-channel-message-switch"
+                    bind:checked={settings.notify_channel_message}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-channel-message-label"
+                    ariaDescribedby="notify-channel-message-hint"
+                  />
+                </div>
+              </div>
             </div>
           </div>
 
-          <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_notifications_events_label()}</h4>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-download-complete-label" for="notify-download-complete-switch">{m.settings_notify_download_complete()}</label>
-              </div>
-              <ToggleSwitch
-                id="notify-download-complete-switch"
-                bind:checked={settings.notify_download_complete}
-                disabled={notifyOff}
-                ariaLabelledby="notify-download-complete-label"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-download-failed-label" for="notify-download-failed-switch">{m.settings_notify_download_failed()}</label>
-              </div>
-              <ToggleSwitch
-                id="notify-download-failed-switch"
-                bind:checked={settings.notify_download_failed}
-                disabled={notifyOff}
-                ariaLabelledby="notify-download-failed-label"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-friend-online-label" for="notify-friend-online-switch">{m.settings_notify_friend_online()}</label>
-              </div>
-              <ToggleSwitch
-                id="notify-friend-online-switch"
-                bind:checked={settings.notify_friend_online}
-                disabled={notifyOff}
-                ariaLabelledby="notify-friend-online-label"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-friend-message-label" for="notify-friend-message-switch">{m.settings_notify_friend_message()}</label>
-                <span class="hint" id="notify-friend-message-hint">{m.settings_notify_friend_message_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="notify-friend-message-switch"
-                bind:checked={settings.notify_friend_message}
-                disabled={notifyOff}
-                ariaLabelledby="notify-friend-message-label"
-                ariaDescribedby="notify-friend-message-hint"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-friend-request-label" for="notify-friend-request-switch">{m.settings_notify_friend_request()}</label>
-              </div>
-              <ToggleSwitch
-                id="notify-friend-request-switch"
-                bind:checked={settings.notify_friend_request}
-                disabled={notifyOff}
-                ariaLabelledby="notify-friend-request-label"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-shares-browsed-label" for="notify-shares-browsed-switch">{m.settings_notify_shares_browsed()}</label>
-                <span class="hint" id="notify-shares-browsed-hint">{m.settings_notify_shares_browsed_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="notify-shares-browsed-switch"
-                bind:checked={settings.notify_shares_browsed}
-                disabled={notifyOff}
-                ariaLabelledby="notify-shares-browsed-label"
-                ariaDescribedby="notify-shares-browsed-hint"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-channel-message-label" for="notify-channel-message-switch">{m.settings_notify_channel_message()}</label>
-                <span class="hint" id="notify-channel-message-hint">
-                  {m.settings_notify_channel_message_hint()}
-                  <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
-                    {m.settings_notify_channel_manage()}
-                  </button>
-                </span>
-              </div>
-              <ToggleSwitch
-                id="notify-channel-message-switch"
-                bind:checked={settings.notify_channel_message}
-                disabled={notifyOff}
-                ariaLabelledby="notify-channel-message-label"
-                ariaDescribedby="notify-channel-message-hint"
-              />
-            </div>
-          </div>
-
-          <!-- In-window toasts, apart from desktop notifications: the master
-               switch above does not govern them. -->
           <div class="settings-group">
             <h4 class="subsection-title" id="popups-title">{m.settings_popups_title()}</h4>
             <p class="hint" id="popups-hint">{m.settings_popups_hint()}</p>
-            {#each popupAreas as area (area.key)}
-              <div class="field toggle-row">
-                <div class="toggle-info">
-                  <label class="toggle-title" id="popups-{area.id}-label" for="popups-{area.id}-switch">{area.label()}</label>
+            <div class="toggle-grid">
+              {#each popupAreas as area (area.key)}
+                <div class="field toggle-row">
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="popups-{area.id}-label" for="popups-{area.id}-switch">{area.label()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="popups-{area.id}-switch"
+                    bind:checked={settings[area.key]}
+                    ariaLabelledby="popups-{area.id}-label"
+                    ariaDescribedby="popups-hint"
+                  />
                 </div>
-                <ToggleSwitch
-                  id="popups-{area.id}-switch"
-                  bind:checked={settings[area.key]}
-                  ariaLabelledby="popups-{area.id}-label"
-                  ariaDescribedby="popups-hint"
-                />
-              </div>
-            {/each}
+              {/each}
+            </div>
           </div>
         </div>
       </section>
@@ -6194,6 +6220,39 @@
     border-left: 2px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
+  /* Several such settings at once: the group's own rhythm, inside the rule. */
+  .notify-options {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  /* A run of fields within a group, named for the part of Ember they are
+     about. Quieter than the group heading above it. */
+  .settings-subgroup {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  .subgroup-title {
+    margin: 0 0 -7px;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .notify-options.is-disabled .subgroup-title {
+    opacity: 0.55;
+  }
+
+  /* Short switches with one-word labels, two to a row. */
+  .toggle-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px 32px;
+  }
+
   /* Its control is disabled; the words go quiet with it. The control dims
      itself, so dimming the whole row would dim it twice. */
   .field.is-disabled > .toggle-info,
@@ -7124,7 +7183,8 @@
   }
 
   @media (max-width: 760px) {
-    .behavior-picker {
+    .behavior-picker,
+    .toggle-grid {
       grid-template-columns: 1fr;
     }
 
