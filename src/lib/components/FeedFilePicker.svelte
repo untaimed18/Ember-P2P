@@ -7,6 +7,8 @@
    * refuses the rest), so only those are listed.
    */
   import { tick } from 'svelte';
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { getSharedFilesIfChanged } from '$lib/api/sharing';
   import type { FileInfo } from '$lib/types';
   import {
@@ -19,7 +21,7 @@
   } from '$lib/fileTypes';
   import { compareFileNames, formatNumber, formatSize } from '$lib/utils';
   import { translateError } from '$lib/i18n';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import * as m from '$lib/paraglide/messages';
@@ -302,7 +304,12 @@
   <div bind:this={dialogRootEl}>
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="picker-overlay" onclick={closeUnlessPicked}></div>
+    <div
+      class="picker-overlay"
+      onclick={closeUnlessPicked}
+      transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+      onoutrostart={inertDuringOutro}
+    ></div>
     <!-- svelte-ignore a11y_interactive_supports_focus -->
     <div
       class="picker-modal"
@@ -312,6 +319,8 @@
       tabindex="-1"
       bind:this={modalEl}
       onkeydown={handleKeydown}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+      onoutrostart={inertDuringOutro}
     >
       <div class="picker-header">
         <div class="picker-header-text">
@@ -597,7 +606,6 @@
     inset: 0;
     background: var(--overlay-bg);
     z-index: 10000;
-    animation: picker-fade-in 0.15s ease;
   }
 
   .picker-modal {
@@ -618,26 +626,13 @@
     box-shadow:
       inset 0 1px 0 var(--surface-highlight),
       var(--shadow-lg);
-    animation: picker-pop-in 0.2s ease;
   }
 
-  @keyframes picker-fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  @keyframes picker-pop-in {
-    from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
-    to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-  }
   @keyframes picker-spin {
     to { transform: rotate(360deg); }
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .picker-overlay,
-    .picker-modal {
-      animation: none;
-    }
     .picker-icon-btn.spinning svg {
       animation: none;
     }

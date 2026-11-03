@@ -458,6 +458,7 @@
     overflow: hidden;
     max-height: 280px;
     overflow-y: auto;
+    animation: ctx-menu-in 0.12s ease-out;
   }
 
   .recent-header {

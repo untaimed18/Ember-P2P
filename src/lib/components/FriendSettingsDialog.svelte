@@ -246,12 +246,12 @@
   tabindex="-1"
   onkeydown={onKeydown}
   onclick={(e) => e.target === e.currentTarget && dismiss()}
-  transition:fade={{ duration: prefersReducedMotion.current ? 0 : 140 }}
+  transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
 >
   <div
     class="fs-dialog"
     bind:this={dialogEl}
-    transition:scale={{ start: 0.97, opacity: 0, duration: prefersReducedMotion.current ? 0 : 180 }}
+    transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
   >
     <div class="fs-header">
       <h3 id="fs-title-{instanceId}" class="fs-title">

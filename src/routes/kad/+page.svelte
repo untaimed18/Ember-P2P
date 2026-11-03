@@ -18,10 +18,12 @@
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import type { KadContact, KadSearchEntry } from '$lib/types';
   import { onMount, untrack } from 'svelte';
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText } from '$lib/i18n';
   import { kadNodesLoadedText } from '$lib/commandReplies';
-  import { inertBackground } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro } from '$lib/a11y';
   import { copyToClipboard, formatDateTime, formatNumber, formatSize } from '$lib/utils';
   import IconX from '$lib/components/IconX.svelte';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
@@ -1235,8 +1237,13 @@
           }
         }
       }}
+      transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+      onoutrostart={inertDuringOutro}
     >
-      <div class="modal-content bootstrap-modal">
+      <div
+        class="modal-content bootstrap-modal"
+        transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+      >
         <div class="modal-header">
           <h3 id="kad-bootstrap-title">{m.kad_bootstrap_modal_title()}</h3>
           <button type="button" class="icon-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}><IconX size={16} /></button>

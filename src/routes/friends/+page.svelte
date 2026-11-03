@@ -11,6 +11,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { toastError, toastWarning } from '$lib/stores/toast';
   import { copyToClipboard, formatBytes, formatCalendarDate } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
@@ -1200,9 +1201,9 @@
           {@const accepting = $acceptingOfferStore === offerKey(offer.user_hash, offer.file_hash)}
           <div
             class="request-card"
-            in:fly={{ y: 6, duration: 200 }}
-            out:fade={{ duration: 150 }}
-            animate:flip={{ duration: 200 }}
+            in:fly={{ y: 6, duration: prefersReducedMotion.current ? 0 : 200 }}
+            out:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+            animate:flip={{ duration: prefersReducedMotion.current ? 0 : 200 }}
           >
             <div class="request-avatar">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1260,9 +1261,9 @@
           {@const reqName = sharedFriendLabel(req.sender_hash, req.sender_nickname, $friendNamesStore)}
           <div
             class="request-card"
-            in:fly={{ y: 6, duration: 200 }}
-            out:fade={{ duration: 150 }}
-            animate:flip={{ duration: 200 }}
+            in:fly={{ y: 6, duration: prefersReducedMotion.current ? 0 : 200 }}
+            out:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+            animate:flip={{ duration: prefersReducedMotion.current ? 0 : 200 }}
           >
             <div class="request-avatar">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2451,6 +2452,7 @@
     box-shadow: var(--ctx-shadow);
     display: flex;
     flex-direction: column;
+    animation: ctx-menu-in 0.12s ease-out;
   }
 
   .card-more-menu button {

@@ -1002,7 +1002,7 @@
     flex-direction: column;
     align-items: center;
     gap: 16px;
-    animation: wizard-in 400ms ease-out;
+    animation: wizard-in 250ms ease-out;
   }
 
   .relaunch-title {
@@ -1027,7 +1027,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-md);
-    animation: wizard-in 400ms ease-out;
+    animation: wizard-in 250ms ease-out;
     overflow: hidden;
   }
 

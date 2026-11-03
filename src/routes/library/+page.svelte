@@ -79,7 +79,7 @@
   } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
   import { onMount, tick, untrack } from 'svelte';
-  import { fly } from 'svelte/transition';
+  import { fade, fly, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
 
   import { listen } from '@tauri-apps/api/event';
@@ -110,7 +110,7 @@
   import { openChatFilesFolder } from '$lib/api/friends';
   import { openChannelFilesFolder } from '$lib/api/channels';
   import { openFeedFilesFolder } from '$lib/api/feeds';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { appSettings } from '$lib/stores/settings';
@@ -4558,8 +4558,12 @@
         void handleCreateCollection();
       }
     }
-  }}>
-    <div class="modal-content coll-modal" bind:this={createCollectionModal}>
+  }} transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }} onoutrostart={inertDuringOutro}>
+    <div
+      class="modal-content coll-modal"
+      bind:this={createCollectionModal}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="modal-header">
         <span id="create-coll-title" class="modal-title">{m.library_create_collection()}</span>
         <button type="button" class="icon-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
@@ -4718,8 +4722,14 @@
       }
       trapTabKey(e, renameModalEl);
     }}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+    onoutrostart={inertDuringOutro}
   >
-    <div class="modal-content rename-modal" bind:this={renameModalEl}>
+    <div
+      class="modal-content rename-modal"
+      bind:this={renameModalEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="modal-header">
         <span id="lib-rename-title" class="modal-title">{m.library_rename_title()}</span>
         <button type="button" class="icon-close" onclick={closeRename} disabled={renameDialog.busy} aria-label={m.common_close()}><IconX size={15} /></button>
@@ -7643,6 +7653,7 @@
     padding: 0 1px;
     line-height: 1;
   }
+  .star-btn { transition: transform var(--transition-fast) ease; }
   .star-btn:hover { transform: scale(1.2); }
   .star-clear {
     display: inline-flex;
@@ -7834,7 +7845,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    animation: modal-fade-in 0.15s ease;
   }
   .modal-content {
     background: var(--bg-secondary);
@@ -7846,21 +7856,6 @@
     display: flex;
     flex-direction: column;
     max-height: 80vh;
-    animation: modal-pop-in 0.2s ease;
-  }
-  @keyframes modal-fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  @keyframes modal-pop-in {
-    from { opacity: 0; transform: scale(0.96); }
-    to { opacity: 1; transform: scale(1); }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .modal-overlay,
-    .modal-content {
-      animation: none;
-    }
   }
   /* Create Collection, laid out like the File Details window: the collection
      up front, then details, format and files each on their own card. */

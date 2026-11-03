@@ -70,7 +70,7 @@
   import { foldForSearch, splitFoldedHighlights } from '$lib/dockSearch';
   import { getLocale } from '$lib/paraglide/runtime';
   import { highlightMatches } from '$lib/stores/highlight';
-  import { fade, scale } from 'svelte/transition';
+  import { fade, scale, slide } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import * as m from '$lib/paraglide/messages';
   import { alreadyQueuedText } from '$lib/alreadyQueued';
@@ -4782,7 +4782,7 @@
   </div>
 
   {#if showAdvancedFilters}
-    <div class="filter-advanced-row" id="search-advanced-filters">
+    <div class="filter-advanced-row" id="search-advanced-filters" transition:slide={{ duration: prefersReducedMotion.current ? 0 : 180 }}>
       <div class="filter-toggles" role="group" aria-label={m.search_visibility_filters_aria()}>
         <label class="filter-toggle">
           <input
@@ -5678,12 +5678,12 @@
         tabindex="-1"
         onclick={(e) => { if (e.target === e.currentTarget) closeFileDetails(); }}
         onkeydown={handleDetailsKeydown}
-        transition:fade={{ duration: prefersReducedMotion.current ? 0 : 140 }}
+        transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
       >
         <div
           class="modal-content file-details-modal"
           bind:this={detailsModalEl}
-          transition:scale={{ start: 0.97, opacity: 0, duration: prefersReducedMotion.current ? 0 : 180 }}
+          transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
         >
         <div class="modal-header">
           <span id="file-details-title" class="modal-title">{m.search_file_details()}</span>
@@ -6364,6 +6364,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     box-shadow: var(--shadow-lg);
+    animation: ctx-menu-in 0.12s ease-out;
   }
 
   .search-syntax-ed2k {
@@ -6517,6 +6518,7 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+    animation: ctx-menu-in 0.12s ease-out;
   }
 
   .column-menu-item {
@@ -7324,6 +7326,7 @@
     font-size: var(--font-size-xs);
     line-height: 1.35;
     box-shadow: var(--shadow-md);
+    animation: ctx-menu-in 0.12s ease-out;
   }
 
   /* Spam rows stay faded enough to de-prioritize but don't strike out

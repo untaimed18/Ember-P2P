@@ -43,7 +43,7 @@
   import type {
     Transfer, SourceInfo, UploadQueueClient, KnownClient, KnownClientCounts, DownloadFileDetails,
   } from '$lib/types';
-  import { inertBackground, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
   import { menuKeyDownloadId } from '$lib/transfersMenuKey';
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
@@ -6107,7 +6107,7 @@
                 {@const waitingSlotCount = expandedSources.filter(s => s.status === 'waiting_for_slot').length}
                 {@const partsBusyCount = expandedSources.filter(s => s.status === 'parts_busy').length}
                 {@const otherCount = expandedSources.filter(s => !SOURCE_CHIP_STATUSES.has(s.status)).length}
-                <tr class="source-child-row source-summary-row" in:fade={{ duration: 150 }}>
+                <tr class="source-child-row source-summary-row" in:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}>
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-summary">
                       <strong>{expandedSources.length}</strong> {peersNoun(expandedSources.length)}
@@ -6125,7 +6125,7 @@
                   </td>
                 </tr>
                 {#each visibleSources as src (src.ip + ':' + src.port)}
-                  <tr class="source-child-row src-{src.status}" in:fade={{ duration: 150 }}>
+                  <tr class="source-child-row src-{src.status}" in:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}>
                     <td class="source-child-cell" colspan={dlColCount}>
                       <span class="source-fields">
                         <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src)}></span>
@@ -7864,12 +7864,12 @@
     tabindex="-1"
     onclick={(e) => { if (e.target === e.currentTarget) closeFileDetails(); }}
     onkeydown={handleFileDetailsKeydown}
-    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 140 }}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
   >
     <div
       class="modal-content dl-details-modal"
       bind:this={fileDetailsModalEl}
-      transition:scale={{ start: 0.97, opacity: 0, duration: prefersReducedMotion.current ? 0 : 180 }}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
     >
       <div class="modal-header">
         <span id="dl-file-details-title" class="modal-title">{m.transfers_file_details_title()}</span>
@@ -8067,8 +8067,14 @@
       }
       trapTabKey(e, renameModalEl);
     }}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+    onoutrostart={inertDuringOutro}
   >
-    <div class="modal-content rename-modal" bind:this={renameModalEl}>
+    <div
+      class="modal-content rename-modal"
+      bind:this={renameModalEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="modal-header">
         <span id="dl-rename-title" class="modal-title">{m.transfers_rename_title()}</span>
         <button
@@ -8128,8 +8134,14 @@
       }
       trapTabKey(e, mirrorModalEl);
     }}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+    onoutrostart={inertDuringOutro}
   >
-    <div class="modal-content rename-modal" bind:this={mirrorModalEl}>
+    <div
+      class="modal-content rename-modal"
+      bind:this={mirrorModalEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="modal-header">
         <span id="dl-mirror-title" class="modal-title">{m.transfers_mirror_title()}</span>
         <button
@@ -8805,6 +8817,13 @@
     height: 2px;
     border-radius: 0 0 999px 999px;
     background: var(--accent);
+    animation: tab-bar-in var(--transition-normal) ease-out;
+  }
+  /* Grows from the middle as the tab becomes active, as the Ember page's tab
+     underline does. */
+  @keyframes tab-bar-in {
+    from { transform: scaleX(0); }
+    to { transform: scaleX(1); }
   }
   .tab-btn.active::after {
     content: '';

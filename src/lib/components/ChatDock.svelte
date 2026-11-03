@@ -1219,6 +1219,11 @@
     height: 13px;
     flex-shrink: 0;
     color: var(--text-muted);
+    transition: transform var(--transition-normal) ease;
+  }
+
+  .dock-current.open .dock-chevron {
+    transform: rotate(180deg);
   }
 
   .dock-presence {
@@ -1362,6 +1367,12 @@
     flex-direction: column;
     min-height: 0;
     background: var(--bg-primary);
+    animation: dock-switcher-in 0.12s ease-out;
+  }
+
+  @keyframes dock-switcher-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
 
   .dock-search {

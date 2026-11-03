@@ -1146,6 +1146,13 @@
     justify-content: center;
     line-height: 1;
     flex-shrink: 0;
+    /* The unread bump Channels gives a room row, played as a count appears. */
+    animation: nav-badge-in 460ms cubic-bezier(0.34, 1.6, 0.5, 1);
+  }
+
+  @keyframes nav-badge-in {
+    0%   { transform: scale(0.7); }
+    100% { transform: scale(1); }
   }
 
   /* Pending friend requests use the same orange as the transfers

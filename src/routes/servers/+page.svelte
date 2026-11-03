@@ -18,6 +18,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { fade } from 'svelte/transition';
   import { flip } from 'svelte/animate';
+  import { prefersReducedMotion } from 'svelte/motion';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { serverMetDownloadedText } from '$lib/commandReplies';
@@ -1318,8 +1319,8 @@
                   ondblclick={() => handleDoubleClick(server)}
                   oncontextmenu={(e: MouseEvent) => handleContextMenu(e, server)}
                   onkeydown={(e) => handleRowKeydown(e, server)}
-                  in:fade={{ duration: serverWindow.active ? 0 : 150 }}
-                  animate:flip={{ duration: serverWindow.active ? 0 : 180 }}
+                  in:fade={{ duration: serverWindow.active || prefersReducedMotion.current ? 0 : 150 }}
+                  animate:flip={{ duration: serverWindow.active || prefersReducedMotion.current ? 0 : 180 }}
                 >
                   <td class="name-cell" title={server.name || m.servers_unnamed()}>
                     <span class="name-inner">

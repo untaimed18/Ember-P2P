@@ -58,6 +58,17 @@ export function inertBackground(overlay: Element | null | undefined): () => void
 }
 
 /**
+ * `onoutrostart` for a closing dialog: make it inert while it fades out.
+ *
+ * Svelte keeps an element and its listeners live in the DOM until its outro
+ * finishes, so for those 150–200 ms a second Enter or click would act on a
+ * dialog that has already been answered.
+ */
+export function inertDuringOutro(e: Event): void {
+  (e.currentTarget as HTMLElement).inert = true;
+}
+
+/**
  * Arrow-key navigation for a `role="menu"` container. Call from the
  * container's `keydown` handler.
  *

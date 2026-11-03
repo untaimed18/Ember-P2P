@@ -4673,7 +4673,7 @@
               <section
                 class="xfer-drawer"
                 aria-label={m.channels_xfer_panel_title()}
-                transition:fly={{ y: 48, duration: 240 }}
+                transition:fly={{ y: 24, duration: prefersReducedMotion.current ? 0 : 180 }}
               >
                 <button
                   type="button"
@@ -4701,14 +4701,14 @@
                        but must not cut across whatever is being read. The
                        per-second numbers are hidden from it; the progress bar
                        carries the figure for anyone who asks. -->
-                  <div id="xfer-drawer-body" class="xfer-drawer-body" aria-live="polite" transition:slide={{ duration: 180 }}>
+                  <div id="xfer-drawer-body" class="xfer-drawer-body" aria-live="polite" transition:slide={{ duration: prefersReducedMotion.current ? 0 : 180 }}>
                     {#each roomTransfers as t (t.xfer_id)}
                       {@const tone = xferTone(t)}
                       {@const pct = xferPct(t)}
                       {@const rate = t.status === 'active' ? xferRate(xferSamples, t.xfer_id, xferNow) : 0}
                       {@const left = xferSecondsLeft(t.size, t.transferred, rate)}
                       {@const busy = respondingTo.includes(t.xfer_id)}
-                      <article class="xfer-card tone-{tone}" transition:slide={{ duration: 180 }}>
+                      <article class="xfer-card tone-{tone}" transition:slide={{ duration: prefersReducedMotion.current ? 0 : 180 }}>
                         <div class="xfer-card-top">
                           <span class="xfer-dir" class:send={t.direction === 'send'} aria-hidden="true">
                             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -7806,6 +7806,7 @@
     box-shadow: var(--ctx-shadow);
     display: flex;
     flex-direction: column;
+    animation: ctx-menu-in 0.12s ease-out;
   }
 
   .card-more-menu button {

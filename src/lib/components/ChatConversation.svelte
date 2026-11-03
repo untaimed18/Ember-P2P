@@ -6482,6 +6482,8 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     background: var(--bg-surface);
+    transform-origin: bottom;
+    animation: reaction-picker-in 0.12s ease-out;
   }
 
   .conversation.channel .mention-list {
@@ -6580,6 +6582,8 @@
     box-shadow: var(--shadow-md);
     color: var(--text-primary);
     font-size: var(--font-size-sm);
+    transform-origin: bottom;
+    animation: reaction-picker-in 0.12s ease-out;
   }
 
   .conv-format-row {

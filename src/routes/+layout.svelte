@@ -71,9 +71,10 @@
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
-  import { fly } from 'svelte/transition';
+  import { fade, fly, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import ChatWindowShell from '$lib/components/ChatWindowShell.svelte';
   import { initChatPopoutMain } from '$lib/chatPopout';
   import { applyUpdateResume, initUpdateResume } from '$lib/updateResume';
@@ -958,12 +959,12 @@
           change ties navigation together. Keyed on pathname (not full URL)
           so query-param changes (search tabs, filters) don't re-animate.
           The wrapper mirrors `.page-container`'s flex-column/overflow so the
-          pages' `flex: 1` height chain is preserved. The global
-          prefers-reduced-motion rule in app.css neutralizes this for users
-          who opt out.
+          pages' `flex: 1` height chain is preserved. Svelte runs this through
+          the Web Animations API, which the reduced-motion rule in app.css
+          does not reach, so it checks the preference itself.
         -->
         {#key $page.url.pathname}
-          <div class="route-view" in:fly={{ y: 8, duration: 160 }}>
+          <div class="route-view" in:fly={{ y: 8, duration: prefersReducedMotion.current ? 0 : 160 }}>
             <ErrorBoundary title={m.layout_render_error_title()} body={m.layout_render_error_body()}>
               {@render children()}
             </ErrorBoundary>
@@ -1055,10 +1056,13 @@
     class="policy-reset-backdrop"
     bind:this={policyResetOverlayEl}
     role="presentation"
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+    onoutrostart={inertDuringOutro}
   >
     <div
       class="policy-reset-dialog"
       bind:this={policyResetDialogEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
       role="alertdialog"
       aria-modal="true"
       aria-busy={policyResetPending}

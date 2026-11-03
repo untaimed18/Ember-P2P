@@ -30,6 +30,8 @@
 
 <script lang="ts">
   import { onDestroy, tick, untrack } from 'svelte';
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { goto } from '$app/navigation';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
@@ -53,7 +55,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
 
   interface Props {
@@ -921,7 +923,12 @@
   <div bind:this={dialogRootEl}>
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="browse-overlay" onclick={requestClose}></div>
+    <div
+      class="browse-overlay"
+      onclick={requestClose}
+      transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+      onoutrostart={inertDuringOutro}
+    ></div>
     <!-- svelte-ignore a11y_interactive_supports_focus -->
     <div
       class="browse-modal"
@@ -931,6 +938,8 @@
       tabindex="-1"
       bind:this={modalEl}
       onkeydown={handleKeydown}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+      onoutrostart={inertDuringOutro}
     >
       <div class="browse-header">
         <div class="browse-header-text">
@@ -1314,7 +1323,6 @@
     inset: 0;
     background: var(--overlay-bg);
     z-index: 10000;
-    animation: browse-fade-in 0.15s ease;
   }
 
   .browse-modal {
@@ -1334,17 +1342,6 @@
     box-shadow:
       inset 0 1px 0 var(--surface-highlight),
       var(--shadow-lg);
-    animation: browse-pop-in 0.2s ease;
-  }
-
-  /* Keyframe keeps the translate centering while scaling/fading in. */
-  @keyframes browse-fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  @keyframes browse-pop-in {
-    from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
-    to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
   }
 
   .browse-header {
