@@ -2,7 +2,7 @@
  * The emoji the composer's picker offers, and the ones used most recently.
  *
  * A curated set rather than the full Unicode list: thousands of glyphs need a
- * search to be usable, and a search needs names in nine languages. These are
+ * search to be usable, and a search needs names in ten languages. These are
  * the ones people actually reach for in chat, each a single glyph every
  * platform Ember runs on draws in colour. Default skin tone only, for the same
  * reason.

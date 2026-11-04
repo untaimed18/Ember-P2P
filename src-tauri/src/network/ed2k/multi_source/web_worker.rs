@@ -1,5 +1,6 @@
 //! One web source of a download: fetch the parts no peer is working on with
-//! HTTP `Range` requests, into the shared part file.
+//! HTTP `Range` requests, into the shared part file — and once every part left
+//! has a source on it, a share of what one of them has left.
 //!
 //! A child of `multi_source` so it uses the same claim → reserve → write →
 //! commit path, and the same MD4 sweep, as a peer worker — a mirror is one more
@@ -33,7 +34,16 @@ const THIN_PASS_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Redirects followed per request, each re-validated like the first URL.
 const MAX_REDIRECTS: usize = 5;
 
-/// How long to wait when every unfinished part is already being worked on.
+/// How far past where it is reading a mirror tells other workers it is
+/// fetching. Its request runs to the end of its range, but published whole, a
+/// second mirror joining the part found nothing left to take and streamed the
+/// same bytes from the same offset: a part with N mirrors was downloaded N
+/// times. Published this short, one joining starts beyond it, and the request
+/// ends where it reaches bytes the other wrote ([`read_on`]).
+const PUBLISHED_AHEAD: u64 = 4 * WRITE_CHUNK as u64;
+
+/// How long to wait when nothing is left to fetch but bytes another source is
+/// writing right now, and how often a resting source looks again.
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How often the dispatcher looks for web sources added since it started —
@@ -171,6 +181,18 @@ impl Drop for ActiveRequest {
     }
 }
 
+/// How a request that did not fail ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fetched {
+    /// Its range is read, or the body ran out first.
+    Done,
+    /// Another source wrote the bytes it reached; what that source fetches
+    /// lies ahead, so the part is picked from again.
+    Overtaken,
+    /// Web sources were switched off, or this one retired or replaced.
+    Withdrawn,
+}
+
 /// How a request ended, which decides what the source is told.
 enum FetchError {
     /// The server will never serve this file in parts: missing, refused, or
@@ -265,9 +287,10 @@ impl WebWorker {
             if !web_sources::enabled() {
                 break;
             }
-            // Retired elsewhere: by a corrupt part it mostly wrote, judged
+            // Retired elsewhere: by a corrupt part charged to it, judged
             // wherever that happened (see `web_sources::note_corrupt_range`),
-            // or by the download giving up on every mirror.
+            // by the download giving up on every mirror, or replaced by a new
+            // mirror.
             if web_sources::is_retired(&self.file_hash, &self.url) {
                 debug!("Web source {} retired for {}", self.url, self.transfer_id);
                 self.report("failed", 0, transferred, Some(SourceFailureKind::Permanent)).await;
@@ -275,19 +298,19 @@ impl WebWorker {
             }
             let picked = {
                 let mut t = self.tracker.write().await;
-                let claimed = t.in_progress_flags();
-                let part = (0..t.part_count).find(|&p| {
-                    !t.is_part_complete(p) && !claimed.get(p).copied().unwrap_or(false)
-                });
-                part.map(|p| {
-                    guard.claim_locked(p, &mut t);
-                    let (ps, pe) = t.part_range(p);
-                    (p, t.fillable_subranges(ps, pe))
-                })
+                let picked = pick(&t, self.worker);
+                if let Some((p, ranges)) = &picked {
+                    guard.claim_locked(*p, &mut t);
+                    // With the claim, so a mirror picking next sees where this
+                    // one starts.
+                    if let Some(&(start, end)) = ranges.first() {
+                        t.publish_in_flight_requests(self.worker, vec![ahead(start, end)]);
+                    }
+                }
+                picked
             };
             let Some((part, gaps)) = picked else {
-                // Every unfinished part has a peer on it. Wait, rather than
-                // racing them for the same bytes.
+                // Nothing left that is not mid-write by someone else.
                 self.pause(IDLE_RECHECK).await;
                 continue;
             };
@@ -301,35 +324,37 @@ impl WebWorker {
                 continue;
             }
 
-            // So a peer worker piling onto this part in the endgame asks for
-            // these ranges last, as it does for another peer's requests.
-            let in_flight: Vec<OutstandingRange> =
-                gaps.iter().map(|&(gs, ge)| OutstandingRange::new(gs, ge)).collect();
-            guard.publish_in_flight(&in_flight, None).await;
             let mut written: u64 = 0;
-            let mut outcome: Result<(), FetchError> = Ok(());
+            let mut outcome: Result<Fetched, FetchError> = Ok(Fetched::Done);
             for (gs, ge) in gaps {
-                match self
+                outcome = self
                     .fetch_range(&mut effective_url, gs, ge, &mut transferred, &mut written)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        outcome = Err(e);
-                        break;
-                    }
+                    .await;
+                if !matches!(outcome, Ok(Fetched::Done)) {
+                    break;
                 }
             }
             guard.publish_in_flight(&[], None).await;
             // Check what this source just filled now, while the claim still
-            // keeps the sweep and every peer off it, so the verdict is about
-            // this mirror and a bad one is found out after one part.
+            // keeps the sweep off it, so a bad mirror is found out after one
+            // part. On a part it shared with another source, the verdict is
+            // about both, and a mirror is only charged for one it wrote alone
+            // or AICH narrows to it (`web_sources::note_corrupt_range`).
+            //
+            // Not while another source still holds the part, as one this mirror
+            // joined does: that source hashes it when its own fetch ends, and on
+            // a mismatch it may be waiting on an AICH answer that narrows the
+            // repair to one block. Hashing here as well reopened the whole part
+            // under it, so the answer was thrown away and the part fetched again
+            // in full with nobody blamed. A part nobody else holds is still
+            // checked here; one left complete and unclaimed goes to the sweep.
             let (to_check, part_done) = {
                 let t = self.tracker.read().await;
                 let (ps, pe) = t.part_range(part);
                 let done = t.is_part_complete(part);
+                let shared = t.claims_on(part) > 1;
                 (
-                    (outcome.is_ok() && done && !t.is_part_verified(part))
+                    (outcome.is_ok() && done && !shared && !t.is_part_verified(part))
                         .then(|| ((ps, pe), t.part_content_generation(part))),
                     done,
                 )
@@ -359,10 +384,19 @@ impl WebWorker {
             };
 
             match outcome {
-                Ok(()) => {
+                Ok(fetched) => {
                     web_sources::note_success(&self.file_hash, &self.url);
-                    if written < THIN_PASS_BYTES && !part_done {
-                        self.pause(THIN_PASS_PAUSE).await;
+                    match fetched {
+                        Fetched::Done if written < THIN_PASS_BYTES && !part_done => {
+                            self.pause(THIN_PASS_PAUSE).await;
+                        }
+                        // Another source wrote everything it read: a breath
+                        // before picking again, so a lost race is not re-run
+                        // in a tight loop.
+                        Fetched::Overtaken if written == 0 => {
+                            self.pause(std::time::Duration::from_millis(250)).await;
+                        }
+                        _ => {}
                     }
                 }
                 Err(FetchError::Stopped(e)) => return Err(e),
@@ -428,9 +462,7 @@ impl WebWorker {
             if web_sources::ready(&self.file_hash).contains(&self.url) {
                 return true;
             }
-            if !web_sources::urls(&self.file_hash).contains(&self.url)
-                || web_sources::is_retired(&self.file_hash, &self.url)
-            {
+            if web_sources::is_retired(&self.file_hash, &self.url) {
                 return false;
             }
             self.pause(IDLE_RECHECK).await;
@@ -461,7 +493,11 @@ impl WebWorker {
         end: u64,
         transferred: &mut u64,
         written: &mut u64,
-    ) -> Result<(), FetchError> {
+    ) -> Result<Fetched, FetchError> {
+        self.tracker
+            .write()
+            .await
+            .publish_in_flight_requests(self.worker, vec![ahead(start, end)]);
         let response = match self.send_range(effective_url, start, end).await {
             Ok(r) => r,
             Err(e @ (FetchError::Permanent(_) | FetchError::Transient(_)))
@@ -625,7 +661,7 @@ impl WebWorker {
         end: u64,
         transferred: &mut u64,
         written: &mut u64,
-    ) -> Result<(), FetchError> {
+    ) -> Result<Fetched, FetchError> {
         let wire = self.tracker.read().await.transferred_counter();
         let mut pos = body_start;
         let mut buf: Vec<u8> = Vec::with_capacity(WRITE_CHUNK);
@@ -636,10 +672,11 @@ impl WebWorker {
         let mut reported_transferring = false;
         let mut got_any = false;
         loop {
-            if !web_sources::enabled() {
-                // Switched off mid-request. What was written stays; the worker
-                // ends at the top of its loop rather than after a whole part.
-                return Ok(());
+            if !web_sources::enabled() || web_sources::is_retired(&self.file_hash, &self.url) {
+                // Switched off, retired or replaced mid-request. What was
+                // written stays; the worker ends at the top of its loop rather
+                // than after a whole part.
+                return Ok(Fetched::Withdrawn);
             }
             let chunk = tokio::select! {
                 c = response.chunk() => c.map_err(|e| FetchError::Transient(format!("read failed: {e}")))?,
@@ -701,13 +738,11 @@ impl WebWorker {
                 got_any = true;
                 pos += len;
                 buf.clear();
-                // Peers filled the rest of this range meanwhile: reading on
-                // would only download it again.
-                if outcome.newly_written == 0
-                    && pos < end
-                    && self.tracker.read().await.fillable_subranges(pos, end).is_empty()
-                {
-                    return Ok(());
+                if pos < end {
+                    let keep = read_on(&mut *self.tracker.write().await, self.worker, pos, end);
+                    if !keep {
+                        return Ok(Fetched::Overtaken);
+                    }
                 }
                 let elapsed = window_start.elapsed();
                 if !reported_transferring || elapsed >= std::time::Duration::from_secs(1) {
@@ -719,13 +754,13 @@ impl WebWorker {
                 }
             }
             if pos >= end {
-                return Ok(());
+                return Ok(Fetched::Done);
             }
             if done {
                 // Short body: what came is written, and the gap map says what
                 // is left. Nothing at all is a failure.
                 return if got_any {
-                    Ok(())
+                    Ok(Fetched::Done)
                 } else {
                     Err(FetchError::Transient("the server sent no data".to_string()))
                 };
@@ -757,6 +792,121 @@ fn is_encoded(content_encoding: Option<&reqwest::header::HeaderValue>) -> bool {
     })
 }
 
+/// `ranges` with every part covered by one of `cut` taken out. `cut` may
+/// overlap itself (several workers' requests); `ranges` is sorted and disjoint.
+fn without_ranges(ranges: &[(u64, u64)], cut: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(start, end) in ranges {
+        let mut pieces = vec![(start, end)];
+        for &(cs, ce) in cut {
+            if cs >= ce {
+                continue;
+            }
+            pieces = pieces
+                .into_iter()
+                .flat_map(|(s, e)| {
+                    if ce <= s || cs >= e {
+                        vec![(s, e)]
+                    } else {
+                        [(s, cs.max(s)), (ce.min(e), e)].into_iter().filter(|&(a, b)| a < b).collect()
+                    }
+                })
+                .collect();
+        }
+        out.extend(pieces);
+    }
+    out
+}
+
+/// What `worker`, a mirror, fetches next: a part nobody holds, its gaps in
+/// order; or, with every unfinished part held, one range of one of them
+/// ([`join_range`]). Joining rather than sitting idle behind a slow peer
+/// holding the last part — or the only one, on a file of a single part — as a
+/// peer's own fallback does.
+fn pick(t: &PartTracker, worker: usize) -> Option<(usize, Vec<(u64, u64)>)> {
+    let claimed = t.in_progress_flags();
+    let free = (0..t.part_count)
+        .find(|&p| !t.is_part_complete(p) && !claimed.get(p).copied().unwrap_or(false));
+    if let Some(p) = free {
+        let (ps, pe) = t.part_range(p);
+        return Some((p, t.fillable_subranges(ps, pe)));
+    }
+    let others = t.requested_by_others(worker);
+    (0..t.part_count)
+        .filter(|&p| !t.is_part_complete(p))
+        .filter_map(|p| {
+            let (ps, pe) = t.part_range(p);
+            join_range(ps, &t.fillable_subranges(ps, pe), &others).map(|(range, unrequested)| (p, range, unrequested))
+        })
+        .max_by_key(|&(p, (start, end), unrequested)| (unrequested, end - start, std::cmp::Reverse(p)))
+        .map(|(p, range, _)| (p, vec![range]))
+}
+
+/// The range a mirror joining a part takes, given the part's `gaps` and what
+/// other workers have in flight, with how many bytes of the part nobody has
+/// asked for, which decides the part to join. As eMule's endgame does, it
+/// splits what is left rather than stream it beside another source:
+///
+/// - The largest span nobody has asked for, from its middle when a worker's
+///   requests run up to it — that worker is heading in, and the two meet
+///   halfway — or else from its start.
+/// - With nothing unasked for, the back half of the largest range another
+///   worker has in flight, down to racing one block whole.
+fn join_range(part_start: u64, gaps: &[(u64, u64)], others: &[(u64, u64)]) -> Option<((u64, u64), u64)> {
+    let largest =
+        |ranges: &[(u64, u64)]| ranges.iter().copied().max_by_key(|&(s, e)| (e - s, std::cmp::Reverse(s)));
+    let unrequested = without_ranges(gaps, others);
+    if let Some((start, end)) = largest(&unrequested) {
+        let heading_in = others.iter().any(|&(os, oe)| os < start && oe >= start);
+        let from = if heading_in { split_point(part_start, start, end) } else { start };
+        return Some(((from, end), unrequested.iter().map(|&(s, e)| e - s).sum()));
+    }
+    let in_flight: Vec<(u64, u64)> = others
+        .iter()
+        .flat_map(|&(os, oe)| {
+            gaps.iter()
+                .map(move |&(gs, ge)| (gs.max(os), ge.min(oe)))
+                .filter(|&(s, e)| s < e)
+        })
+        .collect();
+    let (start, end) = largest(&in_flight)?;
+    Some(((split_point(part_start, start, end), end), 0))
+}
+
+/// Where a second source starts in `[start, end)` so that it and one coming
+/// from `start` meet halfway: the middle, up to a block of the part as peers
+/// ask for them, since the one coming is already reading while the second
+/// still has to ask. `start`, for the whole span, when no block boundary lies
+/// between the middle and `end`.
+fn split_point(part_start: u64, start: u64, end: u64) -> u64 {
+    let block = WRITE_CHUNK as u64;
+    let middle = start + (end - start) / 2;
+    let boundary = part_start + (middle - part_start).div_ceil(block) * block;
+    if boundary < end {
+        boundary.max(start)
+    } else {
+        start
+    }
+}
+
+/// What a mirror reading from `pos` toward `end` publishes as in flight.
+fn ahead(pos: u64, end: u64) -> (u64, u64) {
+    (pos, end.min(pos.saturating_add(PUBLISHED_AHEAD)))
+}
+
+/// After writing up to `pos` of a request running to `end`, whether to read
+/// on. Not once another source has written the byte at `pos`: it got there
+/// first, so what it is fetching lies ahead and reading on would download it
+/// a second time — two mirrors that split a part stop where they meet. Reading
+/// on, `worker` publishes the stretch about to come in.
+fn read_on(t: &mut PartTracker, worker: usize, pos: u64, end: u64) -> bool {
+    if t.fillable_subranges(pos, pos + 1).is_empty() {
+        return false;
+    }
+    t.publish_in_flight_requests(worker, vec![ahead(pos, end)]);
+    true
+}
+
 /// `bytes first-last/total` → `(first, last, total)`; `total` is `None` for
 /// `*`. Anything else, or a range that runs backwards, is `None`.
 fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
@@ -777,8 +927,164 @@ fn parse_content_range(header: &str) -> Option<(u64, u64, Option<u64>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_encoded, parse_content_range};
+    use super::{
+        ahead, is_encoded, join_range, parse_content_range, pick, read_on, split_point, without_ranges, PartTracker,
+        PUBLISHED_AHEAD, WRITE_CHUNK,
+    };
     use reqwest::header::HeaderValue;
+
+    const BLOCK: u64 = WRITE_CHUNK as u64;
+
+    #[test]
+    fn requested_ranges_are_cut_out_of_the_gaps() {
+        assert_eq!(without_ranges(&[(0, 100)], &[]), vec![(0, 100)]);
+        assert_eq!(without_ranges(&[(0, 100)], &[(20, 30)]), vec![(0, 20), (30, 100)]);
+        assert_eq!(without_ranges(&[(0, 100)], &[(0, 100)]), vec![]);
+        assert_eq!(
+            without_ranges(&[(0, 50), (60, 100)], &[(40, 70), (45, 65), (90, 200)]),
+            vec![(0, 40), (70, 90)],
+            "overlapping requests, and one past the end"
+        );
+        assert_eq!(without_ranges(&[(10, 20)], &[(30, 40), (5, 5)]), vec![(10, 20)], "disjoint and empty cuts");
+    }
+
+    /// One part, one slow peer with a block in flight: a mirror joining takes
+    /// what nobody asked for rather than wait behind it, from halfway, since
+    /// the peer is heading into it from the front.
+    #[test]
+    fn a_mirror_joining_a_part_takes_what_nobody_asked_for() {
+        assert_eq!(join_range(0, &[(0, 10 * BLOCK)], &[(0, BLOCK)]), Some(((6 * BLOCK, 10 * BLOCK), 9 * BLOCK)));
+
+        // Nobody heading into the span: it is taken from its start.
+        assert_eq!(
+            join_range(0, &[(0, 10 * BLOCK)], &[(8 * BLOCK, 9 * BLOCK)]),
+            Some(((0, 8 * BLOCK), 9 * BLOCK))
+        );
+
+        assert_eq!(
+            join_range(0, &[(0, BLOCK)], &[(0, BLOCK)]),
+            Some(((0, BLOCK), 0)),
+            "only the peer's block is left, so the mirror races it"
+        );
+        assert_eq!(join_range(0, &[], &[(0, BLOCK)]), None);
+    }
+
+    /// With everything in flight elsewhere, a joining mirror takes the back
+    /// half of the longest stretch, so it and the worker on it meet halfway.
+    #[test]
+    fn a_mirror_with_nothing_unasked_for_splits_the_longest_request() {
+        let gaps = [(0, 6 * BLOCK)];
+        let others = [(0, BLOCK), (BLOCK, 5 * BLOCK), (5 * BLOCK, 6 * BLOCK)];
+        assert_eq!(join_range(0, &gaps, &others), Some(((3 * BLOCK, 5 * BLOCK), 0)));
+    }
+
+    #[test]
+    fn a_span_is_split_on_a_block_of_its_part() {
+        let part = 9_728_000;
+        assert_eq!(split_point(part, part, part + 10 * BLOCK), part + 5 * BLOCK);
+        assert_eq!(split_point(part, part + 100, part + 3 * BLOCK), part + 2 * BLOCK);
+        assert_eq!(split_point(0, 0, BLOCK + BLOCK / 2), BLOCK);
+        assert_eq!(split_point(0, 0, BLOCK), 0, "no block boundary past the middle: the whole span");
+        assert_eq!(split_point(0, 7, 9), 7);
+    }
+
+    /// The report this exists for: a one-part file and two mirrors. The first
+    /// claims the part; the second used to find all of it published as in
+    /// flight and stream it again from the same offset.
+    #[test]
+    fn a_second_mirror_on_a_one_part_file_starts_halfway_through_what_is_left() {
+        let size = 20 * BLOCK;
+        let mut t = tracker(size, "pick");
+        let (part, ranges) = pick(&t, 1).expect("a free part");
+        assert_eq!((part, ranges.clone()), (0, vec![(0, size)]));
+        t.claim_in_progress(0);
+        t.publish_in_flight_requests(1, vec![ahead(0, size)]);
+        assert_eq!(ahead(0, size), (0, PUBLISHED_AHEAD));
+
+        let (part, ranges) = pick(&t, 2).expect("a share of the held part");
+        assert_eq!(part, 0);
+        assert_eq!(ranges, vec![(12 * BLOCK, size)], "halfway through what lies past the first mirror's window");
+    }
+
+    /// Mirrors on a one-part file, run chunk by chunk as the worker does: the
+    /// file comes in once, give or take where they meet, rather than once per
+    /// mirror.
+    #[test]
+    fn mirrors_on_one_part_download_it_about_once_between_them() {
+        for mirrors in 2..=5 {
+            let size = 40 * BLOCK + 1234;
+            let fetched = simulate(&mut tracker(size, &format!("sim{mirrors}")), mirrors);
+            assert!(
+                fetched <= size + mirrors as u64 * BLOCK,
+                "{mirrors} mirrors fetched {fetched} bytes of a {size}-byte file"
+            );
+        }
+    }
+
+    /// A request runs on until it reaches bytes another source wrote.
+    #[test]
+    fn a_request_stops_where_another_source_wrote() {
+        let mut t = tracker(10 * BLOCK, "read-on");
+        assert!(read_on(&mut t, 1, BLOCK, 10 * BLOCK));
+        assert_eq!(t.requested_by_others(2), vec![(BLOCK, 5 * BLOCK)], "the window ahead is published");
+        t.fill_range(2 * BLOCK, 3 * BLOCK);
+        assert!(!read_on(&mut t, 1, 2 * BLOCK, 10 * BLOCK));
+        assert!(read_on(&mut t, 1, 3 * BLOCK, 10 * BLOCK));
+    }
+
+    fn tracker(size: u64, name: &str) -> PartTracker {
+        let path = std::env::temp_dir().join(format!("ember-web-worker-test-{name}-{}.part", std::process::id()));
+        PartTracker::new(size, &path)
+    }
+
+    /// Run `mirrors` mirror workers over `t` in lockstep, one chunk each per
+    /// round, picking and stopping as `run_inner` and `stream_body` do.
+    /// Returns the bytes they fetched between them.
+    fn simulate(t: &mut PartTracker, mirrors: usize) -> u64 {
+        // Per mirror: the part it claims, the ranges left of its pass, and
+        // where it is reading.
+        let mut passes: Vec<Option<(usize, Vec<(u64, u64)>, u64)>> = vec![None; mirrors];
+        let mut fetched = 0;
+        for _round in 0..10_000 {
+            if t.all_complete() {
+                return fetched;
+            }
+            for (worker, pass) in passes.iter_mut().enumerate() {
+                if pass.is_none() {
+                    if let Some((part, ranges)) = pick(t, worker).filter(|(_, ranges)| !ranges.is_empty()) {
+                        t.claim_in_progress(part);
+                        t.publish_in_flight_requests(worker, vec![ahead(ranges[0].0, ranges[0].1)]);
+                        let start = ranges[0].0;
+                        *pass = Some((part, ranges, start));
+                    }
+                }
+                let Some((part, ranges, pos)) = pass.as_mut() else {
+                    continue;
+                };
+                let end = ranges[0].1;
+                let chunk_end = end.min(*pos + BLOCK);
+                fetched += chunk_end - *pos;
+                t.fill_range(*pos, chunk_end);
+                *pos = chunk_end;
+                let next = if *pos < end && read_on(t, worker, *pos, end) {
+                    true
+                } else if *pos >= end && ranges.len() > 1 {
+                    ranges.remove(0);
+                    *pos = ranges[0].0;
+                    t.publish_in_flight_requests(worker, vec![ahead(ranges[0].0, ranges[0].1)]);
+                    true
+                } else {
+                    false
+                };
+                if !next {
+                    t.release_in_progress(*part);
+                    t.clear_in_flight_requests(worker);
+                    *pass = None;
+                }
+            }
+        }
+        panic!("{mirrors} mirrors never finished");
+    }
 
     #[test]
     fn only_a_real_content_encoding_counts() {

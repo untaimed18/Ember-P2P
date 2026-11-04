@@ -21,6 +21,7 @@ mod ember_search;
 mod ember_udp;
 mod event_loop;
 pub(crate) mod feed_direct;
+pub(crate) mod feed_reach;
 pub(crate) mod friend_intro;
 mod friend_transfer;
 mod friends;
@@ -138,7 +139,7 @@ use self::ember_publish::{
     EMBER_STORE_RECORDS_PER_PEER_PER_MIN, K_EMBER_REPLICAS,
 };
 use self::health::{
-    ActiveSourceInjectionStats, FriendRelayTicketPollResult, KnownMetSaveResult, NatProbeResult,
+    ActiveSourceInjectionStats, CompletedDigests, FriendRelayTicketPollResult, KnownMetSaveResult, NatProbeResult,
     PeriodicSaveJob, PeriodicSaveResult, PublishHealthSnapshot, RendezvousRegisterResult,
     ServerConnectResult, SourceInjectionResult, SpamSaveResult, TcpMappingKeepaliveResult,
     TcpPortConfirmation, UdpDiscoveryHealthSnapshot, UdpMappingKeepaliveResult, UpnpMaintainResult,
@@ -1009,6 +1010,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         last_server_session_low_id: false,
         preferred_ed2k_server: None,
         server_last_connect_attempt: None,
+        server_last_moved_at: None,
         pending_uss_pings: HashMap::new(),
         uss_host: None,
         uss_prev_host: None,
@@ -1071,11 +1073,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_session_hold_pinged: HashSet::new(),
         ember_publish_targets: HashMap::new(),
         ember_publish_target_queue: std::collections::VecDeque::new(),
+        ember_awaited_lookup_minute: None,
         ember_publish_target_waits: HashMap::new(),
         ember_publish_target_lookups: HashMap::new(),
+        ember_key_record_holds: HashMap::new(),
+        ember_key_record_queue: std::collections::VecDeque::new(),
+        ember_key_records_ready: std::collections::VecDeque::new(),
+        ember_key_record_lookups: HashMap::new(),
         ember_store_loaded: false,
         ember_reach_witness: None,
         ember_udp_reachable_at: None,
+        outside_probe_last: None,
+        ember_buddy_keepalive_at: None,
         ember_reach_external_ip: None,
         ember_source_address: EmberSourceAddress::default(),
         ember_source_address_dirty: false,
@@ -1186,6 +1195,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_dht_maint_pings: HashMap::new(),
         ember_source_publish_at: HashMap::new(),
         ember_named_source_buddy: None,
+        ember_records_buddy: None,
         ember_source_publish_unix: HashMap::new(),
         ember_keyword_publish_at: HashMap::new(),
         ember_keyword_publish_unix: HashMap::new(),
@@ -1248,6 +1258,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_roster_cache: None,
         channel_neighbor_lookup_at: HashMap::new(),
         channel_neighbor_lookup_inflight: HashSet::new(),
+        channel_neighbor_pinged_at: HashMap::new(),
         channel_neighbor_scan_after: None,
         channel_relay_outboxes: HashMap::new(),
         channel_relay_pending: HashSet::new(),
@@ -1261,6 +1272,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_recv: HashMap::new(),
         xfer_finish_tx,
         xfer_finish_in_flight: 0,
+        xfer_block_uploads: Vec::new(),
         xfer_finishing: HashMap::new(),
         xfer_accepting: HashMap::new(),
         xfer_accept_tx,
@@ -1294,6 +1306,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_epoch_fetch_at: HashMap::new(),
         ember_channel_claim_searches: HashMap::new(),
         ember_pending_channel_claim: Vec::new(),
+        channel_return_held_since: HashMap::new(),
     };
 
     kad::firewall::publish_local_firewall(state.firewalled, state.udp_firewalled);
@@ -1543,10 +1556,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // values have no operational use — crash recovery rebuilds them from the
     // `.part.met` via `PartTracker::new` at `start_network` resume, and the
     // live UI reads from `transfer_manager` (commands/transfers.rs).
-    // Keep a per-transfer "last persisted at" map and only flush to SQLite
-    // once per `DB_PROGRESS_PERSIST_INTERVAL`, plus always at terminal
-    // state transitions (handled separately via `update_transfer_status`).
-    let mut db_progress_last_persist: HashMap<String, std::time::Instant> = HashMap::new();
+    // Collect each download's latest figure and flush them all to SQLite in
+    // one transaction once per `DB_PROGRESS_PERSIST_INTERVAL`, plus always at
+    // terminal state transitions (handled separately via `update_transfer_status`).
+    let mut db_progress_batch = DbProgressBatch::default();
     // Upload `transferred` is intentionally capped to the file size for UI
     // progress. Keep a separate raw counter for durable Library accounting so
     // retransmitted payload bytes are not silently discarded.
@@ -1762,6 +1775,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 }
             }
             Err(e) => warn!("Could not load Known Ember Peers links: {e}"),
+        }
+        match db.load_credit_key_links() {
+            Ok(links) => {
+                for (user_hash, ember_hash, secident_key) in links {
+                    cm.restore_signed_ember_hash(user_hash, ember_hash, &secident_key);
+                }
+            }
+            Err(e) => warn!("Could not load Ember key links: {e}"),
         }
         // Ember credit records live in a separate v15 table, loaded the
         // same way as the eMule table above.
@@ -2074,6 +2095,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     punch_poll_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_punch_poll: Option<tokio::time::Instant> = None;
     publish_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // See the early re-run of the publish tick in the loop below.
+    let mut publish_recheck_armed = true;
     // eMule's Kad publish driver wakes every KADEMLIAPUBLISHTIME (2s)
     // and starts at most one due source/keyword/note store per tick while
     // respecting per-type active-search caps.
@@ -2225,8 +2248,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     server_udp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut uss_ping_timer = tokio::time::interval(std::time::Duration::from_secs(2));
     uss_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Batch TCP OP_GETSOURCES to connected server (eMule ~4 min ProcessLocalRequests cycle)
-    let mut server_tcp_source_timer = tokio::time::interval(std::time::Duration::from_secs(4 * 60));
+    // Batch TCP OP_GETSOURCES to connected server, once per source-request
+    // frame (a shorter period only finds the frame still closed)
+    let mut server_tcp_source_timer = tokio::time::interval(std::time::Duration::from_secs(
+        SERVER_TCP_SRCREQ_INTERVAL_SECS as u64,
+    ));
     server_tcp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut ember_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -2277,12 +2303,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         mpsc::unbounded_channel::<String>();
     let (nat_probe_result_tx, mut nat_probe_result_rx) =
         mpsc::unbounded_channel::<NatProbeResult>();
-    // Completed-download BLAKE3 digests, computed off the event loop.
-    // `(ed2k hash, digest)`.
-    let (ember_digest_result_tx, mut ember_digest_result_rx) =
-        mpsc::unbounded_channel::<([u8; 16], [u8; 32])>();
-    // Completed-download ed2k part hashsets, recomputed off the event loop for
-    // the same reason as the digests above. `(ed2k hash, part hashes)`.
+    // Completed-download AICH roots and BLAKE3 digests, computed off the event
+    // loop.
+    let (completed_digest_result_tx, mut completed_digest_result_rx) =
+        mpsc::unbounded_channel::<CompletedDigests>();
+    // Completed-download ed2k part hashsets, recomputed off the event loop in
+    // the same read as the digests above. `(ed2k hash, part hashes)`.
     let (part_hashset_result_tx, mut part_hashset_result_rx) =
         mpsc::unbounded_channel::<([u8; 16], Vec<[u8; 16]>)>();
     // Durable inputs for the enforced-ban rebuild, read off the event loop.
@@ -2925,7 +2951,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     None => {
                         emit_server_auto_connect_failed(
                             &app_handle,
-                            "no last server and eMule Sunrise not in list",
+                            "no last server in the list, no High priority server, and eMule Sunrise missing or Low priority",
                         );
                     }
                 }
@@ -3013,6 +3039,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 state.nat_probe_generation,
                 reason,
             ));
+        }
+        // The publish tick settles the Ember reachability verdict, and the first
+        // one usually runs before any external IPv4 is known. Bring the next one
+        // forward once the verdict is out of date and the evidence is in,
+        // instead of leaving it for up to a minute. At most once per regular tick.
+        if publish_recheck_armed && ember_reachability_recheck_due(&state) {
+            publish_recheck_armed = false;
+            publish_timer.reset_immediately();
         }
         // Not gated on activity: an idle node is exactly the one nothing else
         // re-probes for, and the votes only ask on a change of confirmation.
@@ -3301,8 +3335,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     ed25519_secret_key,
                     &a4af_shared,
                     &aich_set_tx,
-                    &mut db_progress_last_persist,
-                    &ember_digest_result_tx,
+                    &mut db_progress_batch,
+                    &completed_digest_result_tx,
                     &part_hashset_result_tx,
                     &pending_kad_callbacks,
                     &shared_files,
@@ -3416,6 +3450,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &firewall_probe_ips,
                     &shared_banned_ips,
                     &friend_hashes,
+                    &credit_manager,
                     ember_hash,
                     &ul_event_tx,
                     ed25519_pubkey,
@@ -3501,6 +3536,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &friend_relay_ticket_session_done_tx,
                     &mut friend_relay_ticket_sessions_in_flight,
                     &inbound_stream_tx,
+                    &bandwidth_limiter,
                 )
                 .await;
             }
@@ -3511,6 +3547,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
             // Periodic publishing
             _ = publish_timer.tick() => {
+                publish_recheck_armed = true;
                 let __panic_result = std::panic::AssertUnwindSafe(on_publish_tick(
                     &udp_socket,
                     &mut state,
@@ -3660,7 +3697,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     channel_sweep_cutoff,
                     &mut credit_flush_handle,
                     &credit_save_ownership,
-                    &mut db_progress_last_persist,
                     &mut last_chat_expiry_sweep,
                     &mut nat_probe_in_flight,
                     &mut nat_probe_packet_tx,
@@ -3731,6 +3767,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &bandwidth_limiter,
                     &db,
                     &app_handle,
+                    &credit_manager,
                     &mut xfer_finish_rx,
                 ))
                 .catch_unwind()
@@ -4465,7 +4502,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                     &channel_neighbor_lookup_tx,
                     &mut channel_relay_event_rx,
                     &channel_relay_event_tx,
-                    &mut ember_digest_result_rx,
+                    &mut completed_digest_result_rx,
                     &mut part_hashset_result_rx,
                     &shared_ip_filter,
                     &shared_transfer_stats,
@@ -4475,6 +4512,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 if let Err(__p) = __panic_result {
                     error!("Network loop arm 'stats_timer' panicked: {}", describe_panic(&*__p));
                 }
+                // Progress events stop when a download stalls; what they left
+                // waiting is written here instead.
+                db_progress_batch.flush_due(&db);
             }
 
             Some(result) = known_met_save_result_rx.recv() => {
@@ -4945,7 +4985,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             describe_panic(&*panic_info)
         );
         let _ = app_handle.emit("network-error", serde_json::json!({
-            "message": "Internal error in network task. The application may need to be restarted.",
+            "message": crate::commands::errors::coded(
+                "network_task_panicked",
+                "Internal error in network task. The application may need to be restarted.",
+            ),
         }));
     }
 

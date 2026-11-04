@@ -11,14 +11,16 @@
   import {
     addUserCategory, countDownloadCategories, isCategoryTaken, removeUserCategory, setCategoryFolder,
   } from '$lib/categorySettings';
-  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
-  import { addActionToast, removeToast, setToastMessage, toastError, toastSuccess, toastWarning } from '$lib/stores/toast';
+  import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, setLocalFileName, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
+  import { removeToast, setToastMessage, toastsFor } from '$lib/stores/toast';
+  const { addActionToast, toastError, toastSuccess, toastWarning } = toastsFor('downloads');
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
+  import { completedFirst as completedFirstPref } from '$lib/stores/transfersView';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     pauseTransfer, stopTransfer, resumeTransfer, removeTransfer, deleteFinishedDownloads,
-    clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransfersCategory, renameTransfer, setPreviewPriority,
+    clearCompleted, moveTransfersInQueue, getDownloadQueueIds, setTransferPriority, setTransfersCategory, renameTransfer, setPreviewPriority, addTransferWebSources,
     pauseTransfersBatch, resumeTransfersBatch, stopTransfersBatch, cancelTransfersBatch, getTransfers,
     getTransferSources, openFile, openTransferFileLocation, openDownloadsFolder, recoverArchive, startDownload,
     getUploadQueue, getKnownClients, getKnownClientCounts, getDownloadFileDetails,
@@ -42,11 +44,11 @@
   import type {
     Transfer, SourceInfo, UploadQueueClient, KnownClient, KnownClientCounts, DownloadFileDetails,
   } from '$lib/types';
-  import { inertBackground, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, menuKeydown, swallowKeyboardContextMenu, trapTabKey } from '$lib/a11y';
   import { menuKeyDownloadId } from '$lib/transfersMenuKey';
   import { scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
-  import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
+  import { ctxMenuPosition, ctxSubmenuPlacement, resolveSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
@@ -66,6 +68,7 @@
   import { isEmberBlake3Mismatch } from '$lib/emberIntegrity';
   import { uploadCapInForce, uploadScaleFactor, uploadSumBound } from '$lib/uploadSpeed';
   import { computeSegmentWindow, segmentRowOffset } from '$lib/segmentWindow';
+  import { createSortMemo, sortWithMemo } from '$lib/sortMemo';
   import { adoptRowHeight } from '$lib/rowWindow';
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
@@ -470,13 +473,13 @@
       let msg: string;
       switch (d.kind) {
         case 'server_query': msg = m.transfers_src_server_query(); break;
-        case 'server_found': msg = plural(count, { one: m.transfers_src_server_found_one, other: () => m.transfers_src_server_found_other({ count }) }); break;
+        case 'server_found': msg = plural(count, { one: () => m.transfers_src_server_found_one({ count }), oneShowsCount: true, other: () => m.transfers_src_server_found_other({ count }) }); break;
         case 'server_empty': msg = m.transfers_src_server_empty(); break;
-        case 'udp_found': msg = plural(count, { one: m.transfers_src_udp_found_one, other: () => m.transfers_src_udp_found_other({ count }) }); break;
+        case 'udp_found': msg = plural(count, { one: () => m.transfers_src_udp_found_one({ count }), oneShowsCount: true, other: () => m.transfers_src_udp_found_other({ count }) }); break;
         case 'udp_empty': msg = m.transfers_src_udp_empty(); break;
         case 'kad_search': msg = m.transfers_src_kad_search(); break;
-        case 'kad_found': msg = plural(count, { one: m.transfers_src_kad_found_one, other: () => m.transfers_src_kad_found_other({ count }) }); break;
-        case 'kad_indirect': msg = plural(count, { one: m.transfers_src_kad_indirect_one, other: () => m.transfers_src_kad_indirect_other({ count }) }); break;
+        case 'kad_found': msg = plural(count, { one: () => m.transfers_src_kad_found_one({ count }), oneShowsCount: true, other: () => m.transfers_src_kad_found_other({ count }) }); break;
+        case 'kad_indirect': msg = plural(count, { one: () => m.transfers_src_kad_indirect_one({ count }), oneShowsCount: true, other: () => m.transfers_src_kad_indirect_other({ count }) }); break;
         case 'kad_empty': msg = m.transfers_src_kad_empty(); break;
         default: msg = m.transfers_src_unknown(); break;
       }
@@ -553,6 +556,7 @@
       clearTimeout(knownCopyTimer);
       knownCopyTimer = undefined;
     }
+    if (moreMenuReflow) window.removeEventListener('resize', moreMenuReflow);
   });
 
   let searchStatus: Map<string, string> = $state(new Map());
@@ -592,6 +596,19 @@
   let renameModalEl: HTMLDivElement | undefined = $state();
   let renameOverlayEl: HTMLDivElement | undefined = $state();
   let renameReturnFocusEl: HTMLElement | null = null;
+  let mirrorDialog: {
+    open: boolean;
+    id: string;
+    name: string;
+    value: string;
+    error: string | null;
+    busy: boolean;
+  } = $state({ open: false, id: '', name: '', value: '', error: null, busy: false });
+  let mirrorInputEl: HTMLTextAreaElement | undefined = $state();
+  let mirrorModalEl: HTMLDivElement | undefined = $state();
+  let mirrorOverlayEl: HTMLDivElement | undefined = $state();
+  let mirrorReturnFocusEl: HTMLElement | null = null;
+  let webSourcesOn = $derived($appSettings?.web_sources_enabled ?? true);
   let recoveringIds: Set<string> = $state(new Set());
   // L14: persist the Completed-section collapsed state so it survives
   // navigation. Falls back to expanded on first load or invalid storage.
@@ -605,6 +622,8 @@
   $effect(() => {
     try { localStorage.setItem(COMPLETED_COLLAPSED_KEY, completedCollapsed ? '1' : '0'); } catch { /* ignore */ }
   });
+  // Each section keeps its own sort either way.
+  let completedFirst = $derived($completedFirstPref);
 
   // --- Source detail panel (eMule-style) ---
   let expandedTransferId: string | null = $state(null);
@@ -978,6 +997,17 @@
   });
   let allDownloads = $derived(downloadPartition.all);
   let activeDownloads = $derived(downloadPartition.active);
+  /** `transfersLoaded` waits on the network task restoring the last session;
+   *  one that never answers must not leave the list loading for good. */
+  const RESTORE_WAIT_MS = 15_000;
+  let restoreWaitExpired = $state(false);
+  $effect(() => {
+    if ($transfersLoaded) return;
+    restoreWaitExpired = false;
+    const timer = setTimeout(() => (restoreWaitExpired = true), RESTORE_WAIT_MS);
+    return () => clearTimeout(timer);
+  });
+  let downloadsLoading = $derived(!$transfersLoaded && !restoreWaitExpired);
   /// The live download whose sources the Download Clients tab is showing.
   let expandedClientsParent = $derived(
     expandedTransferId ? (activeDownloads.find((d) => d.id === expandedTransferId) ?? null) : null,
@@ -1398,14 +1428,16 @@
   let knownCopiedHash = $state<string | null>(null);
   let knownCopyTimer: ReturnType<typeof setTimeout> | undefined;
   async function copyKnownHash(hash: string) {
-    if (await copyToClipboard(hash)) {
-      knownCopiedHash = hash;
-      if (knownCopyTimer !== undefined) clearTimeout(knownCopyTimer);
-      knownCopyTimer = setTimeout(() => {
-        knownCopiedHash = null;
-        knownCopyTimer = undefined;
-      }, 1400);
+    if (!(await copyToClipboard(hash))) {
+      transferError = m.search_copy_failed();
+      return;
     }
+    knownCopiedHash = hash;
+    if (knownCopyTimer !== undefined) clearTimeout(knownCopyTimer);
+    knownCopyTimer = setTimeout(() => {
+      knownCopiedHash = null;
+      knownCopyTimer = undefined;
+    }, 1400);
   }
 
   // Manual bans, keyed by lowercase user hash to the id the ban was stored
@@ -2144,7 +2176,7 @@
 
   // One reused collator instead of the implicit per-comparison one
   // `String.prototype.localeCompare` allocates. `sortedActiveDownloads`
-  // re-sorts on every `$transfers` update, so the name/category branches
+  // can re-sort on every `$transfers` update, so the name/category branches
   // below were paying for a collator per comparison at flush rate. Default
   // options, so ordering is unchanged. Mirrors the search page's
   // `sortCollator`.
@@ -2183,11 +2215,30 @@
     return compareFileNames(a.file_name, b.file_name) || a.id.localeCompare(b.id);
   }
 
+  /** What `compareDownloads` reads of a row for the current sort, or `null`
+   *  when that moves with progress, so the order is only reused while it
+   *  cannot have changed. Plain memos, not `$state`: they only spare work. */
+  function downloadOrderKey(field: DlSortField): ((t: Transfer) => string) | null {
+    const primary: ((t: Transfer) => string | number) | null =
+      field === 'file_name' ? () => ''
+      : field === 'total_size' ? (t) => t.total_size
+      : field === 'priority' ? (t) => t.priority
+      : field === 'status' ? (t) => t.status
+      : field === 'category' ? (t) => t.category || ''
+      : field === 'started_at' ? (t) => t.started_at
+      : null;
+    return primary && ((t) => `${primary(t)}\u0000${t.file_name}`);
+  }
+  const activeSortMemo = createSortMemo();
+  const completedSortMemo = createSortMemo();
+
   let sortedActiveDownloads = $derived.by(() => {
-    return [...activeDownloads].sort(compareDownloads);
+    const token = `${dlSortField}:${dlSortAsc}`;
+    return sortWithMemo(activeDownloads, compareDownloads, activeSortMemo, token, (t) => t.id, downloadOrderKey(dlSortField));
   });
   let sortedCompletedDownloads = $derived.by(() => {
-    return [...completedDownloads].sort(compareDownloads);
+    const token = `${dlSortField}:${dlSortAsc}`;
+    return sortWithMemo(completedDownloads, compareDownloads, completedSortMemo, token, (t) => t.id, downloadOrderKey(dlSortField));
   });
 
   // --- Categories ---
@@ -2275,6 +2326,90 @@
       || ulStatusLabel(t).toLowerCase().includes(query)
     );
   });
+
+  // Upload and known-peer rows each keep one Tab stop per table: the row last
+  // focused, else the first one drawn.
+  let ulFocusId = $state<string | null>(null);
+  let knownFocusHash = $state<string | null>(null);
+  let ulTabStopId = $derived(
+    ulFocusId && filteredActiveUploads.some((t) => t.id === ulFocusId)
+      ? ulFocusId
+      : (filteredActiveUploads[0]?.id ?? null),
+  );
+  let knownTabStopHash = $derived(
+    knownFocusHash && displayedKnownClients.some((kc) => kc.user_hash === knownFocusHash)
+      ? knownFocusHash
+      : (displayedKnownClients[0]?.user_hash ?? null),
+  );
+  let knownCtxMenuEl: HTMLDivElement | undefined = $state(undefined);
+  /** Where focus was when the Menu key opened the known-peer menu, handed
+   *  back when Escape closes it. */
+  let knownCtxReturnFocus: HTMLElement | null = null;
+
+  /** Arrow keys between the rows of the upload and known-peer tables, and the
+   *  Menu key or Shift+F10 for the focused row's menu: Ban, Unban and Add
+   *  Friend live only there. */
+  function onBottomRowKeydown(
+    e: KeyboardEvent & { currentTarget: HTMLElement },
+    index: number,
+    count: number,
+    focusRow: (index: number) => void,
+    openMenu: (e: MouseEvent) => void,
+  ) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    let next: number | null = null;
+    if (e.key === 'ArrowDown') next = Math.min(count - 1, index + 1);
+    else if (e.key === 'ArrowUp') next = Math.max(0, index - 1);
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = count - 1;
+    if (next !== null) {
+      e.preventDefault();
+      focusRow(next);
+      return;
+    }
+    if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      e.preventDefault();
+      swallowKeyboardContextMenu();
+      const rect = e.currentTarget.getBoundingClientRect();
+      openMenu(new MouseEvent('contextmenu', {
+        cancelable: true,
+        clientX: rect.left + Math.min(24, rect.width / 2),
+        clientY: rect.top + Math.min(16, rect.height / 2),
+      }));
+    }
+  }
+
+  function focusUploadRow(index: number) {
+    const t = filteredActiveUploads[index];
+    if (!t) return;
+    ulFocusId = t.id;
+    void tick().then(() => {
+      uploadTableEl?.querySelector<HTMLElement>(`tr[data-upload-id="${CSS.escape(t.id)}"]`)?.focus();
+    });
+  }
+
+  function openUploadMenuFromKey(e: MouseEvent, t: Transfer, row: HTMLElement) {
+    onCtx(e, t, 'upload');
+    ctxReturnFocus = row;
+    void tick().then(() => ctxMenuEl?.querySelector<HTMLElement>('.ctx-item:not([disabled])')?.focus());
+  }
+
+  function focusKnownRow(index: number) {
+    const kc = filteredKnownClients[index];
+    if (!kc) return;
+    knownFocusHash = kc.user_hash;
+    knownWindow.reveal(index, knownTableEl?.tHead?.getBoundingClientRect().height ?? 0);
+    void tick().then(() => {
+      knownTableEl?.querySelector<HTMLElement>(`tr[data-user-hash="${CSS.escape(kc.user_hash)}"]`)?.focus();
+    });
+  }
+
+  function openKnownMenuFromKey(e: MouseEvent, kc: KnownClient, row: HTMLElement) {
+    onKnownCtx(e, kc);
+    knownCtxReturnFocus = row;
+    void tick().then(() => knownCtxMenuEl?.querySelector<HTMLElement>('.ctx-item:not([disabled])')?.focus());
+  }
+
   // Removed `filteredCompletedUploads`, `filteredFailedUploads`,
   // `filteredQueuedUploads` derivations — they fed UI sections that no
   // longer exist (terminal upload rows are dropped from the store, and
@@ -2284,15 +2419,21 @@
   let visibleActiveDownloadIds = $derived.by(() => new Set(filteredActiveDownloads.map((t) => t.id)));
 
   // Every row the user can currently click or tick, in render order: the
-  // active rows followed by the completed/failed ones (which only exist on
-  // screen while that section is expanded). Selection, shift-ranges and
-  // arrow-key navigation all walk this list so finished rows can be picked
-  // in bulk and removed, instead of one right-click at a time.
-  let filteredSelectableDownloads = $derived.by(() =>
-    completedCollapsed
-      ? filteredActiveDownloads
-      : [...filteredActiveDownloads, ...filteredCompletedDownloads]
-  );
+  // active rows and the completed/failed ones (which only exist on screen
+  // while that section is expanded), in whichever order `completedFirst`
+  // draws them. Selection, shift-ranges and arrow-key navigation all walk
+  // this list so finished rows can be picked in bulk and removed, instead of
+  // one right-click at a time.
+  let filteredSelectableDownloads = $derived.by(() => {
+    if (completedCollapsed) return filteredActiveDownloads;
+    return completedFirst
+      ? [...filteredCompletedDownloads, ...filteredActiveDownloads]
+      : [...filteredActiveDownloads, ...filteredCompletedDownloads];
+  });
+  // Rows drawn above each section's first, so the stripes run on unbroken
+  // from one section into the next.
+  let dlActiveStripeOffset = $derived(completedFirst && !completedCollapsed ? filteredCompletedDownloads.length : 0);
+  let dlCompletedStripeOffset = $derived(completedFirst ? 0 : filteredActiveDownloads.length);
   let visibleSelectableDownloadIds = $derived.by(() => new Set(filteredSelectableDownloads.map((t) => t.id)));
 
   // --- Downloads table windowing ---
@@ -2400,6 +2541,7 @@
     void filteredActiveDownloads.length;
     void filteredCompletedDownloads.length;
     void completedCollapsed;
+    void completedFirst;
     void expandedTransferId;
     void expandedSources;
     void loadingSources;
@@ -2476,6 +2618,72 @@
     if (e.shiftKey) e.preventDefault();
     focusedDlId = t.id;
     lastClickedDlId = t.id;
+  }
+
+  /** Double-click or Enter on a row: a finished download opens its file, a
+   *  running one shows its sources. */
+  function activateDownloadRow(t: Transfer) {
+    if (t.status === 'completed') {
+      void openFile(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); });
+    } else if (!isFinished(t)) {
+      void toggleSourceDetail(t);
+    }
+  }
+
+  function onDownloadRowKeydown(e: KeyboardEvent, t: Transfer) {
+    if (e.key !== 'Enter' || e.target !== e.currentTarget || e.repeat) return;
+    e.preventDefault();
+    activateDownloadRow(t);
+  }
+
+  /** The one download row Tab stops on: the highlighted one when it is drawn,
+   *  else the first row drawn. */
+  let dlTabStopId = $derived.by(() => {
+    const drawn = completedFirst ? [...dlCompletedSlice, ...dlActiveSlice] : [...dlActiveSlice, ...dlCompletedSlice];
+    if (focusedDlId && drawn.some((t) => t.id === focusedDlId)) return focusedDlId;
+    return drawn[0]?.id ?? null;
+  });
+
+  /** Arrow keys move the highlight; the row's own focus follows so a screen
+   *  reader reads it, unless the keyboard is busy with a control elsewhere. */
+  function focusDownloadRowEl(id: string) {
+    const active = document.activeElement;
+    if (active && active !== document.body && !downloadsScrollEl?.contains(active)) return;
+    void tick().then(() => {
+      downloadsScrollEl
+        ?.querySelector<HTMLElement>(`tr[data-transfer-id="${CSS.escape(id)}"]`)
+        ?.focus({ preventScroll: true });
+    });
+  }
+
+  /** The row shown after `id` that is not leaving with `leaving`, else the
+   *  one before it: where the highlight goes when its row is removed. */
+  function survivingNeighbour(id: string, leaving: ReadonlySet<string>): string | null {
+    const list = filteredSelectableDownloads;
+    const idx = list.findIndex((t) => t.id === id);
+    if (idx < 0) return null;
+    for (let i = idx + 1; i < list.length; i++) if (!leaving.has(list[i].id)) return list[i].id;
+    for (let i = idx - 1; i >= 0; i--) if (!leaving.has(list[i].id)) return list[i].id;
+    return null;
+  }
+
+  /** A confirm dialog keeps the focus through its outro and then hands it back
+   *  to its opener, which a removed row no longer is; this runs before that. */
+  function focusDownloadRowAfterDialog(id: string | null, fallback: HTMLElement | null = null) {
+    requestAnimationFrame(() => {
+      const row = id
+        ? downloadsScrollEl?.querySelector<HTMLElement>(`tr[data-transfer-id="${CSS.escape(id)}"]`)
+        : null;
+      (row ?? fallback)?.focus({ preventScroll: true });
+    });
+  }
+
+  /** Cancel deletes a finished download's file, so on one it says so. */
+  function cancelLabel(rows: Transfer[]): string {
+    const completed = rows.filter((t) => t.status === 'completed').length;
+    if (completed === 0) return m.common_cancel();
+    if (rows.some((t) => !isFinished(t))) return m.transfers_cancel_and_delete();
+    return completed === 1 ? m.transfers_delete_file() : m.transfers_delete_files();
   }
 
   function toggleDlCheck(t: Transfer, shiftKey: boolean) {
@@ -2646,7 +2854,8 @@
         if (t.health === 'degraded' && t.health_reason) return m.transfers_dl_status_searching_delayed();
         if (t.sources > 0) {
           return plural(t.sources, {
-            one: m.transfers_dl_status_searching_with_sources_one,
+            one: () => m.transfers_dl_status_searching_with_sources_one({ count: t.sources }),
+            oneShowsCount: true,
             other: () => m.transfers_dl_status_searching_with_sources_other({ count: t.sources }),
           });
         }
@@ -2927,14 +3136,13 @@
     renameDialog.busy = true;
     renameDialog.error = null;
     try {
-      const name = await renameTransfer(id, value);
-      transfers.update((list) =>
-        list.map((t) => (t.id === id ? { ...t, file_name: name } : t)),
-      );
+      setLocalFileName(id, await renameTransfer(id, value));
       renameDialog = { open: false, id: '', value: '', error: null, busy: false };
     } catch (e: unknown) {
       renameDialog.busy = false;
       renameDialog.error = toErrorMsg(e);
+      // The field was disabled while saving, which dropped focus.
+      void tick().then(() => renameInputEl?.focus());
     }
   }
 
@@ -2959,6 +3167,72 @@
   $effect(() => {
     if (!renameDialog.open || !renameOverlayEl) return;
     return inertBackground(renameOverlayEl);
+  });
+
+  const MIRROR_DIALOG_CLOSED = { open: false, id: '', name: '', value: '', error: null, busy: false };
+
+  function openAddMirror(t: Transfer) {
+    const active = typeof document !== 'undefined' ? document.activeElement : null;
+    mirrorReturnFocusEl =
+      active instanceof HTMLElement && active !== document.body ? active : null;
+    mirrorDialog = { ...MIRROR_DIALOG_CLOSED, open: true, id: t.id, name: t.file_name };
+  }
+
+  function closeAddMirror() {
+    if (mirrorDialog.busy) return;
+    mirrorDialog = { ...MIRROR_DIALOG_CLOSED };
+  }
+
+  async function submitAddMirror() {
+    if (!mirrorDialog.open || mirrorDialog.busy) return;
+    const lines = mirrorDialog.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    if (lines.length === 0) return;
+    mirrorDialog.busy = true;
+    mirrorDialog.error = null;
+    try {
+      const result = await addTransferWebSources(mirrorDialog.id, lines);
+      mirrorDialog.busy = false;
+      // Anything refused stays in the dialog to be corrected; the rest of the
+      // outcome is reported either way, in one line (a second `showInfo`
+      // replaces the first), so a valid mirror the cap left out is never
+      // dropped without a word.
+      const outcome = [
+        result.added > 0 ? m.transfers_mirror_added({ count: result.added }) : '',
+        result.over_limit > 0
+          ? m.transfers_mirror_over_limit({ count: result.over_limit })
+          : result.added === 0 && result.already > 0
+            ? m.transfers_mirror_already()
+            : '',
+      ].filter(Boolean);
+      if (outcome.length > 0) showInfo(outcome.join(' · '));
+      if (result.refused.length > 0) {
+        mirrorDialog.value = result.refused.join('\n');
+        mirrorDialog.error = m.transfers_mirror_refused({ count: result.refused.length });
+        return;
+      }
+      mirrorDialog = { ...MIRROR_DIALOG_CLOSED };
+    } catch (e: unknown) {
+      mirrorDialog.busy = false;
+      mirrorDialog.error = toErrorMsg(e);
+    }
+  }
+
+  $effect(() => {
+    if (!mirrorDialog.open) return;
+    const raf = requestAnimationFrame(() => mirrorInputEl?.focus());
+    return () => {
+      cancelAnimationFrame(raf);
+      const el = mirrorReturnFocusEl;
+      mirrorReturnFocusEl = null;
+      if (el && typeof document !== 'undefined' && document.contains(el)) {
+        requestAnimationFrame(() => el.focus());
+      }
+    };
+  });
+
+  $effect(() => {
+    if (!mirrorDialog.open || !mirrorOverlayEl) return;
+    return inertBackground(mirrorOverlayEl);
   });
 
   const archiveExts = ['zip', 'cbz', 'jar', 'rar', 'cbr', 'ace'];
@@ -3100,6 +3374,7 @@
     closePaneCtx();
     closeUploadsPaneCtx();
     knownCtxMenu = { x: e.clientX, y: e.clientY, client };
+    knownCtxReturnFocus = null;
   }
   /// Background menu for the downloads pane, distinct from the per-row one.
   /// It acts on the whole visible list, and it is the only place two of these
@@ -3356,10 +3631,12 @@
     closePaneCtx();
     closeUploadsPaneCtx();
     // Match ctx/column menus: native <details> stays open on outside click.
+    // A click inside is left to it: on its <summary> the native toggle,
+    // which runs after this, would reopen one closed here.
     document
       .querySelectorAll<HTMLDetailsElement>('.toolbar-more[open]')
       .forEach((d) => {
-        d.open = false;
+        if (!target || !d.contains(target)) d.open = false;
       });
   }
 
@@ -3444,14 +3721,15 @@
         case 'open': await openFile(t.id); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'rename': openRename(t); return;
+        case 'add_mirror': openAddMirror(t); return;
         case 'priority': if (extra && PRIORITIES.includes(extra as Priority)) await setPriorityFor(targets, extra as Priority); break;
         case 'queue_front':
         case 'queue_back': {
           const front = action === 'queue_front';
           const moved = await moveTransfersInQueue(queueTargetsOf(targets, queued).map((x) => x.id), front);
           if (moved === 0) showInfo(m.transfers_queue_none_waiting());
-          else if (front) showInfo(plural(moved, { one: m.transfers_queue_moved_front_one, other: () => m.transfers_queue_moved_front_other({ count: moved }) }));
-          else showInfo(plural(moved, { one: m.transfers_queue_moved_back_one, other: () => m.transfers_queue_moved_back_other({ count: moved }) }));
+          else if (front) showInfo(plural(moved, { one: () => m.transfers_queue_moved_front_one({ count: moved }), oneShowsCount: true, other: () => m.transfers_queue_moved_front_other({ count: moved }) }));
+          else showInfo(plural(moved, { one: () => m.transfers_queue_moved_back_one({ count: moved }), oneShowsCount: true, other: () => m.transfers_queue_moved_back_other({ count: moved }) }));
           break;
         }
         case 'find_sources': {
@@ -3555,7 +3833,8 @@
     const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
-        one: () => m.transfers_paused_matching_one({ filter }),
+        one: () => m.transfers_paused_matching_one({ filter, count: ids.length }),
+        oneShowsCount: true,
         other: () => m.transfers_paused_matching_other({ count: ids.length, filter }),
       }));
     }
@@ -3567,7 +3846,8 @@
     const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
-        one: () => m.transfers_resumed_matching_one({ filter }),
+        one: () => m.transfers_resumed_matching_one({ filter, count: ids.length }),
+        oneShowsCount: true,
         other: () => m.transfers_resumed_matching_other({ count: ids.length, filter }),
       }));
     }
@@ -3620,7 +3900,8 @@
       }
       showInfo(
         plural(targets.length, {
-          one: m.transfers_copied_links_one,
+          one: () => m.transfers_copied_links_one({ count: targets.length }),
+          oneShowsCount: true,
           other: () => m.transfers_copied_links_other({ count: targets.length }),
         }),
       );
@@ -3652,16 +3933,16 @@
   // accepts a multi-line blob and returns only the first link: the later lines
   // survive as `|`-segments its tag loop skips, so pasting ten links used to
   // queue one and report success.
+  // Throws when nothing was queued, so the Add Links dialog can stay open with
+  // the reason beside the text.
   async function queuePastedLinks(text: string) {
     const trimmed = text.trim();
     if (trimmed.length > MAX_PASTE_LEN) {
-      transferError = m.transfers_clipboard_too_long({ length: trimmed.length, max: MAX_PASTE_LEN });
-      return;
+      throw new Error(m.transfers_clipboard_too_long({ length: trimmed.length, max: MAX_PASTE_LEN }));
     }
     const batch = await parseEd2kLinks(trimmed);
     if (batch.links.length === 0) {
-      transferError = m.transfers_clipboard_not_ed2k();
-      return;
+      throw new Error(m.transfers_clipboard_not_ed2k());
     }
 
     // A file pasted twice is one download; its copies count as already listed.
@@ -3703,22 +3984,26 @@
     // including the real error, whether or not it succeeded.
     const ignored = batch.invalid + batch.skipped + failed;
     if (links.length === 1 && batch.invalid === 0 && batch.skipped === 0) {
-      if (firstError !== undefined) {
-        transferError = toErrorMsg(firstError);
-        return;
-      }
+      if (firstError !== undefined) throw firstError;
       const only = links[0];
       showInfo(queued > 0
         ? m.transfers_queued_from_clipboard({ name: only.name })
         : m.transfers_already_in_list({ name: only.name }));
       return;
     }
-    showInfo(m.transfers_paste_summary({
+    const summary = m.transfers_paste_summary({
       total: queued + already + ignored,
       queued,
       already,
       ignored,
-    }));
+    });
+    if (failed === 0) {
+      showInfo(summary);
+      return;
+    }
+    const withError = m.transfers_paste_summary_with_error({ summary, error: toErrorMsg(firstError) });
+    if (queued === 0 && already === 0) throw new Error(withError);
+    transferError = withError;
   }
 
   /** The Add eD2K Links dialog: the header button opens it; Ctrl+V and the
@@ -3743,8 +4028,6 @@
     pasteLinkBusy = true;
     try {
       await queuePastedLinks(text);
-    } catch (e: unknown) {
-      transferError = toErrorMsg(e);
     } finally {
       pasteLinkBusy = false;
     }
@@ -3783,6 +4066,7 @@
    *  3 sources", "Server returned no sources") and as sources on the row. So a
    *  network that is down is reported here, once, and never waited on. */
   async function runFindSourcesWithStatus(t: Transfer): Promise<void> {
+    searchFoundIds.delete(t.id);
     searchStatus.set(t.id, m.transfers_src_asking());
     searchStatus = new Map(searchStatus);
     const ask = await findSources(t.id, t.file_hash, t.total_size);
@@ -3800,10 +4084,11 @@
    *  state finished last rather than the one asked for. */
   let selectedActionBusy = $state(false);
 
-  async function runSelectedAction(action: 'pause' | 'resume' | 'stop' | 'sources' | 'preview') {
+  async function runSelectedAction(action: 'pause' | 'resume' | 'stop' | 'sources' | 'preview' | 'open') {
     if (!selectedTransfer || selectedActionBusy) return;
     selectedActionBusy = true;
     try {
+      if (action === 'open' && selectedTransfer.status === 'completed') await openFile(selectedTransfer.id);
       if (action === 'pause' && canPause(selectedTransfer)) await pauseTransfer(selectedTransfer.id);
       if (action === 'resume' && canResume(selectedTransfer)) await resumeTransfer(selectedTransfer.id);
       if (action === 'stop' && canStop(selectedTransfer)) await stopTransfer(selectedTransfer.id);
@@ -3829,7 +4114,8 @@
   function summarizeBatchResult(label: string, total: number, failed: { id: string; name: string; error: string }[]) {
     if (failed.length === 0) {
       showInfo(plural(total, {
-        one: () => m.transfers_batch_done_one({ label }),
+        one: () => m.transfers_batch_done_one({ label, count: total }),
+        oneShowsCount: true,
         other: () => m.transfers_batch_done_other({ label, count: total }),
       }));
       return;
@@ -3908,6 +4194,7 @@
   function discardWithUndo(cancelIds: string[], removeIds: string[], clear = false) {
     const all = new Set([...cancelIds, ...removeIds]);
     if (all.size === 0) return;
+    const successor = focusedDlId && all.has(focusedDlId) ? survivingNeighbour(focusedDlId, all) : null;
     let snapshots: Transfer[] = [];
     transfers.update((list) => {
       snapshots = list.filter((x) => all.has(x.id));
@@ -3916,8 +4203,9 @@
     for (const id of all) holdDownloadRemoved(id);
     const wasChecked = checkedDownloadIds.filter((id) => all.has(id));
     checkedDownloadIds = checkedDownloadIds.filter((id) => !all.has(id));
-    if (focusedDlId && all.has(focusedDlId)) focusedDlId = null;
-    if (lastClickedDlId && all.has(lastClickedDlId)) lastClickedDlId = null;
+    if (focusedDlId && all.has(focusedDlId)) focusedDlId = successor;
+    if (lastClickedDlId && all.has(lastClickedDlId)) lastClickedDlId = successor;
+    if (successor) focusDownloadRowEl(successor);
 
     const byId = new Map(snapshots.map((s) => [s.id, s] as const));
     const toPause = cancelIds.filter((id) => {
@@ -4221,11 +4509,13 @@
     }
     return permanently
       ? plural(count, {
-          one: m.transfers_confirm_delete_finished_permanent_one,
+          one: () => m.transfers_confirm_delete_finished_permanent_one({ count: formatNumber(count) }),
+          // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
           other: () => m.transfers_confirm_delete_finished_permanent_other({ count: formatNumber(count) }),
         })
       : plural(count, {
-          one: m.transfers_confirm_delete_finished_bin_one,
+          one: () => m.transfers_confirm_delete_finished_bin_one({ count: formatNumber(count) }),
+          // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
           other: () => m.transfers_confirm_delete_finished_bin_other({ count: formatNumber(count) }),
         });
   }
@@ -4252,11 +4542,13 @@
         const permanently = $appSettings?.delete_permanently === true;
         showInfo(permanently
           ? plural(removed.size, {
-              one: m.transfers_deleted_finished_permanent_one,
+              one: () => m.transfers_deleted_finished_permanent_one({ count: formatNumber(removed.size) }),
+              oneShowsCount: true,
               other: () => m.transfers_deleted_finished_permanent_other({ count: formatNumber(removed.size) }),
             })
           : plural(removed.size, {
-              one: m.transfers_deleted_finished_bin_one,
+              one: () => m.transfers_deleted_finished_bin_one({ count: formatNumber(removed.size) }),
+              oneShowsCount: true,
               other: () => m.transfers_deleted_finished_bin_other({ count: formatNumber(removed.size) }),
             }));
       }
@@ -4312,7 +4604,8 @@
     const filter = narrowLabel;
     if (filter && ok) {
       showInfo(plural(ids.length, {
-        one: () => m.transfers_stopped_matching_one({ filter }),
+        one: () => m.transfers_stopped_matching_one({ filter, count: ids.length }),
+        oneShowsCount: true,
         other: () => m.transfers_stopped_matching_other({ count: ids.length, filter }),
       }));
     }
@@ -4340,7 +4633,8 @@
         other: () => m.transfers_confirm_batch_cancel_mixed_one_other({ removed }),
       }),
       other: () => plural(removed, {
-        one: () => m.transfers_confirm_batch_cancel_mixed_other_one({ count }),
+        one: () => m.transfers_confirm_batch_cancel_mixed_other_one({ count, removed }),
+        oneShowsCount: true,
         other: () => m.transfers_confirm_batch_cancel_mixed_other_other({ count, removed }),
       }),
     });
@@ -4350,13 +4644,15 @@
   function batchCancelMessage(count: number, filter: string): string {
     if (filter) {
       return plural(count, {
-        one: () => m.transfers_confirm_batch_cancel_filtered_one({ filter }),
+        one: () => m.transfers_confirm_batch_cancel_filtered_one({ filter, count }),
+        // Not `oneShowsCount`: the singular speaks of one download, so Russian 21, 31, … take `other`.
         few: () => m.transfers_confirm_batch_cancel_filtered_few({ count, filter }),
         other: () => m.transfers_confirm_batch_cancel_filtered_other({ count, filter }),
       });
     }
     return plural(count, {
-      one: m.transfers_confirm_batch_cancel_one,
+      one: () => m.transfers_confirm_batch_cancel_one({ count }),
+      oneShowsCount: true,
       few: () => m.transfers_confirm_batch_cancel_few({ count }),
       other: () => m.transfers_confirm_batch_cancel_other({ count }),
     });
@@ -4366,6 +4662,7 @@
   function peersNoun(count: number): string {
     return plural(count, {
       one: m.transfers_known_peers_one,
+      oneShowsCount: true,
       few: m.transfers_known_peers_few,
       other: m.transfers_known_peers_other,
     });
@@ -4434,6 +4731,72 @@
     // snapshot so a later widen doesn't undo the user's choice.
     preAutoCompactHidden = null;
     applyDownloadColumnPreset(showAdvancedDlCols);
+  }
+
+  /** The More menu is a `<details>`; this gives it a menu's keys. Up and Down
+   *  open it from its button and move between the items; Escape is the page
+   *  handler's. */
+  function onMoreKeydown(e: KeyboardEvent & { currentTarget: HTMLDetailsElement }) {
+    const more = e.currentTarget;
+    if (!more.open) {
+      if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+      more.open = true;
+    }
+    menuKeydown(e, more.querySelector<HTMLElement>('.toolbar-more-menu'));
+  }
+
+  /** The More menu is fixed, so a short pane's `overflow: hidden` cannot cut
+   *  it off: right-aligned under its button, or above it when that has more room. */
+  function placeMoreMenu(more: HTMLDetailsElement) {
+    const menu = more.querySelector<HTMLElement>('.toolbar-more-menu');
+    const button = more.querySelector('summary');
+    if (!more.open || !menu || !button) return;
+    menu.style.maxHeight = '';
+    menu.style.overflowY = '';
+    const rect = button.getBoundingClientRect();
+    const gap = 4;
+    const margin = 8;
+    const width = menu.offsetWidth;
+    const height = menu.offsetHeight;
+    const placement = resolveSubmenuPlacement(
+      { top: rect.bottom + gap, bottom: rect.top - gap, left: rect.left, right: rect.right },
+      { width, height },
+      { width: window.innerWidth, height: window.innerHeight },
+    );
+    const shown = placement.maxHeight ?? height;
+    if (placement.maxHeight !== null) {
+      menu.style.maxHeight = `${placement.maxHeight}px`;
+      menu.style.overflowY = 'auto';
+    }
+    menu.style.top = `${placement.flipUp ? rect.top - gap - shown : rect.bottom + gap}px`;
+    menu.style.left = `${Math.max(margin, Math.min(rect.right - width, window.innerWidth - width - margin))}px`;
+  }
+
+  let moreMenuReflow: (() => void) | null = null;
+  function onMoreToggle(e: Event & { currentTarget: HTMLDetailsElement }) {
+    const more = e.currentTarget;
+    if (moreMenuReflow) window.removeEventListener('resize', moreMenuReflow);
+    moreMenuReflow = null;
+    if (!more.open) return;
+    const reflow = () => placeMoreMenu(more);
+    moreMenuReflow = reflow;
+    reflow();
+    window.addEventListener('resize', reflow);
+  }
+
+  /** Tabbing out of the More menu closes it, as leaving a menu does. */
+  function onMoreFocusout(e: FocusEvent & { currentTarget: HTMLDetailsElement }) {
+    const more = e.currentTarget;
+    if (more.open && e.relatedTarget instanceof Node && !more.contains(e.relatedTarget)) more.open = false;
+  }
+
+  function runFromMore(e: MouseEvent & { currentTarget: HTMLElement }, run: () => void) {
+    const more = e.currentTarget.closest('details');
+    run();
+    if (more) {
+      more.open = false;
+      more.querySelector('summary')?.focus();
+    }
   }
 
   function ariaSortValue(currentField: string, field: string, asc: boolean): 'ascending' | 'descending' | 'none' {
@@ -5160,6 +5523,28 @@
     });
   });
 
+  // A "found" status outlives the sources it reported once they all drop
+  // away, and would otherwise block every later status for that row.
+  const lastSourceCounts = new Map<string, number>();
+  $effect(() => {
+    const counts = allDownloads.map((t) => [t.id, t.sources ?? 0] as const);
+    untrack(() => {
+      let mutated = false;
+      const seen = new Set<string>();
+      for (const [id, count] of counts) {
+        seen.add(id);
+        if (count === 0 && (lastSourceCounts.get(id) ?? 0) > 0 && searchFoundIds.delete(id)) {
+          mutated = searchStatus.delete(id) || mutated;
+        }
+        lastSourceCounts.set(id, count);
+      }
+      for (const id of lastSourceCounts.keys()) {
+        if (!seen.has(id)) lastSourceCounts.delete(id);
+      }
+      if (mutated) searchStatus = new Map(searchStatus);
+    });
+  });
+
   // Same idea for `reputationMap` / `reputationInFlight`. The known-
   // clients ledger is the only producer of hashes for these caches;
   // when a peer leaves the ledger (eviction in the credit manager,
@@ -5239,6 +5624,7 @@
     // fallback for when focus has somehow ended up outside it, and it comes
     // first because the dialog sits above everything else.
     if (renameDialog.open) { closeRename(); e.preventDefault(); e.stopPropagation(); }
+    else if (mirrorDialog.open) { closeAddMirror(); e.preventDefault(); e.stopPropagation(); }
     else if (fileDetailsId) { closeFileDetails(); e.preventDefault(); e.stopPropagation(); }
     else if (ctxMenu) {
       const returnTo = ctxReturnFocus;
@@ -5249,12 +5635,20 @@
     }
     else if (paneCtxMenu) { closePaneCtx(); e.preventDefault(); e.stopPropagation(); }
     else if (uploadsPaneCtxMenu) { closeUploadsPaneCtx(); e.preventDefault(); e.stopPropagation(); }
-    else if (knownCtxMenu) { closeKnownCtx(); e.preventDefault(); e.stopPropagation(); }
+    else if (knownCtxMenu) {
+      const returnTo = knownCtxReturnFocus;
+      closeKnownCtx();
+      returnTo?.focus({ preventScroll: true });
+      e.preventDefault();
+      e.stopPropagation();
+    }
     else if (columnMenu) { closeColumnMenu(); e.preventDefault(); e.stopPropagation(); }
     else {
       const openMore = document.querySelector('.toolbar-more[open]') as HTMLDetailsElement | null;
       if (openMore) {
+        const hadFocus = openMore.contains(document.activeElement);
         openMore.open = false;
+        if (hadFocus) openMore.querySelector('summary')?.focus();
         e.preventDefault();
         e.stopPropagation();
       } else if (e.target instanceof HTMLInputElement && e.target.classList.contains('filter-input') && transferFilter) {
@@ -5297,11 +5691,14 @@
     (target instanceof HTMLInputElement && !['checkbox', 'radio', 'button'].includes(target.type))
     || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable
   );
-  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open) return;
+  if (inEditable || ctxMenu || paneCtxMenu || knownCtxMenu || columnMenu || uploadsPaneCtxMenu || confirmCancel.open || confirmBan.open || confirmBatchCancel.open || confirmRecover.open || renameDialog.open || mirrorDialog.open) return;
   // A dialog owned elsewhere (the shortcut sheet, a settings modal) or the
   // chat dock has the keyboard; File Details is this page's own and keeps F2.
   if (target?.closest('.chat-dock')) return;
   if ([...document.querySelectorAll('[aria-modal="true"]')].some((el) => el !== fileDetailsOverlayEl)) return;
+  // An upload or known-peer row has the keyboard: the download keys below
+  // would act on a list the user is not in.
+  if (target?.closest('.uploads-pane tbody')) return;
   if (e.key === 'F2') {
     const t = fileDetailsId
       ? (fileDetailsTransfer && canRename(fileDetailsTransfer) ? fileDetailsTransfer : null)
@@ -5331,10 +5728,13 @@
     lastClickedDlId = checkedDownloadIds[0] ?? null;
     return;
   }
+  // A control that has focus keeps its own keys: Space and Delete there must
+  // not act on a download selection made elsewhere.
+  const onControl = !!target?.closest('button, a[href], summary, select, [role="button"], [role="menuitem"], [role="tab"]');
   // Space pauses the selection, or resumes it when nothing in it is running —
   // one key for the toggle, as in most download managers.
   if (e.key === ' ' && !e.ctrlKey && !e.metaKey && !e.altKey && selectedBatchTransfers.length > 0) {
-    if (target?.closest('button, a[href], summary, select, [role="button"], [role="menuitem"], [role="tab"]')) return;
+    if (onControl) return;
     // A checkbox reached with the keyboard keeps Space for ticking; one just
     // clicked does not, or Space would untick the row the user meant to
     // pause. Told apart by the last pointer press rather than
@@ -5363,6 +5763,7 @@
     focusedDlId = next.id;
     lastClickedDlId = next.id;
     revealDownloadRow(next.id);
+    focusDownloadRowEl(next.id);
   } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
     // The focused row's menu, beside the row, as Library and Search do.
     const focusRowId = target?.closest<HTMLElement>('tr[data-transfer-id]')?.dataset.transferId ?? null;
@@ -5400,12 +5801,12 @@
       await tick();
       ctxMenuEl?.querySelector<HTMLElement>('.ctx-item:not([disabled])')?.focus();
     });
-  } else if (e.key === 'Delete' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && selectedDownloadIds.length > 0) {
+  } else if (e.key === 'Delete' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey && !onControl && selectedDownloadIds.length > 0) {
     // Shift+Delete is Cancel, as a file manager's is the stronger Delete: it
     // also deletes the files of finished downloads, behind Cancel's prompt.
     e.preventDefault();
     openCancelConfirm(selectedBatchTransfers);
-  } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedDownloadIds.length > 0) {
+  } else if ((e.key === 'Delete' || e.key === 'Backspace') && !onControl && selectedDownloadIds.length > 0) {
     e.preventDefault();
     const cancelIds = selectedBatchTransfers.filter((t) => !isFinished(t)).map((t) => t.id);
     const removeIds = selectedBatchTransfers.filter((t) => isFinished(t)).map((t) => t.id);
@@ -5535,7 +5936,17 @@
       </button>
     </div>
     <div class="pane-toolbar">
-      <span class="pane-title">{m.transfers_downloading_count({ shown: filteredActiveDownloads.length, total: activeDownloads.length })}</span>
+      <span class="pane-title">
+        {#if filteredActiveDownloads.length !== activeDownloads.length}
+          {m.transfers_downloading_count({ shown: formatNumber(filteredActiveDownloads.length), total: formatNumber(activeDownloads.length) })}
+        {:else}
+          {plural(activeDownloads.length, {
+            one: () => m.transfers_categories_count_one({ count: formatNumber(activeDownloads.length) }),
+            oneShowsCount: true,
+            other: () => m.transfers_categories_count_other({ count: formatNumber(activeDownloads.length) }),
+          })}
+        {/if}
+      </span>
       <div class="toolbar-actions">
         <label
           class="finish-action"
@@ -5567,22 +5978,26 @@
           </select>
         </label>
         <span class="toolbar-sep"></span>
-        <button class="tb-btn tb-toggle" onclick={toggleAdvancedDlCols} title={m.transfers_toggle_cols_title()}>
-          {showAdvancedDlCols ? m.transfers_toggle_compact() : m.transfers_toggle_full()}
-        </button>
+        <div class="tb-segmented" role="group" aria-label={m.transfers_toggle_cols_title()} title={m.transfers_toggle_cols_title()}>
+          <button type="button" class="tb-btn" aria-pressed={!showAdvancedDlCols} onclick={() => { if (showAdvancedDlCols) toggleAdvancedDlCols(); }}>{m.transfers_toggle_compact()}</button>
+          <button type="button" class="tb-btn" aria-pressed={showAdvancedDlCols} onclick={() => { if (!showAdvancedDlCols) toggleAdvancedDlCols(); }}>{m.transfers_toggle_full()}</button>
+        </div>
         <span class="toolbar-sep"></span>
-        <details class="toolbar-more">
+        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+        <details class="toolbar-more" onkeydown={onMoreKeydown} onfocusout={onMoreFocusout} ontoggle={onMoreToggle}>
           <summary class="tb-btn" title={m.common_more()} aria-haspopup="menu">{m.common_more()}</summary>
           <div class="toolbar-more-menu" role="menu">
-            <button type="button" role="menuitem" onclick={(e) => { handlePauseAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_pause_all()}</button>
-            <button type="button" role="menuitem" onclick={(e) => { handleResumeAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_resume_all()}</button>
+            <button type="button" role="menuitem" onclick={(e) => runFromMore(e, () => void handlePauseAll())}>{m.transfers_pause_all()}</button>
+            <button type="button" role="menuitem" onclick={(e) => runFromMore(e, () => void handleResumeAll())}>{m.transfers_resume_all()}</button>
             {#if activeDownloads.length > 0}
-              <button type="button" role="menuitem" onclick={(e) => { handleStopAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_stop_all()}</button>
-              <button type="button" role="menuitem" class="menu-danger" onclick={(e) => { handleCancelAll(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_cancel_all()}</button>
+              <button type="button" role="menuitem" onclick={(e) => runFromMore(e, () => void handleStopAll())}>{m.transfers_stop_all()}</button>
+              <button type="button" role="menuitem" class="menu-danger" onclick={(e) => runFromMore(e, () => void handleCancelAll())}>{m.transfers_cancel_all()}</button>
             {/if}
             {#if clearCompletedTargets().length > 0}
-              <button type="button" role="menuitem" onclick={(e) => { clearCompletedWithUndo(); (e.currentTarget.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open'); }}>{m.transfers_clear_completed()}</button>
+              <button type="button" role="menuitem" onclick={(e) => runFromMore(e, clearCompletedWithUndo)}>{m.transfers_clear_completed()}</button>
             {/if}
+            <div class="toolbar-more-sep" role="separator"></div>
+            <button type="button" role="menuitemcheckbox" aria-checked={completedFirst} onclick={(e) => runFromMore(e, () => completedFirstPref.update((on) => !on))}>{m.transfers_completed_first()}</button>
           </div>
         </details>
       </div>
@@ -5648,18 +6063,23 @@
           </tr>
         </thead>
         <tbody>
+          {#snippet activeDownloadRows()}
           <tr class="vpad-row" aria-hidden="true" bind:this={dlActiveTopPadEl} style="height: {dlActiveWindow.topPad}px;"><td colspan={dlColCount}></td></tr>
           {#each dlActiveSlice as t, i (t.id)}
             <tr
               class="dl-row {t.status}"
-              class:row-alt={((dlActiveWindow.start + i) & 1) === 1}
+              class:row-alt={((dlActiveStripeOffset + dlActiveWindow.start + i) & 1) === 1}
               class:expanded={expandedTransferId === t.id}
-              class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
+              class:selected={checkedDlIdSet.has(t.id)}
+              class:focused={focusedDlId === t.id}
               class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
               data-transfer-id={t.id}
+              tabindex={dlTabStopId === t.id ? 0 : -1}
+              onfocus={(e) => { if (e.currentTarget.matches(':focus-visible')) { focusedDlId = t.id; lastClickedDlId = t.id; } }}
+              onkeydown={(e) => onDownloadRowKeydown(e, t)}
               onclick={(e) => onDownloadRowClick(e, t)}
               oncontextmenu={(e) => onCtx(e, t, 'active')}
-              ondblclick={() => toggleSourceDetail(t)}
+              ondblclick={() => activateDownloadRow(t)}
             >
               <td class="col-dl-check">
                 <input
@@ -5752,7 +6172,8 @@
                     <span class="source-indent">
                       {t.sources > 0
                         ? plural(t.sources, {
-                          one: m.transfers_connecting_sources_one,
+                          one: () => m.transfers_connecting_sources_one({ count: t.sources }),
+                          oneShowsCount: true,
                           other: () => m.transfers_connecting_sources_other({ count: t.sources }),
                         })
                         : m.transfers_no_source_details()}
@@ -5785,7 +6206,7 @@
                 {@const waitingSlotCount = expandedSources.filter(s => s.status === 'waiting_for_slot').length}
                 {@const partsBusyCount = expandedSources.filter(s => s.status === 'parts_busy').length}
                 {@const otherCount = expandedSources.filter(s => !SOURCE_CHIP_STATUSES.has(s.status)).length}
-                <tr class="source-child-row source-summary-row" in:fade={{ duration: 150 }}>
+                <tr class="source-child-row source-summary-row" in:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}>
                   <td class="source-child-cell" colspan={dlColCount}>
                     <span class="source-summary">
                       <strong>{expandedSources.length}</strong> {peersNoun(expandedSources.length)}
@@ -5803,7 +6224,7 @@
                   </td>
                 </tr>
                 {#each visibleSources as src (src.ip + ':' + src.port)}
-                  <tr class="source-child-row src-{src.status}" in:fade={{ duration: 150 }}>
+                  <tr class="source-child-row src-{src.status}" in:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}>
                     <td class="source-child-cell" colspan={dlColCount}>
                       <span class="source-fields">
                         <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src)}></span>
@@ -5834,7 +6255,7 @@
                 {#if failedCount > 0}
                   <tr class="source-child-row src-failed-summary">
                     <td class="source-child-cell" colspan={dlColCount}>
-                      <span class="source-indent source-failed-note">{plural(failedCount, { one: m.transfers_failed_sources_hidden_one, other: () => m.transfers_failed_sources_hidden_other({ count: failedCount }) })}</span>
+                      <span class="source-indent source-failed-note">{plural(failedCount, { one: () => m.transfers_failed_sources_hidden_one({ count: failedCount }), oneShowsCount: true, other: () => m.transfers_failed_sources_hidden_other({ count: failedCount }) })}</span>
                     </td>
                   </tr>
                 {/if}
@@ -5844,6 +6265,8 @@
           {#if dlActiveWindow.bottomPad > 0}
             <tr class="vpad-row" aria-hidden="true" style="height: {dlActiveWindow.bottomPad}px;"><td colspan={dlColCount}></td></tr>
           {/if}
+          {/snippet}
+          {#snippet completedDownloadRows()}
           {#if filteredCompletedDownloads.length > 0}
             <tr class="section-divider-row">
               <td colspan={dlColCount}>
@@ -5858,12 +6281,17 @@
             {#each dlCompletedSlice as t, i (t.id)}
               <tr
                 class="dl-row completed-row {t.status}"
-                class:row-alt={((filteredActiveDownloads.length + dlCompletedWindow.start + i) & 1) === 1}
-                class:selected={focusedDlId === t.id || checkedDlIdSet.has(t.id)}
+                class:row-alt={((dlCompletedStripeOffset + dlCompletedWindow.start + i) & 1) === 1}
+                class:selected={checkedDlIdSet.has(t.id)}
+                class:focused={focusedDlId === t.id}
                 class:ctx-target={ctxMenu?.transfer.id === t.id && focusedDlId !== t.id && !checkedDlIdSet.has(t.id)}
                 data-transfer-id={t.id}
+                tabindex={dlTabStopId === t.id ? 0 : -1}
+                onfocus={(e) => { if (e.currentTarget.matches(':focus-visible')) { focusedDlId = t.id; lastClickedDlId = t.id; } }}
+                onkeydown={(e) => onDownloadRowKeydown(e, t)}
                 onclick={(e) => onDownloadRowClick(e, t)}
                 oncontextmenu={(e) => onCtx(e, t, 'completed')}
+                ondblclick={() => activateDownloadRow(t)}
               >
                 <td class="col-dl-check">
                   <input
@@ -5930,7 +6358,30 @@
             {/if}
             {/if}
           {/if}
-          {#if allDownloads.length === 0}
+          {/snippet}
+          <!-- The running downloads are rendered by the same block in either
+               order, so switching it moves their rows rather than rebuilding
+               them. -->
+          {#if completedFirst}
+            {@render completedDownloadRows()}
+            {#if filteredCompletedDownloads.length > 0 && filteredActiveDownloads.length > 0}
+              <tr class="section-divider-row">
+                <td colspan={dlColCount}>{m.transfers_downloading_section({ count: filteredActiveDownloads.length })}</td>
+              </tr>
+            {/if}
+          {/if}
+          {@render activeDownloadRows()}
+          {#if !completedFirst}
+            {@render completedDownloadRows()}
+          {/if}
+          {#if allDownloads.length === 0 && downloadsLoading}
+            <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
+              <div class="empty-state compact">
+                <div class="spinner"></div>
+                <p class="empty-sub">{m.transfers_loading_short()}</p>
+              </div>
+            </td></tr>
+          {:else if allDownloads.length === 0}
             <tr class="empty-row"><td colspan={dlColCount} class="empty-cell">
               <div class="empty-state compact">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="44" height="44" aria-hidden="true">
@@ -5960,7 +6411,7 @@
     {#if checkedDownloadIds.length > 0}
       <div class="selection-footer">
         <div class="selection-meta">
-          <strong>{m.transfers_selected_count({ count: selectedDownloadCount })}</strong>
+          <strong>{m.transfers_selected_count({ count: formatNumber(selectedDownloadCount) })}</strong>
         </div>
         <div class="selection-actions">
           <button class="tb-btn" disabled={selectedPausableCount === 0} onclick={handleBatchPauseDownloads} title={m.transfers_batch_pause_title()}>{m.common_pause()}</button>
@@ -5986,14 +6437,14 @@
               <option value={prio}>{priorityLabel(prio)}</option>
             {/each}
           </select>
-          <button class="tb-btn tb-danger" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{m.common_cancel()}</button>
+          <button class="tb-btn tb-danger" disabled={selectedCancellableCount === 0} onclick={handleBatchCancelDownloads} title={m.transfers_batch_cancel_title()}>{cancelLabel(selectedBatchTransfers)}</button>
           <button class="tb-btn" disabled={copyingAllDownloadLinks || linkableSelectedCount === 0} onclick={() => void copyDownloadLinks(selectedBatchTransfers)} title={m.transfers_copy_selected_links_title()}>{m.transfers_copy_links_btn()}</button>
           {#if selectedFinishedCount > 0}
             <button class="tb-btn" onclick={handleBatchRemoveDownloads} title={m.transfers_batch_remove_title()}>
               {m.transfers_batch_remove({ count: selectedFinishedCount })}
             </button>
           {/if}
-          <button class="tb-btn" onclick={clearDlSelection} title={m.transfers_batch_clear_title()}>{m.common_clear()}</button>
+          <button class="tb-btn" onclick={clearDlSelection}>{m.transfers_ctx_clear_selection()}</button>
         </div>
       </div>
     {:else if selectedTransfer}
@@ -6009,7 +6460,7 @@
           -->
           <span>{formatSize(selectedTransfer.completed_size ?? selectedTransfer.transferred)} / {formatSize(selectedTransfer.total_size)}</span>
           <span>{dlStatusLabel(selectedTransfer)}</span>
-          <span>{selectedSourcesLabel}{#if selectedSourcesLabel !== '\u2014'} {plural(selectedSourcesTotal, { one: m.transfers_src_suffix_one, other: m.transfers_src_suffix_other })}{/if}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
+          <span>{selectedSourcesLabel}{#if selectedSourcesLabel !== '\u2014'} {plural(selectedSourcesTotal, { one: m.transfers_src_suffix_one, oneShowsCount: true, other: m.transfers_src_suffix_other })}{/if}{#if selectedTransfer.ember_sources > 0} {m.transfers_epx_count({ count: selectedTransfer.ember_sources })}{/if}</span>
         </div>
         <div class="selection-actions">
           <span class="tb-btn-wrap" title={!canPause(selectedTransfer) ? m.transfers_action_cannot_pause() : undefined}>
@@ -6031,9 +6482,37 @@
           {/if}
           {#if isFinished(selectedTransfer)}
             {@const finishedId = selectedTransfer.id}
+            {#if selectedTransfer.status === 'completed'}
+              <button class="tb-btn" disabled={selectedActionBusy} onclick={() => runSelectedAction('open')}>{m.transfers_ctx_open_file()}</button>
+            {/if}
             <button class="tb-btn" onclick={() => discardWithUndo([], [finishedId])} title={m.transfers_batch_remove_title()}>
               {m.transfers_ctx_remove_from_list()}
             </button>
+          {:else}
+            <select
+              class="tb-btn tb-select"
+              value=""
+              aria-label={m.transfers_ctx_priority()}
+              title={m.transfers_ctx_priority()}
+              onkeydown={holdClosedSelectKeys}
+              onchange={(e) => {
+                const value = e.currentTarget.value;
+                e.currentTarget.value = '';
+                void applyBulkPriority(value);
+              }}
+            >
+              <option value="" disabled>{m.transfers_ctx_priority()}</option>
+              {#each PRIORITIES as prio}
+                <option value={prio}>{priorityLabel(prio)}</option>
+              {/each}
+            </select>
+          {/if}
+          {#if selectedTransfer.status !== 'failed'}
+            <button
+              class="tb-btn tb-danger"
+              title={selectedTransfer.status === 'completed' ? m.transfers_cancel_finished_title() : undefined}
+              onclick={handleBatchCancelDownloads}
+            >{cancelLabel([selectedTransfer])}</button>
           {/if}
         </div>
       </div>
@@ -6104,7 +6583,7 @@
           aria-controls="bottom-pane-content"
           tabindex={bottomView === 'uploading' ? 0 : -1}
           onclick={() => bottomView = 'uploading'}
-        >{m.transfers_tab_uploading({ count: filteredActiveUploads.length })}</button>
+        >{m.transfers_tab_uploading({ count: formatNumber(filteredActiveUploads.length) })}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'queued'}
@@ -6114,7 +6593,7 @@
           tabindex={bottomView === 'queued' ? 0 : -1}
           onclick={() => bottomView = 'queued'}
           title={m.transfers_tab_queued_title()}
-        >{uploadQueueLoaded && !uploadQueueLoadFailed ? m.transfers_tab_queued_count({ count: uploadQueueClients.length }) : m.transfers_tab_queued()}</button>
+        >{uploadQueueLoaded && !uploadQueueLoadFailed ? m.transfers_tab_queued_count({ count: formatNumber(uploadQueueClients.length) }) : m.transfers_tab_queued()}</button>
         <button
           class="tab-btn"
           class:active={bottomView === 'known_clients'}
@@ -6145,6 +6624,7 @@
           onclick={() => bottomView = 'download_clients'}
         >{m.transfers_tab_download_clients()}</button>
       </div>
+      <button type="button" class="tb-btn tabs-refresh" onclick={refreshBottomPane}>{m.common_refresh()}</button>
     </div>
     <!-- `tabindex`: answering the pane's own right-click makes this element
          interactive as far as the a11y check is concerned, which then wants it
@@ -6167,6 +6647,13 @@
     >
       {#if bottomView === 'uploading'}
         <!-- UPLOADING VIEW -->
+        {#if transferFilter.trim()}
+          <!-- The downloads filter box narrows this list too. -->
+          <div class="known-toolbar" role="status">
+            <span class="known-stat">{m.transfers_uploads_filtered({ query: transferFilter.trim() })}</span>
+            <button type="button" class="tb-btn" onclick={() => (transferFilter = '')}>{m.transfers_known_clear_filter()}</button>
+          </div>
+        {/if}
         <table
           class="transfer-table ul-table"
           bind:this={uploadTableEl}
@@ -6215,8 +6702,15 @@
             </tr>
           </thead>
           <tbody>
-            {#each filteredActiveUploads as t (t.id)}
-              <tr class="ul-row" oncontextmenu={(e) => onCtx(e, t, 'upload')}>
+            {#each filteredActiveUploads as t, i (t.id)}
+              <tr
+                class="ul-row"
+                data-upload-id={t.id}
+                tabindex={ulTabStopId === t.id ? 0 : -1}
+                onfocus={() => (ulFocusId = t.id)}
+                onkeydown={(e) => onBottomRowKeydown(e, i, filteredActiveUploads.length, focusUploadRow, (ev) => openUploadMenuFromKey(ev, t, e.currentTarget))}
+                oncontextmenu={(e) => onCtx(e, t, 'upload')}
+              >
                 {#each visibleUploadColumns as column (column.key)}
                   {#if column.key === 'country'}
                     <td class="flag-cell" title={t.country_code ?? ''}>{#if countryFlagSrc(t.country_code)}<img src={countryFlagSrc(t.country_code)} alt={t.country_code ?? ''} class="flag-img" />{/if}</td>
@@ -6527,15 +7021,16 @@
                 </span>
               {:else}
                 <span class="known-stat">
-                  <strong>{knownStats.total}</strong>
+                  <strong>{formatNumber(knownStats.total)}</strong>
                   {peersNoun(knownStats.total)}
                 </span>
               {/if}
               {#if knownStats.friends > 0}
                 <span class="known-stat known-stat-friends" title={m.transfers_known_friends_title()}>
-                  <strong>{knownStats.friends}</strong>
+                  <strong>{formatNumber(knownStats.friends)}</strong>
                   {plural(knownStats.friends, {
                     one: m.transfers_known_friends_one,
+                    oneShowsCount: true,
                     few: m.transfers_known_friends_few,
                     other: m.transfers_known_friends_other,
                   })}
@@ -6549,7 +7044,7 @@
               </span>
               {#if knownFilter && filteredKnownClients.length !== knownStats.total}
                 <span class="known-stat known-stat-match" aria-live="polite">
-                  {m.transfers_known_showing_label()} <strong>{filteredKnownClients.length}</strong>
+                  {m.transfers_known_showing_label()} <strong>{formatNumber(filteredKnownClients.length)}</strong>
                 </span>
               {/if}
             </div>
@@ -6614,6 +7109,10 @@
                 class="client-row win-row"
                 class:row-alt={((knownWindow.start + i) & 1) === 1}
                 class:client-row-friend={isFriend}
+                data-user-hash={kc.user_hash}
+                tabindex={knownTabStopHash === kc.user_hash ? 0 : -1}
+                onfocus={() => (knownFocusHash = kc.user_hash)}
+                onkeydown={(e) => onBottomRowKeydown(e, knownWindow.start + i, filteredKnownClients.length, focusKnownRow, (ev) => openKnownMenuFromKey(ev, kc, e.currentTarget))}
                 oncontextmenu={(e) => onKnownCtx(e, kc)}
               >
                 {#each visibleKnownColumns as column (column.key)}
@@ -6874,7 +7373,8 @@
                   <p class="empty-title">
                     {parent.sources > 0
                       ? plural(parent.sources, {
-                        one: m.transfers_connecting_sources_one,
+                        one: () => m.transfers_connecting_sources_one({ count: parent.sources }),
+                        oneShowsCount: true,
                         other: () => m.transfers_connecting_sources_other({ count: parent.sources }),
                       })
                       : m.transfers_no_source_details()}
@@ -7065,7 +7565,7 @@
   >
     <div class="ctx-header" role="presentation">
       {#if ctxMulti}
-        {m.transfers_selected_count({ count: ctxTargets.length })}
+        {m.transfers_selected_count({ count: formatNumber(ctxTargets.length) })}
       {:else}
         <bdi dir="auto">{ctxTransfer.file_name}</bdi>
       {/if}
@@ -7133,7 +7633,7 @@
       {#if ctxTargets.some(isFinished)}
         <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
       {/if}
-      <button class="ctx-item ctx-danger" role="menuitem" disabled={!ctxTargets.some((x) => !isFinished(x) || x.status === 'completed')} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+      <button class="ctx-item ctx-danger" role="menuitem" disabled={!ctxTargets.some((x) => !isFinished(x) || x.status === 'completed')} onclick={() => ctxAction('cancel')}>{cancelLabel(ctxTargets)}</button>
     {:else if ctxMenu.section !== 'upload' && ctxMulti}
       {#if ctxTargets.some(canResume)}
         <button class="ctx-item" role="menuitem" title={m.transfers_ctx_resume_failed_title()} onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
@@ -7152,7 +7652,7 @@
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('remove')}>{m.transfers_batch_remove({ count: ctxTargets.filter(isFinished).length })}</button>
       {#if ctxTargets.some((x) => x.status === 'completed')}
-        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{cancelLabel(ctxTargets)}</button>
       {/if}
     {:else if ctxMenu.section === 'active'}
       {#if canPause(ctxTransfer)}
@@ -7224,6 +7724,13 @@
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.transfers_ctx_copy_link()}</button>
       <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => ctxAction('paste_link')}>{m.transfers_ctx_paste_link()}</button>
+      <button
+        class="ctx-item"
+        role="menuitem"
+        disabled={!webSourcesOn}
+        title={webSourcesOn ? undefined : m.transfers_mirror_off_title()}
+        onclick={() => ctxAction('add_mirror')}
+      >{m.transfers_ctx_add_mirror()}</button>
       <button class="ctx-item" role="menuitem" onclick={() => ctxAction('find_sources')}>{m.transfers_find_more_sources()}</button>
       <!-- Greyed out exactly where eMule greys it out — see `relatedSearchReady`. -->
       <button
@@ -7278,7 +7785,7 @@
       {#if ctxTransfer.status === 'completed'}
         <!-- Cancel on a finished download deletes its file, which Remove
              from List never does. -->
-        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.common_cancel()}</button>
+        <button class="ctx-item ctx-danger" role="menuitem" title={m.transfers_cancel_finished_title()} onclick={() => ctxAction('cancel')}>{m.transfers_delete_file()}</button>
       {/if}
     {:else}
       {@const uploadFriendHash = emberHashForUpload(ctxTransfer)}
@@ -7313,8 +7820,10 @@
     class="ctx-menu"
     role="menu"
     tabindex="-1"
+    bind:this={knownCtxMenuEl}
     use:ctxMenuPosition={{ x: knownCtxMenu.x, y: knownCtxMenu.y }}
     onclick={(e) => e.stopPropagation()}
+    onkeydown={(e) => menuKeydown(e, e.currentTarget)}
   >
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">
@@ -7360,9 +7869,11 @@
     const id = confirmCancel.id;
     // Re-read: a download can finish while the dialog is open, and the
     // backend still cancels a finished row, recording it in the download
-    // history as cancelled over its completed entry.
-    if ($transfers.some((x) => x.id === id && isFinished(x))) return;
-    discardWithUndo([id], []);
+    // history as cancelled over its completed entry. It leaves the list as
+    // a finished row in a batch cancel does.
+    if ($transfers.some((x) => x.id === id && isFinished(x))) discardWithUndo([], [id]);
+    else discardWithUndo([id], []);
+    focusDownloadRowAfterDialog(focusedDlId);
   }}
 />
 <ConfirmDialog
@@ -7442,9 +7953,10 @@
     // To the list, not the filter box: a text field there keeps Ctrl+Z for
     // its own undo, and the Undo toast that just appeared is what the
     // shortcut is for.
-    requestAnimationFrame(() => {
-      (selectAllDownloadsCheckbox ?? document.querySelector<HTMLInputElement>('.filter-input'))?.focus();
-    });
+    focusDownloadRowAfterDialog(
+      focusedDlId,
+      selectAllDownloadsCheckbox ?? document.querySelector<HTMLInputElement>('.filter-input'),
+    );
   }}
 />
 
@@ -7461,12 +7973,12 @@
     tabindex="-1"
     onclick={(e) => { if (e.target === e.currentTarget) closeFileDetails(); }}
     onkeydown={handleFileDetailsKeydown}
-    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 140 }}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
   >
     <div
       class="modal-content dl-details-modal"
       bind:this={fileDetailsModalEl}
-      transition:scale={{ start: 0.97, opacity: 0, duration: prefersReducedMotion.current ? 0 : 180 }}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
     >
       <div class="modal-header">
         <span id="dl-file-details-title" class="modal-title">{m.transfers_file_details_title()}</span>
@@ -7664,8 +8176,14 @@
       }
       trapTabKey(e, renameModalEl);
     }}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+    onoutrostart={inertDuringOutro}
   >
-    <div class="modal-content rename-modal" bind:this={renameModalEl}>
+    <div
+      class="modal-content rename-modal"
+      bind:this={renameModalEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="modal-header">
         <span id="dl-rename-title" class="modal-title">{m.transfers_rename_title()}</span>
         <button
@@ -7691,13 +8209,85 @@
           bind:value={renameDialog.value}
           disabled={renameDialog.busy}
           spellcheck="false"
+          aria-invalid={renameDialog.error ? 'true' : undefined}
+          aria-describedby={renameDialog.error ? 'dl-rename-error' : undefined}
         />
         {#if renameDialog.error}
-          <p class="dl-details-note error-msg">{renameDialog.error}</p>
+          <p id="dl-rename-error" class="dl-details-note error-msg" role="alert">{renameDialog.error}</p>
         {/if}
         <div class="modal-footer rename-actions">
           <button type="button" class="ghost" disabled={renameDialog.busy} onclick={closeRename}>{m.common_cancel()}</button>
-          <button type="submit" disabled={renameDialog.busy || !renameDialog.value.trim()}>{m.transfers_rename_save()}</button>
+          <button type="submit" disabled={renameDialog.busy || !renameDialog.value.trim()}>{renameDialog.busy ? m.transfers_renaming() : m.transfers_rename_save()}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+{/if}
+
+{#if mirrorDialog.open}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="modal-overlay rename-overlay"
+    bind:this={mirrorOverlayEl}
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="dl-mirror-title"
+    tabindex="-1"
+    onclick={(e) => { if (e.target === e.currentTarget) closeAddMirror(); }}
+    onkeydown={(e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        closeAddMirror();
+        return;
+      }
+      trapTabKey(e, mirrorModalEl);
+    }}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+    onoutrostart={inertDuringOutro}
+  >
+    <div
+      class="modal-content rename-modal"
+      bind:this={mirrorModalEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
+      <div class="modal-header">
+        <span id="dl-mirror-title" class="modal-title">{m.transfers_mirror_title()}</span>
+        <button
+          type="button"
+          class="icon-close"
+          title={m.common_close()}
+          aria-label={m.common_close()}
+          disabled={mirrorDialog.busy}
+          onclick={closeAddMirror}
+        >
+          <IconX size={15} />
+        </button>
+      </div>
+      <form
+        class="modal-body"
+        onsubmit={(e) => { e.preventDefault(); void submitAddMirror(); }}
+      >
+        <p class="dl-details-note mirror-file" title={mirrorDialog.name}>{mirrorDialog.name}</p>
+        <label class="rename-label" for="dl-mirror-input">{m.transfers_mirror_label()}</label>
+        <textarea
+          id="dl-mirror-input"
+          class="rename-input mirror-input"
+          rows="4"
+          placeholder="https://"
+          bind:this={mirrorInputEl}
+          bind:value={mirrorDialog.value}
+          disabled={mirrorDialog.busy}
+          spellcheck="false"
+          aria-describedby="dl-mirror-help"
+        ></textarea>
+        <p id="dl-mirror-help" class="dl-details-note">{m.transfers_mirror_help()}</p>
+        {#if mirrorDialog.error}
+          <p class="dl-details-note error-msg" role="alert">{mirrorDialog.error}</p>
+        {/if}
+        <div class="modal-footer rename-actions">
+          <button type="button" class="ghost" disabled={mirrorDialog.busy} onclick={closeAddMirror}>{m.common_cancel()}</button>
+          <button type="submit" disabled={mirrorDialog.busy || !mirrorDialog.value.trim()}>{m.transfers_mirror_add()}</button>
         </div>
       </form>
     </div>
@@ -7933,6 +8523,20 @@
     font: inherit;
   }
 
+  .mirror-input {
+    resize: vertical;
+    min-height: 4.5em;
+    font-family: var(--font-mono, monospace);
+    font-size: var(--font-size-sm);
+  }
+
+  .mirror-file {
+    margin: 0 0 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .rename-actions {
     margin-top: 14px;
     padding: 0;
@@ -8151,14 +8755,26 @@
     border-color: var(--accent);
     color: var(--accent);
   }
-  /* A view option rather than an action: dashed until pointed at. */
-  .tb-btn.tb-toggle {
-    color: var(--text-muted);
-    border-style: dashed;
+  /* A view option rather than an action: the column set in use is the pressed
+     half. */
+  .tb-segmented {
+    display: inline-flex;
   }
-  .tb-btn.tb-toggle:hover:not(:disabled) {
+  .tb-segmented .tb-btn {
+    color: var(--text-muted);
+  }
+  .tb-segmented .tb-btn:first-child {
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
+  }
+  .tb-segmented .tb-btn:last-child {
+    margin-left: -1px;
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  }
+  .tb-segmented .tb-btn[aria-pressed="true"] {
+    position: relative;
+    background: var(--bg-hover);
+    border-color: var(--accent);
     color: var(--text-primary);
-    border-style: solid;
   }
   .toolbar-more {
     position: relative;
@@ -8170,9 +8786,7 @@
     display: none;
   }
   .toolbar-more-menu {
-    position: absolute;
-    right: 0;
-    top: calc(100% + 4px);
+    position: fixed;
     z-index: 9999;
     min-width: 160px;
     padding: 4px;
@@ -8205,6 +8819,25 @@
   .toolbar-more-menu button.menu-danger:hover {
     background: color-mix(in srgb, var(--danger) 14%, transparent);
   }
+  .toolbar-more-sep {
+    height: 1px;
+    margin: 2px 4px;
+    background: var(--ctx-border);
+  }
+  /* A setting rather than a command: its tick, drawn as the context menus
+     draw theirs, from `aria-checked` so it cannot disagree with it. */
+  .toolbar-more-menu button[role="menuitemcheckbox"] {
+    position: relative;
+    padding-left: 26px;
+  }
+  .toolbar-more-menu button[aria-checked="true"]::before {
+    content: "\2713";
+    position: absolute;
+    left: 9px;
+    top: 50%;
+    transform: translateY(-50%);
+    font-size: var(--font-size-xs);
+  }
   /* Both panes window their tables behind spacer rows. Scroll anchoring would
      answer each spacer resize by nudging scrollTop, which moves the window
      again; a scrollbar drag turns that into a loop (see `.results-scroll` on
@@ -8235,6 +8868,10 @@
   }
   .bottom-tabs::-webkit-scrollbar {
     display: none;
+  }
+  .tabs-refresh {
+    flex-shrink: 0;
+    margin-bottom: 3px;
   }
   .tab-btn {
     position: relative;
@@ -8287,6 +8924,13 @@
     height: 2px;
     border-radius: 0 0 999px 999px;
     background: var(--accent);
+    animation: tab-bar-in var(--transition-normal) ease-out;
+  }
+  /* Grows from the middle as the tab becomes active, as the Ember page's tab
+     underline does. */
+  @keyframes tab-bar-in {
+    from { transform: scaleX(0); }
+    to { transform: scaleX(1); }
   }
   .tab-btn.active::after {
     content: '';
@@ -8490,6 +9134,25 @@
   .transfer-table tbody tr.dl-row.selected:hover {
     background: var(--table-row-selected);
   }
+  /* The highlighted row is outlined, not filled: once any box is ticked the
+     batch actions skip it, so it must not look ticked. */
+  .transfer-table tbody tr.dl-row:focus {
+    outline: none;
+  }
+  .transfer-table tbody tr.dl-row.focused {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+  }
+  .transfer-table tbody tr.dl-row.focused:focus-visible,
+  .transfer-table tbody tr.ul-row:focus-visible,
+  .transfer-table tbody tr.client-row:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .transfer-table tbody tr.ul-row:focus:not(:focus-visible),
+  .transfer-table tbody tr.client-row:focus:not(:focus-visible) {
+    outline: none;
+  }
   /* The row a context menu is open for, when it is not part of the selection:
      marked as the Library marks it, without selecting (and so checking) it. */
   .transfer-table tbody tr.dl-row.ctx-target,
@@ -8640,8 +9303,14 @@
     text-overflow: ellipsis;
   }
   .selection-meta strong {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     color: var(--text-primary);
     font-weight: 600;
+  }
+  .selection-meta span {
+    flex: none;
   }
   .selection-footer-idle {
     justify-content: center;

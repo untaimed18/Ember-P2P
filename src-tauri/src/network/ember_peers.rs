@@ -443,10 +443,20 @@ pub(super) fn harvest_ember_noise_keys(
 /// Addresses we currently hold an Ember DHT contact at, so a KAD `ember_npub`
 /// tag can be told apart from an unverified first sighting.
 pub(super) fn ember_established_addrs(state: &NetworkState) -> HashSet<(Ipv4Addr, u16)> {
-    state
-        .ember_dht
-        .contacts()
-        .into_iter()
+    ember_established_among(&state.ember_dht.contacts())
+}
+
+/// The addresses in `contacts` that have answered us.
+///
+/// A lead's address and key are whatever the peer that named it wrote, so
+/// counting one pinned that key against the real owner's KAD tag and passed
+/// the gossiped address off as a peer we had reached.
+pub(super) fn ember_established_among(
+    contacts: &[ember::dht::EmberContact],
+) -> HashSet<(Ipv4Addr, u16)> {
+    contacts
+        .iter()
+        .filter(|c| c.is_verified())
         .filter_map(|c| match c.addr.ip() {
             IpAddr::V4(v4) => Some((v4, c.addr.port())),
             IpAddr::V6(_) => None,
@@ -454,12 +464,18 @@ pub(super) fn ember_established_addrs(state: &NetworkState) -> HashSet<(Ipv4Addr
         .collect()
 }
 
-/// How many rendezvous-listed peers are already overlay contacts.
+/// How many rendezvous-listed peers are already overlay contacts that have
+/// answered us. A listed address someone gossiped back at us is not a
+/// conversion, and this count drives the retry backoff.
 pub(super) fn ember_rendezvous_converted_contacts(state: &NetworkState, peers: &[KadSource]) -> usize {
     let established = ember_established_addrs(state);
     let listed: Vec<(Ipv4Addr, u16)> = peers.iter().map(|s| (s.ip, s.udp_port)).collect();
-    let session: HashSet<(Ipv4Addr, u16)> =
-        state.ember_session_dht_contacts.keys().copied().collect();
+    let session: HashSet<(Ipv4Addr, u16)> = state
+        .ember_session_dht_contacts
+        .iter()
+        .filter(|(_, c)| c.is_verified())
+        .map(|(addr, _)| *addr)
+        .collect();
     ember_rendezvous_converted_among(&listed, &established, &session)
 }
 
@@ -1016,15 +1032,23 @@ pub(super) fn ember_announce_due(
 /// one that cost its sender a lookup token: an `ANNOUNCE_PEER`, a `PEER_LIST`
 /// from a peer we announced to within the last two maintenance cycles, or a
 /// `FOUND_NODE` answering a query outstanding to its sender. Only those have
-/// their leads probed; see `handle_ember_dht_message`.
+/// their leads probed, and only the replies among them have their leads
+/// merged into the table; see `handle_ember_dht_message`.
+///
+/// An `ANNOUNCE_PEER` qualifies only as often as its sender's network is
+/// granted one by [`ember::dht::gossip::GossipReputation::take_announce_probes`]:
+/// the lookup budget is sized for queries, and every announce it lets through
+/// would otherwise aim a batch of probes at addresses its sender chose.
 pub(super) fn ember_leads_were_asked_for(
-    state: &NetworkState,
+    state: &mut NetworkState,
     inbound: &ember::dht::engine::DhtInbound,
     from: SocketAddr,
     now: i64,
 ) -> bool {
     if inbound.announce_peer_received {
-        return true;
+        return state
+            .ember_gossip_reputation
+            .take_announce_probes(from.ip(), std::time::Instant::now());
     }
     let Some(sender) = inbound.sender_id else {
         return false;
@@ -1047,6 +1071,7 @@ pub(super) fn ember_leads_were_asked_for(
         return state
             .ember_dht_search_requests
             .get(rid)
+            .filter(|req| req.sent_to == from)
             .and_then(|req| {
                 state
                     .ember_search
@@ -1075,6 +1100,7 @@ pub(super) fn ember_reply_was_solicited(
         state
             .ember_dht_search_requests
             .get(&rid)
+            .filter(|req| req.sent_to == from)
             .and_then(|req| {
                 state
                     .ember_search
@@ -1227,8 +1253,9 @@ pub(super) fn remember_ember_lan_gossip(
     }
 }
 
-/// Whether this Ember UDP source already has a session, a table slot, or a
-/// recent dial — the "known peer" side of the shared KAD/Ember flood limiter.
+/// Whether this Ember UDP source already has a session, a table slot it has
+/// answered us from, or a recent dial — the "known peer" side of the shared
+/// KAD/Ember flood limiter.
 ///
 /// The limiter used to consult only the KAD routing table and KAD's outbound
 /// `recent_ips` map. Ember-only, KAD-off, and LAN session peers then sat on
@@ -1242,7 +1269,14 @@ pub(super) fn ember_udp_is_known_peer(state: &NetworkState, from: SocketAddr) ->
             return true;
         }
     }
-    state.ember_dht.routing().contact_at(from).is_some()
+    // A lead at `from` is only an address someone named, so it must not lift a
+    // stranger's datagrams off the flood budget. One we are dialling is
+    // covered by `recently_dialled` above.
+    state
+        .ember_dht
+        .routing()
+        .contact_at(from)
+        .is_some_and(|c| c.is_verified())
 }
 
 /// Fill a publish target set from firsthand session peers the public table
@@ -1285,6 +1319,36 @@ pub(super) fn ember_overlay_publish_targets(
 /// still gets a share — just not one that can crowd our own keys out.
 pub(super) const EMBER_FORWARDED_TARGET_QUEUE_MAX: usize = EMBER_PUBLISH_TARGET_QUEUE_MAX / 4;
 
+/// Publish targets for a record we fan out as a buddy, without queueing a
+/// lookup: the replica set our own records would get, less any storer whose
+/// share of forwards ([`super::ember_publish::EMBER_FORWARDED_RECORDS_PER_PEER_PER_MIN`])
+/// is spent this minute.
+///
+/// The lookup waits for [`ember_commit_forwarded_publish`], because the buddy
+/// can still refuse the forward after its targets are chosen, and a key queued
+/// for a refused one held a slot our own keys wait for.
+pub(super) fn ember_forwarded_publish_targets(
+    state: &mut NetworkState,
+    key: [u8; 16],
+) -> Vec<ember::dht::EmberContact> {
+    let mut targets = ember_overlay_publish_targets_within(state, key, 0);
+    let now = std::time::Instant::now();
+    let pacing = &mut state.ember_batch_publish;
+    targets.retain(|c| pacing.forwarded_allowance(c.node_id, now) > 0);
+    targets
+}
+
+/// Mark a committed forward's publish so each STORE it sends is charged to
+/// that storer's forwarding share, and queue the target lookup
+/// [`ember_forwarded_publish_targets`] held back. Charging the targets as
+/// chosen spent the share of every storer a send then failed to reach.
+pub(super) fn ember_commit_forwarded_publish(state: &mut NetworkState, key: [u8; 16], publish_id: u32) {
+    if let Some(op) = state.ember_publish.get_mut(publish_id) {
+        op.forwarded = true;
+    }
+    let _ = ember_overlay_publish_targets_within(state, key, EMBER_FORWARDED_TARGET_QUEUE_MAX);
+}
+
 /// [`ember_overlay_publish_targets`], queueing a lookup for `key` only while the
 /// queue holds fewer than `queue_limit` keys.
 ///
@@ -1323,13 +1387,44 @@ pub(super) fn ember_overlay_publish_targets_within(
 /// presence key changes every [`ember::channel::PRESENCE_EPOCH_SECS`], so its
 /// lookup would land after the only publish that could use it. Key epochs are
 /// one key per member, so a large room's republish would fill the queue, which
-/// drains a few keys a minute, and hold back every other key behind it.
+/// drains a few keys a minute, and hold back every other key behind it; they
+/// have a lookup schedule of their own instead ([`hold_key_record_in`]).
 pub(super) fn start_own_channel_publish(
     state: &mut NetworkState,
     record: ember::dht::publish::SignedRecord,
 ) -> Option<u32> {
+    start_own_channel_publish_queued(state, record, true)
+}
+
+/// [`start_own_channel_publish`] for the owner's renewal of key-epoch records,
+/// whose lookups wait behind those of records a member is waiting on.
+pub(super) fn start_own_channel_renewal(
+    state: &mut NetworkState,
+    record: ember::dht::publish::SignedRecord,
+) -> Option<u32> {
+    start_own_channel_publish_queued(state, record, false)
+}
+
+fn start_own_channel_publish_queued(
+    state: &mut NetworkState,
+    record: ember::dht::publish::SignedRecord,
+    urgent: bool,
+) -> Option<u32> {
+    let key = record.keyword_hash;
     let queue_limit = own_record_target_queue_limit(&record.data);
-    let targets = ember_overlay_publish_targets_within(state, record.keyword_hash, queue_limit);
+    let targets = ember_overlay_publish_targets_within(state, key, queue_limit);
+    let now = chrono::Utc::now().timestamp();
+    if ember::dht::publish::channel_kind_from_data(&record.data) == Some(ember::dht::publish::CHANNEL_KIND_EPOCH)
+        && key_record_needs_lookup_in(state.ember_dht.routing().verified_len(), &state.ember_publish_targets, key, now)
+    {
+        hold_key_record_in(
+            &mut state.ember_key_record_holds,
+            &mut state.ember_key_record_queue,
+            record.clone(),
+            urgent,
+            now,
+        );
+    }
     state.ember_publish.start_publish_to(record, targets)
 }
 
@@ -1979,7 +2074,7 @@ pub(super) async fn ingest_friend_ember_contacts(
     probe_bucket_oldest(socket, state, &pressure, chrono::Utc::now().timestamp()).await;
     // No introducer: see the note above. The probe budget and its one-second
     // window still apply, so this cannot outspend ordinary gossip.
-    probe_ember_gossip_leads(socket, state, &contacts, None).await;
+    probe_ember_gossip_leads(socket, state, &contacts, None::<GossipIntroducer>).await;
 }
 
 /// Whether `friend` already answers us as a DHT contact. An Ember hash is the
@@ -2055,7 +2150,7 @@ pub(super) async fn ask_friends_to_meet(state: &mut NetworkState) -> usize {
     let due = least_recently_asked_due(live, &state.ember_friend_meets_asked, now, EMBER_FRIEND_MEET_INTERVAL);
     let frame = ed2k::messages::build_ember_ext_frame(
         ed2k::messages::EMBER_EXT_DHT_MEET,
-        &ed2k::messages::encode_dht_meet(udp_port, false),
+        &ed2k::messages::encode_dht_meet(udp_port, false, state.ember_transport.local_noise_public_key()),
     );
     let mut asked = 0usize;
     for (eh, tx) in due {
@@ -2082,6 +2177,12 @@ pub(super) async fn ask_friends_to_meet(state: &mut NetworkState) -> usize {
 /// session is connected from and the port it claimed, and, unless this is the
 /// answer to our own ask, answer with ours so it `PING`s us back.
 ///
+/// The `PING` is IK to `noise_pub`, the key the friend sent, when it sent one.
+/// Both `PING`s of a meet then cross as IK dials, which the transport settles
+/// by key, and the one a NAT dropped first goes again once the other side has
+/// dialled (`MSG1_RESEND_AFTER`). An XX dial would refuse the friend's own
+/// handshake outright for as long as it waited.
+///
 /// An answer is only acted on inside [`EMBER_FRIEND_MEET_ANSWER_WINDOW`] of our
 /// ask, and a friend is `PING`ed for a meet at most once per window whichever
 /// frame asked for it, so no run of frames has us `PING` it on demand. When
@@ -2095,6 +2196,7 @@ pub(super) async fn answer_friend_meet(
     peer_ip: Ipv4Addr,
     udp_port: u16,
     answer: bool,
+    noise_pub: Option<[u8; 32]>,
     reply_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 ) {
     if crate::security::is_bogus_v4(peer_ip) {
@@ -2115,7 +2217,9 @@ pub(super) async fn answer_friend_meet(
         return;
     }
     state.ember_friend_meets_pinged.insert(friend, now);
-    let noise = lookup_ember_noise_key(&state.ember_noise_keys, peer_ip, udp_port);
+    // The friend's word for its own key, over the session that authenticates
+    // it, ahead of what we last saw at that address.
+    let noise = noise_pub.or_else(|| lookup_ember_noise_key(&state.ember_noise_keys, peer_ip, udp_port));
     let addr = SocketAddr::new(IpAddr::V4(peer_ip), udp_port);
     send_ember_dht_ping(socket, state, addr, noise.as_ref()).await;
     if answer {
@@ -2127,7 +2231,7 @@ pub(super) async fn answer_friend_meet(
     }
     let frame = ed2k::messages::build_ember_ext_frame(
         ed2k::messages::EMBER_EXT_DHT_MEET,
-        &ed2k::messages::encode_dht_meet(our_port, true),
+        &ed2k::messages::encode_dht_meet(our_port, true, state.ember_transport.local_noise_public_key()),
     );
     let _ = reply_tx.try_send(frame);
 }
@@ -2257,21 +2361,65 @@ pub(super) async fn send_ember_announce_peer(
     }
 }
 
+/// The peer whose frame carried a batch of gossip leads.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct GossipIntroducer {
+    pub(super) node_id: ember::dht::EmberNodeId,
+    /// Where the frame came from, which is what its reputation is charged to.
+    /// Without it the address we hold for `node_id` stands in.
+    pub(super) from: Option<SocketAddr>,
+}
+
+impl From<ember::dht::EmberNodeId> for GossipIntroducer {
+    fn from(node_id: ember::dht::EmberNodeId) -> Self {
+        Self { node_id, from: None }
+    }
+}
+
+impl From<(ember::dht::EmberNodeId, SocketAddr)> for GossipIntroducer {
+    fn from((node_id, from): (ember::dht::EmberNodeId, SocketAddr)) -> Self {
+        Self { node_id, from: Some(from) }
+    }
+}
+
+/// The address `introducer`'s probes are charged to: where its frame came
+/// from, or else where we hold it.
+fn gossip_introducer_ip(state: &NetworkState, introducer: &GossipIntroducer) -> Option<IpAddr> {
+    if let Some(from) = introducer.from {
+        return Some(from.ip());
+    }
+    state
+        .ember_dht
+        .contact_for(&introducer.node_id)
+        .or_else(|| {
+            state
+                .ember_session_dht_contacts
+                .values()
+                .find(|c| c.node_id == introducer.node_id)
+        })
+        .map(|c| c.addr.ip())
+}
+
 /// Ping unverified gossip as soon as we hear it, so a PEER_LIST of the
 /// friend's other contacts does not sit idle until the next 60s tick.
 ///
 /// `introducer` is the peer whose frame carried these leads: it is skipped if it
-/// named itself, and it is who the outcome of each probe is charged to. See
-/// [`ember::dht::gossip`].
+/// named itself, and the outcome of each probe is charged to the network its
+/// frame came from. See [`ember::dht::gossip`].
 pub(super) async fn probe_ember_gossip_leads(
     socket: &UdpSocket,
     state: &mut NetworkState,
     leads: &[ember::dht::EmberContact],
-    introducer: Option<ember::dht::EmberNodeId>,
+    introducer: Option<impl Into<GossipIntroducer>>,
 ) {
     if leads.is_empty() {
         return;
     }
+    let introducer: Option<GossipIntroducer> = introducer.map(Into::into);
+    let introducer_ip = introducer
+        .as_ref()
+        .and_then(|intro| gossip_introducer_ip(state, intro));
+    let introducer = introducer.map(|intro| intro.node_id);
     let local_id = state.ember_dht.local_id();
     let starved = ember_dht_starved(state);
     let budget = if starved {
@@ -2342,8 +2490,8 @@ pub(super) async fn probe_ember_gossip_leads(
         // overlay. Asked last, so a lead skipped for any of the reasons above
         // does not read as an introducer being rationed.
         if !starved {
-            if let Some(intro) = introducer {
-                if !state.ember_gossip_reputation.should_probe(&intro) {
+            if let Some(intro) = introducer_ip {
+                if !state.ember_gossip_reputation.should_probe(intro) {
                     state.ember_diagnostics.ember_dht_gossip_leads_rationed = state
                         .ember_diagnostics
                         .ember_dht_gossip_leads_rationed
@@ -2423,7 +2571,7 @@ pub(super) async fn probe_ember_gossip_leads(
             // Attribution starts here rather than at the naming, so an
             // introducer is never charged for a lead our own budget never
             // reached.
-            if let Some(intro) = introducer {
+            if let Some(intro) = introducer_ip {
                 state.ember_gossip_reputation.note_probe(
                     intro,
                     contact.node_id,
@@ -2440,9 +2588,54 @@ pub(super) async fn probe_ember_gossip_leads(
             // Gated on `!starved` because that is the only branch that calls
             // `should_probe` at all — refunding a sample never spent would let
             // the counter grant one early.
-            if let Some(intro) = introducer {
-                state.ember_gossip_reputation.refund_probe(&intro);
+            if let Some(intro) = introducer_ip {
+                state.ember_gossip_reputation.refund_probe(intro);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer_at(seed: u8, addr: SocketAddr, last_seen: i64) -> ember::dht::EmberContact {
+        ember::dht::EmberContact {
+            node_id: ember::dht::EmberNodeId([seed; 16]),
+            addr,
+            noise_pub: [seed; 32],
+            ed25519_pub: [seed; 32],
+            last_seen,
+            failed_queries: 0,
+        }
+    }
+
+    /// A lead's address and key are only what someone wrote beside a node id,
+    /// so it must not count as an address we hold a contact at: that pinned
+    /// the gossiped key against the owner's KAD tag.
+    #[test]
+    fn only_contacts_that_answered_are_established() {
+        let reached = SocketAddr::from(([80, 1, 1, 1], 4672));
+        let named = SocketAddr::from(([80, 1, 1, 2], 4672));
+        let established = ember_established_among(&[
+            peer_at(1, reached, 1_700_000_000),
+            peer_at(2, named, 0),
+        ]);
+        assert_eq!(
+            established,
+            HashSet::from([(Ipv4Addr::new(80, 1, 1, 1), 4672)])
+        );
+    }
+
+    /// The frame's own source is what reputation is charged to whenever the
+    /// caller has it.
+    #[test]
+    fn an_introducer_carries_its_frames_source_when_given_one() {
+        let id = ember::dht::EmberNodeId([7; 16]);
+        let from = SocketAddr::from(([198, 51, 100, 7], 4672));
+        let with: GossipIntroducer = (id, from).into();
+        assert_eq!((with.node_id, with.from), (id, Some(from)));
+        let without: GossipIntroducer = id.into();
+        assert_eq!((without.node_id, without.from), (id, None));
     }
 }

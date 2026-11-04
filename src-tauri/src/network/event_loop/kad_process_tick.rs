@@ -10,6 +10,7 @@ pub(in crate::network) async fn on_kad_process_tick(
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
     app_handle: &tauri::AppHandle,
+    credit_manager: &Arc<RwLock<CreditManager>>,
     xfer_finish_rx: &mut mpsc::UnboundedReceiver<XferFinishResult>,
 ) {
     // Transfers whose hash finished on the blocking pool. Drained
@@ -22,7 +23,13 @@ pub(in crate::network) async fn on_kad_process_tick(
     // that peer to time the transfer out as failed after it had
     // already succeeded.
     while let Ok(finished) = xfer_finish_rx.try_recv() {
-        apply_xfer_finish(udp_socket, state, db, app_handle, finished).await;
+        apply_xfer_finish(udp_socket, state, db, app_handle, credit_manager, finished).await;
+    }
+    if !state.xfer_block_uploads.is_empty() {
+        let mut credits = credit_manager.write().await;
+        for (member, bytes) in state.xfer_block_uploads.drain(..) {
+            credits.add_uploaded_over_ember(&member, bytes);
+        }
     }
     // Accepts whose part file is ready. Ahead of the same gates, since the
     // user's click is waiting on the answer.

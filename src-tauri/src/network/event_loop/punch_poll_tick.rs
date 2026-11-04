@@ -3,9 +3,14 @@
 
 use super::*;
 
-/// Idle cadence for the same poll, preserving the old behaviour when no
-/// transfer punch is pending so an idle client does not poll every 3 s.
-const PUNCH_POLL_IDLE_SECS: u64 = 60;
+/// Idle cadence for the same poll, when no transfer punch is pending, so an
+/// idle client does not poll every 3 s.
+///
+/// Under the server's `PUNCH_TTL` (30 s): a friend's chat or browse punch
+/// toward us registers one entry and waits, and at 60 s most of those expired
+/// before we ever looked, leaving the pair on the relay. Three polls a minute
+/// is still a small share of the 60-a-minute general budget it is charged to.
+const PUNCH_POLL_IDLE_SECS: u64 = 20;
 
 /// Budget for the responder's own dial toward the initiator.
 ///
@@ -235,12 +240,38 @@ pub(in crate::network) async fn on_punch_poll_tick(
                 return;
             }
         };
+        // A friend connect waiting on this friend's reply, or a room punch on
+        // this neighbour, owns the entry: taking it here as a fresh request
+        // answered a reply with another punch and left the waiting side on its
+        // relay, and acknowledging a room entry deleted it unseen.
+        if ember::relay::punch_sender_awaited(&info.from_id) {
+            return;
+        }
         let Some(_claim) = gate.claim(&info.punch_id) else {
             tracing::trace!("Punch responder: {} already being handled", info.punch_id);
             return;
         };
         let Some(friend_hash) = known_punch_friends.get(&info.from_id).copied() else {
-            ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
+            // A follower of a feed of ours who found no source for its list.
+            let our_pubkey = ed25519_dalek::SigningKey::from_bytes(&punch_secret)
+                .verifying_key()
+                .to_bytes();
+            if crate::network::feed_reach::own_feed_for_capability(&our_pubkey, info.epoch, &info.capability)
+                .is_some()
+            {
+                let responder = crate::network::feed_reach::PunchResponder {
+                    rendezvous_url: rv_url.clone(),
+                    endpoint: endpoint.clone(),
+                    our_hash: our_punch_hash,
+                    our_secret: punch_secret,
+                    quic_port: advertised_quic_port,
+                    nat_type: our_nat_type.as_u8(),
+                    external_ip: our_ext_addr.map(|addr| addr.ip()),
+                };
+                crate::network::feed_reach::answer_feed_punch(responder, info).await;
+            } else {
+                ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
+            }
             return;
         };
         let expected_capability = match rendezvous::fetch_identity_pubkey_authenticated(
@@ -287,43 +318,55 @@ pub(in crate::network) async fn on_punch_poll_tick(
             ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
             return;
         }
-        // Ack means "taken", not "succeeded": the entry leaves the mailbox now
-        // instead of being re-leased to us every 5 s while we dial. A dial that
-        // then fails is not retried from here either way — the initiator's own
-        // connect into our accept loop is the other half of the punch.
-        ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
         let initiator_addr = SocketAddr::new(ip, info.port);
         tracing::info!(
             "Punch responder: reciprocating for initiator {} at {initiator_addr}",
             &info.from_id[..8.min(info.from_id.len())]
         );
 
-        // Reciprocate so the initiator's own `poll_punch`
-        // (keyed on its own id) finds us and learns our
-        // real external address to dial. The registered
-        // port is our QUIC port, not `our_addr.port()`
-        // (the KAD UDP NAT mapping) — the initiator
-        // dials this port over QUIC, not UDP/KAD.
-        if let Some(ext_addr) = our_ext_addr {
-            if let Err(e) = ember::relay::register_punch_with_ip(
-                &rv_url,
-                &our_punch_hash,
-                &friend_hash,
-                advertised_quic_port,
-                our_nat_type.as_u8(),
-                ext_addr.ip(),
-                &punch_secret,
-                &our_punch_hash,
-            )
-            .await
-            {
-                tracing::debug!("Punch responder: reciprocal register failed: {e}");
+        // Run beside the dial below rather than ahead of it: the initiator is
+        // dialling us already, and two round-trips to the server before our
+        // own packets opened the mapping used up its punch window. Its own
+        // task, so a punched stream is not held back for them either.
+        let reciprocate = {
+            let rv_url = rv_url.clone();
+            let info = info.clone();
+            async move {
+                // Ack means "taken", not "succeeded": the entry leaves the
+                // mailbox now instead of being re-leased to us every 5 s while
+                // we dial. A dial that then fails is not retried from here
+                // either way — the initiator's own connect into our accept loop
+                // is the other half of the punch.
+                ack_taken(&rv_url, &our_punch_hash, &info, &punch_secret).await;
+                // Reciprocate so the initiator's own `poll_punch`
+                // (keyed on its own id) finds us and learns our
+                // real external address to dial. The registered
+                // port is our QUIC port, not `our_addr.port()`
+                // (the KAD UDP NAT mapping) — the initiator
+                // dials this port over QUIC, not UDP/KAD.
+                if let Some(ext_addr) = our_ext_addr {
+                    if let Err(e) = ember::relay::register_punch_with_ip(
+                        &rv_url,
+                        &our_punch_hash,
+                        &friend_hash,
+                        advertised_quic_port,
+                        our_nat_type.as_u8(),
+                        ext_addr.ip(),
+                        &punch_secret,
+                        &our_punch_hash,
+                    )
+                    .await
+                    {
+                        tracing::debug!("Punch responder: reciprocal register failed: {e}");
+                    }
+                } else {
+                    tracing::debug!(
+                        "Punch responder: no external address known yet, skipping reciprocal register"
+                    );
+                }
             }
-        } else {
-            tracing::debug!(
-                "Punch responder: no external address known yet, skipping reciprocal register"
-            );
-        }
+        };
+        tokio::spawn(reciprocate);
 
         // Also dial out ourselves. If this succeeds, treat
         // it as a normal inbound connection — we remain the
@@ -381,6 +424,7 @@ pub(in crate::network) async fn on_punch_poll_tick(
                     writer: Box::new(send),
                     serve_friend_ember_hash: serve_friend,
                     relayed: false,
+                    friend_relay: false,
                 };
                 if let Err(e) = punch_cb_tx.try_send(req) {
                     tracing::debug!("Punch responder: dropping punched stream: {e}");

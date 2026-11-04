@@ -31,7 +31,6 @@ pub(in crate::network) async fn on_cleanup_tick(
     channel_sweep_cutoff: i64,
     credit_flush_handle: &mut Option<tokio::task::JoinHandle<()>>,
     credit_save_ownership: &Arc<tokio::sync::Mutex<()>>,
-    db_progress_last_persist: &mut HashMap<String, std::time::Instant>,
     last_chat_expiry_sweep: &mut Option<std::time::Instant>,
     nat_probe_in_flight: &mut bool,
     nat_probe_packet_tx: &mut Option<mpsc::Sender<(Vec<u8>, SocketAddr)>>,
@@ -65,13 +64,6 @@ pub(in crate::network) async fn on_cleanup_tick(
     if ember_expired > 0 {
         debug!("Ember DHT: expired {ember_expired} stored records");
     }
-
-    // Prune the DB-progress throttle map so cancelled/removed
-    // downloads (whose handles are gone) don't leave dead entries
-    // accumulating for the lifetime of the session. Completed and
-    // failed transfers are already pruned in handle_download_event;
-    // this catches the cancel/pause paths that bypass it.
-    db_progress_last_persist.retain(|tid, _| state.download_handles.contains_key(tid));
 
     // Drop expired inbound-callback expectations. UI placeholders
     // are managed separately by `source_retry_timer`.
@@ -111,6 +103,9 @@ pub(in crate::network) async fn on_cleanup_tick(
         let now = std::time::Instant::now();
         state.channel_neighbor_lookup_at.retain(|_, at| {
             now.saturating_duration_since(*at) < CHANNEL_NEIGHBOR_LOOKUP_INTERVAL
+        });
+        state.channel_neighbor_pinged_at.retain(|_, at| {
+            now.saturating_duration_since(*at) < CHANNEL_NEIGHBOR_PINGED_MEMORY
         });
     }
 
@@ -295,10 +290,7 @@ pub(in crate::network) async fn on_cleanup_tick(
                 state.user_hash,
                 ember_hash,
                 settings.nickname.clone(),
-                state
-                    .external_ip
-                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                    .unwrap_or(0),
+                crate::network::ed2k::messages::hello_client_id(),
                 advertised_tcp_port(state),
                 advertised_udp_port(state),
                 settings.friend_session_encryption,
@@ -345,10 +337,7 @@ pub(in crate::network) async fn on_cleanup_tick(
                 state.user_hash,
                 ember_hash,
                 settings.nickname.clone(),
-                state
-                    .external_ip
-                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                    .unwrap_or(0),
+                crate::network::ed2k::messages::hello_client_id(),
                 advertised_tcp_port(state),
                 advertised_udp_port(state),
                 settings.friend_session_encryption,

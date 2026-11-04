@@ -39,6 +39,7 @@ use super::ember::attach::{
     self, AttachCancel, AttachOffer, AttachReply, AttachStreamStatus, ATTACH_GRANT_TTL_SECS,
     ATTACH_OFFER_TTL_SECS,
 };
+use super::ed2k::credits::CreditManager;
 use super::ed2k::secure_stream::SecureStreamParts;
 use super::ember::attach_stream::{self, FetchError, HeldSource, SourceStamp};
 use super::ember::attach_tcp;
@@ -1559,11 +1560,13 @@ impl ServeProgress {
 
 /// A friend offered us a file. Record it, and fetch it now if it is under the
 /// user's ceiling.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn on_offer(
     state: &mut NetworkState,
     db: &Arc<Database>,
     app: &tauri::AppHandle,
     settings: &AppSettings,
+    credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     friend: [u8; 16],
     offer: AttachOffer,
     peer_addr: Option<SocketAddr>,
@@ -1591,7 +1594,7 @@ pub(super) async fn on_offer(
         return;
     }
     if let Some(row) = db.chat_attachment(&xfer_hex) {
-        on_reoffer(state, db, app, settings, friend, offer, peer_addr, row).await;
+        on_reoffer(state, db, app, settings, credits, friend, offer, peer_addr, row).await;
         return;
     }
     // Ahead of the unreachable branch below, which also leaves a row and an
@@ -1685,7 +1688,7 @@ pub(super) async fn on_offer(
     // Announced only once it is known to be waiting on the user: the UI treats
     // `awaiting` as "offered you a file", which is wrong for one fetched
     // without asking.
-    if risky || !try_auto_accept(state, db, app, settings, friend, xfer_id, size, now).await {
+    if risky || !try_auto_accept(state, db, app, settings, credits, friend, xfer_id, size, now).await {
         hold_for_user(state, xfer_id).await;
         emit_by_id(app, db, &xfer_hex);
     }
@@ -1771,6 +1774,7 @@ async fn on_reoffer(
     db: &Arc<Database>,
     app: &tauri::AppHandle,
     settings: &AppSettings,
+    credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     friend: [u8; 16],
     offer: AttachOffer,
     peer_addr: Option<SocketAddr>,
@@ -1836,11 +1840,11 @@ async fn on_reoffer(
         save_inbound(db, &xfer_id, inbound);
     }
     if asked {
-        match accept_offer(state, db, app, settings, xfer_id).await {
+        match accept_offer(state, db, app, settings, credits, xfer_id).await {
             Ok(()) => return,
             Err(e) => info!("Chat attachment: {xfer_hex} waits for the user: {e}"),
         }
-    } else if !risky && try_auto_accept(state, db, app, settings, friend, xfer_id, size, now).await {
+    } else if !risky && try_auto_accept(state, db, app, settings, credits, friend, xfer_id, size, now).await {
         return;
     }
     hold_for_user(state, xfer_id).await;
@@ -1856,6 +1860,7 @@ async fn try_auto_accept(
     db: &Arc<Database>,
     app: &tauri::AppHandle,
     settings: &AppSettings,
+    credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     friend: [u8; 16],
     xfer_id: [u8; 16],
     size: u64,
@@ -1876,7 +1881,7 @@ async fn try_auto_accept(
         debug!("Chat attachment: {xfer_hex} waits for the user; this friend's auto-accept budget is spent");
         return false;
     }
-    match accept_offer(state, db, app, settings, xfer_id).await {
+    match accept_offer(state, db, app, settings, credits, xfer_id).await {
         Ok(()) => {
             state
                 .attach_auto_log
@@ -1979,6 +1984,7 @@ pub(super) async fn respond(
     db: &Arc<Database>,
     app: &tauri::AppHandle,
     settings: &AppSettings,
+    credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     xfer_id: [u8; 16],
     accept: bool,
 ) -> Result<(), String> {
@@ -1992,7 +1998,7 @@ pub(super) async fn respond(
         return Err(why);
     }
     if accept {
-        return accept_offer(state, db, app, settings, xfer_id).await;
+        return accept_offer(state, db, app, settings, credits, xfer_id).await;
     }
     let Some(inbound) = state.attach_inbound.remove(&xfer_id) else {
         return Err(not_found());
@@ -2071,6 +2077,7 @@ async fn accept_offer(
     db: &Arc<Database>,
     app: &tauri::AppHandle,
     settings: &AppSettings,
+    credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     xfer_id: [u8; 16],
 ) -> Result<(), String> {
     let Some((friend, size)) = state
@@ -2170,6 +2177,7 @@ async fn accept_offer(
         download_folder: PathBuf::from(&settings.download_folder),
         cancel_tx,
         row,
+        credits: credits.clone(),
     };
     let friend = ctx.friend;
     let handle = tokio::spawn(run_fetch(ctx));
@@ -2200,6 +2208,8 @@ struct FetchCtx {
     cancel_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     /// Snapshot for progress ticks.
     row: ChatAttachmentRow,
+    /// Where the friend is credited for the file once it has verified.
+    credits: Arc<tokio::sync::RwLock<CreditManager>>,
 }
 
 /// Why a receive stopped.
@@ -2300,6 +2310,9 @@ async fn fetch_to_chat_files(ctx: &FetchCtx) -> Result<bool, ReceiveFailure> {
         let _ = std::fs::remove_file(&part_path);
         return Err(failure);
     }
+    // All of it came from the friend in this task, each chunk checked against
+    // the offered root as it landed.
+    ctx.credits.write().await.add_downloaded_over_ember(&ctx.friend, ctx.size);
 
     let name = ctx.name.clone();
     let db = ctx.db.clone();

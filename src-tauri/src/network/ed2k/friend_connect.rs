@@ -1074,7 +1074,7 @@ pub async fn run_friend_session_over_transport(
                                         Some((super::messages::EMBER_EXT_DHT_MEET, body)) => {
                                             // A relayed session has no address
                                             // of the friend's own to ping.
-                                            if let (false, std::net::IpAddr::V4(peer_ip), Some((udp_port, answer))) = (
+                                            if let (false, std::net::IpAddr::V4(peer_ip), Some(meet)) = (
                                                 relayed,
                                                 addr.ip(),
                                                 super::messages::decode_dht_meet(body),
@@ -1084,8 +1084,9 @@ pub async fn run_friend_session_over_transport(
                                                     kind: UploadEventKind::EmberDhtMeet {
                                                         ember_hash: peer_ember_hash,
                                                         peer_ip,
-                                                        udp_port,
-                                                        answer,
+                                                        udp_port: meet.udp_port,
+                                                        answer: meet.answer,
+                                                        noise_pub: meet.noise_pub,
                                                         reply_tx: session_ember_session_handle.tx.clone(),
                                                     },
                                                 }).await;
@@ -1161,6 +1162,14 @@ pub async fn run_friend_session_over_transport(
                                                 },
                                             }).await;
                                         }
+                                        // Key-link frames belong to plain eD2K
+                                        // sessions, where SecIdent runs; neither
+                                        // side sends one on a friend session.
+                                        Some((
+                                            super::messages::EMBER_EXT_KEY_LINK_CHALLENGE
+                                            | super::messages::EMBER_EXT_KEY_LINK_PROOF,
+                                            _,
+                                        )) => {}
                                         // A sub-type this build predates. Ignoring
                                         // it is the whole point of the envelope.
                                         Some((other, _)) => debug!(
@@ -2057,6 +2066,8 @@ async fn punch_friend_until(
     secret_key: &[u8; 32],
     deadline: tokio::time::Instant,
 ) -> Result<PunchedStreams, String> {
+    let friend_id = crate::network::rendezvous::hashed_id(&friend_ember_hash);
+    let _awaiting = crate::network::ember::relay::await_punch_from(friend_id.clone());
     for _ in 0..FRIEND_PUNCH_POLL_ATTEMPTS {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -2076,6 +2087,11 @@ async fn punch_friend_until(
         .await
         {
             Ok(Ok(Some(info))) => {
+                // Someone else's entry: a room punch or another friend's
+                // request, left for whoever polls for it.
+                if info.from_id != friend_id {
+                    continue;
+                }
                 let info_for_timeout = info.clone();
                 match tokio::time::timeout_at(
                     punch_attempt_deadline(tokio::time::Instant::now(), deadline),

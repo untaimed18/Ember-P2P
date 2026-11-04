@@ -1,6 +1,6 @@
 <script lang="ts">
   import * as m from '$lib/paraglide/messages';
-  let { exiting = false } = $props<{ exiting?: boolean }>();
+  let { exiting = false }: { exiting?: boolean } = $props();
 </script>
 
 <div class={`splash ${exiting ? 'exit' : ''}`} role="status" aria-live="polite" aria-label={m.splash_aria_starting()}>

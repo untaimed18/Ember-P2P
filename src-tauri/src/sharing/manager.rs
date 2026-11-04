@@ -377,7 +377,7 @@ pub struct TransferManager {
 /// `network::ed2k::transfer`: the English is for logs and for a UI older than
 /// the backend, the code is what the UI translates.
 /// `scripts/backend-codes.test.mjs` parses this table to require a translation
-/// in all nine locales before a new variant can ship.
+/// in all ten locales before a new variant can ship.
 macro_rules! transfer_health_codes {
     ($($variant:ident => $code:literal, $message:literal;)+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2972,7 +2972,7 @@ mod tests {
     }
 
     /// The row the UI renders must never carry one half of the pair: English
-    /// with no code degrades the eight non-English locales silently.
+    /// with no code degrades the nine non-English locales silently.
     #[test]
     fn a_health_verdict_writes_reason_and_code_together() {
         let mut manager = TransferManager::new(1);

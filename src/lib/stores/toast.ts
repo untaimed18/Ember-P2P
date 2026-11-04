@@ -12,6 +12,8 @@ export interface ToastItem {
   type: 'success' | 'error' | 'warning' | 'info';
   message: string;
   action?: ToastAction;
+  /** How many times the same toast was raised again while this one was up. */
+  repeats?: number;
 }
 
 let nextId = 0;
@@ -123,7 +125,14 @@ export function resumeToastDismiss() {
 function expire(id: number): void | Promise<unknown> {
   const onExpire = toastExpiry.get(id);
   toastExpiry.delete(id);
-  const result = onExpire?.();
+  // A throw is settled like a rejection, so the Undo flag still clears and a
+  // flush goes on to the other toasts.
+  let result: void | Promise<unknown>;
+  try {
+    result = onExpire?.();
+  } catch (e) {
+    result = Promise.reject(e);
+  }
   if (result instanceof Promise) {
     const settled: Promise<unknown> = result.catch(() => {}).finally(() => {
       inFlight.delete(settled);
@@ -208,7 +217,36 @@ export async function flushToastActionsBeforeExit(timeoutMs = 3500): Promise<voi
   clearTimeout(timer);
 }
 
+/** Reload the document (or run `reload`, which does) once what Undo toasts
+ *  hold back has been sent: a reload runs no toast's expiry, so the cancels
+ *  and removals behind them would never reach the backend. */
+export function reloadAfterToastActions(reload: () => void = () => location.reload()): void {
+  // Even if an expiry throws: this is the language switch and the Retry
+  // after a failed start, which must still reload.
+  void flushToastActionsBeforeExit()
+    .catch(() => {})
+    .finally(reload);
+}
+
+/**
+ * A plain toast. The same type and message again while one is still on screen
+ * restarts that one's countdown instead of stacking a copy: a repeated event
+ * says nothing new, and the copies would push other toasts out of the cap.
+ * Its `repeats` count goes up, so the toast can show and announce that it
+ * happened again; a retry that fails the same way must not look like nothing.
+ * A sticky toast stays sticky, and a sticky repeat makes a timed one sticky.
+ */
 export function addToast(type: ToastItem['type'], message: string, durationMs = 5000) {
+  const existing = get(toasts).find((t) => !t.action && t.type === type && t.message === message);
+  if (existing) {
+    if (!stickyToasts.has(existing.id)) {
+      clearToastTimer(existing.id);
+      if (durationMs <= 0) stickyToasts.add(existing.id);
+      else armToastTimer(existing.id, durationMs);
+    }
+    toasts.update((t) => t.map((x) => (x.id === existing.id ? { ...x, repeats: (x.repeats ?? 0) + 1 } : x)));
+    return existing.id;
+  }
   const id = nextId++;
   return pushToast(id, { id, type, message }, durationMs);
 }
@@ -281,3 +319,34 @@ export function toast(message: string) { addToast('info', message); }
 export function toastSuccess(message: string) { addToast('success', message); }
 export function toastError(message: string) { addToast('error', message, 8000); }
 export function toastWarning(message: string) { addToast('warning', message, 6000); }
+
+/** Parts of the window whose confirmations Settings can turn off. */
+export type ToastArea = 'downloads' | 'search' | 'library' | 'friends' | 'channels' | 'feeds' | 'network';
+
+let hiddenAreas: ReadonlySet<ToastArea> = new Set();
+
+/** The areas whose confirmations are not shown. Kept by the settings store. */
+export function setHiddenToastAreas(areas: Iterable<ToastArea>): void {
+  hiddenAreas = new Set(areas);
+}
+
+/**
+ * The toast functions for code in `area`. While the user has turned that area
+ * off, its timed success and info toasts are dropped and return -1, an id no
+ * toast has. Warnings, errors, sticky notices and action toasts always show:
+ * they say something went wrong, or offer the only way back from it.
+ */
+export function toastsFor(area: ToastArea) {
+  const add = (type: ToastItem['type'], message: string, durationMs = 5000): number =>
+    hiddenAreas.has(area) && durationMs > 0 && (type === 'success' || type === 'info')
+      ? -1
+      : addToast(type, message, durationMs);
+  return {
+    addToast: add,
+    addActionToast,
+    toast: (message: string) => { add('info', message); },
+    toastSuccess: (message: string) => { add('success', message); },
+    toastError,
+    toastWarning,
+  };
+}

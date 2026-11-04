@@ -15,8 +15,8 @@ use crate::network::ember::channel::{
     self, ChannelIdentity, ChannelInvite, CHANNEL_KIND_PRIVATE, CHANNEL_KIND_PUBLIC,
 };
 use crate::network::ember::dht::publish::{
-    ModerationTail, SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX, CHANNEL_NAME_MAX,
-    CHANNEL_PIN_MAX, CHANNEL_WELCOME_MAX,
+    ChannelLanguages, ModerationTail, SignedRecord, CHANNEL_BAN_LIST_MAX, CHANNEL_MOD_LIST_MAX,
+    CHANNEL_NAME_MAX, CHANNEL_PIN_MAX, CHANNEL_WELCOME_MAX,
 };
 use crate::network::channel_membership::{OfferedKey, OfferedKeyOutcome, RotatingRoom};
 use crate::network::ember::crypto;
@@ -246,6 +246,8 @@ pub struct ChannelMemberInfo {
     /// The language the member publishes in their presence, a code from
     /// `CHANNEL_LANGUAGES`; empty when they publish none.
     pub language: String,
+    /// A second language they publish beside it; empty for none.
+    pub language2: String,
 }
 
 fn ember_hash_for_member_pubkey(hex_pk: &str) -> String {
@@ -272,6 +274,7 @@ impl ChannelMemberInfo {
             moderator: row.moderator,
             ember_hash,
             language: row.language,
+            language2: row.language2,
         }
     }
 }
@@ -585,19 +588,23 @@ pub(crate) async fn apply_channel_username_locally(state: &AppState, username: &
     }
 }
 
-/// Relabel our own roster rows with a newly chosen language, so a member list
-/// opened before the next presence publish already shows it. The publish
+/// Relabel our own roster rows with newly chosen languages, so a member list
+/// opened before the next presence publish already shows them. The publish
 /// itself is the network loop's, when it applies `UpdateSettings`, for the
 /// reason [`apply_channel_username_locally`] gives.
 pub(crate) async fn apply_channel_language_locally(
     app: &tauri::AppHandle,
     state: &AppState,
-    language: Option<&'static str>,
+    languages: ChannelLanguages,
 ) {
     let pk = hex::encode(state.identity.ed25519_public_key);
     let db = state.db.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        db.set_self_channel_member_language(&pk, language.unwrap_or(""))
+        db.set_self_channel_member_language(
+            &pk,
+            languages.primary.unwrap_or(""),
+            languages.secondary.unwrap_or(""),
+        )
     })
     .await;
     match outcome {
@@ -611,9 +618,9 @@ pub(crate) async fn apply_channel_language_locally(
     }
 }
 
-/// Our Channel language as the settings hold it now.
-async fn channel_language_setting(state: &AppState) -> Option<&'static str> {
-    state.config.read().await.settings.channel_language_code()
+/// Our Channel languages as the settings hold them now.
+async fn channel_language_setting(state: &AppState) -> ChannelLanguages {
+    state.config.read().await.settings.channel_languages()
 }
 
 /// Claim `username` on Rendezvous and return the stored display form.
@@ -752,7 +759,7 @@ async fn record_self_member(
     nickname: &str,
     fail_code: &'static str,
 ) -> Result<(), String> {
-    let language = channel_language_setting(state).await;
+    let languages = channel_language_setting(state).await;
     let db = state.db.clone();
     let id = channel_id.to_string();
     let pk = hex::encode(state.identity.ed25519_public_key);
@@ -762,7 +769,7 @@ async fn record_self_member(
             &id,
             &pk,
             &nick,
-            Some(language.unwrap_or("")),
+            Some((languages.primary.unwrap_or(""), languages.secondary.unwrap_or(""))),
             chrono::Utc::now().timestamp(),
             Some(&pk),
         )
@@ -1220,11 +1227,15 @@ pub async fn join_channel(
         return Ok(entered);
     }
 
-    refuse_deleted_channel(&state, &channel_id_hex).await?;
-
-    // Only a first join reaches here — re-entry returned above — so this costs
-    // a bounded round-trip once per room rather than on every walk back in.
-    let username = reassert_channel_username(&state, &username).await?;
+    // Only a first join reaches here — re-entry returned above — so the
+    // username costs a bounded round-trip once per room rather than on every
+    // walk back in. A deleted room is refused at once, whatever the registry
+    // says about the username.
+    let ((), username) = tokio::try_join!(
+        refuse_deleted_channel(&state, &channel_id_hex),
+        async { Ok::<_, String>(reassert_channel_username(&state, &username).await) },
+    )?;
+    let username = username?;
 
     let pubkey_hex = hex::encode(invite.pubkey);
     let visibility = if invite.private {
@@ -1680,10 +1691,12 @@ pub async fn forget_channel(
 
 #[tauri::command]
 pub async fn claim_channel_username(
+    window: tauri::WebviewWindow,
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     name: String,
 ) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let display = claim_username_on_registry(&state, &name).await?;
     persist_channel_username(&state, &display).await?;
     // Taking up Channels this session: the identity's list of rooms is read
@@ -1696,9 +1709,11 @@ pub async fn claim_channel_username(
 /// this device out. Moderators cannot call this.
 #[tauri::command]
 pub async fn delete_owned_channel(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
     let owned = load_owned_channel_as(&state, &channel_id, true).await?;
@@ -3267,6 +3282,30 @@ fn owner_pins_fit(
         >= tail.pinned_msg_ids.len()
 }
 
+/// Refuse an owner edit while the room waits for a claim lookup
+/// ([`crate::network::channel_membership::owner_edit_waits_for_claims`]).
+async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str) -> Result<(), String> {
+    let db = state.db.clone();
+    let id = channel_id.to_string();
+    let waits = tokio::task::spawn_blocking(move || {
+        crate::network::channel_membership::owner_edit_waits_for_claims(
+            &db,
+            &id,
+            chrono::Utc::now().timestamp(),
+        )
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?;
+    if waits {
+        return Err(coded(
+            "channels_owner_return_pending",
+            "Ember is checking whether this room was taken over while you were away. \
+             Try again in a few minutes.",
+        ));
+    }
+    Ok(())
+}
+
 async fn commit_channel_moderation_with(
     state: &AppState,
     owned: &OwnedChannel,
@@ -3276,6 +3315,7 @@ async fn commit_channel_moderation_with(
     mods: &[[u8; 32]],
     pin_fit: PinFit,
 ) -> Result<(), String> {
+    refuse_owner_edit_during_return(state, &owned.row.channel_id).await?;
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     let our_pk = state.identity.ed25519_public_key;
     let tail = owner_moderation_tail(state, owned).await;
@@ -3841,6 +3881,8 @@ async fn rotate_and_commit(
     bans: &[[u8; 32]],
     mods: &[[u8; 32]],
 ) -> Result<(), String> {
+    // Before a key is minted, which the commit refusing would take back.
+    refuse_owner_edit_during_return(state, &owned.row.channel_id).await?;
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     if private {
         // The snapshot the commit will sign, naming the epoch about to be
@@ -4003,9 +4045,11 @@ async fn reseal_current_epoch_to_member(
 /// invite handed out before this stops working, which is the point.
 #[tauri::command]
 pub async fn rotate_channel_room_key(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4069,10 +4113,12 @@ pub(crate) async fn rekey_recovered_room(
 /// patches their build — they already hold the key either way.
 #[tauri::command]
 pub async fn set_channel_invite_policy(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     owner_only: bool,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4123,10 +4169,12 @@ pub async fn set_channel_invite_policy(
 /// rather than against a patched one.
 #[tauri::command]
 pub async fn set_channel_slow_mode(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     secs: u16,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4177,10 +4225,12 @@ pub async fn set_channel_slow_mode(
 /// `ModerationTail::announce_only`). Reactions stay open.
 #[tauri::command]
 pub async fn set_channel_announce_only(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     announce_only: bool,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4236,10 +4286,12 @@ fn parse_channel_language(code: Option<&str>) -> Result<Option<&'static str>, St
 /// owner-signed moderation snapshot like the posting rule.
 #[tauri::command]
 pub async fn set_channel_language(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     language: Option<String>,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4587,11 +4639,13 @@ async fn apply_local_mod_ban(
 
 #[tauri::command]
 pub async fn update_channel_moderation(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     topic: String,
     welcome: String,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4625,10 +4679,12 @@ const RENAME_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// room — so one who is offline picks it up when they are back.
 #[tauri::command]
 pub async fn rename_channel(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     name: String,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -4704,6 +4760,9 @@ pub async fn rename_channel(
              or unpin a message.",
         ));
     }
+    // Before the registry grants the name: past it the snapshot's refusal
+    // would leave members on the old one.
+    refuse_owner_edit_during_return(&state, &channel_id).await?;
 
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     let url = rendezvous_url(&state).await;
@@ -4802,10 +4861,12 @@ pub async fn rename_channel(
 
 #[tauri::command]
 pub async fn ban_channel_member(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5002,10 +5063,12 @@ pub async fn ban_channel_member(
 
 #[tauri::command]
 pub async fn unban_channel_member(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5074,10 +5137,12 @@ async fn refuse_protected_ban_target(
 
 #[tauri::command]
 pub async fn add_channel_moderator(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5129,10 +5194,12 @@ pub async fn add_channel_moderator(
 
 #[tauri::command]
 pub async fn remove_channel_moderator(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5164,11 +5231,14 @@ pub async fn remove_channel_moderator(
 /// member can check a later claim against them.
 #[tauri::command]
 pub async fn set_channel_successor_nominee(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: Option<String>,
     claim_after_days: Option<u16>,
 ) -> Result<ChannelInfo, String> {
+    // A hand-off, only deferred: guarded as `transfer_channel_ownership` is.
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5303,9 +5373,11 @@ async fn register_nominee_with_registry(
 /// record before following it.
 #[tauri::command]
 pub async fn claim_channel_ownership(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(
@@ -5624,23 +5696,24 @@ async fn probe_public_member_counts(
     // One FIND_VALUE per presence key, the same pattern as the public-index
     // shard walks. Batching independent rooms into extras AND-filters by
     // file_hash, and MAX_FIND_VALUE_KEYS would truncate the rest to a
-    // confirmed 0 the UI treated as authoritative. Run in small batches so
-    // the 64-slot search table is not filled by one Discover pass.
-    let keys: Vec<[u8; 16]> = wanted.keys().copied().collect();
-    let mut walks = Vec::with_capacity(keys.len());
-    for chunk in keys.chunks(PRESENCE_PROBE_CONCURRENCY) {
-        let batch = futures::future::join_all(
-            chunk
-                .iter()
-                .map(|key| find_raw_keys_within(state, vec![*key], PRESENCE_PROBE_TIMEOUT_MS)),
-        )
-        .await;
-        walks.extend(batch);
-    }
+    // confirmed 0 the UI treated as authoritative. A few at a time so the
+    // 64-slot search table is not filled by one Discover pass.
+    // Unordered: an ordered buffer keeps a finished walk's slot until every
+    // walk ahead of it is done, so one slow key would stall the rest.
+    let walks: Vec<_> = {
+        use futures::StreamExt;
+        futures::stream::iter(wanted.keys().copied())
+            .map(|key| async move {
+                (key, find_raw_keys_within(state, vec![key], PRESENCE_PROBE_TIMEOUT_MS).await)
+            })
+            .buffer_unordered(PRESENCE_PROBE_CONCURRENCY)
+            .collect()
+            .await
+    };
     let mut members: HashMap<String, HashMap<[u8; 32], (i64, bool)>> = HashMap::new();
     let mut answered: HashSet<String> = HashSet::new();
     let mut any_answer = false;
-    for (key, walk) in keys.into_iter().zip(walks) {
+    for (key, walk) in walks {
         let Some(blobs) = walk.unwrap_or(None) else {
             continue;
         };
@@ -6360,10 +6433,12 @@ pub(crate) async fn find_raw_keys_counted(
 /// old key then signs a DHT handoff. The seed is never copied.
 #[tauri::command]
 pub async fn transfer_channel_ownership(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     require_ember(&state).await?;
     if state.db.chat_locked() {
         return Err(coded(

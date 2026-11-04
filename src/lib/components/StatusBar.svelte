@@ -48,7 +48,8 @@
     const size = formatBytes(bytes);
     const n = formatNumber(count);
     return plural(count, {
-      one: () => m.statusbar_shared_title_one({ size }),
+      one: () => m.statusbar_shared_title_one({ size, count: n }),
+      oneShowsCount: true,
       few: () => m.statusbar_shared_title_few({ count: n, size }),
       other: () => m.statusbar_shared_title_other({ count: n, size }),
     });
@@ -154,7 +155,19 @@
   function ed2kTitle(status: string, id: 'low' | 'high' | null): string {
     const base = m.statusbar_ed2k_title({ status: statusLabel(status) });
     if (!id) return base;
-    return `${base} · ${id === 'low' ? m.servers_lowid() : m.servers_highid()}`;
+    if (id === 'high') return `${base} · ${m.servers_highid()}`;
+    return `${base} · ${m.servers_lowid()}\n${m.statusbar_lowid_explain()}`;
+  }
+
+  /** Each state has its own mark as well as its colour, as on the KAD page,
+   *  so the dots still read apart without colour vision. */
+  function stateGlyph(s: string): string {
+    switch (s) {
+      case 'connected': return '\u2713';
+      case 'disconnected': return '\u2715';
+      case 'no_peers': return '!';
+      default: return '';
+    }
   }
 
   // Source exchange rides the Ember overlay, not KAD. Keying this off
@@ -183,7 +196,8 @@
       const peers = stats.ember_dht_verified_contacts ?? 0;
       const label = statusLabel(status);
       base = plural(peers, {
-        one: () => m.statusbar_ember_dht_title_peers_one({ status: label }),
+        one: () => m.statusbar_ember_dht_title_peers_one({ status: label, count: peers }),
+        oneShowsCount: true,
         few: () => m.statusbar_ember_dht_title_peers_few({ status: label, count: peers }),
         other: () => m.statusbar_ember_dht_title_peers_other({ status: label, count: peers }),
       });
@@ -228,12 +242,18 @@
         other: () => m.statusbar_epx_title_active_one_other({ sources: s }),
       }),
       other: () => plural(s, {
-        one: () => m.statusbar_epx_title_active_other_one({ peers: p }),
+        one: () => m.statusbar_epx_title_active_other_one({ peers: p, sources: s }),
+        oneShowsCount: true,
         other: () => m.statusbar_epx_title_active_other_other({ peers: p, sources: s }),
       }),
     });
   }
 </script>
+
+{#snippet stateDot(s: string)}
+  <span class="dot {s}" aria-hidden="true">{stateGlyph(s)}</span>
+  <span class="sr-only">{statusLabel(s)}</span>
+{/snippet}
 
 <footer class="statusbar">
   <!--
@@ -256,7 +276,7 @@
         onclick={() => openPage('/ember')}
       >
         {m.statusbar_ember_dht_label()}
-        <span class="dot {emberDhtStatus($networkStats, $emberJoinTimedOut)}" aria-label={statusLabel(emberDhtStatus($networkStats, $emberJoinTimedOut))}></span>
+        {@render stateDot(emberDhtStatus($networkStats, $emberJoinTimedOut))}
       </button>
       <button
         type="button"
@@ -265,7 +285,7 @@
         onclick={() => openPage('/kad')}
       >
         {m.statusbar_kad_label()}
-        <span class="dot {$networkStats.status}" aria-label={statusLabel($networkStats.status)}></span>
+        {@render stateDot($networkStats.status)}
       </button>
       <button
         type="button"
@@ -274,7 +294,7 @@
         onclick={() => openPage('/servers')}
       >
         {m.statusbar_ed2k_label()}
-        <span class="dot {$serverStatus}" aria-label={statusLabel($serverStatus)}></span>
+        {@render stateDot($serverStatus)}
         {#if ed2kId}
           <!-- The one number eMule users check first: a LowID is why
                downloads crawl, and it used to live only on the Servers page. -->
@@ -421,12 +441,20 @@
     outline-offset: 1px;
   }
 
+  /* Filled with a tick or a cross when settled, a hollow ring while still
+     trying, and a ring with "!" when Ember found nobody. */
   .dot {
-    width: 8px;
-    height: 8px;
+    width: 12px;
+    height: 12px;
     border-radius: 50%;
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     flex-shrink: 0;
+    font-size: 8px;
+    font-weight: 800;
+    line-height: 1;
+    color: var(--bg-secondary);
   }
 
   .ed2k-id {
@@ -461,14 +489,15 @@
   }
 
   .dot.connecting {
-    background: var(--status-connecting);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent);
+    background: transparent;
+    box-shadow: inset 0 0 0 2px var(--status-connecting), 0 0 0 2px color-mix(in srgb, var(--status-connecting) 18%, transparent);
     animation: status-pulse 1.5s ease-in-out infinite;
   }
 
   .dot.no_peers {
     background: transparent;
-    box-shadow: inset 0 0 0 2px var(--warning), 0 0 0 2px color-mix(in srgb, var(--warning) 18%, transparent);
+    color: var(--warning);
+    box-shadow: inset 0 0 0 1.5px var(--warning), 0 0 0 2px color-mix(in srgb, var(--warning) 18%, transparent);
   }
 
   .dot.disconnected {

@@ -1088,6 +1088,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                             }
                         };
 
+                        let we_are_unreachable = ember_tcp_firewalled_or_presumed(state);
                         {
                             let pfs = state.per_file_sources
                                 .entry(transfer_id.clone())
@@ -1110,7 +1111,7 @@ pub(in crate::network) async fn on_search_poll_tick(
                                 cb_src.source_user_hash,
                                 is_new,
                             );
-                            if state.firewalled || state.low_id {
+                            if we_are_unreachable {
                                 let broker_started = if !cb_src.is_ember_capable {
                                     debug!(
                                         "Skipping LowID-to-LowID broker for {}:{} — \

@@ -385,6 +385,68 @@ pub(in crate::network) async fn on_source_retry_tick(
         }
     }
 
+    // A source search evicted for another search was cut short, so the wait
+    // its start put on the file is taken back.
+    let evicted_targets = state.search_manager.take_evicted_source_targets();
+    if !evicted_targets.is_empty() {
+        let undo: Vec<String> = {
+            let mgr = transfer_manager.read().await;
+            state
+                .active_kad_search_state
+                .keys()
+                .filter(|tid| !state.download_source_searches.values().any(|(t, _)| t == *tid))
+                .filter(|tid| {
+                    state
+                        .pending_downloads
+                        .get(*tid)
+                        .map(|pd| pd.file_hash.as_str())
+                        .or_else(|| mgr.get_transfer(tid).map(|t| t.file_hash.as_str()))
+                        .and_then(parse_ed2k_hash16)
+                        .is_some_and(|fh| evicted_targets.contains(&md4_bytes_to_kad_id(&fh)))
+                })
+                .cloned()
+                .collect()
+        };
+        for tid in &undo {
+            undo_kad_source_search(&mut state.active_kad_search_state, tid, tick_now);
+        }
+    }
+
+    // Sources whose attempts keep failing are dropped and blocked, as eMule
+    // removes a source it cannot connect to; left listed, they counted as
+    // known sources until discovery stopped looking for more.
+    {
+        let mut retired: Vec<([u8; 16], Ipv4Addr, u16)> = Vec::new();
+        for pfs in state.per_file_sources.values_mut() {
+            for (ip, port, firewalled) in pfs.retire_failing_sources() {
+                state
+                    .dead_sources
+                    .add_dead_source(0, u32::from(ip), port, firewalled);
+                retired.push((pfs.file_hash, ip, port));
+            }
+        }
+        if !retired.is_empty() {
+            state.ember_payload_dirty = true;
+            let mut sm = source_manager.write().await;
+            for (fh, ip, port) in &retired {
+                sm.remove_source(fh, ip, *port);
+            }
+            debug!("Retired {} repeatedly failing source(s)", retired.len());
+        }
+    }
+
+    // A `LowToLowIp` park is only right while we cannot be called back
+    // either. Once we can, the parked peers get their callback or dial again.
+    if !ember_tcp_firewalled_or_presumed(state) {
+        let mut released = 0usize;
+        for pfs in state.per_file_sources.values_mut() {
+            released += pfs.release_low_to_low_parks();
+        }
+        if released > 0 {
+            info!("Reachable again: released {released} LowID-to-LowID source(s) for retry");
+        }
+    }
+
     // Always process cancellations even when offline.
     {
         let to_cancel: Vec<String> = state.pending_downloads.iter()
@@ -421,8 +483,10 @@ pub(in crate::network) async fn on_source_retry_tick(
                 continue;
             }
             // Stop/Pause/Insufficient already cancelled the control
-            // and removed it from the manager. Prefer those statuses
-            // over rewriting the row as Failed ("Cancelled").
+            // and removed it from the manager, and a finished or
+            // finishing transfer cancels its control on the way out.
+            // Prefer those statuses over rewriting the row as Failed
+            // ("Cancelled").
             let skip_fail = {
                 let mgr = transfer_manager.read().await;
                 mgr.get_transfer(tid)
@@ -432,6 +496,10 @@ pub(in crate::network) async fn on_source_retry_tick(
                             TransferStatus::Stopped
                                 | TransferStatus::Paused
                                 | TransferStatus::Insufficient
+                                | TransferStatus::Verifying
+                                | TransferStatus::Completing
+                                | TransferStatus::Completed
+                                | TransferStatus::Failed
                         )
                     })
                     .unwrap_or(false)
@@ -573,12 +641,22 @@ pub(in crate::network) async fn on_source_retry_tick(
         |pd: &PendingDownload| !pd.control.is_cancelled() && !pd.control.is_paused();
     // One cached reading per download folder serves the whole tick,
     // including the start paths below.
-    let mut part_volumes = PartVolumes::new(
-        DiskSpaceMonitor::global(),
-        PathBuf::from(&settings.download_folder),
-    );
+    let current_folder = PathBuf::from(&settings.download_folder);
+    let folders = {
+        let mgr = transfer_manager.read().await;
+        PartVolumes::folders_of(
+            &current_folder,
+            mgr.active
+                .keys()
+                .chain(state.pending_downloads.keys())
+                .map(String::as_str),
+        )
+    };
+    DiskSpaceMonitor::global().resolve_volumes(folders).await;
+    let mut part_volumes = PartVolumes::new(DiskSpaceMonitor::global(), current_folder);
     {
         let mgr = transfer_manager.read().await;
+        part_volumes.promise_running(&mgr, &state.pending_downloads);
         for (tid, pd) in &state.pending_downloads {
             if !is_retry_candidate(pd) {
                 continue;
@@ -592,7 +670,7 @@ pub(in crate::network) async fn on_source_retry_tick(
             let completed = mgr.get_transfer(tid)
                 .map(|t| t.completed_size)
                 .unwrap_or(0);
-            let needed = remaining_download_bytes(pd.file_size, completed);
+            let needed = part_volumes.needed(tid, pd.file_size, completed);
             if !part_volumes.suffices(tid, needed) {
                 debug!("Skipping source retry for {} ({}): insufficient disk space", tid, pd.file_name);
                 insufficient_downloads.push((tid.clone(), pd.file_name.clone()));
@@ -641,7 +719,12 @@ pub(in crate::network) async fn on_source_retry_tick(
                     priority: priority_str_to_u32(&t.priority),
                 },
             );
-            let _ = try_start_pending_download_from_known_sources(
+            // One that does not fit stays pending, for the next tick to hold.
+            let needed = part_volumes.needed(&t.id, t.total_size, t.completed_size);
+            if !part_volumes.suffices(&t.id, needed) {
+                continue;
+            }
+            let started = try_start_pending_download_from_known_sources(
                 state,
                 &t.id,
                 transfer_manager,
@@ -664,6 +747,9 @@ pub(in crate::network) async fn on_source_retry_tick(
                 &stats_manager.epx_counters,
             )
             .await;
+            if started {
+                part_volumes.promise(&t.id, needed);
+            }
         }
     }
 
@@ -721,6 +807,7 @@ pub(in crate::network) async fn on_source_retry_tick(
         }
     }
     drop(a4af_snap);
+    let persistent_set: HashSet<&String> = started_from_persistent.iter().collect();
 
     // First pass: check if SourceManager has accumulated sources for
     // any pending download (from server TCP/UDP responses). If so, start
@@ -729,7 +816,7 @@ pub(in crate::network) async fn on_source_retry_tick(
     {
         let sm = source_manager.read().await;
         for (tid, _) in &to_retry {
-            if started_from_persistent.contains(tid) || !may_start.contains(tid) { continue; }
+            if persistent_set.contains(tid) || !may_start.contains(tid) { continue; }
             if let Some(pd) = state.pending_downloads.get(tid) {
                 if let Ok(hash_bytes) = hex::decode(&pd.file_hash) {
                     if hash_bytes.len() == 16 {
@@ -815,7 +902,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                     .map(|t| t.completed_size)
                     .unwrap_or(0)
             };
-            let needed = remaining_download_bytes(pending.file_size, completed);
+            let needed = part_volumes.needed(tid, pending.file_size, completed);
             if !part_volumes.suffices(tid, needed) {
                 warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
                 let freed = mark_download_insufficient(
@@ -852,6 +939,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 }
                 continue;
             }
+            part_volumes.promise(tid, needed);
             let source_count = ready_sources.len() as u32;
             {
                 // Canonical lock order: transfer_manager before
@@ -981,7 +1069,7 @@ pub(in crate::network) async fn on_source_retry_tick(
     }
 
     for tid in &started_from_sm {
-        if started_from_persistent.contains(tid) { continue; }
+        if persistent_set.contains(tid) { continue; }
         if let Some(pending) = state.pending_downloads.remove(tid) {
             let hash_bytes = match hex::decode(&pending.file_hash) {
                 Ok(b) if b.len() == 16 => {
@@ -1029,7 +1117,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                     .map(|t| t.completed_size)
                     .unwrap_or(0)
             };
-            let needed = remaining_download_bytes(pending.file_size, completed);
+            let needed = part_volumes.needed(tid, pending.file_size, completed);
             if !part_volumes.suffices(tid, needed) {
                 warn!("Skipping download {} ({}): insufficient disk space", tid, pending.file_name);
                 let freed = mark_download_insufficient(
@@ -1066,6 +1154,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 }
                 continue;
             }
+            part_volumes.promise(tid, needed);
             let source_count = live_sources.len() as u32;
             {
                 let mut mgr = transfer_manager.write().await;
@@ -1128,7 +1217,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 let mut sm = source_manager.write().await;
                 for (ip, port) in &live_sources {
                     if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                        sm.register_source(hash_bytes, v4, *port, None);
+                        sm.register_source_if_absent(hash_bytes, v4, *port);
                     }
                 }
             }
@@ -1231,8 +1320,9 @@ pub(in crate::network) async fn on_source_retry_tick(
     // cached sources — replicate that one-shot kick here.
     {
         let mut warm_started: Vec<String> = started_from_persistent.clone();
+        let mut warm_seen: HashSet<String> = warm_started.iter().cloned().collect();
         for tid in &started_from_sm {
-            if !warm_started.contains(tid) {
+            if warm_seen.insert(tid.clone()) {
                 warm_started.push(tid.clone());
             }
         }
@@ -1346,8 +1436,9 @@ pub(in crate::network) async fn on_source_retry_tick(
         }
     }
 
+    let started: HashSet<&String> = started_from_sm.iter().chain(&started_from_persistent).collect();
     let mut to_retry: Vec<String> = to_retry.into_iter()
-        .filter(|(tid, _)| !started_from_sm.contains(tid) && !started_from_persistent.contains(tid))
+        .filter(|(tid, _)| !started.contains(tid))
         .map(|(tid, _)| tid)
         .collect();
 
@@ -1363,8 +1454,9 @@ pub(in crate::network) async fn on_source_retry_tick(
         // socket applied backpressure or the source list was large.
         let mut to_send: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
         let mut reask_ids = to_retry.clone();
+        let mut reask_seen: HashSet<String> = reask_ids.iter().cloned().collect();
         for tid in state.active_source_senders.keys() {
-            if !reask_ids.iter().any(|existing| existing == tid) {
+            if reask_seen.insert(tid.clone()) {
                 reask_ids.push(tid.clone());
             }
         }
@@ -1398,6 +1490,15 @@ pub(in crate::network) async fn on_source_retry_tick(
                 }
             }
         }
+        // Building the bitmap reads the part file, so only for a download that
+        // has a source due this tick; one that falls due meanwhile is caught
+        // on the next.
+        reask_ids.retain(|tid| {
+            state
+                .per_file_sources
+                .get(tid)
+                .is_some_and(|pfs| pfs.sources.iter().any(|s| s.needs_udp_reask()))
+        });
         let mut reask_bitmaps: HashMap<String, Vec<bool>> = HashMap::new();
         for tid in &reask_ids {
             if let Some(parts) = udp_reask_serveable_parts(state, tid).await {
@@ -1471,6 +1572,19 @@ pub(in crate::network) async fn on_source_retry_tick(
                         .unwrap_or(*orig_udp);
                     if udp_port == 0 {
                         pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
+                        continue;
+                    }
+                    // Rows from server answers, source exchange and A4AF
+                    // start without a UDP port; keeping the one found here
+                    // lets the ack find its row and spares the next lookup.
+                    pfs.learn_udp_port(ip, tcp_port, udp_port);
+                    // eMule's `UDPReaskForDownload` skips a client it has a
+                    // connected socket to; that session does the asking.
+                    // Left due, so it is pinged once the session is over.
+                    let user_hash = sm
+                        .get_user_hash(&pfs.file_hash, ip, tcp_port)
+                        .or_else(|| pfs.source_user_hash_at(ip, tcp_port));
+                    if ed2k::peer_sessions::is_busy(user_hash, ip, tcp_port) {
                         continue;
                     }
                     if sent_this_tick.contains(&(ip, tcp_port)) {

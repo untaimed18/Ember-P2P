@@ -4,6 +4,7 @@ pub mod dht_common;
 pub mod firewall;
 pub mod ip_filter;
 pub mod legacy_challenge;
+mod lower_map;
 pub mod messages;
 pub mod obfuscation;
 pub mod outbound;

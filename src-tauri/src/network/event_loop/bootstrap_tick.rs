@@ -19,6 +19,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
     firewall_probe_ips: &upload_server::FirewallProbeSet,
     shared_banned_ips: &upload_server::SharedBannedIps,
     friend_hashes: &crate::app_state::SharedFriendHashes,
+    credit_manager: &Arc<RwLock<CreditManager>>,
     ember_hash: [u8; 16],
     ul_event_tx: &mpsc::Sender<UploadEvent>,
     ed25519_pubkey: [u8; 32],
@@ -43,6 +44,9 @@ pub(in crate::network) async fn on_bootstrap_tick(
     upnp_maintain_started_at: &mut Option<tokio::time::Instant>,
     upnp_mappings: &mut upnp::UpnpMappings,
 ) {
+    maybe_probe_from_outside(state, settings);
+    keep_named_buddy_reachable(udp_socket, state).await;
+
     // Only the KAD bootstrap below depends on KAD being up. The
     // friend-presence and friend-search work after this block must
     // not: `stats.status` is only ever advanced by KAD code paths,
@@ -65,7 +69,10 @@ pub(in crate::network) async fn on_bootstrap_tick(
             // conditions that persist for the session and must stay
             // on screen even once KAD finishes bootstrapping.
             let _ = app_handle.emit("network-error", serde_json::json!({
-                "message": "Unable to connect to the KAD network. Try Bootstrap on the KAD Network page and use the default nodes.dat.",
+                "message": crate::commands::errors::coded(
+                    "network_kad_no_peers",
+                    "Unable to connect to the KAD network. Try Bootstrap on the KAD Network page and use the default nodes.dat.",
+                ),
                 "transient": true,
             }));
         }
@@ -188,12 +195,25 @@ pub(in crate::network) async fn on_bootstrap_tick(
 
     tokio::task::yield_now().await;
 
-    // Firewall detection using FirewallChecker
-    if !state.firewall_checker.is_checking() && state.firewall_checker.should_recheck() && table_size >= 10 {
+    // Firewall detection using FirewallChecker. Requests go only to verified
+    // contacts, so a check waits until there are enough of them: one started
+    // with none sends nothing yet stamps its start, and the next would wait an
+    // hour. Contacts from a legacy or downloaded nodes.dat load unverified.
+    let checks = state.firewall_checker.checks_to_send() as usize;
+    if !state.firewall_checker.is_checking()
+        && state.firewall_checker.should_recheck()
+        && table_size >= 10
+        && state
+            .routing_table
+            .all_contacts()
+            .filter(|c| c.verified && !c.is_dead())
+            .take(checks)
+            .count()
+            >= checks
+    {
         state.firewall_checker.start_check();
         clear_external_udp_for_firewall_recheck(state);
         if let Ok(mut probes) = firewall_probe_ips.lock() { probes.clear(); }
-        let checks = state.firewall_checker.checks_to_send() as usize;
 
         let fw_contacts: Vec<KadContact> = state
             .routing_table
@@ -685,6 +705,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
                                 Some(ember::relay::RoomXferServeContext {
                                     grants: state.xfer_grants.clone(),
                                 }),
+                                Some(credit_manager.clone()),
                             ));
                             tracing::info!("QUIC accept loop spawned");
 

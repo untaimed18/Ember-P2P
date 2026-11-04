@@ -95,6 +95,9 @@
       0,
     ) ?? 0,
   );
+  let movedCount = $derived(
+    preview?.downloads.filter((d, i) => downloadChoice[i] && d.status === 'ready' && !copied(d)).length ?? 0,
+  );
   let downloadFree = $derived(
     preview ? (targetIsIncoming ? preview.free_incoming : preview.free_download_folder) : null,
   );
@@ -151,13 +154,15 @@
     error = '';
     try {
       const result = await previewEmuleImport(install.id);
+      // Off until the user turns it on: two clients sharing one identity are
+      // flagged by peers whenever both run. Kept through a re-read.
+      if (preview?.source.id !== result.source.id) wantIdentity = false;
       preview = result;
       // A whole drive is left for the user to tick, knowing what it means;
       // ticking it also brings up the native confirmation when staging.
       folderChoice = result.shared_folders.map((f) => f.status === 'ready');
       downloadChoice = result.downloads.map((d) => d.status === 'ready');
       wantIpfilter = result.ipfilter;
-      wantIdentity = mode === 'wizard' && result.identity;
       importChosen = mode === 'wizard' && !declined;
       onpreview?.(result);
     } catch (e) {
@@ -480,7 +485,8 @@
                           {folder.subfolder_count_capped
                             ? m.emule_import_folder_subfolders_capped({ count: folder.newly_shared_subfolders })
                             : plural(folder.newly_shared_subfolders, {
-                                one: m.emule_import_folder_subfolders_one,
+                                one: () => m.emule_import_folder_subfolders_one({ count: folder.newly_shared_subfolders }),
+                                oneShowsCount: true,
                                 other: () => m.emule_import_folder_subfolders_other({ count: folder.newly_shared_subfolders }),
                               })}
                         </span>
@@ -513,7 +519,8 @@
             <span class="toggle-title">{m.emule_import_credits_title()}</span>
             <span class="hint">
               {plural(preview.credits, {
-                one: m.emule_import_credits_desc_one,
+                one: () => m.emule_import_credits_desc_one({ count: preview.credits }),
+                // Not `oneShowsCount`: the singular speaks of one peer, so Russian 21, 31, … take `other`.
                 few: () => m.emule_import_credits_desc_few({ count: preview.credits }),
                 other: () => m.emule_import_credits_desc_other({ count: preview.credits }),
               })}
@@ -572,7 +579,8 @@
             <div class="toggle-info">
               <span class="toggle-title">
                 {plural(preview.servers, {
-                  one: m.emule_import_servers_one,
+                  one: () => m.emule_import_servers_one({ count: preview.servers }),
+                  oneShowsCount: true,
                   other: () => m.emule_import_servers_other({ count: preview.servers }),
                 })}
               </span>
@@ -702,6 +710,27 @@
         </button>
       </div>
       {#if importChosen}
+        <!-- Outside "Choose what to import": the parts that change eMule
+             itself are said where the choice is made. -->
+        {#if movedCount > 0 || preview.identity}
+        <ul class="import-summary">
+          {#if movedCount > 0}
+            <li class="warn">
+              {plural(movedCount, {
+                one: () => m.emule_import_summary_moved_one({ count: movedCount }),
+                // Not `oneShowsCount`: the singular speaks of one download, so Russian 21, 31, … take `other`.
+                few: () => m.emule_import_summary_moved_few({ count: movedCount }),
+                other: () => m.emule_import_summary_moved_other({ count: movedCount }),
+              })}
+            </li>
+          {/if}
+          {#if preview.identity}
+            <li class:warn={wantIdentity}>
+              {wantIdentity ? m.emule_import_summary_identity_on() : m.emule_import_summary_identity_off()}
+            </li>
+          {/if}
+        </ul>
+        {/if}
         <details class="customize">
           <summary>{m.emule_import_customize()}</summary>
           {@render checklist(preview)}
@@ -1105,6 +1134,19 @@
   .choice.selected {
     border-color: var(--accent);
     box-shadow: 0 0 0 1px var(--accent);
+  }
+  .import-summary {
+    margin: 0;
+    padding-left: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: var(--font-size-sm);
+    line-height: 1.5;
+    color: var(--text-secondary);
+  }
+  .import-summary .warn {
+    color: var(--warning);
   }
   .customize summary {
     cursor: pointer;

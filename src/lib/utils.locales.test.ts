@@ -37,6 +37,9 @@ describe('durations in the app language', () => {
     expect(ru.formatDurationSecs(2 * 3600 + 15 * 60)).toBe('2 ч 15 мин');
     const zh = await utilsIn('zh-CN');
     expect(zh.formatDurationSecs(2 * 3600 + 15 * 60)).toBe('2小时15分钟');
+    const pl = await utilsIn('pl');
+    expect(pl.formatDurationSecs(2 * 3600 + 15 * 60)).toBe('2 h 15 min');
+    expect(pl.formatElapsed(3600 + 5 * 60 + 9)).toBe('1 h 05 min 09 s');
   });
 
   it('never falls back to English letters for a non-English locale', async () => {
@@ -119,6 +122,12 @@ describe('sizes in the app language', () => {
     expect(en.formatLiveSpeed(0)).toBe('0 B/s');
     const fr = await utilsIn('fr');
     expect(fr.formatLiveSpeed(3 * 1024 * 1024)).toBe('3,0 Mo/s');
+  });
+
+  it('keeps the shared units with a decimal comma in Polish', async () => {
+    const { formatBytes, formatSpeed } = await utilsIn('pl');
+    expect(formatBytes(1536)).toBe('1,5 KB');
+    expect(formatSpeed(3 * 1024 * 1024)).toBe('3 MB/s');
   });
 
   it('does not group the digits of a sub-kilobyte count', async () => {

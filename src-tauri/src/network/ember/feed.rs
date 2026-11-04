@@ -247,6 +247,10 @@ pub const FEED_INDEX_SHARDS: u8 = 16;
 /// of the feed outranks the one it replaces, so this one, kept as long as a
 /// listing, displaces the copies storers still hold.
 pub const FEED_LISTING_WITHDRAWN: u8 = 0x01;
+/// A listing's flag saying followers cannot fetch its feed's files now: its
+/// publisher can place no source record and is not on the rendezvous server
+/// either. Builds before 1.7.6 keep the bit and read nothing into it.
+pub const FEED_LISTING_CANNOT_SHARE: u8 = 0x02;
 /// How long storers keep a listing, or a withdrawal, after it was signed
 /// (`FEED_LISTING_TTL` in `dht::store`). A week: its publisher signs it anew
 /// every hour it runs, and junk listings that fill the index lapse within it
@@ -255,6 +259,10 @@ pub const FEED_LISTING_TTL_SECS: i64 = 7 * 24 * 3600;
 /// How long storers keep a head after it was signed (`CHANNEL_GOVERNANCE_TTL`
 /// in `dht::store`): what a deleted feed's tombstone must outlast.
 pub const FEED_HEAD_TTL_SECS: i64 = 30 * 24 * 3600;
+/// How often a publisher republishes a head nothing has changed, and signs
+/// its listing anew with it. Storers read a listing unsigned for two of
+/// these as one whose publisher stopped, so the two must not drift apart.
+pub const FEED_LISTING_RESIGN_SECS: i64 = 60 * 60;
 /// A listing signed this recently says its publisher is running: one
 /// signs it anew with every publish and hourly republish, and a republish
 /// that does not get through is tried again within minutes.
@@ -319,10 +327,16 @@ pub fn tombstone_head(sequence: u64, title: &str) -> FeedHead {
 
 /// A listing's trailer: `flags(1)`, then the head's own trailer
 /// ([`encode_feed_extra`]). `None` for a head with a field out of bounds.
+#[cfg(test)]
 pub fn encode_feed_listing_extra(head: &FeedHead, withdrawn: bool) -> Option<Vec<u8>> {
+    encode_feed_listing_extra_flags(head, if withdrawn { FEED_LISTING_WITHDRAWN } else { 0 })
+}
+
+/// [`encode_feed_listing_extra`] with its flags byte as given.
+pub fn encode_feed_listing_extra_flags(head: &FeedHead, flags: u8) -> Option<Vec<u8>> {
     let head_extra = encode_feed_extra(head)?;
     let mut out = Vec::with_capacity(1 + head_extra.len());
-    out.push(if withdrawn { FEED_LISTING_WITHDRAWN } else { 0 });
+    out.push(flags);
     out.extend_from_slice(&head_extra);
     Some(out)
 }

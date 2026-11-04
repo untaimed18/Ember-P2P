@@ -74,7 +74,10 @@ vi.mock('@tauri-apps/api/event', () => ({
   }),
 }));
 
-vi.mock('$lib/stores/toast', () => ({ toast: vi.fn() }));
+vi.mock('$lib/stores/toast', () => {
+  const toast = vi.fn();
+  return { toast, toastsFor: () => ({ toast }) };
+});
 vi.mock('$lib/notifications', () => ({ notify: vi.fn(async () => {}) }));
 
 function room(partial: Partial<ChannelInfo> & { channel_id: string }): ChannelInfo {

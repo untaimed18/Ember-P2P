@@ -5,6 +5,79 @@
 
 use super::*;
 
+/// How often running downloads' progress is written to SQLite between
+/// terminal state changes; `start_network` explains why this is throttled.
+pub(in crate::network) const DB_PROGRESS_PERSIST_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// The latest progress of each running download, written to SQLite together
+/// once per [`DB_PROGRESS_PERSIST_INTERVAL`]. One transaction for all of them
+/// is one WAL fsync, where a write per download was one each.
+#[derive(Default)]
+pub(in crate::network) struct DbProgressBatch {
+    pending: HashMap<String, (u64, f64, u64)>,
+    last_flush: Option<std::time::Instant>,
+    /// The flush still being written. The next waits for it, so an older
+    /// figure can never land after a newer one.
+    in_flight: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl DbProgressBatch {
+    /// Record `transfer_id`'s progress for the next flush, replacing what was
+    /// waiting.
+    pub(in crate::network) fn note(&mut self, transfer_id: &str, transferred: u64, progress: f64, speed: u64) {
+        match self.pending.get_mut(transfer_id) {
+            Some(entry) => *entry = (transferred, progress, speed),
+            None => {
+                self.pending.insert(transfer_id.to_string(), (transferred, progress, speed));
+            }
+        }
+    }
+
+    /// Drop what is waiting for `transfer_id`, which has reached a state its
+    /// own write records.
+    pub(in crate::network) fn forget(&mut self, transfer_id: &str) {
+        self.pending.remove(transfer_id);
+    }
+
+    /// Write everything waiting, if the interval has passed since the last
+    /// flush and that one has finished.
+    pub(in crate::network) fn flush_due(&mut self, db: &Arc<Database>) {
+        if self.pending.is_empty()
+            || self.last_flush.is_some_and(|at| at.elapsed() < DB_PROGRESS_PERSIST_INTERVAL)
+            || self.in_flight.as_ref().is_some_and(|h| !h.is_finished())
+        {
+            return;
+        }
+        let rows: Vec<crate::storage::database::TransferProgressRow> = self
+            .pending
+            .drain()
+            .map(|(transfer_id, (transferred, progress, speed))| {
+                let part_folder = crate::storage::part_folders::located_folder(&transfer_id)
+                    .map(|folder| folder.to_string_lossy().into_owned());
+                crate::storage::database::TransferProgressRow {
+                    transfer_id,
+                    transferred,
+                    progress,
+                    speed,
+                    part_folder,
+                }
+            })
+            .collect();
+        let db = Arc::clone(db);
+        self.last_flush = Some(std::time::Instant::now());
+        self.in_flight = Some(tokio::task::spawn_blocking(move || {
+            // Guarded per row: this write is unsequenced and can be executed
+            // after the completion write it was queued before, which would
+            // leave a `completed` row showing the last flushed percentage
+            // instead of 100%.
+            if let Err(e) = db.update_transfer_progress_batch(&rows) {
+                warn!("DB progress flush of {} download(s) failed: {e}", rows.len());
+            }
+        }));
+    }
+}
+
 /// [`spawn_transfer_status_write`] of "failed", ordered on the same clock,
 /// with the failure stored beside it: a restart reads it back to tell
 /// whether Resume may continue the row.
@@ -229,9 +302,9 @@ pub(super) async fn handle_download_event(
     stats_manager: &mut StatsManager,
     remove_finished: bool,
     a4af: &Arc<RwLock<ed2k::a4af::A4AFManager>>,
+    credit_manager: &Arc<RwLock<CreditManager>>,
     download_roots: &[String],
-    db_progress_last_persist: &mut HashMap<String, std::time::Instant>,
-    db_progress_persist_interval: std::time::Duration,
+    db_progress_batch: &mut DbProgressBatch,
     // Pending-since tracking for KAD callback placeholder rows. When
     // the `SourceDetail` handler removes stale placeholders, we also
     // drop their timestamp entries so the periodic timeout sweep in
@@ -301,37 +374,12 @@ pub(super) async fn handle_download_event(
             // times per second per active download, and we already keep the
             // authoritative in-memory state on `transfer_manager`. The DB
             // copy is only consulted at startup recovery, where the
-            // `.part.met` (via PartTracker::new) supersedes it anyway. Flush
-            // at most once per `db_progress_persist_interval` per transfer,
-            // plus on completion/fail/verifying via the dedicated paths.
-            let should_persist_db = match db_progress_last_persist.get(&transfer_id) {
-                None => true,
-                Some(last) => last.elapsed() >= db_progress_persist_interval,
-            };
-            if should_persist_db {
-                let db_for_progress = db.clone();
-                let transfer_id_for_progress = transfer_id.clone();
-                let part_folder = crate::storage::part_folders::located_folder(&transfer_id)
-                    .map(|folder| folder.to_string_lossy().into_owned());
-                tokio::task::spawn_blocking(move || {
-                    // Guarded: this write is unsequenced and can be executed
-                    // after the completion write it was queued before, which
-                    // would leave a `completed` row showing the last
-                    // rate-limited percentage instead of 100%.
-                    if let Err(e) = db_for_progress.update_transfer_progress_if_active(
-                        &transfer_id_for_progress,
-                        capped_downloaded,
-                        progress,
-                        speed,
-                        part_folder.as_deref(),
-                    ) {
-                        warn!(
-                            "DB update_transfer_progress failed for {transfer_id_for_progress}: {e}"
-                        );
-                    }
-                });
-                db_progress_last_persist.insert(transfer_id.clone(), std::time::Instant::now());
-            }
+            // `.part.met` (via PartTracker::new) supersedes it anyway. Every
+            // running download's latest figure is flushed together at most
+            // once per `DB_PROGRESS_PERSIST_INTERVAL` (here and from the stats
+            // timer), plus on completion/fail/verifying via the dedicated paths.
+            db_progress_batch.note(&transfer_id, capped_downloaded, progress, speed);
+            db_progress_batch.flush_due(db);
             let _ = app_handle.emit(
                 "transfer-progress",
                 &crate::types::TransferProgressPayload {
@@ -672,13 +720,17 @@ pub(super) async fn handle_download_event(
                     assigned,
                     format!("{ip}:{port}").parse::<std::net::SocketAddr>(),
                 ) {
+                    let standing = match live_hash {
+                        Some(user_hash) => credit_manager.read().await.standing_with(&user_hash),
+                        None => 1.0,
+                    };
                     let mut a4af_lock = a4af.write().await;
                     a4af_lock.update_source_state(
                         addr,
                         assigned,
                         queue_rank.unwrap_or(0).min(u16::MAX as u32) as u16,
                         true,
-                        1.0,
+                        standing,
                     );
                 }
             }
@@ -722,7 +774,7 @@ pub(super) async fn handle_download_event(
                 }
                 mgr.remove(&transfer_id);
             }
-            db_progress_last_persist.remove(&transfer_id);
+            db_progress_batch.forget(&transfer_id);
             let outcome = match final_path {
                 Some(path) if ember_verified => crate::sharing::feed_files::FetchOutcome::Done(path.into()),
                 Some(path) => {
@@ -745,7 +797,7 @@ pub(super) async fn handle_download_event(
                 }
                 mgr.remove(&transfer_id);
             }
-            db_progress_last_persist.remove(&transfer_id);
+            db_progress_batch.forget(&transfer_id);
             crate::sharing::feed_files::report_fetch(
                 &transfer_id,
                 crate::sharing::feed_files::FetchOutcome::failed(error),
@@ -767,7 +819,7 @@ pub(super) async fn handle_download_event(
                 let mgr = transfer_manager.read().await;
                 mgr.get_transfer(&transfer_id).map(|t| t.total_size)
             };
-            db_progress_last_persist.remove(&transfer_id);
+            db_progress_batch.forget(&transfer_id);
             let completed_ok = if let Some(promoted) = {
                 let mut mgr = transfer_manager.write().await;
                 // Record the real on-disk path (possibly deduplicated by
@@ -931,7 +983,7 @@ pub(super) async fn handle_download_event(
                     }
                 });
             }
-            db_progress_last_persist.remove(&transfer_id);
+            db_progress_batch.forget(&transfer_id);
             if let Some(promoted) = {
                 let mut mgr = transfer_manager.write().await;
                 mgr.fail(
@@ -991,6 +1043,7 @@ pub(super) async fn handle_download_event(
             // Handled directly in the network event loop (EPX source injection / peer tracking / friend requests).
         }
         DownloadEvent::DataReceived { .. }
+        | DownloadEvent::Completing { .. }
         | DownloadEvent::PartVerified { .. }
         | DownloadEvent::PartCorrupted { .. }
         | DownloadEvent::AichRecoveryFailed { .. }

@@ -82,6 +82,24 @@ pub(in crate::network) async fn on_ember_search_tick(
         .await;
     }
 
+    // Message 1s our own handshakes still wait on, sent again (see
+    // `MSG1_RESEND_AFTER`). Ahead of the idle guard: a handshake in
+    // flight is not one of the maps it reads.
+    for (addr, packet) in state.ember_transport.due_msg1_resends(std::time::Instant::now()) {
+        if let Err(e) = send_ember_udp(udp_socket, &packet, addr, &state.ember_dht_overhead).await {
+            debug!("Ember: resending handshake message 1 to {addr} failed: {e}");
+        }
+    }
+
+    // Ahead of the idle guard: a queued lookup is not one of the maps it reads.
+    top_up_awaited_target_lookups(udp_socket, state).await;
+
+    // Key-epoch records whose target lookup has landed (see
+    // `hold_key_record_in`); nothing to do while none has.
+    if !state.ember_key_records_ready.is_empty() {
+        publish_ready_key_records(udp_socket, state).await;
+    }
+
     // Cheap when idle: the maps are empty unless an iterative
     // lookup, a publish, or a maintenance liveness ping is in
     // flight.
@@ -333,6 +351,10 @@ pub(in crate::network) async fn on_ember_search_tick(
     if !state.ember_pending_source_injections.is_empty() {
         let entries = std::mem::take(&mut state.ember_pending_source_injections);
         let we_are_unreachable = ember_tcp_firewalled(state);
+        // Publishers refuse to connect back to a well-known port, so on one
+        // the callback path is closed to us as surely as when firewalled.
+        let no_connect_back =
+            we_are_unreachable || !ember_callback_port_accepted(advertised_tcp_port(state));
 
         // Firewalled records that name a usable buddy, when we can
         // accept a TCP connect-back, take the Ember CALLBACK_REQ
@@ -368,7 +390,7 @@ pub(in crate::network) async fn on_ember_search_tick(
                     .is_some_and(|b| state.ember_dht.buddy_endpoint_corroborated(&b));
                 if ember_source_uses_callback(
                     src,
-                    we_are_unreachable,
+                    no_connect_back,
                     buddy_blocked_or_banned,
                     buddy_corroborated,
                     now_ts,
@@ -571,6 +593,11 @@ pub(in crate::network) async fn on_ember_search_tick(
                         src.udp_port,
                         src.user_hash,
                     );
+                    let relaying = pfs.sources.iter().any(|s| {
+                        s.ip == src.ip
+                            && s.tcp_port == src.tcp_port
+                            && matches!(s.state, ed2k::sources::DownloadSourceState::EmberRelay)
+                    });
                     pfs.set_ember_callback_buddy(
                         src.ip,
                         src.tcp_port,
@@ -584,6 +611,25 @@ pub(in crate::network) async fn on_ember_search_tick(
                         buddy.endorsed_until,
                         added,
                     );
+                    // A rediscovered record does not restore the budget, so
+                    // an unverified row whose callbacks ran out stayed parked
+                    // for good. The buddy vouched for this publisher, so the
+                    // relay may be pinned to it.
+                    if pfs.callback_route_exhausted_at(src.ip, src.tcp_port, src.user_hash)
+                        && ember_firewalled_source_should_broker(src.flags, src.ip, src.tcp_port)
+                    {
+                        let target = ember::broker::RelayTarget {
+                            quic_port: src.quic_port,
+                            node_id: Some(src.publisher_id),
+                        };
+                        if relaying
+                            || start_ember_low_to_low_broker(state, tid, fh, src.ip, src.tcp_port, target).await
+                        {
+                            if let Some(pfs) = state.per_file_sources.get_mut(tid) {
+                                pfs.set_ember_relay(src.ip, src.tcp_port, src.user_hash);
+                            }
+                        }
+                    }
                 }
                 if matching_ids.is_empty() {
                     continue;

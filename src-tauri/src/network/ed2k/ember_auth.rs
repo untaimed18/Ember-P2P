@@ -19,6 +19,14 @@
 //! dispatcher. Restoring it as a live signing oracle would re-introduce the
 //! cross-session nonce-signing attack surface v2 deliberately closed.
 //!
+//! ## Not a credit link either
+//!
+//! A verified RESPONSE never ties an eD2K user hash to an Ember identity.
+//! The signed preimage is the domain and our nonce only, naming neither
+//! side's user hash, and builds before 1.7.5 sign any nonce they are sent, so
+//! a stranger could relay ours to one and pass its signature off as its own.
+//! Ember-stream credit takes only `super::key_link`'s proof, which names both.
+//!
 //! ## What this module deliberately does NOT do
 //!
 //! - Gate friend-slot priority, chat, browse, or FriendSeen.

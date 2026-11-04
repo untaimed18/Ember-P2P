@@ -470,14 +470,12 @@ pub(super) struct NetworkState {
     /// `0` means unknown (no trusted source has reported our public IP yet);
     /// any non-zero value is our public IPv4 confirmed by a trusted source
     /// (ed2k server HighID, multi-reporter KAD consensus, or UPnP→firewall
-    /// re-verification). The upload listener reads this atomic when building
-    /// an outgoing `OP_HELLOANSWER`: advertising our real ID here instead
-    /// of a hardcoded `0` lets strict eMule forks and older clients
-    /// correctly treat us as HighID in their queue scoring and callback
-    /// logic, rather than relying on BaseClient.cpp's forgiving
-    /// `m_nUserIDHybrid == 0 → use connect IP` auto-heal. Keeps this in
-    /// sync with `external_ip` via `set_external_ip` below so there is no
-    /// way to update one without the other.
+    /// re-verification). The upload listener reads it where it needs the
+    /// address peers see us at, such as checking a SecIdent signature made
+    /// over it. Never the client ID a Hello advertises: a LowID node knows
+    /// its public IP too (see `ed2k::messages::hello_client_id`). Keeps this
+    /// in sync with `external_ip` via `set_external_ip` so there is no way to
+    /// update one without the other.
     pub(super) external_ip_shared: Arc<std::sync::atomic::AtomicU32>,
     /// Whether we've done the initial self-lookup (FindNode for own ID)
     pub(super) self_lookup_done: bool,
@@ -692,7 +690,8 @@ pub(super) struct NetworkState {
     pub(super) udp_fw_node_search: Option<SearchId>,
     /// Whether we have LowID from the server
     pub(super) low_id: bool,
-    /// Our server-assigned client ID
+    /// Our server-assigned client ID. One input to the ID our Hellos
+    /// advertise; changes must be followed by `refresh_hello_client_id`.
     pub(super) server_client_id: u32,
     /// The TCP port we advertised in `OP_LOGINREQUEST` for the current
     /// session. eD2k has no "update my port" message once logged in — the
@@ -761,6 +760,10 @@ pub(super) struct NetworkState {
     pub(super) preferred_ed2k_server: Option<(String, u16)>,
     /// Instant when the last server connect attempt was started
     pub(super) server_last_connect_attempt: Option<std::time::Instant>,
+    /// When a server was last followed to a new address by its hostname
+    /// (`follow_moved_server`), so DNS that flips between answers cannot turn
+    /// reconnecting into a loop.
+    pub(super) server_last_moved_at: Option<std::time::Instant>,
     /// Pending USS ping timestamps for RTT measurement (at most one in flight).
     pub(super) pending_uss_pings: HashMap<SocketAddr, std::time::Instant>,
     /// Currently selected USS ping target
@@ -993,7 +996,8 @@ pub(super) struct NetworkState {
     /// so resolving by ID alone lost most of a fresh answer within the minute
     /// it took to publish against it.
     pub(super) ember_publish_targets: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)>,
-    /// Keys waiting for such a lookup, oldest first. On a small table
+    /// Keys waiting for such a lookup, oldest first, behind those a publish
+    /// waits on (see [`ember_publish_awaits_lookup_in`]). On a small table
     /// publishing never blocks on this: a key with no cached set publishes
     /// from the table now and gets a better set for its next republish.
     pub(super) ember_publish_target_queue: std::collections::VecDeque<[u8; 16]>,
@@ -1001,8 +1005,22 @@ pub(super) struct NetworkState {
     /// and whether the lookup has since ended, whatever it found. See
     /// [`ember_publish_awaits_lookup`].
     pub(super) ember_publish_target_waits: HashMap<[u8; 16], (i64, bool)>,
+    /// When the current minute of awaited target lookups began, and how many
+    /// it has started. See [`EMBER_MAX_AWAITED_TARGET_LOOKUPS_PER_MIN`].
+    pub(super) ember_awaited_lookup_minute: Option<(std::time::Instant, usize)>,
     /// In-flight target lookups, search id to the key each is resolving.
     pub(super) ember_publish_target_lookups: HashMap<u32, [u8; 16]>,
+    /// Our key-epoch records waiting for a target lookup, by key. See
+    /// [`hold_key_record_in`].
+    pub(super) ember_key_record_holds: HashMap<[u8; 16], KeyRecordHold>,
+    /// Held keys waiting for their lookup to start, a rotation's first.
+    pub(super) ember_key_record_queue: std::collections::VecDeque<[u8; 16]>,
+    /// Held keys whose lookup has landed, waiting for the search tick to
+    /// publish them.
+    pub(super) ember_key_records_ready: std::collections::VecDeque<[u8; 16]>,
+    /// In-flight key-record lookups, search id to key. Apart from
+    /// `ember_publish_target_lookups`, whose count bounds the library's.
+    pub(super) ember_key_record_lookups: HashMap<u32, [u8; 16]>,
     /// Whether this session managed to read `store_ember.dat` (or found there was
     /// none to read). Only the shutdown save consults it, to tell an empty store
     /// from a file it never got to open — see `bootstrap::save_store`.
@@ -1032,6 +1050,11 @@ pub(super) struct NetworkState {
     /// did not need one, and it hides exactly the open-port nodes that make the
     /// best relays for everyone else. See [`ember_udp_reachable`].
     pub(super) ember_udp_reachable_at: Option<i64>,
+    /// The last background outside-in probe we started, and the address and
+    /// advertised TCP port it was about. See [`maybe_probe_from_outside`].
+    pub(super) outside_probe_last: Option<(std::time::Instant, std::net::Ipv4Addr, u16)>,
+    /// When we last pinged our named source buddy to keep its path to us open.
+    pub(super) ember_buddy_keepalive_at: Option<std::time::Instant>,
     /// The external address `ember_reach_witness` and `ember_udp_reachable_at`
     /// were earned under. The evidence is dropped when the address moves to a
     /// different one, not when it is merely unknown for a while: KAD
@@ -1434,6 +1457,11 @@ pub(super) struct NetworkState {
     /// every record naming the old one is republished rather than left
     /// pointing searchers at it until its own republish comes round.
     pub(super) ember_named_source_buddy: Option<ember::dht::EmberNodeId>,
+    /// The buddy, endpoint and key the source records already out name, kept
+    /// through a gap in which none is named: the same buddy coming back as it
+    /// was is not a change, and making the whole library due again for it
+    /// re-proxied everything after every blip.
+    pub(super) ember_records_buddy: Option<(ember::dht::EmberNodeId, std::net::Ipv4Addr, u16, [u8; 32])>,
     /// Unix-second copy of the source-publish stamps, written to known.met
     /// so a restart does not treat the whole library as never-published.
     pub(super) ember_source_publish_unix: HashMap<[u8; 16], u32>,
@@ -1665,6 +1693,10 @@ pub(super) struct NetworkState {
     /// Last rendezvous lookup attempt per neighbor Ed25519 pubkey.
     pub(super) channel_neighbor_lookup_at: HashMap<[u8; 32], std::time::Instant>,
     pub(super) channel_neighbor_lookup_inflight: HashSet<[u8; 32]>,
+    /// When a lookup last handed us a neighbor's address and we pinged it. A
+    /// later lookup for the same neighbor means the ping never became a
+    /// contact, which is when the room relay is offered as well.
+    pub(super) channel_neighbor_pinged_at: HashMap<[u8; 32], std::time::Instant>,
     /// Earliest tick at which [`maybe_dial_channel_neighbors`] should read the
     /// member roster again. `None` means "next tick". See
     /// [`CHANNEL_NEIGHBOR_IDLE_RESCAN`].
@@ -1706,6 +1738,9 @@ pub(super) struct NetworkState {
     /// socket down, so a transfer that finished hashing as the user quit still
     /// gets its completion frame instead of being timed out by the sender.
     pub(super) xfer_finish_in_flight: usize,
+    /// Bytes room transfers sent as blocks, by the recipient's Ember identity,
+    /// for the KAD process tick to count against it in the credit ledger.
+    pub(super) xfer_block_uploads: Vec<([u8; 16], u64)>,
     /// Receives being verified and moved into place, by transfer id. Out of
     /// `xfer_recv` by then, so this is what a cancel, a leave or a ban finds
     /// them by.
@@ -1808,6 +1843,9 @@ pub(super) struct NetworkState {
     pub(super) ember_channel_claim_searches: HashMap<u32, [u8; 16]>,
     /// Claim blobs waiting to be verified against the owner's nomination.
     pub(super) ember_pending_channel_claim: Vec<([u8; 16], Vec<Vec<u8>>)>,
+    /// When the owner pass first held a room's snapshot for a claim lookup,
+    /// by room; see [`ember::channel::owner_return_waits_for_claims`].
+    pub(super) channel_return_held_since: HashMap<[u8; 16], i64>,
 }
 
 /// One in-flight iterative-lookup `FIND_NODE`, tracked by the network
@@ -1839,4 +1877,9 @@ pub(super) struct EmberSearchRequest {
     /// the search treats differently from a lost reply — see
     /// [`ember::dht::search::QueryFailure::HandshakeNeverCompleted`].
     pub(super) handshake_to: Option<(std::net::SocketAddr, [u8; 32])>,
+    /// Where the query went. An answer is taken only from there: the reply's
+    /// sender id is whatever key it was signed with, and a host holding many
+    /// keys could otherwise answer for ones it had gossiped at addresses in
+    /// other /24s, from its own, and pass for that many independent nodes.
+    pub(super) sent_to: std::net::SocketAddr,
 }

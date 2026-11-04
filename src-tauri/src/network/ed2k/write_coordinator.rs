@@ -440,6 +440,24 @@ impl PartFileWriter {
     }
 }
 
+/// The fsync requests queued straight behind `first`, all answered by one
+/// fsync: no write sits between any two of them, so that one is as durable
+/// for each as its own would be. Stops at the first other operation, which is
+/// returned to run next. Several sources verifying parts at once each ask.
+fn take_queued_syncs(
+    rx: &mut mpsc::Receiver<WriteOp>,
+    first: oneshot::Sender<io::Result<()>>,
+) -> (Vec<oneshot::Sender<io::Result<()>>>, Option<WriteOp>) {
+    let mut acks = vec![first];
+    while let Ok(op) = rx.try_recv() {
+        match op {
+            WriteOp::SyncData { ack } => acks.push(ack),
+            other => return (acks, Some(other)),
+        }
+    }
+    (acks, None)
+}
+
 fn writer_loop(
     mut file: std::fs::File,
     rx: &mut mpsc::Receiver<WriteOp>,
@@ -453,13 +471,15 @@ fn writer_loop(
     }
 
     let mut abandon = discarding(&discard);
+    // An operation taken off the queue while gathering fsync requests.
+    let mut next_op: Option<WriteOp> = None;
     while !abandon {
         // `blocking_recv` is documented to work outside an async context,
         // which is exactly the situation here (we're on a `std::thread`). The
         // discard watchdog spawned in `open` pokes `Abandon` into the queue, so
         // parking here costs nothing while idle and still releases the handle
         // promptly on a Cancel.
-        let Some(op) = rx.blocking_recv() else {
+        let Some(op) = next_op.take().or_else(|| rx.blocking_recv()) else {
             break;
         };
         // Checked between operations, which is the first moment after a wedged
@@ -520,7 +540,17 @@ fn writer_loop(
                     )));
                     break;
                 }
-                let _ = ack.send(file.sync_data());
+                let (acks, after) = take_queued_syncs(rx, ack);
+                next_op = after;
+                let result = file.sync_data();
+                for ack in acks {
+                    let _ = ack.send(
+                        result
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|e| io::Error::new(e.kind(), e.to_string())),
+                    );
+                }
             }
             WriteOp::Close => break,
             WriteOp::Abandon => {
@@ -586,6 +616,57 @@ mod tests {
         let (buf, _) = writer.hash_part_md4(100, 64).await.unwrap();
         assert!(buf.iter().all(|&b| b == 0xAB));
 
+        drop(writer);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn one_fsync_answers_only_the_requests_queued_before_the_next_write() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let sync = || {
+            let (ack, ack_rx) = oneshot::channel::<io::Result<()>>();
+            (WriteOp::SyncData { ack }, ack_rx)
+        };
+        let (first, _first_rx) = oneshot::channel();
+        let (second, _second_rx) = sync();
+        tx.try_send(second).unwrap();
+        let (ack, _) = oneshot::channel();
+        tx.try_send(WriteOp::Write {
+            offset: 0,
+            data: vec![1],
+            ack,
+        })
+        .unwrap();
+        let (after_write, _after_rx) = sync();
+        tx.try_send(after_write).unwrap();
+
+        let (acks, next) = take_queued_syncs(&mut rx, first);
+        assert_eq!(acks.len(), 2);
+        assert!(matches!(next, Some(WriteOp::Write { offset: 0, .. })));
+        assert!(matches!(rx.try_recv(), Ok(WriteOp::SyncData { .. })), "left for its own fsync");
+
+        let (acks, next) = take_queued_syncs(&mut rx, oneshot::channel().0);
+        assert_eq!(acks.len(), 1);
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_syncs_all_succeed() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let (path, allowed, base) = approved_temp_file("syncs", 4096);
+        let writer = PartFileWriter::open(path.clone(), allowed, None).await.unwrap();
+        writer.write(0, vec![7u8; 16]).await.unwrap();
+        let syncs: Vec<_> = (0..8)
+            .map(|_| {
+                let w = writer.clone();
+                tokio::spawn(async move { w.sync_data().await })
+            })
+            .collect();
+        for sync in syncs {
+            sync.await.unwrap().unwrap();
+        }
+        let (buf, _) = writer.hash_part_md4(0, 16).await.unwrap();
+        assert_eq!(buf, vec![7u8; 16]);
         drop(writer);
         let _ = std::fs::remove_dir_all(base);
     }

@@ -7,9 +7,9 @@ import test from "node:test";
 /**
  * Parity is not the same as liveness.
  *
- * `locales.test.mjs` guarantees the nine locale files carry exactly the keys
+ * `locales.test.mjs` guarantees the ten locale files carry exactly the keys
  * English does, which means a string nothing renders any more is not one dead
- * entry but nine — and translators keep re-reviewing text no user can reach.
+ * entry but ten — and translators keep re-reviewing text no user can reach.
  * A UI removal that leaves its strings behind is invisible to every other
  * check in the repo, so this one walks `src/` and requires each English key to
  * have a call site.

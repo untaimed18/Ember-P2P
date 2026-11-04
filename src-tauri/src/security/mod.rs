@@ -909,12 +909,25 @@ pub fn build_pinned_client(
         // and fast; anything over a minute is already failing.
         .timeout(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(15));
-    for addr in addrs {
-        builder = builder.resolve(host, *addr);
-    }
+    builder = builder.resolve_to_addrs(host, &ipv4_first(addrs));
     builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// `addrs` with IPv4 first, for a pinned client's override list.
+///
+/// One `resolve` call per address kept only the last, since each replaces the
+/// host's override: a single address with no fallback, and an IPv6 one
+/// whenever the resolver listed it last. The rendezvous binds punch and
+/// presence registrations to the IPv4 address they sign, and refused every
+/// one arriving over IPv6. The connector races the rest after the first
+/// address's family, so IPv4 first keeps those routes on IPv4 and still
+/// falls back to IPv6 when IPv4 does not connect.
+fn ipv4_first(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    let mut ordered = addrs.to_vec();
+    ordered.sort_by_key(|addr| addr.is_ipv6());
+    ordered
 }
 
 /// [`build_pinned_client`] for an ed2k web source: plain HTTP allowed (see
@@ -933,9 +946,7 @@ pub fn build_pinned_web_source_client(
         .connect_timeout(std::time::Duration::from_secs(15))
         .read_timeout(idle)
         .user_agent(user_agent);
-    for addr in addrs {
-        builder = builder.resolve(host, *addr);
-    }
+    builder = builder.resolve_to_addrs(host, &ipv4_first(addrs));
     builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
@@ -2144,6 +2155,18 @@ fn filter_message_text(text: &str, keep_joiners: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every resolved address is kept, IPv4 first, so routes the server binds
+    /// to a signed IPv4 address are tried over IPv4 and IPv6 is the fallback.
+    #[test]
+    fn a_pinned_client_keeps_every_address_ipv4_first() {
+        let v6: std::net::SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let v4a: std::net::SocketAddr = "203.0.113.1:443".parse().unwrap();
+        let v4b: std::net::SocketAddr = "203.0.113.2:443".parse().unwrap();
+        assert_eq!(ipv4_first(&[v6, v4a, v4b]), vec![v4a, v4b, v6]);
+        assert_eq!(ipv4_first(&[v4a, v6]), vec![v4a, v6]);
+        assert!(build_pinned_client("example.com", &[v6, v4a]).is_ok());
+    }
 
     #[test]
     fn relayed_stand_ins_name_no_peer_address() {

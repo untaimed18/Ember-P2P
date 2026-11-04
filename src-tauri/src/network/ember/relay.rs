@@ -65,11 +65,12 @@ const MAX_RELAY_REQUEST_NONCE_IDENTITIES: usize = 256;
 /// indirectly by reqwest's default response cap and the very small
 /// JSON shapes these endpoints accept; if a future endpoint needs
 /// larger bodies, add an explicit `bytes_per_response` cap here.
+///
+/// The rendezvous module's cached client, so the punch poll shares its
+/// connection pool instead of resolving DNS and doing a TLS handshake on
+/// every poll.
 async fn relay_http_client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
-    let (_, host, addrs) = crate::security::validate_fetch_url(rendezvous_url)
-        .await
-        .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
-    crate::security::build_pinned_client(&host, &addrs)
+    crate::network::rendezvous::client(rendezvous_url).await
 }
 
 /// Defense-in-depth: refuse to contact a non-HTTPS rendezvous/relay URL.
@@ -278,6 +279,13 @@ impl RelayManager {
     /// anyway, so the count drains naturally.
     pub fn set_policy(&mut self, enabled: bool, max_sessions: u32) {
         self.enabled = enabled;
+        // What we already advertised stays in peers' candidate lists until it
+        // expires. Forgetting it makes their requests the refusal they drop us
+        // for, not the capacity one they retry, and keeps turning the setting
+        // back on from reviving attestations signed before it went off.
+        if !enabled {
+            self.attestation_hashes.clear();
+        }
         // `max_relay_sessions` is config.json-only, so it never passes through
         // the settings screen's clamps. Bound it here: each session can move
         // `RELAY_MAX_BYTES_PER_DIRECTION` in each direction, so an absurd
@@ -881,32 +889,49 @@ pub async fn register_punch_with_ip(
     )
     .await?
     .ok_or_else(|| "punch target has no registered v2 identity".to_string())?;
-    let capability = super::crypto::derive_pairwise_presence_capability(
-        secret_key,
-        &target_pubkey,
-        &target_pubkey,
-        epoch,
-    )
-    .ok_or_else(|| "could not derive pairwise punch capability".to_string())?;
-    register_punch_with_capability(
-        rendezvous_url,
-        from_ember_hash,
-        target_ember_hash,
-        capability,
-        epoch,
-        port,
-        nat_type,
-        advertised_ip,
-        secret_key,
-    )
-    .await
+    // The target registers the current epoch's capability on its presence
+    // heartbeat, every two minutes, so for up to that long after a rollover
+    // the server only holds the previous epoch's and refuses the current one
+    // with 403. The refusal comes before the replay mark, and the target reads
+    // whichever epoch an entry carries, so the previous one is tried next.
+    let mut last_err = String::new();
+    for epoch in [epoch, epoch - 1] {
+        let capability = super::crypto::derive_pairwise_presence_capability(
+            secret_key,
+            &target_pubkey,
+            &target_pubkey,
+            epoch,
+        )
+        .ok_or_else(|| "could not derive pairwise punch capability".to_string())?;
+        match register_punch_status(
+            rendezvous_url,
+            from_ember_hash,
+            target_ember_hash,
+            capability,
+            epoch,
+            port,
+            nat_type,
+            advertised_ip,
+            secret_key,
+        )
+        .await?
+        {
+            status if status.is_success() => return Ok(()),
+            reqwest::StatusCode::FORBIDDEN => last_err = "punch register: status 403 Forbidden".to_string(),
+            status => return Err(format!("punch register: status {status}")),
+        }
+    }
+    Err(last_err)
 }
 
-/// Register a punch using a pre-derived capability (channel gossip neighbors).
+/// Send one punch registration under a pre-derived capability and report the
+/// server's answer, which callers read to retry the previous epoch on 403.
 ///
-/// Skips the friend identity oracle so a room peer cannot be confused with
-/// a friend punch slot.
-pub async fn register_punch_with_capability(
+/// Room neighbours call this directly with their channel capability, skipping
+/// the friend identity oracle so a room peer cannot be confused with a friend
+/// punch slot.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn register_punch_status(
     rendezvous_url: &str,
     from_ember_hash: &[u8; 16],
     target_ember_hash: &[u8; 16],
@@ -916,7 +941,7 @@ pub async fn register_punch_with_capability(
     nat_type: u8,
     advertised_ip: IpAddr,
     secret_key: &[u8; 32],
-) -> Result<(), String> {
+) -> Result<reqwest::StatusCode, String> {
     require_https(rendezvous_url)?;
     let protocol = crate::network::rendezvous::negotiate_protocol(rendezvous_url).await?;
     if matches!(advertised_ip, IpAddr::V6(_)) {
@@ -965,13 +990,7 @@ pub async fn register_punch_with_capability(
         .send()
         .await
         .map_err(|e| format!("punch register: {e}"))?;
-
-    let status = resp.status();
-    if status.is_success() {
-        Ok(())
-    } else {
-        Err(format!("punch register: status {status}"))
-    }
+    Ok(resp.status())
 }
 
 /// Verify initiator register proof returned by punch poll before dialing.
@@ -1063,6 +1082,46 @@ fn verify_punch_proof_freshness(register_ts: i64, epoch: i64, now: i64) -> Resul
     Ok(())
 }
 
+/// Mailbox senders a dedicated poller is waiting on right now, by the hashed id
+/// the mailbox reports, counted so overlapping waits on one sender nest.
+///
+/// One identity has one punch mailbox, and several pollers read it: the
+/// responder tick, a friend connect waiting on its friend's reply, a room
+/// punch waiting on its neighbour's. Only the waiting poller can tell such an
+/// entry is its own, so the responder, which acknowledges what it cannot use,
+/// leaves an awaited sender's entries to it.
+fn awaited_punch_senders() -> &'static parking_lot::Mutex<HashMap<String, usize>> {
+    static AWAITED: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    AWAITED.get_or_init(Default::default)
+}
+
+/// Marks a mailbox sender as awaited until dropped.
+pub struct AwaitedPunchSender(String);
+
+impl Drop for AwaitedPunchSender {
+    fn drop(&mut self) {
+        let mut awaited = awaited_punch_senders().lock();
+        if let Some(count) = awaited.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                awaited.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Wait on entries from `from_id` (a mailbox's hashed sender id).
+pub fn await_punch_from(from_id: String) -> AwaitedPunchSender {
+    *awaited_punch_senders().lock().entry(from_id.clone()).or_insert(0) += 1;
+    AwaitedPunchSender(from_id)
+}
+
+/// Whether some poller is waiting on entries from `from_id`.
+pub fn punch_sender_awaited(from_id: &str) -> bool {
+    awaited_punch_senders().lock().contains_key(from_id)
+}
+
 /// Signed self-mailbox poll. No friend list or stable target candidates are
 /// sent; the returned capability is checked by the caller against its local
 /// friend relationship before acknowledgement.
@@ -1082,6 +1141,13 @@ pub async fn poll_punch(
         }
     };
     let (target_id, target_raw) = punch_identity(our_ember_hash);
+    let client = relay_http_client(rendezvous_url).await?;
+    // The server refuses a poll that arrives after a later-signed one from the
+    // same key, and the responder tick, a friend connect and a room punch all
+    // poll this one mailbox. Signing and sending one at a time keeps them in
+    // order, where racing lost whichever crossed the other in flight.
+    static POLL_IN_ORDER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let in_order = POLL_IN_ORDER.lock().await;
     let ts = crate::network::rendezvous::current_timestamp();
     let nonce = punch_nonce();
     let mut signed = Vec::with_capacity(domain.len() + 1 + 32 + 16 + 8);
@@ -1091,7 +1157,6 @@ pub async fn poll_punch(
     signed.extend_from_slice(&nonce);
     signed.extend_from_slice(&ts.to_le_bytes());
     let sig = sign_punch(secret_key, &signed);
-    let client = relay_http_client(rendezvous_url).await?;
     let resp = client
         .post(format!("{}{}", rendezvous_url.trim_end_matches('/'), route))
         .json(&serde_json::json!({
@@ -1104,6 +1169,7 @@ pub async fn poll_punch(
         .send()
         .await
         .map_err(|e| format!("punch poll: {e}"))?;
+    drop(in_order);
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -1974,15 +2040,30 @@ enum PreSessionPermit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuicIncomingAddressPolicy {
+    /// Blocked, and nothing proves the source sent it: drop without a reply.
+    Ignore,
+    /// Blocked, at an address that has proven itself: refuse.
+    Refuse,
     Retry,
     ApplyAdmissionLimits,
 }
 
-fn quic_incoming_address_policy(remote_address_validated: bool) -> QuicIncomingAddressPolicy {
-    if remote_address_validated {
-        QuicIncomingAddressPolicy::ApplyAdmissionLimits
-    } else {
-        QuicIncomingAddressPolicy::Retry
+/// What to do with an inbound QUIC connection, before any per-IP accounting.
+///
+/// The ban list and IP filter come before Retry. A Retry is a send to an
+/// address nothing has validated, and answering a blocked one gives it a
+/// reply it was never owed — anything that treats "we sent to it" as a signal
+/// would then count it. A blocked source with an unproven address gets
+/// nothing at all, since a refusal would be the same send.
+fn quic_incoming_address_policy(
+    remote_address_validated: bool,
+    blocked: bool,
+) -> QuicIncomingAddressPolicy {
+    match (blocked, remote_address_validated) {
+        (true, false) => QuicIncomingAddressPolicy::Ignore,
+        (true, true) => QuicIncomingAddressPolicy::Refuse,
+        (false, false) => QuicIncomingAddressPolicy::Retry,
+        (false, true) => QuicIncomingAddressPolicy::ApplyAdmissionLimits,
     }
 }
 
@@ -2207,7 +2288,8 @@ pub struct FileStreamServe {
 ///
 /// `None` when the peer is not a friend. Otherwise the serve result, and the
 /// progress the carrier settles once it knows whether every byte arrived —
-/// which each carrier learns its own way.
+/// which each carrier learns its own way. What was sent counts against the
+/// friend in `credits` (see [`note_sent_over_ember`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_chat_attachment_stream<R, W>(
     ctx: &AttachServeContext,
@@ -2218,6 +2300,7 @@ pub async fn serve_chat_attachment_stream<R, W>(
     send: &mut W,
     header: &[u8; 7],
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+    credits: Option<&SharedCredits>,
 ) -> Option<(anyhow::Result<u64>, crate::network::chat_attach::ServeProgress)>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2273,7 +2356,20 @@ where
             "Chat attachment: stream to {peer_hex} stopped at {reached} of {size} bytes: {e}"
         ),
     }
+    note_sent_over_ember(credits, Some(peer_id), served.as_ref().ok().copied()).await;
     Some((served, progress))
+}
+
+/// The credit ledger a file stream's serve records what it sent in.
+pub type SharedCredits = std::sync::Arc<tokio::sync::RwLock<crate::network::ed2k::credits::CreditManager>>;
+
+/// Count `sent` bytes, sent to the Ember identity `peer` over one of Ember's
+/// own streams, against the eD2K user hash it is proven to own, as an upload
+/// to it over eD2K would count. Nothing when either is unknown.
+async fn note_sent_over_ember(credits: Option<&SharedCredits>, peer: Option<[u8; 16]>, sent: Option<u64>) {
+    if let (Some(credits), Some(peer), Some(sent)) = (credits, peer, sent) {
+        credits.write().await.add_uploaded_over_ember(&peer, sent);
+    }
 }
 
 /// Serve a room member's transfer request on a stream whose carrier has proved
@@ -2287,20 +2383,28 @@ pub async fn serve_room_transfer_stream<R, W>(
     send: &mut W,
     header: &[u8; 7],
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+    credits: Option<&SharedCredits>,
 ) -> anyhow::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
     let grants = ctx.grants.clone();
+    let mut progress = None;
+    let mut started_at = None;
     let served = super::attach_stream::serve_stream(
         super::attach::ROOM_XFER_STREAM_MSG_TYPE,
         recv,
         send,
         header,
-        |xfer_id| super::xfer::stream_grant_for(&grants, xfer_id, &peer_pubkey),
+        |xfer_id| {
+            let (grant, grant_progress) = super::xfer::stream_grant_for(&grants, xfer_id, &peer_pubkey)?;
+            progress = Some(grant_progress);
+            Some(grant)
+        },
         // Called only once the request's tag has verified.
         |xfer_id, position, _size| {
+            started_at.get_or_insert(position);
             super::xfer::note_stream_served(&grants, xfer_id, &peer_pubkey, position)
         },
         Some(limiter),
@@ -2311,6 +2415,12 @@ where
         Ok(bytes) => debug!("Ember Transfer: streamed {bytes} byte(s)"),
         Err(e) => debug!("Room transfer stream failed: {e}"),
     }
+    let counted = match (&served, progress, started_at) {
+        (Ok(sent), Some(progress), Some(from)) => progress.count_served(from, from.saturating_add(*sent)),
+        _ => 0,
+    };
+    let peer = super::crypto::node_id_from_ed25519_bytes(&peer_pubkey);
+    note_sent_over_ember(credits, peer, Some(counted).filter(|&bytes| bytes > 0)).await;
     served
 }
 
@@ -2322,13 +2432,16 @@ where
 /// refused as busy, and the follower asks again later. Returns the stream's
 /// id once this follower has been sent the whole file, over this stream and
 /// those before it, for the caller to count the download once the follower
-/// says it has it.
+/// says it has it. With `lists_only`, as over the server relay, only a
+/// feed's list is served.
 pub async fn serve_feed_stream<R, W>(
     recv: &mut R,
     send: &mut W,
     header: &[u8; 7],
     follower: Option<[u8; 16]>,
     limiter: &crate::bandwidth::limiter::BandwidthLimiter,
+    credits: Option<&SharedCredits>,
+    lists_only: bool,
 ) -> anyhow::Result<Option<[u8; 16]>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -2342,7 +2455,7 @@ where
         send,
         header,
         |xfer_id| {
-            let file = crate::network::feed_direct::served(xfer_id);
+            let file = crate::network::feed_direct::served(xfer_id, lists_only);
             busy.store(file == Err(super::attach::AttachStreamStatus::Busy), std::sync::atomic::Ordering::Relaxed);
             file
         },
@@ -2367,6 +2480,7 @@ where
         Ok(bytes) => debug!("Feed stream: served {bytes} byte(s)"),
         Err(e) => debug!("Feed stream failed: {e}"),
     }
+    note_sent_over_ember(credits, follower, served.as_ref().ok().copied()).await;
     let whole = streamed.and_then(|(xfer_id, _)| {
         let follower = follower?;
         crate::network::feed_direct::note_served(&xfer_id, follower, sent).then_some(xfer_id)
@@ -2441,6 +2555,7 @@ pub async fn run_quic_accept_loop(
     bandwidth_limiter: std::sync::Arc<crate::bandwidth::limiter::BandwidthLimiter>,
     attach_serve: Option<AttachServeContext>,
     room_serve: Option<RoomXferServeContext>,
+    credits: Option<SharedCredits>,
 ) {
     info!("QUIC accept loop started on {:?}", endpoint.local_addr());
     let ordinary_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(QUIC_ACCEPT_ORDINARY_CAP));
@@ -2466,27 +2581,38 @@ pub async fn run_quic_accept_loop(
             Some(inc) = accept_or_wait(legacy_endpoint.as_deref()) => inc,
         };
 
-        if quic_incoming_address_policy(incoming.remote_address_validated())
-            == QuicIncomingAddressPolicy::Retry
-        {
-            let remote = incoming.remote_address();
-            if let Err(error) = incoming.retry() {
-                debug!("QUIC accept: failed to issue Retry to {remote}: {error}");
-            }
-            continue;
-        }
-
         let remote_ip = incoming.remote_address().ip();
         // Before any per-IP accounting or handshake work: the operator's filter
         // and ban list apply to this transport exactly as they do to inbound
-        // eD2K TCP. `refuse()` rather than `retry()` — a blocked peer is not
-        // being asked to prove its address, it is being turned away.
-        if let Some(peer_v4) = quic_peer_ipv4(remote_ip) {
-            if let Some(reason) = address_policy.inbound_refusal(peer_v4) {
-                debug!("QUIC accept: refusing inbound from {remote_ip}: {reason}");
+        // eD2K TCP. A blocked peer is not asked to prove its address, it is
+        // turned away.
+        let refusal =
+            quic_peer_ipv4(remote_ip).and_then(|peer_v4| address_policy.inbound_refusal(peer_v4));
+        match quic_incoming_address_policy(incoming.remote_address_validated(), refusal.is_some()) {
+            QuicIncomingAddressPolicy::Ignore => {
+                debug!(
+                    "QUIC accept: dropping unvalidated inbound from {remote_ip}: {}",
+                    refusal.unwrap_or_default()
+                );
+                incoming.ignore();
+                continue;
+            }
+            QuicIncomingAddressPolicy::Refuse => {
+                debug!(
+                    "QUIC accept: refusing inbound from {remote_ip}: {}",
+                    refusal.unwrap_or_default()
+                );
                 incoming.refuse();
                 continue;
             }
+            QuicIncomingAddressPolicy::Retry => {
+                let remote = incoming.remote_address();
+                if let Err(error) = incoming.retry() {
+                    debug!("QUIC accept: failed to issue Retry to {remote}: {error}");
+                }
+                continue;
+            }
+            QuicIncomingAddressPolicy::ApplyAdmissionLimits => {}
         }
         {
             let mut counts = pending_ip_counts.lock();
@@ -2533,6 +2659,7 @@ pub async fn run_quic_accept_loop(
         let limiter = bandwidth_limiter.clone();
         let attach_serve = attach_serve.clone();
         let room_serve = room_serve.clone();
+        let credits = credits.clone();
         let accepted_at = tokio::time::Instant::now();
         tokio::spawn(async move {
             let pending_ip_guard = pending_ip_guard;
@@ -2665,6 +2792,7 @@ pub async fn run_quic_accept_loop(
                     &mut init_send,
                     &header,
                     limiter.as_ref(),
+                    credits.as_ref(),
                 )
                 .await
                 else {
@@ -2702,6 +2830,7 @@ pub async fn run_quic_accept_loop(
                     &mut init_send,
                     &header,
                     limiter.as_ref(),
+                    credits.as_ref(),
                 )
                 .await;
                 // As for an attachment: returning drops the connection, and
@@ -2715,8 +2844,16 @@ pub async fn run_quic_accept_loop(
                 // A follower fetching a file of a feed we publish. No identity
                 // check: a feed is public, and the request's id is the grant.
                 // The certificate names who it was, for the download count.
-                let finished =
-                    serve_feed_stream(&mut init_recv, &mut init_send, &header, peer_node_id, limiter.as_ref()).await;
+                let finished = serve_feed_stream(
+                    &mut init_recv,
+                    &mut init_send,
+                    &header,
+                    peer_node_id,
+                    limiter.as_ref(),
+                    credits.as_ref(),
+                    false,
+                )
+                .await;
                 let _ = init_send.finish();
                 let delivered = attachment_delivered(&init_send).await;
                 if let (Ok(Some(xfer_id)), true, Some(follower)) = (finished, delivered, peer_node_id) {
@@ -2809,7 +2946,12 @@ pub async fn run_quic_accept_loop(
                 // tick — one connection advertising zero credit was enough.
                 let reject_reason = {
                     let mut mgr_lock = mgr.lock().await;
-                    if !mgr_lock.accepts_attestation_hash(&verified.attestation_hash) {
+                    if !mgr_lock.enabled {
+                        debug!(
+                            "QUIC accept: refusing relay request from {remote}: relaying for peers is off"
+                        );
+                        Some(REJECT_AUTH)
+                    } else if !mgr_lock.accepts_attestation_hash(&verified.attestation_hash) {
                         debug!(
                             "QUIC accept: refusing relay request from {remote}: unknown or expired attestation hash"
                         );
@@ -2878,6 +3020,7 @@ pub async fn run_quic_accept_loop(
                     serve_friend_ember_hash: None,
                     // `remote` is the relay node, not the peer behind it.
                     relayed: true,
+                    friend_relay: false,
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping relay-target stream from {remote}: {e}");
@@ -2906,6 +3049,7 @@ pub async fn run_quic_accept_loop(
                     // and that side never arrives through this accept loop.
                     serve_friend_ember_hash: None,
                     relayed: false,
+                    friend_relay: false,
                 };
                 if let Err(e) = cb_tx.try_send(req) {
                     debug!("QUIC accept: dropping direct stream from {remote}: {e}");
@@ -3756,6 +3900,26 @@ mod tests {
     }
 
     #[test]
+    fn turning_relaying_off_forgets_what_was_advertised() {
+        let mut mgr = RelayManager::new();
+        let hash = [1u8; 32];
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        mgr.set_current_attestation_hash(hash, expires);
+        mgr.set_policy(true, 0);
+        assert!(mgr.accepts_attestation_hash(&hash));
+        mgr.set_policy(false, 0);
+        mgr.set_policy(true, 0);
+        assert!(
+            !mgr.accepts_attestation_hash(&hash),
+            "an attestation signed before relaying went off must not come back with it"
+        );
+    }
+
+    #[test]
     fn active_relay_ignores_waiting_session_idle_timeout() {
         let mut session = RelaySession::new(
             1,
@@ -4071,15 +4235,29 @@ mod tests {
     #[test]
     fn unvalidated_quic_incoming_retries_before_ip_accounting() {
         let mut pending_by_ip = HashMap::<IpAddr, usize>::new();
-        let policy = quic_incoming_address_policy(false);
+        let policy = quic_incoming_address_policy(false, false);
         if policy == QuicIncomingAddressPolicy::ApplyAdmissionLimits {
             pending_by_ip.insert("203.0.113.99".parse().unwrap(), 1);
         }
         assert_eq!(policy, QuicIncomingAddressPolicy::Retry);
         assert!(pending_by_ip.is_empty());
         assert_eq!(
-            quic_incoming_address_policy(true),
+            quic_incoming_address_policy(true, false),
             QuicIncomingAddressPolicy::ApplyAdmissionLimits
+        );
+    }
+
+    /// A banned or filtered source is never sent a Retry: unvalidated, it gets
+    /// nothing at all, and only a source that proved its address is refused.
+    #[test]
+    fn a_blocked_quic_incoming_is_turned_away_before_any_retry() {
+        assert_eq!(
+            quic_incoming_address_policy(false, true),
+            QuicIncomingAddressPolicy::Ignore
+        );
+        assert_eq!(
+            quic_incoming_address_policy(true, true),
+            QuicIncomingAddressPolicy::Refuse
         );
     }
 

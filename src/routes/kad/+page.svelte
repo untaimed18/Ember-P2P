@@ -12,15 +12,18 @@
   import { downloadNodesDat } from '$lib/api/settings';
   import { goto } from '$app/navigation';
   import { networkError, networkStats, serverStatus } from '$lib/stores/network';
-  import { toastSuccess, toastError, toast as toastInfo } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toastSuccess, toastError, toast: toastInfo } = toastsFor('network');
   import { passiveScroll } from '$lib/actions/passiveScroll';
   import { ctxMenuPosition } from '$lib/actions/ctxMenu';
   import type { KadContact, KadSearchEntry } from '$lib/types';
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import * as m from '$lib/paraglide/messages';
   import { translateError, degradedReasonText } from '$lib/i18n';
   import { kadNodesLoadedText } from '$lib/commandReplies';
-  import { inertBackground } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, menuKeydown, swallowKeyboardContextMenu } from '$lib/a11y';
   import { copyToClipboard, formatDateTime, formatNumber, formatSize } from '$lib/utils';
   import IconX from '$lib/components/IconX.svelte';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
@@ -66,6 +69,7 @@
   let lastEmptyRefresh = 0;
   let rechecking = $state(false);
   let recheckTimer: ReturnType<typeof setTimeout> | undefined;
+  let kadUsersHelpOpen = $state(false);
 
   let bootstrapOpen = $state(false);
   let bootstrapMode: BootstrapMode = $state('ip');
@@ -349,7 +353,17 @@
     });
   }
 
+  /** The user closing the dialog. A request in flight carries on — the backend
+   *  has no cancel for it — and reports through its own toast when it lands;
+   *  `bootstrapPending` keeps a second one from starting meanwhile. */
+  function dismissBootstrap() {
+    if (!bootstrapOpen) return;
+    if (bootstrapPending) toastInfo(m.kad_bootstrap_continues_in_background());
+    closeBootstrap();
+  }
+
   function closeBootstrap() {
+    if (!bootstrapOpen) return;
     bootstrapOpen = false;
     const el = bootstrapReturnFocus;
     bootstrapReturnFocus = null;
@@ -736,15 +750,50 @@
   }
 
   let searchColMenu: { x: number; y: number } | null = $state(null);
+  let searchColMenuEl: HTMLDivElement | undefined = $state();
+  let searchColReturnFocus: HTMLElement | null = null;
+
+  function showSearchColumnMenu(x: number, y: number, header: HTMLElement | null) {
+    searchColReturnFocus = header;
+    searchColMenu = { x, y };
+    void tick().then(() => searchColMenuEl?.querySelector<HTMLElement>('.ctx-item')?.focus());
+  }
 
   function openSearchColumnMenu(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
-    searchColMenu = { x: e.clientX, y: e.clientY };
+    const header = e.target instanceof Element ? e.target.closest('th[tabindex="0"]') : null;
+    showSearchColumnMenu(e.clientX, e.clientY, header instanceof HTMLElement ? header : null);
+  }
+
+  function searchHeaderKeydown(e: KeyboardEvent, key: string) {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      sortSearches(key);
+    } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      e.preventDefault();
+      e.stopPropagation();
+      swallowKeyboardContextMenu();
+      const header = e.currentTarget as HTMLElement;
+      const rect = header.getBoundingClientRect();
+      showSearchColumnMenu(rect.left + Math.min(24, rect.width / 2), rect.bottom, header);
+    }
   }
 
   function closeSearchColumnMenu() {
     searchColMenu = null;
+    searchColReturnFocus = null;
+  }
+
+  /** Escape: close and put focus back on the header the menu was opened from,
+   *  or the first header if hiding a column took that one away. */
+  function dismissSearchColumnMenu() {
+    const returnTo = searchColReturnFocus;
+    closeSearchColumnMenu();
+    const target = returnTo && document.contains(returnTo)
+      ? returnTo
+      : searchTableEl?.tHead?.querySelector<HTMLElement>('th[tabindex="0"]');
+    target?.focus();
   }
 
   function toggleSearchColumn(key: string) {
@@ -853,24 +902,6 @@
       $serverStatus === 'disconnected',
   );
 
-  // V2 keeps the cross-page mirroring of the global `networkError` store
-  // so a connect/listen failure raised elsewhere (e.g. by the network
-  // initializer in onMount of +layout) still surfaces here. Main's KAD
-  // page reverted this for separation-of-concerns; V2 prefers the
-  // single-pane visibility, so the dismiss button clears both stores.
-  let lastNetworkError: string | null = null;
-  $effect(() => {
-    const ne = $networkError;
-    // Mirror both directions: raise the banner when the global network error
-    // is set, and clear it when that error is cleared elsewhere. Tracking the
-    // previous value means a local (connect) error set while `networkError`
-    // didn't change is left intact.
-    if (ne !== lastNetworkError) {
-      lastNetworkError = ne;
-      kadError = ne;
-    }
-  });
-
   $effect(() => {
     if ($networkStats.status === 'disconnected') {
       contacts = [];
@@ -889,7 +920,7 @@
     if (e.key === 'Escape' && searchColMenu) {
       e.preventDefault();
       e.stopPropagation();
-      closeSearchColumnMenu();
+      dismissSearchColumnMenu();
     }
   }}
 />
@@ -918,10 +949,20 @@
   {/if}
 </div>
 
-{#if kadError}
+<!-- Two banners, not one: the page's own refresh and connect results come and
+     go with every poll, while `networkError` (a port in use, a failed bind)
+     holds for the session and has no other place on screen. -->
+{#if $networkError}
+  <div class="error-banner" role="alert">
+    <span>{$networkError}</span>
+    <button class="ghost" onclick={() => networkError.set(null)}>{m.common_dismiss()}</button>
+  </div>
+{/if}
+
+{#if kadError && kadError !== $networkError}
   <div class="error-banner" role="alert">
     <span>{kadError}</span>
-    <button class="ghost" onclick={() => { kadError = null; networkError.set(null); }}>{m.common_dismiss()}</button>
+    <button class="ghost" onclick={() => { kadError = null; }}>{m.common_dismiss()}</button>
   </div>
 {/if}
 
@@ -1135,7 +1176,17 @@
             <span class="stat-value stat-numeric">{formatNumber(contacts.length)}</span>
           </div>
           <div class="stat-tile">
-            <span class="stat-label" title={m.kad_stat_kad_users_title()}>{m.kad_stat_kad_users()}</span>
+            <span class="stat-label-row">
+              <span class="stat-label" title={m.kad_stat_kad_users_title()}>{m.kad_stat_kad_users()}</span>
+              <button
+                type="button"
+                class="term-help"
+                aria-expanded={kadUsersHelpOpen}
+                aria-controls="kad-users-help"
+                aria-label={m.kad_explain_term({ term: m.kad_stat_kad_users() })}
+                onclick={() => (kadUsersHelpOpen = !kadUsersHelpOpen)}
+              >?</button>
+            </span>
             <span class="stat-value stat-numeric">
               {$networkStats.status === 'disconnected' || $networkStats.kad_users_estimate == null
                 ? '—'
@@ -1143,6 +1194,7 @@
             </span>
           </div>
         </div>
+        <p class="tile-help" id="kad-users-help" hidden={!kadUsersHelpOpen}>{m.kad_stat_kad_users_title()}</p>
 
         <NetworkStatusTiles />
 
@@ -1190,13 +1242,10 @@
       aria-busy={bootstrapPending}
       tabindex="-1"
       onkeydown={(e) => {
-        // Matches the Cancel button: dismissing mid-request would strand
-        // `bootstrapPending` (cleared only in handleBootstrap's finally), so a
-        // reopen would show a spinner and a disabled submit for up to 90s.
         if (e.key === 'Escape') {
           e.preventDefault();
           e.stopPropagation();
-          if (!bootstrapPending) closeBootstrap();
+          dismissBootstrap();
           return;
         }
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !bootstrapPending) {
@@ -1222,11 +1271,16 @@
           }
         }
       }}
+      transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+      onoutrostart={inertDuringOutro}
     >
-      <div class="modal-content bootstrap-modal">
+      <div
+        class="modal-content bootstrap-modal"
+        transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+      >
         <div class="modal-header">
           <h3 id="kad-bootstrap-title">{m.kad_bootstrap_modal_title()}</h3>
-          <button type="button" class="icon-close" aria-label={m.common_close()} disabled={bootstrapPending} onclick={closeBootstrap}><IconX size={16} /></button>
+          <button type="button" class="icon-close" aria-label={m.common_close()} onclick={dismissBootstrap}><IconX size={16} /></button>
         </div>
         <div class="modal-body">
           <!--
@@ -1317,7 +1371,7 @@
           </div>
         </div>
         <div class="modal-footer">
-          <button class="ghost" onclick={closeBootstrap} disabled={bootstrapPending}>{m.common_cancel()}</button>
+          <button class="ghost" onclick={dismissBootstrap}>{m.common_cancel()}</button>
           <button
             class="primary"
             onclick={handleBootstrap}
@@ -1399,7 +1453,7 @@
                   role="columnheader"
                   aria-sort={searchSortCol === column.key ? (searchSortAsc ? 'ascending' : 'descending') : 'none'}
                   onclick={() => sortSearches(column.key)}
-                  onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), sortSearches(column.key))}
+                  onkeydown={(e) => searchHeaderKeydown(e, column.key)}
                 >
                   <span class="header-content">
                     {column.label}{getSortArrow(searchSortCol, column.key, searchSortAsc)}
@@ -1476,8 +1530,15 @@
 
 {#if searchColMenu}
   {@const menu = searchColMenu}
-  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-  <div class="ctx-menu ctx-scroll" role="menu" tabindex="-1" use:ctxMenuPosition={{ x: menu.x, y: menu.y }} onclick={(e) => e.stopPropagation()}>
+  <div
+    class="ctx-menu ctx-scroll"
+    role="menu"
+    tabindex="-1"
+    bind:this={searchColMenuEl}
+    use:ctxMenuPosition={{ x: menu.x, y: menu.y }}
+    onclick={(e) => e.stopPropagation()}
+    onkeydown={(e) => menuKeydown(e, e.currentTarget)}
+  >
     <div class="ctx-label" role="presentation">{m.kad_search_columns_title()}</div>
     {#each SEARCH_COLUMNS.filter((c) => c.key !== SEARCH_FIXED_COL) as column (column.key)}
       <button
@@ -1792,6 +1853,57 @@
 
   .tile-wide {
     grid-column: span 1;
+  }
+
+  /* The explanation behind a term, on a button so the keyboard and touch
+     reach it too; same look as `NetworkStatusTiles`' own. */
+  .stat-label-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .stat-label-row .stat-label {
+    min-width: 0;
+  }
+
+  .term-help {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .term-help:hover,
+  .term-help[aria-expanded='true'] {
+    background: transparent;
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .term-help:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .tile-help {
+    margin: 6px 0 8px;
+    font-size: var(--font-size-sm);
+    line-height: 1.45;
+    color: var(--text-secondary);
   }
 
   /* Numeric readouts get the larger "stat card" treatment so peer

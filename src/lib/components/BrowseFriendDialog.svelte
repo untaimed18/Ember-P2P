@@ -30,6 +30,8 @@
 
 <script lang="ts">
   import { onDestroy, tick, untrack } from 'svelte';
+  import { fade, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { goto } from '$app/navigation';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
@@ -53,7 +55,7 @@
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
 
   interface Props {
@@ -921,21 +923,28 @@
   <div bind:this={dialogRootEl}>
     <!-- svelte-ignore a11y_click_events_have_key_events -->
     <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="browse-overlay" onclick={requestClose}></div>
+    <div
+      class="browse-overlay"
+      onclick={requestClose}
+      transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+      onoutrostart={inertDuringOutro}
+    ></div>
     <!-- svelte-ignore a11y_interactive_supports_focus -->
     <div
       class="browse-modal"
       role="dialog"
       aria-modal="true"
-      aria-labelledby="browse-title-{instanceId}"
+      aria-labelledby="browse-title-{instanceId} browse-subtitle-{instanceId}"
       tabindex="-1"
       bind:this={modalEl}
       onkeydown={handleKeydown}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+      onoutrostart={inertDuringOutro}
     >
       <div class="browse-header">
         <div class="browse-header-text">
           <h3 id="browse-title-{instanceId}">{m.browse_title_prefix()}</h3>
-          <p class="browse-subtitle" title={friendName || friendHash}>
+          <p id="browse-subtitle-{instanceId}" class="browse-subtitle" title={friendName || friendHash}>
             <bdi dir="auto">{friendName || friendHash.slice(0, 8) + '\u2026'}</bdi>
           </p>
         </div>
@@ -962,14 +971,14 @@
 
       <div class="browse-body">
         {#if loading}
-          <div class="browse-status">{m.browse_requesting()}</div>
+          <div class="browse-status" role="status">{m.browse_requesting()}</div>
         {:else if error}
           <div class="browse-error">
-            <p>{error}</p>
+            <p role="alert">{error}</p>
             <button type="button" class="browse-retry" onclick={() => void retryBrowse()}>{m.common_retry()}</button>
           </div>
         {:else if files.length === 0}
-          <div class="browse-status">{m.browse_no_files()}</div>
+          <div class="browse-status" role="status">{m.browse_no_files()}</div>
         {:else}
           <div class="browse-toolbar">
             <div class="browse-categories" role="group" aria-label={m.library_type_filter_aria()}>
@@ -1004,6 +1013,11 @@
                   onkeydown={(e) => {
                     // Clear first, close second: otherwise Escape reaches the
                     // modal and throws away the filter and selection with it.
+                    // Mid-composition, Escape belongs to the IME alone.
+                    if (e.key === 'Escape' && (e.isComposing || e.keyCode === 229)) {
+                      e.stopPropagation();
+                      return;
+                    }
                     if (e.key === 'Escape' && filterQuery) {
                       e.preventDefault();
                       e.stopPropagation();
@@ -1050,7 +1064,8 @@
                   {m.browse_count_filtered({ filtered: filteredFiles.length, total: files.length })}
                 {:else}
                   {plural(files.length, {
-                    one: m.browse_count_one,
+                    one: () => m.browse_count_one({ count: files.length }),
+                    oneShowsCount: true,
                     few: () => m.browse_count_few({ count: files.length }),
                     other: () => m.browse_count_other({ count: files.length }),
                   })}
@@ -1170,7 +1185,8 @@
           {#if queuedCount > 0}
             <div class="browse-banner browse-banner-success" role="status">
               <span>{plural(queuedCount, {
-                one: m.browse_added_one,
+                one: () => m.browse_added_one({ count: formatNumber(queuedCount) }),
+                oneShowsCount: true,
                 other: () => m.browse_added_other({ count: formatNumber(queuedCount) }),
               })}</span>
               <button type="button" class="browse-link-btn" onclick={viewTransfers}>{m.browse_view_transfers()}</button>
@@ -1312,7 +1328,6 @@
     inset: 0;
     background: var(--overlay-bg);
     z-index: 10000;
-    animation: browse-fade-in 0.15s ease;
   }
 
   .browse-modal {
@@ -1332,17 +1347,6 @@
     box-shadow:
       inset 0 1px 0 var(--surface-highlight),
       var(--shadow-lg);
-    animation: browse-pop-in 0.2s ease;
-  }
-
-  /* Keyframe keeps the translate centering while scaling/fading in. */
-  @keyframes browse-fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  @keyframes browse-pop-in {
-    from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
-    to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
   }
 
   .browse-header {

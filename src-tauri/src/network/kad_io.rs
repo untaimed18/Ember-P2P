@@ -525,17 +525,6 @@ pub(super) fn can_advertise_direct_udp_callback(state: &NetworkState) -> bool {
         && state.external_udp_port.unwrap_or(state.udp_port) != 0
 }
 
-/// Mutate `state.external_ip` AND publish the change to the shared atomic
-/// that long-lived subsystems (e.g. the upload listener's HelloAnswer path)
-/// read without holding a lock. Always use this instead of assigning to
-/// `state.external_ip` directly so the two views never drift. `None` clears
-/// the atomic back to `0`, which the Hello builder interprets as "advertise
-/// client_id=0 and let the peer's BaseClient auto-heal from the connect IP"
-/// — correct fallback behavior when we don't yet have a trusted public IP.
-///
-/// The routing table is updated here too: KAD contact UDP keys are bound to our
-/// public address, so a table left on a stale IP would judge every stored key
-/// against the wrong one.
 /// HighID from a live ed2k server TCP connect-back, if it is a plausible IP.
 pub(super) fn live_highid_external_ip(state: &NetworkState) -> Option<Ipv4Addr> {
     if !state.server_connected || state.low_id {
@@ -603,6 +592,18 @@ pub(super) fn reach_evidence_survives(
     }
 }
 
+/// Mutate `state.external_ip` AND publish the change to the shared atomic
+/// that long-lived subsystems (e.g. the upload listener's SecIdent path)
+/// read without holding a lock. Always use this instead of assigning to
+/// `state.external_ip` directly so the two views never drift. `None` clears
+/// the atomic back to `0`.
+///
+/// This is our public address, not the client ID Hellos advertise: KAD's
+/// share of that ID is this address, so it is recomputed here too.
+///
+/// The routing table is updated here too: KAD contact UDP keys are bound to our
+/// public address, so a table left on a stale IP would judge every stored key
+/// against the wrong one.
 pub(super) fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
     if state.external_ip != ip {
         state.server_list.invalidate_udp_keys_for_public_ip(ip);
@@ -644,6 +645,27 @@ pub(super) fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
     state
         .external_ip_shared
         .store(client_id_le, std::sync::atomic::Ordering::Relaxed);
+    refresh_hello_client_id(state);
+}
+
+/// The client ID our Hellos advertise: eMule's `GetID()` over our KAD and
+/// server state. KAD counts as firewalled until a connect-back proves TCP
+/// open, as eMule's KAD does until its firewall check completes.
+pub(super) fn hello_client_id_for(state: &NetworkState) -> u32 {
+    ed2k::messages::emule_client_id(
+        state.stats.status == NetworkStatus::Connected,
+        state.firewall_checker.tcp_status()
+            != crate::network::kad::firewall::FirewallStatus::Open,
+        state.external_ip,
+        state.server_connected.then_some(state.server_client_id),
+    )
+}
+
+/// Publish [`hello_client_id_for`] to the Hello builders. Called wherever an
+/// input changes; `update_publish_manager_state` also runs it on every cache
+/// refresh, which bounds the lag for transitions that do not call it.
+pub(super) fn refresh_hello_client_id(state: &NetworkState) {
+    ed2k::messages::set_hello_client_id(hello_client_id_for(state));
 }
 
 /// Whether KAD *source* publishes must use the firewalled (buddy / type-6)
@@ -692,6 +714,7 @@ pub(super) fn update_publish_manager_state(state: &mut NetworkState) {
     );
     state.publish_manager.direct_udp_callback = can_advertise_direct_udp_callback(state);
     state.publish_manager.connect_options = build_kad_connect_options(state);
+    refresh_hello_client_id(state);
 
     if let Some(buddy) = state.buddy_manager.buddy_id().cloned() {
         state.publish_manager.buddy_id = Some(buddy);
@@ -830,7 +853,7 @@ pub(super) fn dispatch_udp_firewall_probe_requests(
             external_udp_port
         );
     }
-    let external_ip = state.external_ip;
+    let client_id = hello_client_id_for(state);
     let obfuscation_enabled = settings.obfuscation_enabled;
     for contact in contacts {
         state
@@ -844,7 +867,7 @@ pub(super) fn dispatch_udp_firewall_probe_requests(
             advertised_udp_port(state),
             external_udp_port,
             state.udp_key_seed,
-            external_ip,
+            client_id,
             obfuscation_enabled,
         );
     }
@@ -858,7 +881,7 @@ pub(super) fn spawn_udp_firewall_probe_request(
     udp_port: u16,
     external_udp_port: u16,
     udp_key_seed: u32,
-    external_ip: Option<Ipv4Addr>,
+    client_id: u32,
     obfuscation_enabled: bool,
 ) {
     let contact_ip = contact.ip;
@@ -872,7 +895,7 @@ pub(super) fn spawn_udp_firewall_probe_request(
             udp_port,
             external_udp_port,
             udp_key_seed,
-            external_ip,
+            client_id,
             obfuscation_enabled,
         )
         .await
@@ -905,7 +928,7 @@ pub(super) async fn send_udp_firewall_probe_request(
     udp_port: u16,
     external_udp_port: u16,
     udp_key_seed: u32,
-    external_ip: Option<Ipv4Addr>,
+    our_client_id: u32,
     obfuscation_enabled: bool,
 ) -> anyhow::Result<()> {
     let addr = SocketAddr::new(contact.ip.into(), contact.tcp_port);
@@ -916,9 +939,6 @@ pub(super) async fn send_udp_firewall_probe_request(
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(writer);
 
-    let our_client_id = external_ip
-        .map(|ip| u32::from_le_bytes(ip.octets()))
-        .unwrap_or(0);
     // Same crypt claims as every other Hello we send: the default options
     // advertise obfuscation even for a user who turned it off.
     let mut hello_options = ed2k::messages::HelloOptions::default_for_udp_port(udp_port);

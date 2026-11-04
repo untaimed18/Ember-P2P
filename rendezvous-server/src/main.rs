@@ -1021,7 +1021,7 @@ const NEW_KEY_WINDOW: Duration = Duration::from_secs(3600);
 /// the impact of `punch_register` spam against a victim once the
 /// per-IP rate limit is exhausted (the attacker would have to source
 /// from many IPs to fill more slots, which is also bounded by
-/// `MAX_GLOBAL_RELAY_SESSIONS` upstream).
+/// `MAX_GLOBAL_RELAY_SOCKETS` upstream).
 const MAX_PUNCH_PER_TARGET: usize = 8;
 /// Of [`MAX_PUNCH_PER_TARGET`], how many slots requesters authorized only by a
 /// public friend-code intro capability may hold at once. Everyone else's claim
@@ -1045,17 +1045,30 @@ const MAX_PUNCH_REQUESTS_TOTAL: usize = 100_000;
 /// LowID peers per active download and 2–3 active downloads, the
 /// realistic working set is 16–32 simultaneous sessions per client
 /// IP. `32` covers that with a small buffer; the global cap
-/// (`MAX_GLOBAL_RELAY_SESSIONS = 200`) still bounds total resource
-/// consumption to ~6 maxed-out clients before backpressure kicks in.
+/// ([`MAX_GLOBAL_RELAY_SOCKETS`]) still bounds total resource
+/// consumption to ~3 maxed-out clients before backpressure kicks in,
+/// since each of their sessions also holds a socket on the far peer's
+/// network.
 ///
-/// Counted per [`client_network`] rather than per address, so those ~6
+/// Counted per [`client_network`] rather than per address, so those
 /// clients must sit in distinct /24s or /64s: identities are free, and an
 /// exact-address key let one IPv6 host (or a handful of IPv4 addresses in one
 /// rented block) hold every relay slot. Not lowered below `32` because
 /// carrier-grade NAT puts many subscribers in one /24, and they are the users
-/// most likely to need the relay.
+/// most likely to need the relay. What is counted is joined sockets from the
+/// network, so a session with both ends in one network takes two.
 const MAX_RELAY_SESSIONS_PER_NETWORK: usize = 32;
-const MAX_GLOBAL_RELAY_SESSIONS: usize = 200;
+/// Joined relay sockets server-wide — the sum of `relay_network_counts` —
+/// not sessions: a bridged session holds two, so this admits at most 100
+/// bridged sessions (or 200 still waiting for their second peer).
+///
+/// This was named `MAX_GLOBAL_RELAY_SESSIONS`, and fly.toml's
+/// `[http_service.concurrency]` comment still calls it that: the proxy's
+/// `hard_limit` is the 240 ordinary connections plus one per relay join, and
+/// every join is a socket here. Counting sessions instead (400 sockets) would
+/// let relays pin the machine at the proxy, so raise this only together with
+/// that `hard_limit`.
+const MAX_GLOBAL_RELAY_SOCKETS: usize = 200;
 /// Combined (both directions summed) byte ceiling for a single relay
 /// session — see `RelaySessionEntry` for why both directions share one
 /// counter. This is the server-relay counterpart to
@@ -1070,14 +1083,28 @@ const MAX_GLOBAL_RELAY_SESSIONS: usize = 200;
 /// is no partial-credit or backoff.
 ///
 /// `256 MiB` covers dozens of parts per session while still bounding
-/// worst-case server egress: with `MAX_GLOBAL_RELAY_SESSIONS = 200`
-/// and `RELAY_SESSION_TIMEOUT` below, the absolute worst case is
-/// `200 * 256 MiB = 50 GiB` of relay traffic per timeout window, which
+/// worst-case server egress: with [`MAX_GLOBAL_RELAY_SOCKETS`] admitting
+/// 100 bridged sessions and `RELAY_SESSION_TIMEOUT` below, the absolute
+/// worst case is `100 * 256 MiB = 25 GiB` of relay traffic per timeout
+/// window (less once [`RELAY_NETWORK_BYTES_PER_SEC`] binds), which
 /// is a deliberately smaller blast radius than the client's own
 /// volunteer-relay ceiling (`4 sessions * 2 dirs * 8 GiB = 64 GiB` per
 /// `RELAY_MAX_DURATION`) since this server is shared infrastructure
 /// rather than a single peer's own uplink.
 const RELAY_BANDWIDTH_CAP_BYTES: usize = 256 * 1024 * 1024;
+/// Sustained rate at which one client network (the [`client_network`] /24 or
+/// /64 that keys [`MAX_RELAY_SESSIONS_PER_NETWORK`]) may send bytes into the
+/// server relay, summed over all its sessions. Socket counts and the per-session
+/// byte cap bound how much a network can move, not how fast, so one host could
+/// push its 32 sessions at line rate. Chat and room traffic is a few KiB/s and
+/// never reaches this; an eD2K upload through the relay is paced to 8 Mbit/s
+/// after the burst below, still well above the ~142 KiB/s a session needs to
+/// use its byte cap within `RELAY_SESSION_TIMEOUT`. Pacing stops reading the
+/// sender's socket, so TCP slows it down and no frame is dropped.
+const RELAY_NETWORK_BYTES_PER_SEC: u64 = 1024 * 1024;
+/// What a network may send at once before pacing starts, so a handshake or a
+/// few queued eD2K blocks pass at full speed.
+const RELAY_NETWORK_BURST_BYTES: u64 = 4 * 1024 * 1024;
 /// Hard per-session lifetime, independent of activity. Was `120s`,
 /// which is far too short for the byte cap above to ever be reached
 /// at realistic relay throughput (256 MiB in 120s needs a sustained
@@ -1086,7 +1113,7 @@ const RELAY_BANDWIDTH_CAP_BYTES: usize = 256 * 1024 * 1024;
 /// server-relayed transfers. `30` minutes gives a session a realistic
 /// chance to move the full byte budget (≈142 KiB/s sustained) while
 /// still bounding how long any one session can occupy a slot against
-/// `MAX_GLOBAL_RELAY_SESSIONS`. Transfers that need longer than this
+/// `MAX_GLOBAL_RELAY_SOCKETS`. Transfers that need longer than this
 /// simply reconnect through a fresh relay session and resume, same as
 /// any other eD2K peer disconnect — see `multi_source.rs` reconnect
 /// handling.
@@ -1097,10 +1124,12 @@ const RELAY_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// peer2 joins, this timeout is no longer consulted — so it does not
 /// need to scale with the bandwidth/duration changes above.
 const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Once both peers are bridged, retain the relay only while it carries
-/// application traffic. This is deliberately longer than the pre-bridge
-/// window so legitimate transfers can pause briefly, but it releases shared
-/// admission capacity long before the 30-minute absolute ceiling.
+/// Once both peers are bridged, each half closes the relay when its own peer
+/// has sent nothing for this long: no data frame and no pong to the
+/// [`RELAY_TRANSPORT_KEEPALIVE`] pings. Data alone was the old test, and it
+/// dropped quiet room relays every three minutes although both members still
+/// answered every ping. A peer that stopped answering is gone, and its slot
+/// is released long before the 30-minute absolute ceiling.
 const RELAY_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 /// How often a bridged relay pings its peer purely to keep the transport's
 /// `HTTP_IDLE_TIMEOUT` from expiring under it. Comfortably inside that window so
@@ -1413,6 +1442,8 @@ struct PunchEntry {
     created_at: Instant,
     /// Set while a poller holds this entry; expired leases return to the queue.
     leased_until: Option<Instant>,
+    /// When a poll last returned this entry; `None` until the first one.
+    last_served: Option<Instant>,
     proof_version: RendezvousVersion,
     /// Present only for v4. Legacy v3 deliberately preserves its original
     /// response shape and relies on the server-observed source address.
@@ -1530,6 +1561,94 @@ fn relay_queue() -> (RelayQueueSender, RelayQueueReceiver) {
 
 type RelayPeerChannel = (RelayQueueSender, Arc<AtomicUsize>);
 
+struct RelayByteBucket {
+    /// Negative while the network is in debt: every frame is charged in full
+    /// when it arrives, and its sender waits the debt off before reading more.
+    tokens: f64,
+    updated: Instant,
+}
+
+impl RelayByteBucket {
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.updated).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * RELAY_NETWORK_BYTES_PER_SEC as f64)
+            .min(RELAY_NETWORK_BURST_BYTES as f64);
+        self.updated = self.updated.max(now);
+    }
+
+    fn is_full(&self) -> bool {
+        self.tokens >= RELAY_NETWORK_BURST_BYTES as f64
+    }
+}
+
+/// Per-network token buckets for [`RELAY_NETWORK_BYTES_PER_SEC`]. A full
+/// bucket is the same as none, so idle ones are dropped: what stays is one
+/// per network that sent through the relay in the last few seconds, and only
+/// admitted relay sockets ([`MAX_GLOBAL_RELAY_SOCKETS`]) can send.
+#[derive(Default)]
+struct RelayBandwidth {
+    buckets: HashMap<IpAddr, RelayByteBucket>,
+}
+
+impl RelayBandwidth {
+    /// Charge `bytes` sent from `network`; how long its sender must wait
+    /// before reading another frame.
+    fn charge(&mut self, network: IpAddr, bytes: usize, now: Instant) -> Duration {
+        if self.buckets.len() >= MAX_GLOBAL_RELAY_SOCKETS && !self.buckets.contains_key(&network) {
+            self.prune(now);
+        }
+        let bucket = self.buckets.entry(network).or_insert(RelayByteBucket {
+            tokens: RELAY_NETWORK_BURST_BYTES as f64,
+            updated: now,
+        });
+        bucket.refill(now);
+        bucket.tokens -= bytes as f64;
+        if bucket.tokens >= 0.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(-bucket.tokens / RELAY_NETWORK_BYTES_PER_SEC as f64)
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.buckets.retain(|_, bucket| {
+            bucket.refill(now);
+            !bucket.is_full()
+        });
+    }
+}
+
+/// One relay socket's handle on its network's bucket.
+struct RelayPacer {
+    bandwidth: Arc<std::sync::Mutex<RelayBandwidth>>,
+    network: IpAddr,
+}
+
+impl RelayPacer {
+    fn new(state: &AppState, client_ip: IpAddr) -> Self {
+        Self {
+            bandwidth: state.relay_bandwidth.clone(),
+            network: client_network(client_ip),
+        }
+    }
+
+    /// Charge a frame this socket sent; until when its reads must pause.
+    fn charge(&self, bytes: usize) -> Option<tokio::time::Instant> {
+        let wait = self
+            .bandwidth
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .charge(self.network, bytes, Instant::now());
+        (!wait.is_zero()).then(|| tokio::time::Instant::now() + wait)
+    }
+}
+
+/// A frame other than data that shows the peer is still there: the pong to a
+/// keepalive ping (clients answer but never send pings), or a ping of its own.
+fn relay_control_frame_shows_liveness(message: &Message) -> bool {
+    matches!(message, Message::Pong(_) | Message::Ping(_))
+}
+
 struct RelaySessionEntry {
     peer1_inbox_tx: Option<RelayQueueSender>,
     peer2_announce_tx: Option<tokio::sync::oneshot::Sender<RelayPeerChannel>>,
@@ -1579,6 +1698,11 @@ struct RelayTicketStore {
     initiator_counts: HashMap<String, usize>,
     accepted_responder_counts: HashMap<String, usize>,
     expirations: VecDeque<(Instant, String)>,
+    /// Expired tickets kept for an outstanding pre-upgrade reservation, by
+    /// when to look again. Kept apart from `expirations`, whose front is the
+    /// next ticket to expire: put back there, a retry waited behind every
+    /// ticket issued in the TTL before it, up to 75 seconds past its time.
+    reservation_retries: BTreeSet<(Instant, String)>,
 }
 
 struct MailboxServedPage {
@@ -1719,26 +1843,88 @@ impl RelayTicketStore {
                 .expirations
                 .pop_front()
                 .expect("front was checked above");
-            let Some(ticket) = self.tickets.get(&ticket_id) else {
-                continue;
-            };
-            if ticket.expires_at > now {
-                continue;
+            self.remove_if_expired(ticket_id, now);
+        }
+        while self
+            .reservation_retries
+            .first()
+            .is_some_and(|(retry_at, _)| *retry_at <= now)
+        {
+            let (_, ticket_id) = self
+                .reservation_retries
+                .pop_first()
+                .expect("first was checked above");
+            self.remove_if_expired(ticket_id, now);
+        }
+    }
+
+    fn remove_if_expired(&mut self, ticket_id: String, now: Instant) {
+        let Some(ticket) = self.tickets.get(&ticket_id) else {
+            return;
+        };
+        if ticket.expires_at > now {
+            return;
+        }
+        if ticket.initiator_reservation.is_some() || ticket.responder_reservation.is_some() {
+            // A pre-upgrade capacity reservation is outstanding. Removing
+            // the ticket now would strand its `relay_network_counts` increment
+            // forever, because `rollback_relay_ticket_reservation` bails
+            // out when the ticket is gone and never decrements the count.
+            // Retain the ticket until the reservation watchdog window has
+            // passed (commit or rollback clears the reservation within
+            // `RELAY_UPGRADE_RESERVATION_TIMEOUT`), then look again.
+            self.reservation_retries
+                .insert((now + RELAY_UPGRADE_RESERVATION_TIMEOUT, ticket_id));
+            return;
+        }
+        self.remove(&ticket_id);
+    }
+
+    /// For an offer of `ticket_id` from `initiator_id` to `responder_id`
+    /// under `capability` for `epoch`, the ticket it replaces, if any. A pair
+    /// holds one ticket at a time, and an initiator offering the same
+    /// capability again has given up on its earlier one (its wait ran out, or
+    /// the responder never joined), so that ticket is replaced rather than
+    /// refusing every retry for the rest of its TTL. A different capability
+    /// in the same epoch is another purpose (a friend relay beside a room
+    /// relay, or another room), which replaces the earlier ticket only while
+    /// the responder has not accepted it (no role can join before), so neither
+    /// undoes a handshake under way. Capabilities change every epoch, so
+    /// across epochs a different one may be the same purpose retried after a
+    /// rollover, and is treated as a retry.
+    /// Also refused for an id already in use, and while the pair's ticket
+    /// has a pre-upgrade reservation outstanding: its rollback must still find
+    /// it to release the per-network count.
+    fn offer_replaces(
+        &self,
+        ticket_id: &str,
+        initiator_id: &str,
+        responder_id: &str,
+        capability: &[u8; 32],
+        epoch: i64,
+    ) -> Result<Option<String>, StatusCode> {
+        if self.tickets.contains_key(ticket_id) {
+            return Err(StatusCode::CONFLICT);
+        }
+        let Some(existing_id) = self
+            .by_responder
+            .get(responder_id)
+            .and_then(|by_initiator| by_initiator.get(initiator_id))
+        else {
+            return Ok(None);
+        };
+        match self.tickets.get(existing_id) {
+            Some(existing)
+                if existing.initiator_reservation.is_some()
+                    || existing.responder_reservation.is_some()
+                    || (existing.accepted
+                        && existing.epoch == epoch
+                        && existing.capability != *capability) =>
+            {
+                Err(StatusCode::CONFLICT)
             }
-            if ticket.initiator_reservation.is_some() || ticket.responder_reservation.is_some() {
-                // A pre-upgrade capacity reservation is outstanding. Removing
-                // the ticket now would strand its `relay_network_counts` increment
-                // forever, because `rollback_relay_ticket_reservation` bails
-                // out when the ticket is gone and never decrements the count.
-                // Retain the ticket until the reservation watchdog window has
-                // passed (commit or rollback clears the reservation within
-                // `RELAY_UPGRADE_RESERVATION_TIMEOUT`), then let a later
-                // sweep remove it.
-                self.expirations
-                    .push_back((now + RELAY_UPGRADE_RESERVATION_TIMEOUT, ticket_id));
-                continue;
-            }
-            self.remove(&ticket_id);
+            Some(_) => Ok(Some(existing_id.clone())),
+            None => Ok(None),
         }
     }
 
@@ -2417,9 +2603,15 @@ impl PunchStore {
         removed
     }
 
-    /// Lease the oldest entry for `target` that `version` may observe: an
-    /// unleased one if any, else (an idempotent re-poll mid-handshake) the
-    /// oldest leased one.
+    /// Lease the least recently served entry for `target` that `version` may
+    /// observe — never-served ones first, oldest registration first — taking
+    /// an unleased one if any, else (an idempotent re-poll mid-handshake) a
+    /// leased one.
+    ///
+    /// Ordering by registration alone starved pollers: clients leave entries
+    /// meant for another of their tasks unacknowledged, and a poller arriving
+    /// after their leases ran out was handed the same oldest ones every time,
+    /// never the newer one it was waiting for. Serving order rotates instead.
     fn lease_next(
         &mut self,
         target: &str,
@@ -2435,19 +2627,21 @@ impl PunchStore {
                 && (version == RendezvousVersion::LegacyV3
                     || entry.proof_version == RendezvousVersion::IpBoundV4)
         };
+        let serve_order = |entry: &PunchEntry| (entry.last_served, entry.created_at);
         let from = entries
             .iter()
             .filter(|(_, entry)| visible(entry) && punch_available(entry, now))
-            .min_by_key(|(_, entry)| entry.created_at)
+            .min_by_key(|(_, entry)| serve_order(entry))
             .or_else(|| {
                 entries
                     .iter()
                     .filter(|(_, entry)| visible(entry))
-                    .min_by_key(|(_, entry)| entry.created_at)
+                    .min_by_key(|(_, entry)| serve_order(entry))
             })
             .map(|(from, _)| from.clone())?;
         let entry = entries.get_mut(&from)?;
         entry.leased_until = Some(now + PUNCH_LEASE);
+        entry.last_served = Some(now);
         Some(entry)
     }
 
@@ -2576,6 +2770,9 @@ struct AppState {
     relay_admissions: Arc<RwLock<HashMap<(String, RelayRole), IpAddr>>>,
     /// Joined or reserved relay sockets, keyed by [`client_network`].
     relay_network_counts: Arc<RwLock<HashMap<IpAddr, usize>>>,
+    /// Relayed-byte pacing, keyed by [`client_network`]. A blocking mutex:
+    /// it is held only for arithmetic, never across an await.
+    relay_bandwidth: Arc<std::sync::Mutex<RelayBandwidth>>,
     next_relay_reservation_id: Arc<AtomicU64>,
     relay_tickets: Arc<RwLock<RelayTicketStore>>,
     /// Process-lifetime secret used to issue role tokens on demand. Ticket
@@ -3466,8 +3663,8 @@ async fn reserve_relay_ticket_join(
     // The ticket lock stays held until capacity is reserved so a failed
     // pre-upgrade check neither burns the token nor returns a false 101.
     let mut counts = state.relay_network_counts.write().await;
-    let global_total: usize = counts.values().sum();
-    if global_total >= MAX_GLOBAL_RELAY_SESSIONS {
+    let joined_sockets: usize = counts.values().sum();
+    if joined_sockets >= MAX_GLOBAL_RELAY_SOCKETS {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     let count = counts.entry(network).or_insert(0);
@@ -3508,11 +3705,21 @@ async fn commit_relay_ticket_reservation(
     }
     *pending = None;
     *joined = true;
-    drop(tickets);
+    let both_joined = ticket.initiator_joined && ticket.responder_joined;
+    // Recorded before the ticket lock is released: `relay_mailbox_offer`
+    // checks admissions under that lock before letting an id be offered again.
     state.relay_admissions.write().await.insert(
         (reservation.ticket_id.clone(), reservation.role),
         reservation.client_ip,
     );
+    if both_joined {
+        // Both role tokens are spent, so the ticket admits nothing more. Held
+        // to its TTL it kept the pair's slot and both parties' ticket counts,
+        // which refused the pair's next offer and, eight sessions in, every
+        // accept by the responder. Neither role has a reservation left for a
+        // rollback to look for, and `remove` releases each count only once.
+        tickets.remove(&reservation.ticket_id);
+    }
     Ok(())
 }
 
@@ -3803,30 +4010,38 @@ async fn reachability_v4(
         let refusal = serde_json::json!({ "reason": "hourly", "server_time": server_time });
         return Err((StatusCode::TOO_MANY_REQUESTS, Json(refusal)).into_response());
     }
-    let tcp = match tokio::time::timeout(
-        REACHABILITY_CONNECT_TIMEOUT,
-        tokio::net::TcpStream::connect(SocketAddr::new(client_ip, body.tcp_port)),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => {
-            drop(stream);
-            "open"
+    let tcp_check = async {
+        match tokio::time::timeout(
+            REACHABILITY_CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect(SocketAddr::new(client_ip, body.tcp_port)),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                "open"
+            }
+            Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => "closed",
+            _ => "timeout",
         }
-        Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => "closed",
-        _ => "timeout",
     };
-    let mut probe = Vec::with_capacity(REACHABILITY_PROBE_TAG.len() + nonce.len());
-    probe.extend_from_slice(REACHABILITY_PROBE_TAG);
-    probe.extend_from_slice(&nonce);
-    let mut udp_sent = false;
-    if let Ok(socket) = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await {
-        let target = SocketAddr::new(client_ip, body.udp_port);
-        for _ in 0..3 {
-            udp_sent |= socket.send_to(&probe, target).await.is_ok();
-            tokio::time::sleep(Duration::from_millis(150)).await;
+    let udp_check = async {
+        let mut probe = Vec::with_capacity(REACHABILITY_PROBE_TAG.len() + nonce.len());
+        probe.extend_from_slice(REACHABILITY_PROBE_TAG);
+        probe.extend_from_slice(&nonce);
+        let mut udp_sent = false;
+        if let Ok(socket) = tokio::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await {
+            let target = SocketAddr::new(client_ip, body.udp_port);
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                udp_sent |= socket.send_to(&probe, target).await.is_ok();
+            }
         }
-    }
+        udp_sent
+    };
+    let (tcp, udp_sent) = tokio::join!(tcp_check, udp_check);
     debug!("reachability check for {client_ip}: tcp {tcp}, udp sent {udp_sent}");
     Ok(Json(serde_json::json!({
         "available": true,
@@ -5192,6 +5407,7 @@ async fn punch_register_impl(
             epoch: body.epoch,
             created_at: now,
             leased_until: None,
+            last_served: None,
             proof_version: version,
             register_nonce: (version == RendezvousVersion::IpBoundV4).then_some(nonce),
             register_ts: (version == RendezvousVersion::IpBoundV4).then_some(body.ts),
@@ -5247,9 +5463,12 @@ async fn punch_poll_impl(
         RendezvousVersion::IpBoundV4 => build_punch_poll_v4_msg(&target_raw, &nonce, body.ts),
     };
     // A replayed poll would lease the target's current queue head — possibly
-    // registered after the original poll — to whoever holds it. Polls come
-    // one at a time from each client, so a single one-time scope per key
-    // (shared by v3 and v4) costs one mark and never refuses an honest poll.
+    // registered after the original poll — to whoever holds it. One one-time
+    // scope per key (shared by v3 and v4) costs one mark. A client's tasks may
+    // poll concurrently: polls signed in the same second are all admitted, but
+    // one arriving after a later-signed poll from the same key is refused, and
+    // that task waits for its next poll. Nothing is lost, as `lease_next`
+    // rotates through the live entries instead of serving the same head.
     let signer =
         verify_signed_relay_identity_signature(&state, &body.target_id, &signed, &sig).await?;
     admit_signed_request(
@@ -5504,21 +5723,42 @@ async fn relay_mailbox_offer(
     };
     let mut tickets = state.relay_tickets.write().await;
     prune_expired_relay_tickets(&mut tickets, now);
-    if tickets.tickets.len() >= MAX_RELAY_TICKETS
-        || tickets.envelope_bytes + ticket.mailbox_envelope.len() > MAX_RELAY_TICKET_ENVELOPE_BYTES
+    // A relay session outlives its ticket, and is keyed by its id like the
+    // admissions that release its per-network counts. Role tokens derive from
+    // the id, so a ticket offered again under it would join the live session's
+    // keys and overwrite its admissions, leaking those counts for good.
+    {
+        let admissions = state.relay_admissions.read().await;
+        if [RelayRole::Initiator, RelayRole::Responder]
+            .into_iter()
+            .any(|role| admissions.contains_key(&(ticket_id.clone(), role)))
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+    }
+    let replaced = tickets.offer_replaces(
+        &ticket_id,
+        &ticket.initiator_id,
+        &ticket.responder_id,
+        &ticket.capability,
+        ticket.epoch,
+    )?;
+    let (freed_tickets, freed_bytes) = replaced
+        .as_ref()
+        .and_then(|replaced_id| tickets.tickets.get(replaced_id))
+        .map_or((0, 0), |replaced| (1, replaced.mailbox_envelope.len()));
+    if tickets.tickets.len() - freed_tickets >= MAX_RELAY_TICKETS
+        || tickets.envelope_bytes - freed_bytes + ticket.mailbox_envelope.len()
+            > MAX_RELAY_TICKET_ENVELOPE_BYTES
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    if tickets.tickets.contains_key(&ticket_id)
-        || tickets
-            .by_responder
-            .get(&ticket.responder_id)
-            .is_some_and(|by_initiator| by_initiator.contains_key(&ticket.initiator_id))
-    {
-        return Err(StatusCode::CONFLICT);
-    }
-    if !initiator_has_ticket_capacity(&tickets, &ticket.initiator_id) {
+    // A replacement is the same initiator's, so it frees the slot it needs.
+    if replaced.is_none() && !initiator_has_ticket_capacity(&tickets, &ticket.initiator_id) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if let Some(replaced_id) = replaced {
+        tickets.remove(&replaced_id);
     }
     tickets.insert(ticket_id.clone(), ticket);
     Ok(Json(RelayTicketOfferResponse {
@@ -5864,6 +6104,7 @@ async fn handle_relay_ws(
             &session_id,
             role,
             session_deadline,
+            RelayPacer::new(&state, client_ip),
         )
         .await;
     } else {
@@ -5896,6 +6137,7 @@ async fn handle_relay_ws(
             peer2_announce_rx,
             &session_id,
             session_deadline,
+            RelayPacer::new(&state, client_ip),
         )
         .await;
         cleanup_relay(&state, &session_id, role).await;
@@ -5930,9 +6172,14 @@ async fn run_peer1_loop(
     peer2_announce_rx: tokio::sync::oneshot::Receiver<RelayPeerChannel>,
     session_id: &str,
     session_deadline: Instant,
+    pacer: RelayPacer,
 ) {
     let idle_timeout = tokio::time::sleep(RELAY_IDLE_TIMEOUT);
     tokio::pin!(idle_timeout);
+    // Armed when peer2 joins; `bridge_relay` holds peer2's half to the same rule.
+    let peer_idle_timeout = tokio::time::sleep(RELAY_BRIDGE_IDLE_TIMEOUT);
+    tokio::pin!(peer_idle_timeout);
+    let mut reads_paused_until: Option<tokio::time::Instant> = None;
     let mut announce_rx = Some(peer2_announce_rx);
     let mut peer2_tx: Option<RelayQueueSender> = None;
     let mut total_bytes: Option<Arc<AtomicUsize>> = None;
@@ -5966,10 +6213,25 @@ async fn run_peer1_loop(
                 info!("relay session {} timed out waiting for peer2", &session_id[..8.min(session_id.len())]);
                 break;
             }
+            _ = &mut peer_idle_timeout, if peer2_tx.is_some() => {
+                info!(
+                    "relay session {} closed: peer1 silent for {:?}",
+                    &session_id[..8.min(session_id.len())],
+                    RELAY_BRIDGE_IDLE_TIMEOUT
+                );
+                break;
+            }
+            _ = tokio::time::sleep_until(reads_paused_until.unwrap_or_else(tokio::time::Instant::now)),
+                if reads_paused_until.is_some() => {
+                reads_paused_until = None;
+            }
             announced = async { announce_rx.as_mut().unwrap().await }, if announce_rx.is_some() => {
                 announce_rx = None;
                 match announced {
                     Ok((tx, counter)) => {
+                        peer_idle_timeout
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RELAY_BRIDGE_IDLE_TIMEOUT);
                         peer2_tx = Some(tx);
                         total_bytes = Some(counter);
                         let Some(ref tx) = peer2_tx else { return };
@@ -5993,17 +6255,22 @@ async fn run_peer1_loop(
                     }
                 }
             }
-            // Stop reading while a bounded pre-bridge queue is full. This
-            // applies WebSocket/TCP backpressure instead of silently losing
-            // handshake frames.
-            msg = socket.recv(), if peer2_tx.is_some()
-                || (prebridge_frames.len() < MAX_PREBRIDGE_RELAY_FRAMES
-                    && prebridge_bytes < MAX_PREBRIDGE_RELAY_BYTES) => {
+            // Stop reading while a bounded pre-bridge queue is full, or while
+            // this network's relay bandwidth is paced. This applies
+            // WebSocket/TCP backpressure instead of silently losing frames.
+            msg = socket.recv(), if reads_paused_until.is_none()
+                && (peer2_tx.is_some()
+                    || (prebridge_frames.len() < MAX_PREBRIDGE_RELAY_FRAMES
+                        && prebridge_bytes < MAX_PREBRIDGE_RELAY_BYTES)) => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
                         if data.len() > MAX_RELAY_FRAME_BYTES {
                             break;
                         }
+                        reads_paused_until = pacer.charge(data.len());
+                        peer_idle_timeout
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RELAY_BRIDGE_IDLE_TIMEOUT);
                         if let (Some(ref tx), Some(ref counter)) = (&peer2_tx, &total_bytes) {
                             let new_total =
                                 counter.fetch_add(data.len(), Ordering::Relaxed) + data.len();
@@ -6027,6 +6294,11 @@ async fn run_peer1_loop(
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(control)) if relay_control_frame_shows_liveness(&control) => {
+                        peer_idle_timeout
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RELAY_BRIDGE_IDLE_TIMEOUT);
+                    }
                     _ => {}
                 }
             }
@@ -6077,9 +6349,11 @@ async fn bridge_relay(
     session_id: &str,
     role: RelayRole,
     deadline: Instant,
+    pacer: RelayPacer,
 ) {
-    let bridge_idle_timeout = tokio::time::sleep(RELAY_BRIDGE_IDLE_TIMEOUT);
-    tokio::pin!(bridge_idle_timeout);
+    let peer_idle_timeout = tokio::time::sleep(RELAY_BRIDGE_IDLE_TIMEOUT);
+    tokio::pin!(peer_idle_timeout);
+    let mut reads_paused_until: Option<tokio::time::Instant> = None;
     // The upgraded socket still sits on the `IdleTimeoutStream` that
     // `serve_connection` was given, and `with_upgrades()` hands that same IO to
     // this task — so `HTTP_IDLE_TIMEOUT` outranks every relay lifetime rule
@@ -6105,20 +6379,28 @@ async fn bridge_relay(
                     break;
                 }
             }
-            _ = &mut bridge_idle_timeout => {
+            _ = &mut peer_idle_timeout => {
                 info!(
-                    "relay session {} timed out after {:?} without bridged traffic",
+                    "relay session {} closed: peer2 silent for {:?}",
                     &session_id[..8.min(session_id.len())],
                     RELAY_BRIDGE_IDLE_TIMEOUT
                 );
                 break;
             }
-            msg = socket.recv() => {
+            _ = tokio::time::sleep_until(reads_paused_until.unwrap_or_else(tokio::time::Instant::now)),
+                if reads_paused_until.is_some() => {
+                reads_paused_until = None;
+            }
+            msg = socket.recv(), if reads_paused_until.is_none() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
                         if data.len() > MAX_RELAY_FRAME_BYTES {
                             break;
                         }
+                        reads_paused_until = pacer.charge(data.len());
+                        peer_idle_timeout
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RELAY_BRIDGE_IDLE_TIMEOUT);
                         let new_total =
                             total_bytes.fetch_add(data.len(), Ordering::Relaxed) + data.len();
                         if new_total > RELAY_BANDWIDTH_CAP_BYTES {
@@ -6131,11 +6413,13 @@ async fn bridge_relay(
                         if peer1_inbox_tx.send(data.to_vec()).await.is_err() {
                             break;
                         }
-                        bridge_idle_timeout
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(control)) if relay_control_frame_shows_liveness(&control) => {
+                        peer_idle_timeout
                             .as_mut()
                             .reset(tokio::time::Instant::now() + RELAY_BRIDGE_IDLE_TIMEOUT);
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
             }
@@ -6160,9 +6444,6 @@ async fn bridge_relay(
                         ) {
                             break;
                         }
-                        bridge_idle_timeout
-                            .as_mut()
-                            .reset(tokio::time::Instant::now() + RELAY_BRIDGE_IDLE_TIMEOUT);
                     }
                     None => break,
                 }
@@ -6237,7 +6518,10 @@ async fn stats_handler(
     let relay_count =
         state.relay_sessions.read().await.len() + state.bridged_relays.read().await.len();
     let punch_count = state.punch_requests.read().await.len();
-    let relay_ip_count = state.relay_network_counts.read().await.len();
+    let (relay_ip_count, relay_socket_count) = {
+        let counts = state.relay_network_counts.read().await;
+        (counts.len(), counts.values().sum::<usize>())
+    };
     let presence_count = state.store.read().await.len();
     let uptime_secs = state.started_at.elapsed().as_secs();
     let channels_registry_read_only = state.channels_registry.read().await.is_read_only();
@@ -6250,11 +6534,14 @@ async fn stats_handler(
         "chat_mailbox_items": chat_mailbox_items,
         "chat_mailbox_bytes": chat_mailbox_bytes,
         "active_relay_sessions": relay_count,
+        // The global relay cap bounds sockets, two per bridged session, so it
+        // is reported beside the socket count rather than the session count.
+        "active_relay_sockets": relay_socket_count,
         "active_punch_requests": punch_count,
         "relay_ip_count": relay_ip_count,
         "registered_peers": presence_count,
         "uptime_seconds": uptime_secs,
-        "max_global_relays": MAX_GLOBAL_RELAY_SESSIONS,
+        "max_global_relays": MAX_GLOBAL_RELAY_SOCKETS,
         "channels_registry_read_only": channels_registry_read_only,
     })))
 }
@@ -6502,6 +6789,11 @@ async fn sweep_expired(state: AppState) {
                 debug!("swept {removed} expired relay tickets");
             }
         }
+        state
+            .relay_bandwidth
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .prune(now);
 
         // Sweep both waiting and actively bridged sessions at their original
         // absolute deadline. Counter release is registry-backed and
@@ -6669,6 +6961,7 @@ async fn main() {
         bridged_relays: Arc::new(RwLock::new(HashMap::new())),
         relay_admissions: Arc::new(RwLock::new(HashMap::new())),
         relay_network_counts: Arc::new(RwLock::new(HashMap::new())),
+        relay_bandwidth: Arc::new(std::sync::Mutex::new(RelayBandwidth::default())),
         next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
         relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
         relay_token_key: {
@@ -6894,6 +7187,7 @@ mod relay_ticket_tests {
             bridged_relays: Arc::new(RwLock::new(HashMap::new())),
             relay_admissions: Arc::new(RwLock::new(HashMap::new())),
             relay_network_counts: Arc::new(RwLock::new(HashMap::new())),
+            relay_bandwidth: Arc::new(std::sync::Mutex::new(RelayBandwidth::default())),
             next_relay_reservation_id: Arc::new(AtomicU64::new(1)),
             relay_tickets: Arc::new(RwLock::new(RelayTicketStore::default())),
             relay_token_key: [0x5a; 32],
@@ -8935,6 +9229,7 @@ mod relay_ticket_tests {
             epoch: 1,
             created_at: Instant::now(),
             leased_until: None,
+            last_served: None,
             proof_version: RendezvousVersion::IpBoundV4,
             register_nonce: Some([4; 16]),
             register_ts: Some(1),
@@ -8983,6 +9278,7 @@ mod relay_ticket_tests {
             epoch: 1,
             created_at: now,
             leased_until: Some(now + PUNCH_LEASE),
+            last_served: None,
             proof_version: RendezvousVersion::IpBoundV4,
             register_nonce: Some([4; 16]),
             register_ts: Some(1),
@@ -9008,6 +9304,7 @@ mod relay_ticket_tests {
             epoch: 1,
             created_at,
             leased_until: None,
+            last_served: None,
             proof_version: version,
             register_nonce: Some([1; 16]),
             register_ts: Some(1),
@@ -9044,6 +9341,50 @@ mod relay_ticket_tests {
             .lease_next(&target, RendezvousVersion::IpBoundV4, now)
             .map(|entry| entry.punch_id.clone());
         assert_eq!(again.as_deref(), Some(&*"11".repeat(32)));
+    }
+
+    /// A poller that leaves other tasks' entries unacknowledged, polling after
+    /// their leases ran out, was handed the oldest entry every time and never
+    /// the newest one it was waiting for.
+    #[test]
+    fn punch_polls_rotate_through_entries_left_unacknowledged() {
+        let start = Instant::now();
+        let target = "tt".repeat(32);
+        let mut punches = PunchStore::default();
+        let ids = ["01", "02", "03", "04"];
+        for (age, id) in ids.iter().enumerate() {
+            punches.insert(
+                target.clone(),
+                id.repeat(32),
+                punch_entry(
+                    &id.repeat(32),
+                    &id.repeat(32),
+                    start + Duration::from_millis(age as u64),
+                    RendezvousVersion::IpBoundV4,
+                ),
+            );
+        }
+        let mut now = start + Duration::from_millis(10);
+        let mut served = Vec::new();
+        for _ in 0..ids.len() + 1 {
+            served.push(
+                punches
+                    .lease_next(&target, RendezvousVersion::IpBoundV4, now)
+                    .map(|entry| entry.punch_id[..2].to_owned())
+                    .unwrap(),
+            );
+            now += PUNCH_LEASE + Duration::from_millis(1);
+        }
+        assert_eq!(served, ["01", "02", "03", "04", "01"]);
+
+        // Concurrent polls within one lease each get a different entry.
+        let first = punches
+            .lease_next(&target, RendezvousVersion::IpBoundV4, now)
+            .map(|entry| entry.punch_id.clone());
+        let second = punches
+            .lease_next(&target, RendezvousVersion::IpBoundV4, now)
+            .map(|entry| entry.punch_id.clone());
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -9268,17 +9609,419 @@ mod relay_ticket_tests {
             StatusCode::CONFLICT
         );
         assert_eq!(
-            admit_relay_ticket_join(&state, &ticket_id, &responder_token, client_ip)
-                .await
-                .unwrap(),
-            RelayRole::Responder
-        );
-        assert_eq!(
             admit_relay_ticket_join(&state, &ticket_id, &"cd".repeat(32), client_ip)
                 .await
                 .unwrap_err(),
             StatusCode::UNAUTHORIZED
         );
+        assert_eq!(
+            admit_relay_ticket_join(&state, &ticket_id, &responder_token, client_ip)
+                .await
+                .unwrap(),
+            RelayRole::Responder
+        );
+        for token in [&initiator_token, &responder_token] {
+            assert_eq!(
+                admit_relay_ticket_join(&state, &ticket_id, token, client_ip)
+                    .await
+                    .unwrap_err(),
+                StatusCode::GONE,
+                "both tokens are spent once both roles have joined"
+            );
+        }
+    }
+
+    /// Once both roles join, the ticket admits nothing more, so it must not
+    /// keep holding the pair slot and the ticket counts until its TTL.
+    #[tokio::test]
+    async fn a_ticket_is_released_once_both_roles_join() {
+        let state = test_state();
+        let ticket_id = "a1".repeat(32);
+        let (initiator_token, responder_token) =
+            insert_ticket(&state, &ticket_id, Instant::now() + Duration::from_secs(30)).await;
+        // The same pair's responder holds a second accepted ticket, so a
+        // double decrement of its count would show.
+        state
+            .relay_tickets
+            .write()
+            .await
+            .insert("a2".repeat(32), ticket_with_parties(&"33".repeat(32), &"22".repeat(32), true));
+
+        assert_eq!(
+            join_from(&state, &ticket_id, &initiator_token, "8.8.8.8").await,
+            Ok(RelayRole::Initiator)
+        );
+        assert!(
+            state.relay_tickets.read().await.tickets.contains_key(&ticket_id),
+            "the responder has yet to join"
+        );
+        assert_eq!(
+            join_from(&state, &ticket_id, &responder_token, "9.9.9.9").await,
+            Ok(RelayRole::Responder)
+        );
+        {
+            let mut tickets = state.relay_tickets.write().await;
+            assert!(!tickets.tickets.contains_key(&ticket_id));
+            assert!(!tickets.by_responder["22".repeat(32).as_str()].contains_key(&"11".repeat(32)));
+            assert!(!tickets.initiator_counts.contains_key(&"11".repeat(32)));
+            assert_eq!(tickets.accepted_responder_counts.get(&"22".repeat(32)), Some(&1));
+
+            assert!(tickets.remove(&ticket_id).is_none(), "removal is idempotent");
+            prune_expired_relay_tickets(&mut tickets, Instant::now() + RELAY_TICKET_TTL);
+            assert!(tickets.accepted_responder_counts.is_empty());
+            assert!(tickets.initiator_counts.is_empty());
+        }
+        // The relay itself still holds both sockets until it closes.
+        assert_eq!(state.relay_admissions.read().await.len(), 2);
+        assert_eq!(state.relay_network_counts.read().await.values().sum::<usize>(), 2);
+    }
+
+    /// An expired ticket held for its reservation used to be put back at the
+    /// end of the expiry queue, behind every ticket issued after it.
+    #[test]
+    fn a_reserved_ticket_is_removed_soon_after_its_reservation_clears() {
+        let start = Instant::now();
+        let reserved_id = "77".repeat(32);
+        let later_id = "78".repeat(32);
+        let mut tickets = RelayTicketStore::default();
+        let mut reserved = ticket_with_parties(&"55".repeat(32), &"66".repeat(32), true);
+        reserved.expires_at = start;
+        reserved.initiator_reservation = Some(1);
+        tickets.insert(reserved_id.clone(), reserved);
+        let mut later = ticket_with_parties(&"58".repeat(32), &"66".repeat(32), false);
+        later.expires_at = start + RELAY_TICKET_TTL;
+        tickets.insert(later_id.clone(), later);
+
+        tickets.prune_expired(start);
+        assert!(tickets.tickets.contains_key(&reserved_id));
+        let retry = start + RELAY_UPGRADE_RESERVATION_TIMEOUT;
+        tickets.prune_expired(retry);
+        assert!(
+            tickets.tickets.contains_key(&reserved_id),
+            "still reserved, so it is kept and looked at again"
+        );
+
+        tickets
+            .tickets
+            .get_mut(&reserved_id)
+            .unwrap()
+            .initiator_reservation = None;
+        tickets.prune_expired(retry + RELAY_UPGRADE_RESERVATION_TIMEOUT);
+        assert!(
+            !tickets.tickets.contains_key(&reserved_id),
+            "removed at its retry, not after the later ticket's expiry"
+        );
+        assert!(tickets.tickets.contains_key(&later_id));
+        assert!(tickets.reservation_retries.is_empty());
+        assert!(!tickets.initiator_counts.contains_key(&"55".repeat(32)));
+    }
+
+    #[test]
+    fn an_offer_replaces_its_pairs_ticket_unless_it_is_mid_join() {
+        let (initiator, responder) = ("31".repeat(32), "32".repeat(32));
+        let capability = [0; 32];
+        let mut tickets = RelayTicketStore::default();
+        assert_eq!(
+            tickets.offer_replaces(&"01".repeat(32), &initiator, &responder, &capability, 0),
+            Ok(None)
+        );
+        tickets.insert("01".repeat(32), ticket_with_parties(&initiator, &responder, true));
+
+        assert_eq!(
+            tickets.offer_replaces(&"01".repeat(32), &"39".repeat(32), &responder, &capability, 0),
+            Err(StatusCode::CONFLICT),
+            "an id in use is never replaced"
+        );
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &capability, 0),
+            Ok(Some("01".repeat(32)))
+        );
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &"39".repeat(32), &responder, &capability, 0),
+            Ok(None),
+            "another initiator's offer replaces nothing"
+        );
+        tickets.tickets.get_mut(&"01".repeat(32)).unwrap().responder_reservation = Some(4);
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &capability, 0),
+            Err(StatusCode::CONFLICT),
+            "a reservation's rollback must still find its ticket"
+        );
+    }
+
+    /// A friend relay and a room relay to one person share the pair's slot.
+    #[test]
+    fn an_offer_for_another_purpose_replaces_only_a_ticket_nobody_has_taken_up() {
+        let (initiator, responder) = ("31".repeat(32), "32".repeat(32));
+        let (friend, room) = ([0xF1; 32], [0xC4; 32]);
+        let mut tickets = RelayTicketStore::default();
+        let mut pending = ticket_with_parties(&initiator, &responder, false);
+        pending.capability = friend;
+        tickets.insert("01".repeat(32), pending);
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &room, 0),
+            Ok(Some("01".repeat(32))),
+            "an offer the responder has not taken up yet"
+        );
+
+        tickets.mark_accepted(&"01".repeat(32));
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &room, 0),
+            Err(StatusCode::CONFLICT),
+            "accepted"
+        );
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &friend, 0),
+            Ok(Some("01".repeat(32))),
+            "a retry of the same offer still replaces it"
+        );
+    }
+
+    /// Capabilities are derived per epoch, so a retry after a rollover (or
+    /// after the client's previous-epoch fallback) comes under another one.
+    /// The server cannot tell it from another purpose, and lets it replace
+    /// the stalled ticket as any retry does.
+    #[test]
+    fn an_accepted_ticket_is_replaced_by_an_offer_under_the_next_epochs_capability() {
+        let (initiator, responder) = ("31".repeat(32), "32".repeat(32));
+        let (previous, current) = ([0xE1; 32], [0xE2; 32]);
+        let mut tickets = RelayTicketStore::default();
+        let mut accepted = ticket_with_parties(&initiator, &responder, false);
+        accepted.capability = previous;
+        accepted.epoch = 6;
+        tickets.insert("01".repeat(32), accepted);
+        tickets.mark_accepted(&"01".repeat(32));
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &current, 7),
+            Ok(Some("01".repeat(32)))
+        );
+        assert_eq!(
+            tickets.offer_replaces(&"02".repeat(32), &initiator, &responder, &current, 6),
+            Err(StatusCode::CONFLICT),
+            "in the same epoch another capability is still another purpose"
+        );
+    }
+
+    async fn send_relay_offer(
+        state: &AppState,
+        key: &ed25519_dalek::SigningKey,
+        initiator_id: &str,
+        responder_id: &str,
+        capability: [u8; 32],
+        ticket_id: &str,
+        nonce: [u8; 16],
+    ) -> StatusCode {
+        let ts = now_unix_secs();
+        let envelope = [0xE7; 64];
+        let signed = build_relay_mailbox_offer_msg(
+            &decode_hex_id(initiator_id).unwrap(),
+            &decode_hex_id(responder_id).unwrap(),
+            &capability,
+            7,
+            &decode_hex_id(ticket_id).unwrap(),
+            &envelope,
+            &nonce,
+            ts,
+        );
+        match relay_mailbox_offer(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+            Json(RelayMailboxOfferRequest {
+                initiator_id: initiator_id.to_string(),
+                responder_id: responder_id.to_string(),
+                capability: hex::encode(capability),
+                epoch: 7,
+                ticket_id: ticket_id.to_string(),
+                envelope: hex::encode(envelope),
+                ts,
+                nonce: hex::encode(nonce),
+                sig: hex::encode(key.sign(&signed).to_bytes()),
+            }),
+        )
+        .await
+        {
+            Ok(_) => StatusCode::OK,
+            Err(status) => status,
+        }
+    }
+
+    /// A retry used to get 409 until the earlier ticket's 90-second TTL ran out.
+    #[tokio::test]
+    async fn a_relay_offer_retry_replaces_the_pairs_earlier_ticket() {
+        let state = test_state();
+        let (initiator_key, initiator_id, initiator_pubkey) = insert_test_identity(&state, 0x81).await;
+        let (_, responder_id, responder_pubkey) = insert_test_identity(&state, 0x82).await;
+        let capability = [0xC1; 32];
+        state.capability_store.write().await.insert(
+            hex::encode(capability),
+            PairwisePresenceEntry {
+                ip: "8.8.4.4".parse().unwrap(),
+                port: 4662,
+                expires_at: Instant::now() + Duration::from_secs(60),
+                peer_pubkey: initiator_pubkey,
+                open_intro: false,
+                pubkey: responder_pubkey,
+                epoch: 7,
+                legacy_proof: None,
+                v4_proof: None,
+            },
+        );
+        let offer = |ticket_id: String, nonce: u8| {
+            let state = state.clone();
+            let (key, initiator_id, responder_id) =
+                (initiator_key.clone(), initiator_id.clone(), responder_id.clone());
+            async move {
+                send_relay_offer(&state, &key, &initiator_id, &responder_id, capability, &ticket_id, [nonce; 16])
+                    .await
+            }
+        };
+        let (first, second, third) = ("c1".repeat(32), "c2".repeat(32), "c3".repeat(32));
+
+        assert_eq!(offer(first.clone(), 1).await, StatusCode::OK);
+        assert_eq!(offer(second.clone(), 2).await, StatusCode::OK);
+        {
+            let tickets = state.relay_tickets.read().await;
+            assert!(!tickets.tickets.contains_key(&first));
+            assert_eq!(tickets.by_responder[&responder_id][&initiator_id], second);
+            assert_eq!(tickets.initiator_counts[&initiator_id], 1);
+            assert_eq!(tickets.envelope_bytes, 64);
+        }
+        assert_eq!(offer(second.clone(), 3).await, StatusCode::CONFLICT, "an id in use");
+
+        state
+            .relay_tickets
+            .write()
+            .await
+            .tickets
+            .get_mut(&second)
+            .unwrap()
+            .initiator_reservation = Some(9);
+        assert_eq!(offer(third.clone(), 4).await, StatusCode::CONFLICT, "mid-join");
+        state
+            .relay_tickets
+            .write()
+            .await
+            .tickets
+            .get_mut(&second)
+            .unwrap()
+            .initiator_reservation = None;
+
+        // A session outlives its ticket; its id must not be offered again while
+        // it holds admissions.
+        state
+            .relay_admissions
+            .write()
+            .await
+            .insert((first.clone(), RelayRole::Responder), "9.9.9.9".parse().unwrap());
+        assert_eq!(offer(first.clone(), 5).await, StatusCode::CONFLICT);
+        assert!(
+            state.relay_tickets.read().await.tickets.contains_key(&second),
+            "a refused offer replaces nothing"
+        );
+        assert_eq!(offer(third.clone(), 6).await, StatusCode::OK);
+    }
+
+    /// The global cap counts joined sockets, two per bridged session, and
+    /// /stats reports the number it is compared with.
+    #[tokio::test]
+    async fn the_global_relay_cap_is_a_socket_cap() {
+        let state = test_state();
+        {
+            let mut counts = state.relay_network_counts.write().await;
+            for index in 0..MAX_GLOBAL_RELAY_SOCKETS - 1 {
+                counts.insert(IpAddr::V4(Ipv4Addr::new(198, 18, index as u8, 0)), 1);
+            }
+        }
+        let ticket_id = "a5".repeat(32);
+        let (initiator_token, responder_token) =
+            insert_ticket(&state, &ticket_id, Instant::now() + Duration::from_secs(30)).await;
+        assert_eq!(
+            join_from(&state, &ticket_id, &initiator_token, "8.8.8.8").await,
+            Ok(RelayRole::Initiator)
+        );
+        assert_eq!(
+            join_from(&state, &ticket_id, &responder_token, "9.9.9.9").await,
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+
+        let stats = stats_handler(
+            State(state.clone()),
+            ConnectInfo("8.8.8.8:1000".parse().unwrap()),
+            HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats["active_relay_sockets"], MAX_GLOBAL_RELAY_SOCKETS);
+        assert_eq!(stats["max_global_relays"], MAX_GLOBAL_RELAY_SOCKETS);
+    }
+
+    #[test]
+    fn relay_bandwidth_paces_a_network_past_its_burst() {
+        let start = Instant::now();
+        let network = client_network("203.0.113.7".parse().unwrap());
+        let mut bandwidth = RelayBandwidth::default();
+        let frame_time =
+            Duration::from_secs_f64(MAX_RELAY_FRAME_BYTES as f64 / RELAY_NETWORK_BYTES_PER_SEC as f64);
+        for _ in 0..RELAY_NETWORK_BURST_BYTES as usize / MAX_RELAY_FRAME_BYTES {
+            assert_eq!(bandwidth.charge(network, MAX_RELAY_FRAME_BYTES, start), Duration::ZERO);
+        }
+        let wait = bandwidth.charge(network, MAX_RELAY_FRAME_BYTES, start);
+        assert_eq!(wait, frame_time, "past the burst, frames are paced");
+        assert_eq!(
+            bandwidth.charge(network, MAX_RELAY_FRAME_BYTES, start + wait),
+            frame_time,
+            "and held to the sustained rate"
+        );
+        assert_eq!(
+            bandwidth.charge(client_network("203.0.114.7".parse().unwrap()), 1, start),
+            Duration::ZERO,
+            "other networks have their own budget"
+        );
+        let idle = start + Duration::from_secs(60);
+        assert_eq!(bandwidth.charge(network, MAX_RELAY_FRAME_BYTES, idle), Duration::ZERO);
+        bandwidth.prune(idle + Duration::from_secs(1));
+        assert!(bandwidth.buckets.is_empty(), "refilled buckets are dropped");
+    }
+
+    #[test]
+    fn relay_bandwidth_buckets_stay_bounded() {
+        let start = Instant::now();
+        let mut bandwidth = RelayBandwidth::default();
+        for index in 0..MAX_GLOBAL_RELAY_SOCKETS as u32 {
+            bandwidth.charge(IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + (index << 8))), 1, start);
+        }
+        assert_eq!(bandwidth.buckets.len(), MAX_GLOBAL_RELAY_SOCKETS);
+        bandwidth.charge(
+            IpAddr::V4(Ipv4Addr::new(11, 0, 0, 0)),
+            1,
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(bandwidth.buckets.len(), 1, "idle buckets are pruned to admit a new one");
+    }
+
+    #[tokio::test]
+    async fn relay_pacing_is_shared_across_a_network() {
+        let state = test_state();
+        let first = RelayPacer::new(&state, "203.0.113.7".parse().unwrap());
+        let neighbour = RelayPacer::new(&state, "203.0.113.200".parse().unwrap());
+        for _ in 0..RELAY_NETWORK_BURST_BYTES as usize / MAX_RELAY_FRAME_BYTES {
+            first.charge(MAX_RELAY_FRAME_BYTES);
+        }
+        assert!(neighbour.charge(MAX_RELAY_FRAME_BYTES).is_some());
+        assert!(RelayPacer::new(&state, "198.51.100.1".parse().unwrap())
+            .charge(MAX_RELAY_FRAME_BYTES)
+            .is_none());
+    }
+
+    /// Room relays carry little data, so liveness must come from the pongs
+    /// that answer the keepalive pings.
+    #[test]
+    fn keepalive_answers_count_as_relay_liveness() {
+        assert!(relay_control_frame_shows_liveness(&Message::Pong(Vec::new().into())));
+        assert!(relay_control_frame_shows_liveness(&Message::Ping(Vec::new().into())));
+        assert!(!relay_control_frame_shows_liveness(&Message::Text("x".into())));
+        assert!(!relay_control_frame_shows_liveness(&Message::Close(None)));
     }
 
     #[tokio::test]

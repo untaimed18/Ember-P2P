@@ -1116,8 +1116,11 @@ pub struct EmberDiagnostics {
     /// Slice 14: inbound STORE frames rejected as short-window signature replays.
     #[serde(default)]
     pub ember_dht_store_replays: u32,
-    /// Slice 15: true when we are LowID/firewalled but still self-publishing
-    /// Ember DHT source records (UDP Noise path is usable).
+    /// Slice 15: true when our TCP port is firewalled (LowID, or KAD, the
+    /// server or the outside-in probe found it closed) and Ember DHT source
+    /// records go out naming an endorsed buddy that relays callbacks. A closed
+    /// UDP port alone does not set it: with TCP open the records carry our own
+    /// address.
     #[serde(default)]
     pub ember_dht_firewalled_publishing: bool,
     /// True when firewalled with no HighID buddy yet — source STORE is skipped.
@@ -1138,6 +1141,13 @@ pub struct EmberDiagnostics {
     /// PROXY_STORE requests we accepted and fanned out as a HighID buddy.
     #[serde(default)]
     pub ember_dht_buddy_forwards: u32,
+    /// Storers that took a record we fanned out as someone's buddy. Kept
+    /// apart from `ember_dht_stores_acked`, which is about our own records.
+    #[serde(default)]
+    pub ember_dht_buddy_forward_stores_acked: u32,
+    /// Storers that refused or never answered one of those records.
+    #[serde(default)]
+    pub ember_dht_buddy_forward_stores_failed: u32,
     /// Firewalled Ember users we are relaying for right now: publishers whose
     /// PROXY_STORE we accepted within the callback window, whose searchers'
     /// callback requests we still pass on. Live, not a session total.
@@ -1159,6 +1169,15 @@ pub struct EmberDiagnostics {
     /// callback path is unavailable and downloads use the relay/park route.
     #[serde(default)]
     pub ember_dht_buddy_uncorroborated: u32,
+    /// `BUDDY_ENDORSE_REQ` frames we sent, asking a reachable peer to relay
+    /// for us while firewalled. Rising with no endorsements beside it means
+    /// nobody answers, and no source record of ours can be placed.
+    #[serde(default)]
+    pub ember_dht_buddy_endorse_asks: u32,
+    /// Endorsements received in answer, each letting us name that peer as
+    /// our buddy.
+    #[serde(default)]
+    pub ember_dht_buddy_endorsements: u32,
     /// Ember `CALLBACK_REQ` frames we sent (searcher → buddy).
     #[serde(default)]
     pub ember_dht_callback_sent: u32,
@@ -1506,6 +1525,11 @@ pub struct AppSettings {
     /// the language they speak and is not ours to publish unasked.
     #[serde(default)]
     pub channel_language: String,
+    /// A second language shown beside the first, for someone who writes in
+    /// two: a code from `CHANNEL_LANGUAGES`, or empty for none. Published only
+    /// beside a first and when it differs from it.
+    #[serde(default)]
+    pub channel_language_secondary: String,
     pub shared_folders: Vec<String>,
     pub download_folder: String,
     /// Earlier download folders whose `Temp` still holds unfinished downloads.
@@ -2027,6 +2051,25 @@ pub struct AppSettings {
     #[serde(default)]
     pub notify_channel_message: bool,
 
+    /// Show the confirmation and info pop-ups (toasts) each part of the window
+    /// raises: "Download queued", "Link copied" and the like. Off hides only
+    /// those for that part; warnings, errors and Undo offers always show.
+    /// Frontend-only, like `save_search_history`: the backend round-trips them.
+    #[serde(default = "default_true")]
+    pub popups_downloads: bool,
+    #[serde(default = "default_true")]
+    pub popups_search: bool,
+    #[serde(default = "default_true")]
+    pub popups_library: bool,
+    #[serde(default = "default_true")]
+    pub popups_friends: bool,
+    #[serde(default = "default_true")]
+    pub popups_channels: bool,
+    #[serde(default = "default_true")]
+    pub popups_feeds: bool,
+    #[serde(default = "default_true")]
+    pub popups_network: bool,
+
     /// Hold a system sleep inhibitor while a transfer is actually working, so
     /// an overnight download is not cut off by the OS idle timer. The display
     /// is left alone — only sleep is deferred, and only while there is work.
@@ -2189,6 +2232,20 @@ impl AppSettings {
     /// for a code this build does not list.
     pub fn channel_language_code(&self) -> Option<&'static str> {
         crate::network::ember::dht::publish::channel_language(self.channel_language.trim())
+    }
+
+    /// [`Self::channel_language_secondary`] as a registry code, alone; see
+    /// [`Self::channel_languages`] for what is published.
+    pub fn channel_language_secondary_code(&self) -> Option<&'static str> {
+        crate::network::ember::dht::publish::channel_language(self.channel_language_secondary.trim())
+    }
+
+    /// The languages our presence publishes beside our username.
+    pub fn channel_languages(&self) -> crate::network::ember::dht::publish::ChannelLanguages {
+        crate::network::ember::dht::publish::ChannelLanguages::new(
+            self.channel_language_code(),
+            self.channel_language_secondary_code(),
+        )
     }
 
     pub fn download_folders(&self) -> crate::storage::part_folders::DownloadFolders {
@@ -2989,12 +3046,13 @@ impl Default for AppSettings {
             nickname_site_tag: true,
             channel_username: String::new(),
             channel_language: String::new(),
+            channel_language_secondary: String::new(),
             shared_folders: vec![completed_dir],
             download_folder: download_dir,
             previous_download_folders: Vec::new(),
             max_upload_speed: 0,
             max_download_speed: 0,
-            max_concurrent_downloads: 5,
+            max_concurrent_downloads: 10,
             max_concurrent_uploads: default_max_uploads(),
             tcp_port: DEFAULT_TCP_PORT,
             udp_port: DEFAULT_UDP_PORT,
@@ -3093,6 +3151,13 @@ impl Default for AppSettings {
             // See the field docs: a room is chatty enough that this is the one
             // notification a user has to ask for.
             notify_channel_message: false,
+            popups_downloads: true,
+            popups_search: true,
+            popups_library: true,
+            popups_friends: true,
+            popups_channels: true,
+            popups_feeds: true,
+            popups_network: true,
             prevent_sleep_while_active: true,
             bandwidth_schedule_enabled: false,
             bandwidth_schedule: Vec::new(),

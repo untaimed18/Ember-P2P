@@ -565,8 +565,10 @@ impl PartTracker {
         &self.file_name
     }
 
+    /// Held one MD4 per part: a verified set in eMule's form for an exact
+    /// multiple of PARTSIZE loses its trailing `MD4("")` here.
     pub fn set_part_hashes(&mut self, hashes: Vec<[u8; 16]>) {
-        self.part_hashes = hashes;
+        self.part_hashes = super::transfer::per_part_hashes(hashes, self.file_size);
     }
 
     pub fn part_hashes(&self) -> &[[u8; 16]] {
@@ -1471,17 +1473,12 @@ impl PartTracker {
             cursor.read_exact(&mut ph)?;
             self.part_hashes.push(ph);
         }
-        // Normalise the `known.met` form to the on-wire one by dropping the
-        // trailing `MD4("")`. Everything downstream is checked by
-        // `verify_hashset`, which requires exactly one MD4 per part and would
-        // otherwise reject a perfectly good sidecar written by eMule for a
-        // file that is an exact multiple of PARTSIZE — clearing every verified
-        // flag with it. Truncating cannot weaken that check: the set still has
-        // to reproduce the file hash afterwards.
-        let wire_count = super::messages::ed2k_part_count_for_size(self.file_size);
-        if self.part_hashes.len() > wire_count {
-            self.part_hashes.truncate(wire_count);
-        }
+        // Normalise the `known.met` form to the one held in memory, one MD4 per
+        // part, by dropping the trailing `MD4("")`. Only that exact entry is
+        // dropped: any other extra stays, and `verify_hashset` refuses the set
+        // as eMule does, rather than the truncation hiding it.
+        self.part_hashes =
+            super::transfer::per_part_hashes(std::mem::take(&mut self.part_hashes), self.file_size);
 
         let raw_tag_count = cursor.read_u32::<LittleEndian>()?;
         const MAX_TAG_COUNT: u32 = 100_000;
@@ -1727,6 +1724,11 @@ impl PartTracker {
     /// Per-part "somebody is pulling this" bitmap, for `ChunkSelector`.
     pub fn in_progress_flags(&self) -> Vec<bool> {
         self.in_progress_claims.iter().map(|&c| c > 0).collect()
+    }
+
+    /// How many sources hold a claim on `part_idx`.
+    pub fn claims_on(&self, part_idx: usize) -> u16 {
+        self.in_progress_claims.get(part_idx).copied().unwrap_or(0)
     }
 
     /// How many parts have at least one outstanding claim (diagnostics).
@@ -3207,9 +3209,12 @@ mod tests {
             "fixture must exercise the sentinel"
         );
 
+        use digest::Digest;
+        let empty: [u8; 16] = md4::Md4::digest([]).into();
         let mut tracker = PartTracker::new(file_size, &part_path);
         tracker.set_file_hash([0xEE; 16]);
-        tracker.set_part_hashes(vec![[0x11; 16], [0x22; 16], [0x00; 16]]);
+        tracker.set_part_hashes(vec![[0x11; 16], [0x22; 16], empty]);
+        assert_eq!(tracker.part_hashes(), &[[0x11; 16], [0x22; 16]], "held one per part");
         tracker.fill_range(0, PARTSIZE);
         tracker.save();
 
@@ -3218,6 +3223,29 @@ mod tests {
         assert_eq!(reloaded.gap_list(), &[(PARTSIZE, file_size)]);
         assert_eq!(reloaded.part_hashes().len(), wire_count);
         assert_eq!(reloaded.part_hashes(), &[[0x11; 16], [0x22; 16]]);
+
+        let _ = std::fs::remove_file(part_path.with_extension("part.met"));
+    }
+
+    /// An extra entry that is not `MD4("")` is not eMule's form: it is kept,
+    /// so `verify_hashset` refuses the set instead of the load hiding it.
+    #[test]
+    fn part_met_extra_hash_that_is_not_the_sentinel_is_kept_for_verification() {
+        let part_path = temp_part_path("bogus-sentinel");
+        let file_size = PARTSIZE * 2;
+        let mut tracker = PartTracker::new(file_size, &part_path);
+        tracker.set_file_hash([0xEF; 16]);
+        tracker.set_part_hashes(vec![[0x11; 16], [0x22; 16], [0x00; 16]]);
+        tracker.fill_range(0, PARTSIZE);
+        tracker.save();
+
+        let reloaded = PartTracker::new_with_identity(file_size, &part_path, [0xEF; 16]);
+        assert_eq!(reloaded.part_hashes(), &[[0x11; 16], [0x22; 16], [0x00; 16]]);
+        assert!(!super::super::transfer::verify_hashset(
+            &[0xEF; 16],
+            reloaded.part_hashes(),
+            file_size
+        ));
 
         let _ = std::fs::remove_file(part_path.with_extension("part.met"));
     }

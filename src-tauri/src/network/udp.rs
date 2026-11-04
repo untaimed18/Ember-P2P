@@ -219,10 +219,7 @@ fn fw_check_hello(state: &NetworkState, nickname: &str) -> Vec<u8> {
     options.supports_crypt_layer = state.obfuscation_enabled;
     options.requests_crypt_layer = state.obfuscation_enabled;
     options.supports_direct_udp_callback = can_advertise_direct_udp_callback(state);
-    let client_id = state
-        .external_ip
-        .map(|ip| u32::from_le_bytes(ip.octets()))
-        .unwrap_or(0);
+    let client_id = ed2k::messages::hello_client_id();
     ed2k::messages::build_hello_with_buddy_opts(
         &state.user_hash,
         client_id,
@@ -822,9 +819,13 @@ pub(super) async fn handle_udp_packet_inner(
                                     src.state = ed2k::sources::DownloadSourceState::Banned;
                                     src.state_changed = std::time::Instant::now();
                                 } else if opcode == ed2k::messages::OP_QUEUEFULL_UDP {
+                                    // eMule handles this as `UDPReaskACK(0)`, which
+                                    // restarts the reask clock like any other answer.
+                                    let now = std::time::Instant::now();
                                     src.state =
                                         ed2k::sources::DownloadSourceState::OnQueue { rank: None };
-                                    src.state_changed = std::time::Instant::now();
+                                    src.state_changed = now;
+                                    src.last_asked = now;
                                 } else {
                                     src.state = ed2k::sources::DownloadSourceState::Failed;
                                     src.state_changed = std::time::Instant::now();
@@ -3246,8 +3247,11 @@ pub(super) async fn handle_udp_packet_inner(
                     );
                 }
             } else {
-                state.firewall_checker.handle_udp_firewall_result(false);
-                info!("UDP firewall test returned remote error from {from} on port {udp_port} (error={error_code})");
+                // The peer could not run a test worth the name (eMule answers
+                // 1 when it already holds a path to us through our NAT), and
+                // eMule records it as cancelled. Counted as an answer, it read
+                // as UDP closed when nobody had tested it.
+                info!("UDP firewall test from {from} on port {udp_port} not run by the peer (error={error_code}); ignoring");
             }
         }
 

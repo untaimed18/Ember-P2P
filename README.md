@@ -80,7 +80,7 @@ The consequence is that every path except `nodes_ember.dat` presupposes either a
 
 Shared files are published as keyword records (findable by name) and source records (fetchable), and republished on a cycle to stay alive. Publishing starts once the node has contacts.
 
-- **Search** — The Search page exposes an **Ember Only** method, and **Global** queries Ember alongside KAD and servers, merging into one de-duplicated result list. With KAD and eD2K both offline, Global falls back to Ember alone.
+- **Search** — The Search page exposes an **Ember only** method, and **All networks** queries Ember alongside KAD and servers, merging into one de-duplicated result list. With KAD and eD2K both offline, All networks falls back to Ember alone.
 - **Source lookup** — Downloads resolve sources on the Ember DHT in addition to KAD and servers, so a file found elsewhere can still gain Ember sources.
 - **Publish badge** — The Library marks a shared file with an **Ember** badge (`shared_ember` on `FileInfo`) once a source record is placed, which is the point at which other Ember users can actually fetch it.
 - **Firewalled publishing and consume** — LowID and firewalled nodes publish through a buddy `PROXY_STORE` fan-out instead of storing directly, and name that buddy in the source record so a reachable searcher can `CALLBACK_REQ` them (KAD callback analogue; LowID↔LowID still needs relay).
@@ -89,9 +89,9 @@ Shared files are published as keyword records (findable by name) and source reco
 
 ### Current limits
 
-- **Library content still moves over eD2K.** Ember discovers the source; the bytes travel the eMule wire. Three exceptions move over a QUIC stream of their own, or an encrypted stream on the sender's TCP upload port when their UDP port cannot be reached, each 256 KiB chunk checked against a BLAKE3 hash list ([`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs)) as it lands ([`ember/attach_stream.rs`](src-tauri/src/network/ember/attach_stream.rs)): a friend chat attachment and a room transfer between two 1.7.0+ members ([`network/channel_xfer.rs`](src-tauri/src/network/channel_xfer.rs)), both accept-first and up to 2 GB, and a [feed](#feeds)'s file fetched from its publisher, up to 8 GiB. A room transfer that can open neither falls back to receiver-driven blocks over the room's Noise session ([`ember/xfer.rs`](src-tauri/src/network/ember/xfer.rs)). Putting ordinary downloads on the same footing is the largest remaining piece toward a network that does not need the eMule wire at all.
+- **Library content still moves over eD2K.** Ember discovers the source; the bytes travel the eMule wire. Three exceptions move over a QUIC stream of their own, or an encrypted stream on the sender's TCP upload port when their UDP port cannot be reached, each 256 KiB chunk checked against a BLAKE3 hash list ([`ember/transfer.rs`](src-tauri/src/network/ember/transfer.rs)) as it lands ([`ember/attach_stream.rs`](src-tauri/src/network/ember/attach_stream.rs)): a friend chat attachment and a room transfer between two 1.7.0+ members ([`network/channel_xfer.rs`](src-tauri/src/network/channel_xfer.rs)), both accept-first and up to 2 GB, and a [feed](#feeds-beta)'s file fetched from its publisher, up to 8 GiB. A room transfer that can open neither falls back to receiver-driven blocks over the room's Noise session ([`ember/xfer.rs`](src-tauri/src/network/ember/xfer.rs)). Putting ordinary downloads on the same footing is the largest remaining piece toward a network that does not need the eMule wire at all.
 - **Bootstrap depends on eMule** — as described above; seed lists are deliberately not planned.
-- **Version mismatches are silent** — incompatible peers refuse each other cleanly, but neither side is told why and there is no upgrade prompt. They simply never fold each other into a routing table.
+- **A peer that needs to update cannot be told so** — incompatible peers refuse each other cleanly at the version byte and never fold each other into a routing table. Your side counts the refusals, split into peer-older and peer-newer, and the Ember page shows a banner while older peers are being turned away, but the outdated peer cannot decode anything sent to it, so it gets no upgrade prompt.
 - **Multi-keyword search is approximate** — sparse DHT intersection (missing secondary keys are skipped) plus a filename match at emit time, not a strict worldwide AND of every keyword.
 - **No reputation scoring on gossip** — admission is bounded by the diversity caps above, but gossip itself is not scored, so table poisoning under sustained Sybil pressure is only rate-limited.
 - **Not yet exercised end to end** — LowID publishing through buddy `PROXY_STORE` and Ember callback consume, a cold join from an empty contact file with no KAD, and republish behaviour across a full record TTL on a large library.
@@ -232,13 +232,13 @@ This is a **static** DH, not a ratchet. It gives confidentiality and integrity a
 - **Friend Block List** — Block a Friend ID to reject future requests, chat, browse and offers from that identity. Blocking removes any existing mutual friendship, and unblocking does not restore it.
 - **Optional Peer Relaying** — **Relay for other peers** (Settings) lets your client carry traffic for peers that cannot reach each other directly. It is what makes transfers work behind strict NATs, and it spends your upload bandwidth on people you are not trading with, so it can be turned off.
 
-## Channels — group rooms (beta)
+## Channels — group rooms
 
 Channels are group chat rooms carried over the [Ember Network](#ember-network) itself. No server hosts a room: messages travel encrypted between the members over the same overlay that carries search and source lookup, and members never publish their IP address to the room.
 
 Friends are one-to-one with people you know. Channels are for a group — a room you can hand an invite to, hand off to someone else, or leave running after you have gone.
 
-Channels are in beta and the app marks them so. The format is still settling; read [What to expect](#what-to-expect) before relying on a room.
+Channels left beta in 1.7.6. Their formats have been frozen since 1.7.5 ([docs/channels-format.md](docs/channels-format.md#what-freezes-at-the-end-of-the-beta)), so rooms keep working across updates; read [What to expect](#what-to-expect) before relying on a room.
 
 ### Getting in
 
@@ -274,7 +274,7 @@ Whoever creates a room owns it. Owner tools open in a room settings window from 
 
 One device can own up to 10 rooms at once; deleting one gives the slot back. Joining rooms is not limited. New room names are also rate-limited per connection, so creating many in a burst is refused.
 
-Every member can **mute** a room and **ignore** a member. Both are local to the device and both are listed under Settings > Channels, where they can be undone. Members can also show the language they speak as a flag beside their name (Settings > Channels).
+Every member can set a room's notifications to All messages, Mentions only or Off, and **ignore** a member in one room or everywhere. Both are local to the device and are listed under Settings > Channels (Quieter rooms, Ignored members), where they can be undone. Members can also show the language they speak as a flag beside their name (Settings > Channels).
 
 ### Private messages
 
@@ -292,9 +292,9 @@ A member can send one other member a file, up to **2 GB**, and only after they a
 - **A room holds up to 256 members**, and a message up to 3,728 bytes (3,592 for a reply), so every line still fits through a relay hop.
 - **History is what your device kept.** Rooms are not archived centrally. On joining, nearby members share recent messages; older conversation you were not present for is gone. In-room search covers only local history.
 
-## Feeds
+## Feeds (beta)
 
-A feed is a list of files someone keeps up to date under their Ember identity. Follow one and Ember shows what the publisher adds and removes, and can download it for you. Feeds run on the [Ember Network](#ember-network) with no server involved; the formats are in [docs/channels-format.md](docs/channels-format.md#feed-heads-record-type-0x04) and the code in [`ember/feed.rs`](src-tauri/src/network/ember/feed.rs) and [`commands/feeds.rs`](src-tauri/src/commands/feeds.rs).
+A feed is a list of files someone keeps up to date under their Ember identity. Follow one and Ember shows what the publisher adds and removes, and can download it for you. Feeds run on the [Ember Network](#ember-network), with the rendezvous server used only to reach a firewalled publisher; the formats are in [docs/channels-format.md](docs/channels-format.md#feed-heads-record-type-0x04) and the code in [`ember/feed.rs`](src-tauri/src/network/ember/feed.rs) and [`commands/feeds.rs`](src-tauri/src/commands/feeds.rs).
 
 ### How a feed works
 
@@ -309,6 +309,8 @@ Followers look a feed up every 30 minutes (every 3 minutes for a day while it ha
 
 A feed download is streamed from the publisher first, friend or not, on the same stream a chat file crosses (type `0x09`, [`ember/attach_stream.rs`](src-tauri/src/network/ember/attach_stream.rs)). Ember finds the publisher's own signed source record for the file, or a friend's last address, and dials QUIC pinned to the publisher's identity, then the publisher's TCP port as a Noise secure stream if QUIC has not answered in 3 seconds. The request names the file by an id derived from the publisher key, the feed salt and the eD2K hash, which only the link and list give; each 256 KiB chunk is checked against the publisher's chunk list as it lands, and the finished file against the list's eD2K, AICH and BLAKE3. The stream runs inside the download's worker as a source beside peers and mirrors ([`multi_source/feed_worker.rs`](src-tauri/src/network/ed2k/multi_source/feed_worker.rs)). The publisher serves it as a priority upload outside the eD2K queue, up to 8 at once, for files up to 8 GiB. If the publisher is not there, refuses, the stream fails, or nothing arrives for 45 seconds, every network is asked at once. Feed downloads are shown and controlled on the Feeds page rather than Transfers, while sharing its speed limits and slots; their progress, speed and completion update on the page as the bytes arrive.
 
+A firewalled publisher with no buddy is still reachable: a follower that finds no source for the list after 3 minutes, or nobody sending a file after 90 seconds, reaches the publisher by hole punch or over the rendezvous relay, and the feed page says when the publisher cannot be reached.
+
 **Followers and downloads.** My feeds shows how many followers a published feed has and, on each file, how many followers downloaded it. Followers are counted every 30 minutes as the distinct identities other than yours with a signed source record standing for the feed's current list or one of the two before it, one DHT lookup per list, so the count is followers online in the last few hours, those who never downloaded anything included; a lookup that comes back full (300 records) shows the count with a "+". A download counts once a follower's feed stream has run to the end of the file and the follower has acknowledged it, once per follower per file; a follower who got the whole file from other sources is not seen. Counts are kept per feed and deleted with it.
 
 **Automatic downloads** are per feed and off until turned on, and take only files added from then. Each feed caps the largest file and the total per rolling 24 hours (1 GiB and 4 GiB by default, 0 for no limit), never takes programs, scripts or other risky types, and starts nothing that would leave under 64 MiB free on the drive.
@@ -317,7 +319,7 @@ A feed download is streamed from the publisher first, friend or not, on the same
 
 - **Feeds are public.** Anyone with a feed's link can see its files and who publishes it, and a listed feed is visible to everyone in Discover.
 - **Following is not secret.** Nodes answering a lookup and whoever serves the list see your address, and a follower serves the list too.
-- **A feed belongs to an identity.** Keep a backup (Settings > Backup): an identity lost is its feeds lost.
+- **A feed belongs to an identity.** Keep a backup (Settings > Backup & import): an identity lost is its feeds lost.
 
 ## Network Compatibility
 
@@ -338,10 +340,10 @@ eMule users and eD2K servers see your nickname followed by `[https://emberp2p.or
 ### Networking
 
 - **Ember Network** — Ember's own encrypted, server-less overlay for peer discovery, keyword search, publishing, and source lookup. On by default, joins automatically, runs alongside KAD and eD2K (see [above](#ember-network)).
-- **KAD Network & eD2K Servers** — The decentralized KAD DHT bootstraps on launch and needs no setup; traditional eD2K servers stay opt-in. A community `server.met` can be downloaded from emule-security.org, and fresh KAD `nodes.dat` bootstrap contacts can be fetched from Settings → Network when KAD will not connect.
+- **KAD Network & eD2K Servers** — The decentralized KAD DHT bootstraps on launch and needs no setup; traditional eD2K servers stay opt-in. A community `server.met` can be downloaded from emule-security.org, and fresh KAD `nodes.dat` bootstrap contacts can be fetched from **Bootstrap** on the KAD Network page (From URL → Use the default list) when KAD will not connect.
 - **Auto-Connect Server** — Optionally reconnect your last eD2K server on launch; with no server history, it falls back to eMule Sunrise.
 - **EPX Source Exchange** — Ember peers share source lists with each other for faster downloads (see above).
-- **Connection Doctor** — Settings > Network checks the local ports, Windows Firewall, UPnP, the router's address (to spot carrier-grade NAT), Kad, the eD2K server ID, NAT type, the Ember Network and the clock, has the rendezvous server test your ports from outside, and gives one plain verdict with at most three fixes. It can retry UPnP or add the firewall rules itself, and the status bar links to it while you have a Low ID or are firewalled on Kad.
+- **Connection Doctor** — Settings > Network checks the local ports, Windows Firewall, UPnP, the router's address (to spot carrier-grade NAT), Kad, the eD2K server ID, NAT type, the Ember Network and the clock, has the rendezvous server test your ports from outside, and gives one plain verdict with at most three fixes. It can retry UPnP or add the firewall rules itself, and the status bar links to it while you have a Low ID or are firewalled on Kad. When traffic leaves through a VPN it points to the VPN's own port forwarding instead of the router's UPnP, and the firewall rules it adds open every port for Ember's own executable, so a port change needs no new rules.
 - **NAT Traversal** — UPnP automatic port mapping, firewall detection, KAD buddy relay for LowID peers, and EPX peer-relay (ERAT) for LowID↔LowID paths when attestations allow.
 - **STUN Port Keep-Alive** — Periodic STUN plus a TCP hold from the listen port keeps NAT mappings alive and advertises the discovered public ports for HighID. Aimed at CGNAT and full-cone NAT without UPnP; auto-suspends on symmetric or unstable remapping.
 - **Protocol Obfuscation** — RC4-based TCP and UDP header encryption to help with ISP throttling.
@@ -351,9 +353,10 @@ eMule users and eD2K servers see your nickname followed by `[https://emberp2p.or
 
 - **Multi-Source Downloads** — Download from multiple peers simultaneously with part-level hash verification, automatic source rotation, and queue management.
 - **Transfer Monitoring** — Real-time progress bars, per-source detail drawers, upload tracking, health indicators, peer country flags, and archive recovery.
-- **Bulk Transfer Actions** — Pause, resume, stop or cancel many downloads at once via checkbox selection or the Pause/Resume/Stop/Cancel All commands; finished and failed rows can be selected and removed from the list together, keeping the files.
+- **Bulk Transfer Actions** — Pause, resume, stop or cancel many downloads at once via checkbox selection or the Pause/Resume/Stop/Cancel All commands; finished and failed rows can be selected and removed from the list together, keeping the files. **Completed First** in the More menu, or Show completed downloads first under Settings > Transfers, lists finished rows above running ones.
 - **Download Categories** — Audio, Video, Image, Archive, Document, Program, or up to 32 of your own, set from a download's Category menu and filtered with the chips above the list. Each can finish in its own folder inside Downloads, and a finished download given another category moves there. One window manages them all, opened from Transfers, from the Library's Move to category menu, or from Settings → Transfers.
 - **Known Peers** — Known eD2K Peers and Known Ember Peers list everyone you have traded upload credit with, connected or not, for 150 days after the last contact. Each tab lists its 5,000 most recently seen peers and its label counts them all.
+- **Web Mirrors** — HTTP/HTTPS mirrors named in an eD2K link are used alongside peers, and **Add Web Mirror…** on an unfinished download adds up to five more; new installs also run 10 downloads at once instead of 5.
 - **Upload Speed Sense (USS)** — Optionally adjusts upload speed from network latency to prevent congestion. Requires an upload speed limit to be set.
 - **Bandwidth Schedule** — A weekday timetable of upload/download caps (Settings → Bandwidth): full speed overnight, throttled during work hours, whatever the week needs. Windows may cross midnight, the first rule whose times match is the one that applies, and the manual limits apply whenever none does. Off by default; when a window is open, Settings names the rule in force and until when.
 - **Keep Awake During Transfers** — Defers OS sleep while a transfer is actually moving, so an overnight download is not cut off by the idle timer. The screen still turns off, stalled transfers do not count, and sleep resumes the moment the work stops. On Linux it goes through the desktop portal (GNOME, KDE, Cinnamon and others), or logind where there is none, and a sleep you choose from the menu still happens.
@@ -361,18 +364,19 @@ eMule users and eD2K servers see your nickname followed by `[https://emberp2p.or
 
 ### Search & library
 
-- **Advanced Search** — Multi-tab keyword search across Global, KAD Only, Server Only and Ember Only methods, with type, size, source, and extension filters.
-- **Spam Detection** — Built-in detection with balanced and aggressive profiles, a configurable threshold, and automatic result hiding.
+- **Advanced Search** — Multi-tab keyword search across All networks, KAD only, Server only and Ember only methods, with type, size, source, and extension filters.
+- **Spam Detection** — Built-in detection with Relaxed, Balanced (the default) and Aggressive profiles, each setting how high a score must be to count as spam, and automatic result hiding.
 - **Copy eD2K Links** — Copy the link for one result, every ticked result, or the whole result list, from the context menu, the selection toolbar, or Ctrl+C.
-- **Library Management** — Virtual-scrolling tables that handle thousands of files, with sorting, filtering, bulk priority edits, comments, ratings, eD2K collection support, a scan for missing files, and copy-all-links for the current view. **Chat Files**, **Channel Files** and **Feed Files** at the top open the unshared folders that files from friends, rooms and feeds are saved to.
-- **[Ember-P2P] Name Tag** — Rename selected files to start with `[Ember-P2P]`, with Undo. Settings > Transfers can also tag completed downloads and new media, archive, disc image and document files in shared folders, never programs, hidden files, files in hidden or git folders, or files with same-name companions (subtitles, cue sheets, split archives, disc folders).
+- **Library Management** — Virtual-scrolling tables that handle thousands of files, with sorting, filtering, bulk priority edits, comments, ratings, eMule collection support (Open eMule Collection / Create eMule Collection), a scan for missing files, and copy-all-links for the current view. **Chat Files**, **Channel Files** and **Feed Files** at the top open the unshared folders that files from friends, rooms and feeds are saved to.
+- **[Ember-P2P] Name Tag** — Rename selected files to start with `[Ember-P2P]`, with Undo. Settings > Library can also tag completed downloads and new media, archive, disc image and document files in shared folders, never programs, hidden files, files in hidden or git folders, or files with same-name companions (subtitles, cue sheets, split archives, disc folders).
+- **Library Settings** — Settings > Library holds Allow browsing my shares (off by default), Send video uploads without transfer compression, and the [Ember-P2P] name-tag switches; **Add to feed** on Library rows adds files to one of your feeds.
 - **In-App Media Player** — Play supported audio and video from the Library detail drawer; Open Externally is still available.
 
 ### Social
 
 - **Friends (beta)** — Ember-exclusive friend system with v3 Friend Codes, Noise-secured sessions, Online/Away/Busy status, end-to-end encrypted chat with file sending, remote browsing, friends-only shares, file offers, priority uploads, a block list, and transfers that can work without HighID (see [above](#friends--ember-exclusive-social-features-beta)).
-- **Channels (beta)** — Group rooms carried over the Ember Network itself: public rooms anyone can find, private rooms that need an invite, moderation with bans, moderators, owner-only invites and slow mode, private messages between members, and member-to-member file sending. Nobody publishes their IP address to the room (see [above](#channels--group-rooms-beta)).
-- **Feeds** — Follow the files someone publishes under their Ember identity, by link or from Discover, with private downloads fetched from the publisher first and optional automatic downloads; or publish your own (see [above](#feeds)).
+- **Channels** — Group rooms carried over the Ember Network itself: public rooms anyone can find, private rooms that need an invite, moderation with bans, moderators, owner-only invites and slow mode, private messages between members, and member-to-member file sending. Nobody publishes their IP address to the room (see [above](#channels--group-rooms)).
+- **Feeds (beta)** — Follow the files someone publishes under their Ember identity, by link or from Discover, with private downloads fetched from the publisher first and optional automatic downloads; or publish your own (see [above](#feeds-beta)).
 - **Credits & SecIdent** — RSA-based Secure Identification prevents credit theft; upload priority follows the standard credit ratio formula.
 
 ### Security
@@ -387,12 +391,12 @@ eMule users and eD2K servers see your nickname followed by `[https://emberp2p.or
 ### User experience
 
 - **First-Time Setup Wizard** — Guided configuration on first launch: nickname, download folder, ports, speed limits, and theme, plus a summary of the networks Ember joins on its own.
-- **Backup & Restore** — Save your profile to a single passphrase-encrypted `.emberbackup` file and restore it on another machine or after a reinstall (Settings → Backup). Covers identity and SecIdent keys, credits, settings, shared-folder list, known files, friends, chat history, transfers, server/Kad contacts, IP filter and learned spam data; excludes the shared files themselves and part-finished downloads. Identity keys are DPAPI-unwrapped into the encrypted archive and re-wrapped for the restoring Windows account, so a restore keeps your user hash, credits and friendships. Restores are staged and applied during the next launch, with the replaced files preserved in a `pre-restore-<timestamp>` folder.
-- **Desktop Notifications** — Optional system notifications for a finished or failed download, a friend coming online, a friend's message or file offer, a friend request, and room messages (that last one off by default). Each category switches off on its own, and by default they only appear while Ember is not the focused window — so they cover exactly the moments the in-app toasts and badges cannot.
+- **Backup & Restore** — Save your profile to a single passphrase-encrypted `.emberbackup` file and restore it on another machine or after a reinstall (Settings → Backup & import). Covers identity and SecIdent keys, credits, settings, shared-folder list, known files, friends, chat history, transfers, server/Kad contacts, IP filter and learned spam data; excludes the shared files themselves and part-finished downloads. Identity keys are DPAPI-unwrapped into the encrypted archive and re-wrapped for the restoring Windows account, so a restore keeps your user hash, credits and friendships. Restores are staged and applied during the next launch, with the replaced files preserved in a `pre-restore-<timestamp>` folder.
+- **Notifications** — Desktop notifications (Settings > Notifications, on by default) for a finished or failed download, a friend coming online, a friend's message or file offer, a friend request, someone viewing your shared files, and room messages (that last one off by default). Each switches off on its own, and by default they only appear while Ember is not the focused window. A separate **Pop-ups in Ember** group hides Ember's own timed confirmation pop-ups by area (Transfers, Search, Library, Friends, Channels, Feeds, Networks); warnings, errors, sticky notices and Undo always show.
 - **Close to Tray** — Choose what the title-bar X does: ask each time, minimize to tray, or exit. The tray icon stays available either way, and its tooltip carries the current up/down rates. On a Linux desktop with nothing to show the icon (stock GNOME without the AppIndicator extension), closing to the tray minimizes the window instead of hiding it. A separate **Minimize to the tray** switch (Settings > General, off by default) hides the window in the tray when it is minimized rather than leaving it on the taskbar.
 - **Keyboard Shortcuts** — `?` opens a shortcut cheat sheet, Alt+1–9 then Alt+0 jump to the first ten sidebar pages, and Ctrl+, opens Settings.
 - **Statistics** — Session and cumulative transfer statistics, connection uptime, network health indicators, and a peer reputation snapshot.
-- **Internationalization** — UI strings via Paraglide (`en`, `es`, `fr`, `pt-BR`, `de`, `zh-CN`, `it`, `ru`, `zh-TW`), with a Settings language picker whose **System** option follows the OS locale; see [docs/i18n.md](docs/i18n.md).
+- **Internationalization** — UI strings via Paraglide (`en`, `es`, `fr`, `pt-BR`, `de`, `zh-CN`, `it`, `ru`, `zh-TW`, `pl`), with a Settings language picker whose **System** option follows the OS locale; see [docs/i18n.md](docs/i18n.md).
 - **GeoIP** — Country identification for connected peers from a bundled MaxMind database.
 
 ## Getting Started
@@ -404,23 +408,24 @@ Ember ships for **Windows 10 and Windows 11**, and for **x86-64 Linux** as a `.d
 1. Download the latest release from the [Releases page](https://github.com/untaimed18/Ember-P2P/releases).
 2. Run the installer (`.exe` on Windows). On Linux, install the `.deb` with your package manager, or mark the AppImage executable and run it. Both update themselves in place from inside Ember, using the format you installed; the AppImage needs FUSE 2 to start at all — `libfuse2` on Ubuntu 22.04, `libfuse2t64` on Ubuntu 24.04 and Debian 13 — so on those prefer the `.deb`.
 3. On first launch, the **Setup Wizard** walks you through essential settings — nickname, download folder, ports, speed limits, and theme.
-4. **KAD connects on its own** every launch, so there is nothing to press. eD2K servers are separate: connect from the eD2K Servers page, or enable Auto-Connect Server in Settings so Ember rejoins your last one on launch. A community `server.met` list can be downloaded from emule-security.org on first run.
+4. **KAD connects on its own** every launch, so there is nothing to press. eD2K servers are separate: connect from the eD2K Servers page, or turn on **Auto-connect to server** in Settings > Network so Ember rejoins your last one on launch. A community `server.met` list can be downloaded from emule-security.org on first run.
 5. The [Ember Network](#ember-network) needs no connect step either — it is on by default and joins on its own, finding its first peers *through* KAD.
-6. Add folders to your library, search with the Global / KAD / Server / Ember methods, open `ed2k://` links, and start downloading. Ember handles multi-source transfers, queueing and source discovery on its own.
+6. Add folders to your library, search with the All networks / KAD only / Server only / Ember only methods, open `ed2k://` links, and start downloading. Ember handles multi-source transfers, queueing and source discovery on its own.
 7. Optionally open the Friends page, share your Friend Code and add theirs. Once mutual and online you get end-to-end encrypted chat, remote browsing and priority upload slots — see [Friends](#friends--ember-exclusive-social-features-beta).
-8. Optionally open the Channels page, pick a Channel username, then create a room or paste an invite. Discover lists public rooms other people have published — see [Channels](#channels--group-rooms-beta).
-9. Optionally open the Feeds page and paste an `ember-feed:` link, or follow a feed from Discover, to get the files someone publishes as they add them — see [Feeds](#feeds).
+8. Optionally open the Channels page, pick a Channel username, then create a room or paste an invite. Discover lists public rooms other people have published — see [Channels](#channels--group-rooms).
+9. Optionally open the Feeds page and paste an `ember-feed:` link, or follow a feed from Discover, to get the files someone publishes as they add them — see [Feeds](#feeds-beta).
 
 ### Port forwarding
 
-Ember uses two ports for peer communication:
+Ember uses two port numbers for peer communication:
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 4662 | TCP | Peer-to-peer file transfers |
 | 4672 | UDP | KAD DHT and Ember Network communication (both share this socket) |
+| 4662 | UDP | QUIC for relays that dial your TCP port number over UDP (UPnP maps it) |
 
-These are configurable in **Settings > Network**. For best performance (HighID), forward both ports on your router, enable **UPnP** so Ember maps them automatically, or leave **STUN port keep-alive** on.
+These are configurable in **Settings > Network**. For best performance (HighID), forward 4662 TCP and 4672 UDP on your router (and 4662 UDP if you forward by hand), enable **UPnP** so Ember maps them automatically, or leave **STUN port keep-alive** on.
 
 STUN keep-alive (on by default) periodically refreshes your NAT mappings with STUN, holds a TCP connection from the listen port, and advertises the discovered public ports so peers connect to the right place. It is aimed at CGNAT and full-cone NAT where UPnP is unavailable, and auto-suspends on Open/Symmetric NAT or unstable remapping, falling back to your configured ports. Symmetric NAT or a VPN that remaps ports unstably still generally needs a VPN with a fixed forwarded port.
 

@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { swallowKeyboardContextMenu } from './a11y';
+import { inertDuringOutro, swallowKeyboardContextMenu } from './a11y';
+
+describe('inertDuringOutro', () => {
+  it('makes the dialog that is fading out inert', () => {
+    const dialog = { inert: false } as HTMLElement;
+    inertDuringOutro({ currentTarget: dialog } as unknown as Event);
+    expect(dialog.inert).toBe(true);
+  });
+});
 
 /** Unit tests run without a DOM; an `EventTarget` stands in for `window`. */
 let win: EventTarget;

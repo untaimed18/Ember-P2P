@@ -14,24 +14,16 @@
   let {
     value = $bindable(0),
     label = '',
-    idScope = '',
     onenter,
+    onescape,
   }: {
     value: number;
     label?: string;
     /** Called when Enter is pressed in the number box. */
     onenter?: () => void;
-    /**
-     * Disambiguates the generated element id when several of these share a
-     * label on one page.
-     *
-     * The id is derived from `label`, which is fine while there is one upload
-     * and one download field per page — but the bandwidth schedule renders a
-     * pair per rule with the same two labels. Duplicate ids make every
-     * `<label for>` point at the first match, so clicking a rule's caption
-     * focuses the manual limit at the top of the card instead.
-     */
-    idScope?: string;
+    /** Called when Escape is pressed in the number box. Returns true when it
+     *  handled the key, so nothing further up acts on it too. */
+    onescape?: () => boolean;
   } = $props();
 
   let unit: Unit = $state('KB/s');
@@ -56,15 +48,11 @@
   let lastSyncedValue = -1;
   let inputEl: HTMLInputElement | undefined = $state(undefined);
   let unlimitedEl: HTMLDivElement | undefined = $state(undefined);
-  const inputId = $derived(
-    [
-      'speed-input',
-      idScope.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-      label.toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'limit',
-    ]
-      .filter(Boolean)
-      .join('-'),
-  );
+  // Per instance, not from `label`: the bandwidth schedule repeats the same
+  // two labels on every rule, and a label in a non-Latin script has no
+  // characters an id-from-label would keep.
+  const uid = $props.id();
+  const inputId = `speed-input-${uid}`;
 
   function syncFromBytes(bytes: number) {
     if (bytes === 0) {
@@ -121,10 +109,14 @@
   function handleUnitChange(e: Event) {
     const target = e.target as HTMLSelectElement;
     const newUnit = target.value as Unit;
-    const currentBytes = value;
     unit = newUnit;
-    if (currentBytes > 0) {
-      displayValue = String(Math.round((currentBytes / multipliers[newUnit]) * 100) / 100);
+    // The number stays as typed and the new unit scales it: "5", then MB/s,
+    // means 5 MB/s. Converting the bytes would show a small limit as "0",
+    // which reads as Unlimited.
+    const num = parseFloat(displayValue);
+    if (num > 0) {
+      value = Math.max(1, Math.round(num * multipliers[newUnit]));
+      lastSyncedValue = value;
     }
   }
 
@@ -180,9 +172,12 @@
       value={displayValue}
       oninput={handleInput}
       onkeydown={(e) => {
-        if (onenter && e.key === 'Enter' && !e.isComposing) {
+        if (e.isComposing) return;
+        if (onenter && e.key === 'Enter') {
           e.preventDefault();
           onenter();
+        } else if (onescape && e.key === 'Escape' && onescape()) {
+          e.preventDefault();
         }
       }}
       onfocus={() => (focused = true)}

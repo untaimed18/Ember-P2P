@@ -55,7 +55,7 @@ pub(in crate::network) async fn save_on_shutdown(
     while state.xfer_finish_in_flight > 0 {
         match tokio::time::timeout_at(xfer_drain_deadline, xfer_finish_rx.recv()).await {
             Ok(Some(finished)) => {
-                apply_xfer_finish(udp_socket, state, db, app_handle, finished).await;
+                apply_xfer_finish(udp_socket, state, db, app_handle, credit_manager, finished).await;
             }
             // Only `state` holds a sender, so this cannot happen while the
             // loop owns it — treat it as "nothing more is coming" regardless.
@@ -907,13 +907,16 @@ pub(in crate::network) async fn save_on_shutdown(
     // client's full 10s request timeout) could exhaust the app's ~12s
     // shutdown budget and cut off nodes.dat / known.met / credit / reputation
     // persistence. All local state is already on disk by this point, so a slow
-    // unregister can no longer cost us durability.
-    if state.rendezvous_registered {
-        let rv_url = settings.rendezvous_url.clone();
-        let rv_hash = ember_hash;
+    // unregister can no longer cost us durability. It shares nothing with the
+    // router teardown, so the two wait at once.
+    let rendezvous_registered = state.rendezvous_registered;
+    let unregister = async {
+        if !rendezvous_registered {
+            return;
+        }
         match tokio::time::timeout_at(
             shutdown_phase_deadline(shutdown_deadline, std::time::Duration::from_secs(3)),
-            rendezvous::unregister(&rv_url, &rv_hash, &ed25519_secret_key),
+            rendezvous::unregister(&settings.rendezvous_url, &ember_hash, &ed25519_secret_key),
         )
         .await
         {
@@ -921,9 +924,11 @@ pub(in crate::network) async fn save_on_shutdown(
             Ok(Err(e)) => debug!("Failed to unregister from rendezvous server: {e}"),
             Err(_) => debug!("Rendezvous unregister timed out on shutdown; skipping"),
         }
-    }
-
-    if upnp_enabled {
+    };
+    let upnp_teardown = async {
+        if !upnp_enabled {
+            return;
+        }
         // A setup or maintenance pass works on a copy of the mappings, and
         // what it maps is only ours to remove once its result is adopted. Let
         // a pass in flight finish, briefly, rather than quit beside a forward
@@ -956,7 +961,8 @@ pub(in crate::network) async fn save_on_shutdown(
             },
         )
         .await;
-    }
+    };
+    tokio::join!(unregister, upnp_teardown);
 }
 
 /// Wait until the periodic reputation writer has reported, or `deadline`.

@@ -152,6 +152,9 @@ pub(crate) struct EmberBatchPublisher {
     /// exceeding what a storer will accept. See
     /// [`EMBER_STORE_RECORDS_PER_PEER_PER_MIN`] and [`SentWindow`].
     pub(crate) sent_window: HashMap<ember::dht::EmberNodeId, SentWindow>,
+    /// The part of `sent_window` that carried other publishers' records we
+    /// fanned out as their buddy. See [`EMBER_FORWARDED_RECORDS_PER_PEER_PER_MIN`].
+    pub(crate) forwarded_window: HashMap<ember::dht::EmberNodeId, SentWindow>,
 }
 
 /// Sender-side mirror of the storer's rate window.
@@ -286,6 +289,17 @@ pub(crate) const EMBER_MAX_BATCH_FRAMES_PER_PEER: usize = 12;
 /// `MAX_STORE_BATCH_RECORDS` records are discarded silently. The headroom is
 /// cheap — it only slows a peer already at 96 records a minute.
 pub(crate) const EMBER_STORE_RECORDS_PER_PEER_PER_MIN: u32 = 96;
+
+/// Of [`EMBER_STORE_RECORDS_PER_PEER_PER_MIN`], how many a minute one storer
+/// may be sent of records we fan out for the publishers we are buddy to.
+///
+/// The storer charges every record we send to the one budget it keeps for us,
+/// whoever signed it, so forwards still count in the shared window. What this
+/// bounds is how much of that budget strangers can take: a source key is the
+/// hash of a file hash a publisher picks freely, so forwards can be aimed at
+/// whichever storer it likes, and without a share of their own they could use
+/// up our allowance there and leave our own records refused.
+pub(crate) const EMBER_FORWARDED_RECORDS_PER_PEER_PER_MIN: u32 = EMBER_STORE_RECORDS_PER_PEER_PER_MIN / 4;
 
 /// How often the queued records are drained.
 ///
@@ -616,13 +630,46 @@ impl EmberBatchPublisher {
         window.count = window.count.saturating_add(records as u32);
     }
 
+    /// Records we may still forward to this peer this minute for publishers we
+    /// are buddy to: what is left of their own share, and never more than the
+    /// shared window has room for.
+    pub(crate) fn forwarded_allowance(
+        &mut self,
+        node_id: ember::dht::EmberNodeId,
+        now: std::time::Instant,
+    ) -> usize {
+        let shared = self.record_allowance(node_id, now);
+        let own = match self.forwarded_window.get_mut(&node_id) {
+            Some(window) => {
+                window.age(now);
+                let used = window.effective(now).ceil();
+                (f64::from(EMBER_FORWARDED_RECORDS_PER_PEER_PER_MIN) - used).max(0.0) as usize
+            }
+            None => EMBER_FORWARDED_RECORDS_PER_PEER_PER_MIN as usize,
+        };
+        own.min(shared)
+    }
+
+    /// Charge one forwarded record to `node_id`'s forwarding share. The shared
+    /// window is charged when it is sent, as for any record.
+    pub(crate) fn note_forwarded(&mut self, node_id: ember::dht::EmberNodeId, now: std::time::Instant) {
+        let window = self
+            .forwarded_window
+            .entry(node_id)
+            .or_insert_with(|| SentWindow::new(now));
+        window.age(now);
+        window.count = window.count.saturating_add(1);
+    }
+
     /// Forget pacing state for peers we have not sent to in a while, so a long
     /// session's churn cannot grow the map without bound.
     pub(crate) fn prune_sent_window(&mut self, now: std::time::Instant) {
-        self.sent_window.retain(|_, window| {
+        let live = |window: &mut SentWindow| {
             now.saturating_duration_since(window.started_at())
                 < std::time::Duration::from_secs(300)
-        });
+        };
+        self.sent_window.retain(|_, window| live(window));
+        self.forwarded_window.retain(|_, window| live(window));
     }
 }
 
@@ -642,6 +689,27 @@ const EMBER_BUDDY_ASK_ROUND: std::time::Duration =
 /// endorsed one.
 pub(crate) const EMBER_BUDDY_SKIP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+/// Least time between re-asks of a buddy whose endorsement we stopped naming.
+///
+/// An answered ask frees the engine's own pacing at once, so a buddy whose
+/// fresh endorsement is as unusable as the last — its self-view of its address
+/// differs from where we reach it — would otherwise be asked again on every
+/// publish tick. The same interval the engine waits on an unanswered one.
+pub(crate) const EMBER_BUDDY_REASK: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What became of a `PROXY_STORE` ask that expired without an ack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EmberProxyAskExpiry {
+    /// The buddy acked something sent no earlier, so it is alive and turned
+    /// this one down: a cap on the record's file or /24, a missing token, or
+    /// its own allowance. A fault of the file's, and charged to it.
+    Refused,
+    /// Nothing heard from the buddy since; the buddy's fault, not the file's.
+    Silent,
+    /// As `Silent`, and it was the round that has the buddy skipped from now.
+    Skipped,
+}
+
 /// A firewalled publisher's view of each buddy it proxies through: how much of
 /// the buddy's per-sender allowance it has used, and whether the buddy is still
 /// answering.
@@ -654,9 +722,18 @@ pub(crate) const EMBER_BUDDY_SKIP: std::time::Duration = std::time::Duration::fr
 /// forward for the whole window. Firewalled selection is capped at what is left,
 /// because every ask past it is refused without an ack and its file only comes
 /// back as due once the ask expires, having cost a signature for nothing.
+///
+/// It also holds the endorsements we have stopped naming. The engine keeps an
+/// endorsement for its whole six-hour life, and a buddy that has since changed
+/// its address or Noise key, or stopped answering, refuses every `PROXY_STORE`
+/// naming it without an ack. Naming it anyway stalled firewalled publishing
+/// for hours while the page read "relayed". A dropped endorsement stays dropped
+/// until the buddy signs a new one.
 #[derive(Default)]
 pub(crate) struct EmberProxyBuddyPacer {
     buddies: HashMap<ember::dht::EmberNodeId, ProxyBuddyHealth>,
+    /// Signature and expiry of each endorsement dropped, by buddy.
+    dropped: HashMap<ember::dht::EmberNodeId, ([u8; 64], i64)>,
 }
 
 #[derive(Default)]
@@ -669,6 +746,8 @@ struct ProxyBuddyHealth {
     /// When the asks of the last round counted in `silent_rounds` went out.
     last_silent_round: Option<std::time::Instant>,
     skip_until: Option<std::time::Instant>,
+    /// When we last asked for an endorsement to replace a dropped one.
+    reasked_at: Option<std::time::Instant>,
 }
 
 impl ProxyBuddyHealth {
@@ -718,23 +797,75 @@ impl EmberProxyBuddyPacer {
         buddy: ember::dht::EmberNodeId,
         asked_at: std::time::Instant,
         now: std::time::Instant,
-    ) {
+    ) -> EmberProxyAskExpiry {
         let health = self.buddies.entry(buddy).or_default();
         if health.last_ack.is_some_and(|ack| ack >= asked_at) {
-            return;
+            return EmberProxyAskExpiry::Refused;
         }
         let same_round = health.last_silent_round.is_some_and(|round| {
             round.max(asked_at).saturating_duration_since(round.min(asked_at)) < EMBER_BUDDY_ASK_ROUND
         });
         if same_round {
-            return;
+            return EmberProxyAskExpiry::Silent;
         }
         health.last_silent_round = Some(asked_at);
         health.silent_rounds += 1;
         if health.silent_rounds >= EMBER_BUDDY_SILENT_ROUNDS_BEFORE_SKIP {
             health.silent_rounds = 0;
             health.skip_until = Some(now + EMBER_BUDDY_SKIP);
+            return EmberProxyAskExpiry::Skipped;
         }
+        EmberProxyAskExpiry::Silent
+    }
+
+    /// Stop naming the endorsement `buddy` signed as `signature`, expiring at
+    /// `expires_at`.
+    pub(crate) fn drop_endorsement(
+        &mut self,
+        buddy: ember::dht::EmberNodeId,
+        signature: [u8; 64],
+        expires_at: i64,
+    ) {
+        self.dropped.insert(buddy, (signature, expires_at));
+    }
+
+    /// Whether the endorsement `buddy` signed as `signature` has been dropped.
+    pub(crate) fn endorsement_dropped(&self, buddy: &ember::dht::EmberNodeId, signature: &[u8; 64]) -> bool {
+        self.dropped
+            .get(buddy)
+            .is_some_and(|(dropped, _)| dropped == signature)
+    }
+
+    /// Whether `buddy` holds an endorsement we have dropped and not seen
+    /// replaced.
+    pub(crate) fn has_dropped_endorsement(&self, buddy: &ember::dht::EmberNodeId) -> bool {
+        self.dropped.contains_key(buddy)
+    }
+
+    /// Forget dropped endorsements that have lapsed, or that `current` (the
+    /// signature of the endorsement now held from that buddy) says were
+    /// replaced.
+    pub(crate) fn forget_replaced_endorsements(
+        &mut self,
+        now_unix: i64,
+        current: impl Fn(&ember::dht::EmberNodeId) -> Option<[u8; 64]>,
+    ) {
+        self.dropped.retain(|buddy, (signature, expires_at)| {
+            *expires_at > now_unix && current(buddy).is_some_and(|held| held == *signature)
+        });
+    }
+
+    /// Whether `buddy` may be asked again for an endorsement to replace one we
+    /// dropped; see [`EMBER_BUDDY_REASK`].
+    pub(crate) fn may_reask(&self, buddy: &ember::dht::EmberNodeId, now: std::time::Instant) -> bool {
+        self.buddies
+            .get(buddy)
+            .and_then(|health| health.reasked_at)
+            .is_none_or(|at| now.saturating_duration_since(at) >= EMBER_BUDDY_REASK)
+    }
+
+    pub(crate) fn note_reasked(&mut self, buddy: ember::dht::EmberNodeId, now: std::time::Instant) {
+        self.buddies.entry(buddy).or_default().reasked_at = Some(now);
     }
 
     /// Whether `buddy` has stopped answering recently enough to be passed over.
@@ -755,6 +886,9 @@ impl EmberProxyBuddyPacer {
                 || health
                     .last_ack
                     .is_some_and(|ack| now.saturating_duration_since(ack) < EMBER_BUDDY_SKIP)
+                || health
+                    .reasked_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < EMBER_BUDDY_REASK)
         });
     }
 }
@@ -1062,6 +1196,93 @@ mod tests {
             pacer.note_expired(buddy(3), start + std::time::Duration::from_micros(i), later);
         }
         assert!(!pacer.is_skipped(&buddy(3), later));
+    }
+
+    /// What an expired ask is held to be decides whether its file is charged:
+    /// refused by a buddy that answers, or lost to one that does not.
+    #[test]
+    fn an_expired_ask_says_whether_the_buddy_refused_it_or_went_quiet() {
+        let mut pacer = EmberProxyBuddyPacer::default();
+        let start = std::time::Instant::now();
+        let later = start + std::time::Duration::from_secs(90);
+        let window = ember::dht::engine::PROXY_FORWARD_WINDOW;
+
+        pacer.note_asked(buddy(1), start);
+        pacer.note_acked(buddy(1), start + std::time::Duration::from_secs(1));
+        assert_eq!(pacer.note_expired(buddy(1), start, later), EmberProxyAskExpiry::Refused);
+
+        let round = |n: u32| start + window * n;
+        for n in 0..EMBER_BUDDY_SILENT_ROUNDS_BEFORE_SKIP - 1 {
+            assert_eq!(pacer.note_expired(buddy(2), round(n), later), EmberProxyAskExpiry::Silent);
+            assert_eq!(
+                pacer.note_expired(buddy(2), round(n), later),
+                EmberProxyAskExpiry::Silent,
+                "the rest of a round's asks"
+            );
+        }
+        assert_eq!(
+            pacer.note_expired(buddy(2), round(EMBER_BUDDY_SILENT_ROUNDS_BEFORE_SKIP - 1), later),
+            EmberProxyAskExpiry::Skipped,
+            "said once, by the round that has it skipped"
+        );
+    }
+
+    /// A dropped endorsement stays dropped until the buddy signs another, and
+    /// asks for that one are paced even though each is answered.
+    #[test]
+    fn a_dropped_endorsement_stays_dropped_until_replaced() {
+        let mut pacer = EmberProxyBuddyPacer::default();
+        let now = std::time::Instant::now();
+        let (old, new) = ([1u8; 64], [2u8; 64]);
+        pacer.drop_endorsement(buddy(1), old, 1_000);
+        assert!(pacer.endorsement_dropped(&buddy(1), &old));
+        assert!(!pacer.endorsement_dropped(&buddy(1), &new));
+        assert!(!pacer.endorsement_dropped(&buddy(2), &old));
+
+        pacer.forget_replaced_endorsements(500, |_| Some(old));
+        assert!(pacer.has_dropped_endorsement(&buddy(1)), "still the one held");
+        pacer.forget_replaced_endorsements(500, |_| Some(new));
+        assert!(!pacer.has_dropped_endorsement(&buddy(1)), "replaced");
+        pacer.drop_endorsement(buddy(1), old, 1_000);
+        pacer.forget_replaced_endorsements(1_000, |_| Some(old));
+        assert!(!pacer.has_dropped_endorsement(&buddy(1)), "lapsed");
+
+        assert!(pacer.may_reask(&buddy(1), now));
+        pacer.note_reasked(buddy(1), now);
+        assert!(!pacer.may_reask(&buddy(1), now + EMBER_BUDDY_REASK / 2));
+        assert!(pacer.may_reask(&buddy(1), now + EMBER_BUDDY_REASK));
+        pacer.prune(now + EMBER_BUDDY_REASK / 2);
+        assert!(!pacer.may_reask(&buddy(1), now + EMBER_BUDDY_REASK / 2), "kept while it paces");
+    }
+
+    /// Forwards for other publishers stop at their own share of a storer's
+    /// budget, leaving the rest to our records, and never exceed what the
+    /// shared window still has.
+    #[test]
+    fn forwards_have_a_share_of_their_own_at_each_storer() {
+        let mut publisher = EmberBatchPublisher::default();
+        let now = std::time::Instant::now();
+        let storer = contact(1).node_id;
+        let share = EMBER_FORWARDED_RECORDS_PER_PEER_PER_MIN as usize;
+        assert_eq!(publisher.forwarded_allowance(storer, now), share);
+        for _ in 0..share {
+            publisher.note_forwarded(storer, now);
+            publisher.note_records_sent(storer, now, 1);
+        }
+        assert_eq!(publisher.forwarded_allowance(storer, now), 0);
+        assert_eq!(
+            publisher.record_allowance(storer, now),
+            EMBER_STORE_RECORDS_PER_PEER_PER_MIN as usize - share,
+            "our own records keep the rest"
+        );
+        assert_eq!(publisher.forwarded_allowance(contact(2).node_id, now), share);
+
+        let busy = contact(3).node_id;
+        publisher.note_records_sent(busy, now, EMBER_STORE_RECORDS_PER_PEER_PER_MIN as usize - 2);
+        assert_eq!(publisher.forwarded_allowance(busy, now), 2, "bounded by the shared window");
+
+        publisher.prune_sent_window(now + std::time::Duration::from_secs(300));
+        assert!(publisher.forwarded_window.is_empty());
     }
 
     #[test]

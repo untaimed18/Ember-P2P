@@ -28,7 +28,7 @@
   import { chatDockOpen, closeDock, retainChatTabs } from '$lib/stores/chatTabs';
   import { initChannelsStore, cleanupChannelsStore, refreshChannels } from '$lib/stores/channels';
   import { CHANNELS_RECOVERED_EVENT } from '$lib/api/channels';
-  import { loadAppSettings, clearAppSettings, setAppSettings } from '$lib/stores/settings';
+  import { loadAppSettings, clearAppSettings, setAppSettings, syncToastAreasWithSettings } from '$lib/stores/settings';
   import { initTheme, cleanupTheme } from '$lib/stores/theme';
   import { applyDocumentLang, translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
@@ -46,22 +46,22 @@
     takePendingKnownMetNotice,
     SETTINGS_CHANGED_EVENT,
     QUIT_REQUESTED_EVENT,
+    finishRequestedQuit,
     setPendingUndo,
   } from '$lib/api/settings';
-  import {
-    applyBackgroundCheckResult,
-    checkUpdateHandoff,
-    loadLastBackgroundCheckResult,
-    type SecureUpdateCheckResult,
-  } from '$lib/stores/updater';
+  import { checkUpdateHandoff, loadLastBackgroundCheckResult } from '$lib/stores/updater';
   import { setTrayLabels } from '$lib/api/system';
   import {
     acknowledgeSecurityPolicyReset,
     getSecurityPolicyState,
   } from '$lib/api/security';
   import {
-    addActionToast, addToast, clearAllToasts, onPendingUndoChange, toastError, toastSuccess, toastWarning,
+    addActionToast, addToast, clearAllToasts, flushToastActions, onPendingUndoChange, reloadAfterToastActions,
+    setToastMessage, toastError, toastSuccess, toastWarning, toasts, toastsFor,
   } from '$lib/stores/toast';
+  const channelToasts = toastsFor('channels');
+  const libraryToasts = toastsFor('library');
+  import { get } from 'svelte/store';
   import { backupReminderDue, noteBackupReminderShown } from '$lib/backupReminder';
   import { afterNavigate, goto } from '$app/navigation';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -71,9 +71,10 @@
   import type { AppSettings } from '$lib/types';
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
-  import { fly } from 'svelte/transition';
+  import { fade, fly, scale } from 'svelte/transition';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import ChatWindowShell from '$lib/components/ChatWindowShell.svelte';
   import { initChatPopoutMain } from '$lib/chatPopout';
   import { applyUpdateResume, initUpdateResume } from '$lib/updateResume';
@@ -329,6 +330,7 @@
     if (chatWindow) return;
     initTheme();
     const stopStallDetector = startStallDetector();
+    const stopToastAreaSync = syncToastAreasWithSettings();
     const splashStartedAt = performance.now();
     // The splash exists to mask the first paint, not to delay it. Once
     // the stores have initialized we want the app visible immediately;
@@ -384,6 +386,12 @@
     };
     window.addEventListener('unhandledrejection', onUnhandledRejection);
 
+    // A reload runs no toast's expiry. Ember's own reloads send what Undo
+    // holds back first (`reloadAfterToastActions`); for any other, start
+    // sending it as the page goes, which is the best that can be done then.
+    const onPageHide = () => { void flushToastActions(); };
+    window.addEventListener('pagehide', onPageHide);
+
     // Register before consuming the native latch. A close can be prevented by
     // Tauri before this async registration resolves; the backend records that
     // request so it is still surfaced exactly once after the listener is live.
@@ -431,9 +439,10 @@
     listen<{ count: number }>(CHANNELS_RECOVERED_EVENT, (event) => {
       const count = event.payload?.count ?? 0;
       if (count <= 0) return;
-      toastSuccess(
+      channelToasts.toastSuccess(
         plural(count, {
-          one: m.layout_channels_recovered_one,
+          one: () => m.layout_channels_recovered_one({ count }),
+          oneShowsCount: true,
           other: () => m.layout_channels_recovered_other({ count }),
         }),
       );
@@ -508,13 +517,21 @@
       })
       .catch((e) => console.error('Failed to consume the restore download-folder latch:', e));
 
-    listen<{ loaded: boolean; resetRequired: boolean; reason?: string }>(
-      'security-policy-reset-required',
-      (event) => {
-        if (!mounted) return;
-        policyResetReason = event.payload?.reason || m.layout_policy_reset_unknown_reason();
-      },
-    )
+    // Any window can emit an app event, the popped-out chat included, so a
+    // listener whose event the backend alone should send asks the backend for
+    // the state rather than trusting the payload.
+    const readPolicyState = () => {
+      void getSecurityPolicyState()
+        .then((status) => {
+          if (mounted && status.resetRequired) {
+            policyResetReason = status.reason || m.layout_policy_reset_unknown_reason();
+          }
+        })
+        .catch((e) => console.error('Failed to read security-policy state:', e));
+    };
+    listen('security-policy-reset-required', () => {
+      if (mounted) readPolicyState();
+    })
       .then((fn) => { if (mounted) unlistenPolicyReset = fn; else fn(); })
       .catch((e) => console.error('Failed to register security-policy listener:', e));
 
@@ -528,9 +545,10 @@
       if (!mounted) return;
       const count = event.payload?.count ?? 0;
       if (count <= 0) return;
-      toastSuccess(
+      libraryToasts.toastSuccess(
         plural(count, {
-          one: m.library_folders_shared_one,
+          one: () => m.library_folders_shared_one({ count }),
+          oneShowsCount: true,
           other: () => m.library_folders_shared_other({ count }),
         }),
       );
@@ -546,7 +564,8 @@
       if (count <= 0) return;
       toastWarning(
         plural(count, {
-          one: m.library_folders_share_failed_one,
+          one: () => m.library_folders_share_failed_one({ count }),
+          oneShowsCount: true,
           other: () => m.library_folders_share_failed_other({ count }),
         }),
       );
@@ -568,8 +587,8 @@
     // for as long as Ember stays open (release builds only); they have no
     // setting. Their results are applied exactly as a silent check's would
     // be, and surface non-blockingly via <UpdateNotice />.
-    listen<SecureUpdateCheckResult>('ember:updater-check-result', (event) => {
-      if (mounted) void applyBackgroundCheckResult(event.payload);
+    listen('ember:updater-check-result', () => {
+      if (mounted) void loadLastBackgroundCheckResult();
     })
       .then((fn) => {
         if (!mounted) {
@@ -594,8 +613,10 @@
     }).catch((e) => console.error('Failed to set the tray labels:', e));
 
     // The tray and the status bar save speed limits without the Settings page.
-    listen<AppSettings>(SETTINGS_CHANGED_EVENT, (event) => {
-      if (mounted) setAppSettings(event.payload);
+    // Fetched rather than taken from the event: a forged one with a huge
+    // `settings_revision` would pin itself over every genuine update.
+    listen(SETTINGS_CHANGED_EVENT, () => {
+      if (mounted) void loadAppSettings();
     })
       .then((fn) => { if (mounted) unlistenSettingsChanged = fn; else fn(); })
       .catch((e) => console.error('Failed to register settings-changed listener:', e));
@@ -607,7 +628,7 @@
     });
     listen(QUIT_REQUESTED_EVENT, () => {
       if (!mounted) return;
-      void quitApp().catch((e) => console.error('Failed to quit Ember:', e));
+      void finishRequestedQuit().catch((e) => console.error('Failed to quit Ember:', e));
     })
       .then((fn) => { if (mounted) unlistenQuitRequested = fn; else fn(); })
       .catch((e) => console.error('Failed to register quit-requested listener:', e));
@@ -630,18 +651,29 @@
 
     // Downloads re-queue on their own once the folder is fixed, so without this
     // the only sign of a folder Ember cannot write is rows that never start.
+    // Both of these stop downloads, so they stay until dismissed rather than
+    // vanishing while the user is looking elsewhere.
     listen('download-folder-unavailable', () => {
       if (!mounted) return;
-      toastWarning(m.layout_download_folder_unavailable());
+      addToast('warning', m.layout_download_folder_unavailable(), 0);
     })
       .then((fn) => { if (mounted) unlistenDownloadFolder = fn; else fn(); })
       .catch((e) => console.error('Failed to register download-folder-unavailable listener:', e));
 
+    // One notice per drive: a repeat rewords the one still up with the latest
+    // free space rather than stacking another.
+    const diskSpaceToasts = new Map<string, number>();
     listen<{ path?: string; freeBytes?: number }>('disk-space-low', (event) => {
       if (!mounted) return;
+      const path = event.payload?.path ?? '';
       const free = formatBytes(event.payload?.freeBytes ?? 0);
-      const message = m.layout_disk_space_low({ free, path: event.payload?.path ?? '' });
-      toastWarning(message);
+      const message = m.layout_disk_space_low({ free, path });
+      const shown = diskSpaceToasts.get(path);
+      if (shown !== undefined && get(toasts).some((t) => t.id === shown)) {
+        setToastMessage(shown, message);
+      } else {
+        diskSpaceToasts.set(path, addToast('warning', message, 0));
+      }
       void notify('disk_space', m.layout_disk_space_low_title(), message);
     })
       .then((fn) => { if (mounted) unlistenDiskSpace = fn; else fn(); })
@@ -675,13 +707,7 @@
       .then((fn) => { if (mounted) unlistenDropRejected = fn; else fn(); })
       .catch((e) => console.error('Failed to register drop-rejected listener:', e));
 
-    void getSecurityPolicyState()
-      .then((status) => {
-        if (mounted && status.resetRequired) {
-          policyResetReason = status.reason || m.layout_policy_reset_unknown_reason();
-        }
-      })
-      .catch((e) => console.error('Failed to read security-policy state:', e));
+    readPolicyState();
 
     const revealApp = () => {
       if (!mounted || !splashVisible) return;
@@ -711,24 +737,27 @@
           if (degraded.length > 0) {
             toastError(translateError(degraded[0], m.layout_init_failed()));
           }
-          try {
-            // Only consume once we know the shell is still alive. The backend
-            // command acknowledges+returns the count atomically — there is no
-            // peek — so always surface the toast after a successful take.
-            if (mounted) {
-              const migrated = await takePendingDownloadOverflowNotice();
-              if (migrated > 0) {
-                toastWarning(
-                  plural(migrated, {
-                    one: m.layout_download_overflow_notice_one,
-                    few: () => m.layout_download_overflow_notice_few({ count: migrated }),
-                    other: () => m.layout_download_overflow_notice_other({ count: migrated }),
-                  }),
-                );
-              }
-            }
-          } catch (e) {
-            console.error('Failed to read pending-download migration notice:', e);
+          // Only consume once we know the shell is still alive. The backend
+          // command acknowledges+returns the count atomically — there is no
+          // peek — so always surface the toast after a successful take. Not
+          // awaited: the splash waits on the settings below, not on this.
+          if (mounted) {
+            void takePendingDownloadOverflowNotice()
+              .then((migrated) => {
+                if (migrated > 0) {
+                  toastWarning(
+                    plural(migrated, {
+                      one: () => m.layout_download_overflow_notice_one({ count: migrated }),
+                      oneShowsCount: true,
+                      few: () => m.layout_download_overflow_notice_few({ count: migrated }),
+                      other: () => m.layout_download_overflow_notice_other({ count: migrated }),
+                    }),
+                  );
+                }
+              })
+              .catch((e) => {
+                console.error('Failed to read pending-download migration notice:', e);
+              });
           }
 
           // Fetch settings with bounded exponential-backoff retries.
@@ -840,6 +869,7 @@
     return () => {
       mounted = false;
       window.removeEventListener('unhandledrejection', onUnhandledRejection);
+      window.removeEventListener('pagehide', onPageHide);
       if (revealTimer !== undefined) window.clearTimeout(revealTimer);
       if (hideTimer !== undefined) window.clearTimeout(hideTimer);
       if (handoffCheckTimer !== undefined) window.clearTimeout(handoffCheckTimer);
@@ -866,6 +896,7 @@
       cleanupFeedsStore();
       clearAllToasts();
       clearAppSettings();
+      stopToastAreaSync();
       if (unlistenClose) unlistenClose();
       if (unlistenConfigCorrupt) unlistenConfigCorrupt();
       if (unlistenDbCorrupt) unlistenDbCorrupt();
@@ -920,7 +951,7 @@
       {:else if initError}
         <div class="init-error">
           <p>{initError}</p>
-          <button onclick={() => location.reload()}>{m.layout_retry()}</button>
+          <button onclick={() => reloadAfterToastActions()}>{m.layout_retry()}</button>
         </div>
       {:else}
         <!--
@@ -928,12 +959,12 @@
           change ties navigation together. Keyed on pathname (not full URL)
           so query-param changes (search tabs, filters) don't re-animate.
           The wrapper mirrors `.page-container`'s flex-column/overflow so the
-          pages' `flex: 1` height chain is preserved. The global
-          prefers-reduced-motion rule in app.css neutralizes this for users
-          who opt out.
+          pages' `flex: 1` height chain is preserved. Svelte runs this through
+          the Web Animations API, which the reduced-motion rule in app.css
+          does not reach, so it checks the preference itself.
         -->
         {#key $page.url.pathname}
-          <div class="route-view" in:fly={{ y: 8, duration: 160 }}>
+          <div class="route-view" in:fly={{ y: 8, duration: prefersReducedMotion.current ? 0 : 160 }}>
             <ErrorBoundary title={m.layout_render_error_title()} body={m.layout_render_error_body()}>
               {@render children()}
             </ErrorBoundary>
@@ -1025,10 +1056,13 @@
     class="policy-reset-backdrop"
     bind:this={policyResetOverlayEl}
     role="presentation"
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+    onoutrostart={inertDuringOutro}
   >
     <div
       class="policy-reset-dialog"
       bind:this={policyResetDialogEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
       role="alertdialog"
       aria-modal="true"
       aria-busy={policyResetPending}

@@ -99,6 +99,11 @@ pub async fn open_chat_window(
             "The chat window can only be opened from the main window",
         ));
     }
+    // Commands run concurrently, and a window is registered under its label
+    // only once it is built: two opens a moment apart both found none and both
+    // built one. Held from the look to the build, the second finds the first's.
+    static OPENING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _opening = OPENING.lock().await;
     if let Some(existing) = app.get_webview_window(CHAT_WINDOW_LABEL) {
         bring_forward(&existing);
         return Ok(());
@@ -177,11 +182,13 @@ pub async fn close_chat_window(app: tauri::AppHandle) -> Result<(), String> {
 /// the chat nothing and keeps a compromised chat webview from them.
 pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "acknowledge_security_policy_reset",
+    "add_feed_items",
     "add_ip_filter_range",
     "add_server",
     "ban_peer",
     "batch_unshare",
     "cancel_feed_download",
+    "cancel_finish_action",
     "clear_download_history",
     "confirm_dropped_folders",
     "create_feed",

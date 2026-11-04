@@ -129,6 +129,8 @@ export function languageLabel(locale: Locale): string {
       return m.language_name_ru({}, { locale });
     case 'zh-TW':
       return m.language_name_zh_TW({}, { locale });
+    case 'pl':
+      return m.language_name_pl({}, { locale });
     default:
       return locale;
   }
@@ -161,6 +163,8 @@ export function localeFlagSrc(locale: Locale): string | null {
         return 'ru';
       case 'zh-TW':
         return 'tw';
+      case 'pl':
+        return 'pl';
       default:
         return null;
     }
@@ -304,7 +308,7 @@ export function degradedReasonText(reason: string | undefined): string {
  *
  * `scripts/backend-codes.test.mjs` requires this map to name exactly the codes
  * that table declares, so a variant added in Rust without a row here fails
- * `npm test` rather than quietly rendering English in the other eight locales.
+ * `npm test` rather than quietly rendering English in the other nine locales.
  */
 const TRANSFER_FAILURE_CODES = new Map<string, () => string>([
   ['cancelled', m.transfers_failure_reason_cancelled],

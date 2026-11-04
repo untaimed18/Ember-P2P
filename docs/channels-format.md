@@ -610,7 +610,7 @@ fields that matter here sit in the fixed record header (`RECORD_HEADER_LEN`,
 | 1..17 | 16 | `keyword_hash` | the DHT key the record is filed under |
 | 17..33 | 16 | `file_hash` | the channel id (kind 7: the identity's node id; kind 2 v2: the room-blind id) |
 | 33..65 | 32 | `ember_file_hash` | the channel pubkey (kind 7: the identity pubkey; kind 2 v2: the room-blind key) |
-| 65..73 | 8 | `file_size` | byte 65 kind, 66 flags, 67 language (index, moderation, and from 1.7.5 a public room's presence) |
+| 65..73 | 8 | `file_size` | byte 65 kind, 66 flags, 67 language (index, moderation, and from 1.7.5 a public room's presence), 68 second language (a public room's presence, from 1.7.6) |
 | 73..105 | 32 | `publisher_key` | the signer (kind 2 v2: the member's pseudonym for the room) |
 | 105..113 | 8 | `timestamp` | |
 | 113..115 | 2 | `name_len` | then the name |
@@ -621,9 +621,9 @@ signature travels beside the body; see the
 [DHT specification](ember-dht-specification.pdf) for the record as a whole.
 
 **Language wire ids** (`CHANNEL_LANGUAGES` in `network/ember/dht/publish.rs`,
-mirrored by `src/lib/channelLanguages.ts`). Byte 67 of `file_size`, and the
-language byte in a private room's presence seal (kind 2 below), carry a
-language as its position in this list plus one; 0 is no language:
+mirrored by `src/lib/channelLanguages.ts`). Bytes 67 and 68 of `file_size`,
+and the language bytes in a private room's presence seal (kind 2 below),
+carry a language as its position in this list plus one; 0 is no language:
 
 | Id | Code | Id | Code | Id | Code | Id | Code |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -664,7 +664,17 @@ the `CHANNEL_KIND_*` constants). Per kind:
 | 8 | `CHANNEL_KIND_SETTINGS` | channel key | publisher is the channel key; key is `settings_key`; within `MAX_STORE_RECORD_BYTES`; `settings_fields` | `CHANNEL_GOVERNANCE_TTL`, 30 days |
 
 `record_ttl` falls back to `KEYWORD_RECORD_TTL` (24 hours) for any other kind,
-but `channel_store_ok` refuses those first. The `extra` each kind carries:
+but `channel_store_ok` refuses those first.
+
+The 16 room-index shard keys hold room listings (kind 1) and nothing else,
+off the wire and when stored records are restored. A full shard drops a listing
+for a newer one only once the old listing has gone 13 hours unsigned: two of its
+owner's 6-hour re-signs plus the skew tolerance. A key holding records only its
+owner can make (kinds 3, 4, 5, 7, 8, and feed heads) serves them ahead of
+records filed there freely, and when full, drops a freely filed record to take
+one of them (see `docs/ember-dht.md`, "Keys are not all bound alike").
+
+The `extra` each kind carries:
 
 - **1, index.** Empty. The room name is the record name; flag
   `CHANNEL_FLAG_PRIVATE` (`0x01`).
@@ -694,6 +704,14 @@ but `channel_store_ok` refuses those first. The `extra` each kind carries:
   bytes, so their records read as none and ours read to them as before. A
   leave carries none. A reader takes it only from the member's own record:
   beacons, chat lines and snapshots never set or clear it.
+
+  **A second language** (from 1.7.6), for a member who writes in two, rides
+  beside the first: byte 68 of a public room's record, and the pad byte
+  before the last inside a private room's seal, counted only while
+  `nick_len` is under 63 (a Channel username is at most 12). Builds before it
+  write zero in both places and read neither, so they show the first alone. A
+  second is kept only beside a first and only when it differs from it
+  (`ChannelLanguages::new`), whatever the record holds.
 - **3, moderation.** The owner's whole governance snapshot (welcome, bans,
   moderators, `ModerationTail`). The storer does not check its shape; readers
   do. Worst case 1164 of 1165 bytes (see
@@ -1170,7 +1188,7 @@ replaces the live record under the one store key, as in v1.
 
 The plaintext is v1's, then the member: `noise_pub(32) || nick_len(1) ||
 nickname padded to 64 || member_pubkey(32) || binding(64)`, the pad's last
-byte carrying the member's language as in v1 (see kind 2 above). The AAD is
+two bytes carrying the member's languages as in v1 (see kind 2 above). The AAD is
 `"ember-channel-presence-extra-v2\0" || channel_id || pseudonym_pubkey`
 (`presence_extra_v2_aad`). The binding is the member's long-term key's
 signature over `"ember-channel-presence-binding-v2\0" || channel_id ||
@@ -1492,7 +1510,12 @@ publisher's identity key:
 **Trailer.** Framed as the channel trailer: `flags(1) ||` the head in the
 clear (`version(1) = 1 || sequence(8) || list_ed2k_hash(16) || item_count(4) ||
 total_size(8) || description_len(2) || description`). Flag `0x01` withdraws the feed from the
-index; other bits are kept for later builds. A listing names its feed by
+index. Flag `0x02` (`FEED_LISTING_CANNOT_SHARE`, from 1.7.6) says followers
+cannot fetch the feed's files now: its publisher can place no source record
+(firewalled with no buddy, or no known address) and is not registered on the
+rendezvous server either (see "Reaching a publisher" below). Discover shows such
+a feed's running publisher as online with its files unavailable. Other bits
+are kept for later builds. A listing names its feed by
 publisher and salt, which is all its link holds, so Discover follows it as it
 would the link. A withdrawal carries a
 fixed placeholder head (`withdrawal_head`: title `-`, every hash byte `0xFF`,
@@ -1516,12 +1539,14 @@ a tie). One publisher may hold at most 16 records under a shard key
 keeps, for withdrawals of deleted ones), against 150 under other keys; a
 replacement of one it holds is always taken. A shard key holding its 1,000
 records (`MAX_RECORDS_PER_KEY`) drops its stalest listing for one signed
-after it, rather than refusing every newcomer. Each is dated by the earlier
-of its stamp and when it was stored (the date its expiry is aged from), so a
-stamp up to the hour's skew tolerance ahead of the clock buys nothing. Junk
-filling a shard must be re-signed more often than real feeds are to keep
-them out, and lapses within
-a week when it is not. Older builds file it as an unknown type for 24 hours.
+after it, but only a listing gone 3 hours unsigned: two of the publisher's
+hourly re-signs (`FEED_LISTING_RESIGN_SECS`) plus the hour's skew tolerance,
+so a listing whose publisher is running is never displaced, however often junk
+is re-signed. Each is dated by the earlier of its stamp and when it was stored
+(the date its expiry is aged from), so a stamp ahead of the clock buys nothing.
+Junk filling a full shard keeps newcomers out only while it is re-signed, and
+lapses within a week when it is not. Older builds file it as an unknown type
+for 24 hours.
 
 **The publisher** signs its listing anew with every publish and every hourly
 republish while the feed is listed. Each listing or withdrawal of a feed is
@@ -1631,6 +1656,69 @@ a row, any other refusal, or a chunk that does not verify end it, and every
 network is asked for the file. A feed's download restored after a restart is
 held for its publisher again, as when it was started.
 
+**Lists.** From 1.7.6 the publisher also serves its feeds' published and
+pending lists on this stream, under the same `xfer_id` and `capability`
+derivations with the list's eD2K hash, from the app folder it keeps them in.
+A list is never in the Library, so none of the Library's checks apply to it.
+
+## Reaching a publisher (1.7.6)
+
+A follower whose list fetch has found no source for 3 minutes
+(`REACH_AFTER`), at most once every 20 minutes per feed or at once on Retry,
+reaches the publisher through the rendezvous server
+(`network/feed_reach.rs`). A firewalled publisher with no buddy places no
+source record, while its head and listing still go out, so its feed was
+found and never loaded.
+
+**Presence.** Each heartbeat, after the friend and room registrations, the
+publisher registers its 16 most lately published feeds (`MAX_REGISTERED_FEEDS`)
+with `POST /v4/presence/register` as sealed intros: `intro = true`,
+`peer_pubkey` its own key, and `intro_key = BLAKE3_derive_key("ember-feed-presence-key-v1:{epoch}",
+publisher(32) || salt(16))`, with the capability that key derives as a
+sealed intro's does (`ember-intro-presence-v2:{epoch}` over publisher ||
+key). Only holders of the feed's link can compute it. The server checks
+the derivation under the registrant's key, as for any sealed intro, and
+learns nothing of which feed it is; no server change was needed. A server
+that refuses sealed intros gets no feed entries.
+
+**Lookup.** The follower looks the capability up for the current and the
+previous epoch, and checks the answer as a friend's is: signed by the feed's
+publisher key over the address, the key hashing to the id asked for, fresh,
+and a routable IPv4.
+
+**Connecting.** In order, stopping at the first that works:
+
+1. *Direct:* the registered address and TCP port, as the feed stream's
+   secure TCP carrier, pinned to the publisher's node id.
+2. *Hole punch:* the follower first registers presence for the publisher
+   alone, under the pairwise capability their keys share (so the
+   publisher's reply is admitted), then `POST /v4/punch/register` under the
+   feed's capability. A publisher answers a punch from a non-friend only
+   when its capability is one of its own feeds', only from an IP-bound
+   (v4) registration whose proof verifies, at most 6 a minute and 2 from
+   one follower: it
+   acknowledges it, registers a reply to the follower, and dials it to open
+   its NAT. The follower dials QUIC pinned to the publisher at the address
+   the reply names, and the publisher's accept loop serves the feed stream.
+3. *Server relay:* an offer under the feed's capability whose sealed
+   envelope names the purpose `feed-list`. The publisher accepts it only
+   for one of its own feeds' capabilities, at most 2 at once
+   (`MAX_FEED_RELAY_SESSIONS`), runs the secure handshake as the responder
+   over the relay, and serves the feed stream for lists only, for at most
+   2 minutes. A 1.7.5 publisher drops an unknown purpose. Items never cross
+   the server relay.
+
+Whichever connects, the follower asks for the list on the feed stream,
+checks the chunk list against the BLAKE3 the head names and every chunk
+against it, and takes the list up as a fetched one, checked against the head
+again.
+
+**The publisher's page.** A published feed whose publisher can place no
+source record says followers reach it only through the server, and followers
+on 1.7.5 or older cannot fetch it; one that is not registered either says
+followers cannot fetch it at all. That last state is what flag `0x02` of its
+listing carries, sent again (at most every 10 minutes) when it changes.
+
 ## Friend sessions: `EMBER_EXT_BROWSE_SCOPE_AWARE`
 
 Not a room format, but added by the same audit and frozen with it.
@@ -1730,9 +1818,102 @@ The receiver checks the record exactly as one found in the DHT and takes it
 only for a feed it follows whose publisher is the friend who sent it; a head
 signed by anyone else, or forwarded, is ignored. Older builds log the sub-type as unknown and ignore it.
 
+**Key link, from 1.7.6.** `EMBER_EXT_KEY_LINK_CHALLENGE` (`0x15`) and
+`EMBER_EXT_KEY_LINK_PROOF` (`0x16`) tie a peer's Ember identity to its eD2K
+user hash, so bytes it sends or takes over Ember's own streams (feeds, chat
+files, room transfers) count in the eD2K credit ledger. Unlike the other
+sub-types they ride plain eD2K sessions, download and upload alike, to any
+peer whose `OP_EMBER_HELLO` showed it is an Ember client, friend or not; a
+plain eMule peer never sends that HELLO and never sees either. Friend
+sessions carry neither.
+
+- CHALLENGE body: `nonce(32)`, fresh from the OS RNG. Each side sends at most
+  one per session, after the peer's HELLO named an Ember identity: a
+  downloader once its file request is on the wire, an uploader as soon as the
+  HELLO arrives.
+- PROOF body: `ember_pubkey(32) || ed25519_sig(64) || rsa_sig_len(1) ||
+  rsa_sig(rsa_sig_len)`. `rsa_sig_len` must be 48, the signature size of the
+  RSA-384 keys eMule, aMule and Ember use for SecIdent; any other value, and
+  any body that is not exactly 145 bytes, is refused.
+
+Both signatures cover one statement, the 151 bytes
+`"ember-ed2k-key-link-v1\0" || nonce(32) || prover_user_hash(16) ||
+challenger_user_hash(16) || prover_ember_pubkey(32) ||
+BLAKE3(prover_secident_pubkey)(32)`, the SecIdent public key hashed exactly
+as its `OP_PUBLICKEY` carries it:
+
+- `ed25519_sig` is by the Ember key, over the statement.
+- `rsa_sig` is by the prover's SecIdent RSA key, with SecIdent's own
+  primitive (PKCS#1 v1.5 over SHA-1), over the statement followed by zero
+  bytes to 320 in all. No SecIdent signer, in any Ember or eMule version,
+  signs more than 264 bytes (a peer key of at most 255, the challenge, and
+  the 5-byte IP tail), so no SecIdent answer is, or can be steered into
+  being, a key-link RSA signature; Ember's signer also refuses any input but
+  that exact 320-byte form under this domain.
+
+The prover always names its own user hash, its own Ember and SecIdent keys,
+and the user hash the session's peer sent in Hello, and never signs anything
+else under that prefix. A client without a SecIdent key pair answers
+nothing. A session answers at most two challenges.
+
+The challenger takes a proof only as the answer to its one outstanding nonce,
+which any proof spends; an unsolicited or second proof is ignored. The Ember
+key must hash to the identity the peer's HELLO advertised; the statement is
+rebuilt with the session's peer user hash as prover, the challenger's own as
+challenger, and the digest of the SecIdent key on record for the peer's user
+hash, which must be one SecIdent has proven, on this session or any earlier
+one (`CreditManager::proven_public_key`); the Ed25519 signature must verify
+by the Ember key and the RSA signature by that record key. SecIdent need not
+run on the proof's own session, so a peer already verified at its address
+(for which SecIdent is skipped) still links. Only at first contact, when no
+key for the user hash has been proven yet, is the proof kept (nonce, length
+and binding already checked) and checked when SecIdent proves a key on that
+session; it is dropped if that key did not sign it. However a proof
+verifies, it goes through one call that makes the link
+(`CreditManager::note_session_proven_ember`, which also requires the record
+still to hold that proven key); a later proof from the same Ember key for
+another user hash moves it.
+
+Each key endorses the other, which rules out, in turn: a replayed Ember
+public key (no Ed25519 signature); our nonce relayed to the real key holder
+by a stranger under its own user hash (the statement names the key holder's
+user hash and the stranger's); the same relay by a stranger that reached us
+first under the key holder's user hash with its own RSA key (the key
+holder's RSA signature is not by the key on record); and a stranger that
+passes SecIdent for the key holder's user hash by relaying one of its
+SecIdent answers, which SecIdent v1 allows, then proves its own Ember key
+(it has no signature by the key holder's RSA key over that Ember key, and a
+SecIdent answer cannot serve as one), so it can neither take the user hash's
+link nor replace it.
+
+The link is stored in `credit_key_links` with the SecIdent key it was proven
+under and is restored only while the user hash still holds that key; the older
+`credit_ember_links` table, which builds before 1.7.6 filled from a public
+key alone, is shown on Known Ember Peers and never earns credit. Both tables
+sit outside the numbered schema, so a 1.7.6 backup restores on 1.7.5.
+
+A peer that never answers, or whose user hash never has a key proven, just
+never gets the link: nothing waits on it and no session is dropped. 1.7.5
+logs both sub-types as unknown and ignores them, on every session loop; a
+1.7.5 downloader that meets an uploader's challenge before its own file
+request takes it as the end of its pre-request reads and skips it in the
+file-status wait, as it would any packet it does not expect there.
+
+What remains is what SecIdent itself guarantees: the link ties an Ember key
+to whoever holds the RSA key on record for the user hash, and that key is
+first-come for a user hash never seen before. Someone who holds both the
+Ember private key and that RSA key can make the link, as they can already
+collect that user hash's eD2K credit; a stranger who is first to claim an
+unseen user hash under its own RSA key can link only its own Ember key to
+it, never another client's.
+
 ---
 
 ## What freezes at the end of the beta
+
+Frozen in 1.7.5; the beta ended in 1.7.6, which changed none of it and added
+only a member's second language, in two bytes 1.7.5 writes as zero and never
+reads (see kind 2 above).
 
 **Fixed from then on:**
 
@@ -1781,10 +1962,12 @@ signed by anyone else, or forwarded, is ignored. Older builds log the sub-type a
   except the owner's own key copy and rotates every private room once.
   Sending membership traffic under a throwaway DHT identity is not part of
   the format and can come later (`docs/post-1.7.5.md` item 1).
-- A member's language in their presence record: byte 67 in a public room,
-  the nickname pad's last byte in a private room's seal, a
-  `CHANNEL_LANGUAGES` wire id with 0 for none, and the rule that only the
-  member's own presence record sets or clears it.
+- A member's languages in their presence record: the first in byte 67 of a
+  public room's record and the nickname pad's last byte in a private room's
+  seal, and, from 1.7.6, the second in byte 68 and the pad byte before the
+  last; each a `CHANNEL_LANGUAGES` wire id with 0 for none, a second kept only
+  beside a different first, and the rule that only the member's own presence
+  record sets or clears them.
 - The `CHANNEL_LANGUAGES` wire ids 1 to 37 as tabled under
   [DHT channel records](#dht-channel-records), and the rule that the list
   only grows at its end.

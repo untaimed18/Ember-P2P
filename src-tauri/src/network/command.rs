@@ -86,6 +86,16 @@ pub(in crate::network) fn take_part_presence_grew() -> bool {
     std::mem::take(&mut part_presence().lock().grew)
 }
 
+fn release_peer_file_claims(file_hash_hex: Option<&str>) {
+    let Some(hash) = file_hash_hex
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|raw| <[u8; 16]>::try_from(raw.as_slice()).ok())
+    else {
+        return;
+    };
+    ed2k::peer_sessions::release_file_claims(&hash);
+}
+
 /// The roots a cancelled download's tracker may delete its `.part.met` under.
 /// The tracker names the file in the folder its `.part` is in, which is an
 /// earlier download folder for a download started before the folder changed.
@@ -350,7 +360,10 @@ async fn handle_command_inner(
             // so cancel can clear the UDP queue and emit `search-complete`.
             // Taking first used to skip both, leaving the old tab spinning and
             // leftover UDP packets tagged under the new request.
-            if let Some(active) = state.active_search_request.as_ref() {
+            if let Some(active) = state.active_search_request.as_mut() {
+                // Replaced rather than stopped: only this search can be
+                // continued, so the prior one's tab must not offer it.
+                active.continued = false;
                 let prior_id = active.request_id;
                 cancel_search_request(state, app_handle, prior_id);
             }
@@ -953,6 +966,9 @@ async fn handle_command_inner(
             // delete them. Only the deleting form may discard the part writer's
             // trailing fsync — see `TransferControl::discard`.
             let deleting = cleanup_ack.is_some();
+            // A download that no longer asks anyone has no queue place worth
+            // keeping our other downloads away from.
+            release_peer_file_claims(cancel_hash.as_deref());
 
             // Cancel control first so detached per-source tasks bail before
             // we ACK cleanup / delete .part files (N1).
@@ -1087,7 +1103,10 @@ async fn handle_command_inner(
                         state.source_publish_acks.remove(&kad_hash);
                         let mut fh_arr = [0u8; 16];
                         fh_arr.copy_from_slice(&hb[..16]);
-                        state.corruption_blackbox.remove_file(&fh_arr);
+                        // Stop keeps the `.part`, and who sent its bytes with it.
+                        if deleting {
+                            state.corruption_blackbox.remove_file(&fh_arr);
+                        }
                         if let Ok(mut map) = state.aich_recovery_pending.write() {
                             map.retain(|(file_hash, _), _| *file_hash != fh_arr);
                         }
@@ -1145,6 +1164,12 @@ async fn handle_command_inner(
             }
         }
 
+        NetworkCommand::SetPendingPriority { transfer_id, priority } => {
+            if let Some(pending) = state.pending_downloads.get_mut(&transfer_id) {
+                pending.priority = priority_str_to_u32(&priority);
+            }
+        }
+
         NetworkCommand::PauseDownload { transfer_id } => {
             // eMule PauseFile: tear down active network state but keep source
             // knowledge so the download can be resumed quickly.
@@ -1155,6 +1180,9 @@ async fn handle_command_inner(
                 if let Some(control) = mgr.get_control(&transfer_id) {
                     control.cancel();
                 }
+                release_peer_file_claims(
+                    mgr.get_transfer(&transfer_id).map(|t| t.file_hash.as_str()),
+                );
             }
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
                 // Same reasoning as `CancelDownload`: snapshot the tracker
@@ -1989,6 +2017,19 @@ async fn handle_command_inner(
                 // fetch for the feeds code: it is not the user's download, and
                 // the feeds code asks again after a restart.
                 if !crate::sharing::feed_files::is_internal_fetch(&transfer_id) {
+                    // Discovery for a queued or added-paused row is not a
+                    // start, and a control paused or cancelled while this
+                    // command waited is the user's later word: either way the
+                    // status already saved stands.
+                    let write_searching =
+                        !discovery_only && !control.is_paused() && !control.is_cancelled();
+                    // A row the user cancelled while this command waited is
+                    // gone from the manager and must not be saved back.
+                    let tracked_status = transfer_manager
+                        .read()
+                        .await
+                        .get_transfer(&transfer_id)
+                        .map(|t| t.status.clone());
                     let db_ref = db.clone();
                     let tid = transfer_id.clone();
                     let fname = file_name.clone();
@@ -2002,8 +2043,10 @@ async fn handle_command_inner(
                     let seq = clock.next_seq();
                     tokio::task::spawn_blocking(move || {
                         if db_ref.transfer_exists(&tid) {
-                            apply_transfer_status_write(&clock, &db_ref, &tid, "searching", seq);
-                        } else {
+                            if write_searching {
+                                apply_transfer_status_write(&clock, &db_ref, &tid, "searching", seq);
+                            }
+                        } else if let Some(status) = tracked_status {
                             let db_transfer = Transfer {
                                 id: tid,
                                 file_name: fname,
@@ -2011,7 +2054,7 @@ async fn handle_command_inner(
                                 peer_id: String::new(),
                                 peer_name: String::new(),
                                 direction: TransferDirection::Download,
-                                status: TransferStatus::Searching,
+                                status,
                                 progress: 0.0,
                                 speed: 0,
                                 total_size: file_size,
@@ -2586,6 +2629,16 @@ async fn handle_command_inner(
             state.stats.quic_udp_port = state.quic_port.unwrap_or(0);
             state.stats.session_age_secs = state.session_started.elapsed().as_secs();
             let _ = tx.send(state.stats.clone());
+        }
+
+        NetworkCommand::FeedReachNetwork { tx } => {
+            let reach = state.rendezvous_registered.then(|| super::feed_reach::NetworkReach {
+                rendezvous_url: settings.rendezvous_url.clone(),
+                external_ip: state.external_ip,
+                tcp_port: advertised_tcp_port(state),
+                nat: state.friend_nat_context.clone(),
+            });
+            let _ = tx.send(reach);
         }
 
         NetworkCommand::GetEmberDiagnostics { tx } => {
@@ -4801,16 +4854,28 @@ async fn handle_command_inner(
                 probes.clear();
             }
 
-            let contacts: Vec<KadContact> = state
+            // Only requests that left count, as in the automatic check. A send
+            // can be held back by its destination's budget, spent when the
+            // automatic check asked the same contact moments ago, so a held
+            // one is passed over for the next contact rather than waited on as
+            // if it had gone.
+            const RECHECK_REQUESTS: usize = 4;
+            const RECHECK_CANDIDATES: usize = 16;
+            let candidates: Vec<KadContact> = state
                 .routing_table
                 .all_contacts()
                 .filter(|contact| contact.verified && !contact.is_dead())
-                .take(4)
+                .take(RECHECK_CANDIDATES)
                 .cloned()
                 .collect();
 
             let fw_tcp_port = advertised_tcp_port(state);
-            for contact in &contacts {
+            let mut tried = 0usize;
+            for contact in &candidates {
+                if state.firewall_checks_sent as usize >= RECHECK_REQUESTS {
+                    break;
+                }
+                tried += 1;
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let (msg, track_opcode) = if contact.version > KADEMLIA_VERSION6_49ABETA {
                     (
@@ -4830,31 +4895,37 @@ async fn handle_command_inner(
                     )
                 };
                 if let Ok(packet) = messages::encode_packet(&msg) {
-                    state.flood_protection.track_request(addr, track_opcode);
-                    if let Ok(mut probes) = firewall_probe_ips.lock() {
-                        probes.insert(contact.ip);
+                    // In the probe set before the request leaves, since the
+                    // peer's connect-back races our return from the send; out
+                    // again if it never left.
+                    let newly_probed = firewall_probe_ips
+                        .lock()
+                        .is_ok_and(|mut probes| probes.insert(contact.ip));
+                    if send_kad_packet(socket, &packet, addr, state, &contact.id).await.is_ok() {
+                        state.flood_protection.track_request(addr, track_opcode);
+                        state.firewall_checks_sent += 1;
+                        state.firewall_checker.record_tcp_request_sent(contact.ip);
+                    } else if newly_probed {
+                        if let Ok(mut probes) = firewall_probe_ips.lock() {
+                            probes.remove(&contact.ip);
+                        }
                     }
-                    let _ = send_kad_packet(socket, &packet, addr, state, &contact.id).await;
-                    state.firewall_checks_sent += 1;
-                    state.firewall_checker.record_tcp_request_sent(contact.ip);
                 }
             }
 
-            let ping_contacts: Vec<KadContact> = state
-                .routing_table
-                .all_contacts()
-                .filter(|contact| contact.verified && !contact.is_dead())
-                .skip(4)
-                .take(4)
-                .cloned()
-                .collect();
-            for contact in &ping_contacts {
+            let mut pings_sent = 0usize;
+            for contact in candidates.iter().skip(tried) {
+                if pings_sent >= RECHECK_REQUESTS {
+                    break;
+                }
                 let addr = SocketAddr::new(contact.ip.into(), contact.udp_port);
                 let msg = KadMessage::Ping;
                 if let Ok(packet) = messages::encode_packet(&msg) {
-                    state.flood_protection.track_request(addr, 0x60);
-                    let _ = send_kad_packet(socket, &packet, addr, state, &contact.id).await;
-                    state.firewall_checker.record_udp_port_probe_sent();
+                    if send_kad_packet(socket, &packet, addr, state, &contact.id).await.is_ok() {
+                        state.flood_protection.track_request(addr, 0x60);
+                        state.firewall_checker.record_udp_port_probe_sent();
+                        pings_sent += 1;
+                    }
                 }
             }
 
@@ -4865,11 +4936,11 @@ async fn handle_command_inner(
             info!(
                 "Sent {} firewall checks and {} ping probes",
                 state.firewall_checks_sent,
-                ping_contacts.len()
+                pings_sent
             );
             let _ = tx.send(
-                if state.firewall_checks_sent > 0 || !ping_contacts.is_empty() {
-                    Ok((state.firewall_checks_sent as usize) + ping_contacts.len())
+                if state.firewall_checks_sent > 0 || pings_sent > 0 {
+                    Ok((state.firewall_checks_sent as usize) + pings_sent)
                 } else {
                     Err("No verified contacts available for firewall recheck".to_string())
                 },
@@ -5423,7 +5494,7 @@ async fn handle_command_inner(
             tx,
         } => {
             let result =
-                super::chat_attach::respond(state, db, app_handle, settings, xfer_id, accept).await;
+                super::chat_attach::respond(state, db, app_handle, settings, credit_manager, xfer_id, accept).await;
             let _ = tx.send(result);
         }
 
@@ -6458,10 +6529,7 @@ async fn handle_command_inner(
                                 let our_user_hash = state.user_hash;
                                 let our_ember_hash = ember_hash;
                                 let nickname = settings.nickname.clone();
-                                let client_id = state
-                                    .external_ip
-                                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                                    .unwrap_or(0);
+                                let client_id = crate::network::ed2k::messages::hello_client_id();
                                 let tcp = advertised_tcp_port(state);
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
@@ -6586,10 +6654,7 @@ async fn handle_command_inner(
                             let our_uh = state.user_hash;
                             let our_eh = ember_hash;
                             let nick = settings.nickname.clone();
-                            let cid = state
-                                .external_ip
-                                .map(|eip| u32::from_le_bytes(eip.octets()))
-                                .unwrap_or(0);
+                            let cid = crate::network::ed2k::messages::hello_client_id();
                             let tcp = advertised_tcp_port(state);
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
@@ -6832,10 +6897,7 @@ async fn handle_command_inner(
                                 let our_user_hash = state.user_hash;
                                 let our_ember_hash = ember_hash;
                                 let nickname = settings.nickname.clone();
-                                let client_id = state
-                                    .external_ip
-                                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                                    .unwrap_or(0);
+                                let client_id = crate::network::ed2k::messages::hello_client_id();
                                 let tcp = advertised_tcp_port(state);
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
@@ -6949,10 +7011,7 @@ async fn handle_command_inner(
                             let our_uh = state.user_hash;
                             let our_eh = ember_hash;
                             let nick = settings.nickname.clone();
-                            let cid = state
-                                .external_ip
-                                .map(|eip| u32::from_le_bytes(eip.octets()))
-                                .unwrap_or(0);
+                            let cid = crate::network::ed2k::messages::hello_client_id();
                             let tcp = advertised_tcp_port(state);
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
@@ -7125,10 +7184,7 @@ async fn handle_command_inner(
                 state.user_hash,
                 ember_hash,
                 settings.nickname.clone(),
-                state
-                    .external_ip
-                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                    .unwrap_or(0),
+                crate::network::ed2k::messages::hello_client_id(),
                 advertised_tcp_port(state),
                 advertised_udp_port(state),
                 settings.friend_session_encryption,
@@ -7188,10 +7244,7 @@ async fn handle_command_inner(
                 state.user_hash,
                 ember_hash,
                 settings.nickname.clone(),
-                state
-                    .external_ip
-                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                    .unwrap_or(0),
+                crate::network::ed2k::messages::hello_client_id(),
                 advertised_tcp_port(state),
                 advertised_udp_port(state),
                 settings.friend_session_encryption,

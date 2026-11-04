@@ -247,6 +247,27 @@ pub(super) fn final_verify_retry_delay(prior: u32) -> std::time::Duration {
     std::time::Duration::from_secs(FINAL_VERIFY_RETRY_BASE_SECS << (prior - 1))
 }
 
+/// Whether a finished file's digests show its Ember pin `ember_expected` to be
+/// wrong: the file is the one its ed2k hash and, when pinned, its AICH root
+/// name, and its BLAKE3 is not the pin.
+///
+/// Only once the ed2k hash matched: if both are wrong the bytes are, and that
+/// is the ed2k mismatch path's to repair. Read as a bad pin, a corrupt block
+/// failed the download for good and dropped a pin nothing had shown to be
+/// wrong. Only once the AICH pin matched too, so a mismatch reported this way
+/// says every other check passed, which is what lets the event loop drop a
+/// remote pin and finish on the others; an AICH miss is reported as that.
+pub(super) fn ember_pin_refuted(
+    digests: &super::hash::FileDigests,
+    expected_ed2k: &str,
+    expected_aich: Option<[u8; 20]>,
+    ember_expected: [u8; 32],
+) -> bool {
+    digests.ed2k == expected_ed2k
+        && expected_aich.is_none_or(|aich| digests.aich == Some(aich))
+        && digests.ember.is_some_and(|got| got != ember_expected)
+}
+
 /// What a failed final whole-file check does to the gap list.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum FinalVerifyRecovery {
@@ -719,6 +740,32 @@ async fn take_source_answer(
     }
 }
 
+/// Record what one download session has proven once SecIdent verified
+/// `user_hash` on it: the binding it passed (display only), and a key-link
+/// proof that waited for the user hash's first proven key, checked against
+/// that key now and linked if it verifies.
+async fn note_session_ember_links(
+    credit_mgr: &RwLock<CreditManager>,
+    user_hash: [u8; 16],
+    our_user_hash: &[u8; 16],
+    bound: Option<[u8; 16]>,
+    key_link: &mut super::key_link::KeyLinkSession,
+    addr: SocketAddr,
+) {
+    let proven_key = {
+        let mut cm = credit_mgr.write().await;
+        if let Some(ember_hash) = bound {
+            cm.note_session_bound_ember(user_hash, ember_hash);
+        }
+        cm.proven_public_key(&user_hash).map(<[u8]>::to_vec)
+    };
+    if let Some(signer) =
+        proven_key.and_then(|key| key_link.note_secident(&key, &user_hash, our_user_hash))
+    {
+        super::key_link::link_proven_key(credit_mgr, user_hash, &signer, addr).await;
+    }
+}
+
 /// Persist a snapshot after releasing the tracker lock. The shared
 /// per-path coordinator in `part_tracker` preserves snapshot order.
 async fn spawn_save_snapshot(snap: super::part_tracker::SaveSnapshot) {
@@ -739,8 +786,87 @@ async fn save_snapshot_now(snap: super::part_tracker::SaveSnapshot, context: &'s
 /// sockets to, mirroring eMule (which keeps a large per-file source pool but
 /// only a bounded number of live connections). The machine-wide ceiling is
 /// `GLOBAL_CONN_LIMITER` (eMule `maxconnections`).
-const MAX_CONCURRENT_SOURCES: usize = 50;
+///
+/// The cap is [`per_download_conn_cap`]: an even share of the download side of
+/// that ceiling, never under [`MIN_SOURCES_PER_DOWNLOAD`]. eMule has no
+/// per-file cap at all; a flat 50 left one running download using 50 of the
+/// ~375 connections downloads may hold at the default `maxconnections`.
+const MIN_SOURCES_PER_DOWNLOAD: usize = 50;
 const SOURCE_INJECTION_WAIT_SECS: u64 = 10;
+
+/// Multi-source download workers running now, each holding a
+/// [`RunningDownloadGuard`]. The divisor of [`per_download_conn_cap`].
+static RUNNING_DOWNLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct RunningDownloadGuard;
+
+impl RunningDownloadGuard {
+    fn enter() -> Self {
+        RUNNING_DOWNLOADS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for RunningDownloadGuard {
+    fn drop(&mut self) {
+        RUNNING_DOWNLOADS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Live source connections one download may hold when `running` downloads
+/// share a configured `max_connections` of `max`.
+fn per_download_share(max: usize, running: usize) -> usize {
+    let download_side = max.saturating_sub(listener_reserve(max));
+    (download_side / running.max(1)).max(MIN_SOURCES_PER_DOWNLOAD)
+}
+
+/// [`per_download_share`] for the configured budget and the downloads running
+/// now. Read live, so it follows a settings change and downloads starting or
+/// ending.
+fn per_download_conn_cap() -> usize {
+    use std::sync::atomic::Ordering;
+    let max = GLOBAL_CONN_LIMITER
+        .get()
+        .map_or(FALLBACK_CONN_LIMIT, |l| l.desired_max.load(Ordering::Acquire));
+    per_download_share(max, RUNNING_DOWNLOADS.load(Ordering::Acquire))
+}
+
+/// How often a source waiting for a per-download permit re-reads
+/// [`per_download_conn_cap`], so a share that grew reaches it.
+const SOURCE_BUDGET_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One download's source-connection permits, resized to
+/// [`per_download_conn_cap`] as the share changes.
+struct SourceConnBudget {
+    sem: tokio::sync::Semaphore,
+    /// Permits the semaphore holds in total, handed out ones included.
+    size: std::sync::Mutex<usize>,
+}
+
+impl SourceConnBudget {
+    fn new(cap: usize) -> Self {
+        Self {
+            sem: tokio::sync::Semaphore::new(cap),
+            size: std::sync::Mutex::new(cap),
+        }
+    }
+
+    /// Grow to `target` at once. Shrinking only reclaims free permits; ones
+    /// backing a live connection come off on a later call, after it ends.
+    fn resize(&self, target: usize) {
+        let mut size = self.size.lock().unwrap_or_else(|p| p.into_inner());
+        if target > *size {
+            self.sem.add_permits(target - *size);
+            *size = target;
+        } else if target < *size {
+            *size -= self.sem.forget_permits(*size - target);
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.sem.available_permits() == 0
+    }
+}
 
 /// The machine-wide cap on client TCP connections, wired from
 /// `AppSettings::max_connections` (eMule's `maxconnections`). Installed at
@@ -1144,15 +1270,61 @@ async fn acquire_global_dl_conn(priority_ord: u8) -> Option<GlobalConnPermit> {
     }
 }
 
-/// Trickle-source rotation floor. A source that has delivered data but then
-/// sits below this rate for `TRICKLE_SLOW_WINDOW` while connections are
-/// contended is occupying a scarce slot a fresh candidate could use, so we
-/// rotate it out (same warm-keep path as a Path B queue detach). Deliberately
-/// conservative: eMule keeps slow sources when it has spare connections, so we
-/// only rotate when the slot is genuinely contended (per-file at budget or the
-/// machine-wide cap saturated).
-const TRICKLE_SLOW_FLOOR_BPS: u64 = 2 * 1024;
+/// How long a source that has delivered data may then deliver none before it
+/// gives its dial slot to a fresh candidate, while connections are contended
+/// (see [`idle_source_rotation_due`]).
 const TRICKLE_SLOW_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// eMule's `DOWNLOADTIMEOUT`: a downloading source that sends no data block
+/// for this long is dropped.
+const DOWNLOAD_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(super::dead_sources::DOWNLOADTIMEOUT_SECS as u64);
+
+/// The first-data budget for a part's requests. eMule uses `DOWNLOADTIMEOUT`
+/// for this too; a shorter wait cuts off peers that accept and never send
+/// while still giving a slow uploader time to start.
+const INITIAL_DATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When a worker in its receive loop gives the peer up: [`DOWNLOAD_TIMEOUT`]
+/// after the last data block once one has come (eMule's
+/// `m_dwLastBlockReceived`), before that [`INITIAL_DATA_TIMEOUT`] after the
+/// part's requests went out. Requests we send do not move it; only data does.
+fn receive_deadline(
+    got_any_data: bool,
+    last_data_at: std::time::Instant,
+    data_loop_start: std::time::Instant,
+    now: std::time::Instant,
+) -> std::time::Instant {
+    let deadline = if got_any_data {
+        last_data_at + DOWNLOAD_TIMEOUT
+    } else {
+        data_loop_start + INITIAL_DATA_TIMEOUT
+    };
+    deadline.max(now + std::time::Duration::from_secs(1))
+}
+
+/// Whether a source on one of our dial slots should give it up for a fresh
+/// candidate, contention aside: it sent data on this part and has sent none
+/// for [`TRICKLE_SLOW_WINDOW`]. One still delivering keeps the slot however
+/// slow it is, as eMule never drops a working upload slot. Adopted streams
+/// hold no dial slot and are never rotated.
+fn idle_source_rotation_due(
+    got_any_data: bool,
+    holds_dial_slot: bool,
+    since_last_data: std::time::Duration,
+    packet_in_progress: bool,
+) -> bool {
+    got_any_data
+        && holds_dial_slot
+        && !packet_in_progress
+        && since_last_data >= TRICKLE_SLOW_WINDOW
+}
+
+/// This download at its connection share, or the machine-wide cap saturated.
+fn source_connections_contended(active_count: &AtomicU32) -> bool {
+    active_count.load(Ordering::Relaxed) >= per_download_conn_cap() as u32
+        || global_dl_conn_contended()
+}
 
 /// Minimum spacing between new outbound source dials, machine-wide. Paces
 /// connection attempts so bursty source injection and the Path B
@@ -1440,8 +1612,8 @@ impl Drop for PeerConnection {
 /// (hello / emule-info / file-status / hashset). The timer resets whenever a
 /// packet arrives, so a responsive peer is never cut off. Kept far below the
 /// 100s in-transfer no-data timeout (`DOWNLOADTIMEOUT_SECS`): a peer that
-/// accepts TCP then stalls the handshake would otherwise pin one of only
-/// `MAX_CONCURRENT_SOURCES` connection slots for the full transfer timeout,
+/// accepts TCP then stalls the handshake would otherwise pin one of the
+/// download's [`per_download_conn_cap`] connection slots for the full transfer timeout,
 /// starving queued live sources. eMule likewise uses a short establishment
 /// timeout and re-asks slow peers on a later cycle rather than holding the
 /// socket open.
@@ -1509,8 +1681,7 @@ pub struct EstablishedSource {
 /// slow-ramp window without harming anything at low speeds — the kernel
 /// only uses as much as the sender is actually filling, and `SockRef`'s
 /// `set_recv_buffer_size` is advisory (the OS is free to clamp lower, it
-/// just won't clamp higher-than-default). Mirrors the 256 KiB SO_SNDBUF
-/// cap we apply to accepted upload sockets in `upload.rs`.
+/// just won't clamp higher-than-default).
 const PEER_RECV_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Apply the standard low-latency + high-throughput socket tuning to a
@@ -1584,38 +1755,65 @@ fn no_source_can_ever_arrive(
     sources_empty && !has_source_rx && !has_established_rx
 }
 
-/// How many of a worker's past request ranges [`RecentRequests`] keeps.
-const MAX_RECENT_REQUESTS: usize = 64;
+/// How many of a worker's past request ranges [`RecentRequests`] keeps: every
+/// block of the part being received and of the one pipelined behind it.
+const MAX_RECENT_REQUESTS: usize =
+    2 * super::hash::PARTSIZE.div_ceil(super::messages::EMBLOCKSIZE) as usize;
 
 /// Every range this worker has asked its peer for, newest last, kept after it
 /// leaves the outstanding set. An uploader serves requests in order and can be
 /// well behind, so an answer to a request that has expired, or that belongs to
 /// a part this worker has since moved past, is still one we asked for.
+///
+/// Each range is kept once: a re-asked range moves to the back rather than
+/// pushing an older one out. Everything ever asked is also kept, merged, so a
+/// very late answer is told apart from a block never asked for.
 #[derive(Default)]
 struct RecentRequests {
     ranges: std::collections::VecDeque<(u64, u64)>,
+    /// Sorted, disjoint runs of every range ever asked of this peer.
+    ever: Vec<(u64, u64)>,
 }
 
 impl RecentRequests {
     fn record(&mut self, batch: &[(u64, u64)]) {
         for &range in batch {
-            if self.ranges.len() >= MAX_RECENT_REQUESTS {
+            if let Some(pos) = self.ranges.iter().position(|r| *r == range) {
+                self.ranges.remove(pos);
+            } else if self.ranges.len() >= MAX_RECENT_REQUESTS {
                 self.ranges.pop_front();
             }
             self.ranges.push_back(range);
+            self.note_ever(range);
         }
+    }
+
+    fn note_ever(&mut self, (start, end): (u64, u64)) {
+        if start >= end {
+            return;
+        }
+        let mut merged = (start, end);
+        self.ever.retain(|&(s, e)| {
+            if s <= merged.1 && e >= merged.0 {
+                merged = (merged.0.min(s), merged.1.max(e));
+                false
+            } else {
+                true
+            }
+        });
+        let at = self.ever.partition_point(|&(s, _)| s < merged.0);
+        self.ever.insert(at, merged);
     }
 
     fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.ranges.iter().copied()
     }
 
-    /// End of the range recorded as starting at `start`, newest first.
-    fn end_for_start(&self, start: u64) -> Option<u64> {
-        self.ranges
-            .iter()
-            .rev()
-            .find_map(|&(s, e)| (s == start).then_some(e))
+    /// Whether a block starting at `start` lies in anything ever asked of
+    /// this peer.
+    fn was_requested(&self, start: u64) -> bool {
+        let at = self.ever.partition_point(|&(s, _)| s <= start);
+        at > 0 && start < self.ever[at - 1].1
     }
 }
 
@@ -2317,17 +2515,122 @@ async fn cancel_with_grace(control: &TransferControl) {
 /// Acquire a per-file source permit, aborting immediately on cancel/pause so
 /// waiters do not park forever behind pause holders (N4).
 async fn acquire_source_permit<'a>(
-    sem: &'a tokio::sync::Semaphore,
+    budget: &'a SourceConnBudget,
     control: &TransferControl,
 ) -> anyhow::Result<tokio::sync::SemaphorePermit<'a>> {
-    tokio::select! {
-        result = sem.acquire() => {
-            result.map_err(|_| anyhow::anyhow!("download cancelled"))
-        }
-        _ = control.wait_cancel_or_pause() => {
-            Err(anyhow::anyhow!("cancelled by user"))
+    budget.resize(per_download_conn_cap());
+    // Kept across rechecks, so a waiting source keeps its place in the queue.
+    let acquire = budget.sem.acquire();
+    let stop = control.wait_cancel_or_pause();
+    tokio::pin!(acquire, stop);
+    loop {
+        tokio::select! {
+            result = &mut acquire => {
+                return result.map_err(|_| anyhow::anyhow!("download cancelled"));
+            }
+            _ = &mut stop => {
+                return Err(anyhow::anyhow!("cancelled by user"));
+            }
+            _ = tokio::time::sleep(SOURCE_BUDGET_RECHECK) => {
+                budget.resize(per_download_conn_cap());
+            }
         }
     }
+}
+
+/// How a source session that did not fail ended, which sets the peer's redial
+/// cooldown in the retry rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionEnd {
+    /// It delivered what it was asked for, or never got as far as asking.
+    Finished,
+    /// We are on the peer's queue: it rotated us out (`OP_OUTOFPARTREQS`)
+    /// and did not take us back before the in-session wait ran out.
+    Queued,
+    /// The peer holds nothing we still need.
+    NoNeededParts,
+}
+
+/// Per-peer redial cooldown class, keyed by what the last session with it
+/// came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CooldownKind {
+    /// Never queued us, or failed before it could: eMule's `MIN_REQUESTTIME`.
+    /// Uploaders ban a user hash that re-asks faster.
+    Unknown,
+    /// Queued us: eMule's `FILEREASKTIME` (`DownloadClient.cpp:1889`).
+    Queued,
+    /// Had nothing we need: eMule re-asks those at twice `FILEREASKTIME`.
+    NoNeededParts,
+}
+
+impl CooldownKind {
+    fn cooldown(self) -> std::time::Duration {
+        let secs = match self {
+            CooldownKind::Unknown => super::dead_sources::MIN_REQUESTTIME_SECS,
+            CooldownKind::Queued => super::dead_sources::FILEREASKTIME_SECS,
+            CooldownKind::NoNeededParts => 2 * super::dead_sources::FILEREASKTIME_SECS,
+        };
+        std::time::Duration::from_secs(secs as u64)
+    }
+}
+
+/// The cooldown a source task's ending earns its peer, or `None` when the
+/// ending says nothing about when to ask it again.
+fn cooldown_for_session_end(result: &anyhow::Result<SessionEnd>) -> Option<CooldownKind> {
+    match result {
+        Ok(SessionEnd::Finished) => None,
+        Ok(SessionEnd::Queued) => Some(CooldownKind::Queued),
+        Ok(SessionEnd::NoNeededParts) => Some(CooldownKind::NoNeededParts),
+        Err(e) => {
+            let error = e.to_string();
+            if super::transfer::is_no_needed_parts_error(&error) {
+                Some(CooldownKind::NoNeededParts)
+            } else if super::transfer::is_queue_state_error(&error) {
+                Some(CooldownKind::Queued)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// What source tasks learned about their peers, read by the retry rounds.
+#[derive(Default)]
+struct SourceOutcomes {
+    /// Cooldowns earned since the last round took them.
+    cooldowns: HashMap<(String, u16), CooldownKind>,
+    /// Peers that answered they do not share the file. Not asked again by
+    /// this worker.
+    no_file: HashSet<(String, u16)>,
+}
+
+type SharedSourceOutcomes = Arc<std::sync::Mutex<SourceOutcomes>>;
+
+fn note_session_end(
+    outcomes: &SharedSourceOutcomes,
+    ip: &str,
+    port: u16,
+    result: &anyhow::Result<SessionEnd>,
+) {
+    let mut outcomes = outcomes.lock().unwrap_or_else(|p| p.into_inner());
+    let key = (ip.to_string(), port);
+    if let Err(e) = result {
+        if super::transfer::is_no_file_error(&e.to_string()) {
+            outcomes.no_file.insert(key.clone());
+        }
+    }
+    if let Some(kind) = cooldown_for_session_end(result) {
+        outcomes.cooldowns.insert(key, kind);
+    }
+}
+
+fn peer_lacks_file(outcomes: &SharedSourceOutcomes, ip: &str, port: u16) -> bool {
+    outcomes
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .no_file
+        .contains(&(ip.to_string(), port))
 }
 
 /// Outcome of an in-session re-queue attempt after `OP_OUTOFPARTREQS`.
@@ -2685,8 +2988,24 @@ impl MultiSourceDownload {
                     &allowed,
                     !resuming,
                 )?;
+                if !resuming {
+                    crate::storage::part_folders::forget_part_allocation(&tid);
+                }
                 if fs > 0 && f.metadata()?.len() != fs {
+                    // Sparse, so the length costs no disk space until data
+                    // arrives: a download that never progresses takes none,
+                    // and a block far into the file is not preceded by NTFS
+                    // writing zeros up to it. A filesystem without sparse
+                    // files just takes the length as before.
+                    let _ = super::preview::mark_sparse(&f);
                     f.set_len(fs)?;
+                }
+                if let Ok(allocated) = super::preview::allocated_bytes(&f) {
+                    crate::storage::part_folders::note_part_allocation(
+                        &tid,
+                        allocated,
+                        Some(std::time::Instant::now()),
+                    );
                 }
                 Ok(())
             })
@@ -2940,7 +3259,7 @@ impl MultiSourceDownload {
         // Progress aggregator channel: i64 signals used as a trigger
         // (value ignored); actual progress is read from the tracker to
         // avoid double-counting overlapping sources. Capacity 4096 (was
-        // 256): with up to MAX_CONCURRENT_SOURCES sources each pushing a
+        // 256): with up to `per_download_conn_cap` sources each pushing a
         // signal per ~180 KiB block, 256 was easily filled while the
         // aggregator was waiting on `event_tx_clone.send().await`,
         // back-pressuring every source coroutine.
@@ -3055,9 +3374,10 @@ impl MultiSourceDownload {
                 .await;
         });
 
-        // Semaphore to limit concurrent source connections (avoids overwhelming
+        // This download's share of source connections (avoids overwhelming
         // the network with dozens of simultaneous TCP handshakes to unreachable peers)
-        let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SOURCES));
+        let _running = RunningDownloadGuard::enter();
+        let conn_budget = Arc::new(SourceConnBudget::new(per_download_conn_cap()));
         let disk_full = Arc::new(AtomicBool::new(false));
 
         // Tracks "what stage did this peer reach?" per peer, so we
@@ -3069,29 +3389,24 @@ impl MultiSourceDownload {
         // user_hash recognition, without hammering peers that refused
         // our TCP connect.
         //
-        // `CooldownKind::Queued` is set when a source task ends with
-        // a queue-state error (peer dropped our TCP while queued,
-        // queue_full, queue_timeout, OutOfPartReqs) — i.e. the peer
-        // accepted our file request and put us in their upload queue
-        // at some point. `CooldownKind::Unknown` is the seed state
-        // for every source and the state after a hello/file_status-
+        // `CooldownKind::Queued` is set when a source task ends on the
+        // peer's queue (peer dropped our TCP while queued, queue_full,
+        // queue_timeout, OutOfPartReqs, or an in-session re-queue that ran
+        // out) — i.e. the peer accepted our file request and put us in
+        // their upload queue at some point. `CooldownKind::NoNeededParts`
+        // when it held nothing we need. `CooldownKind::Unknown` is the seed
+        // state for every source and the state after a hello/file_status-
         // phase failure. Those still wait `MIN_REQUESTTIME` (~10 min):
         // faster than that is how Ember got itself banned, after which
         // the same two HighIDs RST every dial and the UI paints them
         // Failed.
         //
         // Declared out here (not inside the retry-round loop) so the
-        // initial source tasks at line 849+ can populate it the same
-        // way the retry tasks do — otherwise the first-attempt peers
-        // wouldn't get their cooldown promoted after the initial
-        // round and would be hammered at the hello-fail interval by round 1.
-        #[derive(Clone, Copy, PartialEq)]
-        enum CooldownKind {
-            Unknown,
-            Queued,
-        }
-        let peers_that_queued: Arc<std::sync::Mutex<std::collections::HashSet<(String, u16)>>> =
-            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        // initial source tasks can populate it the same way the retry
+        // tasks do — otherwise the first-attempt peers wouldn't get their
+        // cooldown promoted after the initial round and would be hammered
+        // at the hello-fail interval by round 1.
+        let source_outcomes: SharedSourceOutcomes = Arc::default();
 
         // Shared "peer confirmed missing parts" registry — populated
         // from inside `download_parts_from_source` when a peer accepts
@@ -3201,7 +3516,7 @@ impl MultiSourceDownload {
             let src_ember_pubkey = self.ed25519_public_key;
             let src_ember_secret = self.ed25519_secret_key;
             let nick_for_src = self.nickname.read().await.clone();
-            let sem_clone = conn_semaphore.clone();
+            let sem_clone = conn_budget.clone();
             let qw = queue_wait_secs;
             let shared_out = shared_part_file.clone();
             let epx_payload = self.ember_payload.clone();
@@ -3220,7 +3535,7 @@ impl MultiSourceDownload {
             let fail_tid = self.transfer_id.clone();
             let fail_ip = source.peer_ip.clone();
             let fail_port = source.peer_port;
-            let init_queued = peers_that_queued.clone();
+            let init_outcomes = source_outcomes.clone();
             let init_missing_parts = peers_missing_parts.clone();
             let init_src_ip = source.peer_ip.clone();
             let init_src_port = source.peer_port;
@@ -3229,7 +3544,8 @@ impl MultiSourceDownload {
             let handle = tokio::spawn(async move {
                 let freq_avail =
                     WireAvailabilityGuard::counted(&cs_clone, src_avail.clone(), &src_drop_tx);
-                if sem_clone.available_permits() == 0 {
+                sem_clone.resize(per_download_conn_cap());
+                if sem_clone.is_full() {
                     let _ = fail_etx
                         .send(DownloadEvent::SourceDetail {
                             transfer_id: fail_tid.clone(),
@@ -3248,10 +3564,6 @@ impl MultiSourceDownload {
                         })
                         .await;
                 }
-                let _permit = match acquire_source_permit(&sem_clone, &ctrl_clone).await {
-                    Ok(p) => p,
-                    Err(e) => return (src_idx, parts, Err(e)),
-                };
                 let cancel_ctrl = ctrl_clone.clone();
                 let result = tokio::select! {
                     res = download_parts_from_source(
@@ -3305,29 +3617,19 @@ impl MultiSourceDownload {
                         None,
                         init_missing_parts,
                         Some(src_drop_tx),
+                        &sem_clone,
                     ) => res,
                     _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                 };
 
                 freq_avail.release().await;
 
+                // The retry rounds read this at their boundaries for the
+                // peer's next cooldown (see `CooldownKind`).
+                note_session_end(&init_outcomes, &init_src_ip, init_src_port, &result);
                 if let Err(e) = &result {
                     let err_str = e.to_string();
-                    // Promote the peer's cooldown to `Queued` (29 min,
-                    // matching eMule's FILEREASKTIME) when the task
-                    // ended in a queue-state error — TCP dropped while
-                    // queued, queue_full, queue_timeout, or
-                    // OutOfPartReqs. The outer retry loop reads this
-                    // shared set at round boundaries and applies the
-                    // longer cooldown for next dial. See
-                    // `SOURCE_RETRY_COOLDOWN_SECS` for the full
-                    // rationale.
                     let is_queue_related = super::transfer::is_queue_state_error(&err_str);
-                    if is_queue_related {
-                        if let Ok(mut q) = init_queued.lock() {
-                            q.insert((init_src_ip.clone(), init_src_port));
-                        }
-                    }
                     // Un-suppress the queue_detached case at info
                     // level. It used to exit silently; now we log
                     // that the peer is cooling down instead of
@@ -3455,6 +3757,7 @@ impl MultiSourceDownload {
                 our_secret_key: self.ed25519_secret_key,
                 ip_filter: self.ip_filter.clone(),
                 banned_ips: self.banned_ips.clone(),
+                credit_manager: self.credit_manager.clone(),
             };
             let first = crate::network::feed_direct::stream_ready(&self.transfer_id)
                 .then(|| web_worker::Working::new(&web_working));
@@ -3507,7 +3810,7 @@ impl MultiSourceDownload {
             let abort_handles: Vec<tokio::task::AbortHandle> =
                 handles.iter().map(|h| h.abort_handle()).collect();
             let mut pending_futs: FuturesUnordered<
-                tokio::task::JoinHandle<(usize, Vec<usize>, anyhow::Result<()>)>,
+                tokio::task::JoinHandle<(usize, Vec<usize>, anyhow::Result<SessionEnd>)>,
             > = handles.into_iter().collect();
             let mut injected_abort_handles: Vec<tokio::task::AbortHandle> = Vec::new();
             // Concurrent loop: wait for handles to complete while accepting new sources.
@@ -3603,7 +3906,7 @@ impl MultiSourceDownload {
                         }
                     } => {
                         match result {
-                            Some(Ok((src_idx, parts, Ok(())))) => {
+                            Some(Ok((src_idx, parts, Ok(_)))) => {
                                 tracing::debug!(
                                     "source task {src_idx} completed for parts {:?}",
                                     parts
@@ -3636,6 +3939,9 @@ impl MultiSourceDownload {
                         }
                     } => {
                         if let Some(source) = new_src {
+                            if peer_lacks_file(&source_outcomes, &source.peer_ip, source.peer_port) {
+                                continue;
+                            }
                             // Compute parts FIRST, before incrementing
                             // counters / emitting `SourcesUpdate` /
                             // touching `chunk_selector.total_sources`.
@@ -3756,7 +4062,7 @@ impl MultiSourceDownload {
                             let tid = self.transfer_id.clone();
                             let bi = self.shared_buddy_info.clone();
                             let ctrl = self.control.clone();
-                            let sem = conn_semaphore.clone();
+                            let sem = conn_budget.clone();
 
                             let fail_etx = event_tx.clone();
                             let fail_tid = self.transfer_id.clone();
@@ -3785,17 +4091,13 @@ impl MultiSourceDownload {
                             let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let inj_disk_full = disk_full.clone();
-                            let inj_queued = peers_that_queued.clone();
+                            let inj_outcomes = source_outcomes.clone();
                             let src_drop_tx = drop_tx.clone();
                             let handle = tokio::spawn(async move {
                                 // Paired with the `add_source` at the injection
                                 // site above, before this task was spawned.
                                 let freq_avail =
                                     WireAvailabilityGuard::counted(&cs, avail.clone(), &src_drop_tx);
-                                let _permit = match acquire_source_permit(&sem, &ctrl).await {
-                                    Ok(p) => p,
-                                    Err(e) => return (src_idx, Vec::new(), Err(e)),
-                                };
                                 let cancel_ctrl = ctrl.clone();
                                 let result = tokio::select! {
                                     res = download_parts_from_source(
@@ -3821,25 +4123,19 @@ impl MultiSourceDownload {
                                         None,
                                         inj_missing_parts,
                                         Some(src_drop_tx),
+                                        &sem,
                                     ) => res,
                                     _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                                 };
                                 freq_avail.release().await;
+                                // A KAD / server / source-exchange discovered peer
+                                // that queued us needs the same FILEREASKTIME
+                                // cooldown as an initial one: re-dialed at the
+                                // hello-fail floor, its queue position is thrown away.
+                                note_session_end(&inj_outcomes, &fail_ip, fail_port, &result);
                                 if let Err(e) = &result {
                                     note_disk_full(&inj_disk_full, e);
                                     let err_str = e.to_string();
-                                    // Promote this peer to the 29 min FILEREASKTIME cooldown
-                                    // when it had queued us. Only the initial and retry
-                                    // closures did this, so a KAD / server / source-exchange
-                                    // discovered peer that put us in its upload queue kept
-                                    // `CooldownKind::Unknown` and got re-dialed at the
-                                    // hello-fail floor instead — which is exactly how a queue
-                                    // position is thrown away.
-                                    if super::transfer::is_queue_state_error(&err_str) {
-                                        if let Ok(mut q) = inj_queued.lock() {
-                                            q.insert((fail_ip.clone(), fail_port));
-                                        }
-                                    }
                                     if super::transfer::should_emit_source_failed(&err_str) {
                                         warn!("Injected source {} ({}) failed: {e:#}", src_idx, fail_ip);
                                         let _ = fail_etx.send(DownloadEvent::SourceDetail {
@@ -4013,7 +4309,7 @@ impl MultiSourceDownload {
                             let tid = self.transfer_id.clone();
                             let bi = self.shared_buddy_info.clone();
                             let ctrl = self.control.clone();
-                            let sem = conn_semaphore.clone();
+                            let sem = conn_budget.clone();
 
                             let fail_etx = event_tx.clone();
                             let fail_tid = self.transfer_id.clone();
@@ -4042,17 +4338,13 @@ impl MultiSourceDownload {
                             let inj_file_req_oh = self.file_req_overhead.clone();
                             let inj_missing_parts = peers_missing_parts.clone();
                             let inj_disk_full = disk_full.clone();
-                            let inj_queued = peers_that_queued.clone();
+                            let inj_outcomes = source_outcomes.clone();
                             let src_drop_tx = drop_tx.clone();
                             let handle = tokio::spawn(async move {
                                 // Paired with the `add_source` at the injection
                                 // site above, before this task was spawned.
                                 let freq_avail =
                                     WireAvailabilityGuard::counted(&cs, avail.clone(), &src_drop_tx);
-                                let _permit = match acquire_source_permit(&sem, &ctrl).await {
-                                    Ok(p) => p,
-                                    Err(e) => return (src_idx, Vec::new(), Err(e)),
-                                };
                                 let cancel_ctrl = ctrl.clone();
                                 let result = tokio::select! {
                                     res = download_parts_from_source(
@@ -4079,25 +4371,15 @@ impl MultiSourceDownload {
                                         Some(stream),
                                         inj_missing_parts,
                                         Some(src_drop_tx),
+                                        &sem,
                                     ) => res,
                                     _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                                 };
                                 freq_avail.release().await;
+                                note_session_end(&inj_outcomes, &fail_ip, fail_port, &result);
                                 if let Err(e) = &result {
                                     note_disk_full(&inj_disk_full, e);
                                     let err_str = e.to_string();
-                                    // Promote this peer to the 29 min FILEREASKTIME cooldown
-                                    // when it had queued us. Only the initial and retry
-                                    // closures did this, so a KAD / server / source-exchange
-                                    // discovered peer that put us in its upload queue kept
-                                    // `CooldownKind::Unknown` and got re-dialed at the
-                                    // hello-fail floor instead — which is exactly how a queue
-                                    // position is thrown away.
-                                    if super::transfer::is_queue_state_error(&err_str) {
-                                        if let Ok(mut q) = inj_queued.lock() {
-                                            q.insert((fail_ip.clone(), fail_port));
-                                        }
-                                    }
                                     if super::transfer::should_emit_source_failed(&err_str) {
                                         warn!("Pre-established source {} ({}) failed: {e:#}", src_idx, fail_ip);
                                         let _ = fail_etx.send(DownloadEvent::SourceDetail {
@@ -4142,7 +4424,7 @@ impl MultiSourceDownload {
             }
             while let Some(joined) = pending_futs.next().await {
                 match joined {
-                    Ok((src_idx, parts, Ok(()))) => {
+                    Ok((src_idx, parts, Ok(_))) => {
                         tracing::debug!(
                             "source task {src_idx} completed during drain for parts {:?}",
                             parts
@@ -4259,13 +4541,10 @@ impl MultiSourceDownload {
         // into instant RSTs. We only want the 29 min patience for peers
         // that actually queued us.
         const SOURCE_RETRY_COOLDOWN_SECS: u64 = super::dead_sources::FILEREASKTIME_SECS as u64;
-        const HELLO_FAIL_COOLDOWN_SECS: u64 = super::dead_sources::MIN_REQUESTTIME_SECS as u64;
         let retry_round_min_interval =
             std::time::Duration::from_secs(RETRY_ROUND_MIN_INTERVAL_SECS);
-        let source_retry_cooldown = std::time::Duration::from_secs(SOURCE_RETRY_COOLDOWN_SECS);
-        let hello_fail_cooldown = std::time::Duration::from_secs(HELLO_FAIL_COOLDOWN_SECS);
 
-        let max_retry_rounds = self.ed2k_limits.multisource_retry_rounds;
+        let mut max_retry_rounds = self.ed2k_limits.multisource_retry_rounds;
         let mut source_dial_history: HashMap<(String, u16), (std::time::Instant, CooldownKind)> =
             HashMap::new();
         {
@@ -4286,14 +4565,6 @@ impl MultiSourceDownload {
                 );
             }
         }
-        // Per-peer cooldown duration lookup — see `SOURCE_RETRY_COOLDOWN_SECS`
-        // comment above for the full rationale.
-        let cooldown_for = |kind: CooldownKind| -> std::time::Duration {
-            match kind {
-                CooldownKind::Queued => source_retry_cooldown,
-                CooldownKind::Unknown => hello_fail_cooldown,
-            }
-        };
         let mut last_round_end: Option<std::time::Instant> = None;
         let mut retry_round: u32 = 0;
 
@@ -4419,7 +4690,7 @@ impl MultiSourceDownload {
                     let tid = self.transfer_id.clone();
                     let bi = self.shared_buddy_info.clone();
                     let ctrl = self.control.clone();
-                    let sem = conn_semaphore.clone();
+                    let sem = conn_budget.clone();
                     let fail_etx = event_tx.clone();
                     let fail_tid = self.transfer_id.clone();
                     let fail_ip = source.peer_ip.clone();
@@ -4445,17 +4716,13 @@ impl MultiSourceDownload {
                     let a_file_req_oh = self.file_req_overhead.clone();
                     let a_missing_parts = peers_missing_parts.clone();
                     let a_disk_full = disk_full.clone();
-                    let a_queued = peers_that_queued.clone();
+                    let a_outcomes = source_outcomes.clone();
                     let src_drop_tx = drop_tx.clone();
                     let handle = tokio::spawn(async move {
                         // Paired with the `add_source` at the adoption site above,
                         // before this task was spawned.
                         let freq_avail =
                             WireAvailabilityGuard::counted(&cs, avail.clone(), &src_drop_tx);
-                        let _permit = match acquire_source_permit(&sem, &ctrl).await {
-                            Ok(p) => p,
-                            Err(_) => return,
-                        };
                         let cancel_ctrl = ctrl.clone();
                         let result = tokio::select! {
                             res = download_parts_from_source(
@@ -4477,20 +4744,15 @@ impl MultiSourceDownload {
                                 Some(stream),
                                 a_missing_parts,
                                 Some(src_drop_tx),
+                                &sem,
                             ) => res,
                             _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                         };
                         freq_avail.release().await;
+                        note_session_end(&a_outcomes, &fail_ip, fail_port, &result);
                         if let Err(e) = &result {
                             note_disk_full(&a_disk_full, e);
                             let err_str = e.to_string();
-                            // See the injected-source closures: an adopted callback peer that
-                            // queued us needs the same FILEREASKTIME promotion.
-                            if super::transfer::is_queue_state_error(&err_str) {
-                                if let Ok(mut q) = a_queued.lock() {
-                                    q.insert((fail_ip.clone(), fail_port));
-                                }
-                            }
                             if super::transfer::should_emit_source_failed(&err_str) {
                                 warn!(
                                     "Adopted callback source {} ({}) failed: {e:#}",
@@ -4523,7 +4785,123 @@ impl MultiSourceDownload {
             };
         }
 
-        while retry_round < max_retry_rounds {
+        // Rounds are over once the budget is spent or nothing is left for
+        // them to do. The wait that follows can start one more, for a peer
+        // that arrives during it.
+        let mut rounds_over = false;
+        loop {
+            if rounds_over || retry_round >= max_retry_rounds {
+                // A peer this run has not known before, arrived since the
+                // rounds ran out.
+                let mut fresh_source = false;
+
+                // Mirrors outlast the peers' retry rounds: a file only a
+                // mirror has is still downloading here. Waited for only while
+                // one is fetching, not while all of them rest out a backoff,
+                // and with the peers' channels still read: a callback stream
+                // is adopted as in the rounds, and a new peer ends the wait
+                // and gets a round, rather than being left unread behind a
+                // mirror.
+                loop {
+                    if web_working.load(Ordering::Relaxed) == 0
+                        || web_handles.iter().all(|h| h.is_finished())
+                        || tracker.read().await.all_complete_and_settled()
+                    {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+                        new_est = async {
+                            match post_phase_new_established_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match new_est {
+                                Some(es) => {
+                                    pending_established.push(es);
+                                    adopt_pending_callbacks!(retry_round);
+                                }
+                                None => post_phase_new_established_rx = None,
+                            }
+                        }
+                        new_src = async {
+                            match post_phase_new_source_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match new_src {
+                                Some(source) => {
+                                    info!(
+                                        "Download {}: a new peer {}:{} arrived while mirrors were fetching",
+                                        self.transfer_id, source.peer_ip, source.peer_port
+                                    );
+                                    fresh_source |=
+                                        remember_injected_source(&mut injected_sources, source);
+                                    break;
+                                }
+                                None => post_phase_new_source_rx = None,
+                            }
+                        }
+                    }
+                }
+
+                // Let any in-flight adopted callback downloads finish (they
+                // may be actively transferring), still adopting callback
+                // streams and taking new peers while they do.
+                adopt_pending_callbacks!(retry_round);
+                loop {
+                    let mut arrived: Option<EstablishedSource> = None;
+                    tokio::select! {
+                        // See the initial-phase abort above, and the retry round's wait.
+                        _ = wait_for_sources_unless_settled(&tracker, &adopted_handles) => break,
+                        new_est = async {
+                            match post_phase_new_established_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match new_est {
+                                Some(es) => arrived = Some(es),
+                                None => post_phase_new_established_rx = None,
+                            }
+                        }
+                        new_src = async {
+                            match post_phase_new_source_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match new_src {
+                                Some(source) => {
+                                    fresh_source |=
+                                        remember_injected_source(&mut injected_sources, source);
+                                }
+                                None => post_phase_new_source_rx = None,
+                            }
+                        }
+                    }
+                    if let Some(es) = arrived {
+                        pending_established.push(es);
+                        adopt_pending_callbacks!(retry_round);
+                    }
+                }
+                if fresh_source
+                    && !self.control.is_cancelled()
+                    && !disk_full_hit(&disk_full)
+                    && !tracker.read().await.all_complete()
+                {
+                    info!(
+                        "Download {}: a new peer arrived after the retry rounds; giving it a round",
+                        self.transfer_id
+                    );
+                    rounds_over = false;
+                    max_retry_rounds = max_retry_rounds.max(retry_round + 1);
+                    continue;
+                }
+                break;
+            }
             if disk_full_hit(&disk_full) {
                 for handle in adopted_handles.drain(..) {
                     handle.abort();
@@ -4549,7 +4927,8 @@ impl MultiSourceDownload {
                     .collect()
             };
             if incomplete.is_empty() {
-                break;
+                rounds_over = true;
+                continue;
             }
 
             // Inter-round backoff: never start a retry round less than
@@ -4653,25 +5032,29 @@ impl MultiSourceDownload {
                     .collect()
             };
 
-            // Promote any peers that reached queue state during the
-            // previous round (populated by `download_parts_from_source`
-            // when it receives `OP_QUEUERANKING`). Doing this at
-            // round boundary avoids holding the mutex while we work.
-            {
-                // Recover the inner set if the mutex was poisoned by a panic
+            // Apply the cooldowns source tasks earned since the last round
+            // (queued us, or had nothing we need). Doing this at round
+            // boundary avoids holding the mutex while we work. A peer this
+            // worker never dialed itself (an adopted callback) is timed from
+            // now.
+            let no_file: HashSet<(String, u16)> = {
+                // Recover the inner state if the mutex was poisoned by a panic
                 // in a worker task — the contained data is still consistent
-                // (only HashSet inserts happen under this lock) and dropping
-                // the whole download over an unrelated panic would be worse
-                // than continuing. The other lock sites likewise tolerate it.
-                let mut queued = peers_that_queued
+                // (only inserts happen under this lock) and dropping the whole
+                // download over an unrelated panic would be worse than
+                // continuing. The other lock sites likewise tolerate it.
+                let mut outcomes = source_outcomes
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                for key in queued.drain() {
-                    if let Some(entry) = source_dial_history.get_mut(&key) {
-                        entry.1 = CooldownKind::Queued;
-                    }
+                let now = std::time::Instant::now();
+                for (key, kind) in outcomes.cooldowns.drain() {
+                    source_dial_history
+                        .entry(key)
+                        .and_modify(|entry| entry.1 = kind)
+                        .or_insert((now, kind));
                 }
-            }
+                outcomes.no_file.clone()
+            };
 
             // Build the cooldown-eligible candidate list once; re-used
             // by every part assignment below. `source_dial_history`
@@ -4708,12 +5091,12 @@ impl MultiSourceDownload {
                 .iter()
                 .zip(&reask_waits)
                 .map(|(s, reask)| {
-                    let cooled = match source_dial_history.get(&(s.peer_ip.clone(), s.peer_port))
-                    {
-                        Some((t, kind)) => now.duration_since(*t) >= cooldown_for(*kind),
+                    let key = (s.peer_ip.clone(), s.peer_port);
+                    let cooled = match source_dial_history.get(&key) {
+                        Some((t, kind)) => now.duration_since(*t) >= kind.cooldown(),
                         None => true,
                     };
-                    cooled && reask.is_zero()
+                    cooled && reask.is_zero() && !no_file.contains(&key)
                 })
                 .collect();
 
@@ -4797,6 +5180,9 @@ impl MultiSourceDownload {
                 // the retry budget waiting on its cooldown to expire.
                 let mut next_eligible: Option<std::time::Duration> = None;
                 for (src_idx, source) in all_sources.iter().enumerate() {
+                    if no_file.contains(&(source.peer_ip.clone(), source.peer_port)) {
+                        continue;
+                    }
                     let has_useful_part = sorted_incomplete.iter().any(|&p| {
                         if peer_confirmed_missing_part(
                             &peers_missing_parts,
@@ -4814,7 +5200,8 @@ impl MultiSourceDownload {
                     }
                     let key = (source.peer_ip.clone(), source.peer_port);
                     let remaining = match source_dial_history.get(&key) {
-                        Some((t, kind)) => cooldown_for(*kind)
+                        Some((t, kind)) => kind
+                            .cooldown()
                             .checked_sub(now.duration_since(*t))
                             .unwrap_or_default(),
                         None => std::time::Duration::ZERO,
@@ -4831,13 +5218,15 @@ impl MultiSourceDownload {
                         // retry rounds can't help. Fall out of the loop
                         // and let the outer logic re-queue the transfer.
                         info!("Retry round budget unused: no source advertises any of the {} remaining parts", sorted_incomplete.len());
-                        break;
+                        rounds_over = true;
+                        continue;
                     }
                     Some(d) if d.is_zero() => {
                         // Shouldn't happen given assigned_count == 0,
                         // but defend against an infinite tight loop.
                         warn!("Retry assignment empty despite eligible sources — bailing to avoid loop");
-                        break;
+                        rounds_over = true;
+                        continue;
                     }
                     Some(wait) => {
                         // Cap each individual sleep slice at
@@ -5034,25 +5423,16 @@ impl MultiSourceDownload {
                 let r_sx_oh = self.sx_overhead.clone();
                 let r_epx_oh = self.epx_overhead.clone();
                 let r_file_req_oh = self.file_req_overhead.clone();
-                let r_sem = conn_semaphore.clone();
-                // Clone the shared "peers that queued" set so this
-                // retry task can flag its peer when the task ends in
-                // a queue-related error. The outer loop drains the
-                // set at the top of the next round and promotes the
-                // peer's cooldown from hello-fail (`MIN_REQUESTTIME`) to
-                // 29 min (Queued / eMule FILEREASKTIME) — see
-                // `CooldownKind` and `SOURCE_RETRY_COOLDOWN_SECS`.
-                let r_queued = peers_that_queued.clone();
+                let r_sem = conn_budget.clone();
+                // The outer loop drains this at the top of the next round
+                // and promotes the peer's cooldown — see `CooldownKind`.
+                let r_outcomes = source_outcomes.clone();
                 let r_missing_parts = peers_missing_parts.clone();
                 let r_src_ip = source.peer_ip.clone();
                 let r_src_port = source.peer_port;
                 let r_disk_full = disk_full.clone();
                 let src_drop_tx = drop_tx.clone();
                 let handle = tokio::spawn(async move {
-                    let _permit = match acquire_source_permit(&r_sem, &rctrl).await {
-                        Ok(p) => p,
-                        Err(_) => return,
-                    };
                     // Restore this source's frequency contribution for the
                     // duration of the re-dial. `update_frequencies` counted it
                     // once at construction and the source's previous task
@@ -5092,31 +5472,26 @@ impl MultiSourceDownload {
                             None,
                             r_missing_parts,
                             Some(src_drop_tx),
+                            &r_sem,
                         ) => res,
                         _ = cancel_with_grace(&cancel_ctrl) => Err(anyhow::anyhow!("cancelled by user")),
                     };
                     freq_avail.release().await;
+                    // Queue-phase endings (peer kicked us from its upload
+                    // queue, TCP dropped while queued, queue full, queue
+                    // timeout) cool the peer for 29 min instead of the
+                    // hello-fail floor, and no-needed-parts for twice that.
+                    // Without this the retry loop hammered the peer after
+                    // every queue-state failure, which (a) looked like bot
+                    // behaviour to anti-leecher mods and (b) used up the
+                    // small `max_retry_rounds` budget in under 5 minutes,
+                    // causing downloads to abandon queued peers the user
+                    // would have eventually climbed to rank 1 with.
+                    note_session_end(&r_outcomes, &r_src_ip, r_src_port, &result);
                     if let Err(e) = result {
                         let err_str = e.to_string();
                         note_disk_full(&r_disk_full, &e);
-                        // Queue-phase errors (peer kicked us from its
-                        // upload queue, TCP dropped while queued, queue
-                        // full, queue timeout, no-needed-parts): tag
-                        // the peer as `Queued` so next round's cooldown
-                        // is 29 min instead of the hello-fail floor.
-                        // Without this the retry loop hammered the peer
-                        // after every queue-state failure, which (a)
-                        // looked like bot behaviour to anti-leecher mods
-                        // and (b) used up the small `max_retry_rounds`
-                        // budget in under 5 minutes, causing downloads
-                        // to abandon queued peers the user would have
-                        // eventually climbed to rank 1 with.
                         let is_queue_related = super::transfer::is_queue_state_error(&err_str);
-                        if is_queue_related {
-                            if let Ok(mut q) = r_queued.lock() {
-                                q.insert((r_src_ip.clone(), r_src_port));
-                            }
-                        }
                         // Un-suppress queue_detached logs at info
                         // level — historically suppressed to avoid log
                         // spam, but the resulting silent task exit
@@ -5226,54 +5601,6 @@ impl MultiSourceDownload {
             last_round_end = Some(std::time::Instant::now());
         }
 
-        // Mirrors outlast the peers' retry rounds: a file only a mirror has is
-        // still downloading here. Waited for only while one is fetching, not
-        // while all of them rest out a backoff, and with the peers' channels
-        // still read: a callback stream is adopted as in the rounds, and a new
-        // peer ends the wait, so the download is re-queued and its next run
-        // dials it, rather than leaving it unread behind a mirror.
-        loop {
-            if web_working.load(Ordering::Relaxed) == 0
-                || web_handles.iter().all(|h| h.is_finished())
-                || tracker.read().await.all_complete_and_settled()
-            {
-                break;
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
-                new_est = async {
-                    match post_phase_new_established_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match new_est {
-                        Some(es) => {
-                            pending_established.push(es);
-                            adopt_pending_callbacks!(retry_round);
-                        }
-                        None => post_phase_new_established_rx = None,
-                    }
-                }
-                new_src = async {
-                    match post_phase_new_source_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match new_src {
-                        Some(source) => {
-                            info!(
-                                "Download {}: a new peer {}:{} arrived while mirrors were fetching; ending this run so the re-queued download uses it",
-                                self.transfer_id, source.peer_ip, source.peer_port
-                            );
-                            break;
-                        }
-                        None => post_phase_new_source_rx = None,
-                    }
-                }
-            }
-        }
         // The dispatcher does not end by itself while the download runs.
         // Stopped before the sweep and the final verification, which must not
         // race a writer.
@@ -5284,17 +5611,7 @@ impl MultiSourceDownload {
             let _ = h.await;
         }
         let _ = web_agg.await;
-
-        // Retry budget exhausted: let any in-flight adopted callback downloads
-        // finish (they may be actively transferring), then shut down the
-        // adoption aggregator. Any callback stream still merely buffered can't
-        // be started now — the worker is about to exit — so it's dropped.
-        for es in pending_established.drain(..) {
-            drop(es);
-        }
         drop(adopt_progress_tx);
-        // See the initial-phase abort above, and the retry round's wait.
-        wait_for_sources_unless_settled(&tracker, &adopted_handles).await;
         for h in adopted_handles.drain(..) {
             let _ = h.await;
         }
@@ -5420,18 +5737,12 @@ impl MultiSourceDownload {
                     },
                     job_cancel.as_ref(),
                 )?;
-                // Only once the ed2k hash matched: if both are wrong the bytes
-                // are, and that is the ed2k mismatch path's to repair. Read
-                // as a bad pin, a corrupt block failed the download for good
-                // and dropped a pin nothing had shown to be wrong.
-                if let Some(got) = digests.ember.filter(|_| digests.ed2k == expected_ed2k) {
-                    if got != ember_expected {
-                        anyhow::bail!(
-                            "ember blake3 mismatch: expected={} got={}",
-                            hex::encode(ember_expected),
-                            hex::encode(got)
-                        );
-                    }
+                if ember_pin_refuted(&digests, &expected_ed2k, expected_aich, ember_expected) {
+                    anyhow::bail!(
+                        "ember blake3 mismatch: expected={} got={}",
+                        hex::encode(ember_expected),
+                        hex::encode(digests.ember.unwrap_or_default())
+                    );
                 }
                 Ok::<_, anyhow::Error>((digests.ed2k, identity, digests.aich, digests.part_hashes))
             })
@@ -5550,13 +5861,21 @@ impl MultiSourceDownload {
                 // A fetch for the feeds code finishes where it asked, in the
                 // app data folder, never in `Downloads`.
                 let internal_dest = crate::sharing::feed_files::internal_fetch_dest(&self.transfer_id);
+                let _ = event_tx
+                    .send(DownloadEvent::Completing {
+                        transfer_id: self.transfer_id.clone(),
+                        generation: finish_generation,
+                    })
+                    .await;
                 // Spawned, not awaited in place: Pause and Stop abort this
                 // worker, and `abort` cannot stop the blocking move. Dropped at
                 // its await, the move still finished but nothing after it ran:
                 // no `Completed`, so the row stayed Paused or Stopped with its
                 // `.part` gone, and Resume downloaded the whole file again.
+                // A failed move is reported from in here for the same reason,
+                // and only from in here.
                 let finish = tokio::spawn(async move {
-                    let actual_final = tokio::task::spawn_blocking(move || match internal_dest {
+                    let moved = tokio::task::spawn_blocking(move || match internal_dest {
                         Some(dest) => {
                             let dest_root = dest
                                 .parent()
@@ -5583,7 +5902,23 @@ impl MultiSourceDownload {
                         ),
                     })
                     .await
-                    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))??;
+                    .map_err(|e| anyhow::anyhow!("spawn_blocking: {e}"))
+                    .and_then(|moved| moved);
+                    let actual_final = match moved {
+                        Ok(path) => path,
+                        Err(e) => {
+                            let error = e.to_string();
+                            let _ = finish_tx
+                                .send(DownloadEvent::Failed {
+                                    transfer_id: finish_id,
+                                    failure_kind: super::transfer::classify_error(&error),
+                                    error,
+                                    generation: finish_generation,
+                                })
+                                .await;
+                            return FinishOutcome::MoveFailedReported(e);
+                        }
+                    };
                     finish_tracker.read().await.delete_met(&met_roots);
                     // `part_hashes` was fetched from a source via
                     // OP_HASHSETREQUEST(2) and cryptographically verified
@@ -5616,11 +5951,17 @@ impl MultiSourceDownload {
                             generation: finish_generation,
                         })
                         .await;
-                    Ok::<(), anyhow::Error>(())
+                    FinishOutcome::Completed
                 });
-                finish
+                match finish
                     .await
-                    .map_err(|e| anyhow::anyhow!("completion task: {e}"))??;
+                    .map_err(|e| anyhow::anyhow!("completion task: {e}"))?
+                {
+                    FinishOutcome::Completed => {}
+                    FinishOutcome::MoveFailedReported(e) => {
+                        warn!("Could not move {} into place: {e:#}", self.file_name);
+                    }
+                }
             } else {
                 let expected_part_hashes = part_hashes.read().await.clone();
                 let recovery = if could_not_verify {
@@ -5769,6 +6110,11 @@ impl MultiSourceDownload {
         if let Some(ref registry) = self.tracker_registry {
             unregister_own_tracker(registry, &self.transfer_id, &tracker);
         }
+        // Done with this file: no peer's queue place for it is worth keeping
+        // our other downloads away from that peer.
+        if all_done {
+            peer_sessions::release_file_claims(&self.file_hash);
+        }
 
         drop(source_aborts);
         drop(drop_tx);
@@ -5777,11 +6123,21 @@ impl MultiSourceDownload {
     }
 }
 
+/// How the task moving a verified download into place ended, when it ran to
+/// the end.
+enum FinishOutcome {
+    Completed,
+    /// The move failed and the task has already sent the `Failed` for it.
+    MoveFailedReported(anyhow::Error),
+}
+
 async fn install_verified_part_hashes(
     shared_part_hashes: &Arc<RwLock<Vec<[u8; 16]>>>,
     tracker: &Arc<RwLock<PartTracker>>,
     hashes: Vec<[u8; 16]>,
 ) {
+    let file_size = tracker.read().await.file_size;
+    let hashes = super::transfer::per_part_hashes(hashes, file_size);
     let installed = {
         let mut shared = shared_part_hashes.write().await;
         if shared.is_empty() {
@@ -6260,7 +6616,8 @@ async fn download_parts_from_source(
     // path (to record a fresh failure). See `SharedPeerMissingParts`.
     peers_missing_parts: SharedPeerMissingParts,
     drop_tx: Option<DropReleaseTx>,
-) -> anyhow::Result<()> {
+    conn_budget: &SourceConnBudget,
+) -> anyhow::Result<SessionEnd> {
     use super::messages::*;
     use tokio::net::TcpStream;
 
@@ -6372,7 +6729,9 @@ async fn download_parts_from_source(
     type DynRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
     type DynWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
 
-    let our_client_id = sx_external_ip
+    let our_client_id = hello_client_id();
+    // SecIdent signatures a peer makes over us cover this, not our Hello ID.
+    let our_public_ip = sx_external_ip
         .map(|ip| u32::from_le_bytes(ip.octets()))
         .unwrap_or(0);
 
@@ -6402,10 +6761,16 @@ async fn download_parts_from_source(
     // a Path B detach) to release the machine-wide connection slot. Stays
     // `None` for adopted inbound streams, which open no outbound connection.
     let mut _global_conn_permit: Option<GlobalConnPermit> = None;
+    // This download's share of source connections. A stream that is already
+    // open takes one only if one is free: it is a connection either way, and
+    // waiting behind dials parked on the machine-wide cap would leave the
+    // peer that connected to us hanging until it gave up.
+    let mut _source_permit: Option<tokio::sync::SemaphorePermit<'_>> = None;
     let mut peer_session: Option<peer_sessions::PeerSession> = None;
     let friend_connect_back = pre_established.as_ref().and_then(|es| es.friend_connect_back);
 
     if let Some(es) = pre_established {
+        _source_permit = conn_budget.sem.try_acquire().ok();
         emit_source!("connecting", None, 0u64);
         if let std::net::IpAddr::V4(v4) = addr.ip() {
             peer_session = Some(peer_sessions::register(
@@ -6504,7 +6869,7 @@ async fn download_parts_from_source(
                 _src_idx, addr,
             );
             // Never emitted "connecting" for this route — nothing to clear.
-            return Ok(());
+            return Ok(SessionEnd::Finished);
         }
         // Same admissibility gate as SX registration / network inject:
         // never dial a filtered, banned, or self address that slipped into
@@ -6516,19 +6881,33 @@ async fn download_parts_from_source(
                     "Source {} ({}) skip dial: filtered, banned, or self",
                     _src_idx, addr,
                 );
-                return Ok(());
+                return Ok(SessionEnd::Finished);
             }
         } else {
             debug!("Source {} ({}) skip dial: non-IPv4 address", _src_idx, addr,);
-            return Ok(());
+            return Ok(SessionEnd::Finished);
         }
         if addr.port() == 0 {
             debug!("Source {} ({}) skip dial: port 0", _src_idx, addr,);
-            return Ok(());
+            return Ok(SessionEnd::Finished);
         }
         let std::net::IpAddr::V4(dial_v4) = addr.ip() else {
-            return Ok(());
+            return Ok(SessionEnd::Finished);
         };
+        if let Some(other) = peer_sessions::queued_for_other_file(
+            source.peer_user_hash,
+            dial_v4,
+            &[addr.port()],
+            file_hash,
+        ) {
+            debug!(
+                "Source {} ({}) skip dial: queued at this peer for {} (A4AF)",
+                _src_idx,
+                addr,
+                hex::encode(other),
+            );
+            return Ok(SessionEnd::Finished);
+        }
         let stored_ember = stored_ember_identity(&credit_mgr, source.peer_user_hash).await;
         if let Some(friend) =
             friend_refusing_plain_ed2k(&[stored_ember], &friend_hashes, file_hash, &control).await
@@ -6540,7 +6919,7 @@ async fn download_parts_from_source(
                 hex::encode(friend),
             );
             report_friend_transfer_only(&event_tx, &transfer_id, &src_ip, src_port, friend).await;
-            return Ok(());
+            return Ok(SessionEnd::Finished);
         }
         // Every dial ends in `OP_STARTUPLOADREQ`, and one inside eMule's
         // `MIN_REQUESTTIME` of the last is a strike toward a ban however we
@@ -6558,7 +6937,7 @@ async fn download_parts_from_source(
                 addr,
                 wait.as_secs(),
             );
-            return Ok(());
+            return Ok(SessionEnd::Finished);
         }
         // eMule gives each peer one socket. Dialing while another session
         // with it is open, from another download or its own connection to our
@@ -6568,15 +6947,17 @@ async fn download_parts_from_source(
                 "Source {} ({}) skip dial: a connection with this peer is already open",
                 _src_idx, addr,
             );
-            return Ok(());
+            return Ok(SessionEnd::Finished);
         }
         emit_source!("connecting", None, 0u64);
         // Global connection cap + dial pacing apply to outbound dials only:
         // a machine-wide slot (eMule's `maxconnections`) once the "New
         // Connections / 5s" window has room, then spacing so a burst of source
-        // starts can't storm the network.
+        // starts can't storm the network. The machine-wide slot comes first so
+        // that a dial parked on it holds none of this download's share.
         _global_conn_permit = acquire_dial_slot(&control).await;
         check_control(&control).await?;
+        _source_permit = Some(acquire_source_permit(conn_budget, &control).await?);
         space_outbound_dial().await;
         // Reserved only now: holding it through the slot wait would turn away
         // our own upload side's push-grant to this peer meanwhile.
@@ -6587,7 +6968,7 @@ async fn download_parts_from_source(
                 _src_idx, addr,
             );
             emit_source!("duplicate", None, 0u64);
-            return Ok(());
+            return Ok(SessionEnd::Finished);
         };
         peer_session = Some(session);
 
@@ -7020,7 +7401,7 @@ async fn download_parts_from_source(
         // Clear the Connecting SourceDetail without a fail_count penalty —
         // another live route owns this peer.
         emit_source!("duplicate", None, 0u64);
-        return Ok(());
+        return Ok(SessionEnd::Finished);
     }
     let _live_guard = LivePeerGuard {
         transfer_id: transfer_id.clone(),
@@ -7074,9 +7455,14 @@ async fn download_parts_from_source(
     // The Ember hash this session's binding check passed for, and whether
     // SecIdent verified this session: together they keep the binding for the
     // Known Ember Peers tab without an address to tie them (see
-    // `CreditManager::note_session_proven_ember`).
+    // `CreditManager::note_session_bound_ember`).
     let mut session_bound_ember: Option<[u8; 16]> = None;
     let mut secident_verified_here = false;
+    // Our key-link challenge to this peer, the ones we answer, and the Ember
+    // key whose proof verified (`super::key_link`). With SecIdent that proof
+    // ties the user hash to the identity for Ember-stream credit
+    // (`CreditManager::note_session_proven_ember`).
+    let mut key_link = super::key_link::KeyLinkSession::default();
     // Strict proof-of-possession flag. `true` iff
     // `perform_ember_auth_buffered` completed successfully on THIS
     // TCP session — the peer signed a fresh random nonce we issued
@@ -7108,6 +7494,60 @@ async fn download_parts_from_source(
     // dispatch arms see them in their original arrival order.
     let mut auth_deferred: std::collections::VecDeque<(u8, u8, Vec<u8>)> =
         std::collections::VecDeque::new();
+
+    // Challenge the peer to prove its Ember key (`super::key_link`), once,
+    // when its HELLO has named one.
+    macro_rules! send_key_link_challenge {
+        () => {
+            if peer_ember_hash.is_some() && peer_user_hash != [0u8; 16] {
+                if let Some(challenge) = key_link.challenge_payload(hello_caps.is_ember) {
+                    let _ = write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_EXT, &challenge)
+                        .await;
+                }
+            }
+        };
+    }
+    // A key-link frame, from whichever read loop it lands in: answer the
+    // peer's challenge, or take its proof of ours. The proof is checked
+    // against the proven SecIdent key on record for the peer's user hash;
+    // without one yet it waits for `note_session_ember_links`. Without a
+    // credit ledger there is neither our SecIdent key nor a link to make.
+    macro_rules! on_key_link_frame {
+        ($sub_type:expr, $body:expr) => {
+            if let Some(cm) = &credit_mgr {
+                let our_key = ed25519_dalek::SigningKey::from_bytes(&ed25519_secret_key);
+                let step = {
+                    let ledger = cm.read().await;
+                    let peer = super::key_link::KeyLinkPeer {
+                        is_ember: hello_caps.is_ember,
+                        advertised_ember_hash: peer_ember_hash.as_ref(),
+                        user_hash: &peer_user_hash,
+                        proven_secident_key: ledger.proven_public_key(&peer_user_hash),
+                    };
+                    let us = super::key_link::KeyLinkUs {
+                        user_hash,
+                        key: &our_key,
+                        credits: &ledger,
+                    };
+                    key_link.on_frame($sub_type, $body, peer, us)
+                };
+                match step {
+                    super::key_link::KeyLinkStep::Reply(proof) => {
+                        let _ =
+                            write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_EMBER_EXT, &proof)
+                                .await;
+                    }
+                    super::key_link::KeyLinkStep::Proven(signer) => {
+                        super::key_link::link_proven_key(cm, peer_user_hash, &signer, addr).await;
+                    }
+                    super::key_link::KeyLinkStep::AwaitingSecIdent => {
+                        debug!("Key link: proof from source {} waits for SecIdent", _src_idx);
+                    }
+                    super::key_link::KeyLinkStep::Ignored => {}
+                }
+            }
+        };
+    }
 
     // Handle pre-file-control packets which may arrive before file requests.
     // Bumped from 3 → 12 iterations because `perform_ember_auth_buffered`
@@ -7289,13 +7729,21 @@ async fn download_parts_from_source(
                     addr,
                     peer_secure_ident_level,
                     &payload,
-                    our_client_id,
+                    our_public_ip,
                 )
                 .await
                 {
                     secident_verified_here = true;
-                    if let (Some(eh), Some(cm)) = (session_bound_ember, &credit_mgr) {
-                        cm.write().await.note_session_proven_ember(peer_user_hash, eh);
+                    if let Some(cm) = &credit_mgr {
+                        note_session_ember_links(
+                            cm,
+                            peer_user_hash,
+                            user_hash,
+                            session_bound_ember,
+                            &mut key_link,
+                            addr,
+                        )
+                        .await;
                     }
                 }
             }
@@ -7536,7 +7984,7 @@ async fn download_parts_from_source(
                                             CreditManager::ident_ip_of(addr),
                                         );
                                         if secident_verified_here {
-                                            cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                            cm.note_session_bound_ember(peer_user_hash, *peer_eh);
                                         }
                                     }
                                 }
@@ -7686,6 +8134,13 @@ async fn download_parts_from_source(
                     }
                 }
             }
+            (OP_EMULEPROT, OP_EMBER_EXT)
+                if super::key_link::key_link_frame(proto, opcode, &payload).is_some() =>
+            {
+                if let Some((sub_type, body)) = super::key_link::key_link_frame(proto, opcode, &payload) {
+                    on_key_link_frame!(sub_type, body);
+                }
+            }
             _ => {
                 deferred_packet = Some((proto, opcode, payload));
                 break;
@@ -7782,7 +8237,31 @@ async fn download_parts_from_source(
                 hex::encode(friend),
             );
             report_friend_transfer_only(&event_tx, &transfer_id, &src_ip, src_port, friend).await;
-            return Ok(());
+            return Ok(SessionEnd::Finished);
+        }
+    }
+
+    // One file per peer at a time (eMule A4AF): asking it for this one while
+    // another of our downloads holds a place at it would move that place.
+    // Ember peers keep parallel connections apart, as for the one-socket rule.
+    let ask_ports = [addr.port(), source.peer_port, hello_caps.tcp_port];
+    if !hello_caps.is_ember {
+        if let std::net::IpAddr::V4(v4) = addr.ip() {
+            if let Some(other) = peer_sessions::queued_for_other_file(
+                Some(peer_user_hash),
+                v4,
+                &ask_ports,
+                file_hash,
+            ) {
+                debug!(
+                    "Source {} ({}) not asking for this file: queued at this peer for {} (A4AF)",
+                    _src_idx,
+                    addr,
+                    hex::encode(other),
+                );
+                emit_source!("parts_busy", None, 0u64);
+                return Ok(SessionEnd::Finished);
+            }
         }
     }
 
@@ -7829,13 +8308,17 @@ async fn download_parts_from_source(
     } else {
         Vec::new()
     };
+    let complete_sources = match &chunk_sel {
+        Some(cs) => complete_source_count(&*cs.read().await),
+        None => 0,
+    };
     let file_req = build_file_request(file_hash);
     let mut req_file_name_payload = file_req.clone();
     if peer_extended_requests_ver > 0 {
         req_file_name_payload.extend_from_slice(&(wire_part_count as u16).to_le_bytes());
         req_file_name_payload.extend_from_slice(&completed_bitmap);
         if peer_extended_requests_ver > 1 {
-            req_file_name_payload.extend_from_slice(&0u16.to_le_bytes());
+            req_file_name_payload.extend_from_slice(&complete_sources.to_le_bytes());
         }
     }
     let sx_allowed = if let Some(sm) = &source_mgr {
@@ -7870,7 +8353,7 @@ async fn download_parts_from_source(
             mp.extend_from_slice(&(wire_part_count as u16).to_le_bytes());
             mp.extend_from_slice(&completed_bitmap);
             if peer_extended_requests_ver > 1 {
-                mp.extend_from_slice(&0u16.to_le_bytes());
+                mp.extend_from_slice(&complete_sources.to_le_bytes());
             }
         }
         if !single_part {
@@ -7949,6 +8432,10 @@ async fn download_parts_from_source(
             sent_ember_hello = true;
         }
     }
+    // A peer whose HELLO came before the file request is challenged now, so
+    // the vanilla request sequence still goes first; one whose HELLO comes
+    // later, from the file-status wait below.
+    send_key_link_challenge!();
 
     // Read responses (consume deferred packet first, then any packets)
     // captured by `perform_ember_auth_buffered` that haven't been
@@ -8171,13 +8658,21 @@ async fn download_parts_from_source(
                 addr,
                 peer_secure_ident_level,
                 &_payload,
-                our_client_id,
+                our_public_ip,
             )
             .await
             {
                 secident_verified_here = true;
-                if let (Some(eh), Some(cm)) = (session_bound_ember, &credit_mgr) {
-                    cm.write().await.note_session_proven_ember(peer_user_hash, eh);
+                if let Some(cm) = &credit_mgr {
+                    note_session_ember_links(
+                        cm,
+                        peer_user_hash,
+                        user_hash,
+                        session_bound_ember,
+                        &mut key_link,
+                        addr,
+                    )
+                    .await;
                 }
             }
             continue;
@@ -8204,6 +8699,10 @@ async fn download_parts_from_source(
                 }
                 debug!("Peer comment from source {} during file-status: rating={rating}, comment='{comment}'", _src_idx);
             }
+            continue;
+        }
+        if let Some((sub_type, body)) = super::key_link::key_link_frame(proto, opcode, &_payload) {
+            on_key_link_frame!(sub_type, body);
             continue;
         }
         // Ember-only; gated on HELLO + hash↔pubkey binding.
@@ -8339,6 +8838,7 @@ async fn download_parts_from_source(
                     .await;
                     sent_ember_hello = true;
                 }
+                send_key_link_challenge!();
 
                 // Binding + optional full PoP (mirrors the pre-control
                 // site — see the long comment there for the rationale).
@@ -8361,7 +8861,7 @@ async fn download_parts_from_source(
                                         CreditManager::ident_ip_of(addr),
                                     );
                                     if secident_verified_here {
-                                        cm.note_session_proven_ember(peer_user_hash, *peer_eh);
+                                        cm.note_session_bound_ember(peer_user_hash, *peer_eh);
                                     }
                                 }
                             }
@@ -8955,7 +9455,10 @@ async fn download_parts_from_source(
         None
     };
 
-    // Request part hashset if not already populated (first source to connect does this)
+    // Request part hashset if not already populated, from one source at a
+    // time. Held until it is answered here or in a later loop, the wait for
+    // it times out, or this session ends.
+    let mut hashset_request: Option<HashsetRequest> = None;
     {
         let existing = shared_part_hashes.read().await;
         // A file of one part has its file hash as that part's MD4. eMule never
@@ -8968,6 +9471,15 @@ async fn download_parts_from_source(
             install_verified_part_hashes(&shared_part_hashes, &tracker, vec![*file_hash]).await;
         } else if existing.is_empty() {
             drop(existing);
+            hashset_request = HashsetRequest::try_begin(*file_hash);
+            if hashset_request.is_none() {
+                debug!(
+                    "Source {} not asking for the hashset: another source already is",
+                    _src_idx
+                );
+            }
+        }
+        if hashset_request.is_some() {
             if peer_supports_file_ident {
                 let hashset_req2 = build_hashset_request2(file_hash, file_size, None, true, false);
                 write_packet_async_ms(
@@ -8992,92 +9504,24 @@ async fn download_parts_from_source(
                     .context("stage:hashset_wait")
                 {
                     Ok((proto, opcode, payload))
-                        if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER =>
+                        if (proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER)
+                            || (proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2) =>
                     {
-                        file_req_overhead.record_download((6 + payload.len()) as u64);
-                        if let Ok((_h, hashes)) = parse_hashset_answer(&payload) {
-                            debug!(
-                                "Got hashset with {} part hashes from source {}",
-                                hashes.len(),
-                                _src_idx
-                            );
-                            if super::transfer::verify_hashset(file_hash, &hashes, file_size) {
-                                install_verified_part_hashes(&shared_part_hashes, &tracker, hashes)
-                                    .await;
-                            } else {
-                                warn!(
-                                    "Hashset from source {} failed verification, discarding",
-                                    _src_idx
-                                );
-                            }
-                        }
-                        break;
-                    }
-                    Ok((proto, opcode, payload))
-                        if proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2 =>
-                    {
-                        file_req_overhead.record_download((6 + payload.len()) as u64);
-                        if let Ok(resp) = parse_hashset_answer2(&payload) {
-                            let local_ident = FileIdentifier {
-                                md4_hash: *file_hash,
-                                file_size: Some(file_size),
-                                aich_hash: None,
-                            };
-                            if local_ident.compare_relaxed(&resp.identifier) {
-                                // Pin the AICH master hash ONLY after the
-                                // accompanying MD4 hashset verifies against
-                                // the file's ed2k hash. This prevents a
-                                // first-wins peer from pinning a bogus
-                                // master that is never tied to a verified
-                                // file identity (see audit D2). If MD4
-                                // hashes are missing or bad, we defer AICH
-                                // pinning until a trustworthy source
-                                // arrives or the EPX-time check accepts it.
-                                let md4_ok = resp
-                                    .md4_hashes
-                                    .as_ref()
-                                    .map(|h| {
-                                        super::transfer::verify_hashset(file_hash, h, file_size)
-                                    })
-                                    .unwrap_or(false);
-                                if md4_ok {
-                                    if let Some(hashes) = resp.md4_hashes {
-                                        install_verified_part_hashes(
-                                            &shared_part_hashes,
-                                            &tracker,
-                                            hashes,
-                                        )
-                                        .await;
-                                    }
-                                    if let Some(root) = resp.aich_master_hash {
-                                        {
-                                            let mut am = shared_aich_master.master.write().await;
-                                            let mut votes = shared_aich_master.votes.write().await;
-                                            super::transfer::consider_hashset2_aich_pin(
-                                                &mut am,
-                                                shared_aich_master.expected,
-                                                Some(&mut votes),
-                                                &source.peer_ip,
-                                                root,
-                                            );
-                                        }
-                                        if let Some(part_hashes) = resp.aich_part_hashes.as_ref() {
-                                            debug!(
-                                                "Source {} provided HashSet2 AICH data: master={}, parts={}",
-                                                _src_idx,
-                                                hex::encode(root),
-                                                part_hashes.len()
-                                            );
-                                        }
-                                    }
-                                } else if resp.aich_master_hash.is_some() {
-                                    warn!(
-                                        "HashSet2 from source {} had an AICH master but the MD4 hashset failed or was absent — deferring AICH pin",
-                                        _src_idx
-                                    );
-                                }
-                            }
-                        }
+                        take_hashset_answer(
+                            proto,
+                            opcode,
+                            &payload,
+                            file_hash,
+                            file_size,
+                            &shared_part_hashes,
+                            &tracker,
+                            &shared_aich_master,
+                            &source.peer_ip,
+                            &file_req_overhead,
+                            _src_idx,
+                        )
+                        .await;
+                        drop(hashset_request.take());
                         break;
                     }
                     Ok((proto, opcode, payload))
@@ -9103,6 +9547,15 @@ async fn download_parts_from_source(
                         )
                         .await;
                     }
+                    Ok((proto, opcode, payload))
+                        if super::key_link::key_link_frame(proto, opcode, &payload).is_some() =>
+                    {
+                        if let Some((sub_type, body)) =
+                            super::key_link::key_link_frame(proto, opcode, &payload)
+                        {
+                            on_key_link_frame!(sub_type, body);
+                        }
+                    }
                     Ok((proto, opcode, _)) => {
                         debug!("Source {} waiting for hashset, got proto=0x{proto:02X} op=0x{opcode:02X} — skipping", _src_idx);
                     }
@@ -9124,6 +9577,7 @@ async fn download_parts_from_source(
                             "No hashset answer from source {} (peer may not support it)",
                             _src_idx
                         );
+                        drop(hashset_request.take());
                         break;
                     }
                 }
@@ -9180,6 +9634,112 @@ async fn download_parts_from_source(
         }
     }
 
+    // AICH recovery an earlier source could not give, asked of this one
+    // before it queues us (eMule `CPartFile::RequestAICHRecovery`): one part
+    // per connection, held by the peer, whose MD4 failed here.
+    if let (true, Some(pending), Some(output), std::net::IpAddr::V4(peer_v4)) = (
+        peer_supports_aich,
+        aich_pending.as_ref(),
+        shared_output.as_ref(),
+        addr.ip(),
+    ) {
+        let master = *shared_aich_master.master.read().await;
+        let pending = pending.read().map(|map| (*map).clone()).unwrap_or_default();
+        let part = match master {
+            Some(_) if !pending.is_empty() => {
+                let t = tracker.read().await;
+                aich_retry_parts(
+                    &pending,
+                    file_hash,
+                    peer_v4,
+                    |p| {
+                        claimed_complete_multipart
+                            || peer_file_status
+                                .as_ref()
+                                .is_some_and(|status| status.get(p).copied().unwrap_or(false))
+                    },
+                    |p| t.is_part_verified(p),
+                )
+                .first()
+                .copied()
+            }
+            _ => None,
+        };
+        if let (Some(part), Some(master)) = (part, master) {
+            let mut aich_req = Vec::with_capacity(38);
+            aich_req.extend_from_slice(file_hash);
+            aich_req.extend_from_slice(&(part as u16).to_le_bytes());
+            aich_req.extend_from_slice(&master);
+            write_packet_async_ms(&mut *writer, OP_EMULEPROT, OP_AICHREQUEST, &aich_req).await?;
+            debug!("Source {_src_idx} ({addr}): asking for AICH recovery of part {part}");
+            let answer = wait_for_aich_recovery_answer_ms(
+                &mut *reader,
+                file_hash,
+                part,
+                master,
+                &mut auth_deferred,
+            )
+            .await;
+            let (failed, desynced) = match answer {
+                AichAnswerOutcome::Recovered(data) => {
+                    match apply_aich_recovery_to_disk(&tracker, output, part, master, data, file_size)
+                        .await
+                    {
+                        Ok(AichRecoveryApplied::Applied {
+                            bad_blocks,
+                            recovered,
+                        }) => {
+                            info!(
+                                "AICH recovery of part {part} from source {_src_idx}: {recovered} bytes kept, {bad_blocks} bad 180KiB block(s) to re-fetch"
+                            );
+                            let _ = progress_tx.try_send((_src_idx, recovered as i64));
+                            (false, false)
+                        }
+                        Ok(AichRecoveryApplied::BadData) => (true, false),
+                        Ok(AichRecoveryApplied::Superseded) => (false, false),
+                        Err(e) => {
+                            warn!("{e:#}");
+                            (false, false)
+                        }
+                    }
+                }
+                AichAnswerOutcome::NotAvailable => (true, false),
+                AichAnswerOutcome::StreamDesynced => (true, true),
+            };
+            if let (true, Some(etx)) = (failed, event_tx.as_ref()) {
+                let _ = etx
+                    .send(DownloadEvent::AichRecoveryFailed {
+                        file_hash: *file_hash,
+                        part_index: part as u32,
+                        failed_ip: peer_v4,
+                    })
+                    .await;
+            }
+            if desynced {
+                return Err(anyhow::Error::from(packet_stream_desynced_error())
+                    .context("stage:aich_wait no AICH recovery answer"));
+            }
+        }
+    }
+
+    // The place this download takes at the peer, which keeps our other
+    // downloads from asking it for their files meanwhile (see the A4AF check
+    // above). Queued until a slot is granted.
+    let a4af_claim = match (hello_caps.is_ember, addr.ip()) {
+        (false, std::net::IpAddr::V4(v4)) => Some(peer_sessions::claim_file(
+            Some(peer_user_hash),
+            v4,
+            &ask_ports,
+            *file_hash,
+        )),
+        _ => None,
+    };
+    let set_queued_at_peer = |queued: bool| {
+        if let Some(claim) = &a4af_claim {
+            claim.set_queued(queued);
+        }
+    };
+
     struct CountGuard {
         counter: Arc<AtomicU32>,
         armed: bool,
@@ -9202,6 +9762,7 @@ async fn download_parts_from_source(
     };
 
     if early_upload_accept {
+        set_queued_at_peer(false);
         active_count.fetch_add(1, Ordering::Relaxed);
         _active_guard.armed = true;
         // Slot granted but no block has arrived yet — show "stalled", not
@@ -9210,9 +9771,9 @@ async fn download_parts_from_source(
         // `got_any_data` gate in the receive loop).
         emit_source!("stalled", None, 0u64);
     } else {
-        // Every port the peer is known by, so the record matches however we
-        // reach it next time: dialed, its Hello, or its source row.
-        let ask_ports = [addr.port(), source.peer_port, hello_caps.tcp_port];
+        // `ask_ports` is every port the peer is known by, so the record
+        // matches however we reach it next time: dialed, its Hello, or its
+        // source row.
         let ask_wait = match addr.ip() {
             std::net::IpAddr::V4(v4) => peer_sessions::upload_request_wait(
                 Some(peer_user_hash),
@@ -9285,11 +9846,12 @@ async fn download_parts_from_source(
                     _src_idx, addr, last_rank
                 );
                 peer_conn.held.set_awaiting_grant(false);
+                set_queued_at_peer(false);
                 write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_END_OF_DOWNLOAD, file_hash)
                     .await
                     .ok();
                 emit_source!("no_needed_parts", None, 0u64);
-                return Ok(());
+                return Ok(SessionEnd::Finished);
             }
             let elapsed = queue_start.elapsed().as_secs();
             if elapsed > queue_wait_secs {
@@ -9315,7 +9877,7 @@ async fn download_parts_from_source(
             if _global_conn_permit.is_some()
                 && elapsed >= QUEUE_DETACH_GRACE_SECS
                 && (active_count.load(Ordering::Relaxed) + queued_count.load(Ordering::Relaxed))
-                    >= MAX_CONCURRENT_SOURCES as u32
+                    >= per_download_conn_cap() as u32
                 && last_rank.is_some_and(|r| r > QUEUE_DETACH_RANK_THRESHOLD)
             {
                 debug!(
@@ -9352,6 +9914,7 @@ async fn download_parts_from_source(
                 active_count.fetch_add(1, Ordering::Relaxed);
                 _active_guard.armed = true;
                 peer_conn.held.set_awaiting_grant(false);
+                set_queued_at_peer(false);
                 info!(
                     "Source {} ({}) accepted upload request — entering transfer (obfuscated={})",
                     _src_idx, addr, connection_is_obfuscated
@@ -9368,6 +9931,7 @@ async fn download_parts_from_source(
                 emit_source!("queue_full", None, 0u64);
                 // Not queued after all, so no grant will come on this socket.
                 peer_conn.held.set_awaiting_grant(false);
+                set_queued_at_peer(false);
                 anyhow::bail!("peer queue is full");
             }
             if proto == OP_EDONKEYHEADER && opcode == OP_OUTOFPARTREQS {
@@ -9380,6 +9944,24 @@ async fn download_parts_from_source(
                 // that reads as permanent.
                 emit_source!("queued", last_rank, 0u64);
                 anyhow::bail!("peer has no free upload slots (OutOfPartReqs)");
+            }
+            if take_hashset_answer(
+                proto,
+                opcode,
+                &payload,
+                file_hash,
+                file_size,
+                &shared_part_hashes,
+                &tracker,
+                &shared_aich_master,
+                &source.peer_ip,
+                &file_req_overhead,
+                _src_idx,
+            )
+            .await
+            {
+                drop(hashset_request.take());
+                continue;
             }
             if is_source_answer(proto, opcode, &payload) {
                 // A standalone OP_REQUESTSOURCES2 is usually answered while we
@@ -9429,6 +10011,10 @@ async fn download_parts_from_source(
                     }
                     debug!("Peer comment from source {} while queued: rating={rating}, comment='{comment}'", _src_idx);
                 }
+            } else if let Some((sub_type, body)) =
+                super::key_link::key_link_frame(proto, opcode, &payload)
+            {
+                on_key_link_frame!(sub_type, body);
             } else {
                 info!("Source {} ({}) queue wait: unhandled packet proto=0x{:02X} op=0x{:02X} ({} bytes)",
                     _src_idx, addr, proto, opcode, payload.len());
@@ -9530,6 +10116,9 @@ async fn download_parts_from_source(
     // AICH repair has to be skipped because it writes a request and reads
     // the answer, and no further part may be requested on this connection.
     let mut stream_maybe_desynced = false;
+    // The in-session re-queue after `OP_OUTOFPARTREQS` ran out with us still
+    // on the peer's queue.
+    let mut ended_on_queue = false;
 
     // Outer "session" loop wraps the per-part loop so we can re-enter
     // it after the peer rotates us out via `OP_OUTOFPARTREQS` (their
@@ -9604,64 +10193,24 @@ async fn download_parts_from_source(
                     if queue_idx >= part_queue.len()
                         && consecutive_stale_skips < MAX_CONSECUTIVE_STALE_SKIPS
                     {
-                        if let Some(cs) = &chunk_sel {
-                            let cs = cs.read().await;
-                            let t = tracker.read().await;
-                            let completed = t.completed_parts().to_vec();
-                            let in_prog = t.in_progress_flags();
-                            let remaining = t.remaining_count();
-                            let part_count = t.part_count;
-                            let gap_bytes = t.part_gap_bytes_vec();
-                            drop(t);
-                            if remaining > 0 {
-                                let avail = if source_available.is_empty() {
-                                    vec![true; part_count]
-                                } else {
-                                    source_available.clone()
-                                };
-                                let pp = control.is_preview_priority();
-                                let prefer_higher = remaining <= 3 && part_count > 1;
-                                let active: Vec<usize> = in_prog
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(_, &ip)| ip)
-                                    .map(|(i, _)| i)
-                                    .collect();
-                                let next_part = cs
-                                    .select_part(
-                                        &completed,
-                                        &in_prog,
-                                        &avail,
-                                        &active,
-                                        &gap_bytes,
-                                        pp,
-                                        prefer_higher,
-                                    )
-                                    .or_else(|| {
-                                        let no_in_progress = vec![false; part_count];
-                                        cs.select_part(
-                                            &completed,
-                                            &no_in_progress,
-                                            &avail,
-                                            &active,
-                                            &gap_bytes,
-                                            pp,
-                                            prefer_higher,
-                                        )
-                                    });
-                                if let Some(next) = next_part {
-                                    if !part_queue.contains(&next) {
-                                        part_queue.push(next);
-                                        ip_guard.claim(next).await;
-                                        consecutive_stale_skips += 1;
-                                        info!(
-                                        "DIAG: source {} ({}) stale-queue extend: part {} was already complete, pulled fresh part {} (skip-cycle {}/{})",
-                                        _src_idx, addr, part_idx, next,
-                                        consecutive_stale_skips, MAX_CONSECUTIVE_STALE_SKIPS,
-                                    );
-                                    }
-                                }
-                            }
+                        if let Some(next) = next_session_part(
+                            &chunk_sel,
+                            &tracker,
+                            &source_available,
+                            &control,
+                            &part_queue,
+                            &mismatched_here,
+                        )
+                        .await
+                        {
+                            part_queue.push(next);
+                            ip_guard.claim(next).await;
+                            consecutive_stale_skips += 1;
+                            info!(
+                                "DIAG: source {} ({}) stale-queue extend: part {} was already complete, pulled fresh part {} (skip-cycle {}/{})",
+                                _src_idx, addr, part_idx, next,
+                                consecutive_stale_skips, MAX_CONSECUTIVE_STALE_SKIPS,
+                            );
                         }
                     }
                     continue;
@@ -9854,16 +10403,9 @@ async fn download_parts_from_source(
             const MAX_CONSECUTIVE_BAD_BLOCKS: u32 = 5;
             const MAX_RANGE_WRITE_FAILURES: u32 = 3;
             let mut data_loop_start = std::time::Instant::now();
-            // Trickle-source rotation: timestamp since which this source has been
-            // continuously below `TRICKLE_SLOW_FLOOR_BPS`. Cleared whenever it
-            // recovers. See the rotation check at the top of the receive loop.
-            let mut slow_since: Option<std::time::Instant> = None;
-            // eMule uses DOWNLOADTIMEOUT (100s) as a single timeout for both initial
-            // and mid-transfer stalls.  We use 60s for the initial wait as a
-            // compromise: gives slow uploaders (disk I/O, throttling, busy queue)
-            // enough time to start sending while still cutting off truly dead peers
-            // faster than eMule's full 100s.
-            const INITIAL_DATA_TIMEOUT_SECS: u64 = 60;
+            // When the last data block of this part's requests arrived; the
+            // receive deadline runs from it once there has been one.
+            let mut last_data_at = std::time::Instant::now();
             // When a peer grants the upload slot but then sends no data, eMule
             // keeps the connection and re-issues its block requests
             // (SendBlockRequests) rather than abandoning the slot — the uploader
@@ -9963,35 +10505,27 @@ async fn download_parts_from_source(
                     }
                 }
 
-                // Trickle-source rotation: a source that delivered data but has now
-                // sat below TRICKLE_SLOW_FLOOR_BPS for TRICKLE_SLOW_WINDOW is wasting
-                // a connection slot. Under genuine contention (this file at its
-                // per-file budget, or the machine-wide cap saturated) rotate it out
-                // via the Path B warm-keep detach so a fresh candidate can take the
-                // slot; the source stays known, gets UDP-reasked, and is re-dialed
-                // later. Gated on holding a global permit so we never drop adopted
-                // inbound / LowID streams (which carry no outbound permit).
-                if got_any_data && _global_conn_permit.is_some() {
-                    if measured_speed < TRICKLE_SLOW_FLOOR_BPS {
-                        let since = *slow_since.get_or_insert_with(std::time::Instant::now);
-                        let file_at_budget =
-                            active_count.load(Ordering::Relaxed) >= MAX_CONCURRENT_SOURCES as u32;
-                        if since.elapsed() >= TRICKLE_SLOW_WINDOW
-                            && (file_at_budget || global_dl_conn_contended())
-                        {
-                            note_slow_rotate();
-                            debug!(
-                            "Source {} ({}) rotating out: {} B/s for {}s under connection pressure — freeing slot for a fresh candidate",
-                            _src_idx, addr, measured_speed, since.elapsed().as_secs()
-                        );
-                            emit_source!("queued", None, 0u64);
-                            anyhow::bail!(
-                            "stage:queue_detached slow source rotated ({measured_speed} B/s under pressure)"
-                        );
-                        }
-                    } else {
-                        slow_since = None;
-                    }
+                if idle_source_rotation_due(
+                    got_any_data,
+                    _global_conn_permit.is_some(),
+                    last_data_at.elapsed(),
+                    false,
+                ) && source_connections_contended(&active_count)
+                {
+                    note_slow_rotate();
+                    debug!(
+                        "Source {} ({}) rotating out: no data for {}s under connection pressure — freeing slot for a fresh candidate",
+                        _src_idx, addr, last_data_at.elapsed().as_secs()
+                    );
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(400),
+                        write_packet_async_ms(&mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[]),
+                    )
+                    .await;
+                    anyhow::bail!(
+                        "stage:data_wait idle source rotated: no data for {}s under connection pressure",
+                        last_data_at.elapsed().as_secs()
+                    );
                 }
 
                 // Periodic EPX re-send: if payload has been rebuilt and 5min elapsed
@@ -10033,16 +10567,12 @@ async fn download_parts_from_source(
                     last_epx_resend = std::time::Instant::now();
                 }
 
-                // Use a shorter read timeout until we receive the first data packet.
-                // Prevents waiting 100s on peers that accept but never send data.
+                // A shorter budget until the first data packet, so a peer that
+                // accepts but never sends is not waited on for 100s.
                 let read_timeout = if got_any_data {
-                    std::time::Duration::from_secs(super::dead_sources::DOWNLOADTIMEOUT_SECS as u64)
+                    DOWNLOAD_TIMEOUT
                 } else {
-                    let elapsed = data_loop_start.elapsed();
-                    let budget = std::time::Duration::from_secs(INITIAL_DATA_TIMEOUT_SECS);
-                    budget
-                        .saturating_sub(elapsed)
-                        .max(std::time::Duration::from_secs(1))
+                    INITIAL_DATA_TIMEOUT
                 };
 
                 // Wait for the next packet with two distinct deadlines:
@@ -10070,8 +10600,17 @@ async fn download_parts_from_source(
                 // that looked healthy while the transfer-level health
                 // indicator had already flipped red at the 60s
                 // ACTIVE_STALLED threshold.
-                let mut hard_deadline = tokio::time::Instant::now() + read_timeout;
+                let mut hard_deadline = tokio::time::Instant::from_std(receive_deadline(
+                    got_any_data,
+                    last_data_at,
+                    data_loop_start,
+                    std::time::Instant::now(),
+                ));
                 let packet_started = AtomicBool::new(false);
+                // When the stall tick first saw a packet under way. One that
+                // has begun gets `DOWNLOADTIMEOUT` from then to finish:
+                // abandoned part-way, it would cost the connection.
+                let mut packet_seen_at: Option<tokio::time::Instant> = None;
                 let read_result: Result<anyhow::Result<(u8, u8, Vec<u8>)>, ()> = if let Some(
                     packet,
                 ) =
@@ -10122,7 +10661,17 @@ async fn download_parts_from_source(
                             // classification that the rest of the receive
                             // loop uses.
                             res = &mut read_fut => break Ok(res.map_err(anyhow::Error::from)),
-                            _ = tokio::time::sleep_until(hard_deadline) => break Err(()),
+                            _ = tokio::time::sleep_until(hard_deadline) => {
+                                if packet_started.load(Ordering::Relaxed) {
+                                    let started = *packet_seen_at
+                                        .get_or_insert_with(tokio::time::Instant::now);
+                                    if started + DOWNLOAD_TIMEOUT > hard_deadline {
+                                        hard_deadline = started + DOWNLOAD_TIMEOUT;
+                                        continue;
+                                    }
+                                }
+                                break Err(());
+                            }
                             _ = stall_check.tick() => {
                                 // Another source may have closed the
                                 // last gap while we were blocked here.
@@ -10132,6 +10681,36 @@ async fn download_parts_from_source(
                                     if t.all_complete() {
                                         break Err(());
                                     }
+                                }
+                                let packet_in_progress = packet_started.load(Ordering::Relaxed);
+                                if packet_in_progress {
+                                    packet_seen_at.get_or_insert_with(tokio::time::Instant::now);
+                                }
+                                // Checked here too: a peer that has gone
+                                // quiet never gets back to the loop head.
+                                if idle_source_rotation_due(
+                                    got_any_data,
+                                    _global_conn_permit.is_some(),
+                                    last_data_at.elapsed(),
+                                    packet_in_progress,
+                                ) && source_connections_contended(&active_count)
+                                {
+                                    note_slow_rotate();
+                                    debug!(
+                                        "Source {} ({}) rotating out: no data for {}s under connection pressure — freeing slot for a fresh candidate",
+                                        _src_idx, addr, last_data_at.elapsed().as_secs()
+                                    );
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(400),
+                                        write_packet_async_ms(
+                                            &mut *writer, OP_EDONKEYHEADER, OP_CANCELTRANSFER, &[],
+                                        ),
+                                    )
+                                    .await;
+                                    anyhow::bail!(
+                                        "stage:data_wait idle source rotated: no data for {}s under connection pressure",
+                                        last_data_at.elapsed().as_secs()
+                                    );
                                 }
                                 // Emit a fresh `transferring` update
                                 // with recalculated speed (which will
@@ -10158,15 +10737,35 @@ async fn download_parts_from_source(
                                         measured_speed
                                     );
                                 }
-                                let expired = expire_outstanding_ranges(&mut outstanding_ranges);
+                                // What went quiet is asked for again, and
+                                // nothing new: a peer silent on its requests
+                                // must not be handed more of them. Only when
+                                // other sources landed every expired block is
+                                // the next one asked for, so the window does
+                                // not run dry.
+                                let expired = take_expired_ranges(&mut outstanding_ranges);
                                 if let Some(pending) = pipelined_next.as_mut() {
-                                    let _ = expire_outstanding_ranges(
-                                        &mut pending.outstanding_ranges,
+                                    let expired_next =
+                                        take_expired_ranges(&mut pending.outstanding_ranges);
+                                    requeue_expired_blocks(
+                                        &mut pending.batches,
+                                        pending.sent_idx,
+                                        &expired_next,
+                                        blocks_per_packet,
                                     );
                                 }
-                                if expired > 0 {
+                                if !expired.is_empty() {
+                                    let resend_until = sent_idx
+                                        + requeue_expired_blocks(
+                                            &mut batches,
+                                            sent_idx,
+                                            &expired,
+                                            blocks_per_packet,
+                                        );
                                     let mut sent_any = false;
                                     while sent_idx < batches.len()
+                                        && (sent_idx < resend_until
+                                            || (!sent_any && outstanding_ranges.is_empty()))
                                         && outstanding_ranges.len() < max_outstanding_blocks
                                     {
                                         let batch = next_request_batch(
@@ -10199,17 +10798,6 @@ async fn download_parts_from_source(
                                         );
                                         recent_requests.record(&batch);
                                         sent_any = true;
-                                    }
-                                    // Keyed on a request actually going out,
-                                    // not on `sent_idx` moving: skipping a
-                                    // batch whose bytes another worker
-                                    // already landed advances the index
-                                    // without extending the deadline, so a
-                                    // worker whose whole tail went stale
-                                    // still falls through to the exit below.
-                                    if sent_any {
-                                        hard_deadline =
-                                            tokio::time::Instant::now() + read_timeout;
                                     }
                                     // What expired is no longer in flight,
                                     // whether or not anything replaced it.
@@ -10344,7 +10932,7 @@ async fn download_parts_from_source(
                                 no_data_reasserts += 1;
                                 debug!(
                                 "Source {} ({}) accepted upload but sent no data in {}s — re-asserting part {} request (attempt {}/{}), staying connected like eMule",
-                                _src_idx, addr, INITIAL_DATA_TIMEOUT_SECS, part_idx,
+                                _src_idx, addr, INITIAL_DATA_TIMEOUT.as_secs(), part_idx,
                                 no_data_reasserts, MAX_NO_DATA_REASSERTS,
                             );
                                 emit_source!("queued", None, 0u64);
@@ -10496,6 +11084,14 @@ async fn download_parts_from_source(
                             .chain(recent_requests.iter());
                         let accepted_end = requested_block_end(start, end, requested_ranges);
                         let Some(end) = accepted_end else {
+                            // An answer to a request this peer was given long
+                            // ago, served late: stale, not misbehaviour.
+                            if recent_requests.was_requested(start) {
+                                tracing::debug!(
+                                    "Discarding block at {start} from source {_src_idx}: requested earlier, no longer outstanding"
+                                );
+                                continue;
+                            }
                             consecutive_bad_blocks += 1;
                             tracing::debug!(
                             "source {_src_idx} sent a block we never requested: start={start} ({piece_len} bytes, bad streak: {consecutive_bad_blocks})"
@@ -10517,6 +11113,7 @@ async fn download_parts_from_source(
                         };
                         let data = &data[..(end - start) as usize];
                         consecutive_bad_blocks = 0;
+                        last_data_at = std::time::Instant::now();
                         if !bw.acquire_download(piece_len).await {
                             anyhow::bail!("bandwidth limiter stopped");
                         }
@@ -10766,8 +11363,7 @@ async fn download_parts_from_source(
                         // propagated out of the worker and dropped a healthy peer
                         // into its reask cooldown for the rest of the session.
                         // Discard it and let the gap be re-requested.
-                        if requested_end.is_none() && recent_requests.end_for_start(start).is_some()
-                        {
+                        if requested_end.is_none() && recent_requests.was_requested(start) {
                             tracing::debug!(
                                 "Discarding compressed block at {start} from source {_src_idx}: no outstanding request (part advanced)"
                             );
@@ -10808,19 +11404,7 @@ async fn download_parts_from_source(
                             compressed_total_size,
                             compressed,
                         ) {
-                            Ok(Some(fragment)) => fragment,
-                            Ok(None) => {
-                                refresh_outstanding_range(&mut outstanding_ranges, start);
-                                if let Some(pending) = pipelined_next.as_mut() {
-                                    touch_pipelined_behind(
-                                        &outstanding_ranges,
-                                        start,
-                                        &mut pending.outstanding_ranges,
-                                    );
-                                    refresh_outstanding_range(&mut pending.outstanding_ranges, start);
-                                }
-                                continue;
-                            }
+                            Ok(fragment) => fragment,
                             // Costs the block, not the source: see
                             // `CompressedPartAccumulator::append`.
                             Err(e) => {
@@ -10831,6 +11415,28 @@ async fn download_parts_from_source(
                                 }
                                 continue;
                             }
+                        };
+                        // Data, whether or not it has inflated to anything
+                        // worth writing yet: a packed block arrives as several
+                        // packets and is written only once enough of it has.
+                        last_data_at = std::time::Instant::now();
+                        if !got_any_data {
+                            info!("Source {} ({}) first compressed data received for part {} ({} bytes)", _src_idx, addr, part_idx, packed_len);
+                            got_any_data = true;
+                            conn_got_any_data = true;
+                            emit_source!("transferring", None, measured_speed);
+                        }
+                        let Some(fragment) = fragment else {
+                            refresh_outstanding_range(&mut outstanding_ranges, start);
+                            if let Some(pending) = pipelined_next.as_mut() {
+                                touch_pipelined_behind(
+                                    &outstanding_ranges,
+                                    start,
+                                    &mut pending.outstanding_ranges,
+                                );
+                                refresh_outstanding_range(&mut pending.outstanding_ranges, start);
+                            }
+                            continue;
                         };
                         refresh_outstanding_range(&mut outstanding_ranges, start);
                         if let Some(pending) = pipelined_next.as_mut() {
@@ -10953,11 +11559,6 @@ async fn download_parts_from_source(
                         );
                         }
 
-                        if !got_any_data {
-                            info!("Source {} ({}) first compressed data received for part {} ({} bytes)", _src_idx, addr, part_idx, piece_len);
-                            got_any_data = true;
-                            conn_got_any_data = true;
-                        }
                         // Contribution, not wire bytes — see the uncompressed
                         // path above.
                         src_transferred += newly_written;
@@ -11016,6 +11617,7 @@ async fn download_parts_from_source(
                         pipelined_next.as_ref().map(|p| p.part_idx),
                     );
                         peer_out_of_parts = true;
+                        set_queued_at_peer(true);
                         break;
                     }
                     // Peer revoked our upload slot mid-transfer (queue recalculation).
@@ -11030,13 +11632,32 @@ async fn download_parts_from_source(
                         file_req_overhead.record_download((6 + payload.len()) as u64);
                         let rank = u16::from_le_bytes([payload[0], payload[1]]);
                         emit_source!("queued", Some(rank as u32), 0u64);
+                        set_queued_at_peer(true);
                         anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
                     }
                     (OP_EDONKEYHEADER, OP_QUEUERANK) if payload.len() >= 4 => {
                         let rank =
                             u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
                         emit_source!("queued", Some(rank), 0u64);
+                        set_queued_at_peer(true);
                         anyhow::bail!("peer put us back in queue at rank {} during transfer", rank);
+                    }
+                    (OP_EDONKEYHEADER, OP_HASHSETANSWER) | (OP_EMULEPROT, OP_HASHSETANSWER2) => {
+                        take_hashset_answer(
+                            proto,
+                            opcode,
+                            &payload,
+                            file_hash,
+                            file_size,
+                            &shared_part_hashes,
+                            &tracker,
+                            &shared_aich_master,
+                            &source.peer_ip,
+                            &file_req_overhead,
+                            _src_idx,
+                        )
+                        .await;
+                        drop(hashset_request.take());
                     }
                     (OP_EDONKEYHEADER, OP_FILEREQANSNOFIL) => {
                         anyhow::bail!("peer does not have the file any more (FileNotFound during transfer)");
@@ -11216,16 +11837,33 @@ async fn download_parts_from_source(
                     // logging it as "unexpected" misled us into thinking
                     // the in-session re-queue had a bug.
                     (OP_EDONKEYHEADER, OP_REASKACK) => {}
+                    (OP_EMULEPROT, OP_EMBER_EXT)
+                        if super::key_link::key_link_frame(proto, opcode, &payload).is_some() =>
+                    {
+                        if let Some((sub_type, body)) =
+                            super::key_link::key_link_frame(proto, opcode, &payload)
+                        {
+                            on_key_link_frame!(sub_type, body);
+                        }
+                    }
                     _ => {
                         info!("During data transfer, unexpected packet proto=0x{:02X} op=0x{:02X} ({} bytes) from source {} ({})",
                         proto, opcode, payload.len(), _src_idx, addr);
                     }
                 }
 
-                // Pipeline refill when a request's worth of requested ranges completes
-                let expired = expire_outstanding_ranges(&mut outstanding_ranges);
+                // Pipeline refill when a request's worth of requested ranges
+                // completes. Ranges the peer skipped are asked for again first.
+                let expired = take_expired_ranges(&mut outstanding_ranges);
+                requeue_expired_blocks(&mut batches, sent_idx, &expired, blocks_per_packet);
                 if let Some(pending) = pipelined_next.as_mut() {
-                    let _ = expire_outstanding_ranges(&mut pending.outstanding_ranges);
+                    let expired_next = take_expired_ranges(&mut pending.outstanding_ranges);
+                    requeue_expired_blocks(
+                        &mut pending.batches,
+                        pending.sent_idx,
+                        &expired_next,
+                        blocks_per_packet,
+                    );
                 }
                 // A batch that went out empty (everything in it landed or was
                 // held back) is owed no blocks, so it must not swallow the
@@ -11506,7 +12144,7 @@ async fn download_parts_from_source(
                     blocks_received_in_current_req = 0;
                     completed_reqs = sent_idx;
                 }
-                if expired > 0 || drained {
+                if !expired.is_empty() || drained {
                     let mut sent_any = false;
                     while sent_idx < batches.len()
                         && outstanding_ranges.len() < max_outstanding_blocks
@@ -11523,7 +12161,7 @@ async fn download_parts_from_source(
                         recent_requests.record(&batch);
                         sent_any = true;
                     }
-                    if sent_any || expired > 0 {
+                    if sent_any || !expired.is_empty() {
                         ip_guard
                             .publish_in_flight(&outstanding_ranges, pipelined_next.as_ref())
                             .await;
@@ -11557,8 +12195,16 @@ async fn download_parts_from_source(
                         let t = tracker.read().await;
                         t.periodic_snapshot_for_save(PERIODIC_SAVE_INTERVAL)
                     };
+                    // Synced after the snapshot, so every write the gap list
+                    // counts was queued ahead of the fsync: a crash must not
+                    // leave `.part.met` claiming bytes that never reached disk.
                     if let Some(snap) = snap {
-                        super::part_tracker::save_snapshot_async(snap).await;
+                        match output.sync_data().await {
+                            Ok(()) => super::part_tracker::save_snapshot_async(snap).await,
+                            Err(e) => warn!(
+                                "fsync before the periodic .part.met save failed (source {_src_idx}): {e}"
+                            ),
+                        }
                     }
                     last_periodic_save = std::time::Instant::now();
                 }
@@ -12166,72 +12812,31 @@ async fn download_parts_from_source(
             //      empty ranges of part X via `tracker.gap_list()`, so the
             //      wasted-bandwidth cost is bounded to the blocks in flight
             //      at the exact moment of the request.
-            if let Some(cs) = &chunk_sel {
-                let cs = cs.read().await;
-                let t = tracker.read().await;
-                let completed = t.completed_parts().to_vec();
-                let in_prog = t.in_progress_flags();
-                let remaining = t.remaining_count();
-                let part_count = t.part_count;
-                let gap_bytes = t.part_gap_bytes_vec();
-                drop(t);
-                if remaining == 0 {
+            //
+            // Parts already in the queue are passed over: picking one of them
+            // added nothing, and the session ended with the peer still
+            // holding parts we need.
+            if chunk_sel.is_some() {
+                if tracker.read().await.remaining_count() == 0 {
                     break;
                 }
-                let avail = if source_available.is_empty() {
-                    vec![true; part_count]
-                } else {
-                    source_available.clone()
-                };
-                let pp = control.is_preview_priority();
-                let prefer_higher = remaining <= 3 && part_count > 1;
-                let active: Vec<usize> = in_prog
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &ip)| ip)
-                    .map(|(i, _)| i)
-                    .collect();
-                let next_part = cs
-                    .select_part(
-                        &completed,
-                        &in_prog,
-                        &avail,
-                        &active,
-                        &gap_bytes,
-                        pp,
-                        prefer_higher,
-                    )
-                    .or_else(|| {
-                        // Fallback: relaxed selection. Treat no part as
-                        // in-progress so we can piggy-back on one another
-                        // source is already pulling. `active_parts` is
-                        // still the real active list, so the
-                        // active-chunk-bonus (lower score) inside
-                        // select_part will prefer joining a part already
-                        // in motion over starting a fresh in-progress
-                        // one — that's also what the eMule endgame mode
-                        // does naturally.
-                        let no_in_progress = vec![false; part_count];
-                        cs.select_part(
-                            &completed,
-                            &no_in_progress,
-                            &avail,
-                            &active,
-                            &gap_bytes,
-                            pp,
-                            prefer_higher,
-                        )
-                    });
+                let next_part = next_session_part(
+                    &chunk_sel,
+                    &tracker,
+                    &source_available,
+                    &control,
+                    &part_queue,
+                    &mismatched_here,
+                )
+                .await;
                 if let Some(next) = next_part {
-                    if !part_queue.contains(&next) {
-                        part_queue.push(next);
-                        // Add THIS source's claim on top of whatever another
-                        // source already holds. Claims are refcounted, so the
-                        // first of the two to tear down decrements to a
-                        // still-nonzero count and the part correctly stays
-                        // "in progress" for the one still transferring.
-                        ip_guard.claim(next).await;
-                    }
+                    part_queue.push(next);
+                    // Add THIS source's claim on top of whatever another
+                    // source already holds. Claims are refcounted, so the
+                    // first of the two to tear down decrements to a
+                    // still-nonzero count and the part correctly stays
+                    // "in progress" for the one still transferring.
+                    ip_guard.claim(next).await;
                 } else {
                     // No remaining part is reachable from this source
                     // (the peer's `available_parts` doesn't intersect the
@@ -12316,6 +12921,27 @@ async fn download_parts_from_source(
                     part_queue.push(p);
                     ip_guard.claim(p).await;
                 }
+                continue 'session_loop;
+            }
+            // Whichever way the per-part loop ended, a peer that still holds
+            // a part we need is given it rather than `OP_END_OF_DOWNLOAD`.
+            // Each pass adds a part the queue does not hold yet, so this ends.
+            if let Some(next) = next_session_part(
+                &chunk_sel,
+                &tracker,
+                &source_available,
+                &control,
+                &part_queue,
+                &mismatched_here,
+            )
+            .await
+            {
+                info!(
+                    "DIAG: source {} ({}) queue ran out; taking part {} it still holds instead of ending the session",
+                    _src_idx, addr, next,
+                );
+                part_queue.push(next);
+                ip_guard.claim(next).await;
                 continue 'session_loop;
             }
         }
@@ -12412,6 +13038,7 @@ async fn download_parts_from_source(
         match requeue_outcome {
             InSessionRequeueResult::Promoted => {
                 peer_conn.held.set_awaiting_grant(false);
+                set_queued_at_peer(false);
                 // Peer gave us a fresh slot on the same TCP connection.
                 // Reset per-session state and re-enter the per-part
                 // loop.  pipelined_next / per_part_credit stay because
@@ -12466,6 +13093,7 @@ async fn download_parts_from_source(
                     "DIAG: source {} ({}) in-session re-queue timed out: {} — closing TCP",
                     _src_idx, addr, reason,
                 );
+                ended_on_queue = true;
                 break 'session_loop;
             }
             InSessionRequeueResult::FileComplete => {
@@ -12473,6 +13101,7 @@ async fn download_parts_from_source(
                     "DIAG: source {} ({}) file completed during in-session re-queue — closing TCP",
                     _src_idx, addr,
                 );
+                set_queued_at_peer(false);
                 break 'session_loop;
             }
             InSessionRequeueResult::Disconnected(reason) => {
@@ -12517,7 +13146,29 @@ async fn download_parts_from_source(
     //
     // `src_transferred` is what this source actually contributed, so it settles
     // which ending this was without any new bookkeeping.
-    if src_transferred > 0 {
+    //
+    // What the ending means for asking the peer again is set apart: still on
+    // its queue, holding nothing we need, or neither.
+    let session_end = if ended_on_queue {
+        SessionEnd::Queued
+    } else {
+        set_queued_at_peer(false);
+        let t = tracker.read().await;
+        let peer_has_needed = (0..t.part_count).any(|p| {
+            !t.is_part_complete(p)
+                && !mismatched_here.contains(&p)
+                && (source_available.is_empty()
+                    || source_available.get(p).copied().unwrap_or(false))
+        });
+        if t.all_complete() || peer_has_needed {
+            SessionEnd::Finished
+        } else {
+            SessionEnd::NoNeededParts
+        }
+    };
+    if session_end == SessionEnd::Queued {
+        emit_source!("queued", None, 0u64);
+    } else if src_transferred > 0 {
         emit_source!("completed", None, 0u64);
     } else {
         emit_source!("no_needed_parts", None, 0u64);
@@ -12528,11 +13179,11 @@ async fn download_parts_from_source(
     // availability are decremented by the spawning closure instead.
 
     info!(
-        "DIAG: source {} ({}) download_parts_from_source returning Ok(()): src_transferred={}, per_part_credit_remaining={:?}",
-        _src_idx, addr, src_transferred, per_part_credit,
+        "DIAG: source {} ({}) download_parts_from_source returning {:?}: src_transferred={}, per_part_credit_remaining={:?}",
+        _src_idx, addr, session_end, src_transferred, per_part_credit,
     );
 
-    Ok(())
+    Ok(session_end)
 }
 
 /// Releases a source's wire-learned availability contribution when the source
@@ -12734,6 +13385,114 @@ async fn pre_pipeline_next_part_ms(
         return None;
     }
     Some(next_part)
+}
+
+/// Mark the parts a session must not be handed again as done, so the chunk
+/// selector passes over them: those already in its queue, and those whose MD4
+/// failed on this peer's data.
+fn mask_session_parts(
+    completed: &mut [bool],
+    part_queue: &[usize],
+    mismatched_here: &HashSet<usize>,
+) {
+    for &part in part_queue.iter().chain(mismatched_here) {
+        if let Some(done) = completed.get_mut(part) {
+            *done = true;
+        }
+    }
+}
+
+/// The next part for a session whose queue ran out, so that a peer still
+/// holding a part we need is not sent `OP_END_OF_DOWNLOAD`: strict selection,
+/// then piling onto a part another source is on. `None` when the peer holds
+/// nothing we need that this session has not already had.
+async fn next_session_part(
+    chunk_sel: &Option<Arc<RwLock<ChunkSelector>>>,
+    tracker: &Arc<RwLock<PartTracker>>,
+    source_available: &[bool],
+    control: &TransferControl,
+    part_queue: &[usize],
+    mismatched_here: &HashSet<usize>,
+) -> Option<usize> {
+    let cs = chunk_sel.as_ref()?.read().await;
+    let (mut completed, in_prog, remaining, part_count, gap_bytes) = {
+        let t = tracker.read().await;
+        (
+            t.completed_parts().to_vec(),
+            t.in_progress_flags(),
+            t.remaining_count(),
+            t.part_count,
+            t.part_gap_bytes_vec(),
+        )
+    };
+    if remaining == 0 {
+        return None;
+    }
+    mask_session_parts(&mut completed, part_queue, mismatched_here);
+    let avail = if source_available.is_empty() {
+        vec![true; part_count]
+    } else {
+        source_available.to_vec()
+    };
+    let pp = control.is_preview_priority();
+    let prefer_higher = remaining <= 3 && part_count > 1;
+    let active: Vec<usize> = in_prog
+        .iter()
+        .enumerate()
+        .filter(|(_, &ip)| ip)
+        .map(|(i, _)| i)
+        .collect();
+    cs.select_part(&completed, &in_prog, &avail, &active, &gap_bytes, pp, prefer_higher)
+        .or_else(|| {
+            let no_in_progress = vec![false; part_count];
+            cs.select_part(
+                &completed,
+                &no_in_progress,
+                &avail,
+                &active,
+                &gap_bytes,
+                pp,
+                prefer_higher,
+            )
+        })
+}
+
+/// Take the ranges of `outstanding` whose silence budget ran out.
+fn take_expired_ranges(outstanding: &mut Vec<OutstandingRange>) -> Vec<(u64, u64)> {
+    let before: Vec<(u64, u64)> = outstanding.iter().map(|r| (r.start, r.end)).collect();
+    if expire_outstanding_ranges(outstanding) == 0 {
+        return Vec::new();
+    }
+    before
+        .into_iter()
+        .filter(|&(s, e)| !outstanding.iter().any(|r| r.start == s && r.end == e))
+        .collect()
+}
+
+/// Put `expired` blocks back at `sent_idx`, ahead of every block not yet
+/// asked for, so they are asked for again first. Returns how many batches
+/// that added.
+fn requeue_expired_blocks(
+    batches: &mut Vec<Vec<(u64, u64)>>,
+    sent_idx: usize,
+    expired: &[(u64, u64)],
+    blocks_per_packet: usize,
+) -> usize {
+    let at = sent_idx.min(batches.len());
+    let chunks: Vec<Vec<(u64, u64)>> = expired
+        .chunks(blocks_per_packet.max(1))
+        .map(<[(u64, u64)]>::to_vec)
+        .collect();
+    let added = chunks.len();
+    batches.splice(at..at, chunks);
+    added
+}
+
+/// eMule's `m_nCompleteSourcesCount`, which the extended file request carries:
+/// how many sources hold the whole file, taken as the source count of the
+/// least-held part (`CPartFile::UpdatePartsInfo`).
+fn complete_source_count(cs: &ChunkSelector) -> u16 {
+    cs.part_frequency.iter().copied().min().unwrap_or(0)
 }
 
 /// Pick the part to assign a freshly arrived source, or `None` when it holds
@@ -12995,6 +13754,254 @@ fn parse_sending_part_32(payload: &[u8]) -> std::io::Result<([u8; 16], u64, u64,
         ));
     }
     Ok((hash, start, end, &payload[24..]))
+}
+
+/// Install an `OP_HASHSETANSWER` / `OP_HASHSETANSWER2` for this file once it
+/// verifies, from whichever loop it arrives in: a peer may answer after it
+/// has granted or queued us. `false` when the packet is not a hashset answer.
+#[allow(clippy::too_many_arguments)]
+async fn take_hashset_answer(
+    proto: u8,
+    opcode: u8,
+    payload: &[u8],
+    file_hash: &[u8; 16],
+    file_size: u64,
+    shared_part_hashes: &Arc<RwLock<Vec<[u8; 16]>>>,
+    tracker: &Arc<RwLock<PartTracker>>,
+    shared_aich_master: &SharedAichPin,
+    peer_ip: &str,
+    file_req_overhead: &crate::storage::statistics::SharedFileReqOverheadCounters,
+    src_idx: usize,
+) -> bool {
+    use super::messages::*;
+    if proto == OP_EDONKEYHEADER && opcode == OP_HASHSETANSWER {
+        file_req_overhead.record_download((6 + payload.len()) as u64);
+        if let Ok((_h, hashes)) = parse_hashset_answer(payload) {
+            debug!(
+                "Got hashset with {} part hashes from source {}",
+                hashes.len(),
+                src_idx
+            );
+            if super::transfer::verify_hashset(file_hash, &hashes, file_size) {
+                install_verified_part_hashes(shared_part_hashes, tracker, hashes).await;
+            } else {
+                warn!("Hashset from source {src_idx} failed verification, discarding");
+            }
+        }
+        return true;
+    }
+    if !(proto == OP_EMULEPROT && opcode == OP_HASHSETANSWER2) {
+        return false;
+    }
+    file_req_overhead.record_download((6 + payload.len()) as u64);
+    let Ok(resp) = parse_hashset_answer2(payload) else {
+        return true;
+    };
+    let local_ident = FileIdentifier {
+        md4_hash: *file_hash,
+        file_size: Some(file_size),
+        aich_hash: None,
+    };
+    if !local_ident.compare_relaxed(&resp.identifier) {
+        return true;
+    }
+    // Pin the AICH master hash ONLY after the accompanying MD4 hashset
+    // verifies against the file's ed2k hash. This prevents a first-wins peer
+    // from pinning a bogus master that is never tied to a verified file
+    // identity (see audit D2). If MD4 hashes are missing or bad, we defer AICH
+    // pinning until a trustworthy source arrives or the EPX-time check
+    // accepts it.
+    let md4_ok = resp
+        .md4_hashes
+        .as_ref()
+        .is_some_and(|h| super::transfer::verify_hashset(file_hash, h, file_size));
+    if md4_ok {
+        if let Some(hashes) = resp.md4_hashes {
+            install_verified_part_hashes(shared_part_hashes, tracker, hashes).await;
+        }
+        if let Some(root) = resp.aich_master_hash {
+            {
+                let mut am = shared_aich_master.master.write().await;
+                let mut votes = shared_aich_master.votes.write().await;
+                super::transfer::consider_hashset2_aich_pin(
+                    &mut am,
+                    shared_aich_master.expected,
+                    Some(&mut votes),
+                    peer_ip,
+                    root,
+                );
+            }
+            if let Some(part_hashes) = resp.aich_part_hashes.as_ref() {
+                debug!(
+                    "Source {} provided HashSet2 AICH data: master={}, parts={}",
+                    src_idx,
+                    hex::encode(root),
+                    part_hashes.len()
+                );
+            }
+        }
+    } else if resp.aich_master_hash.is_some() {
+        warn!(
+            "HashSet2 from source {src_idx} had an AICH master but the MD4 hashset failed or was absent — deferring AICH pin"
+        );
+    }
+    true
+}
+
+/// How long one source's unanswered hashset request keeps the others from
+/// asking.
+const HASHSET_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+type HashsetRequests = HashMap<[u8; 16], (u64, std::time::Instant)>;
+
+fn hashset_requests() -> std::sync::MutexGuard<'static, HashsetRequests> {
+    static REQUESTS: std::sync::OnceLock<std::sync::Mutex<HashsetRequests>> =
+        std::sync::OnceLock::new();
+    REQUESTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// A source's outstanding hashset request for one file. Only one source asks
+/// at a time, as eMule's `CPartFile::hashsetneeded` hand-off does; the next
+/// may ask once this one is answered, fails, or times out.
+struct HashsetRequest {
+    file_hash: [u8; 16],
+    token: u64,
+}
+
+impl HashsetRequest {
+    fn try_begin(file_hash: [u8; 16]) -> Option<Self> {
+        Self::try_begin_at(&mut hashset_requests(), file_hash, std::time::Instant::now())
+    }
+
+    fn try_begin_at(
+        requests: &mut HashsetRequests,
+        file_hash: [u8; 16],
+        now: std::time::Instant,
+    ) -> Option<Self> {
+        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+        if requests
+            .get(&file_hash)
+            .is_some_and(|&(_, at)| now.saturating_duration_since(at) < HASHSET_REQUEST_TIMEOUT)
+        {
+            return None;
+        }
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        requests.insert(file_hash, (token, now));
+        Some(Self { file_hash, token })
+    }
+}
+
+impl Drop for HashsetRequest {
+    fn drop(&mut self) {
+        let mut requests = hashset_requests();
+        if requests
+            .get(&self.file_hash)
+            .is_some_and(|&(token, _)| token == self.token)
+        {
+            requests.remove(&self.file_hash);
+        }
+    }
+}
+
+/// Parts this peer can be asked to recover by AICH after an earlier source
+/// could not (eMule `CPartFile::RequestAICHRecovery`): a pending retry with
+/// fewer than three tries, never tried from `peer_ip`, a part the peer holds
+/// and that has not verified here since.
+fn aich_retry_parts(
+    pending: &HashMap<([u8; 16], u32), (Vec<Ipv4Addr>, u32)>,
+    file_hash: &[u8; 16],
+    peer_ip: Ipv4Addr,
+    peer_has: impl Fn(usize) -> bool,
+    verified: impl Fn(usize) -> bool,
+) -> Vec<usize> {
+    let mut parts: Vec<usize> = pending
+        .iter()
+        .filter(|((fh, _), (failed_ips, retries))| {
+            fh == file_hash && *retries < 3 && !failed_ips.contains(&peer_ip)
+        })
+        .map(|((_, part), _)| *part as usize)
+        .filter(|&part| peer_has(part) && !verified(part))
+        .collect();
+    parts.sort_unstable();
+    parts
+}
+
+/// What applying AICH recovery data to a part on disk came to.
+#[derive(Debug, PartialEq, Eq)]
+enum AichRecoveryApplied {
+    /// Good blocks are marked present again, bad ones reopened.
+    Applied { bad_blocks: usize, recovered: u64 },
+    /// The data did not verify against the trusted master.
+    BadData,
+    /// The part changed or verified while it was read; nothing was applied.
+    Superseded,
+}
+
+/// Check `part_idx` as it is on disk against AICH recovery data (eMule
+/// `CPartFile::AICHRecoveryDataAvailable`). The part's gap list may say it is
+/// missing, after its MD4 failed, while its bytes are still there: each
+/// 180 KiB block that matches the trusted tree is marked present again — only
+/// where no other source is writing it — and each that does not is reopened.
+async fn apply_aich_recovery_to_disk(
+    tracker: &Arc<RwLock<PartTracker>>,
+    output: &super::write_coordinator::PartFileWriter,
+    part_idx: usize,
+    master: [u8; 20],
+    recovery: Vec<u8>,
+    file_size: u64,
+) -> anyhow::Result<AichRecoveryApplied> {
+    let (ps, pe, generation) = {
+        let t = tracker.read().await;
+        if t.is_part_verified(part_idx) {
+            return Ok(AichRecoveryApplied::Superseded);
+        }
+        let (ps, pe) = t.part_range(part_idx);
+        (ps, pe, t.part_content_generation(part_idx))
+    };
+    let part_len = (pe - ps) as usize;
+    let (data, _) = output
+        .hash_part_md4(ps, part_len)
+        .await
+        .map_err(|e| anyhow::anyhow!("AICH recovery read of part {part_idx}: {e}"))?;
+    let Some(corrupt) = super::aich::corrupt_blocks_from_aich_recovery_blocking(
+        master,
+        recovery,
+        part_idx,
+        Arc::new(data),
+        part_len,
+        file_size,
+    )
+    .await
+    else {
+        return Ok(AichRecoveryApplied::BadData);
+    };
+    let block = super::aich::AICH_BLOCK_SIZE as u64;
+    let (snap, recovered) = {
+        let mut t = tracker.write().await;
+        if t.part_verdict_superseded(part_idx, generation) {
+            return Ok(AichRecoveryApplied::Superseded);
+        }
+        let mut recovered = 0u64;
+        for (bi, gs) in (ps..pe).step_by(block as usize).enumerate() {
+            let ge = (gs + block).min(pe);
+            if corrupt.contains(&bi) {
+                t.invalidate_range(gs, ge);
+            } else {
+                for (s, e) in t.reserve_write_subranges(gs, ge) {
+                    recovered += t.commit_write_reservation(s, e);
+                }
+            }
+        }
+        (t.snapshot_for_save(), recovered)
+    };
+    save_snapshot_now(snap, "AICH recovery retry").await;
+    Ok(AichRecoveryApplied::Applied {
+        bad_blocks: corrupt.len(),
+        recovered,
+    })
 }
 
 /// Outcome of waiting for an `OP_AICHANSWER`.
@@ -13388,6 +14395,40 @@ mod tests {
     fn a_single_connection_budget_still_leaves_downloads_a_slot() {
         assert_eq!(listener_reserve(1), 0);
         assert_eq!(listener_reserve(0), 0);
+    }
+
+    /// One download may use the whole download side of the budget; several
+    /// split it evenly, and none drops under the old flat 50.
+    #[test]
+    fn each_download_gets_an_even_share_of_the_download_side_never_under_fifty() {
+        assert_eq!(per_download_share(500, 1), 375, "500 less the listener's 125");
+        assert_eq!(per_download_share(500, 0), 375, "no other download running");
+        assert_eq!(per_download_share(500, 5), 75);
+        assert_eq!(per_download_share(500, 10), MIN_SOURCES_PER_DOWNLOAD);
+        assert_eq!(per_download_share(2000, 1), 1500);
+        assert_eq!(per_download_share(100, 1), 75);
+        assert_eq!(per_download_share(60, 1), MIN_SOURCES_PER_DOWNLOAD, "45 is under the floor");
+        assert_eq!(per_download_share(1, 1), MIN_SOURCES_PER_DOWNLOAD);
+    }
+
+    /// A share that grows is granted at once; one that shrinks takes back free
+    /// permits now and permits in use only once they are returned.
+    #[test]
+    fn a_source_budget_grows_at_once_and_shrinks_as_connections_end() {
+        let budget = SourceConnBudget::new(2);
+        budget.resize(4);
+        let held: Vec<_> = (0..4).map(|_| budget.sem.try_acquire().unwrap()).collect();
+        assert!(budget.is_full());
+
+        budget.resize(1);
+        assert_eq!(budget.sem.available_permits(), 0, "nothing free to take back yet");
+        drop(held);
+        assert_eq!(budget.sem.available_permits(), 4, "returned permits wait for the next resize");
+        budget.resize(1);
+        assert_eq!(budget.sem.available_permits(), 1);
+
+        budget.resize(3);
+        assert_eq!(budget.sem.available_permits(), 3);
     }
 
     /// `yy` in the Sources column is the size of the source list, so committing
@@ -14709,6 +15750,184 @@ mod new_connection_window_tests {
 }
 
 #[cfg(test)]
+mod session_policy_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn only_data_moves_the_receive_deadline() {
+        let start = Instant::now();
+        let data_at = start + Duration::from_secs(30);
+        let now = start + Duration::from_secs(40);
+        assert_eq!(
+            receive_deadline(false, data_at, start, now),
+            start + INITIAL_DATA_TIMEOUT
+        );
+        assert_eq!(
+            receive_deadline(true, data_at, start, now),
+            data_at + DOWNLOAD_TIMEOUT,
+            "from the last block, not from now"
+        );
+        let late = start + Duration::from_secs(500);
+        assert_eq!(
+            receive_deadline(true, data_at, start, late),
+            late + Duration::from_secs(1),
+            "never in the past"
+        );
+    }
+
+    #[test]
+    fn a_slow_source_still_delivering_keeps_its_slot() {
+        let idle = TRICKLE_SLOW_WINDOW;
+        assert!(idle_source_rotation_due(true, true, idle, false));
+        assert!(!idle_source_rotation_due(true, true, idle - Duration::from_secs(1), false));
+        assert!(!idle_source_rotation_due(true, true, idle, true), "a packet under way");
+        assert!(!idle_source_rotation_due(false, true, idle, false), "never sent anything");
+        assert!(!idle_source_rotation_due(true, false, idle, false), "adopted stream");
+    }
+
+    #[test]
+    fn session_endings_set_the_cooldown_emule_would() {
+        let end = |r: anyhow::Result<SessionEnd>| cooldown_for_session_end(&r);
+        assert_eq!(end(Ok(SessionEnd::Finished)), None);
+        assert_eq!(end(Ok(SessionEnd::Queued)), Some(CooldownKind::Queued));
+        assert_eq!(end(Ok(SessionEnd::NoNeededParts)), Some(CooldownKind::NoNeededParts));
+        assert_eq!(
+            end(Err(anyhow::anyhow!("peer has no parts we need"))),
+            Some(CooldownKind::NoNeededParts),
+            "not counted as queued"
+        );
+        assert_eq!(
+            end(Err(anyhow::anyhow!("stage:queue_detached queue wait exceeded 60s"))),
+            Some(CooldownKind::Queued)
+        );
+        assert_eq!(end(Err(anyhow::anyhow!("stage:hello_wait reset"))), None);
+        assert_eq!(
+            CooldownKind::NoNeededParts.cooldown(),
+            2 * CooldownKind::Queued.cooldown()
+        );
+        assert!(CooldownKind::Unknown.cooldown() < CooldownKind::Queued.cooldown());
+    }
+
+    #[test]
+    fn a_peer_without_the_file_is_remembered() {
+        let outcomes: SharedSourceOutcomes = Arc::default();
+        note_session_end(
+            &outcomes,
+            "203.0.113.9",
+            4662,
+            &Err(anyhow::anyhow!("peer does not have the file")),
+        );
+        note_session_end(&outcomes, "203.0.113.10", 4662, &Ok(SessionEnd::Queued));
+        assert!(peer_lacks_file(&outcomes, "203.0.113.9", 4662));
+        assert!(!peer_lacks_file(&outcomes, "203.0.113.10", 4662));
+        let o = outcomes.lock().unwrap();
+        assert_eq!(
+            o.cooldowns.get(&("203.0.113.10".to_string(), 4662)),
+            Some(&CooldownKind::Queued)
+        );
+        assert!(!o.cooldowns.contains_key(&("203.0.113.9".to_string(), 4662)));
+    }
+
+    #[test]
+    fn a_re_asked_range_does_not_push_another_out() {
+        let mut recent = RecentRequests::default();
+        let block = |i: u64| (i * 100, i * 100 + 100);
+        recent.record(&[block(0)]);
+        for _ in 0..MAX_RECENT_REQUESTS {
+            recent.record(&[block(1)]);
+        }
+        assert_eq!(recent.iter().count(), 2);
+        assert!(recent.iter().any(|r| r == block(0)));
+
+        for i in 2..(MAX_RECENT_REQUESTS as u64 + 2) {
+            recent.record(&[block(i)]);
+        }
+        assert!(!recent.iter().any(|r| r == block(0)), "the window still slides");
+        assert!(recent.was_requested(block(0).0 + 50), "but it was asked for");
+        assert!(!recent.was_requested(1_000_000), "never asked");
+        recent.record(&[(2_000_000, 2_000_100), (2_000_200, 2_000_300)]);
+        assert!(!recent.was_requested(2_000_150), "between two asks");
+        assert!(recent.was_requested(2_000_000));
+    }
+
+    #[test]
+    fn expired_blocks_go_back_ahead_of_new_ones() {
+        let mut batches = vec![vec![(0, 10)], vec![(10, 20)], vec![(20, 30)], vec![(30, 40)]];
+        let added = requeue_expired_blocks(&mut batches, 2, &[(0, 10), (10, 20), (5, 6)], 2);
+        assert_eq!(added, 2);
+        assert_eq!(
+            batches,
+            vec![
+                vec![(0, 10)],
+                vec![(10, 20)],
+                vec![(0, 10), (10, 20)],
+                vec![(5, 6)],
+                vec![(20, 30)],
+                vec![(30, 40)],
+            ]
+        );
+        assert_eq!(requeue_expired_blocks(&mut batches, 99, &[], 3), 0);
+        let mut outstanding = vec![OutstandingRange::new(0, 10)];
+        assert!(take_expired_ranges(&mut outstanding).is_empty(), "not due yet");
+        assert_eq!(outstanding.len(), 1);
+    }
+
+    #[test]
+    fn a_session_is_not_handed_a_part_it_already_had() {
+        let mut completed = vec![false, true, false, false, false];
+        let mismatched: HashSet<usize> = [3].into_iter().collect();
+        mask_session_parts(&mut completed, &[0, 9], &mismatched);
+        assert_eq!(completed, vec![true, true, false, true, false]);
+    }
+
+    #[test]
+    fn aich_retries_go_to_a_peer_that_has_the_part_and_has_not_failed_it() {
+        let file = [0x11u8; 16];
+        let peer = Ipv4Addr::new(203, 0, 113, 20);
+        let other = Ipv4Addr::new(203, 0, 113, 21);
+        let pending: HashMap<([u8; 16], u32), (Vec<Ipv4Addr>, u32)> = [
+            ((file, 1), (vec![other], 1)),
+            ((file, 2), (vec![peer], 1)),
+            ((file, 3), (vec![other], 3)),
+            ((file, 4), (vec![], 0)),
+            ((file, 5), (vec![], 0)),
+            (([0x22; 16], 6), (vec![], 0)),
+        ]
+        .into_iter()
+        .collect();
+        let parts = aich_retry_parts(&pending, &file, peer, |p| p != 5, |p| p == 4);
+        assert_eq!(parts, vec![1], "2 failed here, 3 out of tries, 4 verified, 5 not held");
+    }
+
+    #[test]
+    fn one_source_at_a_time_asks_for_the_hashset() {
+        let mut requests = HashsetRequests::new();
+        let file = [0x33u8; 16];
+        let t0 = Instant::now();
+        let first = HashsetRequest::try_begin_at(&mut requests, file, t0).expect("first");
+        assert!(HashsetRequest::try_begin_at(&mut requests, file, t0).is_none());
+        assert!(HashsetRequest::try_begin_at(&mut requests, [0x34; 16], t0).is_some());
+        let stale = t0 + HASHSET_REQUEST_TIMEOUT;
+        let second = HashsetRequest::try_begin_at(&mut requests, file, stale).expect("timed out");
+        assert_ne!(first.token, second.token);
+
+        let real = HashsetRequest::try_begin([0x35; 16]).expect("free");
+        assert!(HashsetRequest::try_begin([0x35; 16]).is_none());
+        drop(real);
+        assert!(HashsetRequest::try_begin([0x35; 16]).is_some());
+    }
+
+    #[test]
+    fn complete_sources_are_the_least_held_parts_count() {
+        let mut cs = ChunkSelector::new(3);
+        assert_eq!(complete_source_count(&cs), 0);
+        cs.part_frequency = vec![4, 2, 7];
+        assert_eq!(complete_source_count(&cs), 2);
+    }
+}
+
+#[cfg(test)]
 // Held across the writer open for the same reason as in `write_coordinator`'s
 // tests: the approved-root registry is process-wide.
 #[allow(clippy::await_holding_lock)]
@@ -14908,6 +16127,85 @@ mod unverified_part_sweep_tests {
         assert!(matches!(rx.try_recv(), Ok(DownloadEvent::DataReceived { .. })));
         let _ = std::fs::remove_dir_all(base);
     }
+
+    /// A part whose MD4 failed is reopened whole while its bytes stay on
+    /// disk. Recovery data from another peer gives back the blocks that
+    /// match the trusted tree, except one another source is writing, and
+    /// leaves the bad one to be fetched again.
+    #[tokio::test]
+    async fn an_aich_retry_keeps_the_good_blocks_already_on_disk() {
+        use crate::network::ed2k::aich::{AICHRecoveryHashSet, AICH_BLOCK_SIZE};
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = temp_base("aich-retry");
+        let root = base.join("root");
+        let data_dir = base.join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data_dir,
+            std::slice::from_ref(&root_s),
+        )
+        .unwrap();
+        let block = AICH_BLOCK_SIZE as u64;
+        let good: Vec<u8> = (0..AICH_BLOCK_SIZE * 3).map(|i| (i % 251) as u8).collect();
+        let size = good.len() as u64;
+        let trusted = AICHRecoveryHashSet::build_from_data(&good);
+        let mut on_disk = good.clone();
+        on_disk[AICH_BLOCK_SIZE + 7] ^= 0xFF;
+        let path = root.join("file.part");
+        std::fs::write(&path, &on_disk).unwrap();
+        let output = PartFileWriter::open(path.clone(), vec![root_s], None)
+            .await
+            .unwrap();
+        let tracker = Arc::new(RwLock::new(PartTracker::new(size, &path)));
+        let rival = tracker.write().await.reserve_write_subranges(2 * block, size);
+        assert_eq!(rival, vec![(2 * block, size)]);
+
+        let recovery = trusted.create_part_recovery_data(0, PARTSIZE as usize);
+        let applied = apply_aich_recovery_to_disk(
+            &tracker,
+            &output,
+            0,
+            trusted.root_hash,
+            recovery,
+            size,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            applied,
+            AichRecoveryApplied::Applied {
+                bad_blocks: 1,
+                recovered: block
+            }
+        );
+        {
+            let t = tracker.read().await;
+            assert!(t.fillable_subranges(0, block).is_empty(), "good block kept");
+            assert_eq!(t.fillable_subranges(block, 2 * block), vec![(block, 2 * block)]);
+            assert_eq!(
+                t.fillable_subranges(2 * block, size),
+                vec![(2 * block, size)],
+                "left to the source writing it"
+            );
+        }
+
+        let unrelated = AICHRecoveryHashSet::build_from_data(&vec![0u8; AICH_BLOCK_SIZE * 3]);
+        let applied = apply_aich_recovery_to_disk(
+            &tracker,
+            &output,
+            0,
+            trusted.root_hash,
+            unrelated.create_part_recovery_data(0, PARTSIZE as usize),
+            size,
+        )
+        .await
+        .unwrap();
+        assert_eq!(applied, AichRecoveryApplied::BadData);
+        drop(output);
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
 
 #[cfg(test)]
@@ -14940,6 +16238,32 @@ mod final_verify_recovery_tests {
             final_verify_recovery(Some(Vec::new()), false, 3),
             FinalVerifyRecovery::Reopen(vec![0, 1, 2])
         );
+    }
+
+    /// An Ember mismatch is reported only for a file every other check
+    /// accepts, so the event loop may finish it on those once a remote pin is
+    /// dropped; a file failing its ed2k hash or AICH pin is reported as that.
+    #[test]
+    fn an_ember_mismatch_means_every_other_check_passed() {
+        let digests = |ed2k: &str, aich: Option<[u8; 20]>, ember: [u8; 32]| crate::network::ed2k::hash::FileDigests {
+            ed2k: ed2k.to_string(),
+            part_hashes: Vec::new(),
+            aich,
+            ember: Some(ember),
+        };
+        let (pin, other) = ([0xAA; 32], [0xBB; 32]);
+        let aich = Some([0x11; 20]);
+
+        assert!(ember_pin_refuted(&digests("ab", None, other), "ab", None, pin));
+        assert!(ember_pin_refuted(&digests("ab", aich, other), "ab", aich, pin));
+        assert!(!ember_pin_refuted(&digests("ab", aich, pin), "ab", aich, pin), "the pin matched");
+        assert!(!ember_pin_refuted(&digests("cd", None, other), "ab", None, pin), "the bytes are wrong");
+        assert!(
+            !ember_pin_refuted(&digests("ab", Some([0x22; 20]), other), "ab", aich, pin),
+            "an AICH miss is the AICH pin's failure"
+        );
+        let unpinned = crate::network::ed2k::hash::FileDigests { ember: None, ..digests("ab", None, other) };
+        assert!(!ember_pin_refuted(&unpinned, "ab", None, [0u8; 32]), "nothing was pinned");
     }
 
     struct TwoPartFile {
@@ -15221,8 +16545,8 @@ mod requested_block_tests {
             .collect();
         recent.record(&batch);
         assert_eq!(recent.iter().count(), MAX_RECENT_REQUESTS);
-        assert_eq!(recent.end_for_start(0), None, "the oldest range was dropped");
-        assert_eq!(recent.end_for_start(2 * BLOCK), Some(3 * BLOCK));
+        assert!(!recent.iter().any(|(s, _)| s == 0), "the oldest range was dropped");
+        assert!(recent.iter().any(|r| r == (2 * BLOCK, 3 * BLOCK)));
     }
 
     #[test]
@@ -15241,11 +16565,13 @@ mod requested_block_tests {
     }
 
     #[test]
-    fn the_newest_request_at_a_start_wins() {
+    fn a_range_asked_again_is_kept_once_as_the_newest() {
         let mut recent = RecentRequests::default();
         recent.record(&[(0, BLOCK)]);
         recent.record(&[(0, 100)]);
-        assert_eq!(recent.end_for_start(0), Some(100));
+        recent.record(&[(0, BLOCK)]);
+        let kept: Vec<(u64, u64)> = recent.iter().collect();
+        assert_eq!(kept, vec![(0, 100), (0, BLOCK)]);
     }
 }
 

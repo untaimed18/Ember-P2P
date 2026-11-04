@@ -58,6 +58,9 @@ pub struct DmMessage {
     pub timestamp: i64,
     /// Ours: `"sending"`, `"delivered"` or `"failed"`. Theirs: `"received"`.
     pub status: String,
+    /// Its row, which orders messages sharing a timestamp and pages past
+    /// them; 0 for one not read back from storage.
+    pub seq: i64,
 }
 
 /// What became of a message that arrived.
@@ -663,36 +666,47 @@ impl Database {
             .collect())
     }
 
-    /// A conversation's messages, oldest first: the newest `limit` before
-    /// `before` (Unix seconds), or the newest of all.
-    pub fn dm_messages(&self, member: &str, limit: usize, before: Option<i64>) -> anyhow::Result<Vec<DmMessage>> {
+    /// A conversation's newest `limit` messages, oldest first, before the
+    /// cursor: messages older than `before`, or with `before_seq` too, those at
+    /// that timestamp with a lower row as well. Timestamps are the sender's and
+    /// can repeat, so a cursor of the timestamp alone could not page past more
+    /// than `limit` sharing one. Rows that do not open are passed over, not
+    /// counted, so fewer than `limit` means none older are left to show.
+    pub fn dm_messages(
+        &self,
+        member: &str,
+        limit: usize,
+        before: Option<i64>,
+        before_seq: Option<i64>,
+    ) -> anyhow::Result<Vec<DmMessage>> {
         let member = member.to_ascii_lowercase();
         let key = self.chat_key.as_deref();
         let conn = self.conn.lock();
         Self::ensure_room_dm_locked(&conn)?;
         let mut stmt = conn.prepare(
-            "SELECT message_id, direction, ts, status, body FROM room_dm_messages
-             WHERE member_pubkey = ?1 AND (?2 IS NULL OR ts < ?2)
-             ORDER BY ts DESC, rowid DESC LIMIT ?3",
+            "SELECT message_id, direction, ts, status, body, rowid FROM room_dm_messages
+             WHERE member_pubkey = ?1
+               AND (?2 IS NULL OR ts < ?2 OR (?3 IS NOT NULL AND ts = ?2 AND rowid < ?3))
+             ORDER BY ts DESC, rowid DESC",
         )?;
-        let rows = stmt
-            .query_map(params![member, before, limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut out: Vec<DmMessage> = rows
-            .into_iter()
-            .filter_map(|(message_id, direction, timestamp, status, body)| {
-                let text = Self::open_dm_body(key, &message_id, &member, &direction, timestamp, &body)?;
-                Some(DmMessage { message_id, member_pubkey: member.clone(), direction, text, timestamp, status })
-            })
-            .collect();
+        let mut rows = stmt.query(params![member, before, before_seq])?;
+        let mut out: Vec<DmMessage> = Vec::new();
+        while out.len() < limit {
+            let Some(row) = rows.next()? else {
+                break;
+            };
+            let (message_id, direction, timestamp, status, body, seq) = (
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            );
+            if let Some(text) = Self::open_dm_body(key, &message_id, &member, &direction, timestamp, &body) {
+                out.push(DmMessage { message_id, member_pubkey: member.clone(), direction, text, timestamp, status, seq });
+            }
+        }
         out.reverse();
         Ok(out)
     }
@@ -799,8 +813,50 @@ mod tests {
         assert_eq!(db.dm_thread(ANN, 400).unwrap().unwrap().state, DM_STATE_OPEN);
         let next = db.dm_record_incoming(ANN, "Ann", ROOM, "m2", "thanks", 103, ROOM_DM_POLICY_ASK, 103).unwrap();
         assert_eq!(next, DmIncoming::Stored { request: false, new_thread: false });
-        let texts: Vec<String> = db.dm_messages(ANN, 10, None).unwrap().into_iter().map(|m| m.text).collect();
+        let texts: Vec<String> = db.dm_messages(ANN, 10, None, None).unwrap().into_iter().map(|m| m.text).collect();
         assert_eq!(texts, vec!["hi there", "thanks"]);
+        drop_db(db, path);
+    }
+
+    /// Timestamps are the sender's and can repeat: paging by timestamp and
+    /// row reaches every message, however many share one.
+    #[test]
+    fn paging_gets_past_messages_that_share_a_timestamp() {
+        let (db, path) = db("paging");
+        for i in 0..5 {
+            let id = format!("m{i}");
+            let got = db.dm_record_incoming(ANN, "Ann", ROOM, &id, &format!("t{i}"), 500, ROOM_DM_POLICY_ANYONE, 1_000 + i).unwrap();
+            assert!(matches!(got, DmIncoming::Stored { .. }), "{got:?}");
+        }
+        db.dm_record_incoming(ANN, "Ann", ROOM, "old", "older", 400, ROOM_DM_POLICY_ANYONE, 2_000).unwrap();
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut page = db.dm_messages(ANN, 2, None, None).unwrap();
+        while let Some(oldest) = page.first().cloned() {
+            seen.splice(0..0, page.iter().map(|m| m.text.clone()));
+            page = db.dm_messages(ANN, 2, Some(oldest.timestamp), Some(oldest.seq)).unwrap();
+        }
+        assert_eq!(seen, vec!["older", "t0", "t1", "t2", "t3", "t4"]);
+        drop_db(db, path);
+    }
+
+    /// A row that does not open is passed over, so a page is short only at
+    /// the conversation's start: the screen hides Load older on a short one.
+    #[test]
+    fn a_row_that_does_not_open_does_not_cut_a_page_short() {
+        let (db, path) = db("unreadable");
+        for i in 0..5 {
+            db.dm_record_incoming(ANN, "Ann", ROOM, &format!("m{i}"), &format!("t{i}"), 100 + i, ROOM_DM_POLICY_ANYONE, 100 + i).unwrap();
+        }
+        db.conn.lock().execute("UPDATE room_dm_messages SET body = 'damaged' WHERE message_id = 'm3'", []).unwrap();
+
+        let page = db.dm_messages(ANN, 2, None, None).unwrap();
+        let texts: Vec<&str> = page.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["t2", "t4"]);
+        let older = db.dm_messages(ANN, 2, Some(page[0].timestamp), Some(page[0].seq)).unwrap();
+        let texts: Vec<&str> = older.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, ["t0", "t1"]);
+        assert!(db.dm_messages(ANN, 2, Some(older[0].timestamp), Some(older[0].seq)).unwrap().is_empty());
         drop_db(db, path);
     }
 
@@ -809,7 +865,7 @@ mod tests {
         let (db, path) = db("decline");
         db.dm_record_incoming(ANN, "Ann", ROOM, "m1", "buy now", 100, ROOM_DM_POLICY_ASK, 100).unwrap();
         assert!(db.dm_answer_request(ANN, false, 110).unwrap());
-        assert!(db.dm_messages(ANN, 10, None).unwrap().is_empty());
+        assert!(db.dm_messages(ANN, 10, None, None).unwrap().is_empty());
         assert_eq!(db.dm_record_incoming(ANN, "Ann", ROOM, "m2", "again", 200, ROOM_DM_POLICY_ASK, 200).unwrap(), DmIncoming::Declined);
         db.dm_delete_thread(ANN, 250).unwrap();
         assert_eq!(
@@ -868,7 +924,7 @@ mod tests {
         assert!(!db.dm_mark_delivered(ANN, "o2").unwrap(), "once");
         assert_eq!(db.dm_due_resends(200).unwrap().len(), 0);
         assert_eq!(db.dm_fail_unanswered(1_300).unwrap(), vec![(ANN.to_string(), "o1".to_string())]);
-        let status: Vec<String> = db.dm_messages(ANN, 10, None).unwrap().into_iter().map(|m| m.status).collect();
+        let status: Vec<String> = db.dm_messages(ANN, 10, None, None).unwrap().into_iter().map(|m| m.status).collect();
         assert_eq!(status, vec!["failed", "delivered"]);
         assert!(db.dm_retry(ANN, "o1", 1_400, 2_600).unwrap());
         assert_eq!(db.dm_due_resends(1_400).unwrap().len(), 1);
@@ -1061,7 +1117,7 @@ mod tests {
         db.dm_record_incoming(ANN, "Ann", ROOM, "m2", "hello?", 6, ROOM_DM_POLICY_ASK, 6).unwrap();
         assert!(db.dm_forget_request(&ANN.to_uppercase()).unwrap());
         assert!(db.dm_thread(ANN, 7).unwrap().is_none());
-        assert!(db.dm_messages(ANN, 10, None).unwrap().is_empty());
+        assert!(db.dm_messages(ANN, 10, None, None).unwrap().is_empty());
         assert!(!db.dm_declines(ANN, 7).unwrap(), "no refusal kept");
         assert!(!db.dm_forget_request(ANN).unwrap(), "once");
         assert_eq!(
@@ -1073,7 +1129,7 @@ mod tests {
         let bob = "bb22";
         db.dm_record_outgoing(bob, "Bob", ROOM, "o1", "hi", 5, 6, 7).unwrap();
         assert!(!db.dm_forget_request(bob).unwrap(), "an open conversation is not a request");
-        assert_eq!(db.dm_messages(bob, 10, None).unwrap().len(), 1);
+        assert_eq!(db.dm_messages(bob, 10, None, None).unwrap().len(), 1);
         drop_db(db, path);
     }
 

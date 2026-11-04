@@ -11,6 +11,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
+  import { prefersReducedMotion } from 'svelte/motion';
   import { toastError, toastWarning } from '$lib/stores/toast';
   import { copyToClipboard, formatBytes, formatCalendarDate } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
@@ -71,7 +72,10 @@
   let settingsFor: FriendInfo | null = $state(null);
   $effect(() => {
     const open = settingsFor;
-    if (open && !$friendsListStore.some((f) => f.user_hash === open.user_hash)) settingsFor = null;
+    if (!open) return;
+    const fresh = $friendsListStore.find((f) => f.user_hash === open.user_hash);
+    if (!fresh) settingsFor = null;
+    else if (fresh !== open) settingsFor = fresh;
   });
   /** Whether a friend has any setting of their own, for the dot on the gear. */
   function hasOverrides(hash: string): boolean {
@@ -110,6 +114,9 @@
   let pendingBlock: { user_hash: string; nickname: string } | null = $state(null);
   /** Display name for the block dialog, kept for its outro like `removeDialog`. */
   let blockDialogName = $state('');
+  /** Blocking someone who only sent a request: there is no friendship or chat
+   *  to remove, so the dialog says what blocking them does instead. */
+  let blockDialogRequest = $state(false);
   let blocked: BlockedInfo[] = $state([]);
   let blockedOpen = $state(false);
   let unblocking: Set<string> = $state(new Set());
@@ -419,6 +426,9 @@
     const addParam = $page.url.searchParams.get('add');
     if (!addParam) return;
     showAddForm = true;
+    untrack(() => {
+      if (newHash.trim() !== addParam.trim()) newNickname = '';
+    });
     newHash = addParam;
     addError = null;
     untrack(() => {
@@ -606,9 +616,11 @@
     await Promise.all([loadFriends(), reloadFriendRequests(), loadBlocked()]);
   }
 
-  function confirmBlock(user_hash: string, nickname: string) {
+  function confirmBlock(user_hash: string, nickname: string, fromRequest = false) {
     pendingBlock = { user_hash, nickname };
     blockDialogName = nickname || user_hash.slice(0, 8) + '\u2026';
+    blockDialogRequest =
+      fromRequest && !friends.some((f) => f.user_hash.toLowerCase() === user_hash.toLowerCase());
     confirmBlockOpen = true;
   }
 
@@ -795,8 +807,8 @@
     saveEditPending = true;
     const hash = editingHash;
     const nick = editNickname.trim();
+    // The editor stays open and says why next to the field.
     if (friendNameTooLong(nick)) {
-      error = m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_CHARS });
       saveEditPending = false;
       return;
     }
@@ -857,6 +869,7 @@
   }
 
   function editKeydown(e: KeyboardEvent) {
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') saveEdit();
     else if (e.key === 'Escape') {
       e.preventDefault();
@@ -866,6 +879,7 @@
   }
 
   function addFormKeydown(e: KeyboardEvent) {
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter') handleAdd();
     else if (e.key === 'Escape') {
       e.preventDefault();
@@ -886,14 +900,27 @@
   // menu on the Transfers page. `<details>` only closes on its own summary, so
   // selecting an item, clicking elsewhere, or pressing Escape closes it here.
   function closeCardMenu(from: HTMLElement) {
-    (from.closest('details') as HTMLDetailsElement | null)?.removeAttribute('open');
+    const menu = from.closest('details');
+    if (menu) closeDetails(menu);
+  }
+
+  /** Focus left on a now-hidden item is lost, and a dialog opened from the
+   *  menu would have nowhere to return it, so it goes back to the summary. */
+  function closeDetails(menu: HTMLDetailsElement) {
+    if (menu.contains(document.activeElement)) menu.querySelector('summary')?.focus();
+    menu.open = false;
   }
 
   function closeCardMenus(keepContaining?: Element | null) {
     for (const el of document.querySelectorAll<HTMLDetailsElement>('.card-more[open]')) {
       if (keepContaining && el.contains(keepContaining)) continue;
-      el.open = false;
+      closeDetails(el);
     }
+  }
+
+  function onCardMenuToggle(e: Event) {
+    const menu = e.currentTarget as HTMLDetailsElement;
+    if (menu.open) closeCardMenus(menu);
   }
 
   function onCardMenuPointerDown(e: PointerEvent) {
@@ -980,7 +1007,9 @@
 <ConfirmDialog
   bind:open={confirmBlockOpen}
   title={m.friends_confirm_block_title()}
-  message={m.friends_confirm_block_message({ name: blockDialogName })}
+  message={blockDialogRequest
+    ? m.friends_confirm_block_request_message({ name: blockDialogName })
+    : m.friends_confirm_block_message({ name: blockDialogName })}
   confirmLabel={m.friends_block()}
   danger={true}
   onconfirm={handleBlock}
@@ -1085,7 +1114,7 @@
     {/if}
   </div>
 
-  <!-- Your Friend ID + network status -->
+  <!-- Your Friend Code + network status -->
   {#if myHash}
     <div class="my-id-card">
       <div class="my-id-left">
@@ -1193,9 +1222,9 @@
           {@const accepting = $acceptingOfferStore === offerKey(offer.user_hash, offer.file_hash)}
           <div
             class="request-card"
-            in:fly={{ y: 6, duration: 200 }}
-            out:fade={{ duration: 150 }}
-            animate:flip={{ duration: 200 }}
+            in:fly={{ y: 6, duration: prefersReducedMotion.current ? 0 : 200 }}
+            out:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+            animate:flip={{ duration: prefersReducedMotion.current ? 0 : 200 }}
           >
             <div class="request-avatar">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1253,9 +1282,9 @@
           {@const reqName = sharedFriendLabel(req.sender_hash, req.sender_nickname, $friendNamesStore)}
           <div
             class="request-card"
-            in:fly={{ y: 6, duration: 200 }}
-            out:fade={{ duration: 150 }}
-            animate:flip={{ duration: 200 }}
+            in:fly={{ y: 6, duration: prefersReducedMotion.current ? 0 : 200 }}
+            out:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+            animate:flip={{ duration: prefersReducedMotion.current ? 0 : 200 }}
           >
             <div class="request-avatar">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1274,7 +1303,7 @@
                   escaping prevents XSS; this closes the
                   bidi-spoofing presentation gap.
                 -->
-                <bdi dir="auto">{req.sender_nickname || m.friends_unknown_sender()}</bdi>
+                <bdi dir="auto" title={req.sender_nickname || undefined}>{req.sender_nickname || m.friends_unknown_sender()}</bdi>
                 {#if req.verified}
                   <!-- "Verified" badge: see commit history for the
                        cryptographic semantics. -->
@@ -1293,7 +1322,7 @@
               <!-- Rejecting only clears the row; the same stranger can ask
                    again immediately. Blocking from here is the way to make
                    a persistent requester stop. -->
-              <button class="request-block" onclick={() => confirmBlock(req.sender_hash, req.sender_nickname)} disabled={processingRequests.has(req.sender_hash)} aria-label={m.friends_block_aria({ name: reqName })}>{m.friends_block()}</button>
+              <button class="request-block" onclick={() => confirmBlock(req.sender_hash, req.sender_nickname, true)} disabled={processingRequests.has(req.sender_hash)} aria-label={m.friends_block_aria({ name: reqName })}>{m.friends_block()}</button>
             </div>
           </div>
         {/each}
@@ -1328,7 +1357,7 @@
             placeholder={m.common_search_placeholder()}
             aria-label={m.common_search()}
             onkeydown={(e) => {
-              if (e.key !== 'Escape' || !searchQuery) return;
+              if (e.key !== 'Escape' || !searchQuery || e.isComposing || e.keyCode === 229) return;
               e.preventDefault();
               e.stopPropagation();
               searchQuery = '';
@@ -1341,7 +1370,8 @@
       {/if}
       <span class="inline-stat">
         {plural(friends.length, {
-          one: () => m.friends_online_count_one({ online: onlineFriendCount }),
+          one: () => m.friends_online_count_one({ online: onlineFriendCount, total: friends.length }),
+          oneShowsCount: true,
           few: () => m.friends_online_count_few({ online: onlineFriendCount, total: friends.length }),
           other: () => m.friends_online_count_other({ online: onlineFriendCount, total: friends.length }),
         })}
@@ -1386,7 +1416,8 @@
     <div class="result-count-row">
       <span class="result-count">
         {plural(filtered.length, {
-          one: m.friends_match_count_one,
+          one: () => m.friends_match_count_one({ count: filtered.length }),
+          oneShowsCount: true,
           few: () => m.friends_match_count_few({ count: filtered.length }),
           other: () => m.friends_match_count_other({ count: filtered.length }),
         })}
@@ -1440,7 +1471,7 @@
       section headers above already group online vs offline, and unread is
       counted on the Chat button, the same pill the room list and the dock
       use, whatever the status line is busy saying. Reference
-      data (Friend ID, last address, added date) and the secondary actions live
+      data (internal ID, last address, added date) and the secondary actions live
       in the overflow menu so the resting card is name + status + Chat.
     -->
     {#snippet friendCard(f: FriendInfo, isOnline: boolean)}
@@ -1484,7 +1515,13 @@
               use:autoFocus
               aria-label={m.friends_nickname_edit_placeholder()}
               aria-invalid={friendNameTooLong(editNickname)}
+              aria-describedby={friendNameTooLong(editNickname) ? `edit-error-${f.user_hash}` : undefined}
             />
+            {#if friendNameTooLong(editNickname)}
+              <span id="edit-error-{f.user_hash}" class="edit-error" role="alert">
+                {m.friend_settings_name_too_long({ max: FRIEND_NAME_MAX_CHARS })}
+              </span>
+            {/if}
           {:else}
             <div class="card-name-row">
               <button class="nick-btn" onclick={() => startEdit(f)} title={m.friends_edit_nickname_title()} aria-label={m.friends_edit_nickname_aria({ name: f.nickname ? shortName : m.friends_no_nickname() })}>
@@ -1523,7 +1560,8 @@
             {:else if unread > 0}
               <span class="status-unread">
                 {plural(unread, {
-                  one: m.friends_unread_one,
+                  one: () => m.friends_unread_one({ count: unread }),
+                  oneShowsCount: true,
                   few: () => m.friends_unread_few({ count: unread }),
                   other: () => m.friends_unread_other({ count: unread }),
                 })}
@@ -1562,7 +1600,8 @@
               <span class="count-pill" aria-hidden="true">{unread > 99 ? '99+' : unread}</span>
               <span class="sr-only">
                 {plural(unread, {
-                  one: m.friends_unread_one,
+                  one: () => m.friends_unread_one({ count: unread }),
+                  oneShowsCount: true,
                   few: () => m.friends_unread_few({ count: unread }),
                   other: () => m.friends_unread_other({ count: unread }),
                 })}
@@ -1586,7 +1625,7 @@
             <IconGear size={15} weight={1.3} />
           </button>
 
-          <details class="card-more">
+          <details class="card-more" ontoggle={onCardMenuToggle}>
             <summary class="card-more-btn" title={m.common_more()} aria-haspopup="menu" aria-label={m.common_more()}>
               <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
                 <circle cx="3.5" cy="8" r="1.4"/>
@@ -1621,8 +1660,9 @@
                   title={m.friends_action_reconnect_title()}
                 >{searching ? m.friends_status_searching() : m.friends_action_reconnect()}</button>
               {/if}
-              <!-- The ID lives on the action that uses it, so the reference
-                   value is one hover away without sitting on every card.
+              <!-- The internal ID no longer finds anyone, so it is offered for
+                   troubleshooting only and named so it is not mistaken for
+                   the shareable Friend Code.
                    Deliberately does NOT close the menu: the label flips to
                    "Copied!" for 1.5s, which the user could not see otherwise. -->
               <button
@@ -1630,7 +1670,7 @@
                 role="menuitem"
                 class="menu-item-stacked"
                 onclick={() => copyHash(f.user_hash)}
-                title={f.user_hash}
+                title={`${m.friends_copy_id_hint()}\n${f.user_hash}`}
                 aria-label={copiedHash === f.user_hash
                   ? m.friends_copied_id_aria()
                   : m.friends_copy_id_aria({ name: shortName })}
@@ -2303,6 +2343,15 @@
     box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
+  .edit-input[aria-invalid='true'] {
+    border-color: var(--danger);
+  }
+
+  .edit-error {
+    font-size: var(--font-size-xs);
+    color: var(--danger);
+  }
+
   @keyframes badge-pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.5; }
@@ -2424,6 +2473,7 @@
     box-shadow: var(--ctx-shadow);
     display: flex;
     flex-direction: column;
+    animation: ctx-menu-in 0.12s ease-out;
   }
 
   .card-more-menu button {
@@ -2740,6 +2790,7 @@
 
   .request-card {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 12px;
     padding: 10px 16px;
@@ -2766,8 +2817,10 @@
     height: 16px;
   }
 
+  /* The basis is what pushes the actions onto their own line when the card
+     is too narrow for both, rather than squeezing the name to nothing. */
   .request-info {
-    flex: 1;
+    flex: 1 1 160px;
     min-width: 0;
     display: flex;
     flex-direction: column;
@@ -2784,6 +2837,13 @@
     display: flex;
     align-items: center;
     gap: 6px;
+  }
+
+  .request-name bdi {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .request-hash {
@@ -2808,7 +2868,7 @@
     letter-spacing: 0.4px;
     padding: 1px 6px;
     border-radius: var(--radius-pill);
-    flex-shrink: 0;
+    flex: none;
   }
   .request-badge-verified {
     background: color-mix(in srgb, var(--success) 18%, transparent);
@@ -2828,8 +2888,10 @@
 
   .request-actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
-    flex-shrink: 0;
+    min-width: 0;
+    margin-inline-start: auto;
   }
 
   .request-accept {

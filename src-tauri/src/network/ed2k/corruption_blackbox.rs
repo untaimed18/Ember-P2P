@@ -17,10 +17,10 @@ const MIN_BYTES_FOR_BAN_DECISION: u64 = 3 * EMBLOCKSIZE;
 
 /// Cap on distinct files tracked at once. Each file's own block list is
 /// already bounded by `MAX_BLOCKS_BEFORE_COMPACT`, but nothing previously
-/// bounded the number of *files* — downloads that are paused/cancelled
-/// (rather than completing or failing, the only two events that call
-/// `remove_file`) never got cleaned up, so a long session with many
-/// started-then-abandoned downloads could grow this map indefinitely.
+/// bounded the number of *files* — downloads that are paused, stopped or
+/// failed (only completing, cancelling or removing one calls `remove_file`)
+/// are not cleaned up, so a long session with many started-then-abandoned
+/// downloads could grow this map indefinitely.
 const MAX_TRACKED_FILES: usize = 512;
 
 /// Hard cap on the per-file block list. `compact` is guaranteed to bring the
@@ -397,8 +397,8 @@ impl CorruptionBlackBox {
     /// `[start, end)`.
     ///
     /// Records only cover what this session received. A `.part` file resumed
-    /// after a restart or a requeue (both of which drop the file's records)
-    /// already holds bytes nobody here is on record for, so a part that fails
+    /// after a restart (which drops the file's records) already holds bytes
+    /// nobody here is on record for, so a part that fails
     /// with one *recorded* contributor may still have been spoiled by an
     /// unrecorded one. Only full coverage makes the recorded contributors the
     /// complete list.

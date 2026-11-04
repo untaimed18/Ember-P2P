@@ -7,9 +7,26 @@
   import IconX from './IconX.svelte';
   import { isChatWindow } from '$lib/windowRole';
   import { shortcutModAria } from '$lib/platform';
+  import { afterNavigate } from '$app/navigation';
 
   /** The chat window is all dock, so there is no dock beside it to clear. */
   const besideDock = !isChatWindow();
+
+  /** Where the stack starts: under the page header, whose buttons are what
+   *  most toasts report on, so an error never covers the button that caused
+   *  it. Measured when toasts appear and on navigation, since headers differ
+   *  in height from page to page and with the window width. */
+  let stackTop = $state(4);
+  function measureHeader() {
+    const header = document.querySelector('#main-content .page-header');
+    stackTop = header ? Math.max(4, Math.round(header.getBoundingClientRect().bottom)) : 4;
+  }
+  $effect(() => {
+    if ($toasts.length > 0) measureHeader();
+  });
+  afterNavigate(() => {
+    if ($toasts.length > 0) measureHeader();
+  });
 
   /** Slides in from the window edge, settling as it lands. */
   function toastIn(_node: Element) {
@@ -82,6 +99,8 @@
   bind:this={container}
   class="toast-container"
   class:dock-open={besideDock && $chatDockOpen}
+  style:top="{stackTop}px"
+  style:max-height="calc(100dvh - {stackTop}px)"
   data-a11y-no-inert
   onmouseenter={pauseToastDismiss}
   onmouseleave={resumeToastDismiss}
@@ -125,7 +144,14 @@
           </svg>
         {/if}
       </span>
-      <span class="toast-msg" id="toast-msg-{toast.id}">{toast.message}</span>
+      <!-- Re-created on a repeat, so the live region announces it again and
+           the count pulses: the same failure twice must not look like one. -->
+      {#key toast.repeats}
+        <span class="toast-msg" id="toast-msg-{toast.id}">{toast.message}</span>
+        {#if toast.repeats}
+          <span class="toast-repeat">×{toast.repeats + 1}</span>
+        {/if}
+      {/key}
       {#if toast.action}
         {@const action = toast.action}
         <button
@@ -236,6 +262,24 @@
   /* Backend error strings carry hashes and full Windows paths; without
      min-width:0 a flex item won't shrink below its min-content width. */
   .toast-msg { flex: 1; min-width: 0; line-height: 1.4; overflow-wrap: anywhere; }
+  .toast-repeat {
+    flex-shrink: 0;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--tone) 16%, transparent);
+    color: var(--tone-text);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    animation: toast-repeat-pulse 420ms ease-out;
+  }
+  @keyframes toast-repeat-pulse {
+    from { transform: scale(1.35); background: color-mix(in srgb, var(--tone) 40%, transparent); }
+    to { transform: scale(1); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .toast-repeat { animation: none; }
+  }
   .toast-action {
     flex-shrink: 0;
     padding: 4px 11px;

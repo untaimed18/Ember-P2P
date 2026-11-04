@@ -856,6 +856,14 @@ pub enum DownloadEvent {
     Verifying {
         transfer_id: String,
     },
+    /// The verified `.part` is about to be moved into its final folder by a
+    /// task Pause, Stop and Cancel cannot abort. Sent right before that task
+    /// starts; it ends in `Completed`, or in `Failed` when the move fails.
+    Completing {
+        transfer_id: String,
+        /// As for `Completed`.
+        generation: Option<u64>,
+    },
     SourceDetail {
         transfer_id: String,
         ip: String,
@@ -1457,12 +1465,12 @@ pub(crate) fn failure_kind_name(kind: &SourceFailureKind) -> String {
 /// The English stays because logs, download history, and a UI older than the
 /// backend it is talking to all read it. The code is what the UI translates,
 /// which is what stops a re-wording here from silently dropping a row back to
-/// English for the eight non-English locales.
+/// English for the nine non-English locales.
 ///
 /// Both come out of one table on purpose: a variant cannot compile without a
 /// code and a sentence, `ALL` is generated from the same list so it cannot go
 /// stale, and `scripts/backend-codes.test.mjs` parses this table to require a
-/// translation in all nine locales before a new variant can ship.
+/// translation in all ten locales before a new variant can ship.
 macro_rules! transfer_failure_codes {
     ($($variant:ident => $code:literal, $message:literal;)+) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1672,7 +1680,18 @@ pub(crate) fn is_queue_state_error(error: &str) -> bool {
         // Peer holds nothing we still need. The worker emitted
         // `no_needed_parts`; `multi_source`'s retry-round comment lists this
         // with the queue states that must not be penalized.
-        || error.contains("no parts we need")
+        || is_no_needed_parts_error(error)
+}
+
+/// The peer holds no part we still need (eMule `DS_NONEEDEDPARTS`), which
+/// eMule re-asks at twice `FILEREASKTIME`.
+pub(crate) fn is_no_needed_parts_error(error: &str) -> bool {
+    error.contains("no parts we need")
+}
+
+/// The peer answered that it does not share the file (`OP_FILEREQANSNOFIL`).
+pub(crate) fn is_no_file_error(error: &str) -> bool {
+    error.contains("peer does not have the file")
 }
 
 /// False for user Stop/Pause and for queue-state exits. Those must not emit
@@ -1758,7 +1777,7 @@ mod tests {
     }
 
     /// The classifier is the only producer of a download failure, so its output
-    /// is what decides whether the eight non-English locales see a translation.
+    /// is what decides whether the nine non-English locales see a translation.
     /// Walks one raw error per branch and pins the code, not the wording.
     #[test]
     fn the_classifier_emits_a_code_for_every_branch_it_has() {
@@ -2106,10 +2125,24 @@ mod tests {
         );
 
         // A third real hash is not the sentinel form and must still be refused.
-        let mut padded = two;
+        let mut padded = two.clone();
         padded.push(h(&part));
         padded.push(h(&[]));
         assert!(!verify_hashset(&file_hash, &padded, file_size));
+
+        // Nor is an extra entry that is anything but `MD4("")`: the
+        // recombination appends its own and would never look at it.
+        let mut bogus_sentinel = two.clone();
+        bogus_sentinel.push([0xAB; 16]);
+        assert!(!verify_hashset(&file_hash, &bogus_sentinel, file_size));
+
+        assert_eq!(per_part_hashes(with_sentinel, file_size), two);
+        assert_eq!(
+            per_part_hashes(bogus_sentinel.clone(), file_size),
+            bogus_sentinel,
+            "only the real sentinel is taken off"
+        );
+        assert_eq!(per_part_hashes(two.clone(), file_size), two);
     }
 
     #[test]
@@ -2938,6 +2971,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    /// A volume without hard links (exFAT, FAT32) renames the `.part` into
+    /// place when it is on the target's volume, instead of copying the whole
+    /// file; never over an existing name. With no such rename either, the
+    /// copy is still there to fall back on.
+    #[test]
+    fn a_same_volume_completion_without_hard_links_renames_the_part() {
+        let _registry_guard = crate::security::filesystem::test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-rename-no-links-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        let downloads = root.join("Downloads");
+        for dir in [root.join("Temp"), downloads.clone(), data.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let root_string = root.to_string_lossy().into_owned();
+        crate::security::filesystem::initialize_approved_roots(
+            &data,
+            std::slice::from_ref(&root_string),
+        )
+        .unwrap();
+        let allowed = [root_string];
+        let part = root.join("Temp").join("source.part");
+        let identity = |part: &std::path::Path| {
+            let (_, opened) =
+                crate::security::filesystem::open_existing_approved(part, &allowed, false)
+                    .unwrap();
+            crate::security::filesystem::opened_file_identity(&opened).unwrap()
+        };
+        let complete = |no_rename: bool, name: &str, source| {
+            HARD_LINKS_UNSUPPORTED.with(|unsupported| unsupported.set(true));
+            NO_REPLACE_PUBLISH_UNSUPPORTED.with(|unsupported| unsupported.set(no_rename));
+            let moved = move_part_to_final_with_roots(
+                &part,
+                &downloads.join(name),
+                &allowed,
+                Some(&source),
+                true,
+            );
+            NO_REPLACE_PUBLISH_UNSUPPORTED.with(|unsupported| unsupported.set(false));
+            HARD_LINKS_UNSUPPORTED.with(|unsupported| unsupported.set(false));
+            moved
+        };
+
+        std::fs::write(&part, b"renamed bytes").unwrap();
+        std::fs::write(downloads.join("taken.bin"), b"someone else's").unwrap();
+        let source = identity(&part);
+        let moved = complete(false, "taken.bin", source.clone()).unwrap();
+        assert_eq!(moved.file_name().unwrap(), "taken (1).bin");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"renamed bytes");
+        assert_eq!(std::fs::read(downloads.join("taken.bin")).unwrap(), b"someone else's");
+        assert_eq!(
+            crate::security::filesystem::object_identity(&moved).unwrap(),
+            source,
+            "the .part itself was moved, not copied"
+        );
+        assert!(!part.exists());
+        assert!(completion_copies_in(&downloads).is_empty());
+
+        std::fs::write(&part, b"copied bytes").unwrap();
+        let source = identity(&part);
+        let moved = complete(true, "copied.bin", source.clone()).unwrap();
+        assert_eq!(std::fs::read(&moved).unwrap(), b"copied bytes");
+        assert_ne!(crate::security::filesystem::object_identity(&moved).unwrap(), source);
+        assert!(!part.exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn a_completion_copy_is_named_so_the_library_never_shares_it() {
         let id = uuid::Uuid::new_v4().to_string();
@@ -3206,11 +3309,10 @@ pub(super) async fn finalize_zero_ed2k_file(
         );
     }
     let allowed = vec![download_dir.to_string_lossy().into_owned()];
-    let (temp_dir, completed_dir) = prepare_download_dirs(download_dir).await?;
+    let (temp_dir, _) = prepare_download_dirs(download_dir).await?;
     crate::storage::part_folders::note_located(transfer_id, download_dir);
     let safe_name = crate::security::sanitize_filename(file_name);
     let part_path = temp_dir.join(format!("{transfer_id}.part"));
-    let final_path = completed_dir.join(&safe_name);
     for stale in [&part_path, &part_path.with_extension("part.met")] {
         if let Err(error) = crate::security::filesystem::remove_approved_file(stale, &allowed) {
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -3252,10 +3354,28 @@ pub(super) async fn finalize_zero_ed2k_file(
     .map_err(|e| anyhow::anyhow!("hash task: {e}"))??
     .ok_or_else(|| anyhow::anyhow!("zero-byte file ed2k hash verification failed"))?;
     let pp = part_path.clone();
-    let fp = final_path.clone();
     let root = download_dir.to_path_buf();
-    let actual_final = tokio::task::spawn_blocking(move || {
-        move_part_to_final_approved(&pp, &fp, &root, &verified_identity)
+    let transfer_id = transfer_id.to_string();
+    // Where any other download of this kind finishes: a feeds-code fetch in
+    // the app data folder, a feed's in its folder, the rest by category.
+    let internal_dest = crate::sharing::feed_files::internal_fetch_dest(&transfer_id);
+    let actual_final = tokio::task::spawn_blocking(move || match internal_dest {
+        Some(dest) => {
+            let dest_root = dest
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .ok_or_else(|| anyhow::anyhow!("internal fetch has no folder"))?;
+            std::fs::create_dir_all(&dest_root)?;
+            move_part_between_roots_approved(&pp, &root, &dest, &dest_root, &verified_identity)
+        }
+        None => move_part_to_its_folder(
+            &transfer_id,
+            &pp,
+            &root,
+            &root,
+            &safe_name,
+            &verified_identity,
+        ),
     })
     .await
     .map_err(|e| anyhow::anyhow!("rename task: {e}"))??;
@@ -3287,9 +3407,14 @@ fn move_part_to_final_with_roots(
     // copied under a temporary name first and then renamed into a free name
     // without replacement, which is also collision-safe. Where that rename
     // is unavailable too, the file is copied straight to a free name with an
-    // exclusive create, as before the temporary copy existed.
+    // exclusive create, as before the temporary copy existed. A same-volume
+    // target on a filesystem without hard links takes the `.part` itself by a
+    // pinned rename that refuses to replace, rather than a copy of the whole
+    // file.
     let mut staged: Option<CompletionCopy> = None;
     let mut copy_in_place = false;
+    let mut rename_in_place = allow_hard_link
+        && expected_source_identity.is_some_and(|source| on_same_volume(source, target));
     let mut suffix = 0u32;
     while suffix <= 10_000 {
         let final_path = dedup_candidate(target, suffix);
@@ -3316,7 +3441,13 @@ fn move_part_to_final_with_roots(
             }
         }
         if allow_hard_link && staged.is_none() {
-            let link_result = if allowed_roots.is_empty() {
+            #[cfg(test)]
+            let hard_links_unsupported = HARD_LINKS_UNSUPPORTED.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let hard_links_unsupported = false;
+            let link_result = if hard_links_unsupported {
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+            } else if allowed_roots.is_empty() {
                 std::fs::hard_link(part_path, &final_path).map(|()| final_path.clone())
             } else if let Some(expected) = expected_source_identity {
                 crate::security::filesystem::hard_link_approved(
@@ -3346,6 +3477,31 @@ fn move_part_to_final_with_roots(
                     continue;
                 }
                 Err(e) if hard_link_fallback_allowed(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if let (true, None, Some(expected)) =
+            (rename_in_place, staged.as_ref(), expected_source_identity)
+        {
+            match rename_part_no_replace(part_path, &final_path, allowed_roots, expected) {
+                Ok(moved) => {
+                    sync_published(&moved, allowed_roots);
+                    return Ok(moved);
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || (final_path.exists() && part_path.exists()) =>
+                {
+                    continue;
+                }
+                Err(e) if no_replace_publish_unavailable(&e) || held_by_another_process(&e) => {
+                    tracing::info!(
+                        "Could not rename {} into {} ({e}); copying the finished file instead",
+                        part_path.display(),
+                        final_path.parent().unwrap_or(&final_path).display()
+                    );
+                    rename_in_place = false;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -3396,6 +3552,37 @@ fn move_part_to_final_with_roots(
     anyhow::bail!(
         "Could not allocate a unique completed filename for {}",
         target.display()
+    )
+}
+
+/// Whether `target`'s folder is on the volume the `.part` with identity
+/// `source` is on. `false` when the folder cannot be looked at.
+fn on_same_volume(
+    source: &crate::security::filesystem::ObjectIdentity,
+    target: &std::path::Path,
+) -> bool {
+    target
+        .parent()
+        .and_then(|dir| crate::security::filesystem::object_identity(dir).ok())
+        .is_some_and(|dir| dir.volume_serial == source.volume_serial)
+}
+
+/// Move the pinned `.part` itself to `final_path`, which must not exist yet.
+fn rename_part_no_replace(
+    part_path: &std::path::Path,
+    final_path: &std::path::Path,
+    allowed_roots: &[String],
+    expected: &crate::security::filesystem::ObjectIdentity,
+) -> std::io::Result<std::path::PathBuf> {
+    #[cfg(test)]
+    if NO_REPLACE_PUBLISH_UNSUPPORTED.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
+    crate::security::filesystem::move_approved_no_replace(
+        part_path,
+        final_path,
+        allowed_roots,
+        expected,
     )
 }
 
@@ -4477,13 +4664,15 @@ pub(crate) fn verify_hashset(
     // Permissiveness on the count cannot weaken the check: the recombination
     // below still has to reproduce the ed2k file hash exactly, and that is the
     // real gate. The anti-padding bound the strict count was protecting also
-    // survives — `n + 1` is still `O(n)`.
+    // survives — `n + 1` is still `O(n)`. The extra entry is held to `MD4("")`
+    // here because the recombination appends its own and never reads it.
     let expected_count = super::messages::ed2k_part_count_for_size(file_size);
     let part_hashes: &[[u8; 16]] = if part_hashes.len() == expected_count {
         part_hashes
     } else if part_hashes.len() == expected_count + 1
         && file_size > 0
         && file_size.is_multiple_of(super::hash::PARTSIZE)
+        && part_hashes[expected_count] == super::hash::empty_ed2k_file_md4()
     {
         &part_hashes[..expected_count]
     } else {
@@ -4502,6 +4691,22 @@ pub(crate) fn verify_hashset(
     }
     let computed: [u8; 16] = Md4::digest(&combined).into();
     computed == *file_hash
+}
+
+/// `part_hashes` in the form Ember holds in memory: one MD4 per part, with the
+/// trailing `MD4("")` of eMule's form for an exact multiple of PARTSIZE taken
+/// off. Any other set is returned unchanged, for [`verify_hashset`] to judge.
+/// known.met and the wire add the sentinel back
+/// ([`super::hash::ed2k_known_met_hashset`]).
+pub(crate) fn per_part_hashes(mut part_hashes: Vec<[u8; 16]>, file_size: u64) -> Vec<[u8; 16]> {
+    if file_size > 0
+        && file_size.is_multiple_of(super::hash::PARTSIZE)
+        && part_hashes.len() == super::messages::ed2k_part_count_for_size(file_size) + 1
+        && part_hashes.last() == Some(&super::hash::empty_ed2k_file_md4())
+    {
+        part_hashes.pop();
+    }
+    part_hashes
 }
 
 /// Source networks that must advertise one AICH root before it is trusted

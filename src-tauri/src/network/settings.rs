@@ -224,7 +224,7 @@ pub(super) async fn apply_settings_update(
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
 ) {
     let old_channel_username = settings.channel_username.clone();
-    let old_channel_language = settings.channel_language_code();
+    let old_channel_language = settings.channel_languages();
     let old_nickname = settings.nickname.clone();
     let old_shown_status = effective_friend_status(state, settings);
     let old_friend_status = settings.friend_status;

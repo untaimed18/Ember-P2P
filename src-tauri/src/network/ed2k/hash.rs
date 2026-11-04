@@ -13,12 +13,7 @@ use md4::Md4;
 
 pub const PARTSIZE: u64 = 9_728_000;
 
-const HASH_BUF_SIZE: usize = 1024 * 1024;
-
-pub fn ed2k_part_hashes_file(path: &Path) -> anyhow::Result<Vec<[u8; 16]>> {
-    static NEVER: AtomicBool = AtomicBool::new(false);
-    ed2k_part_hashes_file_cancellable(path, &NEVER)
-}
+pub(crate) const HASH_BUF_SIZE: usize = 1024 * 1024;
 
 pub fn ed2k_known_met_part_hash_count(file_size: u64) -> usize {
     if file_size < PARTSIZE {
@@ -123,6 +118,9 @@ pub fn ed2k_hash_open_file_cancellable(
     Ok(hex::encode(final_hash))
 }
 
+/// The part hashes alone, read on their own: the reference the one-pass
+/// hasher's hashset is checked against.
+#[cfg(test)]
 pub fn ed2k_part_hashes_file_cancellable(
     path: &Path,
     cancelled: &AtomicBool,
@@ -1359,5 +1357,100 @@ mod combined_hash_tests {
             combined_part_hashes.len(),
             ed2k_known_met_part_hash_count(file_size)
         );
+    }
+
+    /// eMule's `CAICHHashTree` over the bytes themselves, apart from the
+    /// leaf-list builder in `aich.rs`. A node no larger than its base size is
+    /// the SHA-1 of its bytes; a larger one is the SHA-1 of its children, the
+    /// left holding `(blocks + is_left) / 2` base-sized blocks. The base is
+    /// `EMBLOCKSIZE` for a node of at most `PARTSIZE` bytes, `PARTSIZE` above.
+    fn emule_aich_tree(data: &[u8], is_left: bool) -> [u8; 20] {
+        use sha1::Sha1;
+        const EMBLOCKSIZE: u64 = 184_320;
+        let size = data.len() as u64;
+        let base = if size <= PARTSIZE { EMBLOCKSIZE } else { PARTSIZE };
+        if size <= base {
+            return Sha1::digest(data).into();
+        }
+        let left = (size.div_ceil(base) + u64::from(is_left)) / 2 * base;
+        let (l, r) = data.split_at(left as usize);
+        let mut node = Sha1::new();
+        node.update(emule_aich_tree(l, true));
+        node.update(emule_aich_tree(r, false));
+        node.finalize().into()
+    }
+
+    /// Every completed download of one part or less now records and
+    /// advertises an AICH root, so the one-pass hasher, the combined hasher
+    /// and `build_from_file` must each give eMule's root wherever the tree
+    /// changes shape: inside one block, either side of a block, either side of
+    /// and at exactly one part, and one byte into a second. Patterned bytes,
+    /// so a block hashed from the wrong offset cannot match by accident.
+    #[test]
+    fn single_part_aich_roots_match_emule_at_every_boundary() {
+        const BLOCK: u64 = 184_320;
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        for size in [
+            1,
+            4096,
+            BLOCK - 1,
+            BLOCK,
+            BLOCK + 1,
+            2 * BLOCK + 7,
+            PARTSIZE - 1,
+            PARTSIZE,
+            PARTSIZE + 1,
+        ] {
+            let data: Vec<u8> = (0..size)
+                .map(|i| (i.wrapping_mul(0x9E37_79B9) >> 13) as u8)
+                .collect();
+            let path = std::env::temp_dir().join(format!(
+                "ember-aich-single-part-{}-{size}.bin",
+                std::process::id()
+            ));
+            std::fs::write(&path, &data).expect("write temp file");
+            let expected = emule_aich_tree(&data, true);
+
+            let mut file = std::fs::File::open(&path).expect("open");
+            let pass = hash_open_file_digests_cancellable(&mut file, WantedDigests::ALL, &NEVER)
+                .expect("digests")
+                .aich;
+            drop(file);
+            let built = super::super::aich::AICHRecoveryHashSet::build_from_file(&path)
+                .expect("build_from_file")
+                .root_hash;
+            let (_, combined_hex, _, _) =
+                hash_file_combined_cancellable(&path, &NEVER, &AtomicU64::new(0))
+                    .expect("combined hash");
+            let _ = std::fs::remove_file(&path);
+
+            assert_eq!(pass, Some(expected), "{size} bytes: the one-pass hasher");
+            assert_eq!(built, expected, "{size} bytes: build_from_file");
+            assert_eq!(combined_hex, hex::encode(expected), "{size} bytes: the combined hasher");
+        }
+    }
+
+    /// A fixed root: a file within one block has its SHA-1 as its AICH root
+    /// in eMule, so "abc" has the FIPS 180 test vector's.
+    #[test]
+    fn a_one_block_files_aich_root_is_its_sha1() {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let path = std::env::temp_dir().join(format!("ember-aich-abc-{}.bin", std::process::id()));
+        std::fs::write(&path, b"abc").expect("write temp file");
+        let mut file = std::fs::File::open(&path).expect("open");
+        let pass = hash_open_file_digests_cancellable(&mut file, WantedDigests::ALL, &NEVER)
+            .expect("digests")
+            .aich;
+        drop(file);
+        let built = super::super::aich::AICHRecoveryHashSet::build_from_file(&path)
+            .expect("build_from_file")
+            .root_hash;
+        let _ = std::fs::remove_file(&path);
+        let fips: [u8; 20] = hex::decode("a9993e364706816aba3e25717850c26c9cd0d89d")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(pass, Some(fips));
+        assert_eq!(built, fips);
     }
 }

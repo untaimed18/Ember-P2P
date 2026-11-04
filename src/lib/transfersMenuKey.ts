@@ -5,8 +5,7 @@ export interface MenuKeyFocus {
   focusRowId: string | null;
   /** Focus is somewhere in the downloads table's pane. */
   inDownloadsTable: boolean;
-  /** Focus is on nothing in particular (the page body), as after clicking a
-   *  row, which takes no focus of its own. */
+  /** Focus is on nothing in particular (the page body). */
   onPage: boolean;
   /** The highlighted download, else the last one ticked, when it is listed. */
   currentId: string | null;

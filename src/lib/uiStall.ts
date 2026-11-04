@@ -126,17 +126,17 @@ function watch(): () => void {
   }, TICK_MS);
 
   let pinging = false;
+  // Hidden, a slow answer is never reported, so the round trip is not made.
   const ping = window.setInterval(() => {
-    if (pinging) return;
+    if (pinging || !visible()) return;
     pinging = true;
     const started = performance.now();
-    const shown = visible();
     void invoke('ui_ping')
       .catch(() => {})
       .finally(() => {
         pinging = false;
         const ms = performance.now() - started;
-        if (ms >= SLOW_PING_MS && shown && visible()) report('ipc', ms, true);
+        if (ms >= SLOW_PING_MS && visible()) report('ipc', ms, true);
       });
   }, PING_MS);
 

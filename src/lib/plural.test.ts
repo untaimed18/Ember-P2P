@@ -19,13 +19,16 @@ describe('pluralCategory', () => {
     expect(pluralCategory(3, 'ru')).toBe('few');
     expect(pluralCategory(5, 'ru')).toBe('many');
     expect(pluralCategory(21, 'ru')).toBe('one');
+    expect(pluralCategory(3, 'pl')).toBe('few');
+    expect(pluralCategory(5, 'pl')).toBe('many');
+    expect(pluralCategory(21, 'pl')).toBe('many');
     expect(pluralCategory(1, 'zh-CN')).toBe('other');
   });
 });
 
 describe('plural', () => {
   it('uses the singular for exactly one in every locale', () => {
-    for (const locale of ['en', 'es', 'fr', 'pt-BR', 'de', 'zh-CN', 'it', 'ru', 'zh-TW']) {
+    for (const locale of ['en', 'es', 'fr', 'pt-BR', 'de', 'zh-CN', 'it', 'ru', 'zh-TW', 'pl']) {
       expect(plural(1, all, locale)).toBe('one');
     }
   });
@@ -33,6 +36,15 @@ describe('plural', () => {
   it('picks the Russian few and many forms', () => {
     for (const n of [2, 3, 4, 22, 34, 102]) expect(plural(n, all, 'ru')).toBe('few');
     for (const n of [0, 5, 11, 12, 14, 20, 25, 111]) expect(plural(n, all, 'ru')).toBe('many');
+  });
+
+  it('picks the Polish few and many forms', () => {
+    for (const n of [2, 3, 4, 22, 34, 102]) expect(plural(n, all, 'pl')).toBe('few');
+    // Unlike Russian, Polish 21, 31, … are `many`, not `one`.
+    for (const n of [0, 5, 11, 12, 14, 20, 21, 25, 111]) expect(plural(n, all, 'pl')).toBe('many');
+    expect(plural(21, { ...all, oneShowsCount: true }, 'pl')).toBe('many');
+    // A group without `_few` sends 2–4 to `other` as it does in Russian.
+    expect(plural(3, twoForm, 'pl')).toBe('other');
   });
 
   it('falls back to other when a group has no few or many form', () => {
@@ -48,6 +60,20 @@ describe('plural', () => {
     expect(plural(0, all, 'fr')).toBe('other');
     expect(plural(0, all, 'pt-BR')).toBe('other');
     expect(plural(21, all, 'ru')).toBe('other');
+  });
+
+  it('lets a one that shows its count serve Russian 21, 31, …', () => {
+    const counted: PluralForms = { ...all, oneShowsCount: true };
+    for (const n of [21, 31, 101, 1001]) expect(plural(n, counted, 'ru')).toBe('one');
+    // Russian 11 and 111 are `many`, not `one`, whatever their last digit.
+    for (const n of [11, 111]) expect(plural(n, counted, 'ru')).toBe('many');
+    for (const n of [22, 34]) expect(plural(n, counted, 'ru')).toBe('few');
+    // French and Portuguese 0 stays plural, and other languages are unchanged.
+    expect(plural(0, counted, 'fr')).toBe('other');
+    expect(plural(0, counted, 'pt-BR')).toBe('other');
+    expect(plural(0, counted, 'ru')).toBe('many');
+    expect(plural(21, counted, 'en')).toBe('other');
+    expect(plural(21, counted, 'de')).toBe('other');
   });
 
   it('keeps English and German to one and other', () => {

@@ -25,14 +25,15 @@
 //! stateless reset sent *to* us looks random and is dropped the same way, so
 //! such a connection ends by idle timeout instead of at once.
 
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, ConnectionId, ConnectionIdGenerator, UdpPoller};
@@ -40,11 +41,22 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-use super::transport::DialLog;
+use super::transport::{DialLog, DIAL_MEMORY};
 
 /// Length of the connection ids our endpoint issues.
 pub const CID_LEN: usize = 16;
 const CID_NONCE_LEN: usize = 8;
+/// Length of the destination connection id our client Initials carry: random
+/// bytes and a tag under [`initial_dcid_key`], so a send can be recognised as
+/// the first flight of a connection we opened. The tag takes the same eight
+/// bytes as in our issued ids, leaving twelve unpredictable ones, past the
+/// eight RFC 9000 asks of an initial destination id.
+const INITIAL_DCID_LEN: usize = MAX_CID_LEN;
+const INITIAL_DCID_NONCE_LEN: usize = INITIAL_DCID_LEN - (CID_LEN - CID_NONCE_LEN);
+/// Connections we opened whose paths are remembered, and the initial
+/// destination ids that opened them, each evicting the oldest. Only our own
+/// dials add to either, so a remote party cannot churn them.
+const MAX_OPENED_PATHS: usize = 4096;
 /// QUIC version 1 (RFC 9000), the one version every build negotiates.
 const QUIC_VERSION_1: u32 = 1;
 /// A long header with version 0 is version negotiation.
@@ -130,6 +142,135 @@ impl CidKey {
     }
 }
 
+/// The key our client Initials' destination ids are tagged under. Process-wide
+/// rather than per endpoint because every client config is built from the same
+/// function and only the shared socket ever checks it.
+fn initial_dcid_key() -> &'static CidKey {
+    static KEY: OnceLock<CidKey> = OnceLock::new();
+    KEY.get_or_init(CidKey::random)
+}
+
+/// A destination connection id for a client Initial: what quinn would use, but
+/// one [`opened_by_us`] recognises. Set as every client config's
+/// `initial_dst_cid_provider`. The peer only ever reads it as random bytes.
+pub fn initial_dst_cid() -> ConnectionId {
+    let nonce: [u8; INITIAL_DCID_NONCE_LEN] = rand::random();
+    let mut cid = [0u8; INITIAL_DCID_LEN];
+    cid[..INITIAL_DCID_NONCE_LEN].copy_from_slice(&nonce);
+    cid[INITIAL_DCID_NONCE_LEN..].copy_from_slice(&initial_dcid_key().tag(&nonce));
+    ConnectionId::new(&cid)
+}
+
+/// The destination connection id of `datagram`, if it opens with a version 1
+/// Initial whose id is one [`initial_dst_cid`] minted: the first flight of a
+/// connection this process dialled.
+///
+/// The type bits of a long header are not covered by header protection, so
+/// this reads the plain bytes. A Retry, a Handshake packet or version
+/// negotiation is never a dial.
+fn opened_by_us(datagram: &[u8]) -> Option<&[u8]> {
+    let &first = datagram.first()?;
+    // Long header, fixed bit set, packet type Initial.
+    if first & 0xF0 != 0xC0 || datagram.len() < 6 {
+        return None;
+    }
+    let version = u32::from_be_bytes([datagram[1], datagram[2], datagram[3], datagram[4]]);
+    let dcid_len = datagram[5] as usize;
+    if version != QUIC_VERSION_1 || dcid_len != INITIAL_DCID_LEN || datagram.len() < 6 + dcid_len {
+        return None;
+    }
+    let dcid = &datagram[6..6 + dcid_len];
+    let (nonce, tag) = dcid.split_at(INITIAL_DCID_NONCE_LEN);
+    (initial_dcid_key().tag(nonce) == tag).then_some(dcid)
+}
+
+/// Whether `datagram` is a Retry or a version negotiation packet.
+fn answers_an_initial(datagram: &[u8]) -> bool {
+    let Some(&first) = datagram.first() else {
+        return false;
+    };
+    if first & 0x80 == 0 || datagram.len() < 5 {
+        return false;
+    }
+    let version = u32::from_be_bytes([datagram[1], datagram[2], datagram[3], datagram[4]]);
+    version == QUIC_VERSION_NEGOTIATION || first & 0x30 == 0x30
+}
+
+/// The paths of QUIC connections we opened from the shared socket, which are
+/// the only QUIC sends that may enter the [`DialLog`].
+///
+/// Every other caller of the log treats an entry as permission, and quinn also
+/// sends to addresses nobody has validated: a Retry to any Initial, a refusal,
+/// a stateless reset to a short header naming an id it once issued. Logging
+/// those let one spoofed 1,200-byte Initial buy ten minutes of that permission
+/// for any address. Connections a peer opened to us are not logged either; the
+/// reachability rule they matter to asks only whether *we* opened a mapping.
+#[derive(Default)]
+struct OpenedPaths {
+    last_sent: HashMap<SocketAddr, Instant>,
+    order: VecDeque<SocketAddr>,
+    /// Which path each initial destination id was first sent to. The id goes
+    /// to the server we dialled, which can then name it as its own source id
+    /// when connecting to us, and our answer would carry it as a destination.
+    /// Bound to its first path, it opens no other.
+    opened_by: HashMap<[u8; INITIAL_DCID_LEN], SocketAddr>,
+    opened_order: VecDeque<[u8; INITIAL_DCID_LEN]>,
+}
+
+impl OpenedPaths {
+    /// Whether sending `datagram` to `destination` is a send on a path we
+    /// opened, recording the path if this datagram is what opens it.
+    fn is_ours(&mut self, datagram: &[u8], destination: SocketAddr, now: Instant) -> bool {
+        if let Some(dcid) = opened_by_us(datagram) {
+            let mut key = [0u8; INITIAL_DCID_LEN];
+            key.copy_from_slice(dcid);
+            match self.opened_by.get(&key) {
+                Some(path) if *path != destination => return false,
+                Some(_) => {}
+                None => {
+                    while self.opened_by.len() >= MAX_OPENED_PATHS {
+                        let Some(oldest) = self.opened_order.pop_front() else {
+                            break;
+                        };
+                        self.opened_by.remove(&oldest);
+                    }
+                    self.opened_by.insert(key, destination);
+                    self.opened_order.push_back(key);
+                }
+            }
+            self.note(destination, now);
+            return true;
+        }
+        // Answers to an unvalidated Initial, which anyone can send from a path
+        // we opened as easily as from any other.
+        if answers_an_initial(datagram) {
+            return false;
+        }
+        match self.last_sent.get_mut(&destination) {
+            Some(at) if now.saturating_duration_since(*at) < DIAL_MEMORY => {
+                *at = now;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn note(&mut self, destination: SocketAddr, now: Instant) {
+        if let Some(at) = self.last_sent.get_mut(&destination) {
+            *at = now;
+            return;
+        }
+        while self.last_sent.len() >= MAX_OPENED_PATHS {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.last_sent.remove(&oldest);
+        }
+        self.last_sent.insert(destination, now);
+        self.order.push_back(destination);
+    }
+}
+
 /// Connection ids that say which endpoint issued them. quinn's own
 /// `HashedConnectionIdGenerator` validates too, but on a five-byte FxHash tag
 /// and a three-byte nonce, which is too thin to tell our packets from random
@@ -203,7 +344,8 @@ pub fn is_quic(data: &[u8], key: &CidKey) -> bool {
 /// socket quinn can drive — `None` when `cid_key` is, which is the fallback to
 /// a separate QUIC socket: then everything goes to the loop, as before.
 ///
-/// The QUIC half records every destination it sends to in `dial_log`.
+/// The QUIC half records in `dial_log` the destinations of connections it
+/// opened, and nothing else; see [`OpenedPaths`].
 ///
 /// The reader stops once the loop drops its receiver.
 pub fn start(
@@ -222,6 +364,7 @@ pub fn start(
                 claimed: claimed.clone(),
                 last_send_error_log: parking_lot::Mutex::new(None),
                 dial_log,
+                opened: parking_lot::Mutex::new(OpenedPaths::default()),
             };
             (Some(QuicRoute { tx, claimed }), Some(shared))
         }
@@ -354,6 +497,7 @@ pub struct SharedQuicSocket {
     /// a Noise packet would, and the unsolicited-reachability rule must not take
     /// a peer answering through it for a stranger.
     dial_log: DialLog,
+    opened: parking_lot::Mutex<OpenedPaths>,
 }
 
 impl SharedQuicSocket {
@@ -388,7 +532,13 @@ impl AsyncUdpSocket for SharedQuicSocket {
         debug_assert!(transmit
             .segment_size
             .is_none_or(|size| size >= transmit.contents.len()));
-        self.dial_log.note(transmit.destination.ip());
+        if self
+            .opened
+            .lock()
+            .is_ours(transmit.contents, transmit.destination, Instant::now())
+        {
+            self.dial_log.note(transmit.destination.ip());
+        }
         match self.socket.try_send_to(transmit.contents, transmit.destination) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
@@ -789,6 +939,112 @@ mod tests {
         round_trip(&client, server_addr, 1024).await;
         assert!(transport.recently_dialled(server_addr.ip()));
         assert!(!transport.recently_dialled("127.0.0.2".parse().unwrap()), "only the host it sent to");
+        echo.abort();
+    }
+
+    /// A long-header Initial with `dcid`, padded as a client's first flight is.
+    fn initial_with_dcid(dcid: &[u8]) -> Vec<u8> {
+        let mut p = vec![0xC3];
+        p.extend_from_slice(&QUIC_VERSION_1.to_be_bytes());
+        p.push(dcid.len() as u8);
+        p.extend_from_slice(dcid);
+        p.push(8);
+        p.extend_from_slice(&[0x22; 8]);
+        p.resize(1200, 0);
+        p
+    }
+
+    #[test]
+    fn only_our_own_client_initials_open_a_path() {
+        let ours = initial_dst_cid();
+        assert_eq!(ours.len(), INITIAL_DCID_LEN);
+        assert!(opened_by_us(&initial_with_dcid(&ours)).is_some());
+        assert_ne!(initial_dst_cid(), ours, "unpredictable, as RFC 9000 requires");
+
+        let random: [u8; INITIAL_DCID_LEN] = rand::random();
+        assert!(opened_by_us(&initial_with_dcid(&random)).is_none(), "a peer's choice of id");
+        assert!(opened_by_us(&initial_with_dcid(&ours[..8])).is_none());
+        let mut handshake = initial_with_dcid(&ours);
+        handshake[0] = 0xE3;
+        assert!(opened_by_us(&handshake).is_none(), "a Handshake packet");
+        let mut retry = initial_with_dcid(&ours);
+        retry[0] = 0xF3;
+        assert!(opened_by_us(&retry).is_none(), "a Retry");
+        assert!(opened_by_us(&short_header(&ours)).is_none());
+    }
+
+    /// Sends on a path we opened keep it logged, a send nobody opened never
+    /// logs, and a Retry or version negotiation, which anyone can draw from any
+    /// path, does not refresh one. An id we minted opens only the path it was
+    /// first sent to, so the server we dialled cannot replay it as its own
+    /// source id to have our answer open another.
+    #[test]
+    fn opened_paths_are_only_the_ones_we_dialled() {
+        let now = Instant::now();
+        let mut opened = OpenedPaths::default();
+        let server = SocketAddr::from(([203, 0, 113, 7], 4672));
+        let stranger = SocketAddr::from(([198, 51, 100, 9], 4672));
+        let one_rtt = short_header(&[0x44; CID_LEN]);
+        let dcid = initial_dst_cid();
+
+        assert!(!opened.is_ours(&one_rtt, stranger, now), "a stranger's connection");
+        assert!(!opened.is_ours(&long_header(QUIC_VERSION_1, 0xF0), stranger, now));
+        assert!(opened.is_ours(&initial_with_dcid(&dcid), server, now));
+        assert!(opened.is_ours(&one_rtt, server, now + Duration::from_secs(5)));
+        assert!(
+            !opened.is_ours(&long_header(QUIC_VERSION_1, 0xF0), server, now),
+            "a Retry is never a dial"
+        );
+        assert!(!opened.is_ours(&long_header(QUIC_VERSION_NEGOTIATION, 0x80), server, now));
+        assert!(
+            opened.is_ours(&one_rtt, server, now + Duration::from_secs(5) + DIAL_MEMORY - Duration::from_secs(1)),
+            "each send refreshes the path"
+        );
+        assert!(!opened.is_ours(&one_rtt, server, now + Duration::from_secs(10) + DIAL_MEMORY * 2));
+
+        assert!(
+            !opened.is_ours(&initial_with_dcid(&dcid), stranger, now),
+            "our id echoed back toward another address opens nothing"
+        );
+        assert!(!opened.is_ours(&one_rtt, stranger, now));
+    }
+
+    /// A stranger's Initial draws a Retry, and its connection then completes
+    /// with us as the server. Neither is a dial of ours, so neither may enter
+    /// the dial record the transport reads as permission.
+    #[tokio::test]
+    async fn answering_a_strangers_initial_is_not_a_dial() {
+        let (server, server_socket, _server_other, server_log) = shared_endpoint_logging().await;
+        let server_addr = server_socket.local_addr().unwrap();
+        let echo = tokio::spawn({
+            let server = server.clone();
+            async move {
+                while let Some(incoming) = server.accept().await {
+                    if !incoming.remote_address_validated() {
+                        let _ = incoming.retry();
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        let Ok(conn) = incoming.await else { return };
+                        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                            let Ok(data) = recv.read_to_end(1 << 20).await else { return };
+                            let _ = send.write_all(&data).await;
+                            let _ = send.finish();
+                        }
+                    });
+                }
+            }
+        });
+        let (cert, key) = endpoint_identity();
+        let (stranger, _) = quic::build_server_client_endpoint(&cert, &key, 0, false)
+            .await
+            .unwrap();
+        round_trip(&stranger, server_addr, 1024).await;
+        let transport = crate::network::ember::transport::EmberTransport::with_dial_log([1; 32], [2; 32], server_log);
+        assert!(
+            !transport.recently_dialled(server_addr.ip()),
+            "a Retry and a server's answers are not dials"
+        );
         echo.abort();
     }
 

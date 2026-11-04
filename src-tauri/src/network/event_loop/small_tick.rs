@@ -25,6 +25,7 @@ pub(in crate::network) async fn on_small_tick(
                     now_dc - last_contact
                 );
                 state.stats.status = NetworkStatus::Connecting;
+                crate::network::kad_io::refresh_hello_client_id(state);
                 state.self_lookup_done = false;
                 state.last_self_lookup = 0;
                 // Clear so bootstrap cannot promote back to Connected

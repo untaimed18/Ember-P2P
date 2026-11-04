@@ -1431,33 +1431,44 @@ fn matching_platform(manifest: &SignedManifest, update: &Update) -> Result<Signe
 async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpdate)>> {
     let config = embedded_updater_config()?;
     let signature_endpoint = signature_url(&config.endpoint)?;
-    let manifest_response = match fetch_capped(
-        &config.endpoint,
-        MANIFEST_MAX_BYTES,
-        METADATA_DEADLINE,
-        "application/json",
-        NetworkPolicy::PRODUCTION,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) if is_missing_updater_resource(&error) => {
-            tracing::debug!(
-                "Secure updater manifest missing at configured endpoint; treating as no update"
-            );
-            return Ok(None);
+    // Both fetched at once. The manifest decides first: once it is missing or
+    // failed, the signature is not waited for.
+    let manifest = async {
+        match fetch_capped(
+            &config.endpoint,
+            MANIFEST_MAX_BYTES,
+            METADATA_DEADLINE,
+            "application/json",
+            NetworkPolicy::PRODUCTION,
+        )
+        .await
+        {
+            Ok(response) => Ok(response),
+            Err(error) if is_missing_updater_resource(&error) => {
+                tracing::debug!(
+                    "Secure updater manifest missing at configured endpoint; treating as no update"
+                );
+                Err(None)
+            }
+            Err(error) => Err(Some(error)),
         }
-        Err(error) => return Err(error),
     };
-    let signature_response = match fetch_capped(
-        &signature_endpoint,
-        SIGNATURE_MAX_BYTES,
-        METADATA_DEADLINE,
-        "application/octet-stream",
-        NetworkPolicy::PRODUCTION,
-    )
-    .await
-    {
+    let signature = async {
+        Ok::<_, Option<anyhow::Error>>(fetch_capped(
+            &signature_endpoint,
+            SIGNATURE_MAX_BYTES,
+            METADATA_DEADLINE,
+            "application/octet-stream",
+            NetworkPolicy::PRODUCTION,
+        )
+        .await)
+    };
+    let (manifest_response, signature_fetch) = match tokio::try_join!(manifest, signature) {
+        Ok(both) => both,
+        Err(None) => return Ok(None),
+        Err(Some(error)) => return Err(error),
+    };
+    let signature_response = match signature_fetch {
         Ok(response) => response,
         Err(error) if is_missing_updater_resource(&error) => {
             tracing::warn!(

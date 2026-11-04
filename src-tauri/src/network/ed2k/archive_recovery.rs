@@ -1961,7 +1961,7 @@ mod tests {
         (0..archive.len())
             .map(|i| {
                 let mut file = archive.by_index(i).unwrap();
-                let name = file.name().to_string();
+                let name = file.name().unwrap().to_string();
                 let mut data = Vec::new();
                 file.read_to_end(&mut data).unwrap();
                 (name, data)

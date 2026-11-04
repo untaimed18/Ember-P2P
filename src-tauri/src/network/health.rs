@@ -24,6 +24,10 @@ pub(crate) struct ServerConnectResult {
     /// `NetworkState::server_login_tcp_port` on success so a later
     /// STUN-confirmed remap can detect it needs a reconnect.
     pub(crate) login_tcp_port: u16,
+    /// The address a server on a dynamic IP has moved to, found by its
+    /// hostname before dialing. Nothing was dialed: the list entry moves and
+    /// the connection starts again there, through the usual checks.
+    pub(crate) moved_to: Option<String>,
     pub(crate) result: Result<(Ed2kServerConnection, ServerSession), String>,
 }
 
@@ -63,6 +67,14 @@ pub(crate) struct RendezvousRegisterResult {
 
 pub(crate) struct FriendRelayTicketPollResult {
     pub(crate) result: Result<rendezvous::FriendRelayTicketPollPage, String>,
+}
+
+/// The digests a completed download arrived without, read from the finished
+/// file off the event loop. `None` for one the completion already had.
+pub(crate) struct CompletedDigests {
+    pub(crate) file_hash: [u8; 16],
+    pub(crate) aich: Option<[u8; 20]>,
+    pub(crate) ember: Option<[u8; 32]>,
 }
 
 pub(crate) struct NatProbeResult {

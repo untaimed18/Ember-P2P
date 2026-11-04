@@ -296,6 +296,37 @@ const _: () = assert!(
     "publishers resend withdrawals for as long as storers keep listings"
 );
 
+use crate::network::ember::feed::FEED_LISTING_RESIGN_SECS;
+/// How often a room's owner signs its listing anew, on the cadence of the
+/// room's governance snapshot.
+const ROOM_LISTING_RESIGN_SECS: i64 = crate::network::ember::channel::MODERATION_REPUBLISH_SECS;
+
+/// How long a listing in a public index may go unsigned before a full shard
+/// may drop it for another: two of its publisher's re-signs, and the skew
+/// tolerance for a publisher whose clock is slow. `None` for anything that is
+/// not a listing.
+fn listing_stale_after(data: &[u8]) -> Option<i64> {
+    if data.first() == Some(&RECORD_TYPE_FEED_LISTING) {
+        Some(2 * FEED_LISTING_RESIGN_SECS + CLOCK_SKEW_TOLERANCE_SECS)
+    } else if is_room_listing(data) {
+        Some(2 * ROOM_LISTING_RESIGN_SECS + CLOCK_SKEW_TOLERANCE_SECS)
+    } else {
+        None
+    }
+}
+
+// Both well inside the listings' week, or a full shard could never drop one.
+const _: () = assert!(
+    2 * ROOM_LISTING_RESIGN_SECS + CLOCK_SKEW_TOLERANCE_SECS < CHANNEL_INDEX_TTL.as_secs() as i64
+        && 2 * FEED_LISTING_RESIGN_SECS + CLOCK_SKEW_TOLERANCE_SECS < FEED_LISTING_TTL.as_secs() as i64
+);
+
+/// Whether a record body is a room's listing in the public index, the only
+/// thing a room index shard key holds.
+pub(super) fn is_room_listing(data: &[u8]) -> bool {
+    channel_kind_from_data(data) == Some(CHANNEL_KIND_INDEX)
+}
+
 fn is_presence_departure(data: &[u8]) -> bool {
     channel_kind_from_data(data) == Some(CHANNEL_KIND_PRESENCE)
         && channel_flags_from_data(data).is_some_and(|f| f & CHANNEL_FLAG_DEPARTED != 0)
@@ -426,6 +457,10 @@ pub struct DhtRecord {
     /// one per record — each getting a fresh quota. Those are attributed to
     /// the peer we actually received them from instead.
     pub attributed_ip: Option<std::net::Ipv4Addr>,
+    /// Whether `attributed_ip` is the buddy the record's own signed trailer
+    /// names, which is what earns the relayed allowance (see
+    /// [`source_ip_class`]).
+    pub attributed_to_buddy: bool,
     /// When this record expires, as a unix timestamp.
     ///
     /// Wall clock, not [`Instant`], because this is not a local schedule: it is
@@ -464,35 +499,62 @@ pub struct DhtRecord {
     /// record as *just* republished — the exact opposite of due, and silently,
     /// on what is the common desktop case.
     pub republish_due: bool,
-    /// The keys the words of the record's name hash to, worked out the first
-    /// time a multi-keyword `FIND_VALUE` asks and kept for the life of the
-    /// record, at most [`MAX_NAME_KEYS_PER_RECORD`] of them. Never persisted:
-    /// it is derived from `data` alone.
-    pub name_keys: std::sync::OnceLock<Box<[[u8; 16]]>>,
+    /// The keys the words of the record's name hash to, at most
+    /// [`MAX_NAME_KEYS_PER_RECORD`] of them, kept from the moment the record
+    /// is stored and charged to the byte budget with it (see
+    /// [`resident_cost`]). Filled on the way in rather than on the first
+    /// multi-keyword `FIND_VALUE`, because a charge that grew after admission
+    /// would no longer match what is discharged when the record leaves.
+    ///
+    /// Kept only for the types filed under whatever key their signer chose
+    /// ([`key_binding`] 2 and 3), which are what sits under a keyword's key
+    /// for such a query to intersect; the rest live under keys derived from
+    /// their own body and work theirs out if ever asked. Never persisted: it
+    /// is derived from `data` alone.
+    pub name_keys: Option<Box<[[u8; 16]]>>,
 }
 
 /// Name keys a stored record keeps (see [`DhtRecord::name_keys`]).
 ///
-/// The cache sits outside the byte accounting every other part of a record is
-/// charged to, and a name long enough to fill its record has a few hundred
-/// words, in up to three spellings. The earliest words are kept: a record whose
-/// name carries a query's other words past them is still served, after the
-/// records known to carry them.
+/// A name long enough to fill its record has a few hundred words, in up to
+/// three spellings, and every key held is charged to the budget. The earliest
+/// words are kept: a record whose name carries a query's other words past them
+/// is still served, after the records known to carry them.
 pub const MAX_NAME_KEYS_PER_RECORD: usize = 64;
 
-impl DhtRecord {
-    /// [`Self::name_keys`], computed on first use.
-    pub fn name_keys(&self) -> &[[u8; 16]] {
-        self.name_keys.get_or_init(|| {
-            super::publish::name_bytes_from_record_data(&self.data)
-                .map(|name| {
-                    let mut keys = super::search::name_word_key_list(&String::from_utf8_lossy(name));
-                    keys.truncate(MAX_NAME_KEYS_PER_RECORD);
-                    keys.into_boxed_slice()
-                })
-                .unwrap_or_default()
+/// The name keys of record body `data` (see [`DhtRecord::name_keys`]).
+fn name_keys_of(data: &[u8]) -> Box<[[u8; 16]]> {
+    super::publish::name_bytes_from_record_data(data)
+        .map(|name| {
+            let mut keys = super::search::name_word_key_list(&String::from_utf8_lossy(name));
+            keys.truncate(MAX_NAME_KEYS_PER_RECORD);
+            keys.into_boxed_slice()
         })
+        .unwrap_or_default()
+}
+
+impl DhtRecord {
+    /// [`Self::name_keys`], or for a record that keeps none, worked out now.
+    pub fn name_keys(&self) -> std::borrow::Cow<'_, [[u8; 16]]> {
+        match &self.name_keys {
+            Some(keys) => std::borrow::Cow::Borrowed(keys),
+            None => std::borrow::Cow::Owned(name_keys_of(&self.data).into_vec()),
+        }
     }
+}
+
+/// What a resident record costs the budget: [`record_cost`] and the name keys
+/// it keeps. Fixed for the record's life, so a charge and its discharge agree.
+fn resident_cost(record: &DhtRecord) -> usize {
+    record_cost(record.data.len()) + record.name_keys.as_ref().map_or(0, |keys| std::mem::size_of_val(&**keys))
+}
+
+/// What a resident record charges its publisher's share: the record alone.
+/// The name keys are ours, worked out for lookups, and charging them to the
+/// publisher tipped a large honest library over its share on a small network,
+/// where it is evicted first everywhere at once.
+fn share_cost(record: &DhtRecord) -> usize {
+    record_cost(record.data.len())
 }
 
 /// What one publisher currently occupies.
@@ -511,6 +573,58 @@ struct PublisherLoad {
 /// counts.
 fn is_feed_head(data: &[u8]) -> bool {
     data.first() == Some(&RECORD_TYPE_FEED)
+}
+
+/// How firmly a record is bound to the key it is filed under, lowest first:
+///
+/// - `0`: only the key's owner can make it — a room's moderation, handoff,
+///   settings or key-epoch record, an owned-rooms list, a feed head;
+/// - `1`: storers check its key against its own body, though anyone may
+///   make one — a source, a room's listing or claim, a feed listing;
+/// - `2`: filed under whatever key its signer chose — a keyword record or a
+///   room presence record;
+/// - `3`: a type this build does not know.
+///
+/// A key is served lowest first, and a full key makes room for a `0` by
+/// dropping a `2` or `3`: otherwise records anyone can file anywhere buried or
+/// shut out the ones a room or feed depends on, under keys anyone can derive.
+pub(super) fn key_binding(data: &[u8]) -> u8 {
+    match data.first().copied() {
+        Some(RECORD_TYPE_FEED) => 0,
+        Some(RECORD_TYPE_CHANNEL) => match channel_kind_from_data(data) {
+            Some(
+                CHANNEL_KIND_MODERATION
+                | CHANNEL_KIND_HANDOFF
+                | CHANNEL_KIND_SETTINGS
+                | CHANNEL_KIND_EPOCH
+                | CHANNEL_KIND_OWNED_ROOMS,
+            ) => 0,
+            Some(CHANNEL_KIND_PRESENCE) => 2,
+            _ => 1,
+        },
+        Some(RECORD_TYPE_SOURCE | RECORD_TYPE_FEED_LISTING) => 1,
+        Some(RECORD_TYPE_KEYWORD) => 2,
+        _ => 3,
+    }
+}
+
+/// Whether the key holding `records` may be given up to make room for a key
+/// we do not hold yet.
+///
+/// Not when more than one publisher holds records there, nor when any is one
+/// only the key's owner can make ([`key_binding`] 0). The incoming key is one
+/// its sender was free to choose, keyword keys outright and feed-head locators
+/// for a little grinding, and a feed head lives a month; a key several
+/// publishers found worth filing under, or one a room or feed depends on, is
+/// not worth less than that. A key one identity alone holds is what a flood
+/// could have planted, and what it may displace.
+fn key_is_displaceable(records: &[DhtRecord]) -> bool {
+    let Some(first) = records.first() else {
+        return true;
+    };
+    records
+        .iter()
+        .all(|r| r.publisher_key == first.publisher_key && key_binding(&r.data) != 0)
 }
 
 /// Per-publisher occupancy of the store, kept so [`MAX_KEYS_PER_PUBLISHER`] and
@@ -714,19 +828,21 @@ pub struct DhtStore {
     /// truncated before the signed identity fields, or naming a different key
     /// in its signed body than the one it was filed under.
     unparseable_rejections: u64,
-    /// Upper bound on the XOR distance of the furthest key currently held,
-    /// or `None` when unknown.
+    /// Upper bound on the XOR distance of the furthest key the key cap may
+    /// give up ([`key_is_displaceable`]), or `None` when unknown.
     ///
     /// Exists to keep the *refusal* path O(1) once the key map is full. Without
     /// it, every record of a flood aimed at random distant keys would drive a
     /// full scan looking for a victim — turning a cap meant to bound memory
     /// into a way to burn CPU.
     ///
-    /// Only ever an over-estimate: it is set from a real scan, removals
-    /// elsewhere can only bring the true furthest closer, and inserting a new
-    /// key clears it rather than risking a value that is too small. Over-
-    /// estimating costs an extra scan; under-estimating would refuse a key we
-    /// should have taken, so the direction matters.
+    /// Only ever an over-estimate: it is set from a real scan, a new key raises
+    /// it to cover the newcomer, and removing a whole key can only bring the
+    /// true value closer. Removing *records* is the exception, since a key
+    /// several publishers held can be left to one, so every path that removes
+    /// records from a key it keeps clears this. Over-estimating costs an extra
+    /// scan; under-estimating would refuse a key we should have taken, so the
+    /// direction matters.
     furthest_key_distance: Option<[u8; 16]>,
 }
 
@@ -849,11 +965,10 @@ impl DhtStore {
             // One key slot per publisher, however many records it held here.
             let mut released: HashSet<[u8; 32]> = HashSet::new();
             for record in records {
-                let cost = record_cost(record.data.len());
-                self.bytes = self.bytes.saturating_sub(cost);
+                self.bytes = self.bytes.saturating_sub(resident_cost(&record));
                 let last = released.insert(record.publisher_key);
                 self.publisher_index
-                    .discharge(&record.publisher_key, cost, last, is_feed_head(&record.data));
+                    .discharge(&record.publisher_key, share_cost(&record), last, is_feed_head(&record.data));
             }
         }
     }
@@ -868,11 +983,12 @@ impl DhtStore {
     ///
     /// Expired keys go first, being free. Then a key held only by publishers
     /// past their share, since those slots were taken by crowding rather than
-    /// by responsibility. Otherwise the furthest key from us is given up, and
-    /// only when the incoming key is closer than it. That ordering is what
-    /// makes the eviction safe rather than a new lever: a flood of distant keys
-    /// finds nothing it is allowed to displace, while a key we are genuinely
-    /// responsible for always finds room.
+    /// by responsibility. Otherwise the furthest key from us that
+    /// [`key_is_displaceable`] is given up, and only when the incoming key is
+    /// closer than it. That ordering is what makes the eviction safe rather
+    /// than a new lever: a flood of distant keys finds nothing it is allowed to
+    /// displace, while a key we are genuinely responsible for finds room as long
+    /// as some key held by one publisher alone lies further out.
     fn make_room_for_key(&mut self, incoming: &[u8; 16], publisher: &[u8; 32]) -> bool {
         if self.entries.len() < self.key_budget {
             return true;
@@ -923,10 +1039,11 @@ impl DhtStore {
             }
         }
 
-        // Furthest key to evict, the next-furthest to seed the bound with once
-        // it is gone, and the furthest key held *only* by publishers past their
-        // share — all from a single pass. The per-record test is skipped
-        // entirely when nobody is over share, which is the normal case.
+        // Furthest displaceable key to evict, the next-furthest to seed the
+        // bound with once it is gone, and the furthest key held *only* by
+        // publishers past their share — all from a single pass. The per-record
+        // test is skipped entirely when nobody is over share, which is the
+        // normal case.
         let mut furthest: Option<([u8; 16], [u8; 16])> = None;
         let mut runner_up: Option<[u8; 16]> = None;
         let mut crowding: Option<([u8; 16], [u8; 16])> = None;
@@ -940,6 +1057,9 @@ impl DhtStore {
                 && records.iter().all(|r| index.over_share(&r.publisher_key))
             {
                 crowding = Some((*key, distance));
+            }
+            if !key_is_displaceable(records) {
+                continue;
             }
             match furthest {
                 Some((_, current)) if distance > current => {
@@ -974,6 +1094,9 @@ impl DhtStore {
         }
 
         let Some((furthest_key, furthest_distance)) = furthest else {
+            // Nothing may be displaced, so nothing may be admitted until a
+            // record leaves, which is when the bound is cleared.
+            self.furthest_key_distance = Some([0u8; 16]);
             return false;
         };
         if incoming_distance >= furthest_distance {
@@ -1062,13 +1185,12 @@ impl DhtStore {
                     break;
                 };
                 let victim = records.remove(soonest);
-                let cost = record_cost(victim.data.len());
-                self.bytes = self.bytes.saturating_sub(cost);
+                self.bytes = self.bytes.saturating_sub(resident_cost(&victim));
                 let last = !records
                     .iter()
                     .any(|r| r.publisher_key == victim.publisher_key);
                 self.publisher_index
-                    .discharge(&victim.publisher_key, cost, last, is_feed_head(&victim.data));
+                    .discharge(&victim.publisher_key, share_cost(&victim), last, is_feed_head(&victim.data));
                 dropped += 1;
             }
             if records.is_empty() {
@@ -1079,6 +1201,7 @@ impl DhtStore {
             }
         }
         if dropped > 0 {
+            self.furthest_key_distance = None;
             debug!(
                 "DHT store over budget: dropped {dropped} record(s), now {} bytes",
                 self.bytes
@@ -1282,6 +1405,9 @@ impl DhtStore {
         let expires_at_unix = aged_from.saturating_add(ttl_secs);
         let incoming_ember = ember_digest_from_record_data(&data);
         let incoming_file = file_hash_from_record_data(&data);
+        let attributed_to_buddy = attributed_ip
+            .is_some_and(|ip| super::publish::source_buddy_ip_from_record_data(&data) == Some(ip));
+        let name_keys = (key_binding(&data) >= 2).then(|| name_keys_of(&data));
         let record = DhtRecord {
             data,
             signature,
@@ -1289,10 +1415,11 @@ impl DhtStore {
             stored_at: now,
             created_at,
             attributed_ip,
+            attributed_to_buddy,
             expires_at_unix,
             last_republished: now,
             republish_due: false,
-            name_keys: std::sync::OnceLock::new(),
+            name_keys,
         };
 
         let records = self.entries.entry(key).or_default();
@@ -1339,9 +1466,14 @@ impl DhtStore {
             // that, keeping it meant the following bare republish was dropped
             // too if it landed just before the resident lapsed, and the key
             // held nothing for a whole interval.
+            // And only for a copy that differs in nothing else: one that also
+            // moves a source to a new address, or renames or resizes the file,
+            // is the publisher's current record, and keeping the old body
+            // served the old address for as long as it had left to live.
             if existing_ember != [0u8; 32]
                 && incoming_ember == [0u8; 32]
                 && records[pos].expires_at_unix > now_unix + ttl_secs / 2
+                && same_but_digest_and_date(&records[pos].data, &record.data)
             {
                 // Keep the richer digest, but still treat this as the
                 // republish it is: the publisher is alive and re-announcing,
@@ -1390,9 +1522,13 @@ impl DhtStore {
                     return false;
                 }
             }
-            let old_len = record_cost(records[pos].data.len());
-            let new_len = record_cost(record.data.len());
+            let old_len = resident_cost(&records[pos]);
+            let new_len = resident_cost(&record);
+            let (old_share, new_share) = (share_cost(&records[pos]), share_cost(&record));
             let (old_head, new_head) = (is_feed_head(&records[pos].data), is_feed_head(&record.data));
+            if key_binding(&records[pos].data) == 0 && key_binding(&record.data) != 0 {
+                self.furthest_key_distance = None;
+            }
             records[pos] = record;
             debug_assert!(
                 self.bytes >= old_len,
@@ -1402,8 +1538,8 @@ impl DhtStore {
             // A replacement, so the publisher's key count is unchanged and only
             // the byte charge moves.
             self.publisher_index
-                .discharge(&publisher_key, old_len, false, old_head);
-            self.publisher_index.charge(&publisher_key, new_len, false, new_head);
+                .discharge(&publisher_key, old_share, false, old_head);
+            self.publisher_index.charge(&publisher_key, new_share, false, new_head);
             self.enforce_byte_budget(&key);
             return true;
         }
@@ -1435,15 +1571,17 @@ impl DhtStore {
         let mut lapsed: Vec<([u8; 32], usize, bool)> = Vec::new();
         records.retain(|r| {
             if r.expires_at_unix <= now_unix {
-                let cost = record_cost(r.data.len());
-                reclaimed += cost;
-                lapsed.push((r.publisher_key, cost, is_feed_head(&r.data)));
+                reclaimed += resident_cost(r);
+                lapsed.push((r.publisher_key, share_cost(r), is_feed_head(&r.data)));
                 false
             } else {
                 true
             }
         });
         self.bytes = self.bytes.saturating_sub(reclaimed);
+        if !lapsed.is_empty() {
+            self.furthest_key_distance = None;
+        }
         // A publisher gives up its key slot once, however many of its records
         // under this key lapsed together.
         let mut released: HashSet<[u8; 32]> = HashSet::new();
@@ -1509,39 +1647,67 @@ impl DhtStore {
             return false;
         }
 
-        // A full index shard makes room for a fresher listing by dropping its
-        // stalest one, as long as that was signed before this one. Refusing
-        // newcomers outright let throwaway identities shut every new feed
-        // out of Discover for a listing's life; this way junk must be kept
-        // fresher than the feeds whose publishers re-sign theirs hourly.
+        // A full index shard, a feed's or a room's, makes room for a listing
+        // by dropping the stalest one whose publisher has stopped re-signing
+        // it (see `listing_stale_after`). Refusing newcomers outright let
+        // throwaway identities shut every new listing out of Discover for a
+        // listing's life. Dropping the stalest for anything fresher let junk
+        // re-signed more often than the honest listings keep them out, each
+        // present only briefly after its own re-sign. This way a listing is
+        // lost only by its publisher going quiet, and junk keeps only what it
+        // filled while there was room.
         //
-        // Ranked by expiry rather than by the stamp: every listing has one
-        // TTL, aged from its stamp or from when it was stored, whichever is
-        // earlier. By the stamp alone, junk stamped up to the skew tolerance
-        // ahead of the clock outranked every honest listing.
-        if records.len() >= MAX_RECORDS_PER_KEY && record.data.first() == Some(&RECORD_TYPE_FEED_LISTING) {
+        // Aged as its expiry is, from its stamp or from when it was stored,
+        // whichever is earlier: by the stamp alone, junk stamped up to the
+        // skew tolerance ahead of the clock looked fresher than it was.
+        let stale_after = listing_stale_after(&record.data);
+        if let Some(stale_after) = stale_after.filter(|_| records.len() >= MAX_RECORDS_PER_KEY) {
             let stalest = records
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| {
-                    r.data.first() == Some(&RECORD_TYPE_FEED_LISTING) && r.expires_at_unix < record.expires_at_unix
+                    let signed = r.expires_at_unix.saturating_sub(record_ttl(&r.data).as_secs() as i64);
+                    r.data.first() == record.data.first()
+                        && listing_stale_after(&r.data) == Some(stale_after)
+                        && now_unix.saturating_sub(signed) >= stale_after
+                        && r.expires_at_unix < record.expires_at_unix
                 })
                 .min_by_key(|(_, r)| r.expires_at_unix)
                 .map(|(at, _)| at);
             if let Some(at) = stalest {
                 let dropped = records.remove(at);
-                let cost = record_cost(dropped.data.len());
-                self.bytes = self.bytes.saturating_sub(cost);
+                self.bytes = self.bytes.saturating_sub(resident_cost(&dropped));
                 // The incoming record keeps its publisher on this key, so a
                 // slot of theirs is not given up for it.
                 let last = dropped.publisher_key != publisher_key
                     && !records.iter().any(|r| r.publisher_key == dropped.publisher_key);
-                self.publisher_index.discharge(&dropped.publisher_key, cost, last, is_feed_head(&dropped.data));
+                self.publisher_index.discharge(&dropped.publisher_key, share_cost(&dropped), last, is_feed_head(&dropped.data));
                 debug!(
                     "Key {} is full; dropped its stalest listing, signed at {}, for one signed at {created_at}",
                     hex::encode(key),
                     dropped.created_at
                 );
+            }
+        }
+
+        // A full key makes room for a record only its owner can make by
+        // dropping one anyone could have filed there: the newest of whichever
+        // publisher holds the most such records at the key, the likeliest to
+        // be flooding it. The owner's own records are bounded by the
+        // per-publisher cap, so this cannot be turned around.
+        if records.len() >= MAX_RECORDS_PER_KEY && key_binding(&record.data) == 0 {
+            let mut loose: HashMap<[u8; 32], usize> = HashMap::new();
+            for r in records.iter().filter(|r| key_binding(&r.data) >= 2) {
+                *loose.entry(r.publisher_key).or_default() += 1;
+            }
+            let heaviest = loose.into_iter().max_by_key(|(publisher, held)| (*held, *publisher)).map(|(p, _)| p);
+            if let Some(at) = heaviest.and_then(|p| records.iter().rposition(|r| r.publisher_key == p && key_binding(&r.data) >= 2)) {
+                let dropped = records.remove(at);
+                self.bytes = self.bytes.saturating_sub(resident_cost(&dropped));
+                let last = dropped.publisher_key != publisher_key
+                    && !records.iter().any(|r| r.publisher_key == dropped.publisher_key);
+                self.publisher_index.discharge(&dropped.publisher_key, share_cost(&dropped), last, is_feed_head(&dropped.data));
+                debug!("Key {} is full; dropped a loosely filed record for one its owner made", hex::encode(key));
             }
         }
 
@@ -1554,13 +1720,13 @@ impl DhtStore {
             return false;
         }
 
-        let cost = record_cost(record.data.len());
+        let share = share_cost(&record);
         let feed_head = is_feed_head(&record.data);
-        self.bytes += cost;
+        self.bytes += resident_cost(&record);
         records.push(record);
         // `mine` was counted a few lines up, before the push, so zero there
         // means this record is what puts the publisher on this key.
-        self.publisher_index.charge(&publisher_key, cost, mine == 0, feed_head);
+        self.publisher_index.charge(&publisher_key, share, mine == 0, feed_head);
         self.enforce_byte_budget(&key);
         true
     }
@@ -1661,9 +1827,8 @@ impl DhtStore {
             records.retain(|r| {
                 let live = r.expires_at_unix > now_unix;
                 if !live {
-                    let cost = record_cost(r.data.len());
-                    freed += cost;
-                    lapsed.push((r.publisher_key, cost, is_feed_head(&r.data)));
+                    freed += resident_cost(r);
+                    lapsed.push((r.publisher_key, share_cost(r), is_feed_head(&r.data)));
                 }
                 live
             });
@@ -1681,6 +1846,7 @@ impl DhtStore {
             self.publisher_index.discharge(&author, cost, last, feed_head);
         }
         if total_removed > 0 {
+            self.furthest_key_distance = None;
             debug!("Expired {total_removed} DHT records");
         }
         total_removed
@@ -1714,9 +1880,8 @@ impl DhtStore {
                 let ours = &r.publisher_key == publisher_key
                     && file_hashes.contains(&file_hash_from_record_data(&r.data));
                 if ours {
-                    let cost = record_cost(r.data.len());
-                    freed += cost;
-                    dropped.push((r.publisher_key, cost, is_feed_head(&r.data)));
+                    freed += resident_cost(r);
+                    dropped.push((r.publisher_key, share_cost(r), is_feed_head(&r.data)));
                 }
                 !ours
             });
@@ -1732,6 +1897,9 @@ impl DhtStore {
         self.bytes = self.bytes.saturating_sub(freed);
         for (author, cost, last, feed_head) in released {
             self.publisher_index.discharge(&author, cost, last, feed_head);
+        }
+        if total_removed > 0 {
+            self.furthest_key_distance = None;
         }
         total_removed
     }
@@ -1999,6 +2167,9 @@ impl DhtStore {
                 // Only listings under an index shard key, as `accept_record`.
                 continue;
             }
+            if crate::network::ember::channel::is_index_key(&key) && !is_room_listing(&record.data) {
+                continue;
+            }
             if self.store_record(key, record.data, record.signature, None, true) {
                 accepted += 1;
             }
@@ -2103,7 +2274,7 @@ impl DhtStore {
             let mut counted: HashSet<[u8; 32]> = HashSet::new();
             for r in records {
                 let load = expected.entry(r.publisher_key).or_default();
-                load.bytes += record_cost(r.data.len());
+                load.bytes += share_cost(r);
                 load.feed_heads += usize::from(is_feed_head(&r.data));
                 if counted.insert(r.publisher_key) {
                     load.keys += 1;
@@ -2200,9 +2371,14 @@ pub(super) const RELAYED_SOURCES_PER_IP_FACTOR: usize = 4;
 /// as a source for that file; the buddy's own source competed with them too.
 /// The relayed allowance is larger, and it still bounds what one host can
 /// claim, since what it relays is counted against it alone.
+///
+/// Only a record that came from the buddy its own trailer names is relayed.
+/// Anyone may send a firewalled record, so one stored from any other address
+/// is that address's own claim and takes its direct allowance; otherwise a
+/// host storing firewalled records from its own address got the larger one.
 fn source_ip_class(record: &DhtRecord) -> Option<(std::net::Ipv4Addr, bool)> {
     match record.attributed_ip {
-        Some(ip) => Some((ip, true)),
+        Some(ip) => Some((ip, record.attributed_to_buddy)),
         None => source_ip_from_record_data(&record.data).map(|ip| (ip, false)),
     }
 }
@@ -2255,6 +2431,12 @@ fn ember_digest_from_record_data(data: &[u8]) -> [u8; 32] {
         out.copy_from_slice(&data[33..65]);
     }
     out
+}
+
+/// Whether two record bodies differ only in their ember digest
+/// (`data[33..65]`) and creation time (`data[105..113]`).
+fn same_but_digest_and_date(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.len() >= 113 && a[..33] == b[..33] && a[65..105] == b[65..105] && a[113..] == b[113..]
 }
 
 /// The key, author and creation time a record body declares, at the fixed
@@ -2568,6 +2750,61 @@ mod tests {
         assert_eq!(store.reject_stats().key_cap, 1);
     }
 
+    /// A key we do not hold is one its sender chose, so at the cap it displaces
+    /// only a key one publisher alone holds with nothing there its owner made:
+    /// it takes the furthest such key, or is refused when every such key is
+    /// closer than it. A key held by several publishers, or holding a feed's
+    /// head, stays, until it is down to one publisher's records again.
+    #[test]
+    fn an_unknown_key_displaces_only_a_key_one_publisher_alone_holds() {
+        let mut store = DhtStore::new();
+        store.set_local_id(EmberNodeId([0u8; 16]));
+        store.set_key_budget_for_test(4);
+
+        let shared = [0xF0u8; 16];
+        let (first, _) = keypair();
+        let (second, _) = keypair();
+        let (data, sig) = signed_body(shared, &[RECORD_TYPE_KEYWORD, 0xA1], &first);
+        assert!(store.store(shared, data, sig));
+        let (data, sig) = signed_body(shared, &[RECORD_TYPE_KEYWORD, 0xA2], &second);
+        assert!(store.store(shared, data, sig));
+        let owned = [0xE0u8; 16];
+        let (owner, _) = keypair();
+        let (data, sig) = signed_body(owned, &[RECORD_TYPE_FEED, 0xB1], &owner);
+        assert!(store.store(owned, data, sig));
+        for key in [[0xD0u8; 16], [0x10u8; 16]] {
+            let (sk, _) = keypair();
+            let (data, sig) = signed_body(key, &[RECORD_TYPE_KEYWORD, 0xC1], &sk);
+            assert!(store.store(key, data, sig));
+        }
+        assert_eq!(store.key_count(), 4);
+
+        let arrive = |store: &mut DhtStore, key: [u8; 16]| {
+            let (sk, _) = keypair();
+            let (data, sig) = signed_body(key, &[RECORD_TYPE_KEYWORD, 0xD1], &sk);
+            store.store(key, data, sig)
+        };
+        assert!(arrive(&mut store, [0x01u8; 16]));
+        assert!(store.get(&[0xD0u8; 16]).is_none(), "the furthest key one publisher holds went");
+        assert!(store.get(&shared).is_some() && store.get(&owned).is_some());
+        assert!(arrive(&mut store, [0x02u8; 16]));
+        assert!(store.get(&[0x10u8; 16]).is_none());
+        assert!(!arrive(&mut store, [0x03u8; 16]), "only closer keys are left to give up");
+        assert!(store.furthest_key_distance.is_some(), "the next refusal needs no scan");
+        assert!(!arrive(&mut store, [0x04u8; 16]));
+        assert_eq!(store.key_count(), 4);
+
+        // One of the two publishers withdraws, which leaves the key to one.
+        let mut file = [0u8; 16];
+        file[0] = 0xA2;
+        assert_eq!(store.drop_publisher_files(&second.verifying_key().to_bytes(), &HashSet::from([file])), 1);
+        assert!(arrive(&mut store, [0x03u8; 16]), "a key down to one publisher is displaceable again");
+        assert!(store.get(&shared).is_none());
+        assert!(store.get(&owned).is_some(), "the feed's head is still not");
+        assert_eq!(store.key_count(), 4);
+        store.assert_publisher_index_consistent();
+    }
+
     /// Our node ID leads every frame we send, so a publisher can mint keys a
     /// hair from it by varying the low bytes — no hash to grind — and the key
     /// cap ranks purely by that distance. Once the map is full those keys make
@@ -2697,7 +2934,15 @@ mod tests {
         store.set_publisher_shares_for_test(4, usize::MAX);
 
         const BODY_LEN: usize = 1024;
-        store.set_byte_budget_for_test(record_cost(BODY_LEN) * 8);
+        // What one of these bodies costs resident, name keys and all.
+        let per_record = {
+            let mut probe = DhtStore::new();
+            let (sk, _) = keypair();
+            let (body, sig) = signed_body_sized([0x55u8; 16], BODY_LEN, &sk);
+            assert!(probe.store([0x55u8; 16], body, sig));
+            probe.byte_len()
+        };
+        store.set_byte_budget_for_test(per_record * 8);
 
         let (hog, _) = keypair();
         let mut hog_keys = Vec::new();
@@ -3081,8 +3326,9 @@ mod tests {
         let key = source_key(&file);
 
         // Fill the address's whole source allowance, from distinct publishers so
-        // only the per-IP cap is in play. Attributed, so the relayed allowance.
-        let max_per_ip = source_ip_cap(&store.scale, (ip, true));
+        // only the per-IP cap is in play. Attributed to an address no trailer
+        // names as a buddy, so its direct allowance.
+        let max_per_ip = source_ip_cap(&store.scale, (ip, false));
         for p in 0..max_per_ip {
             let sk = SigningKey::from_bytes(&[p as u8 + 1; 32]);
             let rec = SignedRecord::source(file, [0u8; 32], 100, "iso", contact, &sk);
@@ -3212,6 +3458,58 @@ mod tests {
         assert_eq!(SignedRecord::feed_head_sequence_of(&held[0].data), Some(110));
     }
 
+    /// A key anyone can derive, filled to its cap with keyword records filed
+    /// under it, still takes the record only its owner can make there, and a
+    /// responder serves that record first.
+    #[test]
+    fn a_full_key_makes_room_for_a_record_only_its_owner_can_make() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::feed::FeedHead;
+
+        let mut store = DhtStore::new();
+        let owner = SigningKey::from_bytes(&[11u8; 32]);
+        let head = FeedHead {
+            sequence: 5,
+            list_ed2k_hash: [1; 16],
+            list_size: 10,
+            list_blake3: [2; 32],
+            item_count: 1,
+            total_size: 0,
+            title: "T".into(),
+            description: String::new(),
+            deleted: false,
+        };
+        let rec = SignedRecord::feed_head_record(&[6u8; 16], &head, &owner, chrono::Utc::now().timestamp()).unwrap();
+        let key = rec.keyword_hash;
+        let mut filled = 0;
+        'fill: for p in 0..8u8 {
+            let sk = SigningKey::from_bytes(&[0x40 + p; 32]);
+            for i in 0..MAX_RECORDS_PER_PUBLISHER_PER_KEY {
+                if filled == MAX_RECORDS_PER_KEY {
+                    break 'fill;
+                }
+                let mut file = [0u8; 16];
+                file[0] = p;
+                file[1] = (i >> 8) as u8;
+                file[2] = (i & 0xFF) as u8;
+                let mut data = SignedRecord::keyword("ubuntu", file, [0u8; 32], 100, "spam.iso", &sk).data;
+                data[1..17].copy_from_slice(&key);
+                let sig = sign(&sk, &data);
+                assert!(store.store(key, data, sig));
+                filled += 1;
+            }
+        }
+        assert_eq!(store.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
+        assert!(store.store(key, rec.data.clone(), rec.signature), "the owner's record is not shut out");
+        let held = store.get_live(&key);
+        assert_eq!(held.len(), MAX_RECORDS_PER_KEY);
+        assert!(held.iter().any(|r| r.data == rec.data));
+        let mut served = held.clone();
+        served.sort_by_key(|r| key_binding(&r.data));
+        assert_eq!(served[0].data, rec.data, "served ahead of the keyword records");
+        store.assert_publisher_index_consistent();
+    }
+
     /// One identity holds at most so many feed heads across every key, each
     /// feed's head having a key of its own; a head replacing one it holds is
     /// always taken, a lapsed one frees its place, and our own are not
@@ -3272,11 +3570,12 @@ mod tests {
         store.assert_publisher_index_consistent();
     }
 
-    /// A full index shard drops its stalest listing for a fresher one, so
-    /// junk that fills it must be kept fresher than real feeds, re-signed
-    /// hourly, to keep them out; one staler than all it holds is refused.
+    /// A full index shard drops its stalest listing for a fresher one only
+    /// once that listing's publisher has stopped re-signing it, so junk
+    /// re-signed faster than real feeds cannot push out the listings their
+    /// publishers re-sign hourly; one staler than all it holds is refused.
     #[test]
-    fn a_full_feed_index_shard_drops_its_stalest_listing() {
+    fn a_full_feed_index_shard_drops_only_a_listing_its_publisher_stopped_re_signing() {
         use super::super::publish::SignedRecord;
         use crate::network::ember::feed::{feed_index_key, feed_index_shard, FeedHead};
 
@@ -3320,33 +3619,44 @@ mod tests {
                 }
             }
         };
-        // The first stored is the stalest.
+        // The first stored is the stalest, and every one was signed within the
+        // hour, as a running publisher's is.
         fill(&mut store, &|stored| now - 3600 + stored as i64);
         let key = feed_index_key(0);
         assert_eq!(store.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
 
         let newcomer = SigningKey::from_bytes(&[0xEE; 32]);
         let salt = shard_salts(&newcomer.verifying_key().to_bytes(), 1)[0];
-        let staler = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now - 7200).unwrap();
-        assert!(!store.store(staler.keyword_hash, staler.data, staler.signature), "staler than every listing held");
         let fresh = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now).unwrap();
+        assert!(
+            !store.store(fresh.keyword_hash, fresh.data.clone(), fresh.signature),
+            "a fresher listing does not push out one re-signed on schedule"
+        );
+
+        // Three hours on, none of them re-signed since: two re-signs missed.
+        for resident in store.entries.get_mut(&key).unwrap() {
+            resident.expires_at_unix -= 3 * 3600;
+        }
+        let staler = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now - 5 * 3600).unwrap();
+        assert!(!store.store(staler.keyword_hash, staler.data, staler.signature), "staler than every listing held");
         assert!(store.store(fresh.keyword_hash, fresh.data, fresh.signature), "a fresher listing makes room");
         let held = store.get(&key).unwrap();
         assert_eq!(held.len(), MAX_RECORDS_PER_KEY);
         assert!(held.iter().any(|r| r.publisher_key == newcomer.verifying_key().to_bytes()));
         assert!(!held.iter().any(|r| r.created_at == now - 3600), "the stalest listing went");
+        store.assert_publisher_index_consistent();
 
         // Junk stamped ahead of the clock, as far as the skew tolerance
-        // allows, ranks from when it was stored: a listing signed since
-        // still makes room.
+        // allows, is aged from when it was stored: kept while that is recent,
+        // given up once it is as old as an unattended listing.
         let mut ahead = DhtStore::new();
         fill(&mut ahead, &|_| now + 1800);
-        for resident in ahead.entries.get_mut(&key).unwrap() {
-            // Stored a minute ago.
-            resident.expires_at_unix -= 60;
-        }
         let since = SignedRecord::feed_listing_record(&salt, &head, false, &newcomer, now - 30).unwrap();
-        assert!(ahead.store(since.keyword_hash, since.data, since.signature), "signed after the junk was stored");
+        assert!(!ahead.store(since.keyword_hash, since.data.clone(), since.signature), "stored just now");
+        for resident in ahead.entries.get_mut(&key).unwrap() {
+            resident.expires_at_unix -= 3 * 3600;
+        }
+        assert!(ahead.store(since.keyword_hash, since.data, since.signature), "stored three hours ago");
         assert_eq!(ahead.get(&key).map(|r| r.len()), Some(MAX_RECORDS_PER_KEY));
     }
 
@@ -3397,6 +3707,88 @@ mod tests {
         let mut restored = DhtStore::new();
         assert_eq!(restored.restore(saved), 1, "the listing alone");
         assert_eq!(restored.get(&key).unwrap()[0].data.first(), Some(&RECORD_TYPE_FEED_LISTING));
+    }
+
+    /// The same for a room index shard key: a record of any other type saved
+    /// under one does not come back from disk.
+    #[test]
+    fn a_room_index_key_restores_only_room_listings() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let room = ChannelIdentity::from_seed(&[0x53; 32]);
+        let listing = SignedRecord::channel_index("Lobby", room.channel_id, room.pubkey, false, None, &room.signing_key);
+        let key = listing.keyword_hash;
+        let sk = SigningKey::from_bytes(&[0x54u8; 32]);
+        let word = SignedRecord::keyword("lobby", [0x33; 16], [0u8; 32], 100, "lobby.iso", &sk);
+        let mut misfiled = word.data.clone();
+        misfiled[1..17].copy_from_slice(&key);
+        let misfiled_sig = sign(&sk, &misfiled);
+        let saved = [(misfiled, misfiled_sig, sk.verifying_key().to_bytes()), (listing.data, listing.signature, room.pubkey)]
+            .into_iter()
+            .map(|(data, signature, publisher_key)| PersistedRecord {
+                key,
+                data,
+                signature,
+                publisher_key,
+                created_at: now_ts(),
+                attributed_ip: None,
+            })
+            .collect();
+        let mut restored = DhtStore::new();
+        assert_eq!(restored.restore(saved), 1, "the room's listing alone");
+        assert!(is_room_listing(&restored.get(&key).unwrap()[0].data));
+    }
+
+    /// A full room index shard gives up a listing for another only once its
+    /// owner has missed two of its six-hourly re-signs, so rooms whose owners
+    /// are online are never pushed out by listings signed more often.
+    #[test]
+    fn a_full_room_index_shard_drops_only_a_listing_its_owner_stopped_re_signing() {
+        use super::super::publish::SignedRecord;
+        use crate::network::ember::channel::{index_key, index_shard, ChannelIdentity};
+
+        let now = now_ts();
+        let rooms = |from: u32, n: usize| -> Vec<ChannelIdentity> {
+            (from..)
+                .map(|i| {
+                    let mut seed = [0x61u8; 32];
+                    seed[..4].copy_from_slice(&i.to_le_bytes());
+                    ChannelIdentity::from_seed(&seed)
+                })
+                .filter(|room| index_shard(&room.channel_id) == 0)
+                .take(n)
+                .collect()
+        };
+        let listing = |room: &ChannelIdentity, at: i64| {
+            let rec = SignedRecord::channel_index("Room", room.channel_id, room.pubkey, false, None, &room.signing_key);
+            redated(&rec, &room.signing_key, at)
+        };
+        let key = index_key(0);
+        let mut store = DhtStore::new();
+        for (i, room) in rooms(0, MAX_RECORDS_PER_KEY).iter().enumerate() {
+            let (data, sig) = listing(room, now - 3600 + i as i64);
+            assert!(store.store(key, data, sig), "filling the shard");
+        }
+        let newcomer = &rooms(1_000_000, 1)[0];
+        let (fresh, fresh_sig) = listing(newcomer, now);
+        assert!(!store.store(key, fresh.clone(), fresh_sig), "every owner re-signed within the hour");
+
+        // Eleven hours on: one pass missed, which is not yet two.
+        for resident in store.entries.get_mut(&key).unwrap() {
+            resident.expires_at_unix -= 11 * 3600;
+        }
+        assert!(!store.store(key, fresh.clone(), fresh_sig), "one missed re-sign is not stale");
+
+        for resident in store.entries.get_mut(&key).unwrap() {
+            resident.expires_at_unix -= 3600;
+        }
+        assert!(store.store(key, fresh, fresh_sig), "two missed, and the stalest makes way");
+        let held = store.get(&key).unwrap();
+        assert_eq!(held.len(), MAX_RECORDS_PER_KEY);
+        assert!(held.iter().any(|r| r.publisher_key == newcomer.pubkey));
+        assert!(!held.iter().any(|r| r.created_at == now - 3600), "the stalest listing went");
+        store.assert_publisher_index_consistent();
     }
 
     #[test]
@@ -3531,7 +3923,7 @@ mod tests {
     /// bounded.
     #[test]
     fn a_buddys_relayed_sources_have_their_own_larger_allowance() {
-        use super::super::publish::{SignedRecord, SourceContact};
+        use super::super::publish::{SignedRecord, SourceBuddy, SourceContact};
         use crate::network::ember::SOURCE_FLAG_FIREWALLED;
         use std::net::Ipv4Addr;
 
@@ -3549,12 +3941,23 @@ mod tests {
             noise_pub: [i; 32],
             ..Default::default()
         };
+        let behind_buddy = |i: u8| SourceContact {
+            callback_token: Some([0x55; 16]),
+            buddy: Some(SourceBuddy {
+                ip: buddy,
+                udp_port: 4672,
+                noise_pub: [0x66; 32],
+                ed25519_pub: [0x77; 32],
+                endorsed_until: 1_900_000_000,
+                endorsement: [0x88; 64],
+            }),
+            ..contact(Ipv4Addr::new(10, 0, 0, i + 1), SOURCE_FLAG_FIREWALLED, i)
+        };
 
         let mut relayed = 0;
         for i in 0..(cap * RELAYED_SOURCES_PER_IP_FACTOR + 3) as u8 {
             let sk = SigningKey::from_bytes(&[i.wrapping_add(90); 32]);
-            let behind = contact(Ipv4Addr::new(10, 0, 0, i + 1), SOURCE_FLAG_FIREWALLED, i);
-            let rec = SignedRecord::source(file_hash, [0u8; 32], 100, "shared.iso", behind, &sk);
+            let rec = SignedRecord::source(file_hash, [0u8; 32], 100, "shared.iso", behind_buddy(i), &sk);
             if store.store_attributed(key, rec.data.clone(), rec.signature, Some(buddy)) {
                 relayed += 1;
             }
@@ -3567,6 +3970,72 @@ mod tests {
             store.store(key, direct.data.clone(), direct.signature),
             "the buddy's own source is not crowded out by those it relays"
         );
+    }
+
+    /// Anyone may send a firewalled record, so only one arriving from the buddy
+    /// its trailer names is relayed. From any other address, its own or one
+    /// naming somebody else as buddy, it is that address's claim and takes the
+    /// direct allowance, which its own direct sources share.
+    #[test]
+    fn firewalled_sources_not_sent_by_their_buddy_take_the_direct_allowance() {
+        use super::super::publish::{SignedRecord, SourceBuddy, SourceContact};
+        use crate::network::ember::SOURCE_FLAG_FIREWALLED;
+        use std::net::Ipv4Addr;
+
+        let mut store = DhtStore::new();
+        store.set_scale(scale::NetworkScale::Established);
+        let cap = scale::NetworkScale::Established.max_sources_per_ip();
+        let file_hash = [0x7Au8; 16];
+        let key = super::super::publish::source_key(&file_hash);
+        let sender = Ipv4Addr::new(198, 51, 8, 1);
+        let named = Ipv4Addr::new(198, 51, 9, 1);
+        let firewalled = |i: u8, buddy: Option<Ipv4Addr>| SourceContact {
+            ip: Ipv4Addr::new(10, 0, 0, i + 1),
+            tcp_port: 4662,
+            udp_port: 4672,
+            flags: SOURCE_FLAG_FIREWALLED,
+            noise_pub: [i; 32],
+            callback_token: buddy.map(|_| [0x55; 16]),
+            buddy: buddy.map(|ip| SourceBuddy {
+                ip,
+                udp_port: 4672,
+                noise_pub: [0x66; 32],
+                ed25519_pub: [0x77; 32],
+                endorsed_until: 1_900_000_000,
+                endorsement: [0x88; 64],
+            }),
+            ..Default::default()
+        };
+
+        let mut stored = 0;
+        for i in 0..(cap * RELAYED_SOURCES_PER_IP_FACTOR) as u8 {
+            let sk = SigningKey::from_bytes(&[i.wrapping_add(150); 32]);
+            let buddy = if i % 2 == 0 { None } else { Some(named) };
+            let rec = SignedRecord::source(file_hash, [0u8; 32], 100, "fw.iso", firewalled(i, buddy), &sk);
+            if store.store_attributed(key, rec.data.clone(), rec.signature, Some(sender)) {
+                stored += 1;
+            }
+        }
+        assert_eq!(stored, cap, "one host's worth, however the trailers read");
+        assert!(store.get(&key).unwrap().iter().all(|r| !r.attributed_to_buddy));
+
+        // The direct sources at that address are already spent by those claims.
+        let own = SigningKey::from_bytes(&[0xED; 32]);
+        let direct = SignedRecord::source(
+            file_hash,
+            [0u8; 32],
+            100,
+            "fw.iso",
+            SourceContact { ip: sender, flags: 0, ..firewalled(0xED, None) },
+            &own,
+        );
+        assert!(!store.store(key, direct.data.clone(), direct.signature));
+
+        // The buddy the trailers name still relays at its own allowance.
+        let relayed = SigningKey::from_bytes(&[0xEC; 32]);
+        let rec = SignedRecord::source(file_hash, [0u8; 32], 100, "fw.iso", firewalled(0xEC, Some(named)), &relayed);
+        assert!(store.store_attributed(key, rec.data.clone(), rec.signature, Some(named)));
+        assert!(store.get(&key).unwrap().iter().any(|r| r.attributed_to_buddy));
     }
 
     /// Store from one address, then replace from another: the replacement
@@ -4674,10 +5143,11 @@ mod tests {
                 .unwrap_or_else(Instant::now),
             created_at: now_ts() - 100,
             attributed_ip: None,
+            attributed_to_buddy: false,
             expires_at_unix: now_ts() - 1,
             last_republished: Instant::now(),
             republish_due: false,
-            name_keys: std::sync::OnceLock::new(),
+            name_keys: None,
         };
         store.entries.entry(key).or_default().push(record);
 
@@ -4721,6 +5191,49 @@ mod tests {
         );
         assert!(store.store(key, later.clone(), sign(&sk, &later)));
         assert_eq!(store.get(&key).unwrap()[0].data, later);
+    }
+
+    /// A bare republish keeps the richer body only when it says nothing else
+    /// new. A source that moved to another address as its digest went to zero
+    /// is the publisher's current record, and keeping the old body served the
+    /// old address for hours while the new one was acknowledged.
+    #[test]
+    fn a_zero_digest_republish_that_moves_a_source_replaces_it() {
+        use super::super::publish::{SignedRecord, SourceContact};
+        use std::net::Ipv4Addr;
+
+        let mut store = DhtStore::new();
+        let sk = SigningKey::from_bytes(&[0x6A; 32]);
+        let contact = |ip| SourceContact {
+            ip,
+            tcp_port: 4662,
+            udp_port: 4672,
+            noise_pub: [6; 32],
+            ..Default::default()
+        };
+        let was = Ipv4Addr::new(198, 51, 100, 1);
+        let now_at = Ipv4Addr::new(198, 51, 100, 2);
+        let rich = SignedRecord::source([3; 16], [9; 32], 10, "s.iso", contact(was), &sk);
+        assert!(store.store(rich.keyword_hash, rich.data.clone(), rich.signature));
+        let moved = SignedRecord::source([3; 16], [0; 32], 10, "s.iso", contact(now_at), &sk);
+        let (data, sig) = redated(&moved, &sk, rich.timestamp + 120);
+        assert!(store.store(rich.keyword_hash, data.clone(), sig));
+        let held = store.get(&rich.keyword_hash).unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].data, data);
+        assert_eq!(source_ip_from_record_data(&held[0].data), Some(now_at));
+
+        // The same address, bare, still keeps the digest.
+        let bare = SignedRecord::source([3; 16], [0; 32], 10, "s.iso", contact(now_at), &sk);
+        let (rich_again, rich_sig) = redated(
+            &SignedRecord::source([3; 16], [9; 32], 10, "s.iso", contact(now_at), &sk),
+            &sk,
+            rich.timestamp + 240,
+        );
+        assert!(store.store(rich.keyword_hash, rich_again.clone(), rich_sig));
+        let (bare_data, bare_sig) = redated(&bare, &sk, rich.timestamp + 360);
+        assert!(store.store(rich.keyword_hash, bare_data, bare_sig));
+        assert_eq!(store.get(&rich.keyword_hash).unwrap()[0].data, rich_again);
     }
 
     /// A future-dated record is aged from our clock, so the skew it is allowed
@@ -4870,22 +5383,57 @@ mod tests {
             &format!("{words}tail.iso"),
             &sk,
         );
-        let record = DhtRecord {
-            data: rec.data.clone(),
-            signature: rec.signature,
-            publisher_key: sk.verifying_key().to_bytes(),
-            stored_at: Instant::now(),
-            created_at: now_ts(),
-            attributed_ip: None,
-            expires_at_unix: now_ts() + 3600,
-            last_republished: Instant::now(),
-            republish_due: false,
-            name_keys: std::sync::OnceLock::new(),
-        };
+        let mut store = DhtStore::new();
+        assert!(store.store(rec.keyword_hash, rec.data.clone(), rec.signature));
+        let record = &store.get(&rec.keyword_hash).unwrap()[0];
+        assert_eq!(record.name_keys.as_ref().map(|k| k.len()), Some(MAX_NAME_KEYS_PER_RECORD), "filled on the way in");
         let keys = record.name_keys();
         assert_eq!(keys.len(), MAX_NAME_KEYS_PER_RECORD);
         assert!(keys.contains(&super::super::search::keyword_hash("word000")));
         assert!(keys.contains(&super::super::search::keyword_hash("word063")));
         assert!(!keys.contains(&super::super::search::keyword_hash("word064")));
+    }
+
+    /// The name keys a record keeps are charged to the byte budget with it, and
+    /// discharged with it, so a store of long-named records holds what its
+    /// budget says rather than several times that.
+    #[test]
+    fn a_records_name_keys_are_charged_to_the_byte_budget() {
+        use super::super::publish::{SignedRecord, SourceContact};
+
+        let sk = SigningKey::from_bytes(&[0x4F; 32]);
+        let words: String = (0..40).map(|i| format!("w{i:02} ")).collect();
+        let name = format!("{words}x.iso");
+        let rec = SignedRecord::keyword("w00", [1; 16], [0; 32], 1, &name, &sk);
+        let mut store = DhtStore::new();
+        assert!(store.store(rec.keyword_hash, rec.data.clone(), rec.signature));
+        let held = store.get(&rec.keyword_hash).unwrap()[0].name_keys.as_ref().map_or(0, |k| k.len());
+        assert!(held >= 40);
+        assert_eq!(store.byte_len(), record_cost(rec.data.len()) + held * 16);
+        store.assert_publisher_index_consistent();
+
+        // A record under a key derived from its own body keeps none, and
+        // still answers when asked.
+        let contact = SourceContact {
+            ip: std::net::Ipv4Addr::new(198, 51, 100, 2),
+            tcp_port: 4662,
+            udp_port: 4672,
+            noise_pub: [2; 32],
+            ..Default::default()
+        };
+        let source = SignedRecord::source([2; 16], [0; 32], 1, &name, contact, &sk);
+        assert!(store.store(source.keyword_hash, source.data.clone(), source.signature));
+        let kept = &store.get(&source.keyword_hash).unwrap()[0];
+        assert!(kept.name_keys.is_none());
+        assert_eq!(kept.name_keys().len(), held);
+        assert_eq!(
+            store.byte_len(),
+            record_cost(rec.data.len()) + held * 16 + record_cost(source.data.len())
+        );
+
+        store.lapse_for_test(&rec.keyword_hash, 0);
+        store.expire();
+        assert_eq!(store.byte_len(), record_cost(source.data.len()), "and given back when it goes");
+        store.assert_publisher_index_consistent();
     }
 }

@@ -3,7 +3,7 @@
 use super::*;
 
 pub(in crate::network) async fn on_a4af_tick(
-    udp_socket: &Arc<UdpSocket>,
+    _udp_socket: &Arc<UdpSocket>,
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
@@ -107,12 +107,20 @@ pub(in crate::network) async fn on_a4af_tick(
         for pfs in state.per_file_sources.values() {
             for src in &pfs.sources {
                 let addr = SocketAddr::new(src.ip.into(), src.tcp_port);
-                if matches!(src.state, ed2k::sources::DownloadSourceState::NoneNeededParts) {
-                    if seen_dry.insert(addr) {
-                        dry_sources.push((addr, pfs.file_hash));
+                match src.state {
+                    ed2k::sources::DownloadSourceState::NoneNeededParts => {
+                        if seen_dry.insert(addr) {
+                            dry_sources.push((addr, pfs.file_hash));
+                        }
                     }
-                } else {
-                    known_for.entry(addr).or_default().push(pfs.file_hash);
+                    // Already working for that file, which is where a swap
+                    // would send it. Offered anyway, a peer kept cooled on
+                    // the file it was swapped away from was swapped again
+                    // on every tick.
+                    ed2k::sources::DownloadSourceState::Connecting
+                    | ed2k::sources::DownloadSourceState::OnQueue { .. }
+                    | ed2k::sources::DownloadSourceState::Downloading => {}
+                    _ => known_for.entry(addr).or_default().push(pfs.file_hash),
                 }
             }
         }
@@ -235,8 +243,10 @@ pub(in crate::network) async fn on_a4af_tick(
                 );
             }
 
-            // Move source between per-file source lists so the
-            // persistent reask state follows the swap.
+            // Add the source to the target's per-file list. The old file
+            // keeps its row, cooled off, as eMule keeps a swapped client in
+            // that file's A4AF list: the peer still has it, and deleting the
+            // row made the old file forget a source it may need again.
             if let std::net::IpAddr::V4(v4) = swap.peer_addr.ip() {
                 let port = swap.peer_addr.port();
                 let mut moved_udp_port = 0u16;
@@ -248,7 +258,7 @@ pub(in crate::network) async fn on_a4af_tick(
                             .find(|s| s.ip == v4 && s.tcp_port == port)
                             .map(|s| s.udp_port)
                             .unwrap_or(0);
-                        pfs.sources.retain(|s| !(s.ip == v4 && s.tcp_port == port));
+                        pfs.cool_after_a4af_swap(v4, port);
                         break;
                     }
                 }
@@ -269,7 +279,6 @@ pub(in crate::network) async fn on_a4af_tick(
                 };
                 {
                     let mut sm = source_manager.write().await;
-                    sm.remove_source(&swap.from_file, &v4, port);
                     // Preserve inbound session-only ports across
                     // A4AF moves — registering them as ordinary
                     // reconnectable HighID rows would reintroduce
@@ -305,63 +314,16 @@ pub(in crate::network) async fn on_a4af_tick(
                         );
                     }
                 }
-                let mut complete_sources = 0u16;
+                // No UDP reask here: we are not on this peer's queue for the
+                // target file yet, so an `OP_REASKFILEPING` for it can only be
+                // answered with "file not found" or not at all. The worker's
+                // TCP file request is what queues us.
                 for pfs in state.per_file_sources.values_mut() {
                     if pfs.file_hash == swap.to_file {
                         if pfs.add_source_full(v4, port, moved_udp_port) {
                             state.ember_payload_dirty = true;
                         }
-                        complete_sources = pfs.complete_source_count();
                         break;
-                    }
-                }
-                if moved_udp_port != 0 {
-                    let file_size = state
-                        .pending_downloads
-                        .values()
-                        .find(|pd| pd.file_hash == target_hex)
-                        .map(|pd| pd.file_size)
-                        .or_else(|| {
-                            let mgr = transfer_manager.try_read().ok()?;
-                            mgr.active
-                                .values()
-                                .chain(mgr.queue.iter())
-                                .find(|t| t.file_hash == target_hex)
-                                .map(|t| t.total_size)
-                        })
-                        .unwrap_or(0);
-                    if file_size > 0 {
-                        let Some(reask_payload) = ed2k::messages::build_reask_file_ping(
-                            &swap.to_file,
-                            file_size,
-                            complete_sources,
-                            None,
-                        ) else {
-                            warn!("Skipping swapped UDP reask: file exceeds standard ED2K wire part-count limit");
-                            continue;
-                        };
-                        let mut pkt = vec![OP_EMULEPROT, ed2k::messages::OP_REASKFILEPING];
-                        pkt.extend_from_slice(&reask_payload);
-                        let addr = SocketAddr::new(v4.into(), moved_udp_port);
-                        let now_ts = std::time::Instant::now();
-                        // Left to the regular reask cycle while the peer
-                        // still owes an answer about another file.
-                        if crate::network::state::udp_reask_awaits_other_file(
-                            &state.pending_udp_reasks,
-                            (v4, moved_udp_port),
-                            &swap.to_file,
-                            now_ts,
-                        ) {
-                            continue;
-                        }
-                        // Both reply branches resolve the file through
-                        // this map, so a reask that skips it has its
-                        // answer discarded as unsolicited — the queue
-                        // rank and state this swap just asked for.
-                        state
-                            .pending_udp_reasks
-                            .insert((v4, moved_udp_port), (swap.to_file, now_ts));
-                        let _ = udp_socket.send_to(&pkt, addr).await;
                     }
                 }
             }

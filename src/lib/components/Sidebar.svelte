@@ -26,7 +26,7 @@
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
   import { appSettings } from '$lib/stores/settings';
-  import { runLatestUndo, toastError } from '$lib/stores/toast';
+  import { reloadAfterToastActions, runLatestUndo, toastError } from '$lib/stores/toast';
   import { openSupportPage } from '$lib/api/settings';
   import { translateError } from '$lib/i18n';
   import { onMount } from 'svelte';
@@ -173,14 +173,16 @@
 
   function downloadsTitle(n: number): string {
     return plural(n, {
-      one: m.sidebar_active_downloads_one,
+      one: () => m.sidebar_active_downloads_one({ count: n }),
+      oneShowsCount: true,
       few: () => m.sidebar_active_downloads_few({ count: n }),
       other: () => m.sidebar_active_downloads_other({ count: n }),
     });
   }
   function uploadsTitle(n: number): string {
     return plural(n, {
-      one: m.sidebar_active_uploads_one,
+      one: () => m.sidebar_active_uploads_one({ count: n }),
+      oneShowsCount: true,
       few: () => m.sidebar_active_uploads_few({ count: n }),
       other: () => m.sidebar_active_uploads_other({ count: n }),
     });
@@ -190,21 +192,6 @@
     if (downloads > 0) parts.push(downloadsTitle(downloads));
     if (uploads > 0) parts.push(uploadsTitle(uploads));
     return parts.join(' · ');
-  }
-
-  function chatsAriaLabel(open: boolean, unread: number): string {
-    const mod = shortcutModSymbol();
-    if (unread <= 0) return open ? m.sidebar_chats_close({ mod }) : m.sidebar_chats_open({ mod });
-    if (open) {
-      return plural(unread, {
-        one: () => m.sidebar_chats_close_unread_one({ mod }),
-        other: () => m.sidebar_chats_close_unread_other({ mod, count: unread }),
-      });
-    }
-    return plural(unread, {
-      one: () => m.sidebar_chats_open_unread_one({ mod }),
-      other: () => m.sidebar_chats_open_unread_other({ mod, count: unread }),
-    });
   }
 
   // Pending incoming friend-request count. Mirrors the transfers badge
@@ -223,7 +210,8 @@
     if (requests > 0) {
       parts.push(
         plural(requests, {
-          one: m.sidebar_friend_requests_title_one,
+          one: () => m.sidebar_friend_requests_title_one({ count: requests }),
+          oneShowsCount: true,
           few: () => m.sidebar_friend_requests_title_few({ count: requests }),
           other: () => m.sidebar_friend_requests_title_other({ count: requests }),
         }),
@@ -232,7 +220,8 @@
     if (offers > 0) {
       parts.push(
         plural(offers, {
-          one: m.sidebar_friend_offers_title_one,
+          one: () => m.sidebar_friend_offers_title_one({ count: offers }),
+          oneShowsCount: true,
           few: () => m.sidebar_friend_offers_title_few({ count: offers }),
           other: () => m.sidebar_friend_offers_title_other({ count: offers }),
         }),
@@ -264,7 +253,8 @@
     if (unread > 0) {
       parts.push(
         plural(unread, {
-          one: m.channels_unread_title_one,
+          one: () => m.channels_unread_title_one({ count: unread }),
+          oneShowsCount: true,
           few: () => m.channels_unread_title_few({ count: unread }),
           other: () => m.channels_unread_title_other({ count: unread }),
         }),
@@ -273,7 +263,8 @@
     if (offers > 0) {
       parts.push(
         plural(offers, {
-          one: m.channels_offers_title_one,
+          one: () => m.channels_offers_title_one({ count: offers }),
+          oneShowsCount: true,
           few: () => m.channels_offers_title_few({ count: offers }),
           other: () => m.channels_offers_title_other({ count: offers }),
         }),
@@ -295,7 +286,7 @@
     const item = navItems.find((i) => i.href === href);
     if (item?.aliases?.includes(current)) return;
     goto(href).catch(() => {
-      window.location.href = href;
+      reloadAfterToastActions(() => { window.location.href = href; });
     });
   }
 
@@ -434,16 +425,20 @@
         <ul class="nav-items">
     {#each run.entries as { item, index } (item.id)}
       {@const digit = navShortcutDigit(index)}
+      {@const settings = item.id === 'settings'}
       <li>
         <a
           href={item.href}
           class:active={isActive(item, $page.url.pathname)}
           aria-current={isActive(item, $page.url.pathname) ? 'page' : undefined}
-          aria-keyshortcuts={digit ? `Alt+${digit}` : undefined}
+          aria-keyshortcuts={[digit ? `Alt+${digit}` : '', settings ? `${shortcutModAria()}+,` : '']
+            .filter(Boolean).join(' ') || undefined}
           onclick={(e: MouseEvent) => navigate(e, item.href)}
-          title={digit
-            ? m.sidebar_nav_with_shortcut_title({ label: item.label(), n: digit })
-            : item.label()}
+          title={settings
+            ? m.sidebar_nav_with_mod_title({ label: item.label(), mod: shortcutModSymbol() })
+            : digit
+              ? m.sidebar_nav_with_shortcut_title({ label: item.label(), n: digit })
+              : item.label()}
         >
           <span class="nav-icon" aria-hidden="true">
             {#if item.id === 'kad'}
@@ -521,42 +516,49 @@
             {/if}
           </span>
           <span class="nav-label">{item.label()}</span>
-          {#if item.id === 'channels' || item.id === 'friends' || item.id === 'feeds'}
+          {#if item.id === 'friends' || item.id === 'feeds'}
             <span class="beta-badge">{m.common_beta()}</span>
           {/if}
+          <!-- Each count is drawn as a bare number and spoken as what it
+               counts: a link read as "Transfers 2 1" says nothing. -->
           {#if item.id === 'feeds' && $totalFeedUnread > 0}
-            <span class="nav-badge" title={m.feeds_unread_title({ count: $totalFeedUnread })}>{navCount($totalFeedUnread)}</span>
+            {@const what = m.feeds_unread_title({ count: $totalFeedUnread })}
+            <span class="nav-badge" title={what}><span aria-hidden="true">{navCount($totalFeedUnread)}</span><span class="sr-only">{what}</span></span>
           {/if}
           {#if item.id === 'transfers' && activeTransferCount > 0}
             <span class="nav-transfer-counts">
               {#if activeDownloadCount > 0}
                 <span class="tc-chip tc-down" title={downloadsTitle(activeDownloadCount)}>
-                  <span class="tc-arrow" aria-hidden="true">↓</span>{navCount(activeDownloadCount)}
+                  <span class="tc-arrow" aria-hidden="true">↓</span><span aria-hidden="true">{navCount(activeDownloadCount)}</span>
+                  <span class="sr-only">{downloadsTitle(activeDownloadCount)}</span>
                 </span>
               {/if}
               {#if activeUploadCount > 0}
                 <span class="tc-chip tc-up" title={uploadsTitle(activeUploadCount)}>
-                  <span class="tc-arrow" aria-hidden="true">↑</span>{navCount(activeUploadCount)}
+                  <span class="tc-arrow" aria-hidden="true">↑</span><span aria-hidden="true">{navCount(activeUploadCount)}</span>
+                  <span class="sr-only">{uploadsTitle(activeUploadCount)}</span>
                 </span>
               {/if}
             </span>
             <span
               class="nav-badge nav-badge-collapsed"
               title={transfersTitle(activeDownloadCount, activeUploadCount)}
-            >{navCount(activeTransferCount)}</span>
+            ><span aria-hidden="true">{navCount(activeTransferCount)}</span><span class="sr-only">{transfersTitle(activeDownloadCount, activeUploadCount)}</span></span>
           {/if}
           {#if item.id === 'friends' && pendingFriendInboxCount > 0}
+            {@const what = friendInboxTitle(pendingFriendRequestCount, pendingFileOfferCount)}
             <span
               class="nav-badge nav-badge-attention"
-              title={friendInboxTitle(pendingFriendRequestCount, pendingFileOfferCount)}
-            >{navCount(pendingFriendInboxCount)}</span>
+              title={what}
+            ><span aria-hidden="true">{navCount(pendingFriendInboxCount)}</span><span class="sr-only">{what}</span></span>
           {/if}
           {#if item.id === 'channels' && channelInboxCount > 0}
+            {@const what = channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount, dmRequestCount)}
             <span
               class="nav-badge"
               class:nav-badge-attention={awaitingChannelOfferCount > 0 || dmRequestCount > 0}
-              title={channelInboxTitle(totalUnreadChannels, awaitingChannelOfferCount, dmRequestCount)}
-            >{navCount(channelInboxCount)}</span>
+              title={what}
+            ><span aria-hidden="true">{navCount(channelInboxCount)}</span><span class="sr-only">{what}</span></span>
           {/if}
         </a>
       </li>
@@ -567,48 +569,53 @@
   </div>
 
   <div class="sidebar-footer">
+    <!-- Chats is opened as often as any page, so it is drawn as one: same row,
+         same icon column, same count pill. It stays a toggle for the dock
+         rather than a link, which `aria-pressed` carries, so its name stays
+         "Chats" either way; only the tooltip says Open or Close. -->
     <button
       type="button"
-      class="about-btn chats-btn"
+      class="chats-btn"
       class:active={$chatDockOpen}
       onclick={toggleChatDock}
       title={$chatDockOpen
         ? m.sidebar_chats_close({ mod: shortcutModSymbol() })
         : m.sidebar_chats_open({ mod: shortcutModSymbol() })}
-      aria-label={chatsAriaLabel($chatDockOpen, totalUnreadChats)}
       aria-pressed={$chatDockOpen}
       aria-keyshortcuts={`${shortcutModAria()}+/`}
     >
-      <span class="about-icon" aria-hidden="true">
+      <span class="nav-icon" aria-hidden="true">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M3 5a2 2 0 012-2h10a2 2 0 012 2v7a2 2 0 01-2 2h-5l-4 3v-3H5a2 2 0 01-2-2V5z"/>
           <line x1="6.5" y1="8" x2="13.5" y2="8"/>
           <line x1="6.5" y1="10.5" x2="11.5" y2="10.5"/>
         </svg>
       </span>
-      <span class="chats-label">{m.sidebar_chats_label()}</span>
+      <span class="nav-label">{m.sidebar_chats_label()}</span>
       {#if totalUnreadChats > 0}
-        <span
-          class="chats-dot"
-          aria-hidden="true"
-          title={plural(totalUnreadChats, {
-            one: m.sidebar_chats_unread_title_one,
-            few: () => m.sidebar_chats_unread_title_few({ count: totalUnreadChats }),
-            other: () => m.sidebar_chats_unread_title_other({ count: totalUnreadChats }),
-          })}
-        ></span>
+        {@const what = plural(totalUnreadChats, {
+          one: () => m.sidebar_chats_unread_title_one({ count: totalUnreadChats }),
+          oneShowsCount: true,
+          few: () => m.sidebar_chats_unread_title_few({ count: totalUnreadChats }),
+          other: () => m.sidebar_chats_unread_title_other({ count: totalUnreadChats }),
+        })}
+        <!-- The accent pill Channels and Feeds use for unread, not the warning
+             hue, which read as "something is wrong". -->
+        <span class="nav-badge" title={what}><span aria-hidden="true">{navCount(totalUnreadChats)}</span><span class="sr-only">{what}</span></span>
       {/if}
     </button>
-    <button
-      type="button"
-      class="about-btn"
-      onclick={() => (shortcutsOpen = true)}
-      title={m.sidebar_keyboard_shortcuts_title()}
-      aria-label={m.sidebar_keyboard_shortcuts_title()}
-      aria-keyshortcuts="?"
-    >
-      <span class="about-icon" aria-hidden="true">
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <!-- The things opened now and then share one row of icons, each named for
+         assistive tech by its short label and described by its tooltip. -->
+    <div class="footer-tools">
+      <button
+        type="button"
+        class="tool-btn"
+        onclick={() => (shortcutsOpen = true)}
+        title={m.sidebar_keyboard_shortcuts_title()}
+        aria-label={m.sidebar_shortcuts_label()}
+        aria-keyshortcuts="?"
+      >
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect x="1.5" y="5" width="17" height="10" rx="2"/>
           <line x1="5" y1="8.5" x2="5.01" y2="8.5"/>
           <line x1="8" y1="8.5" x2="8.01" y2="8.5"/>
@@ -616,73 +623,62 @@
           <line x1="14" y1="8.5" x2="14.01" y2="8.5"/>
           <line x1="5" y1="11.5" x2="14" y2="11.5"/>
         </svg>
-      </span>
-      <span>{m.sidebar_shortcuts_label()}</span>
-    </button>
-    <button type="button" class="about-btn" onclick={() => (aboutOpen = true)} title={m.sidebar_about_title()} aria-label={m.sidebar_about_title()}>
-      <span class="about-icon" aria-hidden="true">
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      </button>
+      <button type="button" class="tool-btn" onclick={() => (aboutOpen = true)} title={m.sidebar_about_title()} aria-label={m.sidebar_about()}>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="10" cy="10" r="7.5"/>
           <line x1="10" y1="9" x2="10" y2="14"/>
           <circle cx="10" cy="6" r="1" fill="currentColor" stroke="none"/>
         </svg>
-      </span>
-      <span>{m.sidebar_about()}</span>
-    </button>
-    <button type="button" class="about-btn" onclick={() => (shareOpen = true)} title={m.sidebar_share_ember_title()} aria-label={m.sidebar_share_ember_title()}>
-      <span class="about-icon" aria-hidden="true">
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      </button>
+      <button type="button" class="tool-btn" onclick={() => (shareOpen = true)} title={m.sidebar_share_ember_title()} aria-label={m.sidebar_share_ember()}>
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <circle cx="5" cy="10" r="2.2"/>
           <circle cx="14.5" cy="5" r="2.2"/>
           <circle cx="14.5" cy="15" r="2.2"/>
           <line x1="7" y1="9.2" x2="12.4" y2="6"/>
           <line x1="7" y1="10.8" x2="12.4" y2="14"/>
         </svg>
-      </span>
-      <span>{m.sidebar_share_ember()}</span>
-    </button>
-    <!-- Always there, never in the way: a row like its neighbours, with only
-         the cup in colour. No badge, no pulse, nothing that asks twice. -->
-    <button
-      type="button"
-      class="about-btn coffee-btn"
-      onclick={() => void openCoffee()}
-      title={m.support_button_title()}
-      aria-label={m.support_button_title()}
-    >
-      <span class="about-icon" aria-hidden="true">
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      </button>
+      <!-- Always there, never in the way: an icon like its neighbours, with
+           only the cup in colour. No badge, no pulse, nothing that asks twice. -->
+      <button
+        type="button"
+        class="tool-btn coffee-btn"
+        onclick={() => void openCoffee()}
+        title={m.support_button_title()}
+        aria-label={m.support_button()}
+      >
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path class="coffee-steam" d="M7 2.5c-.75.8-.75 1.8 0 2.6" />
           <path class="coffee-steam coffee-steam-late" d="M10 2.5c-.75.8-.75 1.8 0 2.6" />
           <path class="coffee-cup" d="M3.5 7.5h10v3.6a4.4 4.4 0 0 1-4.4 4.4H7.9a4.4 4.4 0 0 1-4.4-4.4z" />
           <path d="M13.5 8.75h1.1a2.3 2.3 0 0 1 0 4.6h-1.35" />
           <line x1="2.5" y1="17.75" x2="14.5" y2="17.75" />
         </svg>
-      </span>
-      <span class="coffee-label">{m.support_button()}</span>
-    </button>
-    <div class="footer-sep" aria-hidden="true"></div>
-    <button
-      type="button"
-      class="about-btn collapse-btn"
-      onclick={toggleCollapsed}
-      title={isCollapsed
-        ? m.sidebar_expand({ mod: shortcutModSymbol() })
-        : m.sidebar_collapse({ mod: shortcutModSymbol() })}
-      aria-label={isCollapsed ? m.sidebar_expand_aria() : m.sidebar_collapse_aria()}
-      aria-keyshortcuts={`${shortcutModAria()}+B`}
-    >
-      <span class="about-icon" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      </button>
+      <!-- Collapse is a window control rather than something you open, so it
+           is set apart: pushed to the far end, or below a hairline on the rail. -->
+      <span class="tools-sep" aria-hidden="true"></span>
+      <button
+        type="button"
+        class="tool-btn collapse-btn"
+        onclick={toggleCollapsed}
+        title={isCollapsed
+          ? m.sidebar_expand({ mod: shortcutModSymbol() })
+          : m.sidebar_collapse({ mod: shortcutModSymbol() })}
+        aria-label={isCollapsed ? m.sidebar_expand_aria() : m.sidebar_collapse_aria()}
+        aria-keyshortcuts={`${shortcutModAria()}+B`}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           {#if isCollapsed}
             <polyline points="13 17 18 12 13 7"></polyline><polyline points="6 17 11 12 6 7"></polyline>
           {:else}
             <polyline points="11 17 6 12 11 7"></polyline><polyline points="18 17 13 12 18 7"></polyline>
           {/if}
         </svg>
-      </span>
-      <span>{isCollapsed ? m.sidebar_expand_label() : m.sidebar_collapse_label()}</span>
-    </button>
+      </button>
+    </div>
   </div>
 
   <AboutDialog bind:open={aboutOpen} />
@@ -762,11 +758,6 @@
     display: none;
   }
 
-  .collapse-btn svg {
-    width: 20px;
-    height: 20px;
-  }
-
   .logo-text {
     font-size: 22px;
     font-weight: 700;
@@ -810,7 +801,7 @@
     gap: 8px;
     /* `<p>` for the heading, so the margin it arrives with has to go. */
     margin: 0;
-    padding: 14px 16px 4px;
+    padding: 12px 16px 4px;
   }
 
   .nav-run:first-child .nav-group {
@@ -864,49 +855,70 @@
     flex-shrink: 0;
   }
 
-  .about-btn {
+  /* Small square buttons whose icons sit on the same 26px axis as the nav
+     icons above: 10px of row padding plus half of 32. */
+  .footer-tools {
     display: flex;
     align-items: center;
-    /* Matches `.nav-list li a` on both counts, so the icon column and the
-       icon-to-label rhythm continue across the divide. */
-    gap: 12px;
-    width: 100%;
-    /* Same row box as `.nav-list li a`, not a pixel off it: the two sit in one
-       column and any difference just reads as imprecision. */
-    padding: 10px 16px;
+    gap: 2px;
+    padding: 4px 10px 0;
+  }
+
+  .tool-btn {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
     border: none;
-    border-radius: 0;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-muted);
-    font-size: var(--font-size-md);
-    font-family: inherit;
     cursor: pointer;
-    text-align: left;
     transition: background-color var(--transition-normal), color var(--transition-normal);
   }
 
-  .about-btn:hover {
+  .tool-btn svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .tool-btn:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
   }
 
-  .about-btn:focus-visible {
+  .tool-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
     background: var(--bg-hover);
   }
 
-  /* Buy Me a Coffee's yellow, on the cup only: enough to find it, too little
-     to nag. The row itself is as quiet as the others until hovered. */
-  .coffee-btn {
-    --coffee-yellow: #ffdd00;
+  .tools-sep {
+    flex: 1;
   }
 
-  .coffee-label {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  /* On the rail the row turns into a column, and Collapse drops below a short
+     hairline instead of to the far end. */
+  .sidebar.collapsed .footer-tools {
+    flex-direction: column;
+    padding: 4px 0 0;
+  }
+
+  .sidebar.collapsed .tools-sep {
+    flex: none;
+    width: 24px;
+    height: 1px;
+    margin: 4px 0;
+    background: var(--border);
+  }
+
+  /* Buy Me a Coffee's yellow, on the cup only: enough to find it, too little
+     to nag. The button itself is as quiet as the others until hovered. */
+  .coffee-btn {
+    --coffee-yellow: #ffdd00;
   }
 
   .coffee-btn .coffee-cup {
@@ -948,72 +960,26 @@
     }
   }
 
-  /* Collapse is a window control rather than one of the four things you open
-     from here, so it sits under its own hairline. */
-  .footer-sep {
-    height: 1px;
-    margin: 6px 16px;
-    background: var(--border);
-  }
-
-  /*
-   * Active state for the Chats toggle so users see at a glance whether
-   * the dock is currently open. Mirrors the active treatment of nav
-   * items (left accent stripe via ::before is overkill here, just tint
-   * the bg + text).
-   */
-  .chats-btn.active {
-    background: var(--accent-fill);
-    color: var(--accent);
-  }
-
+  /* Chats shares the nav row's box, so the button needs the browser's own
+     button styling taken off first. */
   .chats-btn {
-    position: relative;
+    width: 100%;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    font-family: inherit;
+    font-weight: inherit;
+    cursor: pointer;
+    text-align: left;
   }
 
-  /* Unread chats are a presence cue, not a work queue: a single accent dot
-     rather than a warning-hued count, which read as "something is wrong".
-     The exact count stays available via the tooltip / aria-label. */
-  .chats-dot {
-    margin-left: auto;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--accent);
-    flex-shrink: 0;
-  }
-
-  .sidebar.collapsed .chats-dot {
-    position: absolute;
-    top: 4px;
-    right: 4px;
-    margin: 0;
-  }
-
-  .sidebar.collapsed .chats-label {
-    display: none;
-  }
-
-  .about-icon {
-    width: 20px;
-    height: 20px;
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .about-icon svg {
-    width: 20px;
-    height: 20px;
-  }
-
-  .nav-list li a {
+  .nav-list li a,
+  .chats-btn {
     position: relative;
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 10px 16px;
+    padding: 8px 16px;
     color: var(--text-secondary);
     text-decoration: none;
     transition: background-color var(--transition-normal), color var(--transition-normal), padding var(--transition-normal);
@@ -1021,14 +987,36 @@
     overflow: hidden;
   }
 
-  .sidebar.collapsed .nav-list li a {
-    padding: 10px 0;
+  .sidebar.collapsed .nav-list li a,
+  .sidebar.collapsed .chats-btn {
+    padding: 8px 0;
     justify-content: center;
   }
 
-  .sidebar.collapsed .nav-label,
+  /* The dock is open: tinted like the current page, without the page stripe,
+     since this is a panel beside the page rather than where you are. */
+  .chats-btn.active {
+    background: var(--accent-fill);
+    color: var(--accent);
+  }
+
   .sidebar.collapsed .beta-badge {
     display: none;
+  }
+
+  /* Hidden from sight only: with `display: none` the link was named by its
+     count badge alone. Same recipe as the global `.sr-only`, which scoped
+     styles can't reach. */
+  .sidebar.collapsed .nav-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
   }
 
   .nav-label {
@@ -1039,9 +1027,16 @@
   }
 
   /* Parent row gap is 12px (icon to label). Pull the chip closer to the
-     word so it reads as a label suffix rather than a third column. */
+     word so it reads as a label suffix rather than a third column.
+     Outlined and grey here rather than the app's pink: a fixed tag beside a
+     page name should not outshout the counts, which are what changes. */
   .nav-list .beta-badge {
     margin-inline-start: -6px;
+    height: 16px;
+    padding: 0 5px;
+    color: var(--text-muted);
+    background: transparent;
+    border-color: var(--border-light);
   }
 
   .sidebar.collapsed .nav-badge {
@@ -1053,26 +1048,6 @@
     height: 14px;
     font-size: 8px;
     padding: 0 3px;
-  }
-
-  .sidebar.collapsed .about-btn span:not(.about-icon):not(.chats-dot) {
-    display: none;
-  }
-
-  .sidebar.collapsed .about-btn {
-    padding: 10px 0;
-    justify-content: center;
-  }
-
-  /* Horizontal padding stays off so the centred icons sit on the rail's own
-     axis; the buttons go full width and centre themselves. */
-  .sidebar.collapsed .sidebar-footer {
-    padding: 6px 0 8px;
-  }
-
-  /* Pulled in to the icon column, since there are no labels to run under. */
-  .sidebar.collapsed .footer-sep {
-    margin: 6px 14px;
   }
 
   /*
@@ -1095,15 +1070,22 @@
     transition: opacity var(--transition-normal) ease, transform var(--transition-normal) ease;
   }
 
-  .nav-list li a:hover {
+  .nav-list li a:hover,
+  .chats-btn:hover {
     background: var(--bg-hover);
     color: var(--text-primary);
   }
 
-  .nav-list li a:focus-visible {
+  .nav-list li a:focus-visible,
+  .chats-btn:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
     background: var(--bg-hover);
+  }
+
+  .chats-btn.active:hover {
+    background: var(--accent-fill);
+    color: var(--accent);
   }
 
   /* `--accent-fill` rather than `--bg-tertiary`. The token exists for exactly
@@ -1123,6 +1105,9 @@
     transform: scaleY(1);
   }
 
+  /* Icons a step quieter than their labels, so the column of words is what
+     the eye reads; they come up to the label's colour on hover and take the
+     accent with it on the current page. */
   .nav-icon {
     width: 20px;
     height: 20px;
@@ -1130,6 +1115,15 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    color: var(--text-muted);
+    transition: color var(--transition-normal);
+  }
+
+  .nav-list li a:hover .nav-icon,
+  .nav-list li a.active .nav-icon,
+  .chats-btn:hover .nav-icon,
+  .chats-btn.active .nav-icon {
+    color: inherit;
   }
 
   .nav-icon svg {
@@ -1152,6 +1146,13 @@
     justify-content: center;
     line-height: 1;
     flex-shrink: 0;
+    /* The unread bump Channels gives a room row, played as a count appears. */
+    animation: nav-badge-in 460ms cubic-bezier(0.34, 1.6, 0.5, 1);
+  }
+
+  @keyframes nav-badge-in {
+    0%   { transform: scale(0.7); }
+    100% { transform: scale(1); }
   }
 
   /* Pending friend requests use the same orange as the transfers

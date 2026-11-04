@@ -40,7 +40,8 @@
   import { disappearLabel } from '$lib/chatDisappear';
   import { deleteChatHistory } from '$lib/api/friends';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
-  import { toastError, toastSuccess } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toastError, toastSuccess } = toastsFor('friends');
   import { formatBytes } from '$lib/utils';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -380,7 +381,8 @@
   );
   let unreadElsewhereLabel = $derived(
     plural(unreadElsewhere, {
-      one: m.chat_dock_unread_elsewhere_one,
+      one: () => m.chat_dock_unread_elsewhere_one({ count: unreadElsewhere }),
+      oneShowsCount: true,
       few: () => m.chat_dock_unread_elsewhere_few({ count: unreadElsewhere }),
       other: () => m.chat_dock_unread_elsewhere_other({ count: unreadElsewhere }),
     }),
@@ -934,7 +936,8 @@
                   <span
                     class="count-pill"
                     aria-label={plural(row.unread, {
-                      one: m.chat_dock_unread_aria_one,
+                      one: () => m.chat_dock_unread_aria_one({ count: row.unread }),
+                      oneShowsCount: true,
                       few: () => m.chat_dock_unread_aria_few({ count: row.unread }),
                       other: () => m.chat_dock_unread_aria_other({ count: row.unread }),
                     })}
@@ -980,7 +983,8 @@
                   <span
                     class="count-pill"
                     aria-label={plural(row.unread, {
-                      one: m.chat_dock_unread_aria_one,
+                      one: () => m.chat_dock_unread_aria_one({ count: row.unread }),
+                      oneShowsCount: true,
                       few: () => m.chat_dock_unread_aria_few({ count: row.unread }),
                       other: () => m.chat_dock_unread_aria_other({ count: row.unread }),
                     })}
@@ -1215,6 +1219,11 @@
     height: 13px;
     flex-shrink: 0;
     color: var(--text-muted);
+    transition: transform var(--transition-normal) ease;
+  }
+
+  .dock-current.open .dock-chevron {
+    transform: rotate(180deg);
   }
 
   .dock-presence {
@@ -1358,6 +1367,12 @@
     flex-direction: column;
     min-height: 0;
     background: var(--bg-primary);
+    animation: dock-switcher-in 0.12s ease-out;
+  }
+
+  @keyframes dock-switcher-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
 
   .dock-search {

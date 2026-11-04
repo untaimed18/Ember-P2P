@@ -366,7 +366,8 @@
 
   function countLabel(count: number): string {
     return plural(count, {
-      one: m.transfers_categories_count_one,
+      one: () => m.transfers_categories_count_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.transfers_categories_count_other({ count: formatNumber(count) }),
     });
   }
@@ -516,7 +517,7 @@
       <input type="checkbox" bind:checked={ownFolder} disabled={busy || (cleaned !== '' && newFolder === null)} />
       <span>
         {newFolder
-          ? m.transfers_categories_own_folder({ folder: `Downloads/${newFolder}` })
+          ? m.transfers_categories_own_folder({ folder: folderPath(newFolder) })
           : m.transfers_categories_own_folder_generic()}
       </span>
     </label>

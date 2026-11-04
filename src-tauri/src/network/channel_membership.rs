@@ -330,16 +330,18 @@ mod membership_record_v2_tests {
         let bob = SigningKey::generate(&mut OsRng);
         let cy = SigningKey::generate(&mut OsRng);
         let pk = |key: &SigningKey| key.verifying_key().to_bytes();
+        use crate::network::ember::dht::publish::ChannelLanguages as L;
 
         let ada_v1 = SignedRecord::channel_presence_v1_at(
-            "ada (v1)", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[1; 32], &ada, now,
+            "ada (v1)", L::default(), room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[1; 32], &ada, now,
         );
-        let ada_v2 =
-            SignedRecord::channel_presence_v2_at("ada", Some("ja"), room.channel_id, &current, false, &[2; 32], &ada, now);
+        let ada_v2 = SignedRecord::channel_presence_v2_at(
+            "ada", L::new(Some("ja"), Some("en")), room.channel_id, &current, false, &[2; 32], &ada, now,
+        );
         let bob_v1 = SignedRecord::channel_presence_v1_at(
-            "bob", Some("de"), room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[3; 32], &bob, now,
+            "bob", L::new(Some("de"), Some("fr")), room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[3; 32], &bob, now,
         );
-        let cy_v2 = SignedRecord::channel_presence_v2_at("cy", None, room.channel_id, &retired, false, &[4; 32], &cy, now);
+        let cy_v2 = SignedRecord::channel_presence_v2_at("cy", L::default(), room.channel_id, &retired, false, &[4; 32], &cy, now);
         let storer = SigningKey::generate(&mut OsRng);
         let mut lifted = ada_v2.clone();
         lifted.publisher_key = pk(&storer);
@@ -355,8 +357,10 @@ mod membership_record_v2_tests {
             assert_eq!(latest[&pk(&ada)].nickname, "ada");
             assert_eq!(latest[&pk(&ada)].noise_pub, [2; 32]);
             assert_eq!(latest[&pk(&ada)].language, Some("ja"), "the v2 copy stands");
+            assert_eq!(latest[&pk(&ada)].language2, Some("en"));
             assert_eq!(latest[&pk(&bob)].nickname, "bob");
             assert_eq!(latest[&pk(&bob)].language, Some("de"));
+            assert_eq!(latest[&pk(&bob)].language2, Some("fr"), "sealed in a private v1 record too");
             assert_eq!(latest[&pk(&cy)].nickname, "cy");
             assert_eq!(latest[&pk(&cy)].language, None);
             assert!(!latest.contains_key(&pk(&storer)));
@@ -369,7 +373,7 @@ mod membership_record_v2_tests {
         // current key, since its AAD names only the room. It must not admit
         // that key, or the owner would seal the next epoch to it.
         let mut lifted_v1 = SignedRecord::channel_presence_v1_at(
-            "ada (v1)", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[1; 32], &storer, now,
+            "ada (v1)", L::default(), room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), false, &[1; 32], &storer, now,
         );
         lifted_v1.data = ada_v1.data.clone();
         lifted_v1.publisher_key = pk(&storer);
@@ -388,7 +392,7 @@ mod membership_record_v2_tests {
         // all no proof of its current key. A public room still reads it.
         let mallory = SigningKey::generate(&mut OsRng);
         let forged = SignedRecord::channel_presence_v1_at(
-            "mallory", None, room.channel_id, room.pubkey, &current, false, channel::presence_epoch(now), false, &[9; 32], &mallory, now,
+            "mallory", L::default(), room.channel_id, room.pubkey, &current, false, channel::presence_epoch(now), false, &[9; 32], &mallory, now,
         );
         let (latest, admits) = merge_channel_presence_blobs(&[blob(&forged)], &room.channel_id, &secrets, true, now);
         assert!(latest.is_empty(), "not read in a private room");
@@ -398,7 +402,7 @@ mod membership_record_v2_tests {
 
         // A newer v1 leave beats an older v2 announce: the merge is by member.
         let ada_left = SignedRecord::channel_presence_v1_at(
-            "ada", None, room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), true, &[1; 32], &ada, now + 5,
+            "ada", L::default(), room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), true, &[1; 32], &ada, now + 5,
         );
         let (latest, _) =
             merge_channel_presence_blobs(&[blob(&ada_v2), blob(&ada_left)], &room.channel_id, &secrets, true, now + 5);
@@ -1723,6 +1727,7 @@ mod channel_roster_snapshot_tests {
             banned,
             moderator: false,
             language: String::new(),
+            language2: String::new(),
         }
     }
 
@@ -1961,7 +1966,7 @@ pub(super) async fn maybe_publish_channel_presence(
         }
         name.to_string()
     };
-    let language = settings.channel_language_code();
+    let languages = settings.channel_languages();
     let refresh_username = !due.is_empty()
         && now.saturating_sub(state.channel_username_refresh_at)
             >= ember::channel::USERNAME_REFRESH_SECS
@@ -2006,7 +2011,7 @@ pub(super) async fn maybe_publish_channel_presence(
         };
         let records = ember::dht::publish::SignedRecord::channel_presence_forms(
             &nickname,
-            language,
+            languages,
             channel_id,
             channel_pubkey,
             &join_secret,
@@ -2030,7 +2035,7 @@ pub(super) async fn maybe_publish_channel_presence(
                 &channel_id_hex,
                 &hex::encode(identity.ed25519_public_key),
                 &nickname,
-                Some(language.unwrap_or("")),
+                Some((languages.primary.unwrap_or(""), languages.secondary.unwrap_or(""))),
                 now,
                 Some(&hex::encode(identity.ed25519_public_key)),
             );
@@ -2090,23 +2095,27 @@ pub(super) async fn publish_presence_under_new_username(
     settings: &AppSettings,
     identity: &crate::storage::identity::NodeIdentity,
     old_username: &str,
-    old_language: Option<&'static str>,
+    old_languages: ember::dht::publish::ChannelLanguages,
 ) {
     let new = settings.channel_username.trim();
-    let language = settings.channel_language_code();
+    let languages = settings.channel_languages();
     let renamed = new != old_username.trim();
-    if new.is_empty() || (!renamed && language == old_language) {
+    if new.is_empty() || (!renamed && languages == old_languages) {
         return;
     }
     let pk = hex::encode(identity.ed25519_public_key);
     if renamed {
         let _ = db.rename_self_channel_member(&pk, new);
     }
-    if language != old_language {
+    if languages != old_languages {
         // The settings save relabelled these rows already, so this usually
         // finds nothing. It catches a publish that ran on the old settings
-        // in between and wrote the old language back.
-        if let Ok(rooms) = db.set_self_channel_member_language(&pk, language.unwrap_or("")) {
+        // in between and wrote the old languages back.
+        if let Ok(rooms) = db.set_self_channel_member_language(
+            &pk,
+            languages.primary.unwrap_or(""),
+            languages.secondary.unwrap_or(""),
+        ) {
             for room in rooms {
                 let _ = app_handle.emit(
                     "ember:channel-members",
@@ -2180,7 +2189,7 @@ pub(super) async fn publish_channel_departures(
         };
         let records = ember::dht::publish::SignedRecord::channel_presence_forms(
             &nickname,
-            None,
+            ember::dht::publish::ChannelLanguages::default(),
             cid,
             cpk,
             &join_secret,
@@ -2257,7 +2266,7 @@ async fn publish_owed_channel_departures(
         }
         let records = ember::dht::publish::SignedRecord::channel_presence_forms(
             nickname,
-            None,
+            ember::dht::publish::ChannelLanguages::default(),
             cid,
             departure.channel_pubkey,
             &departure.join_secret,
@@ -3508,6 +3517,11 @@ pub(super) fn channels_lite_cached(
 pub(super) const CHANNEL_NEIGHBOR_LOOKUP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(ember::channel::CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS);
 pub(super) const CHANNEL_NEIGHBOR_LOOKUPS_PER_TICK: usize = 4;
+/// How long a ping to a looked-up neighbor counts as unanswered if the
+/// neighbor is looked up again: a few lookup intervals, so one that was busy
+/// once is not written off, while one that never answers soon gets a relay.
+pub(super) const CHANNEL_NEIGHBOR_PINGED_MEMORY: std::time::Duration =
+    std::time::Duration::from_secs(ember::channel::CHANNEL_NEIGHBOR_LOOKUP_RETRY_SECS * 4);
 pub(super) const CHANNEL_NEIGHBOR_FIND_NODE_PER_TICK: usize = 2;
 pub(super) const CHANNEL_PUNCH_POLL_ATTEMPTS: usize = 12;
 pub(super) const CHANNEL_PUNCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -4566,6 +4580,30 @@ pub(super) async fn maybe_publish_owned_channel_records(
         {
             continue;
         }
+        // Back from a silence our nominee could have claimed the room in: look
+        // for the claim before signing, so the copy found predates our return.
+        if let Ok(Some(silence)) = db.channel_owner_pending_silence(&ch.channel_id, now) {
+            let claimable_at = silence
+                .silent_from
+                .saturating_add(silence.claim_after_days.saturating_mul(86_400));
+            let held_since = ember::channel::owner_return_hold_start(
+                state.channel_return_held_since.get(&channel_id).copied(),
+                claimable_at,
+                now,
+            );
+            state.channel_return_held_since.insert(channel_id, held_since);
+            if ember::channel::owner_return_waits_for_claims(
+                claimable_at,
+                channel_claim_answered_at(&channel_id),
+                held_since,
+                now,
+            ) {
+                continue;
+            }
+        } else {
+            // Nothing pending: whatever stamp ended the silence, its hold is over.
+            state.channel_return_held_since.remove(&channel_id);
+        }
         let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) else {
             continue;
         };
@@ -4606,6 +4644,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
             undo_owned_rotation(db, &ch.channel_id, rotated);
             continue;
         };
+        state.channel_return_held_since.remove(&channel_id);
         if let Ok(Some(fresh)) = db.get_channel_lite(&ch.channel_id) {
             ch = std::borrow::Cow::Owned(fresh);
         }
@@ -5060,6 +5099,50 @@ impl Drop for RestoringRoom {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.0);
     }
+}
+
+/// When a claim lookup for a room last had an answer, by room. Process-wide so
+/// an owner edit from the UI waits on it as the owner pass does.
+fn claims_answered_at() -> &'static std::sync::Mutex<HashMap<[u8; 16], i64>> {
+    static ROOMS: std::sync::OnceLock<std::sync::Mutex<HashMap<[u8; 16], i64>>> = std::sync::OnceLock::new();
+    ROOMS.get_or_init(Default::default)
+}
+
+pub(crate) fn note_channel_claim_answered(channel_id: [u8; 16], at: i64) {
+    claims_answered_at()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(channel_id, at);
+}
+
+fn channel_claim_answered_at(channel_id: &[u8; 16]) -> Option<i64> {
+    claims_answered_at()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(channel_id)
+        .copied()
+}
+
+/// Whether an owner edit of a room of ours has to wait: we are back from a
+/// silence our nominee could have claimed the room in, and no claim lookup has
+/// answered since it became claimable. The edit's stamp ends the silence, so
+/// signing it first would refuse a claim copy re-signed after it that the
+/// members followed. The claim lookup this device makes for the room
+/// answering, or the owner pass signing once its hold is over, lets it through.
+pub(crate) fn owner_edit_waits_for_claims(db: &Database, channel_id: &str, now: i64) -> bool {
+    let Ok(Some(silence)) = db.channel_owner_pending_silence(channel_id, now) else {
+        return false;
+    };
+    let Some(id) = hex::decode(channel_id)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+    else {
+        return false;
+    };
+    let claimable_at = silence
+        .silent_from
+        .saturating_add(silence.claim_after_days.saturating_mul(86_400));
+    channel_claim_answered_at(&id).is_none_or(|at| at < claimable_at)
 }
 
 /// Rooms of ours with a rotated key stored whose snapshot has not committed
@@ -5643,7 +5726,7 @@ pub(super) async fn republish_channel_key_epoch(
         .unwrap_or_default()
     };
     for record in records {
-        if let Some(publish_id) = start_own_channel_publish(state, record) {
+        if let Some(publish_id) = start_own_channel_renewal(state, record) {
             drive_ember_publish(socket, state, publish_id).await;
         }
     }
@@ -6111,13 +6194,18 @@ pub(super) async fn maybe_refresh_channel_handoff(
         // A succession claim lives under its own key, because it is signed by
         // the nominee rather than the room. Only worth asking for once the
         // owner has actually been silent long enough to honour one — and by
-        // the owner, just back from such a silence, while a claim it finds can
-        // still be one that silence allowed.
+        // the owner, back from such a silence, before it signs anything and
+        // while a claim it finds can still be one that silence allowed.
         let claim_due = if ch.is_owner {
             db.live_channel_owner_silence(&ch.channel_id, now)
                 .ok()
                 .flatten()
                 .is_some()
+                || db
+                    .channel_owner_pending_silence(&ch.channel_id, now)
+                    .ok()
+                    .flatten()
+                    .is_some()
         } else {
             !ch.successor_nominee.is_empty()
                 && ch.claim_after_days > 0
@@ -6391,6 +6479,12 @@ pub(super) fn ingest_channel_claim_records(
 /// of that return, in a copy signed before it: nothing the claimant signs can
 /// show when a claim was first made, so its turning up at once, dated inside
 /// the silence, is the evidence there is that it was made then.
+///
+/// Before that first stamp the silence runs until now, and every copy found
+/// was signed before we said we were back. That is why a device coming back
+/// looks before it signs (`owner_return_waits_for_claims`): the claimant
+/// re-signs every few hours, and a copy re-signed between our stamp and our
+/// first look would otherwise read as a claim raced against our return.
 fn follow_claim_on_owned_channel(
     db: &Database,
     ch: &crate::storage::database::StoredChannel,
@@ -6401,7 +6495,10 @@ fn follow_claim_on_owned_channel(
         return None;
     }
     let now = chrono::Utc::now().timestamp();
-    let silence = db.live_channel_owner_silence(&ch.channel_id, now).ok().flatten()?;
+    let silence = match db.live_channel_owner_silence(&ch.channel_id, now).ok().flatten() {
+        Some(silence) => silence,
+        None => db.channel_owner_pending_silence(&ch.channel_id, now).ok().flatten()?,
+    };
     let mut candidates: Vec<([u8; 32], [u8; 32], [u8; 16], i64, bool)> = records
         .iter()
         .filter_map(|blob| {
@@ -6655,12 +6752,13 @@ pub(super) fn ingest_channel_presence_records(
         // Our own row's language comes from our settings. A walk can still
         // return the copy published before a change, and taking it would flip
         // the flag back until the new one is found.
-        let language = (member.publisher_key != *our_pubkey).then(|| member.language.unwrap_or(""));
+        let languages = (member.publisher_key != *our_pubkey)
+            .then(|| (member.language.unwrap_or(""), member.language2.unwrap_or("")));
         if let Ok(write) = db.upsert_channel_member_with_language(
             &channel_id_hex,
             &pk_hex,
             &nick,
-            language,
+            languages,
             member.timestamp,
             Some(&our_hex),
         ) {

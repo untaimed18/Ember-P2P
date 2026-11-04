@@ -16,14 +16,14 @@ vi.mock('$lib/stores/friends', () => ({ friendDisplayName: vi.fn(() => '') }));
 vi.mock('$lib/notifications', () => ({ notify: vi.fn(async () => {}) }));
 vi.mock('$lib/stores/toast', () => {
   let next = 1;
-  return {
+  const scoped = {
     addToast: vi.fn(() => next++),
-    removeToast: vi.fn(),
     toast: vi.fn(),
     toastError: vi.fn(),
     toastSuccess: vi.fn(),
     toastWarning: vi.fn(),
   };
+  return { ...scoped, removeToast: vi.fn(), toastsFor: () => scoped };
 });
 
 import * as m from '$lib/paraglide/messages';

@@ -12,6 +12,12 @@
 //! This tracks, per introducer, how many of the leads we actually probed went
 //! on to answer, and trickles the probes for one whose leads almost never do.
 //!
+//! An introducer is the /24 (IPv6 /48) its frames come from, not its node id.
+//! A keypair is free, so a record kept per key was wiped by the next one and a
+//! rationed peer was back to fully funded at the cost of a key generation. The
+//! address is what the table's own caps charge, and the one thing a peer
+//! cannot mint.
+//!
 //! Three properties are deliberate, because each is a way this could do more
 //! harm than the problem it addresses:
 //!
@@ -32,10 +38,10 @@
 //! probing junk costs only bandwidth while failing to join costs the overlay.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use super::EmberNodeId;
+use super::{subnet_key_of, EmberNodeId};
 
 /// Probed leads an introducer must have resolved before its record decides
 /// anything. Below this, one unlucky netsplit — or a single peer that went
@@ -79,6 +85,16 @@ const PENDING_TTL: Duration = Duration::from_secs(300);
 
 /// How long an introducer's record outlives its last lead.
 const INTRODUCER_TTL: Duration = Duration::from_secs(3600);
+
+/// The least time between two `ANNOUNCE_PEER`s from one network whose leads
+/// are probed on arrival.
+///
+/// An announce is unsolicited, so nothing else bounds how often a peer sends
+/// one, and each carries a full contact list of addresses it chose. Honest
+/// peers announce to us at most once per 60-second maintenance cycle, so this
+/// still lets three of them share a /24. Leads from an announce past the limit
+/// are kept all the same and wait for the next liveness tick.
+const ANNOUNCE_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 
 /// One introducer's record.
 #[derive(Debug, Clone, Copy)]
@@ -126,7 +142,7 @@ impl Introducer {
 /// A probed lead, waiting to answer or time out.
 #[derive(Debug, Clone, Copy)]
 struct PendingLead {
-    introducer: EmberNodeId,
+    introducer: u64,
     /// The address the introducer named and the probe went to. The claim is
     /// that *this* address is the node, so only a frame from it settles the
     /// lead in the introducer's favour — the same ID speaking from elsewhere
@@ -138,7 +154,11 @@ struct PendingLead {
 /// Per-introducer gossip reputation. See the module docs.
 #[derive(Debug, Default)]
 pub struct GossipReputation {
-    introducers: HashMap<EmberNodeId, Introducer>,
+    /// Keyed on [`subnet_key_of`] the introducer's address.
+    introducers: HashMap<u64, Introducer>,
+    /// When each network last had an `ANNOUNCE_PEER`'s leads probed on
+    /// arrival. See [`Self::take_announce_probes`].
+    announces: HashMap<u64, Instant>,
     /// Leads probed on someone's word, keyed by the lead so an answer can find
     /// its introducer. At most one probe per lead is ever in flight — the
     /// caller skips a lead it is already pinging — so one entry per lead is
@@ -155,12 +175,12 @@ impl GossipReputation {
         Self::default()
     }
 
-    /// Whether to spend a probe on a lead this peer named.
+    /// Whether to spend a probe on a lead named in a frame from `introducer`.
     ///
     /// Mutates: refusing is what advances the sampling counter that later lets
     /// one through, so this must be called once per lead actually considered.
-    pub fn should_probe(&mut self, introducer: &EmberNodeId) -> bool {
-        let Some(record) = self.introducers.get_mut(introducer) else {
+    pub fn should_probe(&mut self, introducer: IpAddr) -> bool {
+        let Some(record) = self.introducers.get_mut(&subnet_key_of(introducer)) else {
             return true;
         };
         if record.funded() {
@@ -191,8 +211,8 @@ impl GossipReputation {
     /// incrementing `skipped` to `NOISY_SAMPLE_EVERY` and resetting it, so one
     /// short of the bar is where it was. A funded introducer consumed no
     /// sample and is left alone.
-    pub fn refund_probe(&mut self, introducer: &EmberNodeId) {
-        let Some(record) = self.introducers.get_mut(introducer) else {
+    pub fn refund_probe(&mut self, introducer: IpAddr) {
+        let Some(record) = self.introducers.get_mut(&subnet_key_of(introducer)) else {
             return;
         };
         if !record.funded() {
@@ -207,11 +227,12 @@ impl GossipReputation {
     /// our own budget running out.
     pub fn note_probe(
         &mut self,
-        introducer: EmberNodeId,
+        introducer: IpAddr,
         lead: EmberNodeId,
         addr: SocketAddr,
         now: Instant,
     ) {
+        let introducer = subnet_key_of(introducer);
         self.introducers
             .entry(introducer)
             .or_insert_with(|| Introducer::new(now))
@@ -287,6 +308,35 @@ impl GossipReputation {
         }
     }
 
+    /// Whether the leads of an `ANNOUNCE_PEER` from `from` are probed on
+    /// arrival: once per [`ANNOUNCE_PROBE_INTERVAL`] for each network.
+    ///
+    /// Mutates: a grant starts the network's interval.
+    pub fn take_announce_probes(&mut self, from: IpAddr, now: Instant) -> bool {
+        let net = subnet_key_of(from);
+        if self
+            .announces
+            .get(&net)
+            .is_some_and(|at| now.saturating_duration_since(*at) < ANNOUNCE_PROBE_INTERVAL)
+        {
+            return false;
+        }
+        if self.announces.len() >= MAX_INTRODUCERS && !self.announces.contains_key(&net) {
+            self.announces
+                .retain(|_, at| now.saturating_duration_since(*at) < ANNOUNCE_PROBE_INTERVAL);
+            // Every entry is inside its interval, so the oldest is the
+            // nearest to expiring and forgetting it grants one early at most.
+            if self.announces.len() >= MAX_INTRODUCERS {
+                let oldest = self.announces.iter().min_by_key(|(_, at)| **at).map(|(n, _)| *n);
+                if let Some(oldest) = oldest {
+                    self.announces.remove(&oldest);
+                }
+            }
+        }
+        self.announces.insert(net, now);
+        true
+    }
+
     /// Introducers whose leads are currently rationed — a gauge worth showing,
     /// because it separates "the table will not grow because nobody is talking
     /// to us" from "it will not grow because what we are being told is junk".
@@ -300,12 +350,14 @@ impl GossipReputation {
             .retain(|_, lead| now.saturating_duration_since(lead.probed_at) < PENDING_TTL);
         self.introducers
             .retain(|_, record| now.saturating_duration_since(record.seen) < INTRODUCER_TTL);
+        self.announces
+            .retain(|_, at| now.saturating_duration_since(*at) < ANNOUNCE_PROBE_INTERVAL);
 
         // Over the cap, the least recently heard from go first: an introducer
         // that has stopped talking to us cannot be spending our probes, so
         // forgetting it costs nothing.
         if self.introducers.len() > MAX_INTRODUCERS {
-            let mut by_age: Vec<(EmberNodeId, Instant)> = self
+            let mut by_age: Vec<(u64, Instant)> = self
                 .introducers
                 .iter()
                 .map(|(id, record)| (*id, record.seen))
@@ -350,11 +402,21 @@ mod tests {
         SocketAddr::from(([198, 51, 100, n], 4000))
     }
 
+    /// A host in introducer network `n`.
+    fn intro(n: u8) -> IpAddr {
+        IpAddr::from([203, 0, n, 7])
+    }
+
+    /// The key introducer network `n` is recorded under.
+    fn net(n: u8) -> u64 {
+        subnet_key_of(intro(n))
+    }
+
     /// Resolve `count` leads from one introducer, `answered` of them by
     /// answering. Every lead is distinct, since the pending map is keyed on it.
     fn resolve_batch(
         rep: &mut GossipReputation,
-        introducer: EmberNodeId,
+        introducer: IpAddr,
         count: u32,
         answered: u32,
         first_lead: u8,
@@ -378,7 +440,7 @@ mod tests {
     fn an_introducer_we_know_nothing_about_is_funded() {
         let mut rep = GossipReputation::new();
         for _ in 0..100 {
-            assert!(rep.should_probe(&id(1)));
+            assert!(rep.should_probe(intro(1)));
         }
         assert_eq!(rep.rationed_len(), 0);
     }
@@ -388,9 +450,9 @@ mod tests {
     #[test]
     fn a_short_record_of_silence_is_not_enough_to_ration() {
         let mut rep = GossipReputation::new();
-        resolve_batch(&mut rep, id(1), MIN_SAMPLE - 1, 0, 10);
+        resolve_batch(&mut rep, intro(1), MIN_SAMPLE - 1, 0, 10);
         assert!(
-            rep.should_probe(&id(1)),
+            rep.should_probe(intro(1)),
             "under {MIN_SAMPLE} resolved leads there is no verdict to act on"
         );
         assert_eq!(rep.rationed_len(), 0);
@@ -400,13 +462,13 @@ mod tests {
     #[test]
     fn an_introducer_whose_leads_never_answer_is_rationed() {
         let mut rep = GossipReputation::new();
-        resolve_batch(&mut rep, id(1), MIN_SAMPLE, 0, 10);
+        resolve_batch(&mut rep, intro(1), MIN_SAMPLE, 0, 10);
         assert_eq!(rep.rationed_len(), 1);
 
         // Still sampled, so the verdict can be revisited — but only one lead in
         // `NOISY_SAMPLE_EVERY`.
         let allowed = (0..NOISY_SAMPLE_EVERY * 4)
-            .filter(|_| rep.should_probe(&id(1)))
+            .filter(|_| rep.should_probe(intro(1)))
             .count();
         assert_eq!(
             allowed, 4,
@@ -419,35 +481,35 @@ mod tests {
     #[test]
     fn a_sample_is_returned_when_the_probe_never_leaves() {
         let mut rep = GossipReputation::new();
-        resolve_batch(&mut rep, id(1), MIN_SAMPLE, 0, 10);
+        resolve_batch(&mut rep, intro(1), MIN_SAMPLE, 0, 10);
         assert_eq!(rep.rationed_len(), 1);
 
         // Walk up to the sampled lead, then fail to send it.
         for _ in 0..NOISY_SAMPLE_EVERY - 1 {
-            assert!(!rep.should_probe(&id(1)));
+            assert!(!rep.should_probe(intro(1)));
         }
-        assert!(rep.should_probe(&id(1)), "the sampled lead comes through");
-        rep.refund_probe(&id(1));
+        assert!(rep.should_probe(intro(1)), "the sampled lead comes through");
+        rep.refund_probe(intro(1));
 
         // The very next lead gets it instead of another full wait.
         assert!(
-            rep.should_probe(&id(1)),
+            rep.should_probe(intro(1)),
             "a refunded sample is available immediately"
         );
         // And it is one sample, not an unlimited pass.
-        assert!(!rep.should_probe(&id(1)));
+        assert!(!rep.should_probe(intro(1)));
     }
 
     /// Refunding for a funded introducer would be a counter it never spent.
     #[test]
     fn refunding_a_funded_introducer_changes_nothing() {
         let mut rep = GossipReputation::new();
-        resolve_batch(&mut rep, id(1), ANSWER_RATE_FLOOR, 1, 10);
+        resolve_batch(&mut rep, intro(1), ANSWER_RATE_FLOOR, 1, 10);
         assert_eq!(rep.rationed_len(), 0);
-        rep.refund_probe(&id(1));
+        rep.refund_probe(intro(1));
         // Still funded, so every lead passes on its own merit.
         for _ in 0..NOISY_SAMPLE_EVERY * 2 {
-            assert!(rep.should_probe(&id(1)));
+            assert!(rep.should_probe(intro(1)));
         }
     }
 
@@ -456,8 +518,8 @@ mod tests {
     #[test]
     fn a_lossy_but_honest_introducer_stays_funded() {
         let mut rep = GossipReputation::new();
-        resolve_batch(&mut rep, id(1), ANSWER_RATE_FLOOR, 1, 10);
-        assert!(rep.should_probe(&id(1)));
+        resolve_batch(&mut rep, intro(1), ANSWER_RATE_FLOOR, 1, 10);
+        assert!(rep.should_probe(intro(1)));
         assert_eq!(rep.rationed_len(), 0);
     }
 
@@ -466,17 +528,17 @@ mod tests {
     #[test]
     fn a_rationed_introducer_earns_its_budget_back() {
         let mut rep = GossipReputation::new();
-        resolve_batch(&mut rep, id(1), MIN_SAMPLE, 0, 10);
+        resolve_batch(&mut rep, intro(1), MIN_SAMPLE, 0, 10);
         assert_eq!(rep.rationed_len(), 1);
 
         // The sampled leads start answering.
-        resolve_batch(&mut rep, id(1), 2, 2, 40);
+        resolve_batch(&mut rep, intro(1), 2, 2, 40);
         assert_eq!(
             rep.rationed_len(),
             0,
             "2 answered of 10 resolved beats a one-in-{ANSWER_RATE_FLOOR} floor"
         );
-        assert!(rep.should_probe(&id(1)));
+        assert!(rep.should_probe(intro(1)));
     }
 
     /// One peer's behaviour must not be readable as another's, or naming a
@@ -484,11 +546,11 @@ mod tests {
     #[test]
     fn a_bad_introducer_does_not_taint_a_good_one() {
         let mut rep = GossipReputation::new();
-        resolve_batch(&mut rep, id(1), MIN_SAMPLE * 2, 0, 10);
-        resolve_batch(&mut rep, id(2), MIN_SAMPLE * 2, MIN_SAMPLE * 2, 60);
+        resolve_batch(&mut rep, intro(1), MIN_SAMPLE * 2, 0, 10);
+        resolve_batch(&mut rep, intro(2), MIN_SAMPLE * 2, MIN_SAMPLE * 2, 60);
 
-        assert!(!rep.should_probe(&id(1)));
-        assert!(rep.should_probe(&id(2)));
+        assert!(!rep.should_probe(intro(1)));
+        assert!(rep.should_probe(intro(2)));
         assert_eq!(rep.rationed_len(), 1);
     }
 
@@ -500,7 +562,7 @@ mod tests {
         rep.note_answered(&id(99), addr(99));
         rep.note_silent(&id(98));
         assert_eq!(rep.rationed_len(), 0);
-        assert!(rep.should_probe(&id(1)));
+        assert!(rep.should_probe(intro(1)));
     }
 
     /// Naming a real, active node at an address that goes nowhere must not
@@ -509,10 +571,10 @@ mod tests {
     fn an_answer_from_another_address_does_not_credit_the_introducer() {
         let mut rep = GossipReputation::new();
         let now = Instant::now();
-        rep.note_probe(id(1), id(50), addr(50), now);
+        rep.note_probe(intro(1), id(50), addr(50), now);
 
         rep.note_answered(&id(50), addr(51));
-        assert_eq!(rep.introducers[&id(1)].answered, 0);
+        assert_eq!(rep.introducers[&net(1)].answered, 0);
         assert_eq!(
             rep.pending_len(),
             1,
@@ -520,7 +582,7 @@ mod tests {
         );
 
         rep.note_silent(&id(50));
-        let record = rep.introducers[&id(1)];
+        let record = rep.introducers[&net(1)];
         assert_eq!((record.answered, record.silent), (0, 1));
     }
 
@@ -529,9 +591,9 @@ mod tests {
     fn an_answer_from_the_named_address_credits_the_introducer() {
         let mut rep = GossipReputation::new();
         let now = Instant::now();
-        rep.note_probe(id(1), id(50), addr(50), now);
+        rep.note_probe(intro(1), id(50), addr(50), now);
         rep.note_answered(&id(50), addr(50));
-        let record = rep.introducers[&id(1)];
+        let record = rep.introducers[&net(1)];
         assert_eq!((record.answered, record.silent), (1, 0));
         assert_eq!(rep.pending_len(), 0);
     }
@@ -541,7 +603,7 @@ mod tests {
     fn an_outcome_is_counted_once() {
         let mut rep = GossipReputation::new();
         let now = Instant::now();
-        rep.note_probe(id(1), id(50), addr(50), now);
+        rep.note_probe(intro(1), id(50), addr(50), now);
         assert_eq!(rep.pending_len(), 1);
         rep.note_silent(&id(50));
         rep.note_silent(&id(50));
@@ -550,7 +612,7 @@ mod tests {
 
         // One silent lead of one resolved is below the floor but under the
         // minimum sample, so it still decides nothing.
-        assert!(rep.should_probe(&id(1)));
+        assert!(rep.should_probe(intro(1)));
     }
 
     /// A peer naming contacts faster than we resolve them must not grow the
@@ -562,7 +624,7 @@ mod tests {
         for i in 0..(MAX_PENDING_LEADS * 2) {
             let mut raw = [0u8; 16];
             raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            rep.note_probe(id(1), EmberNodeId(raw), addr(1), now);
+            rep.note_probe(intro(1), EmberNodeId(raw), addr(1), now);
         }
         assert!(rep.pending_len() <= MAX_PENDING_LEADS);
     }
@@ -581,16 +643,16 @@ mod tests {
         for i in 0..MAX_PENDING_LEADS {
             let mut raw = [0u8; 16];
             raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            rep.note_probe(id(1), EmberNodeId(raw), addr(1), start);
+            rep.note_probe(intro(1), EmberNodeId(raw), addr(1), start);
         }
         assert_eq!(rep.pending_len(), MAX_PENDING_LEADS);
 
         // The next lead it names is probed a moment later and goes silent.
         let later = start + Duration::from_secs(1);
-        rep.note_probe(id(1), id(99), addr(99), later);
+        rep.note_probe(intro(1), id(99), addr(99), later);
         rep.note_silent(&id(99));
 
-        let record = rep.introducers[&id(1)];
+        let record = rep.introducers[&net(1)];
         assert_eq!(
             record.silent, 1,
             "the lead we probed most recently must still be attributable"
@@ -607,21 +669,21 @@ mod tests {
     fn an_unresolved_probe_expires_without_a_verdict() {
         let mut rep = GossipReputation::new();
         let probed = Instant::now();
-        rep.note_probe(id(1), id(50), addr(50), probed);
+        rep.note_probe(intro(1), id(50), addr(50), probed);
         rep.prune(probed + PENDING_TTL + Duration::from_secs(1));
         assert_eq!(rep.pending_len(), 0);
 
         // And the late answer finds no claim to credit.
         rep.note_answered(&id(50), addr(50));
-        assert!(rep.should_probe(&id(1)));
+        assert!(rep.should_probe(intro(1)));
     }
 
     /// Old behaviour must not outweigh current behaviour forever.
     #[test]
     fn tallies_decay_so_a_verdict_tracks_recent_behaviour() {
         let mut rep = GossipReputation::new();
-        resolve_batch(&mut rep, id(1), DECAY_AFTER, 0, 100);
-        let record = rep.introducers[&id(1)];
+        resolve_batch(&mut rep, intro(1), DECAY_AFTER, 0, 100);
+        let record = rep.introducers[&net(1)];
         assert!(
             record.resolved() < DECAY_AFTER,
             "a record past {DECAY_AFTER} resolved leads is halved, not kept whole"
@@ -635,7 +697,7 @@ mod tests {
     fn a_silent_introducers_record_is_forgotten() {
         let mut rep = GossipReputation::new();
         let then = Instant::now();
-        rep.note_probe(id(1), id(50), addr(50), then);
+        rep.note_probe(intro(1), id(50), addr(50), then);
         rep.note_silent(&id(50));
         rep.prune(then + INTRODUCER_TTL + Duration::from_secs(1));
         assert_eq!(rep.rationed_len(), 0);
@@ -649,7 +711,7 @@ mod tests {
     #[test]
     fn a_full_pending_map_sheds_what_a_scan_for_the_oldest_would() {
         let mut rep = GossipReputation::new();
-        let mut model: HashMap<EmberNodeId, (EmberNodeId, SocketAddr, Instant)> = HashMap::new();
+        let mut model: HashMap<EmberNodeId, (u64, SocketAddr, Instant)> = HashMap::new();
         let t0 = Instant::now();
         let mut seed = 0xE703_7ED1_A0B4_28DBu64;
         let mut next = move || {
@@ -685,14 +747,14 @@ mod tests {
                         us += 1;
                     }
                     let now = t0 + Duration::from_micros(us);
-                    let introducer = id((r >> 32) as u8 % 5);
-                    rep.note_probe(introducer, lead(n), from, now);
+                    let introducer = (r >> 32) as u8 % 5;
+                    rep.note_probe(intro(introducer), lead(n), from, now);
                     if model.len() >= MAX_PENDING_LEADS && !model.contains_key(&lead(n)) {
                         let oldest = *model.iter().min_by_key(|(_, p)| p.2).unwrap().0;
                         model.remove(&oldest);
                         shed += 1;
                     }
-                    model.insert(lead(n), (introducer, from, now));
+                    model.insert(lead(n), (net(introducer), from, now));
                 }
                 14..=16 => {
                     let from = if (r >> 16).is_multiple_of(3) {
@@ -728,5 +790,61 @@ mod tests {
             assert!(rep.pending_order.len() <= 2 * MAX_PENDING_LEADS);
         }
         assert!(shed > 1_000, "the cap has to bind, and often: {shed}");
+    }
+
+    /// A rationed peer used to walk back to a clean record by signing its next
+    /// frame with a fresh key. The record follows the network instead, and
+    /// another host on the same /24 inherits it.
+    #[test]
+    fn a_fresh_host_on_a_rationed_network_inherits_its_record() {
+        let mut rep = GossipReputation::new();
+        resolve_batch(&mut rep, intro(1), MIN_SAMPLE, 0, 10);
+        assert!(!rep.should_probe(intro(1)));
+        assert!(
+            !rep.should_probe(IpAddr::from([203, 0, 1, 200])),
+            "the same /24 is the same introducer"
+        );
+        assert!(rep.should_probe(intro(2)), "the next /24 over is not");
+    }
+
+    /// IPv6 introducers are charged a /48, the unit the routing table uses.
+    #[test]
+    fn ipv6_introducers_are_charged_a_48() {
+        let mut rep = GossipReputation::new();
+        let host: IpAddr = "2001:db8:1::1".parse().unwrap();
+        resolve_batch(&mut rep, host, MIN_SAMPLE, 0, 10);
+        assert!(!rep.should_probe("2001:db8:1:ffff::2".parse().unwrap()));
+        assert!(rep.should_probe("2001:db8:2::1".parse().unwrap()));
+    }
+
+    /// An `ANNOUNCE_PEER` always counts as asked for, so its leads are probed
+    /// at once; how often that happens is held per network instead.
+    #[test]
+    fn announce_probes_are_granted_once_per_interval_per_network() {
+        let mut rep = GossipReputation::new();
+        let t0 = Instant::now();
+        assert!(rep.take_announce_probes(intro(1), t0));
+        assert!(!rep.take_announce_probes(intro(1), t0 + Duration::from_secs(1)));
+        assert!(
+            !rep.take_announce_probes(IpAddr::from([203, 0, 1, 99]), t0),
+            "another host on the /24 shares the interval"
+        );
+        assert!(rep.take_announce_probes(intro(2), t0), "other networks are untouched");
+        assert!(rep.take_announce_probes(intro(1), t0 + ANNOUNCE_PROBE_INTERVAL));
+    }
+
+    /// Networks announcing faster than their intervals expire must not grow
+    /// the map, and expired grants are swept.
+    #[test]
+    fn announce_grants_stay_bounded() {
+        let mut rep = GossipReputation::new();
+        let t0 = Instant::now();
+        for i in 0..(MAX_INTRODUCERS as u32 * 2) {
+            let ip = IpAddr::from([10 + (i >> 16) as u8, (i >> 8) as u8, i as u8, 1]);
+            assert!(rep.take_announce_probes(ip, t0));
+        }
+        assert!(rep.announces.len() <= MAX_INTRODUCERS);
+        rep.prune(t0 + ANNOUNCE_PROBE_INTERVAL);
+        assert!(rep.announces.is_empty());
     }
 }

@@ -38,6 +38,11 @@ export async function getConnectedServer(): Promise<ServerInfo | null> {
   return invoke('get_connected_server');
 }
 
+/** The server last logged in to, which startup auto-connect tries first. */
+export async function getLastServer(): Promise<{ ip: string; port: number; name: string } | null> {
+  return invoke('get_last_server');
+}
+
 /** The backend's retained server log, oldest line first. Used to restore the
  *  history after a reload of the webview, which the frontend store cannot
  *  survive on its own. */

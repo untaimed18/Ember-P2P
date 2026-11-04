@@ -144,7 +144,7 @@ pub(super) async fn flush_credit_state(
     // keys are taken under the write lock, which is then downgraded so the
     // row copies and the `clients.met` serialization see exactly that state
     // while readers (the upload dispatcher) keep running.
-    let (serialized_bytes, flush_keys, owned, removed, ember_owned, ember_removed, links) = {
+    let (serialized_bytes, flush_keys, owned, removed, ember_owned, ember_removed, links, key_links) = {
         let mut cm_w = credit_manager.write().await;
         let flush_keys = cm_w.begin_flush();
         let cm = cm_w.downgrade();
@@ -155,11 +155,19 @@ pub(super) async fn flush_credit_state(
         let mut ember_removed: Vec<[u8; 32]> = Vec::new();
         // `proven_ember_hash` of each row written, which lives in its own table.
         let mut links: Vec<([u8; 16], Option<[u8; 16]>)> = Vec::new();
+        // And its key link, which lives in another.
+        let mut key_links: Vec<([u8; 16], Option<([u8; 16], Vec<u8>)>)> = Vec::new();
+        let key_link = |r: &ed2k::credits::CreditRecord| {
+            r.signed_ember_link().map(|(eh, key)| (eh, key.to_vec()))
+        };
         if flush_keys.full_sync {
             for r in cm.all_records() {
                 records.push(credit_row(r));
                 if r.proven_ember_hash.is_some() {
                     links.push((r.user_hash, r.proven_ember_hash));
+                }
+                if let Some(link) = key_link(r) {
+                    key_links.push((r.user_hash, Some(link)));
                 }
             }
             ember_records = cm
@@ -173,6 +181,7 @@ pub(super) async fn flush_credit_state(
                     Some(r) => {
                         records.push(credit_row(r));
                         links.push((r.user_hash, r.proven_ember_hash));
+                        key_links.push((r.user_hash, key_link(r)));
                     }
                     None => removed.push(*key),
                 }
@@ -184,7 +193,7 @@ pub(super) async fn flush_credit_state(
                 }
             }
         }
-        (bytes, flush_keys, records, removed, ember_records, ember_removed, links)
+        (bytes, flush_keys, records, removed, ember_records, ember_removed, links, key_links)
     };
     let full_sync = flush_keys.full_sync;
     // Own the save slot through the blocking DB/cache write itself. If the
@@ -233,6 +242,11 @@ pub(super) async fn flush_credit_state(
         if result.is_ok() {
             if let Err(e) = db_ref.save_credit_ember_links(&links, &removed, full_sync) {
                 debug!("Failed to save Known Ember Peers links: {e}");
+            }
+            // Logged too: a link that misses disk is proven again on the
+            // peer's next session, and the next touch of the row rewrites it.
+            if let Err(e) = db_ref.save_credit_key_links(&key_links, &removed, full_sync) {
+                debug!("Failed to save Ember key links: {e}");
             }
         }
         if result.is_ok() && (full_sync || !removed.is_empty() || !ember_removed.is_empty()) {

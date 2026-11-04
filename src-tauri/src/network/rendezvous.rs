@@ -663,7 +663,7 @@ fn client_cache() -> &'static tokio::sync::RwLock<std::collections::HashMap<Stri
 /// and ~86,400 full TCP+TLS handshakes per client per day against one server.
 /// Cloning a `reqwest::Client` shares the pool, so handing out clones is what
 /// makes connection reuse and TLS session resumption actually apply.
-async fn client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
+pub(crate) async fn client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
     {
         let cache = client_cache().read().await;
         if let Some(hit) = cache.get(rendezvous_url) {
@@ -675,7 +675,7 @@ async fn client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
     let (_, host, addrs) = crate::security::validate_fetch_url(rendezvous_url)
         .await
         .map_err(|e| format!("rendezvous URL rejected: {e}"))?;
-    let built = crate::security::build_pinned_client(&host, &addrs)
+    let built = crate::security::build_pinned_client(&host, &rendezvous_pin(&addrs))
         .map_err(|e| format!("failed to build hardened rendezvous HTTP client: {e}"))?;
     {
         let mut cache = client_cache().write().await;
@@ -694,6 +694,21 @@ async fn client(rendezvous_url: &str) -> Result<reqwest::Client, String> {
         );
     }
     Ok(built)
+}
+
+/// The addresses a rendezvous client may connect to: IPv4 only when the
+/// server has any. The server refuses punch and presence registrations that
+/// sign an IPv4 address but arrive over IPv6, and IPv4 first in the pin list
+/// is not enough: the connector races IPv6 after a few hundred milliseconds
+/// without an IPv4 connection, and the pooled IPv6 one then carries every
+/// request for the life of the cached client.
+fn rendezvous_pin(addrs: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    let v4 = ipv4_only(addrs);
+    if v4.is_empty() {
+        addrs.to_vec()
+    } else {
+        v4
+    }
 }
 
 /// Reject non-HTTPS rendezvous URLs before we send any traffic. The
@@ -996,49 +1011,58 @@ pub async fn register(
         };
         let intro_ok = sealed_intro_ok || legacy_intro_ok;
 
+        use futures::StreamExt;
+
         // Public presence is never indexed by the stable Friend ID. Register
         // one opaque rotating capability for each friend whose public key is
         // available; hash-only relationships are covered by the legacy intro
-        // until the backfill above supplies their key.
-        let mut pairwise_attempted = 0usize;
-        let mut pairwise_failed = 0usize;
-        let mut last_pairwise_error: Option<String> = None;
-        for (_, friend_pubkey) in &friend_identities {
-            let Some(capability) =
+        // until the backfill above supplies their key. Each capability is
+        // its own entry on the server, so they go a few at a time.
+        let pairwise_targets: Vec<_> = friend_identities
+            .iter()
+            .filter_map(|(_, friend_pubkey)| {
                 crate::network::ember::crypto::derive_pairwise_presence_capability(
                     secret_key,
                     friend_pubkey,
                     pubkey,
                     epoch,
                 )
-            else {
-                continue;
-            };
-            pairwise_attempted += 1;
-            if let Err(error) = register_capability_presence(
-                base_url,
-                &capability,
-                epoch,
-                port,
-                external_ip,
-                pubkey,
-                friend_pubkey,
-                secret_key,
-                protocol,
-                IntroProof::None,
-            )
-            .await
-            {
-                pairwise_failed += 1;
-                last_pairwise_error = Some(error.to_string());
-            }
+                .map(|capability| (capability, *friend_pubkey))
+            })
+            .collect();
+        let pairwise: Vec<Result<(), PresenceRegisterError>> = futures::stream::iter(pairwise_targets)
+            .map(|(capability, friend_pubkey)| async move {
+                register_capability_presence(
+                    base_url,
+                    &capability,
+                    epoch,
+                    port,
+                    external_ip,
+                    pubkey,
+                    &friend_pubkey,
+                    secret_key,
+                    protocol,
+                    IntroProof::None,
+                )
+                .await
+            })
+            .buffer_unordered(PRESENCE_REGISTER_CONCURRENCY)
+            .collect()
+            .await;
+        let pairwise_attempted = pairwise.len();
+        let mut pairwise_failed = 0usize;
+        let mut last_pairwise_error: Option<String> = None;
+        for error in pairwise.into_iter().filter_map(Result::err) {
+            pairwise_failed += 1;
+            last_pairwise_error = Some(error.to_string());
         }
         // Channel gossip neighbors resolve over Ember UDP, not the friend
         // TCP listener. Capability `port` is per-entry, so these sit
         // alongside friend slots without changing `/register`.
         if udp_port > 0 {
-            for (channel_id, neighbor_pubkey) in channel_neighbors {
-                let Some(capability) =
+            let neighbor_targets: Vec<_> = channel_neighbors
+                .iter()
+                .filter_map(|(channel_id, neighbor_pubkey)| {
                     crate::network::ember::channel::derive_channel_presence_capability(
                         secret_key,
                         neighbor_pubkey,
@@ -1046,26 +1070,66 @@ pub async fn register(
                         channel_id,
                         epoch,
                     )
-                else {
-                    continue;
-                };
-                if let Err(error) = register_capability_presence(
-                    base_url,
-                    &capability,
-                    epoch,
-                    udp_port,
-                    external_ip,
-                    pubkey,
-                    neighbor_pubkey,
-                    secret_key,
-                    protocol,
-                    IntroProof::None,
-                )
-                .await
-                {
-                    debug!("Channel presence registration failed: {error}");
-                }
-            }
+                    .map(|capability| (capability, *neighbor_pubkey))
+                })
+                .collect();
+            futures::stream::iter(neighbor_targets)
+                .for_each_concurrent(PRESENCE_REGISTER_CONCURRENCY, |(capability, neighbor_pubkey)| async move {
+                    if let Err(error) = register_capability_presence(
+                        base_url,
+                        &capability,
+                        epoch,
+                        udp_port,
+                        external_ip,
+                        pubkey,
+                        &neighbor_pubkey,
+                        secret_key,
+                        protocol,
+                        IntroProof::None,
+                    )
+                    .await
+                    {
+                        debug!("Channel presence registration failed: {error}");
+                    }
+                })
+                .await;
+        }
+        // Each feed we publish, for followers who find no source for its
+        // list. After the friends' entries, so they are what a busy rate
+        // limit refuses last. Sealed like the intro: a server that refuses
+        // sealed intros gets none.
+        if sealed_available {
+            let registered: Vec<Option<[u8; 16]>> = futures::stream::iter(crate::network::feed_reach::own_feeds())
+                .map(|salt| async move {
+                    let (capability, epoch_key) =
+                        crate::network::ember::crypto::derive_feed_presence_capability(pubkey, &salt, epoch);
+                    match register_capability_presence(
+                        base_url,
+                        &capability,
+                        epoch,
+                        port,
+                        external_ip,
+                        pubkey,
+                        pubkey,
+                        secret_key,
+                        protocol,
+                        IntroProof::Sealed(&epoch_key),
+                    )
+                    .await
+                    {
+                        Ok(()) => Some(salt),
+                        Err(error) => {
+                            debug!("Feed presence registration failed: {error}");
+                            None
+                        }
+                    }
+                })
+                .buffer_unordered(PRESENCE_REGISTER_CONCURRENCY)
+                .collect()
+                .await;
+            crate::network::feed_reach::note_registered(registered.into_iter().flatten().collect());
+        } else {
+            crate::network::feed_reach::note_registered(Vec::new());
         }
         if let Some(error) = last_pairwise_error {
             if pairwise_failed == pairwise_attempted {
@@ -1304,6 +1368,10 @@ const CAPABILITY_TS_MAX_LEAD_SECS: i64 = 5;
 /// or after the current second are kept, so this is a burst bound, not a
 /// history.
 const CAPABILITY_TS_MAX_TRACKED: usize = 4_096;
+
+/// Capability registrations in flight at once in [`register`]: well inside
+/// the server's per-network connection limit.
+const PRESENCE_REGISTER_CONCURRENCY: usize = 4;
 
 /// Last second each capability was signed at, for [`next_capability_ts`].
 static CAPABILITY_LAST_SIGNED_TS: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], i64>> =
@@ -1639,6 +1707,80 @@ pub async fn lookup_channel_presence(
         candidates,
     )
     .await
+}
+
+/// Look up the publisher of the feed `salt` by the feed's presence
+/// capability, which only holders of its link can compute. The answer is
+/// checked as a friend's is: signed by `publisher_pubkey` over the address.
+pub async fn lookup_feed_presence(
+    base_url: &str,
+    our_ember_hash: &[u8; 16],
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    publisher_pubkey: &[u8; 32],
+    salt: &[u8; 16],
+) -> Result<Option<(Ipv4Addr, u16)>, String> {
+    require_https(base_url)?;
+    let publisher_hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(publisher_pubkey)
+        .ok_or_else(|| "feed publisher key is not a valid identity".to_string())?;
+    let current_epoch = crate::network::ember::crypto::pairwise_capability_epoch(current_timestamp());
+    let candidates = [current_epoch, current_epoch - 1]
+        .into_iter()
+        .map(|epoch| {
+            let (capability, _) =
+                crate::network::ember::crypto::derive_feed_presence_capability(publisher_pubkey, salt, epoch);
+            (capability, epoch, *publisher_pubkey)
+        })
+        .collect();
+    lookup_capability_entries(
+        base_url,
+        our_ember_hash,
+        our_pubkey,
+        our_secret_key,
+        publisher_pubkey,
+        &hashed_id(&publisher_hash),
+        candidates,
+    )
+    .await
+}
+
+/// Register our presence for `peer_pubkey` alone, under the pairwise
+/// capability the two keys share, so `peer_pubkey` may punch back to us. A
+/// follower does this before punching a feed's publisher, who is not its
+/// friend and so has no such entry from the heartbeat. Lapses with the entry
+/// TTL.
+pub async fn register_peer_presence(
+    base_url: &str,
+    our_pubkey: &[u8; 32],
+    our_secret_key: &[u8; 32],
+    peer_pubkey: &[u8; 32],
+    port: u16,
+    external_ip: Ipv4Addr,
+) -> Result<(), String> {
+    require_https(base_url)?;
+    let protocol = negotiate_protocol(base_url).await?;
+    let epoch = crate::network::ember::crypto::pairwise_capability_epoch(current_timestamp());
+    let capability = crate::network::ember::crypto::derive_pairwise_presence_capability(
+        our_secret_key,
+        peer_pubkey,
+        our_pubkey,
+        epoch,
+    )
+    .ok_or_else(|| "could not derive pairwise presence capability".to_string())?;
+    register_capability_presence(
+        base_url,
+        &capability,
+        epoch,
+        port,
+        external_ip,
+        our_pubkey,
+        peer_pubkey,
+        our_secret_key,
+        protocol,
+        IntroProof::None,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 async fn lookup_capability_entries(
@@ -2235,7 +2377,7 @@ mod lookup_filter_tests {
             None,
         )
         .unwrap();
-        let (initiator, channel_id) = decrypt_relay_mailbox_envelope(
+        let offer = decrypt_relay_mailbox_envelope(
             &bob_hash,
             &bob.to_bytes(),
             &capability,
@@ -2243,8 +2385,9 @@ mod lookup_filter_tests {
             &envelope,
         )
         .unwrap();
-        assert_eq!(initiator, hashed_id(&alice_hash));
-        assert_eq!(channel_id, None);
+        assert_eq!(offer.initiator_id, hashed_id(&alice_hash));
+        assert_eq!(offer.channel_id, None);
+        assert_eq!(offer.feed_salt, None);
         let mut tampered = envelope;
         *tampered.last_mut().unwrap() ^= 1;
         assert!(decrypt_relay_mailbox_envelope(
@@ -2309,6 +2452,17 @@ pub struct PendingFriendRelayTicket {
     /// Set when the mailbox envelope is a channel-capability offer. Friend
     /// tickets keep this `None` and still require `friend_hashes` admission.
     pub channel_id: Option<[u8; 16]>,
+    /// Set when it is a follower asking for the list of our feed with this
+    /// salt, under that feed's presence capability.
+    pub feed_salt: Option<[u8; 16]>,
+}
+
+/// Who a relay mailbox offer is from, and what for.
+#[derive(Debug, PartialEq, Eq)]
+struct MailboxOffer {
+    initiator_id: String,
+    channel_id: Option<[u8; 16]>,
+    feed_salt: Option<[u8; 16]>,
 }
 
 /// One bounded page of authenticated self-mailbox offers.
@@ -2384,7 +2538,7 @@ fn decrypt_relay_mailbox_envelope(
     capability: &[u8; 32],
     expected_ticket_id: &str,
     envelope: &[u8],
-) -> Result<(String, Option<[u8; 16]>), String> {
+) -> Result<MailboxOffer, String> {
     const HEADER: usize = 1 + 8 + 32 + RELAY_MAILBOX_NONCE_LEN;
     if envelope.len() < HEADER + 16 || envelope[0] != RELAY_MAILBOX_ENVELOPE_VERSION {
         return Err("invalid relay mailbox envelope".to_string());
@@ -2428,7 +2582,15 @@ fn decrypt_relay_mailbox_envelope(
         return Err("relay mailbox signed context mismatch".to_string());
     }
     let purpose = body["purpose"].as_str().unwrap_or_default();
+    let mut feed_salt = None;
     let channel_id = match purpose {
+        "feed-list" => {
+            feed_salt = Some(
+                crate::network::feed_reach::own_feed_for_capability(&responder_pubkey, epoch, capability)
+                    .ok_or_else(|| "relay mailbox capability mismatch".to_string())?,
+            );
+            None
+        }
         "friend" => {
             let expected = crate::network::ember::crypto::derive_pairwise_presence_capability(
                 responder_secret_key,
@@ -2461,7 +2623,7 @@ fn decrypt_relay_mailbox_envelope(
         }
         _ => return Err("relay mailbox signed context mismatch".to_string()),
     };
-    Ok((initiator_id.to_owned(), channel_id))
+    Ok(MailboxOffer { initiator_id: initiator_id.to_owned(), channel_id, feed_salt })
 }
 
 fn sign_relay_ticket_message(secret: &[u8; 32], message: &[u8]) -> Signature {
@@ -2495,94 +2657,46 @@ pub async fn offer_friend_relay_ticket(
     initiator_pubkey: &[u8; 32],
     secret_key: &[u8; 32],
 ) -> Result<FriendRelayTicketOffer, String> {
-    require_https(base_url)?;
-    let initiator_id = hashed_id(initiator_ember_hash);
-    let responder_id = hashed_id(responder_ember_hash);
-    let initiator_raw = sha256_id_raw(initiator_ember_hash);
-    let responder_raw = sha256_id_raw(responder_ember_hash);
-    let responder_pubkey = fetch_identity_pubkey_authenticated(
+    offer_relay_ticket(
         base_url,
-        responder_ember_hash,
         initiator_ember_hash,
+        responder_ember_hash,
         initiator_pubkey,
         secret_key,
+        OfferPurpose::Friend,
     )
-    .await?
-    .ok_or_else(|| "relay responder has no registered v2 identity".to_string())?;
-    let ts = current_timestamp();
-    let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
-    let capability = crate::network::ember::crypto::derive_pairwise_presence_capability(
-        secret_key,
-        &responder_pubkey,
-        &responder_pubkey,
-        epoch,
-    )
-    .ok_or_else(|| "could not derive relay responder capability".to_string())?;
-    let mut ticket_raw = [0u8; 32];
-    OsRng.fill_bytes(&mut ticket_raw);
-    let ticket_id = hex::encode(ticket_raw);
-    let envelope = encrypt_relay_mailbox_envelope(
+    .await
+}
+
+/// Offer a relay to the publisher of the feed `salt`, for its list, under the
+/// feed's presence capability (see
+/// [`crate::network::ember::crypto::derive_feed_presence_capability`]). The
+/// publisher accepts it for a list of its own and nothing else.
+pub async fn offer_feed_relay_ticket(
+    base_url: &str,
+    initiator_ember_hash: &[u8; 16],
+    publisher_ember_hash: &[u8; 16],
+    initiator_pubkey: &[u8; 32],
+    secret_key: &[u8; 32],
+    salt: &[u8; 16],
+) -> Result<FriendRelayTicketOffer, String> {
+    offer_relay_ticket(
+        base_url,
         initiator_ember_hash,
+        publisher_ember_hash,
         initiator_pubkey,
-        responder_ember_hash,
-        &responder_pubkey,
-        &capability,
-        epoch,
-        &ticket_id,
         secret_key,
-        "friend",
-        None,
-    )?;
-    let nonce = random_nonce();
-    let signed = build_relay_mailbox_offer_msg(
-        &initiator_raw,
-        &responder_raw,
-        &capability,
-        epoch,
-        &ticket_raw,
-        &envelope,
-        &nonce,
-        ts,
-    );
-    let sig = sign_relay_ticket_message(secret_key, &signed);
-    let url = format!("{}/v4/relay-mailbox/offer", base_url.trim_end_matches('/'));
-    let resp = client(base_url)
-        .await?
-        .post(&url)
-        .json(&serde_json::json!({
-            "initiator_id": initiator_id,
-            "responder_id": responder_id,
-            "capability": hex::encode(capability),
-            "epoch": epoch,
-            "ticket_id": ticket_id,
-            "envelope": hex::encode(envelope),
-            "ts": ts,
-            "nonce": hex::encode(nonce),
-            "sig": hex::encode(sig.to_bytes()),
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("relay ticket offer: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("relay ticket offer: status {}", resp.status()));
-    }
-    let body: serde_json::Value =
-        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
-            .map_err(|e| format!("relay ticket offer bad body: {e}"))?;
-    let returned_ticket_id = canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
-    if returned_ticket_id != ticket_id {
-        return Err("relay ticket offer acknowledgement mismatch".to_string());
-    }
-    let initiator_token = body["initiator_token"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    validate_ticket_response_field(&ticket_id, "ticket_id")?;
-    validate_ticket_response_field(&initiator_token, "initiator_token")?;
-    Ok(FriendRelayTicketOffer {
-        ticket_id,
-        initiator_token,
-    })
+        OfferPurpose::FeedList(salt),
+    )
+    .await
+}
+
+/// What a relay offer is for, which decides the capability it names.
+#[derive(Clone, Copy)]
+enum OfferPurpose<'a> {
+    Friend,
+    Channel(&'a [u8; 16]),
+    FeedList(&'a [u8; 16]),
 }
 
 /// Offer a rendezvous WebSocket relay bound to a channel presence capability.
@@ -2595,7 +2709,39 @@ pub async fn offer_channel_relay_ticket(
     secret_key: &[u8; 32],
     channel_id: &[u8; 16],
 ) -> Result<FriendRelayTicketOffer, String> {
+    offer_relay_ticket(
+        base_url,
+        initiator_ember_hash,
+        responder_ember_hash,
+        initiator_pubkey,
+        secret_key,
+        OfferPurpose::Channel(channel_id),
+    )
+    .await
+}
+
+/// A friend relay offer (`channel_id` `None`, bound to the pairwise presence
+/// capability) or a room one (bound to that room's presence capability).
+///
+/// The current epoch first, then the previous: for up to a presence heartbeat
+/// after a rollover the server holds only the responder's previous-epoch
+/// capability and refuses an offer naming the current one with 403, as it does
+/// punch registrations. The 403 comes before the server admits the request, so
+/// the first attempt consumes nothing the second needs.
+async fn offer_relay_ticket(
+    base_url: &str,
+    initiator_ember_hash: &[u8; 16],
+    responder_ember_hash: &[u8; 16],
+    initiator_pubkey: &[u8; 32],
+    secret_key: &[u8; 32],
+    purpose: OfferPurpose<'_>,
+) -> Result<FriendRelayTicketOffer, String> {
     require_https(base_url)?;
+    let what = match purpose {
+        OfferPurpose::Friend => "relay ticket offer",
+        OfferPurpose::Channel(_) => "channel relay ticket offer",
+        OfferPurpose::FeedList(_) => "feed relay ticket offer",
+    };
     let initiator_id = hashed_id(initiator_ember_hash);
     let responder_id = hashed_id(responder_ember_hash);
     let initiator_raw = sha256_id_raw(initiator_ember_hash);
@@ -2609,84 +2755,130 @@ pub async fn offer_channel_relay_ticket(
     )
     .await?
     .ok_or_else(|| "relay responder has no registered v2 identity".to_string())?;
-    let ts = current_timestamp();
-    let epoch = crate::network::ember::crypto::pairwise_capability_epoch(ts);
-    let capability = crate::network::ember::channel::derive_channel_presence_capability(
-        secret_key,
-        &responder_pubkey,
-        &responder_pubkey,
-        channel_id,
-        epoch,
-    )
-    .ok_or_else(|| "could not derive channel relay responder capability".to_string())?;
-    let mut ticket_raw = [0u8; 32];
-    OsRng.fill_bytes(&mut ticket_raw);
-    let ticket_id = hex::encode(ticket_raw);
-    let envelope = encrypt_relay_mailbox_envelope(
-        initiator_ember_hash,
-        initiator_pubkey,
-        responder_ember_hash,
-        &responder_pubkey,
-        &capability,
-        epoch,
-        &ticket_id,
-        secret_key,
-        "channel",
-        Some(channel_id),
-    )?;
-    let nonce = random_nonce();
-    let signed = build_relay_mailbox_offer_msg(
-        &initiator_raw,
-        &responder_raw,
-        &capability,
-        epoch,
-        &ticket_raw,
-        &envelope,
-        &nonce,
-        ts,
-    );
-    let sig = sign_relay_ticket_message(secret_key, &signed);
-    let url = format!("{}/v4/relay-mailbox/offer", base_url.trim_end_matches('/'));
-    let resp = client(base_url)
-        .await?
-        .post(&url)
-        .json(&serde_json::json!({
-            "initiator_id": initiator_id,
-            "responder_id": responder_id,
-            "capability": hex::encode(capability),
-            "epoch": epoch,
-            "ticket_id": ticket_id,
-            "envelope": hex::encode(envelope),
-            "ts": ts,
-            "nonce": hex::encode(nonce),
-            "sig": hex::encode(sig.to_bytes()),
+    let current_epoch =
+        crate::network::ember::crypto::pairwise_capability_epoch(current_timestamp());
+    let (initiator_id, responder_id) = (&initiator_id, &responder_id);
+    with_previous_epoch_on_403(current_epoch, what, move |epoch| async move {
+        let capability = match purpose {
+            OfferPurpose::Channel(channel_id) => crate::network::ember::channel::derive_channel_presence_capability(
+                secret_key,
+                &responder_pubkey,
+                &responder_pubkey,
+                channel_id,
+                epoch,
+            )
+            .ok_or_else(|| "could not derive channel relay responder capability".to_string())?,
+            OfferPurpose::Friend => crate::network::ember::crypto::derive_pairwise_presence_capability(
+                secret_key,
+                &responder_pubkey,
+                &responder_pubkey,
+                epoch,
+            )
+            .ok_or_else(|| "could not derive relay responder capability".to_string())?,
+            OfferPurpose::FeedList(salt) => {
+                crate::network::ember::crypto::derive_feed_presence_capability(&responder_pubkey, salt, epoch).0
+            }
+        };
+        let (purpose_name, channel_id) = match purpose {
+            OfferPurpose::Friend => ("friend", None),
+            OfferPurpose::Channel(channel_id) => ("channel", Some(channel_id)),
+            OfferPurpose::FeedList(_) => ("feed-list", None),
+        };
+        let mut ticket_raw = [0u8; 32];
+        OsRng.fill_bytes(&mut ticket_raw);
+        let ticket_id = hex::encode(ticket_raw);
+        let envelope = encrypt_relay_mailbox_envelope(
+            initiator_ember_hash,
+            initiator_pubkey,
+            responder_ember_hash,
+            &responder_pubkey,
+            &capability,
+            epoch,
+            &ticket_id,
+            secret_key,
+            purpose_name,
+            channel_id,
+        )?;
+        let ts = current_timestamp();
+        let nonce = random_nonce();
+        let signed = build_relay_mailbox_offer_msg(
+            &initiator_raw,
+            &responder_raw,
+            &capability,
+            epoch,
+            &ticket_raw,
+            &envelope,
+            &nonce,
+            ts,
+        );
+        let sig = sign_relay_ticket_message(secret_key, &signed);
+        let url = format!("{}/v4/relay-mailbox/offer", base_url.trim_end_matches('/'));
+        let resp = client(base_url)
+            .await?
+            .post(&url)
+            .json(&serde_json::json!({
+                "initiator_id": initiator_id,
+                "responder_id": responder_id,
+                "capability": hex::encode(capability),
+                "epoch": epoch,
+                "ticket_id": ticket_id,
+                "envelope": hex::encode(envelope),
+                "ts": ts,
+                "nonce": hex::encode(nonce),
+                "sig": hex::encode(sig.to_bytes()),
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("{what}: {e}"))?;
+        if !resp.status().is_success() {
+            return Ok(Err(resp.status()));
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
+                .map_err(|e| format!("{what} bad body: {e}"))?;
+        let returned_ticket_id =
+            canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
+        if returned_ticket_id != ticket_id {
+            return Err(format!("{what} acknowledgement mismatch"));
+        }
+        let initiator_token = body["initiator_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        validate_ticket_response_field(&ticket_id, "ticket_id")?;
+        validate_ticket_response_field(&initiator_token, "initiator_token")?;
+        Ok(Ok(FriendRelayTicketOffer {
+            ticket_id,
+            initiator_token,
         }))
-        .send()
-        .await
-        .map_err(|e| format!("channel relay ticket offer: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "channel relay ticket offer: status {}",
-            resp.status()
-        ));
-    }
-    let body: serde_json::Value =
-        serde_json::from_slice(&read_bounded_bytes(resp, MAX_RESPONSE_BYTES).await?)
-            .map_err(|e| format!("channel relay ticket offer bad body: {e}"))?;
-    let returned_ticket_id = canonical_ticket_id(body["ticket_id"].as_str().unwrap_or_default())?;
-    if returned_ticket_id != ticket_id {
-        return Err("channel relay ticket offer acknowledgement mismatch".to_string());
-    }
-    let initiator_token = body["initiator_token"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    validate_ticket_response_field(&ticket_id, "ticket_id")?;
-    validate_ticket_response_field(&initiator_token, "initiator_token")?;
-    Ok(FriendRelayTicketOffer {
-        ticket_id,
-        initiator_token,
     })
+    .await
+}
+
+/// `attempt` under `current_epoch`'s capability, then once under the previous
+/// epoch's if the server refused the first with 403. `attempt` answers `Ok(Err)`
+/// with the status of a request the server refused.
+async fn with_previous_epoch_on_403<T, F, Fut>(
+    current_epoch: i64,
+    what: &str,
+    mut attempt: F,
+) -> Result<T, String>
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<Result<T, reqwest::StatusCode>, String>>,
+{
+    let mut status = reqwest::StatusCode::FORBIDDEN;
+    for epoch in [current_epoch, current_epoch - 1] {
+        match attempt(epoch).await? {
+            Ok(value) => return Ok(value),
+            Err(reqwest::StatusCode::FORBIDDEN) => {}
+            Err(refused) => {
+                status = refused;
+                break;
+            }
+        }
+    }
+    Err(format!("{what}: status {status}"))
 }
 
 /// One page of the chat mailbox: at most 32 sealed entries of up to 4608
@@ -2864,6 +3056,19 @@ mod reachability_tests {
         let v4 = super::ipv4_only(&addrs);
         assert_eq!(v4, vec![addrs[1], addrs[3]]);
         assert!(super::ipv4_only(&addrs[..1]).is_empty());
+    }
+
+    /// The shared client never races to IPv6 when the server has an IPv4
+    /// address, and still reaches an IPv6-only server.
+    #[test]
+    fn the_rendezvous_client_is_pinned_to_ipv4_when_there_is_any() {
+        let addrs: Vec<std::net::SocketAddr> = ["[2a09:8280:1::1]:443", "66.241.124.1:443", "[2a09:8280:1::2]:443"]
+            .iter()
+            .map(|a| a.parse().unwrap())
+            .collect();
+        assert_eq!(super::rendezvous_pin(&addrs), vec![addrs[1]]);
+        let v6_only = [addrs[0], addrs[2]];
+        assert_eq!(super::rendezvous_pin(&v6_only), v6_only.to_vec());
     }
 }
 
@@ -3071,11 +3276,12 @@ async fn parse_friend_relay_mailbox_response(
             &ticket_id,
             &envelope,
         ) {
-            Ok((id, channel_id)) => {
+            Ok(offer) => {
                 tickets.push(PendingFriendRelayTicket {
                     ticket_id,
-                    initiator_id: id,
-                    channel_id,
+                    initiator_id: offer.initiator_id,
+                    channel_id: offer.channel_id,
+                    feed_salt: offer.feed_salt,
                 });
                 continue;
             }
@@ -3945,6 +4151,52 @@ fn urlencoding_hex(value: &str) -> String {
 #[cfg(test)]
 mod relay_ticket_tests {
     use super::*;
+
+    /// Run [`with_previous_epoch_on_403`] against a server answering `answers`
+    /// in turn, and report the epochs it was asked under.
+    async fn offer_against(
+        answers: Vec<Result<&'static str, reqwest::StatusCode>>,
+    ) -> (Result<&'static str, String>, Vec<i64>) {
+        let answers = std::sync::Mutex::new(std::collections::VecDeque::from(answers));
+        let asked = std::sync::Mutex::new(Vec::new());
+        let result = with_previous_epoch_on_403(100, "relay ticket offer", |epoch| {
+            asked.lock().unwrap().push(epoch);
+            let answer = answers.lock().unwrap().pop_front().expect("asked past the last answer");
+            async move { Ok(answer) }
+        })
+        .await;
+        (result, asked.into_inner().unwrap())
+    }
+
+    /// For up to a heartbeat after a rollover the server holds only the
+    /// responder's previous-epoch capability, so a 403 is tried once more
+    /// under it, and nothing else is retried.
+    #[tokio::test]
+    async fn a_relay_offer_refused_with_403_is_retried_once_under_the_previous_epoch() {
+        let (result, asked) = offer_against(vec![Ok("ticket")]).await;
+        assert_eq!((result, asked), (Ok("ticket"), vec![100]));
+
+        let (result, asked) =
+            offer_against(vec![Err(reqwest::StatusCode::FORBIDDEN), Ok("ticket")]).await;
+        assert_eq!((result, asked), (Ok("ticket"), vec![100, 99]));
+
+        let forbidden = reqwest::StatusCode::FORBIDDEN;
+        let (result, asked) = offer_against(vec![Err(forbidden), Err(forbidden)]).await;
+        assert_eq!(result, Err("relay ticket offer: status 403 Forbidden".to_string()));
+        assert_eq!(asked, vec![100, 99], "two epochs, then it gives up");
+
+        let (result, asked) = offer_against(vec![Err(reqwest::StatusCode::CONFLICT)]).await;
+        assert_eq!(result, Err("relay ticket offer: status 409 Conflict".to_string()));
+        assert_eq!(asked, vec![100], "only a capability refusal is worth another epoch");
+
+        let (result, asked) = offer_against(vec![
+            Err(forbidden),
+            Err(reqwest::StatusCode::TOO_MANY_REQUESTS),
+        ])
+        .await;
+        assert_eq!(result, Err("relay ticket offer: status 429 Too Many Requests".to_string()));
+        assert_eq!(asked, vec![100, 99]);
+    }
 
     /// This mirrors the rendezvous server's `strip_invisible`, and a
     /// divergence is silent and total: the client signs over a string the

@@ -48,12 +48,16 @@ const PROXY_FORWARD_INFLIGHT: Duration = Duration::from_secs(30);
 /// A forward is the most expensive thing an authenticated peer can ask for:
 /// one inbound datagram becomes a `STORE_RECORD` to each of `K_EMBER_REPLICAS`
 /// nodes and holds one of `MAX_ACTIVE_PUBLISHES` (128) publish slots until it
-/// completes. A quarter of the slots is enough for every buddy we would
-/// plausibly serve and leaves proxied work unable to starve our own publishes.
+/// completes. Under half the slots, which leaves proxied work unable to starve
+/// our own publishes, and far enough above one address's share
+/// ([`MAX_PROXY_FORWARDS_PER_ADDR`]) that it takes three addresses in two /24s
+/// to fill. That share cannot shrink instead: a publisher sends its tick's
+/// asks as one burst of [`MAX_PROXY_FORWARDS_PER_SENDER`], and a burst cut
+/// short reads to it as a buddy that stopped answering.
 /// Since a slot lives at most [`PROXY_FORWARD_INFLIGHT`], counting what was
 /// admitted inside that window bounds what can be alive now — which is how the
 /// engine enforces a concurrency limit without ever seeing a completion.
-const MAX_PROXY_FORWARDS_IN_FLIGHT: usize = 32;
+const MAX_PROXY_FORWARDS_IN_FLIGHT: usize = 60;
 
 /// Window the per-sender proxy allowance is measured over.
 pub(crate) const PROXY_FORWARD_WINDOW: Duration = Duration::from_secs(60);
@@ -78,7 +82,16 @@ pub(crate) const MAX_PROXY_FORWARDS_PER_SENDER: usize = 24;
 /// get, and it stays under the in-flight cap so one address cannot close it.
 /// Firewalled publishers behind one NAT that pick the same buddy share it.
 const MAX_PROXY_FORWARDS_PER_ADDR: usize = MAX_PROXY_FORWARDS_PER_SENDER;
-const _: () = assert!(MAX_PROXY_FORWARDS_PER_ADDR < MAX_PROXY_FORWARDS_IN_FLIGHT);
+/// Proxy forwards accepted from one /24 (or IPv6 /48) per
+/// [`PROXY_FORWARD_WINDOW`]. Addresses in one block are cheap to hold
+/// together, so the per-address share alone let a few of them fill the
+/// in-flight cap; this keeps any one block to about half of it.
+const MAX_PROXY_FORWARDS_PER_SUBNET: usize = 32;
+const _: () = assert!(
+    2 * MAX_PROXY_FORWARDS_PER_ADDR < MAX_PROXY_FORWARDS_IN_FLIGHT
+        && MAX_PROXY_FORWARDS_PER_ADDR <= MAX_PROXY_FORWARDS_PER_SUBNET
+        && MAX_PROXY_FORWARDS_PER_SUBNET < MAX_PROXY_FORWARDS_IN_FLIGHT
+);
 
 /// How long we remember a publisher we `PROXY_STORE`d for, so a later
 /// `CALLBACK_REQ` can still reach them. Matches the source-record TTL: a
@@ -104,11 +117,15 @@ const MAX_CALLBACK_CLIENTS_PER_SUBNET: usize = MAX_CALLBACK_CLIENTS / 4;
 const _: () = assert!(MAX_CALLBACK_CLIENTS_PER_SUBNET >= MAX_CALLBACK_CLIENTS_PER_ADDR);
 /// Files remembered per callback client, against [`CallbackClient::files`].
 ///
-/// One firewalled publisher proxies a tick's worth of source records through a
-/// single buddy, so this has to cover a publish round rather than a single
-/// file; past it the least recently proxied file is forgotten and its searchers
-/// fall back to the park path, exactly as they would once the record expired.
-const MAX_CALLBACK_FILES_PER_CLIENT: usize = 64;
+/// Every record a publisher proxies through us names us for its whole six-hour
+/// life, so this has to cover the publisher's library rather than a publish
+/// round: at 64 a library of a few hundred files had all but its last 64
+/// silently uncallable within minutes, while every one of those records still
+/// sent its searchers here. Past the cap the least recently proxied file is
+/// forgotten and its searchers fall back to the park path. Bounded by memory:
+/// about 56 bytes a grant across [`MAX_CALLBACK_CLIENTS`] publishers is some
+/// 15 MiB at the worst a table can be filled to.
+const MAX_CALLBACK_FILES_PER_CLIENT: usize = 1024;
 /// `CALLBACK_REQ`s we will bounce per searcher per minute.
 const MAX_CALLBACK_FORWARDS_PER_SENDER: usize = 8;
 const MAX_CALLBACK_FORWARDS_IN_FLIGHT: usize = 32;
@@ -127,12 +144,21 @@ const CALLBACK_FORWARD_WINDOW: Duration = Duration::from_secs(60);
 /// [`PROXY_FORWARD_INFLIGHT`] gives a store fan-out.
 const CALLBACK_FORWARD_INFLIGHT: Duration = Duration::from_secs(30);
 /// Outbound connect-backs we will honour per buddy per minute.
-const MAX_CALLBACK_CONNECTS_PER_BUDDY: usize = 8;
-const MAX_CALLBACK_CONNECTS_IN_FLIGHT: usize = 16;
-/// Connect-backs we will honour per buddy address per minute; the same rule as
-/// [`MAX_CALLBACK_FORWARDS_PER_ADDR`].
-const MAX_CALLBACK_CONNECTS_PER_ADDR: usize = MAX_CALLBACK_CONNECTS_IN_FLIGHT / 2;
-const _: () = assert!(MAX_CALLBACK_CONNECTS_PER_ADDR >= MAX_CALLBACK_CONNECTS_PER_BUDDY);
+const MAX_CALLBACK_CONNECTS_PER_BUDDY: usize = 32;
+const MAX_CALLBACK_CONNECTS_IN_FLIGHT: usize = 32;
+/// Connect-backs we will honour to one searcher address per minute, through
+/// any buddy. The budget is charged to the searcher, not the buddy: the
+/// callback token is in our public source record, so anyone who looked it up
+/// can ask, and a per-buddy charge let one such reader spend every honest
+/// searcher's turn. A connect-back serves one file, so this is also how many
+/// of our files one searcher can start fetching a minute: the same 8 a buddy
+/// bounces per searcher, so a download queue is not cut short.
+const MAX_CALLBACK_CONNECTS_PER_SEARCHER: usize = 8;
+/// The same per searcher /24, so one network cannot take the in-flight cap:
+/// two Ember instances behind one address or ISP block each get their share.
+const MAX_CALLBACK_CONNECTS_PER_SEARCHER_SUBNET: usize = 16;
+const _: () = assert!(MAX_CALLBACK_CONNECTS_PER_SEARCHER_SUBNET >= MAX_CALLBACK_CONNECTS_PER_SEARCHER);
+const _: () = assert!(MAX_CALLBACK_CONNECTS_IN_FLIGHT > MAX_CALLBACK_CONNECTS_PER_SEARCHER_SUBNET);
 const CALLBACK_CONNECT_WINDOW: Duration = Duration::from_secs(60);
 /// Sub-window for [`MAX_CALLBACK_CONNECTS_IN_FLIGHT`]; see
 /// [`CALLBACK_FORWARD_INFLIGHT`].
@@ -166,6 +192,21 @@ const MAX_PENDING_PROXY_ASKS_PER_BUDDY: usize = 256;
 /// source-record TTL would make the expiry meaningless; much shorter would
 /// re-ask on every republish cadence.
 const BUDDY_ENDORSEMENT_TTL_SECS: i64 = 6 * 3600;
+/// Distinct publishers we endorse ourselves to from one source address, and
+/// from one /24 (or IPv6 /48), within [`BUDDY_ENDORSEMENT_TTL_SECS`].
+///
+/// An endorsement is what lets a publisher name us in a firewalled source
+/// record, and storers give a record that comes from the buddy it names a
+/// larger allowance than one host's. Given to anyone, it let one host minting
+/// identities borrow that allowance from every buddy it asked. The callback
+/// table's shares, which a publisher past them could not join anyway.
+const MAX_ENDORSED_PER_ADDR: usize = MAX_CALLBACK_CLIENTS_PER_ADDR;
+const MAX_ENDORSED_PER_SUBNET: usize = MAX_CALLBACK_CLIENTS_PER_SUBNET;
+/// Endorsements we remember issuing. Past it the oldest is forgotten, which
+/// only loosens the shares above, and reaching it takes publishers from
+/// sixteen /24s.
+const MAX_ENDORSED_TRACKED: usize = 1024;
+const _: () = assert!(MAX_ENDORSED_TRACKED >= 16 * MAX_ENDORSED_PER_SUBNET);
 /// Endorsements held from candidate buddies. One is enough to publish; a
 /// handful covers churn in whoever we would name.
 const MAX_BUDDY_ENDORSEMENTS: usize = 16;
@@ -219,8 +260,8 @@ pub struct DhtInbound {
     pub find_node_received: bool,
     /// For a `FOUND_NODE`, the `request_id` it answered plus the
     /// contacts it carried (so the caller can resolve a pending
-    /// find-node waiter). The contacts are also merged into the
-    /// routing table before this is returned.
+    /// find-node waiter). The contacts are not merged into the routing
+    /// table; see [`EmberDht::merge_gossip_reply`].
     pub found_node: Option<(u32, Vec<EmberContact>)>,
     /// The verified node ID of the frame's sender (present whenever the
     /// frame decoded — the signature/identity binding has passed). The
@@ -254,12 +295,13 @@ pub struct DhtInbound {
     /// The frame was an `ANNOUNCE_PEER` we answered with a `PEER_LIST`.
     pub announce_peer_received: bool,
     /// For a `PEER_LIST`, the `request_id` it answered plus the contacts
-    /// it carried (also merged into the routing table).
+    /// it carried (merged only by [`EmberDht::merge_gossip_reply`]).
     pub peer_list: Option<(u32, Vec<EmberContact>)>,
     /// Unverified contacts carried on `ANNOUNCE_PEER` / `PEER_LIST` /
-    /// `FOUND_NODE`. Already offered to the public table; the caller may
-    /// also keep LAN/CGNAT ones in the session map and ping them now
-    /// rather than waiting for the next maintenance tick.
+    /// `FOUND_NODE`. An announce's are already offered to the public table,
+    /// the replies' only once the caller merges them; the caller may also
+    /// keep LAN/CGNAT ones in the session map and ping them now rather than
+    /// waiting for the next maintenance tick.
     pub gossip_leads: Vec<EmberContact>,
     /// Of those, how many were peers we did not already hold and the table
     /// accepted.
@@ -372,10 +414,12 @@ struct CallbackClient {
     /// Without it the only question asked was whether the publisher had ever
     /// used us, so any peer holding a Noise session could name a file we never
     /// carried — or a token we never published — and still have us wake the
-    /// publisher with a frame it was always going to refuse. The token is the
-    /// publisher's own secret (`callback_token`), so we cannot derive it; we
-    /// can only remember the one it asked us to relay, which is exactly what
-    /// the searcher copies out of the record.
+    /// publisher with a frame it was always going to refuse. The token is
+    /// derived from the publisher's signing key (`callback_token`), so we
+    /// cannot compute it; we can only remember the one it asked us to relay,
+    /// which is exactly what the searcher copies out of the record. It is no
+    /// secret: anyone who looked the record up holds it, so it shows the asker
+    /// read the record and nothing about who the asker is.
     ///
     /// Keyed by file hash, holding that file's token and when we last proxied
     /// it, so the per-client cap can drop the stalest file rather than an
@@ -521,6 +565,9 @@ pub struct EmberDht {
     /// re-ask a silent candidate on every pass, and so only the answer to an ask
     /// is absorbed.
     buddy_endorse_asked: HashMap<EmberNodeId, (Instant, u32)>,
+    /// Publishers we endorsed ourselves to, with the address each asked from
+    /// and when, for [`MAX_ENDORSED_PER_ADDR`] and [`MAX_ENDORSED_PER_SUBNET`].
+    endorsed: HashMap<EmberNodeId, (IpAddr, Instant)>,
 }
 
 /// A candidate buddy's signed statement of its own endpoint, issued to us.
@@ -621,6 +668,7 @@ impl EmberDht {
             buddy_endorsements: HashMap::new(),
             buddy_endorsement_seq: 0,
             buddy_endorse_asked: HashMap::new(),
+            endorsed: HashMap::new(),
         }
     }
 
@@ -681,6 +729,39 @@ impl EmberDht {
             expires_at,
         );
         Some((expires_at, crypto::sign(&self.signing_key, &signed)))
+    }
+
+    /// Whether to endorse ourselves to `publisher`, asking from `from`, noting
+    /// it if so. One we endorsed before is endorsed again from wherever it
+    /// asks now, as long as that address and /24 have room for it.
+    fn admit_endorsement(&mut self, publisher: EmberNodeId, from: IpAddr, now: Instant) -> bool {
+        let ttl = Duration::from_secs(BUDDY_ENDORSEMENT_TTL_SECS as u64);
+        self.endorsed
+            .retain(|_, (_, at)| now.saturating_duration_since(*at) < ttl);
+        let subnet = super::subnet_key_of(from);
+        let (mut from_addr, mut from_subnet) = (0usize, 0usize);
+        for (id, (ip, _)) in &self.endorsed {
+            if *id == publisher {
+                continue;
+            }
+            from_addr += usize::from(*ip == from);
+            from_subnet += usize::from(super::subnet_key_of(*ip) == subnet);
+        }
+        if from_addr >= MAX_ENDORSED_PER_ADDR || from_subnet >= MAX_ENDORSED_PER_SUBNET {
+            return false;
+        }
+        if self.endorsed.len() >= MAX_ENDORSED_TRACKED && !self.endorsed.contains_key(&publisher) {
+            if let Some(oldest) = self
+                .endorsed
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(id, _)| *id)
+            {
+                self.endorsed.remove(&oldest);
+            }
+        }
+        self.endorsed.insert(publisher, (from, now));
+        true
     }
 
     /// Ask `buddy` to endorse its own endpoint for us, unless we asked
@@ -1221,6 +1302,11 @@ impl EmberDht {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected;
         }
+        // A room index shard key likewise holds rooms' listings only.
+        if crate::network::ember::channel::is_index_key(&key) && !super::store::is_room_listing(&record) {
+            self.store_reject_verify = self.store_reject_verify.saturating_add(1);
+            return StoreOutcome::Rejected;
+        }
 
         if key != parsed.keyword_hash {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
@@ -1487,7 +1573,13 @@ impl EmberDht {
         if from_addr >= MAX_PROXY_FORWARDS_PER_ADDR {
             return false;
         }
-        true
+        let subnet = super::subnet_key_of(from_ip);
+        let from_subnet = self
+            .proxy_forwards
+            .iter()
+            .filter(|(_, _, ip)| super::subnet_key_of(*ip) == subnet)
+            .count();
+        from_subnet < MAX_PROXY_FORWARDS_PER_SUBNET
     }
 
     /// Store a local replica, then charge proxy budget and remember the
@@ -1503,8 +1595,9 @@ impl EmberDht {
     /// was masked; keeping the invariant here rather than in the caller is what
     /// makes it safe for a second one to exist.
     ///
-    /// Call only after [`PublishManager::start_publish_to`] granted a slot; the
-    /// caller must drop that slot if this returns false.
+    /// Called whether or not the fan-out got a publish slot: the caller still
+    /// takes and acks a request it has no slot or uplink to fan out. A slot it
+    /// did get must be dropped if this returns false.
     pub fn commit_proxy_store(
         &mut self,
         publisher: EmberNodeId,
@@ -1514,6 +1607,19 @@ impl EmberDht {
         now: Instant,
     ) -> bool {
         if !self.can_accept_proxy_forward(publisher, from.ip(), now) {
+            return false;
+        }
+        // Without a token no searcher can be bounced through us, so the record
+        // is not worth placing, and with no file remembered for it the share
+        // below could not count it.
+        if record
+            .source_contact
+            .and_then(|sc| sc.callback_token)
+            .is_none_or(|t| t == [0u8; 16])
+        {
+            return false;
+        }
+        if !self.proxied_file_has_room(publisher, record.file_hash, from.ip(), now) {
             return false;
         }
         // Before the replica for the same reason as the budget: a publisher we
@@ -1539,6 +1645,35 @@ impl EmberDht {
             now,
         );
         true
+    }
+
+    /// Whether `publisher`, asking from `from`, may have one more firewalled
+    /// source for `file_hash` proxied through us: fewer other publishers in
+    /// its /24 (or IPv6 /48) hold a live grant for that file than storers
+    /// take sources from one host directly.
+    ///
+    /// Storers count what we relay against our address with a larger allowance
+    /// than one host's, so a host minting publisher identities and asking every
+    /// buddy to proxy a record each for a popular file could fill that file's
+    /// source key for the six hours those records live. Held to the direct
+    /// allowance, a block gets no more of a key through us than it would
+    /// storing from its own addresses, however many buddies it asks.
+    fn proxied_file_has_room(&self, publisher: EmberNodeId, file_hash: [u8; 16], from: IpAddr, now: Instant) -> bool {
+        let subnet = super::subnet_key_of(from);
+        let others = self
+            .callback_clients
+            .iter()
+            .filter(|(id, client)| {
+                **id != publisher
+                    && now.saturating_duration_since(client.last_seen) < CALLBACK_CLIENT_TTL
+                    && super::subnet_key_of(client.addr.ip()) == subnet
+                    && client
+                        .files
+                        .get(&file_hash)
+                        .is_some_and(|(_, at)| now.saturating_duration_since(*at) < CALLBACK_CLIENT_TTL)
+            })
+            .count();
+        others < self.routing.scale().max_sources_per_ip()
     }
 
     /// Named-buddy replica: skip the k-closest proximity gate. We accepted
@@ -1655,7 +1790,11 @@ impl EmberDht {
     /// Whether [`Self::remember_callback_client`] would take `publisher` from
     /// `addr` now.
     ///
-    /// A publisher already held is always refreshed. A newcomer is refused when
+    /// A publisher already held is refreshed unless it comes from an address
+    /// [`Self::callback_client_may_move`] refuses: its entry could not follow,
+    /// so callbacks would go to where it was, and it is refused like a
+    /// newcomer over the same caps so that it moves to another buddy. A
+    /// newcomer is refused when
     /// its address already holds [`MAX_CALLBACK_CLIENTS_PER_ADDR`] live entries
     /// or its /24 holds [`MAX_CALLBACK_CLIENTS_PER_SUBNET`], or when the table
     /// is full of publishers holding a live grant — a file whose record names
@@ -1665,7 +1804,7 @@ impl EmberDht {
     /// break, so they still make way.
     fn admits_callback_client(&self, publisher: EmberNodeId, addr: SocketAddr, now: Instant) -> bool {
         if self.callback_clients.contains_key(&publisher) {
-            return true;
+            return self.callback_client_may_move(publisher, addr, now);
         }
         let subnet = super::subnet_key_of(addr.ip());
         let mut live = 0usize;
@@ -1690,6 +1829,39 @@ impl EmberDht {
         from_addr < MAX_CALLBACK_CLIENTS_PER_ADDR
             && from_subnet < MAX_CALLBACK_CLIENTS_PER_SUBNET
             && (live < MAX_CALLBACK_CLIENTS || evictable)
+    }
+
+    /// Whether a held `publisher` may move to `addr`. The per-address and
+    /// per-/24 caps count each entry where it is now, so a move into an
+    /// address or /24 already at its cap is refused (the entry keeps its old
+    /// address); otherwise one host could admit a full address's worth, move
+    /// them elsewhere and admit as many again.
+    fn callback_client_may_move(&self, publisher: EmberNodeId, addr: SocketAddr, now: Instant) -> bool {
+        let Some(held) = self.callback_clients.get(&publisher) else {
+            return false;
+        };
+        if held.addr.ip() == addr.ip() {
+            return true;
+        }
+        let subnet = super::subnet_key_of(addr.ip());
+        let same_subnet = super::subnet_key_of(held.addr.ip()) == subnet;
+        let mut from_addr = 0usize;
+        let mut from_subnet = 0usize;
+        for (id, client) in &self.callback_clients {
+            if *id == publisher
+                || now.saturating_duration_since(client.last_seen) >= CALLBACK_CLIENT_TTL
+            {
+                continue;
+            }
+            if client.addr.ip() == addr.ip() {
+                from_addr += 1;
+            }
+            if super::subnet_key_of(client.addr.ip()) == subnet {
+                from_subnet += 1;
+            }
+        }
+        from_addr < MAX_CALLBACK_CLIENTS_PER_ADDR
+            && (same_subnet || from_subnet < MAX_CALLBACK_CLIENTS_PER_SUBNET)
     }
 
     /// Whether a `CALLBACK_REQ` naming `publisher` and `file_hash` is one we
@@ -1854,10 +2026,11 @@ impl EmberDht {
     }
 
     fn callback_grant_ok(&self, buddy: EmberNodeId, file_hash: [u8; 16], token: [u8; 16], now: Instant) -> bool {
-        // Constant-time for the same reason the relay side is — see
-        // [`callback_tokens_match`]. This is the check that decides whether a
-        // buddy's `CALLBACK` opens a TCP connection to an address it named, so
-        // recovering the token here buys the same thing as recovering it there.
+        // The token only ties the `CALLBACK` to a file we published. The buddy
+        // was handed it in the record it proxied, as was every reader of that
+        // record, so what stands between a buddy and a connection to an
+        // address it named is the grant below, `callback_dest_ok` and the
+        // connect budgets, not this comparison.
         if token == [0u8; 16] || !callback_tokens_match(&self.callback_token(&file_hash), &token) {
             return false;
         }
@@ -1886,17 +2059,32 @@ impl EmberDht {
         )
     }
 
-    fn accept_callback_connect(&mut self, buddy: EmberNodeId, from_ip: IpAddr, now: Instant) -> bool {
+    /// Whether to connect back to `searcher` for a `CALLBACK` from `buddy`:
+    /// within the in-flight cap, the buddy's rate, and the searcher's own
+    /// address and /24 shares.
+    fn accept_callback_connect(&mut self, buddy: EmberNodeId, searcher: Ipv4Addr, now: Instant) -> bool {
+        let net = u32::from(searcher) >> 8;
+        let same_net = self
+            .callback_connects
+            .iter()
+            .filter(|(at, _, ip)| {
+                now.saturating_duration_since(*at) < CALLBACK_CONNECT_WINDOW
+                    && matches!(ip, IpAddr::V4(v4) if u32::from(*v4) >> 8 == net)
+            })
+            .count();
+        if same_net >= MAX_CALLBACK_CONNECTS_PER_SEARCHER_SUBNET {
+            return false;
+        }
         Self::admit_budgeted(
             &mut self.callback_connects,
             buddy,
-            from_ip,
+            IpAddr::V4(searcher),
             now,
             CALLBACK_CONNECT_WINDOW,
             CALLBACK_CONNECT_INFLIGHT,
             MAX_CALLBACK_CONNECTS_IN_FLIGHT,
             MAX_CALLBACK_CONNECTS_PER_BUDDY,
-            MAX_CALLBACK_CONNECTS_PER_ADDR,
+            MAX_CALLBACK_CONNECTS_PER_SEARCHER,
         )
     }
 
@@ -1957,8 +2145,14 @@ impl EmberDht {
         true
     }
 
+    /// Whether a connect-back to `ip:port` may be relayed or made: not to a
+    /// special-use address, and not to a port below 1024. The searcher's port
+    /// is its own claim and a buddy's `CALLBACK` names any address it likes,
+    /// so this is what keeps either from aiming a publisher's TCP connection
+    /// at a well-known service — on a CGNAT address, one belonging to someone
+    /// else entirely. An eD2K client has no reason to listen down there.
     fn callback_dest_ok(ip: Ipv4Addr, port: u16) -> bool {
-        port != 0 && !crate::security::is_special_use_v4(ip)
+        port >= 1024 && !crate::security::is_special_use_v4(ip)
     }
 
     /// Sign a `CALLBACK_REQ` for the buddy named in a firewalled source record.
@@ -2107,9 +2301,13 @@ impl EmberDht {
         closest
     }
 
+    /// A request id no peer can predict from the ones it was sent: each
+    /// steps past the last by a random amount, so ids stay distinct across
+    /// everything outstanding while a peer that saw ours cannot guess the
+    /// ones we sent its neighbours.
     fn next_request_id(&mut self) -> u32 {
         let id = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.next_request_id = self.next_request_id.wrapping_add(1 + u32::from(rand::random::<u16>()));
         if self.next_request_id == 0 {
             self.next_request_id = 1;
         }
@@ -2775,6 +2973,21 @@ impl EmberDht {
                 failed_queries: 0,
             };
             out.sender_contact = Some(contact.clone());
+            // A publisher we relay callbacks for, heard from on a new address or
+            // key: callbacks go where it is now. Only a PROXY_STORE used to
+            // set this, so a NAT that re-mapped its port between republishes
+            // (hours apart for a small library) had every callback sent to a
+            // mapping that no longer existed. The frame is authenticated, so
+            // only the publisher itself can move it.
+            // A move refused over the caps leaves the entry as it was, and its
+            // next PROXY_STORE from here is refused so it finds another buddy.
+            let may_move = self.callback_client_may_move(msg.sender_id, from, Instant::now());
+            if let Some(client) = self.callback_clients.get_mut(&msg.sender_id) {
+                if may_move {
+                    client.addr = from;
+                    client.noise_pub = remote_noise_pub;
+                }
+            }
             match self.routing.add_contact(contact) {
                 AddResult::Added => out.learned_contact = true,
                 AddResult::PingOldest {
@@ -2813,13 +3026,12 @@ impl EmberDht {
                     .push(messages::encode_message(&found, &self.signing_key, true, &self.local_noise_pub));
             }
             DhtPayload::FoundNode { contacts } => {
-                // Merge every returned contact into the table (standard
-                // Kademlia learns from lookup responses). Each contact
-                // is unverified — it rode inside a signed frame from
-                // `from`, but we have not heard from it directly — so it
-                // enters with the `last_seen` the wire carried (0) and
-                // will be pinged before later slices trust it.
-                Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
+                // Not merged here. Only the caller knows whether this answers
+                // a query of ours, and an unasked FOUND_NODE is charged to no
+                // lookup budget, so merging every one let any session peer
+                // write twenty leads of its choosing into the table per
+                // datagram. See [`Self::merge_gossip_reply`].
+                out.gossip_leads.extend(contacts.iter().cloned());
                 out.found_node = Some((msg.request_id, contacts));
             }
             DhtPayload::StoreRecord {
@@ -2939,6 +3151,7 @@ impl EmberDht {
                 // asker's dump, then reply with our closest contacts to
                 // the asker so both tables thicken without a FIND_NODE.
                 out.announce_peer_received = true;
+                out.gossip_leads.extend(contacts.iter().cloned());
                 Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
                 let closest =
                     self.closest_excluding(&msg.sender_id, msg.sender_id, session_contacts);
@@ -2951,7 +3164,8 @@ impl EmberDht {
                 ));
             }
             DhtPayload::PeerList { contacts } => {
-                Self::merge_gossip_contacts(&mut self.routing, &contacts, &mut out);
+                // Left to the caller for the same reason as FOUND_NODE.
+                out.gossip_leads.extend(contacts.iter().cloned());
                 out.peer_list = Some((msg.request_id, contacts));
             }
             DhtPayload::ProxyStoreAck { key: _ } => {
@@ -3087,7 +3301,7 @@ impl EmberDht {
                 if self.is_recent_proxy_buddy(msg.sender_id, now)
                     && self.callback_grant_ok(msg.sender_id, file_hash, callback_token, now)
                     && Self::callback_dest_ok(searcher_ip, searcher_tcp_port)
-                    && self.accept_callback_connect(msg.sender_id, from.ip(), now)
+                    && self.accept_callback_connect(msg.sender_id, searcher_ip, now)
                 {
                     out.callback_connect = Some(CallbackConnect {
                         dest_ip: searcher_ip,
@@ -3108,10 +3322,17 @@ impl EmberDht {
                 // depend on how busy the last minute was. What actually bounds
                 // the favour is the forward budget at `PROXY_STORE` time and
                 // the grant check before a `CALLBACK_REQ` is bounced; the
-                // frame rate itself is capped in `protection.rs`.
-                if let Some((expires_at, signature)) =
-                    self.sign_buddy_endorsement(msg.sender_id, now)
+                // frame rate itself is capped in `protection.rs`. What is
+                // bounded here is how many identities one address or /24 may
+                // have us name ourselves buddy to.
+                let endorsement = if self.advertises_buddy_endpoint()
+                    && self.admit_endorsement(msg.sender_id, from.ip(), Instant::now())
                 {
+                    self.sign_buddy_endorsement(msg.sender_id, now)
+                } else {
+                    None
+                };
+                if let Some((expires_at, signature)) = endorsement {
                     let reply = messages::build_buddy_endorse(
                         self.local_id,
                         msg.request_id,
@@ -3162,6 +3383,22 @@ impl EmberDht {
         out
     }
 
+    /// Merge the contacts a `FOUND_NODE` or `PEER_LIST` in `out` carried into
+    /// the routing table, once the caller has established that the frame
+    /// answers a request we sent its sender. Full-bucket liveness checks and
+    /// the new / refused counts land in `out` as for an `ANNOUNCE_PEER`.
+    ///
+    /// Each contact is unverified — it rode inside a signed frame from the
+    /// sender, but we have not heard from it directly — so it enters with the
+    /// `last_seen` the wire carried (0) and is pinged before anything trusts it.
+    pub fn merge_gossip_reply(&mut self, out: &mut DhtInbound) {
+        let contacts = match (&out.found_node, &out.peer_list) {
+            (Some((_, contacts)), _) | (None, Some((_, contacts))) => contacts.clone(),
+            (None, None) => return,
+        };
+        Self::merge_gossip_contacts(&mut self.routing, &contacts, out);
+    }
+
     /// Merge unverified gossip contacts from a signed peer frame into the
     /// routing table, collecting any full-bucket liveness checks.
     fn merge_gossip_contacts(
@@ -3169,7 +3406,6 @@ impl EmberDht {
         contacts: &[EmberContact],
         out: &mut DhtInbound,
     ) {
-        out.gossip_leads.extend(contacts.iter().cloned());
         for contact in contacts {
             // Read before the add: `add_contact` reports `Added` for a contact
             // that was already resident, so the return value alone cannot tell
@@ -3198,11 +3434,12 @@ impl EmberDht {
 /// Constant-time comparison of a callback token against the bytes a peer sent.
 ///
 /// The derived `PartialEq` on `[u8; 16]` returns at the first differing byte,
-/// so a peer that can time our forwarding decision could walk that timing to
-/// recover a token one byte at a time — 16x256 probes instead of 2^128. The
-/// token is the whole proof that the sender actually read a record we proxied,
-/// so recovering it is what the check exists to prevent. Same reasoning, and
-/// the same shape, as `transport::cookie_tags_match`.
+/// so a peer that can time our decision could walk that timing to recover a
+/// token one byte at a time — 16x256 probes instead of 2^128. That buys little:
+/// every token we check is in a public source record, so whoever wants one can
+/// look it up, and the token only shows a sender read that record. Kept
+/// constant-time so the comparison is not the cheaper way to get one. Same
+/// shape as `transport::cookie_tags_match`.
 fn callback_tokens_match(expected: &[u8; 16], got: &[u8; 16]) -> bool {
     let mut diff = 0u8;
     for (a, b) in expected.iter().zip(got.iter()) {
@@ -3419,10 +3656,16 @@ fn intersect_live_records<'a>(
     keys: &[[u8; 16]],
 ) -> Option<([u8; 16], Vec<&'a super::store::DhtRecord>, usize)> {
     let primary = *keys.first()?;
-    let primary_recs = store.get_live(&primary);
+    let mut primary_recs = store.get_live(&primary);
     if primary_recs.is_empty() {
         return None;
     }
+    // Records bound to the key ahead of those anyone could file under it, so
+    // a key flooded with keyword records still serves the room governance,
+    // key epoch or source records it exists for in the first pages and
+    // within a searcher's per-node allowance. Stable, and by type alone, so
+    // a record only ever moves down past newcomers, as page anchors expect.
+    primary_recs.sort_by_key(|r| super::store::key_binding(&r.data));
 
     // One query can name a hot key many times over; each is tested once.
     let mut extras: Vec<[u8; 16]> = Vec::new();
@@ -3941,14 +4184,22 @@ mod tests {
         assert!(on_b.learned_contact, "B learns A (the asker)");
 
         // B's FOUND_NODE returns to A.
-        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1001);
-        let (got_rid, contacts) = on_a.found_node.expect("A should see a FOUND_NODE");
+        let mut on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1001);
+        let (got_rid, contacts) = on_a.found_node.clone().expect("A should see a FOUND_NODE");
         assert_eq!(got_rid, rid, "FOUND_NODE must echo the request id");
         assert!(
             contacts.iter().any(|x| x.node_id == c.local_id()),
             "B should have returned contact C"
         );
-        // A merged the returned contacts AND learned B (the responder).
+        assert!(
+            !a.contacts().iter().any(|x| x.node_id == c.local_id()),
+            "the reply's contacts wait for the caller to merge them"
+        );
+        assert!(on_a.gossip_leads.iter().any(|x| x.node_id == c.local_id()));
+        // Merged once the caller has matched it to its query, and A learned B
+        // (the responder) either way.
+        a.merge_gossip_reply(&mut on_a);
+        assert_eq!(on_a.gossip_new, 1);
         assert!(
             a.contacts().iter().any(|x| x.node_id == c.local_id()),
             "A should have learned C from the FOUND_NODE"
@@ -3987,13 +4238,15 @@ mod tests {
         assert_eq!(on_b.responses.len(), 1);
         assert!(on_b.learned_contact);
 
-        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1001);
-        let (got_rid, contacts) = on_a.peer_list.expect("PEER_LIST");
+        let mut on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 1001);
+        let (got_rid, contacts) = on_a.peer_list.clone().expect("PEER_LIST");
         assert_eq!(got_rid, rid);
         assert!(
             contacts.iter().any(|x| x.node_id == c.local_id()),
             "B should have returned C in PEER_LIST"
         );
+        assert!(!a.contacts().iter().any(|x| x.node_id == c.local_id()));
+        a.merge_gossip_reply(&mut on_a);
         assert!(
             a.contacts().iter().any(|x| x.node_id == c.local_id()),
             "A should learn C from PEER_LIST"
@@ -4584,6 +4837,35 @@ mod tests {
         assert_eq!(b.store_reject_verify, 1);
         assert_eq!(b.inbound_record_verifications, 0);
         assert_eq!(b.store_stats(), (0, 0));
+    }
+
+    /// A room index shard key holds rooms' listings only, refused the same way,
+    /// while the listing the shard exists for is still stored.
+    #[test]
+    fn only_a_room_listing_is_stored_under_a_room_index_key() {
+        use crate::network::ember::channel::{index_key, index_key_for_channel, ChannelIdentity};
+
+        let mut a = dht(30);
+        let mut b = dht(31);
+        let a_noise = a.local_noise_pub;
+        let a_addr = addr(30, 4672);
+
+        let key = index_key(3);
+        let mut data = a.build_keyword_record("lobby", [9u8; 16], [0u8; 32], 4096, "lobby.iso").data;
+        data[1..17].copy_from_slice(&key);
+        let signature = crypto::sign(&a.signing_key, &data);
+        let (_rid, frame) = a.build_store(key, data, signature);
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1000);
+        assert!(!on_b.stored_record);
+        assert!(on_b.responses.is_empty(), "no STORE_ACK for a refused record");
+        assert_eq!(b.store_reject_verify, 1);
+        assert_eq!(b.inbound_record_verifications, 0);
+
+        let room = ChannelIdentity::from_seed(&[0x31; 32]);
+        let listing = SignedRecord::channel_index("Lobby", room.channel_id, room.pubkey, false, None, &room.signing_key);
+        assert_eq!(listing.keyword_hash, index_key_for_channel(&room.channel_id));
+        let (_rid, frame) = a.build_store(listing.keyword_hash, listing.data.clone(), listing.signature);
+        assert!(b.handle_message(&frame, a_addr, a_noise, 1001).stored_record);
     }
 
     /// A byte-identical retransmit of a record we hold is answered from the
@@ -5686,6 +5968,11 @@ mod tests {
     /// Run the real `BUDDY_ENDORSE_REQ` / `BUDDY_ENDORSE` exchange so
     /// `publisher` holds `buddy`'s signature over `buddy`'s own endpoint.
     fn endorse(publisher: &mut EmberDht, buddy: &mut EmberDht, now: i64) -> bool {
+        endorse_from(publisher, buddy, addr(1, 4672), now)
+    }
+
+    /// [`endorse`], asking from `from`.
+    fn endorse_from(publisher: &mut EmberDht, buddy: &mut EmberDht, from: SocketAddr, now: i64) -> bool {
         if publisher.buddy_endorsement(&buddy.local_id(), now).is_some() {
             return true;
         }
@@ -5696,7 +5983,7 @@ mod tests {
         };
         let publisher_noise = publisher.local_noise_pub;
         let buddy_noise = buddy.local_noise_pub;
-        let on_buddy = buddy.handle_message(&req, addr(1, 4672), publisher_noise, now);
+        let on_buddy = buddy.handle_message(&req, from, publisher_noise, now);
         let Some(reply) = on_buddy.responses.first() else {
             return false;
         };
@@ -5706,7 +5993,9 @@ mod tests {
     }
 
     /// Firewalled contact whose trailer carries `buddy`'s endorsement —
-    /// required for `PROXY_STORE` to be accepted, and for any searcher to dial.
+    /// required for `PROXY_STORE` to be accepted, and for any searcher to dial —
+    /// and a callback token, as every trailer naming a buddy does. Tests that
+    /// bounce a callback set the file's real one.
     fn firewalled_for_buddy(
         publisher_last: u8,
         publisher: &mut EmberDht,
@@ -5714,7 +6003,7 @@ mod tests {
         now: i64,
     ) -> SourceContact {
         assert!(
-            endorse(publisher, buddy, now),
+            endorse_from(publisher, buddy, addr(publisher_last, 4672), now),
             "the buddy must endorse its own endpoint"
         );
         let mut contact = firewalled_contact_at(publisher_last);
@@ -5722,6 +6011,7 @@ mod tests {
             .buddy_endorsement(&buddy.local_id(), now)
             .map(|e| e.as_source_buddy());
         contact.flags |= crate::network::ember::SOURCE_FLAG_RELAY_CAPABLE;
+        contact.callback_token = Some([0x7C; 16]);
         contact
     }
 
@@ -5902,8 +6192,11 @@ mod tests {
     fn outstanding_proxy_forwards_are_bounded_across_all_senders() {
         let mut buddy = dht(120);
         let mut accepted = 0usize;
-        for seed in 130..190u8 {
+        for seed in 130..210u8 {
             let mut publisher = dht(seed);
+            // Each in a /24 of its own, so only the cap across senders binds.
+            let from = SocketAddr::from(([10, seed, 0, 1], 4672));
+            assert!(endorse_from(&mut publisher, &mut buddy, from, 3000));
             let contact = firewalled_for_buddy(seed, &mut publisher, &mut buddy, 3000);
             let record =
                 publisher.build_source_record([seed; 16], [0u8; 32], 42, "s.mkv", contact);
@@ -5912,7 +6205,7 @@ mod tests {
                 record.data.clone(),
                 record.signature,
             );
-            if commit_inbound_proxy(&mut buddy, &frame, addr(seed, 4672), [seed; 32], 3000) {
+            if commit_inbound_proxy(&mut buddy, &frame, from, [seed; 32], 3000) {
                 accepted += 1;
             }
         }
@@ -6991,6 +7284,52 @@ mod tests {
         ));
     }
 
+    /// The caps count each entry where it is now, so a host that moved a full
+    /// address's entries elsewhere to admit as many again must not be able to
+    /// move those too.
+    #[test]
+    fn a_held_publisher_does_not_move_into_an_address_at_its_cap() {
+        let mut buddy = dht(146);
+        let now = Instant::now();
+        let first_host = SocketAddr::from(([198, 51, 100, 9], 4672));
+        let second_host = SocketAddr::from(([203, 0, 113, 9], 4672));
+        let id = |i: usize| EmberNodeId([i as u8, 0x46, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        for i in 0..MAX_CALLBACK_CLIENTS_PER_ADDR {
+            buddy.remember_callback_client(id(i), first_host, [1; 32], [7; 16], Some([9; 16]), now);
+        }
+        for i in 0..MAX_CALLBACK_CLIENTS_PER_ADDR {
+            buddy.remember_callback_client(id(i), second_host, [1; 32], [7; 16], Some([9; 16]), now);
+            assert_eq!(buddy.callback_clients[&id(i)].addr, second_host);
+        }
+        let second_wave = MAX_CALLBACK_CLIENTS_PER_ADDR..2 * MAX_CALLBACK_CLIENTS_PER_ADDR;
+        for i in second_wave.clone() {
+            assert!(buddy.admits_callback_client(id(i), first_host, now));
+            buddy.remember_callback_client(id(i), first_host, [1; 32], [7; 16], Some([9; 16]), now);
+        }
+        for i in second_wave {
+            buddy.remember_callback_client(id(i), second_host, [1; 32], [7; 16], Some([9; 16]), now);
+            assert_eq!(buddy.callback_clients[&id(i)].addr, first_host);
+        }
+        assert!(!buddy.admits_callback_client(EmberNodeId([0xCE; 16]), first_host, now));
+
+        // An authenticated frame from the publisher moves it the same way.
+        let mut follower = dht(147);
+        let follower_id = follower.local_id;
+        let held_addr = client_addr(99);
+        buddy.remember_callback_client(follower_id, held_addr, [1; 32], [7; 16], Some([9; 16]), now);
+        let (_rid, ping) = follower.build_ping();
+        buddy.handle_message(&ping, second_host, follower.local_noise_pub, 5_000);
+        assert_eq!(
+            buddy.callback_clients[&follower_id].addr,
+            held_addr,
+            "a frame from an address at its cap leaves the entry where it was"
+        );
+        let open_host = client_addr(100);
+        let (_rid, ping) = follower.build_ping();
+        buddy.handle_message(&ping, open_host, follower.local_noise_pub, 5_001);
+        assert_eq!(buddy.callback_clients[&follower_id].addr, open_host);
+    }
+
     /// The refusal comes before anything is spent: a publisher we cannot
     /// remember would get records placed naming a buddy that bounces nobody.
     #[test]
@@ -7021,6 +7360,53 @@ mod tests {
         assert!(buddy
             .local_records(&record.keyword_hash, &[], &messages::ValueConstraints::default())
             .is_empty());
+    }
+
+    /// A held publisher whose move is refused over the caps is refused like a
+    /// newcomer would be from there: acking it while its callbacks went to
+    /// the address it left would keep it on a buddy that cannot reach it.
+    #[test]
+    fn a_held_publisher_refused_a_move_is_refused_its_proxy_stores() {
+        let mut publisher = dht(148);
+        let mut buddy = dht(149);
+        let publisher_id = publisher.local_id;
+        let held = addr(148, 4672);
+        let crowded = SocketAddr::from(([203, 0, 113, 9], 4672));
+        let proxy_for = |publisher: &mut EmberDht, buddy: &mut EmberDht, file_hash: [u8; 16]| {
+            let contact = SourceContact {
+                callback_token: Some(publisher.callback_token(&file_hash)),
+                ..firewalled_for_buddy(148, publisher, buddy, 2000)
+            };
+            let record = publisher.build_source_record(file_hash, [0u8; 32], 1, "fw.mkv", contact);
+            publisher
+                .build_proxy_store(record.keyword_hash, record.data.clone(), record.signature)
+                .1
+        };
+        let proxy = proxy_for(&mut publisher, &mut buddy, [0x71; 16]);
+        assert!(commit_inbound_proxy(&mut buddy, &proxy, held, publisher.local_noise_pub, 2000));
+        let seen = buddy.callback_clients[&publisher_id].last_seen;
+
+        let now = Instant::now();
+        for i in 0..MAX_CALLBACK_CLIENTS_PER_ADDR {
+            let id = EmberNodeId([i as u8, 0x48, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            buddy.remember_callback_client(id, crowded, [1; 32], [7; 16], Some([9; 16]), now);
+        }
+        assert!(!buddy.admits_callback_client(publisher_id, crowded, now));
+        let proxy = proxy_for(&mut publisher, &mut buddy, [0x72; 16]);
+        assert!(
+            !commit_inbound_proxy(&mut buddy, &proxy, crowded, publisher.local_noise_pub, 2001),
+            "refused, so it moves to another buddy"
+        );
+        let client = &buddy.callback_clients[&publisher_id];
+        assert_eq!(client.addr, held);
+        assert_eq!(client.last_seen, seen, "and the refused address keeps nothing alive");
+        assert!(!client.files.contains_key(&[0x72; 16]));
+
+        let proxy = proxy_for(&mut publisher, &mut buddy, [0x73; 16]);
+        assert!(
+            commit_inbound_proxy(&mut buddy, &proxy, held, publisher.local_noise_pub, 2002),
+            "from where it is held it is still served"
+        );
     }
 
     /// A firewalled publisher fans a whole publish tick at one buddy before
@@ -7158,6 +7544,174 @@ mod tests {
         let on_cb =
             publisher.handle_message(&callback, addr(100, 4672), [0xFFu8; 32], 2001);
         assert!(on_cb.callback_connect.is_none());
+    }
+
+    /// Connect-backs are charged to the searcher, not the buddy: one reader
+    /// of our public source record asking over and over takes its own
+    /// share, and every other searcher through the same buddy still gets in.
+    #[test]
+    fn one_searcher_cannot_spend_a_buddys_callbacks() {
+        let mut publisher = dht(101);
+        let buddy = dht(102).local_id();
+        let now = Instant::now();
+        let flooder = Ipv4Addr::new(203, 0, 113, 9);
+        let admitted = (0..10).filter(|_| publisher.accept_callback_connect(buddy, flooder, now)).count();
+        assert_eq!(admitted, MAX_CALLBACK_CONNECTS_PER_SEARCHER);
+        let neighbours = (10..20u8)
+            .filter(|n| publisher.accept_callback_connect(buddy, Ipv4Addr::new(203, 0, 113, *n), now))
+            .count();
+        assert_eq!(
+            admitted + neighbours,
+            MAX_CALLBACK_CONNECTS_PER_SEARCHER_SUBNET,
+            "one /24 takes its share and no more"
+        );
+        assert!(
+            publisher.accept_callback_connect(buddy, Ipv4Addr::new(198, 51, 100, 7), now),
+            "a searcher elsewhere still gets through the same buddy"
+        );
+    }
+
+    /// Neither a searcher's own port claim nor the address a buddy's
+    /// `CALLBACK` names can aim a connect-back below 1024: not bounced by the
+    /// buddy, not dialled by the publisher.
+    #[test]
+    fn connect_backs_never_go_to_a_well_known_port() {
+        for (port, ok) in [(0u16, false), (80, false), (445, false), (1023, false), (1024, true), (4662, true)] {
+            assert_eq!(EmberDht::callback_dest_ok(Ipv4Addr::new(8, 8, 8, 8), port), ok, "port {port}");
+        }
+
+        let mut publisher = dht(155);
+        let mut buddy = dht(156);
+        let mut searcher = dht(157);
+        let pub_addr = addr(155, 4672);
+        let searcher_addr = SocketAddr::from(([8, 8, 8, 8], 4662));
+        let file_hash = [0x6B; 16];
+        let token = publisher.callback_token(&file_hash);
+        let contact = SourceContact {
+            callback_token: Some(token),
+            ..firewalled_for_buddy(155, &mut publisher, &mut buddy, 2000)
+        };
+        let record = publisher.build_source_record(file_hash, [0u8; 32], 1, "fw.mkv", contact);
+        let (proxy_rid, proxy) =
+            publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(commit_inbound_proxy(&mut buddy, &proxy, pub_addr, publisher.local_noise_pub, 2000));
+
+        let ask = |searcher: &mut EmberDht, port: u16| {
+            searcher.build_callback_req(publisher.local_id(), file_hash, port, 0, [0x11; 16], token).1
+        };
+        let low = ask(&mut searcher, 445);
+        assert!(buddy.handle_message(&low, searcher_addr, searcher.local_noise_pub, 2001).callback_forward.is_none());
+        let high = ask(&mut searcher, 4662);
+        assert!(buddy.handle_message(&high, searcher_addr, searcher.local_noise_pub, 2002).callback_forward.is_some());
+
+        publisher.note_proxy_store_sent(buddy.local_id(), proxy_rid, file_hash, Instant::now());
+        let ack = buddy.build_proxy_store_ack_frame(proxy_rid, record.keyword_hash);
+        assert!(publisher.handle_message(&ack, addr(156, 4672), buddy.local_noise_pub, 2003).proxy_store_ack.is_some());
+        let (_rid, aimed) = buddy.build_callback(file_hash, Ipv4Addr::new(8, 8, 8, 8), 445, 0, [0; 16], token);
+        let on_pub = publisher.handle_message(&aimed, addr(156, 4672), buddy.local_noise_pub, 2004);
+        assert!(on_pub.callback_connect.is_none(), "a buddy cannot aim us at port 445");
+        let (_rid, fair) = buddy.build_callback(file_hash, Ipv4Addr::new(8, 8, 8, 8), 4662, 0, [0; 16], token);
+        let on_pub = publisher.handle_message(&fair, addr(156, 4672), buddy.local_noise_pub, 2005);
+        assert!(on_pub.callback_connect.is_some());
+    }
+
+    /// Addresses in one block are cheap to hold together, so a /24 holds only a
+    /// share of the proxy forwards in flight, however many of its addresses
+    /// ask, and a block elsewhere still gets in.
+    #[test]
+    fn one_subnet_holds_only_a_share_of_the_proxy_forwards() {
+        let mut buddy = dht(158);
+        let now = Instant::now();
+        let mut admitted = 0;
+        for host in 1..=4u8 {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, host));
+            for i in 0..MAX_PROXY_FORWARDS_PER_SENDER as u8 {
+                let id = EmberNodeId([host, i, 0x58, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                admitted += usize::from(buddy.accept_proxy_forward(id, ip, now));
+            }
+        }
+        assert_eq!(admitted, MAX_PROXY_FORWARDS_PER_SUBNET);
+        let elsewhere = IpAddr::V4(Ipv4Addr::new(198, 51, 101, 1));
+        assert!(buddy.accept_proxy_forward(EmberNodeId([0xEE; 16]), elsewhere, now));
+    }
+
+    /// Storers give what a buddy relays a larger allowance than one host's, so
+    /// a block of addresses gets no more publishers of one file proxied through
+    /// a buddy than storers take from one host directly: minting identities and
+    /// asking buddy after buddy no longer fills a popular file's source key.
+    #[test]
+    fn one_subnet_gets_few_publishers_of_one_file_proxied() {
+        let mut buddy = dht(159);
+        let cap = buddy.routing.scale().max_sources_per_ip();
+        let file_hash = [0x5E; 16];
+        let proxy = |seed: u8, buddy: &mut EmberDht, from: SocketAddr| {
+            let mut publisher = dht(seed);
+            assert!(endorse_from(&mut publisher, buddy, from, 2000));
+            let contact = firewalled_for_buddy(seed, &mut publisher, buddy, 2000);
+            let record = publisher.build_source_record(file_hash, [0u8; 32], 1, "pop.mkv", contact);
+            let (_rid, frame) =
+                publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+            commit_inbound_proxy(buddy, &frame, from, publisher.local_noise_pub, 2000)
+        };
+        let accepted = (0..cap as u8 + 4)
+            .filter(|&i| proxy(160 + i, &mut buddy, SocketAddr::from(([203, 0, 113, i + 1], 4672))))
+            .count();
+        assert_eq!(accepted, cap);
+        assert!(
+            proxy(160, &mut buddy, SocketAddr::from(([203, 0, 113, 1], 4672))),
+            "one already held is not counted against itself"
+        );
+        assert!(
+            proxy(200, &mut buddy, SocketAddr::from(([198, 51, 100, 1], 4672))),
+            "a publisher elsewhere still gets in"
+        );
+    }
+
+    /// A trailer without a callback token names us for searchers none of whom
+    /// we could bounce, so it is not worth a fan-out or a replica.
+    #[test]
+    fn a_record_no_searcher_could_be_bounced_for_is_not_proxied() {
+        let mut publisher = dht(161);
+        let mut buddy = dht(162);
+        let contact = SourceContact {
+            callback_token: None,
+            ..firewalled_for_buddy(161, &mut publisher, &mut buddy, 2000)
+        };
+        let record = publisher.build_source_record([0x62; 16], [0u8; 32], 1, "fw.mkv", contact);
+        let (_rid, proxy) =
+            publisher.build_proxy_store(record.keyword_hash, record.data.clone(), record.signature);
+        assert!(!commit_inbound_proxy(&mut buddy, &proxy, addr(161, 4672), publisher.local_noise_pub, 2000));
+        assert!(buddy
+            .local_records(&record.keyword_hash, &[], &messages::ValueConstraints::default())
+            .is_empty());
+    }
+
+    /// One address, and one /24, may have us endorse ourselves to only so many
+    /// identities within an endorsement's life; one already endorsed is
+    /// endorsed again, and a block elsewhere is untouched.
+    #[test]
+    fn one_address_gets_few_identities_endorsed() {
+        let mut buddy = dht(163);
+        let host = SocketAddr::from(([198, 51, 100, 9], 4672));
+        let endorsed = (0..MAX_ENDORSED_PER_ADDR as u8 + 2)
+            .filter(|&i| endorse_from(&mut dht(i.wrapping_add(10)), &mut buddy, host, 2000))
+            .count();
+        assert_eq!(endorsed, MAX_ENDORSED_PER_ADDR, "over the wire, as a publisher asks");
+
+        let mut fresh = dht(164);
+        let now = Instant::now();
+        let id = |i: usize| EmberNodeId([i as u8, 0x63, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        for i in 0..MAX_ENDORSED_PER_SUBNET {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 101, (i / MAX_ENDORSED_PER_ADDR) as u8 + 1));
+            assert!(fresh.admit_endorsement(id(i), ip, now));
+        }
+        let same_block = IpAddr::V4(Ipv4Addr::new(198, 51, 101, 250));
+        let newcomer = EmberNodeId([0xCE; 16]);
+        assert!(!fresh.admit_endorsement(newcomer, same_block, now));
+        assert!(fresh.admit_endorsement(id(0), IpAddr::V4(Ipv4Addr::new(198, 51, 101, 1)), now));
+        assert!(fresh.admit_endorsement(newcomer, IpAddr::V4(Ipv4Addr::new(198, 51, 102, 1)), now));
+        let lapsed = now + Duration::from_secs(BUDDY_ENDORSEMENT_TTL_SECS as u64);
+        assert!(fresh.admit_endorsement(EmberNodeId([0xCF; 16]), same_block, lapsed));
     }
 
     #[test]

@@ -351,6 +351,7 @@ fn friend_name_to_store(nickname: &str, name_is_theirs: bool) -> String {
 
 #[tauri::command]
 pub async fn add_friend(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
     nickname: Option<String>,
@@ -359,6 +360,9 @@ pub async fn add_friend(
     // not kept as the user's label once they say what they are called.
     name_is_theirs: Option<bool>,
 ) -> Result<(), String> {
+    // Completes a pending friend request, the grant `accept_friend_request`
+    // keeps to the main window.
+    crate::commands::chat_window::require_main_window(&window)?;
     let ParsedFriendCode {
         canonical,
         hash,
@@ -535,9 +539,11 @@ pub async fn add_friend(
 #[tauri::command]
 pub async fn remove_friend(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
 
@@ -640,9 +646,11 @@ async fn tear_down_friend(state: &AppState, hash: [u8; 16]) -> Result<(), String
 #[tauri::command]
 pub async fn block_friend(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let canonical = user_hash_hex.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
 
@@ -662,9 +670,11 @@ pub async fn block_friend(
 
 #[tauri::command]
 pub async fn unblock_friend(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let canonical = user_hash_hex.to_lowercase();
     parse_user_hash(&canonical)?;
 
@@ -699,10 +709,12 @@ pub async fn get_blocked_friends(
 /// card goes back to the name the friend chose.
 #[tauri::command]
 pub async fn update_friend_nickname(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
     nickname: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     // L20: same sanitisation pass as `add_friend` so a rename to
     // an injected bidi/zero-width payload doesn't slip past.
     let cleaned = crate::security::sanitize_display_name(&nickname);
@@ -784,7 +796,11 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
 }
 
 #[tauri::command]
-pub fn get_my_ember_hash(state: tauri::State<'_, AppState>) -> Result<String, String> {
+pub fn get_my_ember_hash(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let intro_secret = crate::network::friend_intro::own_intro_secret()
         .unwrap_or(state.identity.intro_secret);
     Ok(format_friend_code(
@@ -799,8 +815,10 @@ pub fn get_my_ember_hash(state: tauri::State<'_, AppState>) -> Result<String, St
 #[tauri::command]
 pub async fn reset_friend_code(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
     let secret = tokio::task::spawn_blocking(move || {
         crate::storage::identity::NodeIdentity::rotate_intro_secret(&data_dir)
@@ -1307,9 +1325,11 @@ pub async fn get_friend_requests(
 
 #[tauri::command]
 pub async fn accept_friend_request(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     sender_hash: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     let canonical = sender_hash.to_lowercase();
     let hash = parse_user_hash(&canonical)?;
 
@@ -1448,9 +1468,11 @@ pub async fn accept_friend_request(
 
 #[tauri::command]
 pub async fn reject_friend_request(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     sender_hash: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     // Validate identically to `accept_friend_request` so a malformed
     // hash is rejected before it reaches the database. The DB path
     // uses bound parameters and is safe today, but consistency makes
@@ -1609,8 +1631,21 @@ pub async fn browse_friend(
         },
     )
     .await?;
-    await_reply(rx, "peers_no_response", "No response").await?
+    // A friend with no live session is connected first, and the reply only
+    // comes once that has finished: a direct dial of up to 15 s, then a punch
+    // and relay phase of up to 60 s. The usual 10 s reply window gave up on
+    // every firewalled friend before the relay could land, and the response
+    // that arrived afterwards had nobody waiting for it.
+    match tokio::time::timeout(BROWSE_CONNECT_REPLY_TIMEOUT, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(coded("peers_no_response", "No response")),
+        Err(_) => Err(coded("network_timeout", "The network is not responding")),
+    }
 }
+
+/// The longest [`browse_friend`] waits for the connect behind it: the direct
+/// dial and the whole punch-and-relay phase, with room for the lookups.
+const BROWSE_CONNECT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[tauri::command]
 pub async fn cancel_browse_friend(
@@ -1803,10 +1838,12 @@ pub fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn kad_bootstrap_ip(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     ip: String,
     port: u16,
 ) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     if ip.is_empty() {
         return Err(coded("peers_ip_required", "IP address is required"));
     }

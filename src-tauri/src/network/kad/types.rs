@@ -671,15 +671,19 @@ impl KadTag {
                 TagValue::Blob(buf)
             }
             TAGTYPE_BLOB => {
+                // eMule's Kad reader has no BLOB and drops the whole list, so
+                // a BLOB stored here and served back would cost an eMule peer
+                // every result in that answer. One small enough becomes the
+                // BSOB eMule reads (Ember before 1.4 published its Noise key
+                // as BLOB); a larger one is refused as eMule refuses it.
                 let len = reader.read_u32::<LittleEndian>()? as usize;
-                if len > Self::MAX_TAG_BLOB_LEN {
+                if len > u8::MAX as usize {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("blob too large: {len}"),
+                        format!("blob tag of {len} bytes, which eMule's Kad does not accept"),
                     ));
                 }
-                let buf = Self::read_value_bytes(reader, len)?;
-                TagValue::Blob(buf)
+                TagValue::Bsob(Self::read_value_bytes(reader, len)?)
             }
             TAGTYPE_BSOB => {
                 let len = reader.read_u8()? as usize;
@@ -1136,6 +1140,30 @@ mod kad_tag_wire_layout_tests {
             "BSOB must decode to Bsob"
         );
         assert_eq!(parsed.blob_value(), Some(payload.as_slice()));
+    }
+
+    /// A small BLOB from an older Ember is kept as the BSOB eMule accepts, so
+    /// serving it back cannot make an eMule peer drop the whole answer; one
+    /// too large for BSOB is refused, as eMule refuses every BLOB.
+    #[test]
+    fn a_small_blob_is_read_as_bsob_and_a_large_one_refused() {
+        let blob = |payload: &[u8]| {
+            let mut buf = vec![TAGTYPE_BLOB | 0x80, 0x55];
+            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(payload);
+            buf
+        };
+
+        let key = [0x42u8; 32];
+        let parsed = KadTag::read_from(&mut std::io::Cursor::new(blob(&key))).unwrap();
+        assert!(matches!(parsed.value, TagValue::Bsob(_)));
+        assert_eq!(parsed.blob_value(), Some(key.as_slice()));
+        let mut served = Vec::new();
+        parsed.write_to(&mut served).unwrap();
+        assert_eq!(served[0] & 0x7F, TAGTYPE_BSOB, "served back as BSOB, never BLOB");
+
+        assert!(KadTag::read_from(&mut std::io::Cursor::new(blob(&[0u8; 255]))).is_ok());
+        assert!(KadTag::read_from(&mut std::io::Cursor::new(blob(&[0u8; 256]))).is_err());
     }
 
     /// `blob_value()` accepts both `Blob` (legacy) and `Bsob` (current) so a

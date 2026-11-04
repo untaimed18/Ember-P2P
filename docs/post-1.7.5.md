@@ -8,8 +8,8 @@ room members, feeds and the connection doctor) were built in time and ship
 in 1.7.5; each keeps its plan and records what was built and what is left
 under "Not yet" or "Left as they are". Item 1, and the sections after
 item 4, are for later releases and are not tied to a particular one: they
-can come in whichever release has room. If 1.7.6 needs no format change, it
-removes the BETA badge.
+can come in whichever release has room. 1.7.6 needed no format change, and
+removed the Channels BETA badge.
 
 ## 1. Private-room membership traffic under a throwaway DHT identity
 
@@ -290,10 +290,18 @@ resends; a message to someone with no shared room is refused.
   Settings > Channels. Notifications use the message switch.
 
 **Not yet:** "Add friend" from a conversation with no shared room (the text
-says to), offline delivery through the chat mailbox, "load older" in a
-conversation (the newest 100 show), disappearing-message timers, and an
-end-to-end test over two network loops; the receive path is covered by its
-parts' tests.
+says to), offline delivery through the chat mailbox, disappearing-message
+timers, and an end-to-end test over two network loops; the receive path is
+covered by its parts' tests.
+
+**Done in 1.7.6:** "Load older" in a conversation. The newest 100 show as
+before, and each older page is read from before the oldest one shown, by its
+timestamp and its stored row, since timestamps are the sender's and can
+repeat. A message not read back from storage yet (one that just arrived) has
+no row, so a page read from it takes its timestamp in and drops the rows
+already shown. Rows that cannot be opened are passed over without counting
+toward the page, so a short page, or one that brings nothing new, marks the
+conversation's start.
 
 ## 3. Follow a publisher (feeds)
 
@@ -583,12 +591,30 @@ building"). Nothing that already exists changes format.
   twelve, has no Alt shortcut. With Ember off Channels and Feeds are both
   hidden, and the shortcuts are as in 1.7.4.
 
-**Not yet:** "Add to feed…" on Library rows (the editor's picker does the
-same), "Feeds" on a friend's card and feed cards in room messages, a
-per-feed download folder, labelling auto-started downloads with their feed
-in Transfers (the category does it for now), spam scoring of item names,
+**Not yet:** "Feeds" on a friend's card and feed cards in room messages,
 carrying a feed to another device of the same identity, and lookups under a
 throwaway identity (item 1).
+
+**Done in 1.7.6:**
+
+- **"Add to feed" on Library rows,** for the clicked file or the selection
+  it is part of, narrowed to files shared with everyone that have their
+  Ember hash. A submenu lists this identity's feeds; picking one appends the
+  files through `add_feed_items`, which reads and saves the items under the
+  editor's lock so a save from the editor cannot cross it, leaves files the
+  feed lists where they are, and names those it could not take. It is saved
+  as an edit, so the feed shows as changed until it is published from Feeds.
+- **Spam scoring of item names.** Each item is scored by the search spam
+  filter as a one-row result from Ember (`spam_items`): the user's own
+  verdicts (hashes marked spam, names like them) and the name checks, with
+  the cross-result signals off since a feed is one publisher's list, and a
+  file in the Library never spam. One taken for spam shows the Spam badge,
+  is held from auto-download (`held: spam`), and can still be downloaded by
+  hand. Nothing is scored with the spam filter off.
+- **The download folder and the Transfers label are settled otherwise.**
+  Feed downloads finish in their feed's own folder (`Feeds/<feed>`) and are
+  kept off Transfers (`sharing/feed_downloads.rs`), so neither a folder per
+  feed nor a label in Transfers is left to build.
 
 **Tests:**
 - **Keys.** Storers refuse a head whose key does not match its publisher and
@@ -820,21 +846,41 @@ probe needs the rendezvous server change above, and works without it.
 
 **Left as they are:**
 
-- **Firewall rules are judged by name and port.** A disabled or blocking
-  rule of that name passes, and Windows Firewall switched off, or a
-  third-party firewall, reads as missing rules. The outside probe is what
-  says whether traffic gets through.
-- **No QUIC rule from the doctor.** With QUIC on the Kad UDP port (the
-  default) none is needed; on a port of its own, the rule startup adds is
-  the only one.
-- **"Reconnect the eD2K server" is not an action.** "Check again" restarts
-  the Kad firewall checks only, and is offered only when offline or still
-  checking.
+- **Firewall rules are judged by name and program.** Windows Firewall
+  switched off, or a third-party firewall, reads as missing rules. The
+  outside probe is what says whether traffic gets through.
 - **The TCP probe is a connect.** A SYN-proxying firewall, or a router
   service on the port, reads as open. Writing the nonce on the connection
   for the upload listener to recognise would close it; not done.
-- **The permission prompt has no owner window** and may open behind Ember,
-  as a flashing taskbar button.
+
+**Changed in 1.7.6:**
+
+- **The rules open every port for Ember's own executable,** as the rules
+  Windows writes for a program do, where each named one port. A VPN hands
+  out a new forwarded port on every connect, and a rule naming the old one
+  closed the new one, which a start without elevation cannot rewrite. A rule
+  from an older Ember that names the port in use still counts, and is
+  widened whenever Ember may change rules. The UDP rule covers QUIC on a
+  port of its own, so the doctor's fix removes the QUIC rule rather than
+  adding one.
+- **One rule per executable under each name.** Ember deletes only rules
+  naming its own program (`netsh … program=`), so an installed copy and a
+  development build no longer delete each other's rule on every start, and
+  a switched-off rule of another copy's does not stop this one adding its
+  own.
+- **Behind a VPN** (the route to the internet leaves through a tunnel or a
+  VPN client's adapter, `vpn.rs`), UPnP that mapped nothing reads as not
+  needed rather than failed, and the fix offered is the VPN's own port
+  forwarding instead of the router's UPnP. A forward the router did make
+  still counts, for clients that tunnel only some programs.
+- **The eD2K server is tested again.** "Check again" logs in to a server
+  that gave a LowID again, which is when a server tests the port, and so
+  does adding the firewall rules. When the outside test reaches the TCP port
+  while the server still has us on LowID, the check logs in again itself and
+  the server line says so rather than failing.
+- **The permission prompt opens in front of Ember.** It is asked for through
+  `ShellExecuteExW` with Ember's window as its owner, where a windowless
+  PowerShell asked before and Windows showed the prompt behind Ember.
 
 **How the open questions were settled:**
 
@@ -850,6 +896,203 @@ probe needs the rendezvous server change above, and works without it.
 **Deployment.** The probe needs the rendezvous server deployed with this
 change. Until then the doctor reports from the Kad and eD2K results and
 says the outside test did not run.
+
+## 5. Followers that help seed a feed (opt-in per feed)
+
+From a user report after 1.7.5. 1.7.6 fixed the other points in that report:
+friend meets that stalled behind a restricted NAT, web mirrors idle behind a
+slow peer, and Russian plurals for 21, 31 and so on. This item and item 6 were
+left for later because they are features, not fixes.
+
+**Why:** a feed's files cost its publisher every byte, to every follower. A
+feed download finishes in `<download folder>/Feeds/<feed>` and stays private,
+as a received chat attachment does (`sharing/feed_downloads.rs`): its partial
+is neither advertised nor served, and the finished file goes in no index,
+known.met, KAD or server list. So a feed with many followers is served by
+the publisher alone, over the feed stream (at most 8 priority uploads at
+once) or, once the publisher-first hold ends, over the publisher's ordinary
+public share. Any third party that happens to share the same file helps
+too. A publisher who goes offline leaves new followers with nothing.
+
+**Keep:** private by default. Most followers never expect a feed to share
+from their machine, and a chat-attachment-like folder that starts sharing on
+its own would surprise them.
+
+**To do:** a per-feed switch, "Share files from this feed", off by default,
+beside the auto-download settings. When on:
+
+- A finished file from that feed is shared like any public file: indexed,
+  in known.met, published to KAD, the eD2K server and as an Ember source
+  record. Turning it off unshares them again, and Unfollow does the same.
+- The feed's folder is still skipped by a walk of the download folder
+  (`MARKER`, `is_private_receive_dir_name`); sharing is per file, by the
+  feed's switch, not by the folder.
+- Files are shared from where they are. Nothing is moved or copied.
+
+**Privacy cost.** For a public feed it is small: the publisher already shares
+every item publicly, so the hashes are public, and item 3 notes that anyone
+with a feed's link can already list its followers online. What it adds is
+that anyone looking up an item's hash finds this follower among its sources,
+and, for a feed whose items appear nowhere else, that ties the follower to the
+feed. The switch's help text says so.
+
+**Questions to settle first:**
+
+- **Partials.** Whether a download in progress from an opted-in feed also
+  advertises and serves its partial (as a normal download does), or only
+  finished files are shared. Partials help most while a new item spreads.
+- **The publisher-first hold.** With co-seeders, the 45 seconds a feed
+  download waits for the publisher (`network::feed_direct`) may be the wrong
+  default. One option is to let co-seeding followers' Ember source records
+  end the hold early when the publisher has none.
+- **Defaults per feed kind.** Whether the publisher can mark a feed as
+  "followers are asked to share" so the switch defaults on for that feed
+  (shown, never silently applied), which would need a field in the head.
+- **Upload priority.** Whether co-seeded files take ordinary queue places, or
+  a lower priority than the user's own shares.
+
+**Later, and much bigger:** a swarm among followers only, for link-only feeds,
+found under a key derived from the feed (so nobody without the link can find
+it) and served over Ember's own streams rather than eD2K. That needs Ember to
+download from several Ember peers at once, which it cannot yet do (a feed
+download has one Ember source, the publisher, beside whatever eD2K finds), so
+it waits for that.
+
+**Tests:** with the switch off nothing from the feed is indexed, published or
+served (as today); with it on a finished item is shared everywhere a public
+file is; off again and Unfollow unshare it; a walk of a shared download folder
+still skips `Feeds`; an item the user also shares on purpose stays shared when
+the switch goes off.
+
+## 6. Web mirrors: add one by hand, and keep the good ones
+
+From the same report as item 5.
+
+**Today:** an eD2K link's `s=` mirrors are attached to its download
+(`attach_link_web_sources` in `commands/transfers.rs`), validated and capped
+at 5 (`web_sources::register`, `MAX_WEB_SOURCES_PER_FILE`), and saved in
+`transfer_web_sources` so they survive restarts. Pasting the link again,
+with mirrors, while the download runs adds them, so adding a mirror to a
+running download already works, just not obviously. When the download
+finishes its mirrors are dropped (`web_sources::forget`,
+`delete_transfer_web_sources`), so Copy eD2K Link on the finished file, and a
+feed that lists it, carry none.
+
+**To do, in order of size:**
+
+1. **"Add web mirror…" on a transfer's menu.** A small dialog taking one URL
+   (or several, one per line), passed through `attach_link_web_sources`.
+   Refuse what `normalize_web_source_url` refuses, say when the file already
+   has 5, and say that every part a mirror fills is checked like a peer's.
+   Disabled while web sources are off in Settings > Downloads.
+2. **Keep verified mirrors on the Library entry.** A mirror that filled at
+   least one part that passed its hash check, and was never blamed for a
+   corrupt one (`note_written`, `note_corrupt_range`, `bad_parts`), is kept
+   with the finished file in a new table keyed by file hash, at most 5.
+   Copy eD2K Link then appends them as `|s=<url>|`, which eMule reads too.
+   Deleting the file from the Library drops them. A switch to leave them out
+   of copied links, since a mirror URL can name the user's own server.
+3. **Mirrors in feed lists.** A new per-item collection tag beside
+   `FT_EMBER_NOTE`, carrying the item's kept mirrors. Older followers skip a
+   tag they do not know (`collection.rs` reads only the tags it knows), so it
+   is not a format break; check it against the freeze rules in
+   `channels-format.md` and record it there under the feed list.
+
+**Safety:**
+
+- **A mirror chosen by someone else sees your address.** Fetching from a
+  mirror tells its web server the follower's IP address and when they
+  downloaded. With mirrors in feed lists, a publisher could name a server they
+  run and learn who downloads, which they cannot learn today without being a
+  source themselves. A feed's mirrors are used only when the follower turns
+  that on for the feed (off by default), and the help text says why.
+- **Local addresses.** `normalize_web_source_url` already refuses
+  credentials, `localhost` and private literal addresses, and a host that
+  resolves to a private address is refused at fetch time. A mirror in a feed
+  list or a pasted link goes through the same checks.
+- **Bad data costs nothing but time:** every part a mirror fills is checked
+  against the MD4 part hashes (and AICH when known), and two corrupt parts
+  retire it for the session (`MAX_BAD_PARTS`).
+
+**Done in 1.7.6: step 1.** "Add Web Mirror…" on an unfinished download's
+menu takes one address per line through `add_transfer_web_sources`, which
+validates and caps them as a pasted link's `s=` mirrors are, keeps them
+across restarts, and reports how many it added, which the download already
+had, which the cap of 5 left out, and the lines that can never be a mirror,
+left in the dialog to correct. It is disabled while web sources are off
+(Settings > Transfers), and refused for a download being checked, moved,
+done or failed. Steps 2 and 3 remain.
+
+**Tests:** the dialog refuses what the link path refuses and adds what it
+adds; a mirror is kept on the Library entry only after a verified part and
+never after a corrupt one; Copy eD2K Link carries kept mirrors, and none with
+the switch off; a feed list with the new tag parses in a build without it;
+feed mirrors are not fetched with the per-feed switch off.
+
+## 7. Feeds whose publisher can place no source record (shipped in 1.7.6)
+
+**Reported:** a follower found a feed ("1233软件库": 62 items, a 12 KB list)
+whose publisher Discover showed as active, and its list never loaded: every
+fetch gave up after 30 minutes with no source. A direct DHT lookup of the
+list's source key had 14 nodes answer and none hold a record. A firewalled
+publisher with no buddy places no source record at all, while its head and
+listing still go out.
+
+**What 1.7.6 does** (`docs/feed-reachability-plan.md`; wire details in
+`docs/channels-format.md`, "Reaching a publisher"):
+
+- Publishers register their 16 newest published feeds on the rendezvous
+  server, as sealed intros under a capability only the feed's link holders
+  can compute. The deployed server needed no change.
+- A follower whose list fetch finds no source for 3 minutes, or who presses
+  Retry after one that found none, reaches the publisher through it: at the
+  registered address, by a hole punch, then over the server relay, which
+  carries lists only. The list is checked against the signed head as a
+  fetched one is.
+- The publisher serves its lists on the feed stream, and answers feed punches
+  and `feed-list` relay offers from non-friends, capped (6 punches a minute,
+  2 from one follower; 2 relays at once).
+- The feed page says when the publisher cannot be reached, and while Ember is
+  reaching it directly. My feeds says when followers reach a feed only through
+  the server, or not at all; the listing carries the second as flag `0x02`,
+  which Discover shows as "Publisher online, files unavailable".
+- The Ember Network page counts buddy requests sent and buddies that agreed.
+
+- A feed download that finds no source punches its publisher the same way and
+  streams the file from it.
+
+**Not covered:** a 1.7.5 publisher is not reachable this way, as it never
+registers. Items of a fully blocked publisher are not relayed by the server;
+they come over a direct or punched connection or from any other source.
+
+**To check live:** a publisher behind a firewall with no buddy (no endorsements
+on the Ember Network page) and a follower elsewhere, both on 1.7.6. The
+follower's log says how the list came (`Direct`, `Punch` or `Relay`).
+
+## Smaller follow-ups from the 1.7.6 fixes
+
+- **Check friend meets live.** 1.7.6 puts the sender's Noise key in the meet
+  and resends the first handshake message: the lower-key side as soon as it
+  refuses the peer's crossed dial (at most once a second and twice a dial),
+  and every dial once at 1 second, or at 1 and 3 seconds for a dial the peer
+  has crossed
+  (`docs/ember-dht.md`, section 3). Tests replay the failure, but no meet has
+  been tried between two real restricted NATs. Compare
+  `ember_dht_friend_meets` against `ember_dht_friend_meets_converted` in
+  Diagnostics on builds that have it; conversions should be close to meets for
+  friends that are not behind a symmetric NAT.
+- **Symmetric NAT stays out.** Meets are still skipped while our own NAT is
+  symmetric, since hole punching cannot work there. Reaching such a friend
+  needs a relay (item 1's relay path would serve).
+- **Three plurals still read wrongly in Russian for 21, 31 and so on.**
+  `channels_reactors_others_one`, `statusbar_epx_title_active_one_one` and
+  `transfers_confirm_batch_cancel_mixed_one_one` keep their fixed wording,
+  because each carries two counts or a count in another form, so the 1.7.6
+  change (`oneShowsCount` in `src/lib/plural.ts`) does not fit them. They
+  need rewording, ideally by a native speaker.
+- **French and Portuguese 0 stays on the plural form** ("0 fichiers"), by
+  decision: it reads naturally and avoids "0 fichier" wording in every
+  `_one` string.
 
 ## Already scheduled for 1.8.0
 
@@ -891,7 +1134,10 @@ Origin: `docs/post-1.7.4.md`, "Known limits" of owned-room recovery.
 ## Carried from the 1.7.5 plan
 
 What `docs/post-1.7.4.md` leaves open, apart from the item above, which this
-plan now owns: under "Later", the Away status, component tests, Discover spam
-folding and the smaller Friends items; under "Channels: smaller follow-ups",
-the relayed catch-up frontier, the moderation lock race and pre-1.7.3 bans;
-and its "Known limits".
+plan now owns: under "Later", tuning Discover's spam thresholds from real use
+and the pop-out chat's own copy of the friends store; under "Channels:
+smaller follow-ups", the relayed catch-up frontier (1.8.0), the moderation
+lock race and pre-1.7.3 bans; and the rest of its "Known limits". The Away
+status, the component tests and Discover's friend and age signals were done
+in 1.7.5; key-epoch records sent to the nodes a lookup finds (item 9) and the
+owner's claim on its way back (the 1.7.2 audit) in 1.7.6.

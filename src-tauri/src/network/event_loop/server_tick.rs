@@ -664,9 +664,21 @@ pub(in crate::network) async fn on_server_tick(
                             }
                         }
                     }
-                    ed2k::server::ServerEvent::Message(msg) => {
-                        info!("Server message: {msg}");
-                        emit_server_log(app_handle, &format!("Server: {msg}"));
+                    ed2k::server::ServerEvent::Message(line) => {
+                        match &line {
+                            ed2k::server::ServerMessageLine::Info(_) => info!("Server message: {line:?}"),
+                            _ => warn!("Server message: {line:?}"),
+                        }
+                        emit_server_log(app_handle, &line.log_line());
+                    }
+                    ed2k::server::ServerEvent::DynHost(host) => {
+                        if let Some((ip, port)) = connected_server_list_key(state) {
+                            if state.server_list.set_dyn_host(&ip, port, &host) {
+                                info!("Server {ip}:{port} is on a dynamic IP, known as {host}");
+                                let met_path = state.data_dir.join("server.met");
+                                spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
+                            }
+                        }
                     }
                     ed2k::server::ServerEvent::CallbackRequested { ip, port, crypt_options, user_hash } => {
                         // eMule parity (ServerSocket OP_CALLBACKREQUESTED ->
@@ -1216,14 +1228,12 @@ pub(in crate::network) async fn on_server_tick(
         if elapsed_ok {
         // Retry only the preferred server — never rotate through the list.
         let picked = state.preferred_ed2k_server.clone().map(|(ip, port)| {
-            let obf_port = state
-                .server_list
-                .find_by_addr(&ip, port)
-                .map(|s| s.obfuscation_port_tcp)
-                .unwrap_or(0);
-            (ip, port, obf_port)
+            let entry = state.server_list.find_by_addr(&ip, port);
+            let obf_port = entry.map_or(0, |s| s.obfuscation_port_tcp);
+            let dyn_host = entry.map(|s| s.dyn_host.clone()).unwrap_or_default();
+            (ip, port, obf_port, dyn_host)
         });
-        if let Some((ip, port, obf_port)) = picked {
+        if let Some((ip, port, obf_port, dyn_host)) = picked {
             let addr_str = format!("{ip}:{port}");
             let user_hash = state.user_hash;
             let nickname = settings.ed2k_nickname();
@@ -1249,6 +1259,16 @@ pub(in crate::network) async fn on_server_tick(
             let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "connecting" }));
             let app_for_auto = app_handle.clone();
             state.pending_server_connect = Some(tokio::spawn(async move {
+                if let Some(new_ip) = resolve_moved_server(&dyn_host, &ip, port).await {
+                    return ServerConnectResult {
+                        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+                        ip,
+                        port,
+                        login_tcp_port: tcp_port,
+                        moved_to: Some(new_ip),
+                        result: Err("the server has moved".to_string()),
+                    };
+                }
                 // One crypt→plain cycle; outer auto-reconnect retries
                 // the same preferred server only (see initiate_server_connect).
                 let result = async {
@@ -1308,6 +1328,7 @@ pub(in crate::network) async fn on_server_tick(
                     ip,
                     port,
                     login_tcp_port: tcp_port,
+                    moved_to: None,
                     result: result.map(|(conn, session, _)| (conn, session)),
                 }
             }));

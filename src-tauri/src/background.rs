@@ -551,7 +551,7 @@ fn existing_ancestor(path: &Path) -> Option<&Path> {
 /// nothing is moving.
 ///
 /// Composed from symbols and byte units rather than words because the tray is
-/// owned by the backend, which has no idea which of the nine shipped locales
+/// owned by the backend, which has no idea which of the ten shipped locales
 /// the user is reading. `↓`/`↑` and `MB/s` need no translation; "3 downloads"
 /// would.
 fn tray_tooltip(state: &AppState, working: usize) -> String {

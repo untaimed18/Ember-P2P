@@ -10,11 +10,13 @@ import {
   type ChannelMessageInfo,
   type ChannelTransferInfo,
 } from '$lib/api/channels';
-import { isAppVisible } from '$lib/utils';
+import { isAppFocused, isAppVisible } from '$lib/utils';
 import { appSettings } from '$lib/stores/settings';
-import { toast } from '$lib/stores/toast';
+import { toastsFor } from '$lib/stores/toast';
 import { notify } from '$lib/notifications';
 import * as m from '$lib/paraglide/messages';
+
+const { toast } = toastsFor('channels');
 
 export const channels = writable<ChannelInfo[]>([]);
 export const activeChannelId = writable<string | null>(null);
@@ -1298,8 +1300,10 @@ function channelIsOnScreen(channelId: string): boolean {
 }
 
 export function bumpChannelUnread(channelId: string, mentionsMe = false): void {
-  if (isAppVisible() && channelIsOnScreen(channelId)) return;
-  if (isAppVisible() && get(activeChannelId) === channelId) return;
+  // Focused, not merely visible: a room drawn behind another app keeps its
+  // badge, and the open conversation clears it once the window has focus.
+  if (isAppFocused() && channelIsOnScreen(channelId)) return;
+  if (isAppFocused() && get(activeChannelId) === channelId) return;
   let bumped = false;
   channels.update((list) => {
     if (!list.some((channel) => channel.channel_id === channelId && channel.in_room && !channel.deleted)) {

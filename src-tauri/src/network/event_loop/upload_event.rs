@@ -493,6 +493,7 @@ pub(in crate::network) async fn on_upload_event(
                 db,
                 app_handle,
                 settings,
+                credit_manager,
                 attach_eh,
                 offer.clone(),
                 peer_addr,
@@ -552,7 +553,7 @@ pub(in crate::network) async fn on_upload_event(
 
     // Inject Ember Peer Exchange sources from upload-side peers
     if let UploadEventKind::EmberSources { ref entries, ref aich_roots, ref ember_peers, ref relay_attestations, from_ember_hash } = event.kind {
-        let we_are_unreachable = state.firewalled || state.low_id;
+        let we_are_unreachable = ember_tcp_firewalled(state);
         handle_epx_sources(state, transfer_manager, source_manager, local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, "upload", false, we_are_unreachable, &HashMap::new()).await;
     }
 
@@ -595,9 +596,9 @@ pub(in crate::network) async fn on_upload_event(
         }
     }
 
-    if let UploadEventKind::EmberDhtMeet { ember_hash, peer_ip, udp_port, answer, ref reply_tx } = event.kind {
+    if let UploadEventKind::EmberDhtMeet { ember_hash, peer_ip, udp_port, answer, noise_pub, ref reply_tx } = event.kind {
         if settings.ember_native_enabled && friend_hashes.read().await.contains(&ember_hash) {
-            answer_friend_meet(udp_socket, state, ember_hash, peer_ip, udp_port, answer, reply_tx).await;
+            answer_friend_meet(udp_socket, state, ember_hash, peer_ip, udp_port, answer, noise_pub, reply_tx).await;
         }
     }
 
@@ -1199,7 +1200,7 @@ pub(in crate::network) async fn on_upload_event(
             };
             // Cap both entry count and total payload bytes. The
             // receiving side's inbound frame reader
-            // (`read_packet_with_first_byte` in upload.rs) rejects
+            // (`read_packet_after_protocol` in upload.rs) rejects
             // any packet over 512 KiB outright with no partial
             // delivery, so an oversized answer silently loses the
             // *entire* browse response rather than a truncated

@@ -211,6 +211,13 @@ fn restore_from_listings(
                     .and_then(|l| l.parts.as_ref())
                     .is_some_and(|names| names.contains(&format!("{}.part", job.id)));
                 if has_part && job.total_size > 0 {
+                    // A `.part` from before part files were sparse, or on a
+                    // drive without sparse files, holds its whole length:
+                    // admission must not count that again before a worker
+                    // reopens it.
+                    if let Ok(allocated) = ed2k::preview::allocated_bytes_at(&part_path) {
+                        crate::storage::part_folders::note_part_allocation(&job.id, allocated, None);
+                    }
                     let tracker = crate::network::ed2k::part_tracker::PartTracker::new(
                         job.total_size,
                         &part_path,
@@ -1266,6 +1273,30 @@ mod tests {
         assert_eq!(located_folder(&moved), Some(new.clone()), "a `.part` on disk wins");
         let found: HashSet<&str> = restored.found.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(found, HashSet::from([before.as_str(), after.as_str(), moved.as_str()]));
+    }
+
+    /// A restored `.part` that holds its whole length, as one made before part
+    /// files were sparse or on exFAT does, is known allocated before any
+    /// worker reopens it, and allocated since before this run.
+    #[test]
+    fn a_restored_part_notes_what_it_already_holds_on_disk() {
+        let scratch = Scratch::new("allocated");
+        let current = scratch.folder("current");
+        const LEN: u64 = 256 * 1024;
+        let (full, missing) = (uuid(), uuid());
+        std::fs::write(current.join("Temp").join(format!("{full}.part")), vec![7u8; LEN as usize]).unwrap();
+
+        read_restored_parts(
+            &scratch.folders(&current, &[]),
+            vec![RestoreJob { total_size: LEN, ..job(&full) }, job(&missing)],
+            &HashMap::new(),
+            BUDGET,
+        );
+
+        let noted = crate::storage::part_folders::part_allocation(&full).expect("noted at restore");
+        assert!(noted.bytes >= LEN, "{} bytes noted for a written {LEN}-byte part", noted.bytes);
+        assert_eq!(noted.since, None);
+        assert_eq!(crate::storage::part_folders::part_allocation(&missing), None);
     }
 
     /// Paused on an external drive that is unplugged at startup: with the

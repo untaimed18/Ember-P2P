@@ -323,8 +323,9 @@ pub const EMBER_EXT_BROWSE_SUMMARY: u8 = 0x0C;
 /// whichever lands first is answered with a signed `PONG` that admits its
 /// sender through the ordinary path.
 ///
-/// Body is [`encode_dht_meet`]: the sender's Ember UDP port and whether this
-/// is the answer to one. The port is claimed because it cannot be observed;
+/// Body is [`encode_dht_meet`]: the sender's Ember UDP port, whether this is
+/// the answer to one, and the sender's Noise static key. The port is claimed
+/// because it cannot be observed;
 /// the IP never travels and is always taken from the session itself, so a
 /// friend cannot aim our `PING` at a third party. The frame grants nothing —
 /// only a real `PONG` creates a contact. A peer that predates it ignores it.
@@ -414,24 +415,78 @@ pub const EMBER_EXT_STATUS: u8 = 0x13;
 /// if signed by the friend who sent it. A peer that predates this ignores it.
 pub const EMBER_EXT_FEED_HEAD: u8 = 0x14;
 
+/// [`OP_EMBER_EXT`] sub-type on an eD2K session: "prove you hold the Ember key
+/// your HELLO advertised". Body is a fresh 32-byte random nonce.
+///
+/// Sent at most once per session, and only to a peer whose `OP_EMBER_HELLO`
+/// showed it is an Ember client, so a plain eMule peer never sees one. Not
+/// friend-gated: it is how a stranger's Ember identity gets tied to its eD2K
+/// user hash for Ember-stream credit
+/// ([`crate::network::ed2k::key_link`]). A peer that predates it ignores it
+/// and never gets the link.
+pub const EMBER_EXT_KEY_LINK_CHALLENGE: u8 = 0x15;
+
+/// [`OP_EMBER_EXT`] sub-type: the answer to [`EMBER_EXT_KEY_LINK_CHALLENGE`].
+/// Body is `ember_pubkey(32) || ed25519_sig(64) || rsa_sig_len(1) ||
+/// rsa_sig(rsa_sig_len)`, `rsa_sig_len` always 48 (RSA-384). Both signatures
+/// cover `"ember-ed2k-key-link-v1\0" || nonce(32) || prover_user_hash(16) ||
+/// challenger_user_hash(16) || prover_ember_pubkey(32) ||
+/// BLAKE3(prover_secident_pubkey)(32)`: the Ed25519 one by the Ember key, the
+/// RSA one by the prover's SecIdent key (SecIdent's PKCS#1 v1.5 / SHA-1, over
+/// the statement zero-padded to 320 bytes, longer than anything SecIdent
+/// signs).
+///
+/// Taken only as the answer to our one outstanding nonce, from an Ember key
+/// that hashes to the identity the peer advertised, and checked against the
+/// SecIdent key proven for the peer's user hash, in this session or an
+/// earlier one; at first contact it waits for SecIdent to prove one. A
+/// session answers at most two challenges.
+pub const EMBER_EXT_KEY_LINK_PROOF: u8 = 0x16;
+
 const DHT_MEET_FLAG_ANSWER: u8 = 0x01;
 
-/// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1)`.
-pub fn encode_dht_meet(udp_port: u16, answer: bool) -> [u8; 3] {
+/// [`EMBER_EXT_DHT_MEET`] body: `udp_port(2, LE) || flags(1) || noise_pub(32)`.
+///
+/// The sender's Noise static key rides along so the friend can `PING` it with
+/// IK. Without it the friend falls back to XX for an address it holds no key
+/// for, and an XX dial in flight refuses every handshake the other side starts
+/// — which, in a meet, is exactly the one that would have got through. Taken
+/// on the friend's word, which the session behind this frame authenticates; a
+/// key that is not really theirs only makes the `PING` fail. Older builds read
+/// the first three bytes and ignore the rest.
+pub fn encode_dht_meet(udp_port: u16, answer: bool, noise_pub: &[u8; 32]) -> [u8; 35] {
     let [lo, hi] = udp_port.to_le_bytes();
-    [lo, hi, if answer { DHT_MEET_FLAG_ANSWER } else { 0 }]
+    let mut body = [0u8; 35];
+    body[0] = lo;
+    body[1] = hi;
+    body[2] = if answer { DHT_MEET_FLAG_ANSWER } else { 0 };
+    body[3..].copy_from_slice(noise_pub);
+    body
 }
 
-/// The claimed UDP port and the answer flag, or `None` for a body too short
-/// or naming port zero. Longer bodies are read for what they start with, so a
-/// later build can append fields.
-pub fn decode_dht_meet(body: &[u8]) -> Option<(u16, bool)> {
-    let port = u16::from_le_bytes([*body.first()?, *body.get(1)?]);
-    if port == 0 {
+/// A friend's [`EMBER_EXT_DHT_MEET`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DhtMeet {
+    pub udp_port: u16,
+    pub answer: bool,
+    /// Absent from a build that predates it.
+    pub noise_pub: Option<[u8; 32]>,
+}
+
+/// The claimed UDP port, the answer flag and the sender's Noise key, or `None`
+/// for a body too short or naming port zero. Longer bodies are read for what
+/// they start with, so a later build can append fields.
+pub fn decode_dht_meet(body: &[u8]) -> Option<DhtMeet> {
+    let udp_port = u16::from_le_bytes([*body.first()?, *body.get(1)?]);
+    if udp_port == 0 {
         return None;
     }
     let answer = body.get(2).is_some_and(|flags| flags & DHT_MEET_FLAG_ANSWER != 0);
-    Some((port, answer))
+    let noise_pub = body
+        .get(3..35)
+        .and_then(|key| <[u8; 32]>::try_from(key).ok())
+        .filter(|key| *key != [0u8; 32]);
+    Some(DhtMeet { udp_port, answer, noise_pub })
 }
 
 /// Wrap `body` in an [`OP_EMBER_EXT`] payload under `ext_type`.
@@ -702,6 +757,53 @@ pub fn set_share_browsing_allowed(allowed: bool) {
 /// Whether peers are currently told they may browse our shared files.
 pub fn share_browsing_allowed() -> bool {
     SHARE_BROWSING_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Process-wide client ID every Hello / HelloAnswer advertises, computed by
+/// [`emule_client_id`]. Mirrored for the same reason as
+/// [`SHARE_BROWSING_ALLOWED`]: the upload listener, the per-source download
+/// tasks and the probe paths build Hellos without a `NetworkState`.
+///
+/// Not our public IP. A firewalled node usually knows that too, but a Hello
+/// carrying it makes eMule file us as HighID (`ID == socket IP`), so when our
+/// upload slot comes it drops us from its queue and dials us — which fails —
+/// and Source Exchange hands us on as directly dialable.
+static HELLO_CLIENT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_hello_client_id(id: u32) {
+    HELLO_CLIENT_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Our client ID as Hellos advertise it right now.
+pub fn hello_client_id() -> u32 {
+    HELLO_CLIENT_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// eMule's `CemuleApp::GetID()`: KAD's public IP while KAD is connected and
+/// not firewalled; otherwise the ID the server assigned (a LowID when
+/// firewalled, our IP when HighID); otherwise `1` for a firewalled KAD-only
+/// node; otherwise `0`. `server_client_id` is `None` when not logged in to a
+/// server. IPs are in eD2K HighID form (the octets read little-endian).
+pub fn emule_client_id(
+    kad_connected: bool,
+    kad_firewalled: bool,
+    kad_ip: Option<std::net::Ipv4Addr>,
+    server_client_id: Option<u32>,
+) -> u32 {
+    if kad_connected && !kad_firewalled {
+        kad_ip.map_or(0, |ip| u32::from_le_bytes(ip.octets()))
+    } else if let Some(id) = server_client_id {
+        id
+    } else if kad_connected {
+        1
+    } else {
+        0
+    }
+}
+
+/// Whether an eD2K client ID is a LowID (`0` included).
+pub fn is_low_client_id(id: u32) -> bool {
+    id < super::server::LOWID_THRESHOLD
 }
 
 /// Peer capability flags parsed from Hello/EmuleInfo exchanges.
@@ -1773,9 +1875,9 @@ pub fn parse_emule_info(payload: &[u8]) -> PeerCapabilities {
                 // Reading bit 2 meant a vanilla eMule advertising preview was
                 // always recorded as not supporting it.
                 caps.supports_preview = (int_val & (1 << ET_FEATURES_PREVIEW)) != 0;
-                caps.supports_crypt_layer |= (int_val & 0x08) != 0;
-                caps.requests_crypt_layer |= (int_val & 0x10) != 0;
-                caps.requires_crypt_layer |= (int_val & 0x20) != 0;
+                // No crypt-layer bits here: eMule carries those only in the
+                // Hello's CT_EMULE_MISCOPTIONS2, and bits 2-6 of this tag are
+                // unassigned, so a mod setting them must not change ours.
             }
             _ => {}
         }
@@ -3300,6 +3402,63 @@ pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
 mod tests {
     use super::*;
 
+    const PUBLIC: std::net::Ipv4Addr = std::net::Ipv4Addr::new(203, 0, 113, 7);
+    const PUBLIC_ID: u32 = u32::from_le_bytes([203, 0, 113, 7]);
+    const LOW_ID: u32 = 0x0012_3456;
+
+    /// The case that lost us queue places: a LowID node that knows its public
+    /// IP must still advertise the LowID, or eMule takes the Hello for a
+    /// HighID one and dials us when the slot comes.
+    #[test]
+    fn a_firewalled_node_advertises_its_server_lowid_not_its_public_ip() {
+        let id = emule_client_id(false, true, Some(PUBLIC), Some(LOW_ID));
+        assert_eq!(id, LOW_ID);
+        assert!(is_low_client_id(id));
+        assert_eq!(emule_client_id(true, true, Some(PUBLIC), Some(LOW_ID)), LOW_ID);
+    }
+
+    #[test]
+    fn client_id_follows_emule_get_id_precedence() {
+        // KAD open wins, over a server LowID too.
+        assert_eq!(emule_client_id(true, false, Some(PUBLIC), Some(LOW_ID)), PUBLIC_ID);
+        assert_eq!(emule_client_id(true, false, Some(PUBLIC), None), PUBLIC_ID);
+        // KAD open with no known address is KAD's own 0, as in eMule.
+        assert_eq!(emule_client_id(true, false, None, Some(LOW_ID)), 0);
+        // Server HighID when KAD is firewalled or down.
+        assert_eq!(emule_client_id(true, true, Some(PUBLIC), Some(PUBLIC_ID)), PUBLIC_ID);
+        assert_eq!(emule_client_id(false, false, Some(PUBLIC), Some(PUBLIC_ID)), PUBLIC_ID);
+        // An open verdict means nothing while KAD is disconnected.
+        assert_eq!(emule_client_id(false, false, Some(PUBLIC), Some(LOW_ID)), LOW_ID);
+        // Firewalled KAD only: the placeholder LowID 1.
+        assert_eq!(emule_client_id(true, true, Some(PUBLIC), None), 1);
+        // Nothing connected.
+        assert_eq!(emule_client_id(false, false, Some(PUBLIC), None), 0);
+        assert_eq!(emule_client_id(false, true, None, None), 0);
+    }
+
+    #[test]
+    fn low_client_id_threshold() {
+        assert!(is_low_client_id(0));
+        assert!(is_low_client_id(1));
+        assert!(is_low_client_id(super::super::server::LOWID_THRESHOLD - 1));
+        assert!(!is_low_client_id(super::super::server::LOWID_THRESHOLD));
+        assert!(!is_low_client_id(PUBLIC_ID));
+    }
+
+    /// eMule's ET_FEATURES holds the SecIdent level and the preview bit and
+    /// nothing else; crypt preferences come from the Hello alone, so a mod
+    /// setting the unassigned bits changes nothing.
+    #[test]
+    fn emule_info_features_carry_no_crypt_preferences() {
+        let mut payload = vec![0x99, 0x01];
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        write_ed2k_tag(&mut payload, 0x27, &Ed2kTagValue::Uint32(0x80 | 0x38 | 0x01));
+        let caps = parse_emule_info(&payload);
+        assert!(caps.supports_preview);
+        assert_eq!(caps.secure_ident_level, 1);
+        assert!(!caps.supports_crypt_layer && !caps.requests_crypt_layer && !caps.requires_crypt_layer);
+    }
+
     /// Pins the two Hello capability words to the exact `u32` eMule expects.
     ///
     /// Every field here is packed adjacent to its neighbours, so an off-by-one
@@ -3455,12 +3614,26 @@ mod tests {
 
     #[test]
     fn a_dht_meet_body_round_trips_and_refuses_port_zero() {
-        assert_eq!(decode_dht_meet(&encode_dht_meet(4672, false)), Some((4672, false)));
-        assert_eq!(decode_dht_meet(&encode_dht_meet(51_000, true)), Some((51_000, true)));
-        assert_eq!(decode_dht_meet(&[0x40, 0x12]), Some((0x1240, false)), "flags are optional");
-        assert_eq!(decode_dht_meet(&[0x40, 0x12, 0x01, 0xAA]), Some((0x1240, true)));
-        assert_eq!(decode_dht_meet(&encode_dht_meet(0, false)), None);
+        let key = [0x5Au8; 32];
+        let meet = |udp_port, answer, noise_pub| Some(DhtMeet { udp_port, answer, noise_pub });
+        assert_eq!(decode_dht_meet(&encode_dht_meet(4672, false, &key)), meet(4672, false, Some(key)));
+        assert_eq!(decode_dht_meet(&encode_dht_meet(51_000, true, &key)), meet(51_000, true, Some(key)));
+        assert_eq!(decode_dht_meet(&encode_dht_meet(0, false, &key)), None);
         assert_eq!(decode_dht_meet(&[0x40]), None);
+    }
+
+    /// What a build that predates the key sends, and anything cut short of a
+    /// whole key, still decodes, with no key: the friend then pings by XX.
+    #[test]
+    fn a_dht_meet_body_without_a_whole_key_still_decodes() {
+        let meet = |udp_port, answer| Some(DhtMeet { udp_port, answer, noise_pub: None });
+        assert_eq!(decode_dht_meet(&[0x40, 0x12]), meet(0x1240, false), "flags are optional");
+        assert_eq!(decode_dht_meet(&[0x40, 0x12, 0x01]), meet(0x1240, true));
+        assert_eq!(decode_dht_meet(&[0x40, 0x12, 0x01, 0xAA]), meet(0x1240, true), "a partial key is ignored");
+        let mut zero_key = encode_dht_meet(4672, false, &[0u8; 32]).to_vec();
+        assert_eq!(decode_dht_meet(&zero_key), meet(4672, false), "an all-zero key is no key");
+        zero_key.extend_from_slice(&[7; 8]);
+        assert_eq!(decode_dht_meet(&zero_key), meet(4672, false), "trailing fields are left for later builds");
     }
 
     /// Sub-types dispatch off one byte with no length or type tag around it, so
@@ -3482,6 +3655,14 @@ mod tests {
             EMBER_EXT_BROWSE_SUMMARY,
             EMBER_EXT_DHT_MEET,
             EMBER_EXT_BROWSE_SCOPE_AWARE,
+            EMBER_EXT_CHAT_EXPIRE,
+            EMBER_EXT_MAILBOX_AWARE,
+            EMBER_EXT_CHAT_ID,
+            EMBER_EXT_ATTACH_WAITS,
+            EMBER_EXT_STATUS,
+            EMBER_EXT_FEED_HEAD,
+            EMBER_EXT_KEY_LINK_CHALLENGE,
+            EMBER_EXT_KEY_LINK_PROOF,
         ];
         let mut seen = std::collections::HashSet::new();
         for sub_type in sub_types {

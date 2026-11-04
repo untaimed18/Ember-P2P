@@ -41,6 +41,7 @@ mod storage;
 mod login_launch;
 mod tray;
 mod types;
+mod vpn;
 mod webservices;
 mod window_state;
 
@@ -1466,36 +1467,58 @@ pub fn run() {
                             folder.clone(),
                             tokio::task::spawn_blocking(move || {
                                 match FileIndexer::refuse_unapproved_root(&f) {
-                                    Some(refused) => (true, refused),
-                                    None => (
-                                        false,
-                                        FileIndexer::discover_directory_page_in(
+                                    Some(refused) => (true, false, refused),
+                                    None => {
+                                        let result = FileIndexer::discover_directory_page_in(
                                             &f,
                                             cursor.as_deref(),
                                             scope.as_ref(),
-                                        ),
-                                    ),
+                                        );
+                                        let gone = result.saw_nothing()
+                                            && sharing::indexer::folder_gone_from_present_volume(
+                                                std::path::Path::new(&f),
+                                            );
+                                        (false, gone, result)
+                                    }
                                 }
                             }),
                         )
                     })
                     .collect();
+                // Read while the folders are walked; nothing below needs it sooner.
+                let known_path =
+                    storage::paths::resolve_data_dir_with_app(&startup_app).join("known.met");
+                let known_load = tokio::task::spawn_blocking(move || {
+                    let known_list = storage::known_files::KnownFileList::load(&known_path);
+                    // The per-file `effective_shared` calls below would
+                    // otherwise wait out the share-intent migration on this
+                    // runtime worker.
+                    storage::share_intent::wait_until_initialized();
+                    known_list
+                });
                 let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
                 let mut startup_cursor_updates = std::collections::HashMap::new();
                 // Not walked until re-approved, so not filled in from known.met
                 // either: what is at the path now is not what was approved.
                 let mut refused_roots: Vec<String> = Vec::new();
+                // Read nothing of: a drive not plugged in, a share offline.
+                let mut unreachable_roots: Vec<String> = Vec::new();
                 for (folder, handle) in discovery_handles {
                     match handle.await {
-                        Ok((refused, result)) => {
+                        Ok((refused, gone, result)) => {
                             if refused {
                                 refused_roots.push(folder);
                                 continue;
                             }
                             // An unreachable folder (a drive not plugged in)
                             // says nothing about where its paging stood; a
-                            // `None` here erased the cursor it had.
+                            // `None` here erased the cursor it had. One deleted
+                            // from a drive that is there has nothing to keep
+                            // rows for, or they would be announced every session.
                             if result.saw_nothing() {
+                                if !gone {
+                                    unreachable_roots.push(folder);
+                                }
                                 continue;
                             }
                             if result.reached_file_cap() {
@@ -1526,25 +1549,17 @@ pub fn run() {
                     }
                 }
 
-                if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    info!("Startup hashing cancelled during discovery");
-                    startup_cancel_flags.write().await.remove("__startup__");
-                    let _ = startup_app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
-                    return;
+                // A Stop during the walk still lets last session's files into
+                // the index: only hashing is skipped (see `was_cancelled`).
+                // Returning here left the Library empty with the loading flag
+                // cleared, and a feed saved or published then dropped every
+                // item as gone.
+                let cancelled_in_discovery = cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
+                if cancelled_in_discovery {
+                    info!("Startup hashing cancelled during discovery; indexing known files only");
                 }
 
-                let known_path =
-                    storage::paths::resolve_data_dir_with_app(&startup_app).join("known.met");
-                let known_list = match tokio::task::spawn_blocking(move || {
-                    let known_list = storage::known_files::KnownFileList::load(&known_path);
-                    // The per-file `effective_shared` calls below would
-                    // otherwise wait out the share-intent migration on this
-                    // runtime worker.
-                    storage::share_intent::wait_until_initialized();
-                    known_list
-                })
-                .await
-                {
+                let known_list = match known_load.await {
                     Ok(known_list) => known_list,
                     Err(e) => {
                         tracing::error!("Startup known.met load panicked: {e}");
@@ -1615,14 +1630,13 @@ pub fn run() {
                         // the same background pass. Kept in step with
                         // `resolve_from_known`, which documents the reasoning:
                         //
-                        // - empty AICH on multi-part (v2 migration / missing
-                        //   root) is eD2k recovery data. Valuable, but it costs
-                        //   a downloader one re-fetched part rather than one
+                        // - an empty AICH root (v2 migration, or a file such as
+                        //   a completed download that arrived without one) is
+                        //   eD2k recovery data. Valuable, but it costs a
+                        //   downloader one re-fetched part rather than one
                         //   re-fetched block, and only once something is
                         //   actually corrupt — not worth blocking a scan that
-                        //   would otherwise re-read the whole share. Single-part
-                        //   empty AICH is left as-is (roots never straddled a
-                        //   part boundary).
+                        //   would otherwise re-read the whole share.
                         // - empty ember_file_hash is an Ember-only extra that
                         //   lets a downloader double-check the whole file.
                         //
@@ -1681,7 +1695,15 @@ pub fn run() {
                 // large share (>100k files) loses every non-first-page row
                 // until the user manually triggers enough reloads to cycle it
                 // back in.
-                if startup_cursor_updates.values().any(Option::is_some) {
+                //
+                // A folder that could not be read at all keeps its rows the
+                // same way, as one that goes offline mid-session does: it is
+                // unavailable, not empty. Left out, its files looked gone once
+                // the Library had loaded, and a feed saved or published then
+                // dropped every item on it for good.
+                let hydrate_paged = startup_cursor_updates.values().any(Option::is_some);
+                if hydrate_paged || !unreachable_roots.is_empty() {
+                    let hydration_unreachable = unreachable_roots.clone();
                     let mut known_paths = all_discovered
                         .iter()
                         .map(|file| crate::search::index::normalize_path_key(&file.path))
@@ -1740,6 +1762,18 @@ pub fn run() {
                                         record_path,
                                     )
                                 {
+                                    return false;
+                                }
+                                // As known.met last saw it: its drive cannot
+                                // say otherwise until it is back, and the
+                                // first walk that reads it reconciles the rows.
+                                if hydration_unreachable
+                                    .iter()
+                                    .any(|root| crate::security::path_within_dir(&record.file_path, root))
+                                {
+                                    return true;
+                                }
+                                if !hydrate_paged {
                                     return false;
                                 }
                                 let metadata = match std::fs::symlink_metadata(&record.file_path)
@@ -1926,7 +1960,7 @@ pub fn run() {
                 // small whether files hash slowly (large) or quickly (many).
                 let mut last_known_met_persist = std::time::Instant::now();
                 let mut hashed_since_persist = 0usize;
-                let mut was_cancelled = false;
+                let mut was_cancelled = cancelled_in_discovery;
 
                 // Same scheduler the folder-add and reload passes use: one read
                 // at a time per physical drive, more only where a drive has
@@ -1943,7 +1977,8 @@ pub fn run() {
                     cancel_flag.clone(),
                 );
                 pipeline.log_plan("Startup hashing", total_to_hash);
-                loop {
+                // Every exit that cancels sets `was_cancelled` and breaks.
+                while !was_cancelled {
                     let started = match pipeline.next_started() {
                         commands::sharing::NextHash::Ready(started) => started,
                         // Every drive with work left is busy with a read this
@@ -2416,6 +2451,7 @@ pub fn run() {
             commands::search::parse_ed2k_links,
             commands::search::mark_spam,
             commands::search::mark_not_spam,
+            commands::search::undo_mark_spam,
             commands::search::get_spam_stats,
             commands::search::explain_spam_result,
             commands::search::reset_spam_filter,
@@ -2446,6 +2482,7 @@ pub fn run() {
             commands::transfers::get_download_queue_ids,
             commands::transfers::set_transfers_category,
             commands::transfers::rename_transfer,
+            commands::transfers::add_transfer_web_sources,
             commands::transfers::set_preview_priority,
             commands::transfers::stop_transfer,
             commands::transfers::open_file,
@@ -2597,6 +2634,7 @@ pub fn run() {
             commands::feeds::set_feed_details,
             commands::feeds::set_feed_listed,
             commands::feeds::set_feed_items,
+            commands::feeds::add_feed_items,
             commands::feeds::publish_feed,
             commands::feeds::delete_feed,
             commands::feeds::list_followed_feeds,
@@ -2665,6 +2703,8 @@ pub fn run() {
             commands::settings::download_ipfilter,
             commands::settings::hide_to_tray,
             commands::settings::quit_app,
+            commands::settings::quit_flush_pending,
+            commands::settings::finish_requested_quit,
             commands::settings::set_pending_undo,
             commands::settings::set_close_behavior,
             commands::settings::set_quick_limits,
@@ -2708,6 +2748,7 @@ pub fn run() {
             commands::server::set_server_priority,
             commands::server::get_server_list,
             commands::server::get_connected_server,
+            commands::server::get_last_server,
             commands::server::get_server_log,
             commands::server::clear_server_log,
             commands::server::download_server_met,
@@ -2723,6 +2764,7 @@ pub fn run() {
             commands::system::get_runtime_status,
             commands::system::read_clipboard_text,
             commands::system::write_clipboard_text,
+            commands::system::identity_keyring_fallback,
             commands::system::ui_ping,
             commands::system::log_ui_stall,
             commands::deeplink::list_pending_deep_links,

@@ -378,13 +378,7 @@ fn an_owner_back_from_silence_follows_only_a_claim_that_silence_allowed() {
     let last_word = fx.last_word;
     let during = last_word + 15 * day;
 
-    assert_eq!(
-        fx.ingest(last_word, during),
-        None,
-        "an owner that never went quiet has nothing to follow"
-    );
-
-    // Coming back: the first stamp is what notices the silence.
+    // Coming back: the first stamp is what records the silence.
     fx.db.stamp_owner_snapshot(&fx.channel_id_hex(), now).unwrap();
     assert_eq!(
         fx.ingest(now - 3_600, during),
@@ -416,6 +410,73 @@ fn an_owner_back_from_silence_follows_only_a_claim_that_silence_allowed() {
     assert_eq!(commit.successor_pubkey, hex::encode(fx.successor.pubkey));
 
     fx.finish();
+}
+
+/// An owner back from the silence that looks before it signs anything takes
+/// the claim in the copy it finds, however recently the claimant re-signed it:
+/// nothing it has signed has told the claimant it is back.
+#[test]
+fn an_owner_that_looks_before_signing_follows_a_freshly_re_signed_claim() {
+    let fx = SilentOwnerRoom::new();
+    let now = chrono::Utc::now().timestamp();
+    let id = fx.channel_id_hex();
+    let silence = fx.db.channel_owner_pending_silence(&id, now).unwrap().expect("a claimable silence");
+    assert!(
+        crate::network::ember::channel::owner_return_waits_for_claims(
+            silence.silent_from + silence.claim_after_days * 86_400,
+            None,
+            now,
+            now,
+        ),
+        "so the owner holds its first snapshot until it has looked"
+    );
+
+    assert_eq!(fx.ingest(now - 3_600, now - 60), None, "its window has not run out yet");
+    assert_eq!(fx.ingest(fx.last_word, now + 600), None, "a copy dated past now is not one found now");
+    assert!(fx.db.channel_handoff_commit(&id).unwrap().is_none());
+
+    assert!(fx.db.channel_owner_silence(&id).unwrap().is_none(), "nothing signed, nothing recorded");
+    assert_eq!(
+        fx.ingest(fx.last_word, now - 60),
+        Some(fx.successor.channel_id),
+        "re-signed a minute ago, and still the claim the members followed"
+    );
+    assert!(fx.db.channel_handoff_commit(&id).unwrap().is_some_and(|commit| commit.claimed));
+
+    fx.finish();
+}
+
+/// An owner edit from the UI stamps the room as the owner pass does, so it
+/// waits for the same claim lookup: until one answers after the silence became
+/// claimable, or a stamp has ended the silence.
+#[test]
+fn an_owner_edit_waits_for_a_claim_lookup_after_a_claimable_silence() {
+    use crate::network::channel_membership::{note_channel_claim_answered, owner_edit_waits_for_claims};
+
+    let fx = SilentOwnerRoom::new();
+    let now = chrono::Utc::now().timestamp();
+    let id = fx.channel_id_hex();
+    let claimable_at = fx.last_word + 14 * 86_400;
+    assert!(owner_edit_waits_for_claims(&fx.db, &id, now), "nothing has looked yet");
+    note_channel_claim_answered(fx.room.channel_id, claimable_at - 60);
+    assert!(
+        owner_edit_waits_for_claims(&fx.db, &id, now),
+        "a lookup from before the silence was claimable says nothing about it"
+    );
+    note_channel_claim_answered(fx.room.channel_id, now - 5);
+    assert!(!owner_edit_waits_for_claims(&fx.db, &id, now), "one answered since");
+
+    let other = SilentOwnerRoom::new();
+    let other_id = other.channel_id_hex();
+    assert!(owner_edit_waits_for_claims(&other.db, &other_id, now));
+    other.db.stamp_owner_snapshot(&other_id, now).unwrap();
+    assert!(
+        !owner_edit_waits_for_claims(&other.db, &other_id, now + 1),
+        "the owner pass signed once its hold was over"
+    );
+
+    fx.finish();
+    other.finish();
 }
 
 /// Claims are re-signed every few hours for months, so one found long after
@@ -2646,11 +2707,11 @@ fn the_named_buddy_survives_a_missed_query() {
 /// Target lookups keep pace with the queue instead of a fixed two a minute.
 #[test]
 fn target_lookups_scale_with_the_queue() {
-    assert_eq!(ember_target_lookups_this_cycle(0, false), EMBER_MAINT_MIN_TARGET_LOOKUPS);
-    assert_eq!(ember_target_lookups_this_cycle(100, false), EMBER_MAINT_MIN_TARGET_LOOKUPS);
-    assert_eq!(ember_target_lookups_this_cycle(300, false), 5);
+    assert_eq!(ember_target_lookups_this_cycle(0), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(100), EMBER_MAINT_MIN_TARGET_LOOKUPS);
+    assert_eq!(ember_target_lookups_this_cycle(300), 5);
     assert_eq!(
-        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX, false),
+        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX),
         EMBER_MAINT_MAX_TARGET_LOOKUPS
     );
 }
@@ -2715,6 +2776,33 @@ fn a_publish_waits_for_its_target_lookup_only_where_storers_filter_by_proximity(
         slow,
         now + EMBER_PUBLISH_LOOKUP_WAIT_SECS
     ));
+}
+
+/// The queue also holds keys nothing waits on, and the top-up drains it from
+/// the front, so a key that starts a wait goes behind the keys already waiting
+/// and ahead of the rest — moving up if it was queued as one of the rest.
+#[test]
+fn a_key_a_publish_waits_on_is_looked_up_before_the_keys_nothing_waits_on() {
+    use std::collections::VecDeque;
+    let k = ember::dht::K_BUCKET_SIZE;
+    let now = 1_700_000_000i64;
+    let cache: HashMap<[u8; 16], (Vec<ember::dht::EmberContact>, i64)> = HashMap::new();
+    let mut waits = HashMap::new();
+    let (refresh, forwarded) = ([0x10; 16], [0x11; 16]);
+    let mut queue = VecDeque::from([refresh, forwarded]);
+
+    let (first, second) = ([0x20; 16], [0x21; 16]);
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, first, now));
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, second, now + 1));
+    assert_eq!(queue, [first, second, refresh, forwarded], "first come, first asked, among the waiting");
+
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, forwarded, now + 2));
+    assert_eq!(queue, [first, second, forwarded, refresh], "moved up, not queued twice");
+
+    let late = [0x22; 16];
+    let lapsed = now + 2 + EMBER_PUBLISH_LOOKUP_WAIT_SECS;
+    assert!(ember_publish_awaits_lookup_in(k, &cache, &mut waits, &mut queue, false, late, lapsed));
+    assert_eq!(queue[0], late, "a wait past its limit holds no place ahead");
 }
 
 /// Files waiting on a lookup do not hold the per-tick budget: those that can
@@ -2796,23 +2884,24 @@ fn the_lookup_gate_reads_the_wait_rule_without_starting_it() {
     );
 }
 
-/// A lookup a publish is waiting on holds a file back, so the queue drains in
-/// minutes then rather than over the hour an ordinary refresh can take.
+/// A lookup a publish is waiting on holds a file back, so they are kept
+/// running as they finish rather than started in a batch each minute, within
+/// a bound on how many run at once and how many start in a minute.
 #[test]
-fn awaited_target_lookups_drain_within_a_few_cycles() {
-    assert_eq!(ember_target_lookups_this_cycle(0, true), EMBER_MAINT_MIN_TARGET_LOOKUPS);
-    assert_eq!(ember_target_lookups_this_cycle(10, true), 10, "a held-back file is asked about at once");
-    assert_eq!(ember_target_lookups_this_cycle(20, true), EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS);
-    assert_eq!(
-        ember_target_lookups_this_cycle(EMBER_PUBLISH_TARGET_QUEUE_MAX, true),
-        EMBER_MAINT_MAX_AWAITED_TARGET_LOOKUPS
+fn awaited_target_lookups_are_topped_up_within_their_bounds() {
+    let conc = EMBER_MAX_CONCURRENT_AWAITED_TARGET_LOOKUPS;
+    let per_min = EMBER_MAX_AWAITED_TARGET_LOOKUPS_PER_MIN;
+    assert_eq!(ember_awaited_target_lookups_to_start(0, 0, 0), 0, "nothing queued");
+    assert_eq!(ember_awaited_target_lookups_to_start(3, 0, 0), 3, "a held-back file is asked about at once");
+    assert_eq!(ember_awaited_target_lookups_to_start(500, 0, 0), conc);
+    assert_eq!(ember_awaited_target_lookups_to_start(500, conc - 2, 0), 2, "finished ones are replaced");
+    assert_eq!(ember_awaited_target_lookups_to_start(500, conc, 0), 0);
+    assert_eq!(ember_awaited_target_lookups_to_start(500, 0, per_min - 1), 1);
+    assert_eq!(ember_awaited_target_lookups_to_start(500, 0, per_min), 0, "the minute's allowance is spent");
+    assert!(
+        per_min > EMBER_MAINT_MAX_TARGET_LOOKUPS * 8,
+        "a waiting file is asked about far faster than a republish refresh"
     );
-    for queued in [0, 1, 20, 100, EMBER_PUBLISH_TARGET_QUEUE_MAX] {
-        assert!(
-            ember_target_lookups_this_cycle(queued, true)
-                >= ember_target_lookups_this_cycle(queued, false)
-        );
-    }
 }
 
 /// Which of a file's keys resolves last is timing, not outcome: a timeout
@@ -3135,6 +3224,198 @@ fn only_channel_keys_that_republish_queue_a_target_lookup() {
     assert_eq!(own_record_target_queue_limit(&owned.data), EMBER_PUBLISH_TARGET_QUEUE_MAX);
     assert_eq!(own_record_target_queue_limit(&presence.data), 0);
     assert_eq!(own_record_target_queue_limit(&epoch.data), 0);
+}
+
+/// A key-epoch record for `member` at `epoch`, signed by the room key `seed`
+/// and stamped `at`.
+fn key_epoch_record_at(seed: u8, member: u8, epoch: i64, at: i64) -> ember::dht::publish::SignedRecord {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let channel_pk = sk.verifying_key().to_bytes();
+    ember::dht::publish::SignedRecord::channel_key_epoch_at(
+        [0x11; 16], channel_pk, &[member; 32], None, epoch, &[0u8; 48], &sk, at,
+    )
+}
+
+fn key_epoch_record(seed: u8, member: u8, epoch: i64) -> ember::dht::publish::SignedRecord {
+    key_epoch_record_at(seed, member, epoch, 1_700_000_000)
+}
+
+/// Below k answered contacts our table is the network's answer, and a fresh
+/// lookup answers for itself; otherwise a key-epoch record is held for one.
+#[test]
+fn a_key_epoch_record_is_held_only_where_the_table_is_not_the_answer() {
+    let key = [0xA1u8; 16];
+    let now = 1_700_000_000i64;
+    let k = ember::dht::K_BUCKET_SIZE;
+    let mut cache = HashMap::new();
+    assert!(!key_record_needs_lookup_in(k - 1, &cache, key, now), "a small table is the answer");
+    assert!(key_record_needs_lookup_in(k, &cache, key, now));
+
+    let found = vec![ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([0x42; 16]),
+        addr: SocketAddr::from(([80, 1, 2, 3], 4672)),
+        noise_pub: [1; 32],
+        ed25519_pub: [1; 32],
+        last_seen: now,
+        failed_queries: 0,
+    }];
+    cache.insert(key, (found.clone(), now - 60));
+    assert!(!key_record_needs_lookup_in(k, &cache, key, now), "a fresh lookup answers");
+    cache.insert(key, (found, now - EMBER_PUBLISH_TARGETS_TTL_SECS));
+    assert!(key_record_needs_lookup_in(k, &cache, key, now), "an aged one does not");
+    cache.insert(key, (Vec::new(), now));
+    assert!(key_record_needs_lookup_in(k, &cache, key, now), "nor one that found nobody");
+}
+
+/// A rotation's records are looked up before a renewal's; a later copy of a
+/// record replaces the one held for the same key and publisher; and the holds
+/// are bounded.
+#[test]
+fn held_key_records_queue_a_rotation_first_and_keep_the_latest_copy() {
+    let mut holds = HashMap::new();
+    let mut queue = std::collections::VecDeque::new();
+    let now = 1_700_000_000i64;
+    let renewal = key_epoch_record(7, 1, 3);
+    let rotation = key_epoch_record(7, 2, 4);
+    assert!(hold_key_record_in(&mut holds, &mut queue, renewal.clone(), false, now));
+    assert!(hold_key_record_in(&mut holds, &mut queue, rotation.clone(), true, now));
+    assert_eq!(queue, [rotation.keyword_hash, renewal.keyword_hash], "the rotation's lookup goes first");
+
+    // The renewal's key held again by an unban's re-seal of the same epoch
+    // moves to the front, once.
+    let newer = key_epoch_record_at(7, 1, 3, 1_700_000_100);
+    assert_eq!(newer.keyword_hash, renewal.keyword_hash, "one key per member and epoch");
+    assert_ne!(newer.data, renewal.data);
+    assert!(hold_key_record_in(&mut holds, &mut queue, newer.clone(), true, now + 10));
+    assert_eq!(queue, [renewal.keyword_hash, rotation.keyword_hash]);
+    let held = &holds[&renewal.keyword_hash];
+    assert_eq!(held.records.len(), 1, "a storer keeps one per key and publisher");
+    assert_eq!(held.records[0].data, newer.data);
+    assert_eq!(held.held_at, now + 10);
+
+    // Another owner's record under the same key is held beside it.
+    let mut other_owner = key_epoch_record(8, 1, 3);
+    other_owner.keyword_hash = renewal.keyword_hash;
+    assert!(hold_key_record_in(&mut holds, &mut queue, other_owner, false, now));
+    assert_eq!(holds[&renewal.keyword_hash].records.len(), 2);
+    assert_eq!(queue.len(), 2, "a key is queued once");
+
+    holds.clear();
+    queue.clear();
+    for i in 0..KEY_RECORD_HOLDS_MAX {
+        let key = (i as u64).to_le_bytes();
+        let mut record = renewal.clone();
+        record.keyword_hash[..8].copy_from_slice(&key);
+        assert!(hold_key_record_in(&mut holds, &mut queue, record, false, now));
+    }
+    assert!(!hold_key_record_in(&mut holds, &mut queue, rotation, true, now), "past the bound nothing more is held");
+    let mut again = renewal.clone();
+    again.keyword_hash[..8].copy_from_slice(&0u64.to_le_bytes());
+    assert!(hold_key_record_in(&mut holds, &mut queue, again, false, now), "a key already held still is");
+    assert_eq!(holds.len(), KEY_RECORD_HOLDS_MAX);
+}
+
+/// A lookup that found nodes makes its key ready to publish; one that found
+/// nobody is asked again while the key has tries left, then let go.
+#[test]
+fn a_key_record_lookup_that_found_nobody_is_retried_then_dropped() {
+    let mut holds = HashMap::new();
+    let mut queue = std::collections::VecDeque::new();
+    let mut ready = std::collections::VecDeque::new();
+    let now = 1_700_000_000i64;
+    let record = key_epoch_record(7, 1, 3);
+    let key = record.keyword_hash;
+    hold_key_record_in(&mut holds, &mut queue, record, true, now);
+    queue.clear();
+
+    holds.get_mut(&key).unwrap().lookups = 1;
+    note_key_record_lookup_ended_in(&mut holds, &mut queue, &mut ready, key, false);
+    assert_eq!(queue, [key], "asked again");
+    assert!(ready.is_empty());
+
+    queue.clear();
+    holds.get_mut(&key).unwrap().lookups = KEY_RECORD_LOOKUP_TRIES;
+    note_key_record_lookup_ended_in(&mut holds, &mut queue, &mut ready, key, false);
+    assert!(!holds.contains_key(&key), "out of tries, it is let go");
+    assert!(queue.is_empty());
+
+    let record = key_epoch_record(7, 2, 3);
+    let key = record.keyword_hash;
+    hold_key_record_in(&mut holds, &mut queue, record, false, now);
+    note_key_record_lookup_ended_in(&mut holds, &mut queue, &mut ready, key, true);
+    note_key_record_lookup_ended_in(&mut holds, &mut queue, &mut ready, key, true);
+    assert_eq!(ready, [key], "found: ready, once");
+
+    // A lookup for a key nothing holds changes nothing.
+    note_key_record_lookup_ended_in(&mut holds, &mut queue, &mut ready, [0xEE; 16], true);
+    assert_eq!(ready.len(), 1);
+}
+
+/// A key-record lookup's answer is published against once, at once, so it is
+/// kept with its hold rather than filed among the library's target sets,
+/// stamped as heard from like those.
+#[test]
+fn a_key_record_lookup_keeps_what_it_found_with_its_hold() {
+    let mut holds = HashMap::new();
+    let mut queue = std::collections::VecDeque::new();
+    let mut ready = std::collections::VecDeque::new();
+    let now = 1_700_000_000i64;
+    let record = key_epoch_record(7, 1, 3);
+    let key = record.keyword_hash;
+    hold_key_record_in(&mut holds, &mut queue, record, false, now);
+    queue.clear();
+    holds.get_mut(&key).unwrap().lookups = 1;
+
+    note_key_record_lookup_landed_in(&mut holds, &mut queue, &mut ready, key, &[], now + 5);
+    assert!(holds[&key].found.is_none());
+    assert_eq!(queue, [key], "found nobody: asked again");
+
+    queue.clear();
+    let answered = ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([0x77; 16]),
+        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(81, 2, 3, 4)), 4672),
+        noise_pub: [0x77; 32],
+        ed25519_pub: [0x77; 32],
+        last_seen: 0,
+        failed_queries: 2,
+    };
+    note_key_record_lookup_landed_in(&mut holds, &mut queue, &mut ready, key, &[answered], now + 10);
+    let (found, at) = holds[&key].found.as_ref().expect("kept with the hold");
+    assert_eq!(*at, now + 10);
+    assert_eq!(found[0].node_id, ember::dht::EmberNodeId([0x77; 16]));
+    assert_eq!((found[0].last_seen, found[0].failed_queries), (now + 10, 0));
+    assert_eq!(ready, [key]);
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn key_record_holds_lapse_and_take_their_queued_keys_with_them() {
+    let mut holds = HashMap::new();
+    let mut queue = std::collections::VecDeque::new();
+    let mut ready = std::collections::VecDeque::new();
+    let now = 1_700_000_000i64;
+    let old = key_epoch_record(7, 1, 3);
+    let young = key_epoch_record(7, 2, 3);
+    hold_key_record_in(&mut holds, &mut queue, old.clone(), false, now - KEY_RECORD_HOLD_SECS);
+    hold_key_record_in(&mut holds, &mut queue, young.clone(), false, now - 60);
+    ready.push_back(old.keyword_hash);
+
+    prune_key_record_holds_in(&mut holds, &mut queue, &mut ready, now);
+    assert!(!holds.contains_key(&old.keyword_hash));
+    assert!(holds.contains_key(&young.keyword_hash));
+    assert_eq!(queue, [young.keyword_hash]);
+    assert!(ready.is_empty());
+}
+
+/// Enough lookups a cycle to reach every held key within half its hold, and
+/// never more than the cap, however many are held.
+#[test]
+fn key_record_lookups_keep_pace_with_the_queue_within_their_cap() {
+    assert_eq!(key_record_lookups_this_cycle(0), KEY_RECORD_MIN_LOOKUPS);
+    assert_eq!(key_record_lookups_this_cycle(1), KEY_RECORD_MIN_LOOKUPS);
+    let cycles = (KEY_RECORD_HOLD_SECS as u64 / 2 / EMBER_MAINT_INTERVAL.as_secs()) as usize;
+    assert_eq!(key_record_lookups_this_cycle(cycles * 5), 5);
+    assert_eq!(key_record_lookups_this_cycle(KEY_RECORD_HOLDS_MAX), KEY_RECORD_MAX_LOOKUPS);
 }
 
 #[test]
@@ -4488,8 +4769,13 @@ fn highid_source_records_cache_bound_noise_keys() {
     let mut diag = crate::types::EmberDiagnostics::default();
     let mut noise_keys = HashMap::new();
     let mut content_hashes = HashMap::new();
+    // Returned by a second /24 as well: a key is cached only from a record
+    // an honest storer vouches for.
+    let mut held = held_records(&[blob]);
+    held[0].confirmed_by = Some(ember::dht::EmberNodeId([0x7F; 16]));
+    held[0].confirmed_subnet = Some(0x7F);
     parse_ember_source_records(
-        &held_records(&[blob]),
+        &held,
         file_hash,
         None,
         &[0u8; 32],

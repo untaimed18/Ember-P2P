@@ -94,11 +94,26 @@ pub(super) fn kad_source_search_interval(search_count: u32) -> std::time::Durati
     )
 }
 
+/// eMule `KADEMLIATOTALFILE` (`Opcodes.h`): file source searches Kad runs at
+/// once.
+pub(super) const KADEMLIATOTALFILE: usize = 5;
+
+/// Download source searches still walking.
+fn running_kad_file_source_searches(state: &NetworkState) -> usize {
+    state
+        .download_source_searches
+        .keys()
+        .filter(|sid| state.search_manager.get(sid).is_some_and(|s| !s.completed))
+        .count()
+}
+
 /// Whether a file's KAD source search may start: none of its own is still
-/// running (eMule's `GetKadFileSearchID()` check) and its clock in
+/// running (eMule's `GetKadFileSearchID()` check), fewer than
+/// [`KADEMLIATOTALFILE`] are running for any file, and its clock in
 /// `active_kad_search_state` has run out. Every path that starts one asks
 /// this, so a resume, a promotion or the Find Sources button cannot restart
-/// the backoff or follow a search a minute after the last.
+/// the backoff or follow a search a minute after the last. A file turned away
+/// by the concurrency limit keeps its clock and is asked again next sweep.
 pub(super) fn kad_source_search_may_start(
     state: &NetworkState,
     tid: &str,
@@ -112,6 +127,29 @@ pub(super) fn kad_source_search_may_start(
         && state.active_kad_search_state.get(tid).is_none_or(|&(at, count)| {
             now.saturating_duration_since(at) + SLACK >= kad_source_search_interval(count)
         })
+        && running_kad_file_source_searches(state) < KADEMLIATOTALFILE
+}
+
+/// Take back the stamp [`note_kad_source_search`] made for a search that was
+/// evicted before it finished, so the file is due again at once rather than
+/// waiting out an interval for a search it never got.
+pub(super) fn undo_kad_source_search(
+    clocks: &mut HashMap<String, (std::time::Instant, u32)>,
+    tid: &str,
+    now: std::time::Instant,
+) {
+    let Some(&(_, count)) = clocks.get(tid) else {
+        return;
+    };
+    let prior = count.saturating_sub(1);
+    match now.checked_sub(kad_source_search_interval(prior)) {
+        Some(at) if prior > 0 => {
+            clocks.insert(tid.to_string(), (at, prior));
+        }
+        _ => {
+            clocks.remove(tid);
+        }
+    }
 }
 
 /// Stamp the start of a KAD source search on the file's clock and return how
@@ -298,21 +336,43 @@ fn probe_disk_space(download_dir: &std::path::Path) -> DiskSpaceProbe {
     }
 }
 
+/// How long a tick waits for the volumes of download folders it has not
+/// looked at before. One that takes longer is keyed by folder until its
+/// answer lands.
+const VOLUME_RESOLVE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[derive(Default)]
 struct DiskSpaceCache {
+    /// Each folder's last reading, with when its query began: space a `.part`
+    /// took after that may still read as free.
     readings: HashMap<std::path::PathBuf, (DiskSpaceProbe, std::time::Instant)>,
+    /// The volume each folder was found on, `None` where that could not be
+    /// told.
+    volumes: HashMap<std::path::PathBuf, Option<u64>>,
     refreshing: HashSet<std::path::PathBuf>,
+    /// Folders whose volume is being looked up.
+    resolving: HashSet<std::path::PathBuf>,
 }
 
 impl DiskSpaceCache {
+    #[cfg(test)]
     fn reading(&self, download_dir: &std::path::Path, now: std::time::Instant) -> DiskSpaceProbe {
+        self.dated_reading(download_dir, now).0
+    }
+
+    /// [`Self::reading`], and when its query began when it is fresh.
+    fn dated_reading(
+        &self,
+        download_dir: &std::path::Path,
+        now: std::time::Instant,
+    ) -> (DiskSpaceProbe, Option<std::time::Instant>) {
         match self.readings.get(download_dir) {
             Some((probe, at))
                 if now.saturating_duration_since(*at) <= DISK_SPACE_READING_MAX_AGE =>
             {
-                *probe
+                (*probe, Some(*at))
             }
-            _ => DiskSpaceProbe::Unknown,
+            _ => (DiskSpaceProbe::Unknown, None),
         }
     }
 }
@@ -335,19 +395,47 @@ impl DiskSpaceMonitor {
         MONITOR.get_or_init(DiskSpaceMonitor::default)
     }
 
-    /// The last reading for `download_dir`, or `Unknown` when there is none
-    /// yet or it is older than [`DISK_SPACE_READING_MAX_AGE`]. Starts a
-    /// background refresh unless one is already running for the folder, so
-    /// the answer trails the volume by up to one call. Never blocks on the
-    /// filesystem.
-    pub(super) fn reading_and_refresh(&self, download_dir: &std::path::Path) -> DiskSpaceProbe {
+    /// The last reading for `download_dir` and when its query began, or
+    /// `Unknown` when there is none yet or it is older than
+    /// [`DISK_SPACE_READING_MAX_AGE`]. Starts a background refresh unless one
+    /// is already running for the folder, so the answer trails the volume by
+    /// up to one call. Never blocks on the filesystem.
+    pub(super) fn reading_and_refresh(
+        &self,
+        download_dir: &std::path::Path,
+    ) -> (DiskSpaceProbe, Option<std::time::Instant>) {
         let mut cache = self.cache.lock();
-        let reading = cache.reading(download_dir, std::time::Instant::now());
+        let reading = cache.dated_reading(download_dir, std::time::Instant::now());
         if cache.refreshing.insert(download_dir.to_path_buf()) {
             drop(cache);
             self.spawn_refresh(download_dir.to_path_buf());
         }
         reading
+    }
+
+    /// Look up the volume of each of `folders` not looked at before, on the
+    /// blocking pool, waiting at most [`VOLUME_RESOLVE_WAIT`] for the answers,
+    /// so promises are keyed by volume from a folder's first use.
+    pub(super) async fn resolve_volumes(&self, folders: impl IntoIterator<Item = std::path::PathBuf>) {
+        let mut lookups = Vec::new();
+        {
+            let mut cache = self.cache.lock();
+            for folder in folders {
+                if cache.volumes.contains_key(&folder) || !cache.resolving.insert(folder.clone()) {
+                    continue;
+                }
+                let shared = self.cache.clone();
+                lookups.push(tokio::task::spawn_blocking(move || {
+                    let volume = crate::security::filesystem::volume_serial(&folder).ok();
+                    let mut cache = shared.lock();
+                    cache.resolving.remove(&folder);
+                    cache.volumes.entry(folder).or_insert(volume);
+                }));
+            }
+        }
+        if !lookups.is_empty() {
+            let _ = tokio::time::timeout(VOLUME_RESOLVE_WAIT, futures::future::join_all(lookups)).await;
+        }
     }
 
     fn spawn_refresh(&self, download_dir: std::path::PathBuf) {
@@ -361,15 +449,40 @@ impl DiskSpaceMonitor {
         }
         let guard = RefreshGuard(self.cache.clone(), download_dir.clone());
         tokio::task::spawn_blocking(move || {
+            let began = std::time::Instant::now();
             let probe = probe_disk_space(&download_dir);
-            guard
-                .0
-                .lock()
-                .readings
-                .insert(download_dir, (probe, std::time::Instant::now()));
+            let volume = crate::security::filesystem::volume_serial(&download_dir).ok();
+            let mut cache = guard.0.lock();
+            let known = cache.volumes.entry(download_dir.clone()).or_insert(volume);
+            if volume.is_some() {
+                *known = volume;
+            }
+            cache.readings.insert(download_dir, (probe, began));
+            drop(cache);
             drop(guard);
         });
     }
+
+    fn volume(&self, download_dir: &std::path::Path) -> Option<u64> {
+        self.cache.lock().volumes.get(download_dir).copied().flatten()
+    }
+}
+
+/// What [`PartVolumes`] holds promises against: the volume a folder was last
+/// found on, or the folder itself until a refresh has named its volume.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum PromiseKey {
+    Volume(u64),
+    Folder(std::path::PathBuf),
+}
+
+/// A folder's reading for one tick: the free space, when its query began,
+/// and what promises on it are held against.
+#[derive(Clone)]
+struct FolderReading {
+    probe: DiskSpaceProbe,
+    taken: Option<std::time::Instant>,
+    key: PromiseKey,
 }
 
 /// The free space a pending download needs, judged on the volume that holds
@@ -379,7 +492,12 @@ impl DiskSpaceMonitor {
 pub(super) struct PartVolumes<'a> {
     monitor: &'a DiskSpaceMonitor,
     current: std::path::PathBuf,
-    readings: HashMap<std::path::PathBuf, DiskSpaceProbe>,
+    readings: HashMap<std::path::PathBuf, FolderReading>,
+    /// Bytes downloads already running, or started this tick, still need on
+    /// each volume. A sparse part file takes its space only as data arrives:
+    /// free space alone would admit every queued download against the same
+    /// room. Two download folders on one volume share its free space.
+    promised: HashMap<PromiseKey, u64>,
 }
 
 impl<'a> PartVolumes<'a> {
@@ -388,25 +506,105 @@ impl<'a> PartVolumes<'a> {
             monitor,
             current,
             readings: HashMap::new(),
+            promised: HashMap::new(),
+        }
+    }
+
+    fn folder_of(&self, transfer_id: &str) -> std::path::PathBuf {
+        crate::storage::part_folders::located_folder(transfer_id).unwrap_or_else(|| self.current.clone())
+    }
+
+    /// The folders the downloads `transfer_ids` have their `.part` in, with
+    /// the current one: those whose volume [`DiskSpaceMonitor::resolve_volumes`]
+    /// should know before a tick.
+    pub(super) fn folders_of<'t>(
+        current: &std::path::Path,
+        transfer_ids: impl IntoIterator<Item = &'t str>,
+    ) -> HashSet<std::path::PathBuf> {
+        transfer_ids
+            .into_iter()
+            .filter_map(crate::storage::part_folders::located_folder)
+            .chain(std::iter::once(current.to_path_buf()))
+            .collect()
+    }
+
+    /// The reading of `folder` and its volume, taken once per tick.
+    fn reading(&mut self, folder: &std::path::Path) -> FolderReading {
+        let monitor = self.monitor;
+        self.readings
+            .entry(folder.to_path_buf())
+            .or_insert_with(|| {
+                let (probe, taken) = monitor.reading_and_refresh(folder);
+                let key = monitor
+                    .volume(folder)
+                    .map_or_else(|| PromiseKey::Folder(folder.to_path_buf()), PromiseKey::Volume);
+                FolderReading { probe, taken, key }
+            })
+            .clone()
+    }
+
+    /// What `transfer_id` still takes from its volume as this tick's reading
+    /// sees it: the bytes not completed, less what its `.part` holds
+    /// allocated beyond them. A part file that is not sparse took its whole
+    /// length when it was made; space it took after the reading's query
+    /// began still reads as free, so that is counted until a later reading.
+    pub(super) fn needed(&mut self, transfer_id: &str, file_size: u64, completed: u64) -> u64 {
+        let folder = self.folder_of(transfer_id);
+        let taken = self.reading(&folder).taken;
+        let allocated = crate::storage::part_folders::part_allocation(transfer_id)
+            .filter(|allocation| match allocation.since {
+                None => true,
+                Some(since) => taken.is_some_and(|taken| taken >= since),
+            })
+            .map_or(0, |allocation| allocation.bytes);
+        remaining_download_bytes(file_size, completed.max(allocated))
+    }
+
+    /// Hold `bytes` on the volume of `transfer_id`'s `.part` against every
+    /// later check: a download that is running, or is being started.
+    pub(super) fn promise(&mut self, transfer_id: &str, bytes: u64) {
+        let folder = self.folder_of(transfer_id);
+        let key = self.reading(&folder).key;
+        let promised = self.promised.entry(key).or_default();
+        *promised = promised.saturating_add(bytes);
+    }
+
+    /// [`Self::promise`] what each download with a running worker still
+    /// needs. A pending one has no worker; its own check counts it.
+    pub(super) fn promise_running(
+        &mut self,
+        mgr: &TransferManager,
+        pending: &HashMap<String, PendingDownload>,
+    ) {
+        for t in mgr.active.values() {
+            if t.direction == TransferDirection::Download
+                && t.status == TransferStatus::Active
+                && !pending.contains_key(&t.id)
+            {
+                let needed = self.needed(&t.id, t.total_size, t.completed_size);
+                self.promise(&t.id, needed);
+            }
         }
     }
 
     /// Whether the volume holding `transfer_id`'s `.part` has room for
-    /// `needed_bytes`. An earlier folder that is not there does not count as
-    /// full: the worker holds such a download until its drive is back, which
-    /// marking it Insufficient would turn into a manual resume.
+    /// `needed_bytes` beside what is promised there. An earlier folder that
+    /// is not there does not count as full: the worker holds such a download
+    /// until its drive is back, which marking it Insufficient would turn into
+    /// a manual resume.
     pub(super) fn suffices(&mut self, transfer_id: &str, needed_bytes: u64) -> bool {
-        let folder = crate::storage::part_folders::located_folder(transfer_id)
-            .unwrap_or_else(|| self.current.clone());
-        let monitor = self.monitor;
-        let probe = *self
-            .readings
-            .entry(folder.clone())
-            .or_insert_with(|| monitor.reading_and_refresh(&folder));
+        let folder = self.folder_of(transfer_id);
+        let FolderReading { probe, key, .. } = self.reading(&folder);
         if probe == DiskSpaceProbe::Missing && folder != self.current {
             return true;
         }
-        disk_space_suffices(probe, &folder, needed_bytes)
+        // Its part file already holds every byte it will write, so the free
+        // space, buffer included, has nothing left to cover for it.
+        if needed_bytes == 0 && probe != DiskSpaceProbe::Missing {
+            return true;
+        }
+        let promised = self.promised.get(&key).copied().unwrap_or(0);
+        disk_space_suffices(probe, &folder, needed_bytes.saturating_add(promised))
     }
 }
 
@@ -1000,7 +1198,7 @@ async fn start_pending_download_worker(
         let mut sm = source_manager.write().await;
         for (ip, port) in &live_sources {
             if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                sm.register_source(hash_bytes, v4, *port, None);
+                sm.register_source_if_absent(hash_bytes, v4, *port);
             }
         }
     }
@@ -1267,6 +1465,194 @@ mod disk_space_probe_tests {
         assert!(!volumes.suffices(&unplaced, 0), "a missing current folder still refuses");
     }
 
+    fn download_row(id: &str, status: TransferStatus, total_size: u64, completed_size: u64) -> Transfer {
+        Transfer {
+            id: id.to_string(),
+            file_name: format!("{id}.bin"),
+            file_hash: "0".repeat(32),
+            peer_id: String::new(),
+            peer_name: String::new(),
+            direction: TransferDirection::Download,
+            status,
+            progress: 0.0,
+            speed: 0,
+            total_size,
+            transferred: 0,
+            completed_size,
+            started_at: 1_700_000_000,
+            failure_reason: None,
+            failure_code: None,
+            failure_kind: None,
+            failure_stage: None,
+            priority: "normal".to_string(),
+            sources: 0,
+            active_sources: 0,
+            queued_sources: 0,
+            queue_rank: None,
+            last_seen_complete: None,
+            last_received: None,
+            health: crate::types::TransferHealth::Healthy,
+            health_reason: None,
+            health_code: None,
+            stalled_since: None,
+            category: String::new(),
+            wait_time: 0,
+            upload_time: 0,
+            a4af_sources: 0,
+            max_sources: 0,
+            preview_priority: false,
+            preview_ready: false,
+            ember_sources: 0,
+            client_software: String::new(),
+            country_code: None,
+            user_hash: None,
+            ember_hash: None,
+            expected_aich: None,
+            ember_file_hash: None,
+            completed_path: None,
+            up_part_status: None,
+            up_part_count: None,
+            up_part_fill: None,
+            up_peer_part_status: None,
+            ember_verified: false,
+            friends_only: false,
+        }
+    }
+
+    /// Part files are sparse, so a running download has not taken the space
+    /// it still needs: that, and what a download started this tick needs, is
+    /// held against the free space every later check sees.
+    #[test]
+    fn space_promised_to_running_downloads_is_not_offered_again() {
+        const GIB: u64 = 1 << 30;
+        let current = std::path::PathBuf::from("promised-folder");
+        let monitor = DiskSpaceMonitor::default();
+        {
+            let mut cache = monitor.cache.lock();
+            let reading = DiskSpaceProbe::Available(50 * GIB + DISK_SPACE_BUFFER);
+            cache.readings.insert(current.clone(), (reading, std::time::Instant::now()));
+            cache.refreshing.insert(current.clone());
+        }
+        let id = || uuid::Uuid::new_v4().to_string();
+        let (running, paused, waiting) = (id(), id(), id());
+        let mut mgr = TransferManager::new(10);
+        mgr.active.insert(running.clone(), download_row(&running, TransferStatus::Active, 25 * GIB, 5 * GIB));
+        mgr.active.insert(paused.clone(), download_row(&paused, TransferStatus::Paused, 40 * GIB, 0));
+        mgr.active.insert(waiting.clone(), download_row(&waiting, TransferStatus::Active, 40 * GIB, 0));
+        let mut pending = HashMap::new();
+        pending.insert(
+            waiting.clone(),
+            PendingDownload {
+                transfer_id: waiting.clone(),
+                file_hash: "0".repeat(32),
+                file_name: "waiting.bin".to_string(),
+                file_size: 40 * GIB,
+                expected_aich: None,
+                control: crate::sharing::manager::TransferControl::new(),
+                search_count: 0,
+                last_search_at: None,
+                priority: 1,
+            },
+        );
+
+        let mut volumes = PartVolumes::new(&monitor, current);
+        volumes.promise_running(&mgr, &pending);
+        let (first, second) = (id(), id());
+        assert!(volumes.suffices(&first, 30 * GIB), "50 GiB free, 20 GiB promised to the running one");
+        assert!(!volumes.suffices(&first, 30 * GIB + 1));
+        volumes.promise(&first, 30 * GIB);
+        assert!(
+            !volumes.suffices(&second, 1),
+            "the room is taken by the one running and the one just started"
+        );
+    }
+
+    /// A part file that is not sparse (FAT32, exFAT, one made by 1.7.5) took
+    /// its whole length when it was opened, so free space already excludes
+    /// it: counting it again would hold every queued download as Insufficient.
+    #[test]
+    fn a_part_file_already_allocated_is_not_counted_again() {
+        const GIB: u64 = 1 << 30;
+        let current = std::path::PathBuf::from("allocated-folder");
+        let monitor = DiskSpaceMonitor::default();
+        {
+            let mut cache = monitor.cache.lock();
+            let reading = DiskSpaceProbe::Available(10 * GIB + DISK_SPACE_BUFFER);
+            cache.readings.insert(current.clone(), (reading, std::time::Instant::now()));
+            cache.refreshing.insert(current.clone());
+        }
+        let id = || uuid::Uuid::new_v4().to_string();
+        let (allocated, sparse, queued) = (id(), id(), id());
+        crate::storage::part_folders::note_part_allocation(&allocated, 40 * GIB, None);
+        crate::storage::part_folders::note_part_allocation(&sparse, GIB, None);
+        let mut mgr = TransferManager::new(10);
+        mgr.active.insert(allocated.clone(), download_row(&allocated, TransferStatus::Active, 40 * GIB, 0));
+        mgr.active.insert(sparse.clone(), download_row(&sparse, TransferStatus::Active, 5 * GIB, 2 * GIB));
+
+        let mut volumes = PartVolumes::new(&monitor, current);
+        assert_eq!(volumes.needed(&allocated, 40 * GIB, 0), 0);
+        assert_eq!(volumes.needed(&sparse, 5 * GIB, 2 * GIB), 3 * GIB);
+        assert_eq!(volumes.needed(&sparse, 5 * GIB, 0), 4 * GIB);
+        assert_eq!(volumes.needed(&queued, 5 * GIB, 0), 5 * GIB);
+
+        volumes.promise_running(&mgr, &HashMap::new());
+        assert!(volumes.suffices(&queued, 7 * GIB), "only the sparse one's 3 GiB is promised");
+        assert!(!volumes.suffices(&queued, 7 * GIB + 1));
+    }
+
+    /// A download whose part file already holds all it will write needs no
+    /// free space at all, so a drive left short of the buffer by that very
+    /// file does not park it as Insufficient.
+    #[test]
+    fn a_download_needing_no_more_space_is_not_held_to_the_buffer() {
+        let current = std::path::PathBuf::from("full-drive-folder");
+        let monitor = DiskSpaceMonitor::default();
+        {
+            let mut cache = monitor.cache.lock();
+            let reading = DiskSpaceProbe::Available(DISK_SPACE_BUFFER / 5);
+            cache.readings.insert(current.clone(), (reading, std::time::Instant::now()));
+            cache.refreshing.insert(current.clone());
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut volumes = PartVolumes::new(&monitor, current);
+        assert!(volumes.suffices(&id, 0));
+        assert!(!volumes.suffices(&id, 1), "anything it still has to write is held to the buffer");
+    }
+
+    /// Two download folders on one volume read the same free space, so what
+    /// is promised in one is not offered again in the other.
+    #[test]
+    fn folders_on_one_volume_share_its_promises() {
+        const GIB: u64 = 1 << 30;
+        let current = std::path::PathBuf::from("volume-current-folder");
+        let earlier = std::path::PathBuf::from("volume-earlier-folder");
+        let elsewhere = std::path::PathBuf::from("volume-elsewhere-folder");
+        let monitor = DiskSpaceMonitor::default();
+        {
+            let mut cache = monitor.cache.lock();
+            let now = std::time::Instant::now();
+            for (folder, volume) in [(&current, 7), (&earlier, 7), (&elsewhere, 8)] {
+                let reading = DiskSpaceProbe::Available(10 * GIB + DISK_SPACE_BUFFER);
+                cache.readings.insert(folder.clone(), (reading, now));
+                cache.volumes.insert(folder.clone(), Some(volume));
+                cache.refreshing.insert(folder.clone());
+            }
+        }
+        let id = || uuid::Uuid::new_v4().to_string();
+        let (in_earlier, in_current, in_elsewhere) = (id(), id(), id());
+        crate::storage::part_folders::note_located(&in_earlier, &earlier);
+        crate::storage::part_folders::note_located(&in_elsewhere, &elsewhere);
+
+        let mut volumes = PartVolumes::new(&monitor, current);
+        volumes.promise(&in_earlier, 8 * GIB);
+        assert!(volumes.suffices(&in_current, 2 * GIB));
+        assert!(
+            !volumes.suffices(&in_current, 2 * GIB + 1),
+            "the earlier folder's promise is on the current folder's volume"
+        );
+        assert!(volumes.suffices(&in_elsewhere, 10 * GIB), "another volume keeps its own room");
+    }
+
     async fn wait_for_refresh(monitor: &DiskSpaceMonitor) {
         for _ in 0..500 {
             if monitor.cache.lock().refreshing.is_empty() {
@@ -1282,15 +1668,86 @@ mod disk_space_probe_tests {
         let monitor = DiskSpaceMonitor::default();
         let dir = std::env::temp_dir();
 
-        assert_eq!(monitor.reading_and_refresh(&dir), DiskSpaceProbe::Unknown);
+        let asked = std::time::Instant::now();
+        assert_eq!(monitor.reading_and_refresh(&dir), (DiskSpaceProbe::Unknown, None));
         assert!(monitor.cache.lock().refreshing.contains(&dir));
         wait_for_refresh(&monitor).await;
 
-        assert!(matches!(
-            monitor.reading_and_refresh(&dir),
-            DiskSpaceProbe::Available(_)
-        ));
+        let (probe, taken) = monitor.reading_and_refresh(&dir);
+        assert!(matches!(probe, DiskSpaceProbe::Available(_)));
+        assert!(taken.is_some_and(|taken| taken >= asked), "dated from when its query began");
+        assert!(monitor.volume(&dir).is_some(), "the refresh names the folder's volume");
         wait_for_refresh(&monitor).await;
+    }
+
+    /// A folder's volume is looked up on its first use, before any reading,
+    /// so two folders on one volume share promises from the start.
+    #[tokio::test]
+    async fn a_folders_volume_is_known_from_its_first_use() {
+        const GIB: u64 = 1 << 30;
+        let base = std::env::temp_dir().join(format!("ember-volume-first-use-{}", uuid::Uuid::new_v4()));
+        let (current, earlier) = (base.join("current"), base.join("earlier"));
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&earlier).unwrap();
+        let monitor = DiskSpaceMonitor::default();
+        let in_earlier = uuid::Uuid::new_v4().to_string();
+        crate::storage::part_folders::note_located(&in_earlier, &earlier);
+
+        let folders = PartVolumes::folders_of(&current, [in_earlier.as_str()]);
+        assert_eq!(folders, HashSet::from([current.clone(), earlier.clone()]));
+        monitor.resolve_volumes(folders).await;
+        assert!(monitor.volume(&current).is_some());
+        assert_eq!(monitor.volume(&current), monitor.volume(&earlier));
+        {
+            let mut cache = monitor.cache.lock();
+            let reading = DiskSpaceProbe::Available(10 * GIB + DISK_SPACE_BUFFER);
+            cache.readings.insert(current.clone(), (reading, std::time::Instant::now()));
+            cache.refreshing.extend([current.clone(), earlier.clone()]);
+        }
+        let mut volumes = PartVolumes::new(&monitor, current);
+        volumes.promise(&in_earlier, 8 * GIB);
+        assert!(
+            !volumes.suffices(&uuid::Uuid::new_v4().to_string(), 2 * GIB + 1),
+            "the earlier folder has no reading yet, and its promise still counts"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// On a drive without sparse files a started download takes its whole
+    /// length at once. A reading whose query began before that still counts
+    /// the space free, so the download's need is held against it until a
+    /// later reading; a `.part` restored from before this run never is.
+    #[test]
+    fn an_allocation_newer_than_the_reading_is_still_counted() {
+        const GIB: u64 = 1 << 30;
+        let current = std::path::PathBuf::from("allocation-dating-folder");
+        let monitor = DiskSpaceMonitor::default();
+        let read_at = std::time::Instant::now();
+        {
+            let mut cache = monitor.cache.lock();
+            cache.readings.insert(current.clone(), (DiskSpaceProbe::Available(10 * GIB), read_at));
+            cache.refreshing.insert(current.clone());
+        }
+        let id = || uuid::Uuid::new_v4().to_string();
+        let (started, restored, reopened) = (id(), id(), id());
+        let after = read_at + std::time::Duration::from_millis(5);
+        crate::storage::part_folders::note_part_allocation(&started, 4 * GIB, Some(after));
+        crate::storage::part_folders::note_part_allocation(&restored, 4 * GIB, None);
+        crate::storage::part_folders::note_part_allocation(&reopened, 4 * GIB, None);
+        crate::storage::part_folders::note_part_allocation(&reopened, 4 * GIB, Some(after));
+
+        let mut volumes = PartVolumes::new(&monitor, current.clone());
+        assert_eq!(volumes.needed(&started, 4 * GIB, 0), 4 * GIB, "the reading predates it");
+        assert_eq!(volumes.needed(&restored, 4 * GIB, 0), 0);
+        assert_eq!(volumes.needed(&reopened, 4 * GIB, 0), 0, "reopened, it was allocated all along");
+
+        monitor
+            .cache
+            .lock()
+            .readings
+            .insert(current.clone(), (DiskSpaceProbe::Available(6 * GIB), after));
+        let mut volumes = PartVolumes::new(&monitor, current);
+        assert_eq!(volumes.needed(&started, 4 * GIB, 0), 0, "a later reading has it taken");
     }
 
     #[tokio::test]
@@ -1299,7 +1756,7 @@ mod disk_space_probe_tests {
         let dir = std::env::temp_dir();
         monitor.cache.lock().refreshing.insert(dir.clone());
 
-        assert_eq!(monitor.reading_and_refresh(&dir), DiskSpaceProbe::Unknown);
+        assert_eq!(monitor.reading_and_refresh(&dir).0, DiskSpaceProbe::Unknown);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let cache = monitor.cache.lock();
         assert!(cache.refreshing.contains(&dir));
@@ -1319,5 +1776,27 @@ mod kad_source_search_interval_tests {
         assert_eq!(kad_source_search_interval(2), hours(2));
         assert_eq!(kad_source_search_interval(7), hours(7));
         assert_eq!(kad_source_search_interval(u32::MAX), hours(7));
+    }
+
+    /// An evicted search gives its file back the wait it started.
+    #[test]
+    fn undoing_an_evicted_search_makes_the_file_due_again() {
+        let now = std::time::Instant::now();
+        let mut clocks: HashMap<String, (std::time::Instant, u32)> = HashMap::new();
+        clocks.insert("first".into(), (now, 1));
+        undo_kad_source_search(&mut clocks, "first", now);
+        assert!(!clocks.contains_key("first"), "a first search leaves no clock behind");
+
+        undo_kad_source_search(&mut clocks, "unknown", now);
+        assert!(clocks.is_empty());
+
+        clocks.insert("third".into(), (now, 3));
+        undo_kad_source_search(&mut clocks, "third", now);
+        // Absent only when an `Instant` this close to boot cannot be moved
+        // back two hours.
+        if let Some(&(at, count)) = clocks.get("third") {
+            assert_eq!(count, 2);
+            assert!(now.saturating_duration_since(at) >= kad_source_search_interval(2));
+        }
     }
 }

@@ -1,5 +1,6 @@
 import { writable } from 'svelte/store';
 import { getSettings } from '$lib/api/settings';
+import { setHiddenToastAreas, type ToastArea } from '$lib/stores/toast';
 import type { AppSettings } from '$lib/types';
 
 /**
@@ -16,6 +17,30 @@ import type { AppSettings } from '$lib/types';
  */
 export const appSettings = writable<AppSettings | null>(null);
 let settingsEpoch = 0;
+
+const TOAST_AREA_SETTINGS: Record<ToastArea, keyof AppSettings> = {
+  downloads: 'popups_downloads',
+  search: 'popups_search',
+  library: 'popups_library',
+  friends: 'popups_friends',
+  channels: 'popups_channels',
+  feeds: 'popups_feeds',
+  network: 'popups_network',
+};
+
+/** The areas `settings` turns off. Unknown settings show everything. */
+export function hiddenToastAreas(settings: AppSettings | null): ToastArea[] {
+  if (!settings) return [];
+  return (Object.keys(TOAST_AREA_SETTINGS) as ToastArea[]).filter(
+    (area) => settings[TOAST_AREA_SETTINGS[area]] === false,
+  );
+}
+
+/** Keep the toast store's hidden areas in step with the settings, for as long
+ *  as the returned unsubscribe is not called. Each window calls it once. */
+export function syncToastAreasWithSettings(): () => void {
+  return appSettings.subscribe((settings) => setHiddenToastAreas(hiddenToastAreas(settings)));
+}
 
 function keepNewestSettings(current: AppSettings | null, incoming: AppSettings): AppSettings {
   return current && incoming.settings_revision < current.settings_revision

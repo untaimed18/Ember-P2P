@@ -66,4 +66,21 @@
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${PRODUCTNAME}"
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "${PRODUCTNAME}"
   ${EndIf}
+
+  ; The firewall rules Ember added (firewall.rs) let every port in for this
+  ; exe; left behind, they would admit whatever later sits at its path. Only
+  ; this exe's rules go, never another copy's under the same names. netsh
+  ; refuses without elevation, as in a per-user uninstall; an elevated Ember
+  ; start or the connection doctor's fix removes those later. Not on an
+  ; update: the same exe comes back and keeps its rules.
+  ${If} $UpdateMode <> 1
+    Push $0
+    nsExec::Exec '"$SYSDIR\netsh.exe" advfirewall firewall delete rule "name=Ember P2P (TCP)" "program=$INSTDIR\${MAINBINARYNAME}.exe"'
+    Pop $0
+    nsExec::Exec '"$SYSDIR\netsh.exe" advfirewall firewall delete rule "name=Ember P2P (UDP)" "program=$INSTDIR\${MAINBINARYNAME}.exe"'
+    Pop $0
+    nsExec::Exec '"$SYSDIR\netsh.exe" advfirewall firewall delete rule "name=Ember P2P (QUIC UDP)" "program=$INSTDIR\${MAINBINARYNAME}.exe"'
+    Pop $0
+    Pop $0
+  ${EndIf}
 !macroend

@@ -516,7 +516,7 @@ export interface EmberDiagnostics {
   ember_dht_refused_per_ip?: number;
   /** Slice 14: STORE frames rejected as short-window signature replays. */
   ember_dht_store_replays: number;
-  /** Slice 15: LowID/firewalled but still publishing Ember DHT sources. */
+  /** Slice 15: TCP firewalled, publishing Ember DHT sources through an endorsed buddy. */
   ember_dht_firewalled_publishing: boolean;
   /** Firewalled with no HighID buddy — Ember source STORE is skipped. */
   ember_dht_waiting_buddy: boolean;
@@ -530,8 +530,16 @@ export interface EmberDiagnostics {
   ember_dht_buddy_publishes: number;
   /** PROXY_STORE requests accepted and fanned out as a buddy. */
   ember_dht_buddy_forwards: number;
+  /** Storers that took a record we fanned out as a buddy (not our own records). */
+  ember_dht_buddy_forward_stores_acked?: number;
+  /** Storers that refused or never answered one of those records. */
+  ember_dht_buddy_forward_stores_failed?: number;
   /** Firewalled sources parked because the named buddy never signed for that endpoint. */
   ember_dht_buddy_unendorsed?: number;
+  /** Requests sent asking a reachable peer to relay for us while firewalled. */
+  ember_dht_buddy_endorse_asks?: number;
+  /** Peers that agreed, each one we may name as our buddy. */
+  ember_dht_buddy_endorsements?: number;
   /** Ember CALLBACK_REQ frames sent (searcher → buddy). */
   ember_dht_callback_sent?: number;
   /** CALLBACK_REQs bounced to a firewalled publisher. */
@@ -908,6 +916,9 @@ export interface AppSettings {
   /** Language shown as a flag beside our username in room member lists: a
    *  code from `CHANNEL_LANGUAGES` (`$lib/channelLanguages`), empty for none. */
   channel_language: string;
+  /** A second language shown beside the first, for someone who writes in two;
+   *  empty for none. Published only beside a first and when it differs. */
+  channel_language_secondary: string;
   /** Backend-owned: listed in `BACKEND_OWNED_SETTINGS_FIELDS`
    *  (`src-tauri/src/commands/settings.rs`), so `update_settings` restores it
    *  from the authoritative in-memory config and any value written here is
@@ -1118,6 +1129,17 @@ export interface AppSettings {
    *  can carry hundreds of messages an hour. Muted rooms and ignored members
    *  are excluded regardless. */
   notify_channel_message: boolean;
+
+  /** Show each part of the window's confirmation and info toasts. Off hides
+   *  only those; warnings, errors and Undo offers always show. See
+   *  `toastsFor` in `$lib/stores/toast`. */
+  popups_downloads: boolean;
+  popups_search: boolean;
+  popups_library: boolean;
+  popups_friends: boolean;
+  popups_channels: boolean;
+  popups_feeds: boolean;
+  popups_network: boolean;
 
   /** Hold a system sleep inhibitor while a transfer is working, so an
    *  overnight download survives the OS idle timer. Only the system is kept

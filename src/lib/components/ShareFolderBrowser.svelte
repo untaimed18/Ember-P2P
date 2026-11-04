@@ -11,10 +11,12 @@
     type FileTypeFilter,
   } from '$lib/fileTypes';
   import { isShortcutLetter } from '$lib/shortcutKey';
+  import { shortcutModSymbol } from '$lib/platform';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import IconX from '$lib/components/IconX.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { formatBytes, formatNumber } from '$lib/utils';
   import {
     addSharedFolder,
@@ -46,7 +48,7 @@
     (/Win/i.test(navigator.platform) || /Windows/i.test(navigator.userAgent));
   const IS_MAC =
     typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform);
-  const SHARE_SHORTCUT = IS_MAC ? '⌘↩' : 'Ctrl+Enter';
+  const SHARE_SHORTCUT = IS_MAC ? '⌘↩' : `${shortcutModSymbol()}+${m.chat_key_enter()}`;
   const LAST_PATH_KEY = 'share-browser-last-path';
 
   let overlayEl: HTMLDivElement | undefined = $state(undefined);
@@ -133,6 +135,8 @@
     focusedPath = null;
     focusedTreeId = null;
     selectionNote = null;
+    discardConfirmOpen = false;
+    afterDiscard = null;
     try {
       const view = await openShareBrowser();
       if (gen !== sessionGen) {
@@ -298,6 +302,26 @@
 
   function closeDialog() {
     open = false;
+  }
+
+  /** A selection can be gathered across many folders; leaving with it asks first. */
+  let discardConfirmOpen = $state(false);
+  let afterDiscard: (() => void) | null = null;
+
+  function leaveAfterConfirm(leave: () => void) {
+    if (selectedCount === 0) {
+      leave();
+      return;
+    }
+    afterDiscard = leave;
+    discardConfirmOpen = true;
+  }
+
+  function settleDiscard(discard: boolean) {
+    const leave = afterDiscard;
+    afterDiscard = null;
+    discardConfirmOpen = false;
+    if (discard) leave?.();
   }
 
   function toggleExpand(entry: ShareBrowserEntry, e: Event) {
@@ -494,7 +518,8 @@
     if (sharing) return m.library_explorer_sharing();
     if (ownFilesOnly) {
       return plural(currentOwnFiles.length, {
-        one: m.library_explorer_share_file_one,
+        one: () => m.library_explorer_share_file_one({ count: formatNumber(currentOwnFiles.length) }),
+        oneShowsCount: true,
         other: () => m.library_explorer_share_file_other({ count: formatNumber(currentOwnFiles.length) }),
       });
     }
@@ -506,7 +531,8 @@
     }
     if (selectedFileCount > 0 && selectedFolderCount === 0) {
       return plural(selectedFileCount, {
-        one: m.library_explorer_share_file_one,
+        one: () => m.library_explorer_share_file_one({ count: formatNumber(selectedFileCount) }),
+        oneShowsCount: true,
         other: () => m.library_explorer_share_file_other({ count: formatNumber(selectedFileCount) }),
       });
     }
@@ -653,7 +679,8 @@
       return m.library_explorer_summary_files_at_least({ count: formatNumber(count) });
     }
     return plural(count, {
-      one: m.library_explorer_summary_files_one,
+      one: () => m.library_explorer_summary_files_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_explorer_summary_files_other({ count: formatNumber(count) }),
     });
   });
@@ -667,12 +694,14 @@
     const { folders: count, subfolders } = shareSummary;
     if (subfolders) {
       return plural(count, {
-        one: m.library_explorer_summary_subfolders_one,
+        one: () => m.library_explorer_summary_subfolders_one({ count: formatNumber(count) }),
+        oneShowsCount: true,
         other: () => m.library_explorer_summary_subfolders_other({ count: formatNumber(count) }),
       });
     }
     return plural(count, {
-      one: m.library_explorer_summary_folders_one,
+      one: () => m.library_explorer_summary_folders_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_explorer_summary_folders_other({ count: formatNumber(count) }),
     });
   });
@@ -797,7 +826,9 @@
   }
 
   async function shareSelected() {
-    if (sessionId == null || shareIds.length === 0 || sharing) return;
+    // `shareDisabled` covers a listing still loading: Ctrl+Enter then would
+    // share what was ticked in the folder being left.
+    if (sessionId == null || shareDisabled) return;
     sharing = true;
     error = null;
     try {
@@ -837,13 +868,15 @@
   }
 
   function onDialogKey(e: KeyboardEvent) {
+    // The discard question handles its own keys.
+    if (discardConfirmOpen) return;
     if (e.key === 'Escape') {
       e.preventDefault();
       e.stopPropagation();
       // Mid-share the dialog is already unclosable by click or button; letting
       // Escape through would unmount it while the selection is still being
       // added and leave the Library with no report of what happened.
-      if (!sharing) closeDialog();
+      if (!sharing) leaveAfterConfirm(closeDialog);
       return;
     }
     if (e.key === 'Backspace' && e.target instanceof HTMLInputElement) return;
@@ -873,8 +906,9 @@
         const count = entry.shared_count ?? 0;
         if (count === 0) return m.library_explorer_partial_none();
         return plural(count, {
-          one: m.library_explorer_partial_one,
-          other: () => m.library_explorer_partial_other({ count }),
+          one: () => m.library_explorer_partial_one({ count: formatNumber(count) }),
+          oneShowsCount: true,
+          other: () => m.library_explorer_partial_other({ count: formatNumber(count) }),
         });
       }
       case 'inherited': return m.library_explorer_inherited();
@@ -920,7 +954,7 @@
     >
       <div class="modal-header">
         <span id="share-explorer-title" class="modal-title">{m.library_add_folder_title()}</span>
-        <button type="button" class="icon-close" onclick={closeDialog} aria-label={m.common_close()} disabled={sharing}>
+        <button type="button" class="icon-close" onclick={() => leaveAfterConfirm(closeDialog)} aria-label={m.common_close()} disabled={sharing}>
           <IconX size={15} />
         </button>
       </div>
@@ -1085,6 +1119,8 @@
               {#each visibleChildren as entry, index (entry.id)}
                 {@const badge = statusLabel(entry)}
                 {@const checked = selectedPaths.has(entry.path) || isShared(entry)}
+                <!-- Selected is the user's picks only, so the count read out
+                     matches the one shown; the badge says what is already shared. -->
                 <div
                   class="list-row"
                   class:shared={isShared(entry)}
@@ -1092,7 +1128,7 @@
                   class:checked={selectedPaths.has(entry.path)}
                   bind:this={listRowEls[entry.path]}
                   role="option"
-                  aria-selected={checked}
+                  aria-selected={selectedPaths.has(entry.path)}
                   aria-disabled={entry.kind === 'file' && !canCheck(entry)}
                   tabindex={entry.path === tabbablePath ? 0 : -1}
                   title={entry.path}
@@ -1199,7 +1235,7 @@
           {shareOutcome}
         </p>
         <div class="footer-actions">
-          <button type="button" class="ghost footer-fallback" onclick={useSystemDialog} disabled={sharing}>{m.library_explorer_system_dialog()}</button>
+          <button type="button" class="ghost footer-fallback" onclick={() => leaveAfterConfirm(() => void useSystemDialog())} disabled={sharing}>{m.library_explorer_system_dialog()}</button>
           <button type="button" class="ghost" onclick={closeDialog} disabled={sharing}>{m.common_cancel()}</button>
           <button
             type="button"
@@ -1213,6 +1249,18 @@
         </div>
       </div>
     </div>
+    <!-- Inside the overlay: outside it, the overlay's own inert background
+         would take the question in with it. -->
+    <ConfirmDialog
+      bind:open={discardConfirmOpen}
+      title={m.common_discard_title()}
+      message={m.common_discard_message()}
+      confirmLabel={m.common_discard()}
+      cancelLabel={m.common_keep_editing()}
+      danger={true}
+      onconfirm={() => settleDiscard(true)}
+      oncancel={() => settleDiscard(false)}
+    />
   </div>
 {/if}
 

@@ -13,7 +13,8 @@
     type ConnectionReport,
   } from '$lib/api/connectionDoctor';
   import { translateError } from '$lib/i18n';
-  import { toast } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toast, toastError } = toastsFor('network');
   import { copyToClipboard } from '$lib/utils';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import * as m from '$lib/paraglide/messages';
@@ -21,10 +22,13 @@
   interface Props {
     /** Bring the port fields into view, for a port another program holds. */
     onMovePorts?: () => void;
-    /** Turn UPnP on in the settings being edited. */
-    onEnableUpnp?: () => void;
+    /** Turn UPnP on in the settings being edited; resolves whether it saved. */
+    onEnableUpnp?: () => boolean | Promise<boolean>;
+    /** UPnP is saved on but this run started without it. */
+    upnpPendingRestart?: boolean;
+    onRestart?: () => void;
   }
-  let { onMovePorts, onEnableUpnp }: Props = $props();
+  let { onMovePorts, onEnableUpnp, upnpPendingRestart = false, onRestart }: Props = $props();
 
   let running = $state(false);
   let report = $state<ConnectionReport | null>(null);
@@ -96,6 +100,7 @@
     not_windows: m.doctor_detail_not_windows,
     off: m.doctor_detail_off,
     stood_down: m.doctor_detail_stood_down,
+    vpn: m.doctor_detail_vpn,
     mapped: m.doctor_detail_mapped,
     not_mapped: m.doctor_detail_not_mapped,
     carrier_nat: m.doctor_detail_carrier_nat,
@@ -113,6 +118,7 @@
     partly: m.doctor_detail_partly,
     high_id: m.doctor_detail_high_id,
     low_id: m.doctor_detail_low_id,
+    logging_in_again: m.doctor_detail_logging_in_again,
     not_connected: m.doctor_detail_not_connected,
     symmetric: m.doctor_detail_symmetric,
     no_contacts: m.doctor_detail_no_contacts,
@@ -153,7 +159,13 @@
       return;
     }
     if (action === 'enable_upnp') {
-      onEnableUpnp?.();
+      if (!onEnableUpnp) return;
+      acting = action;
+      try {
+        if ((await onEnableUpnp()) && !destroyed) toast(m.doctor_upnp_enabled_toast());
+      } finally {
+        acting = null;
+      }
       return;
     }
     acting = action;
@@ -166,8 +178,9 @@
       }
       toast(m.doctor_action_done());
       // What the fix changed shows in a fresh check, once it has had a
-      // moment: a UPnP pass takes several seconds to ask the router.
-      if (action === 'retry_upnp') {
+      // moment: a UPnP pass takes several seconds to ask the router, and new
+      // firewall rules are tested again by a server login and Kad's check.
+      if (action === 'retry_upnp' || action === 'add_firewall_rules') {
         setTimeout(() => {
           if (!destroyed) void run();
         }, 10_000);
@@ -175,7 +188,7 @@
         void run();
       }
     } catch (e) {
-      if (!destroyed) toast(translateError(e, m.error_operation_failed()));
+      if (!destroyed) toastError(translateError(e, m.error_operation_failed()));
     } finally {
       acting = null;
     }
@@ -211,10 +224,17 @@
 
   async function copyReport() {
     if (!report) return;
-    toast((await copyToClipboard(reportText(report))) ? m.doctor_copied() : m.error_operation_failed());
+    if (await copyToClipboard(reportText(report))) toast(m.doctor_copied());
+    else toastError(m.error_operation_failed());
   }
 
   const statusIcon: Record<string, string> = { pass: '✓', warn: '!', fail: '✕', skip: '–' };
+
+  let tally = $derived(
+    (['pass', 'warn', 'fail', 'skip'] as const)
+      .map((status) => [status, report?.checks.filter((c) => c.status === status).length ?? 0] as const)
+      .filter(([, count]) => count > 0),
+  );
 </script>
 
 <div class="doctor">
@@ -262,7 +282,18 @@
             <li>
               <strong>{FIX[fix.id]?.[0](params) ?? fix.id}</strong>
               <span>{FIX[fix.id]?.[1](params) ?? ''}</span>
-              {#if fix.action && (fix.action !== 'move_ports' || onMovePorts) && (fix.action !== 'enable_upnp' || onEnableUpnp)}
+              {#if fix.action === 'enable_upnp' && upnpPendingRestart}
+                <!-- This report predates the change; the running check keeps
+                     asking for UPnP until a restart starts it. -->
+                <div class="doctor-row">
+                  <span class="doctor-pending">{m.doctor_upnp_pending()}</span>
+                  {#if onRestart}
+                    <button type="button" class="secondary small" onclick={() => onRestart?.()}>
+                      {m.settings_restart_now()}
+                    </button>
+                  {/if}
+                </div>
+              {:else if fix.action && (fix.action !== 'move_ports' || onMovePorts) && (fix.action !== 'enable_upnp' || onEnableUpnp)}
                 <button
                   type="button"
                   class="secondary small"
@@ -283,26 +314,42 @@
       </div>
     {/if}
 
-    <details class="doctor-block">
-      <summary>{m.doctor_checks_title()}</summary>
-      <ul class="doctor-checks">
-        {#each report.checks as check (check.id)}
-          <li class={check.status}>
-            <span class="doctor-icon" role="img" aria-label={STATUS[check.status]?.() ?? check.status}>{statusIcon[check.status]}</span>
-            <span class="doctor-check-label">{CHECK[check.id]?.() ?? check.id}</span>
-            <span class="doctor-check-detail">{DETAIL[check.detail]?.() ?? check.detail}</span>
-          </li>
-        {/each}
-      </ul>
-      {#if !report.probed}
-        <p class="doctor-hint">{m.doctor_not_probed()}</p>
-      {/if}
-      <div class="doctor-row">
-        <button type="button" class="secondary small" onclick={() => void copyReport()}>{m.doctor_copy_report()}</button>
-        <label class="doctor-include">
-          <input type="checkbox" bind:checked={includeAddresses} />
-          {m.doctor_copy_include_addresses()}
-        </label>
+    <details class="doctor-block doctor-details">
+      <summary>
+        <svg class="doctor-chevron" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span>{m.doctor_checks_title()}</span>
+        <span class="doctor-tally">
+          {#each tally as [status, count] (status)}
+            <span class="doctor-tally-item {status}" role="img" aria-label="{STATUS[status]?.() ?? status}: {count}">
+              <span class="doctor-icon" aria-hidden="true">{statusIcon[status]}</span>{count}
+            </span>
+          {/each}
+        </span>
+      </summary>
+      <div class="doctor-card">
+        <ul class="doctor-checks">
+          {#each report.checks as check (check.id)}
+            <li class={check.status}>
+              <span class="doctor-icon" role="img" aria-label={STATUS[check.status]?.() ?? check.status}>{statusIcon[check.status]}</span>
+              <span class="doctor-check-label">{CHECK[check.id]?.() ?? check.id}</span>
+              <span class="doctor-check-detail">{DETAIL[check.detail]?.() ?? check.detail}</span>
+            </li>
+          {/each}
+        </ul>
+        <div class="doctor-card-footer">
+          {#if !report.probed}
+            <p class="doctor-hint">{m.doctor_not_probed()}</p>
+          {/if}
+          <div class="doctor-row">
+            <button type="button" class="secondary small" onclick={() => void copyReport()}>{m.doctor_copy_report()}</button>
+            <label class="doctor-include">
+              <input type="checkbox" bind:checked={includeAddresses} />
+              {m.doctor_copy_include_addresses()}
+            </label>
+          </div>
+        </div>
       </div>
     </details>
   {/if}
@@ -348,6 +395,12 @@
     margin: 0;
   }
 
+  .doctor-pending {
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--success);
+  }
+
   .doctor-verdict {
     display: flex;
     flex-direction: column;
@@ -387,8 +440,70 @@
     cursor: default;
   }
 
-  .doctor-block summary {
+  .doctor-details summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+    padding: 4px 0;
+    list-style: none;
     cursor: pointer;
+    user-select: none;
+  }
+
+  .doctor-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .doctor-chevron {
+    flex-shrink: 0;
+    color: var(--text-muted);
+    transition: transform 0.15s ease;
+  }
+
+  .doctor-details[open] .doctor-chevron {
+    transform: rotate(90deg);
+  }
+
+  .doctor-details summary:hover .doctor-chevron {
+    color: var(--text-primary);
+  }
+
+  .doctor-tally {
+    display: inline-flex;
+    gap: 10px;
+    margin-left: 6px;
+    font-weight: 500;
+    color: var(--text-secondary);
+  }
+
+  .doctor-tally-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .doctor-tally-item .doctor-icon {
+    width: 16px;
+    height: 16px;
+    font-size: 10px;
+  }
+
+  .doctor-card {
+    margin-top: 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+
+  .doctor-card-footer {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-surface);
   }
 
   .doctor-list,
@@ -417,36 +532,58 @@
   .doctor-checks {
     list-style: none;
     padding-left: 0;
-    gap: 3px;
+    gap: 0;
   }
 
   .doctor-checks li {
     display: grid;
-    grid-template-columns: 18px minmax(120px, 30%) 1fr;
-    gap: 8px;
-    align-items: baseline;
+    grid-template-columns: 20px minmax(140px, 40%) 1fr;
+    gap: 10px;
+    align-items: center;
+    padding: 7px 12px;
+  }
+
+  .doctor-checks li + li {
+    border-top: 1px solid var(--border);
   }
 
   .doctor-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    font-size: 11px;
     font-weight: 700;
-    text-align: center;
-  }
-
-  .doctor-checks li.pass .doctor-icon {
-    color: var(--success);
-  }
-
-  .doctor-checks li.warn .doctor-icon,
-  .doctor-checks li.fail .doctor-icon {
-    color: var(--warning);
-  }
-
-  .doctor-checks li.skip {
+    line-height: 1;
     color: var(--text-muted);
+    background: color-mix(in srgb, var(--text-muted) 14%, transparent);
+  }
+
+  .pass .doctor-icon {
+    color: var(--success);
+    background: color-mix(in srgb, var(--success) 15%, transparent);
+  }
+
+  .warn .doctor-icon,
+  .fail .doctor-icon {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 16%, transparent);
   }
 
   .doctor-check-label {
     color: var(--text-primary);
+  }
+
+  .doctor-checks li.warn .doctor-check-detail,
+  .doctor-checks li.fail .doctor-check-detail {
+    color: color-mix(in srgb, var(--warning) 75%, var(--text-primary));
+  }
+
+  .doctor-checks li.skip .doctor-check-label,
+  .doctor-checks li.skip .doctor-check-detail {
+    color: var(--text-muted);
   }
 
   .doctor-include {

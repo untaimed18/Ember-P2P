@@ -2,24 +2,31 @@
   // The peers the user banned from Transfers, each with an Unban button.
   // Loads on mount so the page can show how many there are before it opens.
   import * as m from '$lib/paraglide/messages';
-  import { getBannedPeers, unbanPeer, type BannedPeer } from '$lib/api/kad';
+  import { banPeer, getBannedPeers, unbanPeer, type BannedPeer } from '$lib/api/kad';
   import { translateError } from '$lib/i18n';
+  import { toastsFor } from '$lib/stores/toast';
   import { formatNumber } from '$lib/utils';
   import IconX from './IconX.svelte';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { fade, scale } from 'svelte/transition';
   import { flip } from 'svelte/animate';
   import { prefersReducedMotion } from 'svelte/motion';
   import { inertBackground, trapTabKey } from '$lib/a11y';
 
+  const { addActionToast, toastError } = toastsFor('network');
+
   let { open = $bindable(false), count = $bindable(0) }: { open?: boolean; count?: number } = $props();
 
   let peers = $state<BannedPeer[]>([]);
   let loaded = $state(false);
+  /** Why the last load failed, until one succeeds. */
+  let loadError = $state<string | null>(null);
+  let retrying = $state(false);
   let unbanning = $state<string[]>([]);
   let error = $state<string | null>(null);
-  let status = $state<string | null>(null);
   let loadSeq = 0;
+  /** Whether any load has succeeded, so the list on screen is a real one. */
+  let listKnown = false;
   let unmounted = false;
 
   let panelEl: HTMLDivElement | undefined = $state();
@@ -36,11 +43,32 @@
       peers = list;
       count = list.length;
       loaded = true;
+      listKnown = true;
+      loadError = null;
     } catch (e: unknown) {
       if (unmounted || seq !== loadSeq) return;
       loaded = true;
-      if (!opts?.quiet) error = translateError(e, m.error_operation_failed());
+      // A background refresh failing says nothing new about a list already
+      // shown, such as the one an unban just emptied.
+      if (opts?.quiet && listKnown) return;
+      loadError = translateError(e, m.error_operation_failed());
+      // With no list to show, the body reports the failure in its place. With
+      // one, the failure only means it may be out of date.
+      if (peers.length > 0) error = loadError;
     }
+  }
+
+  async function retryLoad() {
+    if (retrying) return;
+    retrying = true;
+    try {
+      await load();
+    } finally {
+      retrying = false;
+    }
+    // The Retry button goes with the failure it was offered for.
+    await tick();
+    if (!unmounted && open && panelEl && !panelEl.contains(document.activeElement)) panelEl.focus();
   }
 
   onMount(() => {
@@ -51,7 +79,6 @@
   $effect(() => {
     if (!open) return;
     error = null;
-    status = null;
     void load();
     const active = document.activeElement;
     if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
@@ -90,13 +117,21 @@
     if (unbanning.includes(peer.user_hash)) return;
     unbanning = [...unbanning, peer.user_hash];
     error = null;
-    status = null;
     try {
       await unbanPeer(peer.user_hash);
       if (unmounted) return;
+      const index = peers.findIndex((p) => p.user_hash === peer.user_hash);
       peers = peers.filter((p) => p.user_hash !== peer.user_hash);
       count = peers.length;
-      status = m.security_unbanned_user({ name: displayName(peer) });
+      const next = index < 0 ? undefined : (peers[index] ?? peers[index - 1]);
+      addActionToast(
+        'success',
+        m.security_unbanned_user({ name: displayName(peer) }),
+        { label: m.common_undo(), undo: true, run: () => void reban(peer) },
+        () => {},
+      );
+      await tick();
+      focusAfterUnban(peer.user_hash, next?.user_hash);
     } catch (e: unknown) {
       if (unmounted) return;
       error = translateError(e, m.error_operation_failed());
@@ -106,6 +141,33 @@
         void load({ quiet: true });
       }
     }
+  }
+
+  /** The Unban button that was pressed leaves with its row, which drops focus
+   *  to the document and out of reach of the dialog's Escape and Tab handling.
+   *  Hand it to the row that took that place, or to the panel. Focus the user
+   *  has since moved elsewhere in the dialog stays where it is. */
+  function focusAfterUnban(removedHash: string, nextHash: string | undefined) {
+    if (!open || !panelEl) return;
+    const active = document.activeElement;
+    const lost =
+      !(active instanceof HTMLElement) ||
+      !panelEl.contains(active) ||
+      active.dataset.hash === removedHash;
+    if (!lost) return;
+    const nextBtn = nextHash
+      ? panelEl.querySelector<HTMLButtonElement>(`.unban-btn[data-hash="${nextHash}"]`)
+      : null;
+    (nextBtn && !nextBtn.disabled ? nextBtn : panelEl).focus();
+  }
+
+  async function reban(peer: BannedPeer) {
+    try {
+      await banPeer(peer.user_hash);
+    } catch (e: unknown) {
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+    if (!unmounted) void load({ quiet: true });
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -164,8 +226,6 @@
 
       {#if error}
         <div class="banned-message error" role="alert">{error}</div>
-      {:else if status}
-        <div class="banned-message ok" role="status">{status}</div>
       {/if}
 
       <div class="banned-body">
@@ -173,6 +233,16 @@
           <div class="banned-placeholder">
             <span class="spinner"></span>
             <span>{m.common_loading()}</span>
+          </div>
+        {:else if loadError && peers.length === 0}
+          <div class="banned-placeholder" role="alert">
+            <p class="banned-load-error">{loadError}</p>
+            <button type="button" class="secondary retry-btn" onclick={() => void retryLoad()} aria-busy={retrying}>
+              {#if retrying}
+                <span class="spinner xs current" aria-hidden="true"></span>
+              {/if}
+              {m.common_retry()}
+            </button>
           </div>
         {:else if peers.length === 0}
           <div class="banned-placeholder">
@@ -210,6 +280,7 @@
                 <button
                   type="button"
                   class="secondary unban-btn"
+                  data-hash={peer.user_hash}
                   onclick={() => void unban(peer)}
                   disabled={unbanning.includes(peer.user_hash)}
                   aria-label={m.security_unban_aria({ name: displayName(peer) })}
@@ -319,11 +390,6 @@
     color: var(--danger);
     background: color-mix(in srgb, var(--danger) 9%, var(--bg-secondary));
   }
-  .banned-message.ok {
-    color: var(--badge-success-text);
-    background: color-mix(in srgb, var(--success) 9%, var(--bg-secondary));
-  }
-
   .banned-body {
     flex: 1;
     min-height: 180px;
@@ -349,6 +415,17 @@
     margin: 0;
     font-size: var(--font-size-md);
     color: var(--text-secondary);
+  }
+  .banned-load-error {
+    margin: 0;
+    max-width: 56ch;
+    text-align: center;
+    color: var(--danger);
+  }
+  .retry-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
   }
 
   /* Header and rows share one grid so the columns line up. */

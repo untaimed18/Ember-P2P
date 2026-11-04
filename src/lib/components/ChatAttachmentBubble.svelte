@@ -11,6 +11,8 @@
   import { formatBytes, formatDurationSecs, formatLiveSpeed } from '$lib/utils';
   import { extensionFromPath, fileTypeKey } from '$lib/fileTypes';
   import FileTypeIcon from '$lib/components/FileTypeIcon.svelte';
+  import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import { portal } from '$lib/actions/portal';
   import { noteXferBytes, xferRate, xferSecondsLeft, type RateSamples } from '$lib/xferRate';
   import { toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
@@ -147,6 +149,21 @@
   let rate = $derived(attachment.status === 'active' ? xferRate(samples, attachment.xfer_id, now) : 0);
   let secondsLeft = $derived(xferSecondsLeft(attachment.size, attachment.transferred, rate));
 
+  /** Part of the file has moved, so a stray click would throw that away: ask
+   *  first. One not started yet goes at once. */
+  let cancelAskOpen = $state(false);
+  let cancelNeedsAsk = $derived(attachment.status === 'active' && attachment.transferred > 0);
+
+  function cancel() {
+    if (cancelNeedsAsk) cancelAskOpen = true;
+    else void run(() => cancelChatAttachment(attachment.xfer_id));
+  }
+
+  // Finished or stopped while the question was up: there is nothing to cancel.
+  $effect(() => {
+    if (cancelAskOpen && !moving) cancelAskOpen = false;
+  });
+
   async function run(action: () => Promise<void>) {
     if (busy) return;
     busy = true;
@@ -265,7 +282,7 @@
         type="button"
         class="attach-cancel"
         disabled={busy}
-        onclick={() => run(() => cancelChatAttachment(attachment.xfer_id))}
+        onclick={cancel}
       >{m.chat_attach_cancel()}</button>
     </div>
   {:else if attachment.retryable}
@@ -301,6 +318,22 @@
   {#if time}
     <div class="attach-time">{time}</div>
   {/if}
+
+  <!-- Out to <body>: the transcript scrolls and its rows slide in with a
+       transform, either of which would pin a fixed overlay to the row. -->
+  <div use:portal>
+    <ConfirmDialog
+      bind:open={cancelAskOpen}
+      title={m.chat_attach_cancel_confirm_title()}
+      message={m.chat_attach_cancel_confirm_body({ file: attachment.name })}
+      confirmLabel={m.chat_attach_cancel_confirm()}
+      cancelLabel={m.chat_attach_cancel_keep()}
+      danger={true}
+      onconfirm={() => {
+        if (moving) void run(() => cancelChatAttachment(attachment.xfer_id));
+      }}
+    />
+  </div>
 </div>
 
 <style>

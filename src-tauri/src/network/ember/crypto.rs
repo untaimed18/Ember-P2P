@@ -117,13 +117,6 @@ impl Blake3FileHasher {
     }
 }
 
-/// Streaming BLAKE3 of a file on disk (slice 18). Returns hex for storage
-/// on `FileInfo` / `known.met`.
-pub fn blake3_hash_file_path(path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
-    let mut file = std::fs::File::open(path)?;
-    blake3_hash_open_file(&mut file)
-}
-
 /// Streaming BLAKE3 of a file that is already open, from the start.
 ///
 /// The completion paths verify against a handle whose identity has already been
@@ -400,6 +393,27 @@ pub fn derive_sealed_intro_presence_capability(
     let epoch_key = derive_intro_epoch_key(owner_ed25519_pubkey, intro_secret, epoch);
     (
         derive_sealed_intro_capability_from_key(owner_ed25519_pubkey, &epoch_key, epoch),
+        epoch_key,
+    )
+}
+
+/// Presence of a feed on the rendezvous server, for followers who find no
+/// source for its list: only holders of the feed's link (its publisher key
+/// and salt) can compute it. Registered as a sealed intro, so the server
+/// checks the epoch key derives the capability under the publisher's key
+/// without learning which feed it is. Returns `(capability, epoch_key)`.
+pub fn derive_feed_presence_capability(
+    publisher_ed25519_pubkey: &[u8; 32],
+    salt: &[u8; 16],
+    epoch: i64,
+) -> ([u8; 32], [u8; 32]) {
+    let context = format!("ember-feed-presence-key-v1:{epoch}");
+    let mut input = [0u8; 48];
+    input[..32].copy_from_slice(publisher_ed25519_pubkey);
+    input[32..].copy_from_slice(salt);
+    let epoch_key = blake3::derive_key(&context, &input);
+    (
+        derive_sealed_intro_capability_from_key(publisher_ed25519_pubkey, &epoch_key, epoch),
         epoch_key,
     )
 }

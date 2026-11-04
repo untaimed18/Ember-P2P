@@ -5,10 +5,6 @@
 
 use super::*;
 
-/// How often a download's progress is written to SQLite between terminal
-/// state changes; `start_network` explains why this is throttled.
-const DB_PROGRESS_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
-
 /// Tell the UI, at most once per this many seconds, that downloads are being
 /// refused by the download folder. Every waiting download hits the same wall on
 /// each retry, and one notice says everything the next hundred would.
@@ -118,6 +114,52 @@ fn record_source_failure(
     }
 }
 
+/// Judge the web mirrors that wrote into `[part_start, part_end)`, which failed
+/// verification. Whether a peer wrote there too comes from `blackbox`, so this
+/// runs before the blackbox marks the range corrupt and stops naming them.
+fn charge_web_sources(
+    blackbox: &ed2k::corruption_blackbox::CorruptionBlackBox,
+    file_hash: &[u8; 16],
+    part_start: u64,
+    part_end: u64,
+) -> ed2k::web_sources::CorruptVerdict {
+    let peers_wrote = !blackbox
+        .corrupted_part_contributors(file_hash, part_start, part_end)
+        .is_empty();
+    ed2k::web_sources::note_corrupt_range(file_hash, part_start, part_end, peers_wrote)
+}
+
+/// The source to ask for `part_index`'s AICH recovery data after another
+/// could not give it. eMule asks one that has the part
+/// (`CPartFile::RequestAICHRecovery`), so one that reported it complete comes
+/// first, then one whose parts are not known yet; never one that reported it
+/// missing, one in `failed_ips`, or one not waiting to be asked.
+fn aich_recovery_candidate<'a>(
+    pfs: &'a ed2k::sources::PerFileSourceList,
+    part_index: u32,
+    failed_ips: &[Ipv4Addr],
+) -> Option<&'a ed2k::sources::DownloadSourceEntry> {
+    let askable = pfs.sources.iter().filter(|s| {
+        !failed_ips.contains(&s.ip)
+            && matches!(
+                s.state,
+                ed2k::sources::DownloadSourceState::OnQueue { .. }
+                    | ed2k::sources::DownloadSourceState::New
+            )
+    });
+    let mut unknown = None;
+    for source in askable {
+        match source.available_parts.get(part_index as usize) {
+            Some(&true) => return Some(source),
+            None if source.available_parts.is_empty() => {
+                unknown.get_or_insert(source);
+            }
+            _ => {}
+        }
+    }
+    unknown
+}
+
 /// Failed moves of a verified download into `Downloads` before it is left
 /// Failed instead of re-queued.
 const COMPLETION_MOVE_ATTEMPTS: u32 = 2;
@@ -141,6 +183,52 @@ fn forget_completion_move_failures(transfer_id: &str) {
     if let Ok(mut failures) = completion_move_failures().lock() {
         failures.remove(transfer_id);
     }
+}
+
+/// Drop the Ember digest a download failed its completion check on when only
+/// remote say-so stood behind it, and return whether it did: the download is
+/// then re-queued to finish on its ed2k hash and any AICH pin, which that check
+/// saw match before it reported the digest (`ember_pin_refuted`).
+///
+/// A DHT plurality, and the digest on a search row a click pins, are claims
+/// planted records can choose, and enforcing one failed a download whose every
+/// other check had passed. A digest hashed here stays enforced, as does one a
+/// feed's download was given: its publisher signed it into the list. The
+/// download's own copy goes with the pin, or its next start pins it again, and
+/// the digest is remembered as refuted so the next walk does not either.
+fn drop_refuted_remote_ember_pin(
+    pins: &mut HashMap<[u8; 16], EmberDigestPin>,
+    mgr: &mut TransferManager,
+    transfer_id: &str,
+    from_feed: bool,
+) -> bool {
+    if from_feed {
+        return false;
+    }
+    let Some(transfer) = mgr
+        .active
+        .get_mut(transfer_id)
+        .or_else(|| mgr.queue.iter_mut().find(|t| t.id == transfer_id))
+    else {
+        return false;
+    };
+    let Some(file_hash) = parse_ed2k_hash16(&transfer.file_hash) else {
+        return false;
+    };
+    let pin = pins.get(&file_hash).copied();
+    if pin.is_some_and(|pin| pin.provenance == EmberDigestProvenance::Local) {
+        return false;
+    }
+    pins.remove(&file_hash);
+    let own = parse_ember_file_hash(transfer.ember_file_hash.as_deref().unwrap_or_default());
+    let refuted = pin.map_or(own, |pin| pin.digest);
+    if refuted != [0u8; 32] {
+        note_refuted_ember_digest(file_hash, refuted);
+        if own == refuted {
+            transfer.ember_file_hash = None;
+        }
+    }
+    true
 }
 
 /// Scope of a finished download's known.met record. An existing record is the
@@ -206,9 +294,44 @@ fn drop_superseded_terminal_event(event: &DownloadEvent, mgr: &mut TransferManag
         .is_some_and(|(sender, registered)| sender != registered.generation());
     if superseded {
         mgr.finish_restore_verification(transfer_id, generation, true);
+        // The replaced worker's move was what held the row in Completing, and
+        // the newer worker reports its own progress from here.
+        if mgr
+            .active
+            .get(transfer_id)
+            .is_some_and(|row| row.status == TransferStatus::Completing)
+        {
+            mgr.update_status(transfer_id, TransferStatus::Searching);
+        }
         debug!("Ignoring {transfer_id}'s result from a worker that has since been replaced");
     }
     superseded
+}
+
+/// Mark `transfer_id` Completing for a [`DownloadEvent::Completing`]. Not a
+/// row the user settled first, nor for a worker since replaced: that worker's
+/// `Failed`, should its move fail, is dropped as superseded, and nothing would
+/// take the row out of Completing again. `true` when it was marked.
+fn mark_completing(mgr: &mut TransferManager, transfer_id: &str, generation: Option<u64>) -> bool {
+    let superseded = generation
+        .zip(mgr.get_control(transfer_id))
+        .is_some_and(|(sender, registered)| sender != registered.generation());
+    let markable = mgr.active.get(transfer_id).is_some_and(|row| {
+        !matches!(
+            row.status,
+            TransferStatus::Paused
+                | TransferStatus::Stopped
+                | TransferStatus::Insufficient
+                | TransferStatus::Completing
+                | TransferStatus::Completed
+                | TransferStatus::Failed
+        )
+    });
+    if superseded || !markable {
+        return false;
+    }
+    mgr.update_status(transfer_id, TransferStatus::Completing);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -245,8 +368,8 @@ pub(in crate::network) async fn on_download_event(
     ed25519_secret_key: [u8; 32],
     a4af_shared: &Arc<RwLock<A4AFManager>>,
     aich_set_tx: &mpsc::Sender<ed2k::aich::AICHRecoveryHashSet>,
-    db_progress_last_persist: &mut HashMap<String, std::time::Instant>,
-    ember_digest_result_tx: &mpsc::UnboundedSender<([u8; 16], [u8; 32])>,
+    db_progress_batch: &mut DbProgressBatch,
+    completed_digest_result_tx: &mpsc::UnboundedSender<CompletedDigests>,
     part_hashset_result_tx: &mpsc::UnboundedSender<([u8; 16], Vec<[u8; 16]>)>,
     pending_kad_callbacks: &upload_server::PendingKadCallbacks,
     shared_files: &Arc<RwLock<Vec<FileInfo>>>,
@@ -302,6 +425,22 @@ pub(in crate::network) async fn on_download_event(
     if matches!(event, DownloadEvent::Failed { .. })
         && drop_superseded_terminal_event(&event, &mut *transfer_manager.write().await)
     {
+        return;
+    }
+    if let DownloadEvent::Completing { ref transfer_id, generation } = event {
+        if mark_completing(&mut *transfer_manager.write().await, transfer_id, generation) {
+            spawn_transfer_status_write(
+                transfer_status_writes,
+                db.clone(),
+                transfer_id.clone(),
+                "completing",
+            );
+            crate::commands::transfers::emit_transfer_status(
+                app_handle,
+                transfer_id,
+                &TransferStatus::Completing,
+            );
+        }
         return;
     }
     let mut completed_worker = None;
@@ -454,11 +593,16 @@ pub(in crate::network) async fn on_download_event(
                     fh.copy_from_slice(&hash_bytes);
                     use crate::storage::known_files::KnownFileRecord;
                     let existing = known_files.find_by_hash(&fh).cloned();
+                    // What the completion arrived without, recomputed
+                    // below in one read of the finished file.
+                    let mut recompute_parts = false;
                     // Prefer the hashset already verified during
                     // the transfer, then a valid cached set, before
                     // re-reading the completed file.
+                    // known.met holds eMule's form, `MD4("")` included for an
+                    // exact multiple of PARTSIZE; the worker's may be one per part.
                     let part_hashes = if !event_part_hashes.is_empty() {
-                        event_part_hashes.clone()
+                        ed2k::hash::ed2k_known_met_hashset(event_part_hashes, file_size)
                     } else if existing.as_ref().is_some_and(|record| {
                         record.part_hashes.len()
                             == ed2k::hash::ed2k_known_met_part_hash_count(file_size)
@@ -468,33 +612,9 @@ pub(in crate::network) async fn on_download_event(
                             .map(|record| record.part_hashes.clone())
                             .unwrap_or_default()
                     } else {
-                        // Recompute off the loop and fold it in
-                        // when it lands, exactly as the BLAKE3
-                        // digest below does. Awaiting a sequential
-                        // end-to-end read of a multi-GB file here
-                        // suspended the whole `select!` — no UDP
-                        // receive, no timers, no command handling —
-                        // on every completion that arrives without
-                        // a hashset (callback and single-source
-                        // downloads, and restore re-verification).
-                        let hash_path = completed_path.clone();
-                        let hashset_tx = part_hashset_result_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            // Another whole-file read the library
-                            // scheduler would otherwise not see. It
-                            // rations reads per physical drive, and
-                            // this one lands on the same spindle a
-                            // scan may be working through.
-                            let _drive_busy =
-                                crate::sharing::disk::note_external_read(&hash_path);
-                            if let Ok(hashes) =
-                                ed2k::hash::ed2k_part_hashes_file(&hash_path)
-                            {
-                                if !hashes.is_empty() {
-                                    let _ = hashset_tx.send((fh, hashes));
-                                }
-                            }
-                        });
+                        // Callback and single-source downloads, and
+                        // restore re-verification, arrive without one.
+                        recompute_parts = file_size >= ed2k::hash::PARTSIZE;
                         Vec::new()
                     };
                     let record = KnownFileRecord {
@@ -529,30 +649,9 @@ pub(in crate::network) async fn on_download_event(
                                     })
                                 })
                                 .unwrap_or_default();
-                            if ember_hex.is_empty() {
-                                // Compute it off the loop and fold
-                                // it in when it lands. Awaiting the
-                                // hash here suspended the whole
-                                // `select!` for as long as it took
-                                // to read the file end to end — no
-                                // UDP receive, no timers, no
-                                // command handling, on every plain
-                                // eD2K completion (the fallback is
-                                // the common case: only an Ember
-                                // DHT hit or a prior known.met
-                                // record fills the field above).
-                                let hash_path = completed_path.clone();
-                                let digest_tx = ember_digest_result_tx.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    if let Ok(digest) =
-                                        crate::network::ember::crypto::blake3_hash_file_path(
-                                            &hash_path,
-                                        )
-                                    {
-                                        let _ = digest_tx.send((fh, digest));
-                                    }
-                                });
-                            }
+                            // Empty on every plain eD2K completion: only
+                            // an Ember DHT hit or a prior known.met
+                            // record fills it, and the read below does.
                             ember_hex
                         },
                         modified_at: completed_mtime,
@@ -629,6 +728,109 @@ pub(in crate::network) async fn on_download_event(
                             .as_ref()
                             .is_some_and(|r| r.media_scanned),
                     };
+                    // The AICH root is missing on nearly every download:
+                    // only a prior known.met record supplies one. One read
+                    // computes it with whatever else is missing, off the
+                    // loop, and the results are folded in when they land.
+                    // Awaiting a sequential end-to-end read of a multi-GB
+                    // file here suspended the whole `select!` — no UDP
+                    // receive, no timers, no command handling.
+                    let want = ed2k::hash::WantedDigests {
+                        aich: record.aich_hash.is_empty(),
+                        ember: record.ember_file_hash.is_empty(),
+                    };
+                    // The full AICH set (for serving AICH recovery) is built in
+                    // the same task, after this pass, and recorded only when
+                    // its root matches one tied to this download's ed2k hash:
+                    // the root the pass computed alongside a matching ed2k
+                    // hash, or else the one known.met already holds.
+                    let recorded_aich = hex::decode(&record.aich_hash)
+                        .ok()
+                        .and_then(|root| <[u8; 20]>::try_from(root.as_slice()).ok());
+                    let check_ed2k =
+                        recompute_parts || want.aich || want.ember || recorded_aich.is_none();
+                    let hash_path = completed_path.clone();
+                    let hashset_tx = part_hashset_result_tx.clone();
+                    let digest_tx = completed_digest_result_tx.clone();
+                    let aich_data_dir = state.data_dir.clone();
+                    let aich_tx = aich_set_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        // Another whole-file read the library scheduler
+                        // would otherwise not see. It rations reads per
+                        // physical drive, and this one lands on the same
+                        // spindle a scan may be working through.
+                        let _drive_busy = crate::sharing::disk::note_external_read(&hash_path);
+                        let mut file = match std::fs::File::open(&hash_path) {
+                            Ok(file) => file,
+                            Err(e) => {
+                                debug!("Could not hash completed {}: {e}", hash_path.display());
+                                return;
+                            }
+                        };
+                        let mut trusted_aich = recorded_aich;
+                        if check_ed2k {
+                            static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            let pass = ed2k::hash::WantedDigests { aich: true, ..want };
+                            let digests = match ed2k::hash::hash_open_file_digests_cancellable(
+                                &mut file,
+                                pass,
+                                &NEVER_CANCELLED,
+                            ) {
+                                Ok(digests) => digests,
+                                Err(e) => {
+                                    debug!("Could not hash completed {}: {e}", hash_path.display());
+                                    return;
+                                }
+                            };
+                            // Bytes that are no longer the download's (edited
+                            // or replaced since it finished) say nothing about
+                            // the file this record describes.
+                            if !digests.ed2k.eq_ignore_ascii_case(&hex::encode(fh)) {
+                                debug!("Completed {} no longer matches its ed2k hash", hash_path.display());
+                                return;
+                            }
+                            if recompute_parts && !digests.part_hashes.is_empty() {
+                                let _ = hashset_tx.send((fh, digests.part_hashes));
+                            }
+                            let new_aich = digests.aich.filter(|_| want.aich);
+                            if new_aich.is_some() || digests.ember.is_some() {
+                                let _ = digest_tx.send(CompletedDigests {
+                                    file_hash: fh,
+                                    aich: new_aich,
+                                    ember: digests.ember,
+                                });
+                            }
+                            trusted_aich = digests.aich;
+                        }
+                        match ed2k::aich::AICHRecoveryHashSet::build_from_open_file(&mut file) {
+                            Ok(hs) if Some(hs.root_hash) == trusted_aich => {
+                                let aich_hex = hex::encode(hs.root_hash);
+                                let cache_path = aich_data_dir.join("aich_cache.dat");
+                                if let Err(error) =
+                                    persist_aich_cache_entry(&cache_path, fh, hs.root_hash)
+                                {
+                                    tracing::warn!(
+                                        "Failed to persist AICH cache entry: {error}"
+                                    );
+                                }
+                                tracing::info!("Computed AICH root for completed download: {aich_hex}");
+                                if let Err(e) = aich_tx.try_send(hs) {
+                                    tracing::warn!("AICH hash-set queue full/closed, hash set not stored: {e}");
+                                }
+                            }
+                            Ok(hs) => {
+                                tracing::warn!(
+                                    "AICH root {} of completed {} does not match the one its ed2k check vouched for; not recording its AICH set",
+                                    hex::encode(hs.root_hash),
+                                    hash_path.display()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to compute AICH for completed download: {e}");
+                            }
+                        }
+                    });
                     let completed_friends_only = record.friends_only;
                     known_files.add_or_update(record.clone());
                     if completed_friends_only {
@@ -825,34 +1027,6 @@ pub(in crate::network) async fn on_download_event(
                         "Indexed completed download: {} (shared={})",
                         file_name, shared_file.shared
                     );
-
-                    // Build full AICH hash set for the completed file
-                    // (enables AICH-based verification when serving to other peers)
-                    let aich_path = completed_path.clone();
-                    let aich_data_dir = state.data_dir.clone();
-                    let aich_tx = aich_set_tx.clone();
-                    tokio::task::spawn_blocking(move || {
-                        match ed2k::aich::AICHRecoveryHashSet::build_from_file(&aich_path) {
-                            Ok(hs) => {
-                                let aich_hex = hex::encode(hs.root_hash);
-                                let cache_path = aich_data_dir.join("aich_cache.dat");
-                                if let Err(error) =
-                                    persist_aich_cache_entry(&cache_path, fh, hs.root_hash)
-                                {
-                                    tracing::warn!(
-                                        "Failed to persist AICH cache entry: {error}"
-                                    );
-                                }
-                                tracing::info!("Computed AICH root for completed download: {aich_hex}");
-                                if let Err(e) = aich_tx.try_send(hs) {
-                                    tracing::warn!("AICH hash-set queue full/closed, hash set not stored: {e}");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to compute AICH for completed download: {e}");
-                            }
-                        }
-                    });
                 }
             }
         }
@@ -999,7 +1173,10 @@ pub(in crate::network) async fn on_download_event(
         // disk is full (Insufficient), which is transfer-level —
         // or the Ember BLAKE3 pin missed. That last one is also
         // transfer-level: the ed2k parts already matched, so
-        // searching more sources cannot change the digest.
+        // searching more sources cannot change the digest. A remote
+        // pin that missed is dropped instead, and the download
+        // re-queued to finish without it
+        // (`drop_refuted_remote_ember_pin`).
         // `is_user_cancel` was resolved above, before the
         // `transfer:source-failed` emit it also gates.
         let is_disk_full = *failure_kind == SourceFailureKind::InsufficientDisk
@@ -1009,7 +1186,37 @@ pub(in crate::network) async fn on_download_event(
                 == ed2k::transfer::TransferFailureCode::EmberContentHashMismatch;
         let is_aich_pin_fail = ed2k::transfer::is_expected_aich_mismatch(error)
             || failure_code == ed2k::transfer::TransferFailureCode::AichHashMismatch;
-        if (is_ember_pin_fail || is_aich_pin_fail) && !is_user_cancel {
+        let remote_pin_dropped = is_ember_pin_fail
+            && !is_aich_pin_fail
+            && !is_user_cancel
+            && drop_refuted_remote_ember_pin(
+                &mut state.ember_content_hashes,
+                &mut *transfer_manager.write().await,
+                transfer_id,
+                crate::sharing::feed_downloads::is_private(transfer_id)
+                    || crate::sharing::feed_files::is_internal_fetch(transfer_id),
+            );
+        if remote_pin_dropped {
+            warn!("Dropped the remote Ember digest {transfer_id} failed on; re-queuing it to finish on its ed2k hash");
+            let cleared = transfer_manager
+                .read()
+                .await
+                .get_transfer(transfer_id)
+                .is_some_and(|t| t.ember_file_hash.is_none());
+            if cleared {
+                // Awaited: left to run detached, the clear could land after a
+                // later save of this transfer and wipe a digest pinned since.
+                let (db, id) = (db.clone(), transfer_id.clone());
+                let result = tokio::task::spawn_blocking(move || db.clear_transfer_ember_file_hash(&id))
+                    .await
+                    .map_err(anyhow::Error::from)
+                    .and_then(|r| r);
+                if let Err(e) = result {
+                    warn!("Could not forget the refuted Ember digest of {transfer_id}: {e}");
+                }
+            }
+        }
+        if (is_ember_pin_fail || is_aich_pin_fail) && !is_user_cancel && !remote_pin_dropped {
             state.pending_downloads.remove(transfer_id);
             // A remote-derived digest that fails the content check is
             // worse than no digest at all: every later start for this
@@ -1348,7 +1555,9 @@ pub(in crate::network) async fn on_download_event(
     }
     // Inject Ember Peer Exchange sources into matching active downloads
     if let DownloadEvent::EmberSources { ref transfer_id, ref entries, ref aich_roots, ref ember_peers, ref relay_attestations, from_ember_hash } = event {
-        let we_are_unreachable = state.firewalled || state.low_id;
+        // The same predicate the DHT source path uses, so one source is not
+        // brokered when gossiped and asked to call back when found by search.
+        let we_are_unreachable = ember_tcp_firewalled(state);
         handle_epx_sources(state, transfer_manager, source_manager, local_index, entries, aich_roots, ember_peers, relay_attestations, from_ember_hash, &format!("download {transfer_id}"), false, we_are_unreachable, &HashMap::new()).await;
     }
 
@@ -1723,16 +1932,28 @@ pub(in crate::network) async fn on_download_event(
     }
     if let DownloadEvent::PartVerified { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
         state.corruption_blackbox.verified_part(file_hash, part_start, part_end);
+        // A part that verified needs no recovery, and one that fails later
+        // starts its AICH retries afresh.
+        if let (Ok(part_index), Ok(mut map)) = (
+            u32::try_from(part_start / ed2k::hash::PARTSIZE),
+            state.aich_recovery_pending.write(),
+        ) {
+            map.remove(&(*file_hash, part_index));
+        }
+        ed2k::web_sources::note_verified_range(file_hash, part_start, part_end);
         if let Some(ref uh) = sender_user_hash {
             state.reputation.record_event(uh, ember::reputation::ReputationEvent::SuccessfulChunk);
         }
     }
     if let DownloadEvent::PartCorrupted { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
         // Web mirrors are not in the corruption blackbox, which tracks peers
-        // by address. Each is charged for the parts it wrote most of, whoever
-        // finished them, and one retired for it is dropped from the download
-        // for good.
-        let retired = ed2k::web_sources::note_corrupt_range(file_hash, part_start, part_end);
+        // by address. One retired for this is dropped from the download for
+        // good.
+        let ed2k::web_sources::CorruptVerdict { retired, suspected } =
+            charge_web_sources(&state.corruption_blackbox, file_hash, part_start, part_end);
+        for (url, times) in suspected {
+            debug!("Web source {url} shared a part that failed verification ({times} so far); not charged");
+        }
         if !retired.is_empty() {
             let db_web = db.clone();
             let fh = hex::encode(file_hash);
@@ -1847,32 +2068,52 @@ pub(in crate::network) async fn on_download_event(
         }
     }
     if let DownloadEvent::AichRecoveryFailed { ref file_hash, part_index, failed_ip, .. } = event {
-        if let Ok(mut map) = state.aich_recovery_pending.write() {
+        let noted = state.aich_recovery_pending.write().ok().map(|mut map| {
             let entry = map.entry((*file_hash, part_index)).or_insert_with(|| (Vec::new(), 0));
             if !entry.0.contains(&failed_ip) {
                 entry.0.push(failed_ip);
             }
             entry.1 += 1;
-            let retry_count = entry.1;
-            let failed_ips = entry.0.clone();
-            drop(map);
-
+            (entry.1, entry.0.clone())
+        });
+        if let Some((retry_count, failed_ips)) = noted {
             if retry_count < 3 {
                 let hash_hex = hex::encode(file_hash);
-                let candidate = state.per_file_sources.values().find(|pfs| pfs.file_hash == *file_hash).and_then(|pfs| {
-                    pfs.sources.iter().find(|s| {
-                        !failed_ips.contains(&s.ip)
-                            && matches!(
-                                s.state,
-                                ed2k::sources::DownloadSourceState::OnQueue { .. }
-                                    | ed2k::sources::DownloadSourceState::New
-                            )
-                    })
-                });
-                if let Some(src) = candidate {
+                let candidate = state
+                    .per_file_sources
+                    .values()
+                    .find(|pfs| pfs.file_hash == *file_hash)
+                    .and_then(|pfs| aich_recovery_candidate(pfs, part_index, &failed_ips))
+                    .map(|src| {
+                        (
+                            ed2k::multi_source::DownloadSource {
+                                peer_ip: src.ip.to_string(),
+                                peer_port: src.tcp_port,
+                                available_parts: src.available_parts.clone(),
+                                peer_user_hash: src.source_user_hash,
+                                peer_connect_options: None,
+                            },
+                            src.udp_port,
+                        )
+                    });
+                if let Some((src, udp_port)) = candidate {
                     debug!(
                         "AICH retry {retry_count}/3 for file {} part {part_index}: next candidate {}:{}",
-                        hash_hex, src.ip, src.tcp_port
+                        hash_hex, src.peer_ip, src.peer_port
+                    );
+                    // Handed to the worker to connect to. The pending entry
+                    // is what names the part to ask it to recover, and the
+                    // addresses already tried.
+                    let matching_ids = {
+                        let mgr = transfer_manager.read().await;
+                        matching_active_transfer_ids_for_hash(state, &mgr, &hash_hex)
+                    };
+                    inject_source_into_active_transfers(
+                        state,
+                        *file_hash,
+                        &matching_ids,
+                        &src,
+                        udp_port,
                     );
                 } else {
                     debug!(
@@ -1895,7 +2136,12 @@ pub(in crate::network) async fn on_download_event(
                 if fh_bytes.len() == 16 {
                     let mut fh = [0u8; 16];
                     fh.copy_from_slice(&fh_bytes);
-                    state.corruption_blackbox.remove_file(&fh);
+                    // A failure re-queues with the `.part` and its bytes kept,
+                    // so who sent them is still the evidence a later corrupt
+                    // part is judged on. Cancel and Remove clear it too.
+                    if matches!(event, DownloadEvent::Completed { .. }) {
+                        state.corruption_blackbox.remove_file(&fh);
+                    }
                     if let Ok(mut map) = state.aich_recovery_pending.write() {
                         map.retain(|(file_hash, _), _| *file_hash != fh);
                     }
@@ -1915,7 +2161,7 @@ pub(in crate::network) async fn on_download_event(
     // event can't unwind the whole network loop (→ outer catch →
     // shutdown). Mirrors the handle_command_inner/handle_udp_packet_inner
     // catch_unwind pattern.
-    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, &settings.download_roots(), db_progress_last_persist, DB_PROGRESS_PERSIST_INTERVAL, &mut state.callback_row_pending_since, transfer_status_writes, completed_worker)).catch_unwind().await {
+    if let Err(p) = std::panic::AssertUnwindSafe(handle_download_event(event, app_handle, transfer_manager, source_manager, db, &mut promoted, stats_manager, settings.remove_finished_downloads, a4af_shared, credit_manager, &settings.download_roots(), db_progress_batch, &mut state.callback_row_pending_since, transfer_status_writes, completed_worker)).catch_unwind().await {
         error!("handle_download_event panicked, dropping event: {}", describe_panic(&*p));
     }
 
@@ -2122,6 +2368,109 @@ mod superseded_failure_tests {
 }
 
 #[cfg(test)]
+mod completing_tests {
+    use super::*;
+
+    fn verifying(id: &str) -> Transfer {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "file_name": "movie.bin",
+            "file_hash": "00".repeat(16),
+            "peer_id": "",
+            "peer_name": "",
+            "direction": "download",
+            "status": "verifying",
+            "progress": 100.0,
+            "speed": 0,
+            "total_size": 100,
+            "transferred": 100,
+            "started_at": 0,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_registered_workers_move_marks_the_row_completing() {
+        let mut mgr = TransferManager::new(2);
+        mgr.active.insert("dl".into(), verifying("dl"));
+        let worker = TransferControl::new();
+        mgr.register_control("dl", worker.clone());
+
+        assert!(mark_completing(&mut mgr, "dl", Some(worker.generation())));
+        assert_eq!(mgr.get_transfer("dl").unwrap().status, TransferStatus::Completing);
+        assert!(!mark_completing(&mut mgr, "dl", Some(worker.generation())), "once");
+    }
+
+    #[test]
+    fn a_settled_row_or_a_replaced_workers_move_is_not_marked() {
+        let mut mgr = TransferManager::new(2);
+        let mut paused = verifying("paused");
+        paused.status = TransferStatus::Paused;
+        mgr.active.insert("paused".into(), paused);
+        assert!(!mark_completing(&mut mgr, "paused", None));
+        assert_eq!(mgr.get_transfer("paused").unwrap().status, TransferStatus::Paused);
+
+        mgr.active.insert("dl".into(), verifying("dl"));
+        let old = TransferControl::new();
+        mgr.register_control("dl", old.clone());
+        mgr.register_control("dl", TransferControl::new());
+        assert!(!mark_completing(&mut mgr, "dl", Some(old.generation())));
+        assert_eq!(mgr.get_transfer("dl").unwrap().status, TransferStatus::Verifying);
+
+        assert!(!mark_completing(&mut mgr, "gone", None));
+    }
+
+    #[test]
+    fn a_replaced_workers_failed_move_does_not_leave_the_row_completing() {
+        let mut mgr = TransferManager::new(2);
+        mgr.active.insert("dl".into(), verifying("dl"));
+        let old = TransferControl::new();
+        mgr.register_control("dl", old.clone());
+        assert!(mark_completing(&mut mgr, "dl", Some(old.generation())));
+        mgr.register_control("dl", TransferControl::new());
+
+        let failed = DownloadEvent::Failed {
+            transfer_id: "dl".into(),
+            error: "move failed".into(),
+            failure_kind: ed2k::transfer::SourceFailureKind::Transient,
+            generation: Some(old.generation()),
+        };
+        assert!(drop_superseded_terminal_event(&failed, &mut mgr));
+        assert_eq!(mgr.get_transfer("dl").unwrap().status, TransferStatus::Searching);
+    }
+
+    #[test]
+    fn aich_recovery_is_asked_of_a_source_that_has_the_part() {
+        let mut pfs = ed2k::sources::PerFileSourceList::new([0x11; 16], 50);
+        let (failed, missing, unknown, has) = (
+            Ipv4Addr::new(203, 0, 113, 1),
+            Ipv4Addr::new(203, 0, 113, 2),
+            Ipv4Addr::new(203, 0, 113, 3),
+            Ipv4Addr::new(203, 0, 113, 4),
+        );
+        for ip in [failed, missing, unknown, has] {
+            assert!(pfs.add_source_full(ip, 4662, 0));
+        }
+        for source in pfs.sources.iter_mut() {
+            source.available_parts = if source.ip == missing {
+                vec![true, false]
+            } else if source.ip == unknown {
+                Vec::new()
+            } else {
+                vec![true, true]
+            };
+        }
+
+        let pick = |pfs: &ed2k::sources::PerFileSourceList, failed_ips: &[Ipv4Addr]| {
+            aich_recovery_candidate(pfs, 1, failed_ips).map(|s| s.ip)
+        };
+        assert_eq!(pick(&pfs, &[failed]), Some(has));
+        assert_eq!(pick(&pfs, &[failed, has]), Some(unknown), "parts not known yet");
+        assert_eq!(pick(&pfs, &[failed, has, unknown]), None, "never one missing the part");
+    }
+}
+
+#[cfg(test)]
 mod requeue_tests {
     use super::*;
 
@@ -2252,6 +2601,56 @@ mod requeue_tests {
         assert!(mgr.clear_retry_context("running").is_none(), "nothing left to clear");
     }
 
+    /// A download that failed only on an Ember digest from the DHT or a clicked
+    /// row drops it, its own copy included, so its next start finishes on the
+    /// ed2k hash. A digest hashed here, or a feed's, is still enforced.
+    #[test]
+    fn a_refuted_remote_ember_pin_is_dropped_and_a_local_or_feed_one_kept() {
+        let file = [0xD1; 16];
+        let (clicked, planted) = ([0xAA; 32], [0xEE; 32]);
+        let pinned = |digest: [u8; 32], provenance: EmberDigestProvenance| {
+            HashMap::from([(file, EmberDigestPin { digest, provenance })])
+        };
+        let row_for = |id: &str| Transfer {
+            file_hash: hex::encode(file),
+            ..checking(id)
+        };
+        let mut mgr = TransferManager::new(3);
+        let mut row = row_for("clicked");
+        row.ember_file_hash = Some(hex::encode(clicked));
+        mgr.active.insert("clicked".into(), row);
+
+        let mut pins = pinned(clicked, EmberDigestProvenance::UserSelected);
+        assert!(!drop_refuted_remote_ember_pin(&mut pins, &mut mgr, "clicked", true), "a feed's");
+        assert!(pins.contains_key(&file));
+        assert!(mgr.get_transfer("clicked").unwrap().ember_file_hash.is_some());
+
+        let mut pins = pinned(clicked, EmberDigestProvenance::Local);
+        assert!(!drop_refuted_remote_ember_pin(&mut pins, &mut mgr, "clicked", false), "hashed here");
+        assert!(pins.contains_key(&file));
+
+        let mut pins = pinned(clicked, EmberDigestProvenance::UserSelected);
+        assert!(drop_refuted_remote_ember_pin(&mut pins, &mut mgr, "clicked", false));
+        assert!(pins.is_empty());
+        assert_eq!(mgr.get_transfer("clicked").unwrap().ember_file_hash, None, "or a restart pins it again");
+
+        mgr.active.insert("searched".into(), row_for("searched"));
+        let mut pins = pinned(planted, EmberDigestProvenance::Corroborated(2));
+        assert!(drop_refuted_remote_ember_pin(&mut pins, &mut mgr, "searched", false));
+        assert!(pins.is_empty());
+
+        // The records behind it are still out there; the next walk's plurality
+        // does not pin it again, though another digest or a click may.
+        seed_ember_content_hash(&mut pins, file, planted, EmberDigestProvenance::Corroborated(5));
+        assert!(pins.is_empty(), "a refuted digest is not corroborated again");
+        seed_ember_content_hash(&mut pins, file, [0x77; 32], EmberDigestProvenance::Corroborated(2));
+        assert_eq!(pins[&file].digest, [0x77; 32]);
+        seed_ember_content_hash(&mut pins, file, planted, EmberDigestProvenance::UserSelected);
+        assert_eq!(pins[&file].digest, planted, "a click is the user's to make");
+
+        assert!(!drop_refuted_remote_ember_pin(&mut HashMap::new(), &mut mgr, "gone", false));
+    }
+
     /// A peer without one file is still asked for the others it shares.
     #[test]
     fn a_permanent_source_failure_blocks_only_that_file() {
@@ -2355,5 +2754,52 @@ mod friend_transfer_only_tests {
                 "{outcome:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod web_source_blame_tests {
+    use super::*;
+    use ed2k::corruption_blackbox::CorruptionBlackBox;
+    use ed2k::web_sources;
+
+    const PART: u64 = 9_728_000;
+
+    /// A peer on record for a tenth of a part a mirror wrote the rest of: the
+    /// part failing whole, again and again, never retires the mirror.
+    #[test]
+    fn a_peer_writing_into_a_mirrors_part_keeps_the_mirror_from_being_charged() {
+        let hash = [0xE1; 16];
+        web_sources::clear_for_tests(&hash);
+        let mirror = "https://mirror.example/f".to_string();
+        web_sources::register(hash, [mirror.clone()]);
+        let mut blackbox = CorruptionBlackBox::new();
+        for _ in 0..web_sources::MAX_BAD_PARTS + 1 {
+            blackbox.record_data(hash, 0, PART / 10, Ipv4Addr::new(203, 0, 113, 7));
+            web_sources::note_written(&hash, &mirror, &[(PART / 10, PART)]);
+            let verdict = charge_web_sources(&blackbox, &hash, 0, PART);
+            assert!(verdict.retired.is_empty());
+            assert_eq!(verdict.suspected.len(), 1);
+            let _ = blackbox.corrupted_part(&hash, 0, PART);
+        }
+        assert_eq!(web_sources::bad_parts(&hash, &mirror), 0);
+        assert!(!web_sources::is_retired(&hash, &mirror));
+        web_sources::forget(&hash);
+    }
+
+    /// With no peer on record, the mirror that wrote most of the part is the
+    /// one charged, and retired at the limit.
+    #[test]
+    fn a_mirror_alone_in_a_failed_part_is_charged() {
+        let hash = [0xE2; 16];
+        web_sources::clear_for_tests(&hash);
+        let mirror = "https://mirror.example/f".to_string();
+        web_sources::register(hash, [mirror.clone()]);
+        let blackbox = CorruptionBlackBox::new();
+        web_sources::note_written(&hash, &mirror, &[(PART / 10, PART)]);
+        assert_eq!(charge_web_sources(&blackbox, &hash, 0, PART), Default::default());
+        web_sources::note_written(&hash, &mirror, &[(PART / 10, PART)]);
+        assert_eq!(charge_web_sources(&blackbox, &hash, 0, PART).retired, vec![mirror.clone()]);
+        web_sources::forget(&hash);
     }
 }

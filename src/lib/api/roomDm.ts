@@ -29,6 +29,9 @@ export interface RoomDmMessage {
   timestamp: number;
   /** Ours: `sending`, `delivered`, `failed`. Theirs: `received`. */
   status: 'sending' | 'delivered' | 'failed' | 'received';
+  /** Its stored row, which orders messages sharing a timestamp; 0 for one
+   *  not read back from storage. */
+  seq: number;
 }
 
 export const ROOM_DM_MESSAGE_EVENT = 'ember:dm-message';
@@ -55,8 +58,20 @@ export function listRoomDmThreads(): Promise<RoomDmThread[]> {
   return invoke('list_room_dm_threads');
 }
 
-export function getRoomDmMessages(member: string, before?: number, limit?: number): Promise<RoomDmMessage[]> {
-  return invoke('get_room_dm_messages', { member, before: before ?? null, limit: limit ?? null });
+/** The newest `limit` messages before the one at `before` (its timestamp) and
+ *  `beforeSeq` (its row), or the newest of all. */
+export function getRoomDmMessages(
+  member: string,
+  before?: number,
+  limit?: number,
+  beforeSeq?: number,
+): Promise<RoomDmMessage[]> {
+  return invoke('get_room_dm_messages', {
+    member,
+    before: before ?? null,
+    beforeSeq: beforeSeq ?? null,
+    limit: limit ?? null,
+  });
 }
 
 export function sendRoomDm(member: string, text: string): Promise<RoomDmMessage> {

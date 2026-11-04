@@ -36,6 +36,8 @@ pub struct DiscoveredFeedInfo {
     pub link: String,
     /// Its publisher signed the listing lately, so is running.
     pub active: bool,
+    /// Its listing says followers cannot fetch its files now.
+    pub cannot_share: bool,
     pub following: bool,
     /// One of this identity's own feeds.
     pub own: bool,
@@ -70,8 +72,35 @@ struct FoundBatch<'a> {
 struct Listing {
     feed: DiscoveredFeed,
     withdrawn: bool,
+    cannot_share: bool,
     /// Settles two listings of a feed stamped the same second, as storers do.
     signature: [u8; 64],
+}
+
+/// The listings heard saying their files cannot be fetched now, by feed,
+/// with when each was signed. Not cached with the feeds: a feed shown from
+/// the cache says nothing either way until a walk hears its listing again.
+fn cannot_share_heard() -> &'static parking_lot::Mutex<HashMap<FeedId, i64>> {
+    static HEARD: std::sync::OnceLock<parking_lot::Mutex<HashMap<FeedId, i64>>> = std::sync::OnceLock::new();
+    HEARD.get_or_init(Default::default)
+}
+
+/// Note what the newest listing heard of a feed says about fetching its files.
+fn note_cannot_share(listing: &Listing) {
+    let id = FeedId { publisher: listing.feed.publisher.clone(), salt: listing.feed.salt.clone() };
+    let mut heard = cannot_share_heard().lock();
+    if listing.cannot_share {
+        heard.insert(id, listing.feed.listed_at);
+    } else {
+        heard.remove(&id);
+    }
+}
+
+/// Whether the listing of `feed` it was found by said its files cannot be
+/// fetched now.
+fn cannot_share(feed: &DiscoveredFeed) -> bool {
+    let id = FeedId { publisher: feed.publisher.clone(), salt: feed.salt.clone() };
+    cannot_share_heard().lock().get(&id) == Some(&feed.listed_at)
 }
 
 impl Listing {
@@ -120,6 +149,7 @@ fn listings_from_blobs(blobs: Vec<Vec<u8>>, now: i64) -> Vec<Listing> {
                 first_seen: 0,
             },
             withdrawn,
+            cannot_share: record.feed_listing_cannot_share(),
             signature: record.signature,
         });
     }
@@ -193,9 +223,11 @@ impl Local {
         let mut link = FeedLink { publisher: [0; 32], salt: [0; 16] };
         hex::decode_to_slice(&feed.publisher, &mut link.publisher).ok()?;
         hex::decode_to_slice(&feed.salt, &mut link.salt).ok()?;
+        let active = listed_lately(feed.listed_at, now);
         Some(DiscoveredFeedInfo {
             link: link.format(),
-            active: listed_lately(feed.listed_at, now),
+            active,
+            cannot_share: active && cannot_share(&feed),
             following: self.followed.contains(&FeedId { publisher: feed.publisher.clone(), salt: feed.salt.clone() }),
             own: feed.publisher == self.own_key,
             feed,
@@ -208,9 +240,15 @@ fn listed_lately(listed_at: i64, now: i64) -> bool {
     now - listed_at <= FEED_LISTING_ACTIVE_SECS
 }
 
-/// Running publishers' feeds first, then the most lately published.
+/// Running publishers' feeds first, those whose files can be fetched ahead
+/// of those whose cannot, then the most lately published.
 fn sort_for_display(feeds: &mut [DiscoveredFeedInfo]) {
-    feeds.sort_by(|a, b| b.active.cmp(&a.active).then(b.feed.sequence.cmp(&a.feed.sequence)));
+    feeds.sort_by(|a, b| {
+        b.active
+            .cmp(&a.active)
+            .then(a.cannot_share.cmp(&b.cannot_share))
+            .then(b.feed.sequence.cmp(&a.feed.sequence))
+    });
 }
 
 /// The cached feeds this walk did not hear from, split into those it cannot
@@ -287,6 +325,7 @@ pub async fn discover_feeds(
             changed.retain(|info: &DiscoveredFeedInfo| info.feed.publisher != id.publisher || info.feed.salt != id.salt);
             gone.retain(|g: &Gone| g.publisher != id.publisher || g.salt != id.salt);
             let listing = &heard.newest[&id];
+            note_cannot_share(listing);
             if listing.withdrawn {
                 gone.push(Gone { publisher: id.publisher, salt: id.salt, listed_at: listing.feed.listed_at });
             } else if let Some(info) = local.info(listing.feed.clone(), now) {
@@ -441,6 +480,36 @@ mod tests {
         assert!(listings[1].withdrawn);
     }
 
+    /// A listing saying its files cannot be fetched is stored and read like
+    /// any, and says so only while its publisher shows as running, and only
+    /// for the listing it came from.
+    #[test]
+    fn a_listing_says_when_its_files_cannot_be_fetched() {
+        let identity = crate::network::ember::crypto::signing_key_from_bytes(&[3; 32]);
+        let record = SignedRecord::feed_listing_record_flagged(
+            &[9; 16],
+            &head("Software", 5),
+            crate::network::ember::feed::FEED_LISTING_CANNOT_SHARE,
+            &identity,
+            NOW,
+        )
+        .unwrap();
+        let listing = listings_from_blobs(vec![[record.data, record.signature.to_vec()].concat()], NOW).remove(0);
+        assert!(listing.cannot_share && !listing.withdrawn);
+        note_cannot_share(&listing);
+        let local = Local { own_key: String::new(), followed: HashSet::new(), hidden: HashSet::new() };
+        assert!(local.info(listing.feed.clone(), NOW).unwrap().cannot_share);
+        assert!(!local.info(listing.feed.clone(), NOW + FEED_LISTING_ACTIVE_SECS + 1).unwrap().cannot_share, "not running");
+        let mut later = listing.feed.clone();
+        later.listed_at += 1;
+        assert!(!local.info(later, NOW).unwrap().cannot_share, "another listing said nothing of it");
+
+        let shared = listings_from_blobs(vec![blob(3, 9, &head("Software", 5), false, NOW + 1)], NOW).remove(0);
+        assert!(!shared.cannot_share);
+        note_cannot_share(&shared);
+        assert!(!local.info(listing.feed, NOW).unwrap().cannot_share, "a newer listing that can share clears it");
+    }
+
     #[test]
     fn a_tampered_listing_is_dropped() {
         let mut tampered = blob(1, 1, &head("Mixes", 5), false, NOW);
@@ -502,7 +571,7 @@ mod tests {
         let mut heard = Heard::default();
         heard.newest.insert(
             FeedId { publisher: feeds[0].publisher.clone(), salt: feeds[0].salt.clone() },
-            Listing { feed: feeds[0].clone(), withdrawn: true, signature: [0; 64] },
+            Listing { feed: feeds[0].clone(), withdrawn: true, cannot_share: false, signature: [0; 64] },
         );
         let (carried, lapsed) = sort_cached(feeds.clone(), &unsettled, &heard);
         assert!(carried.iter().all(|feed| shard_of(feed) == shard_of(&feeds[0])));
@@ -586,7 +655,8 @@ mod tests {
     /// first, then the most lately published.
     #[test]
     fn a_walk_and_the_cache_merge_capped_and_in_display_order() {
-        let listing = |feed: DiscoveredFeed, withdrawn: bool| Listing { feed, withdrawn, signature: [0; 64] };
+        let listing =
+            |feed: DiscoveredFeed, withdrawn: bool| Listing { feed, withdrawn, cannot_share: false, signature: [0; 64] };
         let mut heard = Heard::default();
         assert!(heard.take(listing(cached(1, 1, 50, NOW), false)));
         assert!(heard.take(listing(cached(1, 2, 10, NOW - 60), false)));

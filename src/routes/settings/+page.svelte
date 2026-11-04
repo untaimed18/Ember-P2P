@@ -32,6 +32,7 @@
   import ChannelLanguagePicker from '$lib/components/ChannelLanguagePicker.svelte';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
   import { transfers } from '$lib/stores/transfers';
+  import { completedFirst } from '$lib/stores/transfersView';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
   import {
@@ -69,7 +70,7 @@
   import { page } from '$app/stores';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { relaunch } from '@tauri-apps/plugin-process';
-  import { flushToastActionsBeforeExit } from '$lib/stores/toast';
+  import { flushToastActionsBeforeExit, reloadAfterToastActions } from '$lib/stores/toast';
   import BuyCoffeeButton from '$lib/components/BuyCoffeeButton.svelte';
   import EmberLinks from '$lib/components/EmberLinks.svelte';
   import {
@@ -97,7 +98,7 @@
     NICKNAME_MAX_BYTES,
     shortPubkey,
   } from '$lib/utils';
-  import { getRuntimeStatus } from '$lib/api/system';
+  import { getRuntimeStatus, identityKeyringFallback } from '$lib/api/system';
   import {
     MAX_RULE_LABEL_CHARS,
     MAX_SCHEDULE_RULES,
@@ -288,14 +289,16 @@
 
   function pickLocale(next: Locale) {
     if (!followingSystem && next === currentLocale) return;
-    currentLocale = next;
-    followingSystem = false;
-    setLocale(next);
+    guardLanguageChange(() => {
+      currentLocale = next;
+      followingSystem = false;
+      setLocale(next);
+    });
   }
 
   function pickSystemLocale() {
     if (followingSystem) return;
-    useSystemLocale();
+    guardLanguageChange(useSystemLocale);
   }
 
   let settings: AppSettings | null = $state(null);
@@ -370,6 +373,10 @@
   // restart part of the operation rather than an optional follow-up.
   let backupPassphrase = $state('');
   let backupPassphraseConfirm = $state('');
+  /** Said once both have something in them, not after Export. */
+  let backupPassphraseMismatch = $derived(
+    backupPassphrase.length > 0 && backupPassphraseConfirm.length > 0 && backupPassphrase !== backupPassphraseConfirm,
+  );
   let backupBusy = $state(false);
   let backupMessage: string | null = $state(null);
   let backupMessageKind: 'progress' | 'success' | 'error' = $state('progress');
@@ -382,6 +389,8 @@
   /** Milliseconds; this install's own record, so a restored profile shows
    *  "no backup yet" until one is made here. */
   let lastBackupMs: number | null = $state(readLastBackup());
+  /** The identity keys are sealed without the system keyring this session. */
+  let keyringFallback = $state(false);
 
   function readLastBackup(): number | null {
     try {
@@ -405,13 +414,14 @@
     }
   }
 
-  // Lazily checked the first time the Backup section is opened (or on load if
-  // it is the active one), matching how the Security section defers its own
-  // snapshot. A staged restore survives restarts, so this has to be shown
-  // whenever the user comes back - not just after the import that created it.
+  // Lazily checked the first time the Backup section is on screen (opened, on
+  // load as the active one, or matching a filter), matching how the Security
+  // section defers its own snapshot. A staged restore survives restarts, so
+  // this has to be shown whenever the user comes back - not just after the
+  // import that created it.
   let pendingRestoreChecked = false;
   $effect(() => {
-    if (activeSection !== 'backup' || pendingRestoreChecked) return;
+    if (!sectionOnScreen('backup') || pendingRestoreChecked) return;
     pendingRestoreChecked = true;
     void refreshPendingRestore();
   });
@@ -650,7 +660,10 @@
     if (!settings || !speedResult) return;
     settings.max_upload_speed = speedResult.recommended_upload_limit;
     settings.max_download_speed = speedResult.recommended_download_limit;
-    void applyFields(['max_upload_speed', 'max_download_speed']);
+    // Not inline: each field shows the error saved under its own name, and
+    // this one would be saved under the pair, under neither.
+    const fields = ['max_upload_speed', 'max_download_speed'] as const;
+    if (fieldsDirty(fields)) void enqueueSave(() => saveFields(fields));
   }
 
   // ---------------------------------------------------------------------
@@ -811,7 +824,7 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'library' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
 
   /// Sidebar order, and the order the cards are declared in below. Keep them
   /// in step: while filtering, every matching card is on screen in DOM order,
@@ -821,6 +834,7 @@
     'general',
     'notifications',
     'downloads',
+    'library',
     'search',
     'webservices',
     'bandwidth',
@@ -892,10 +906,10 @@
     }
   });
   /// The import group scans eMule's folder when it mounts, so it waits until
-  /// its section is first opened rather than running on every Settings visit.
+  /// its section is first on screen rather than running on every Settings visit.
   let importOpened = $state(false);
   $effect(() => {
-    if (activeSection === 'backup') importOpened = true;
+    if (sectionOnScreen('backup')) importOpened = true;
   });
 
   /**
@@ -918,7 +932,15 @@
   /// Set by the effect below, which is the only thing that can count matches
   /// (it has to read the DOM). Drives the result count and the empty state.
   let filterMatchCount = $state(0);
+  /// The sections with a match, set by the same effect.
+  let filterShownSections: SettingsSection[] = $state([]);
   let cardsGridEl: HTMLDivElement | undefined = $state(undefined);
+
+  /** The section's card is on screen: it is the open tab, or it has a match
+   *  while filtering. What a section loads lazily waits for this. */
+  function sectionOnScreen(section: SettingsSection): boolean {
+    return filtering ? filterShownSections.includes(section) : activeSection === section;
+  }
 
   /**
    * Show only the fields that match, and only the sections that still have
@@ -935,9 +957,17 @@
     const grid = cardsGridEl;
     if (!grid) return;
     // Referenced so the effect re-runs once the sections have rendered their
-    // contents, not just when the query changes.
+    // contents, not just when the query changes, including what a section
+    // loads once it is on screen.
     void settings;
+    void antileechLoaded;
+    void pendingRestore;
+    void importOpened;
     const cards = grid.querySelectorAll<HTMLElement>('.card');
+    const setShown = (ids: Set<string>) => {
+      const next = sections.filter((s) => ids.has(panelId(s)));
+      if (next.join() !== untrack(() => filterShownSections.join())) filterShownSections = next;
+    };
     if (!query) {
       for (const card of cards) {
         card.removeAttribute('data-filtered');
@@ -950,9 +980,11 @@
         }
       }
       filterMatchCount = 0;
+      setShown(new Set());
       return;
     }
     let matches = 0;
+    const shownIds = new Set<string>();
     for (const card of cards) {
       // A section whose own name matches keeps all of its fields, so
       // searching "backup" shows the Backup section rather than only the
@@ -961,9 +993,15 @@
       const wholeCard = heading.includes(query);
       let cardMatches = 0;
       for (const field of card.querySelectorAll<HTMLElement>('.field')) {
-        // Likewise a group's heading: "power" finds the setting under Power.
-        const groupHeading = field.closest('.settings-group')?.querySelector(':scope > .subsection-title');
-        const wholeGroup = groupHeading?.textContent?.toLowerCase().includes(query) ?? false;
+        // Likewise a group's heading and the line explaining it: "power" finds
+        // the setting under Power. An area heading within a group counts the
+        // same for its own fields: "friends" finds the friend notifications.
+        const group = field.closest('.settings-group');
+        const groupText = Array.from(group?.querySelectorAll(':scope > .subsection-title, :scope > .hint') ?? [])
+          .map((el) => el.textContent ?? '')
+          .join(' ');
+        const subgroupText = field.closest('.settings-subgroup')?.querySelector(':scope > .subgroup-title')?.textContent ?? '';
+        const wholeGroup = `${groupText} ${subgroupText}`.toLowerCase().includes(query);
         const hit = wholeCard || wholeGroup || (field.textContent?.toLowerCase().includes(query) ?? false);
         if (hit) {
           field.removeAttribute('data-filtered');
@@ -980,7 +1018,7 @@
       // a row: the test looks for a surviving *field*, and every field was
       // decided by the loop above. A container asking about its child
       // containers would have had to run innermost-first.
-      for (const box of card.querySelectorAll<HTMLElement>('.field-row, .settings-group')) {
+      for (const box of card.querySelectorAll<HTMLElement>('.field-row, .settings-group, .settings-subgroup, .notify-options')) {
         if (box.querySelector('.field:not([data-filtered])')) box.removeAttribute('data-filtered');
         else box.setAttribute('data-filtered', 'out');
       }
@@ -1012,11 +1050,16 @@
           block.setAttribute('data-filtered', 'out');
         }
       }
-      if (cardMatches > 0) card.removeAttribute('data-filtered');
-      else card.setAttribute('data-filtered', 'out');
+      if (cardMatches > 0) {
+        card.removeAttribute('data-filtered');
+        shownIds.add(card.id);
+      } else {
+        card.setAttribute('data-filtered', 'out');
+      }
       matches += cardMatches;
     }
     filterMatchCount = matches;
+    setShown(shownIds);
   });
 
   function sectionLabel(id: SettingsSection): string {
@@ -1024,6 +1067,7 @@
       case 'general': return m.settings_section_general();
       case 'notifications': return m.settings_section_notifications();
       case 'downloads': return m.settings_section_downloads();
+      case 'library': return m.nav_library();
       case 'bandwidth': return m.settings_section_bandwidth();
       case 'network': return m.settings_section_network();
       case 'security': return m.settings_section_security();
@@ -1160,6 +1204,11 @@
         runtimeStatus = status;
       })
       .catch((e) => console.warn('Settings: runtime status unavailable', e));
+    identityKeyringFallback()
+      .then((fallback) => {
+        if (!unmounted) keyringFallback = fallback;
+      })
+      .catch((e) => console.warn('Settings: key protection status unavailable', e));
     listen<RuntimeStatus>('ember:runtime-status', (event) => {
       if (unmounted) return;
       runtimeStatus = event.payload;
@@ -1171,8 +1220,19 @@
       .catch((e) => console.error('Failed to register runtime-status listener:', e));
 
     let unlistenSettingsChanged: UnlistenFn | null = null;
-    listen<AppSettings>(SETTINGS_CHANGED_EVENT, (event) => {
-      if (!unmounted) foldQuickLimits(event.payload);
+    // Re-read rather than trusting the payload: any window can emit the
+    // event, and what is folded here is saved by the next Apply.
+    let settingsChangedSeq = 0;
+    listen(SETTINGS_CHANGED_EVENT, () => {
+      if (unmounted) return;
+      const seq = ++settingsChangedSeq;
+      getSettings()
+        .then((saved) => {
+          if (unmounted || seq !== settingsChangedSeq) return;
+          if (settings && saved.settings_revision < settings.settings_revision) return;
+          foldQuickLimits(saved);
+        })
+        .catch((e) => console.warn('Settings: re-reading changed settings failed', e));
     })
       .then((fn) => {
         if (unmounted) fn();
@@ -1208,7 +1268,7 @@
     // `beforeNavigate` hook below, which is the path a desktop user actually
     // takes (the sidebar navigates with `goto`).
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-      if (hasUnsavedChanges) e.preventDefault();
+      if (hasUnsavedChanges && !discardConfirmed) e.preventDefault();
     };
     window.addEventListener('beforeunload', handleBeforeUnload);
     window.addEventListener('keydown', handleFindKey);
@@ -1387,7 +1447,7 @@
     // USS needs a non-zero upload cap, so applying Unlimited turns it off.
     if (s.max_upload_speed === 0) s.uss_enabled = false;
     s.max_download_speed = cn(s.max_download_speed, MAX_CONFIGURED_SPEED_BPS, 0);
-    s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 5);
+    s.max_concurrent_downloads = ci(s.max_concurrent_downloads, 1, 50, 10);
     // 0 is Auto, not an empty box — `numericFields` above rejects those.
     if (s.max_concurrent_uploads !== 0) s.max_concurrent_uploads = ci(s.max_concurrent_uploads, 1, 50, 5);
     s.max_sources_per_file = ci(s.max_sources_per_file, 50, 2000, 400);
@@ -1489,6 +1549,27 @@
   ] as const satisfies readonly (keyof AppSettings)[];
   type ApplyField = (typeof APPLY_FIELDS)[number];
   const APPLY_FIELD_SET: ReadonlySet<string> = new Set(APPLY_FIELDS);
+  const APPLY_FIELD_SECTION: Record<ApplyField, SettingsSection> = {
+    nickname: 'general',
+    max_concurrent_downloads: 'downloads',
+    max_concurrent_uploads: 'downloads',
+    max_sources_per_file: 'downloads',
+    max_download_file_size_gib: 'downloads',
+    max_connections: 'network',
+    max_connections_per_five_secs: 'network',
+    tcp_port: 'network',
+    udp_port: 'network',
+    search_timeout_secs: 'search',
+    filename_cleanups: 'search',
+    max_upload_speed: 'bandwidth',
+    max_download_speed: 'bandwidth',
+    alt_max_upload_speed: 'bandwidth',
+    alt_max_download_speed: 'bandwidth',
+    bandwidth_schedule: 'bandwidth',
+    chat_attachment_auto_accept_mb: 'friends',
+    max_friends: 'friends',
+    channel_username: 'channels',
+  };
 
   /**
    * Fields the automatic save leaves alone. The anti-leech and IP switches
@@ -1581,6 +1662,18 @@
     return enqueueSave(() => saveFields(fields, { reportInline: true }));
   }
 
+  /** Put typed fields back as they are saved. Whether there was a change to
+   *  put back. */
+  function revertTyped(fields: readonly ApplyField[]): boolean {
+    if (!fieldsDirty(fields)) return false;
+    const current = settings as unknown as Record<string, unknown> | null;
+    const saved = savedSettings;
+    if (!current || !saved) return false;
+    for (const key of fields) current[key] = cloneValue(fieldValue(saved, key));
+    if (applyError?.fields === fields.join(',')) applyError = null;
+    return true;
+  }
+
   /** Enter applies a typed field; Escape puts it back as it is saved. */
   function applyOnEnter(event: KeyboardEvent, fields: readonly ApplyField[]) {
     if (event.isComposing || !fieldsDirty(fields)) return;
@@ -1589,11 +1682,7 @@
       void applyFields(fields);
     } else if (event.key === 'Escape') {
       event.preventDefault();
-      const current = settings as unknown as Record<string, unknown> | null;
-      const saved = savedSettings;
-      if (!current || !saved) return;
-      for (const key of fields) current[key] = cloneValue(fieldValue(saved, key));
-      if (applyError?.fields === fields.join(',')) applyError = null;
+      revertTyped(fields);
     }
   }
 
@@ -1796,18 +1885,30 @@
   /// window disappearance), then call Tauri's `relaunch()` which kills
   /// the current process and spawns a fresh one. If `relaunch` fails for
   /// any reason (rare — usually only when the user lacks permission to
-  /// re-spawn) we surface the error and let them restart manually.
-  async function performRestart() {
+  /// re-spawn) we surface the error and let them restart manually. Typed
+  /// changes not applied yet are offered for applying first, as a language
+  /// change offers them.
+  function performRestart() {
     showRestartPrompt = false;
+    guardUnsavedExit('restart', () => void restartNow());
+  }
+
+  async function restartNow() {
+    if (restarting) return;
     restarting = true;
     try {
       // Brief delay so the overlay has time to paint before the process
       // dies — purely cosmetic, matches the wizard. Spent sending anything
-      // still behind an Undo toast.
-      await Promise.all([new Promise(r => setTimeout(r, 600)), flushToastActionsBeforeExit()]);
+      // still behind an Undo toast, and letting saves already asked for land.
+      await Promise.all([
+        new Promise(r => setTimeout(r, 600)),
+        flushToastActionsBeforeExit(),
+        saveQueue,
+      ]);
       await relaunch();
     } catch (e) {
       restarting = false;
+      discardConfirmed = false;
       showSaveMsg(
         m.settings_restart_failed({ error: translateError(e) }),
         true,
@@ -2060,7 +2161,8 @@
         };
       } else {
         const addedText = plural(added, {
-          one: m.webservices_imported_one,
+          one: () => m.webservices_imported_one({ count: added }),
+          oneShowsCount: true,
           other: () => m.webservices_imported_other({ count: added }),
         });
         webServiceMessage = { kind: 'ok', text: full ? `${addedText} ${full}` : addedText };
@@ -2091,6 +2193,64 @@
   // `$derived` is lazy and immune to ordering at runtime, but the type
   // checker still applies plain TDZ analysis to the referenced binding.
   let hasUnsavedChanges = $derived(fieldsDirty(APPLY_FIELDS) || antileechDraftDirty);
+
+  /** Sections holding a typed change not applied yet, in sidebar order. */
+  let pendingSections = $derived.by((): SettingsSection[] => {
+    const dirty = new Set<SettingsSection>(
+      APPLY_FIELDS.filter((field) => fieldsDirty([field])).map((field) => APPLY_FIELD_SECTION[field]),
+    );
+    if (antileechDraftDirty) dirty.add('security');
+    return sections.filter((section) => dirty.has(section));
+  });
+  let pendingSectionNames = $derived(
+    new Intl.ListFormat(getLocale(), { type: 'conjunction' }).format(pendingSections.map(sectionLabel)),
+  );
+
+  // Changing the language reloads the page and a restart ends it, either of
+  // which drops every typed change not applied yet, so both ask first.
+  type UnsavedExit = 'language' | 'restart';
+  let unsavedConfirmOpen = $state(false);
+  let unsavedExitKind: UnsavedExit = $state('language');
+  let pendingExit: (() => void) | null = null;
+  /** The user chose to discard, so the reload must not ask again. */
+  let discardConfirmed = false;
+
+  function guardUnsavedExit(kind: UnsavedExit, proceed: () => void) {
+    if (!hasUnsavedChanges) {
+      proceed();
+      return;
+    }
+    pendingExit = proceed;
+    unsavedExitKind = kind;
+    // A prompt that asked for the restart is still closing and handing focus
+    // back to its opener; opening alongside it would lose focus to that.
+    void tick().then(() => (unsavedConfirmOpen = true));
+  }
+
+  function guardLanguageChange(change: () => void) {
+    guardUnsavedExit('language', () => reloadAfterToastActions(change));
+  }
+
+  async function applyThenExit() {
+    const proceed = pendingExit;
+    const kind = unsavedExitKind;
+    pendingExit = null;
+    // One field at a time: a failure is shown under the field it was for.
+    const applied = await Promise.all(
+      APPLY_FIELDS.filter((field) => fieldsDirty([field])).map((field) => applyFields([field])),
+    );
+    if (antileechDraftDirty) await handleSaveAntileech();
+    if (applied.every(Boolean) && !hasUnsavedChanges) proceed?.();
+    // The failure may be under a field on another tab, out of sight.
+    else toastError(kind === 'restart' ? m.settings_restart_apply_failed() : m.settings_language_apply_failed());
+  }
+
+  function discardThenExit() {
+    const proceed = pendingExit;
+    pendingExit = null;
+    discardConfirmed = true;
+    proceed?.();
+  }
 
   // In-app routing (the sidebar uses `goto`) would otherwise discard typed
   // edits not yet applied with no prompt — `beforeunload` never fires for it. `nav.cancel()`
@@ -2180,7 +2340,8 @@
         antileechMessage = {
           kind: 'warn',
           text: plural(savedCount, {
-            one: () => m.settings_antileech_saved_rejected_one({ rejected }),
+            one: () => m.settings_antileech_saved_rejected_one({ rejected, count: savedCount }),
+            oneShowsCount: true,
             other: () => m.settings_antileech_saved_rejected_other({ count: savedCount, rejected }),
           }),
         };
@@ -2189,7 +2350,8 @@
         antileechMessage = {
           kind: 'ok',
           text: plural(savedCount, {
-            one: m.settings_antileech_saved_one,
+            one: () => m.settings_antileech_saved_one({ count: savedCount }),
+            oneShowsCount: true,
             other: () => m.settings_antileech_saved_other({ count: savedCount }),
           }),
         };
@@ -2303,7 +2465,8 @@
       antileechMessage = {
         kind: 'ok',
         text: plural(snap.pattern_count, {
-          one: m.settings_antileech_restored_one,
+          one: () => m.settings_antileech_restored_one({ count: snap.pattern_count }),
+          oneShowsCount: true,
           other: () => m.settings_antileech_restored_other({ count: snap.pattern_count }),
         }),
       };
@@ -2318,11 +2481,11 @@
     }
   }
 
-  // Lazy-load the snapshot the first time the Security section is opened
-  // (or on initial load if it's the active section). Avoids paying the
-  // backend round-trip just to render the rest of Settings.
+  // Lazy-load the snapshot the first time the Security section is on screen
+  // (opened, on initial load as the active section, or matching a filter).
+  // Avoids paying the backend round-trip just to render the rest of Settings.
   $effect(() => {
-    if (activeSection === 'security' && !antileechLoaded) {
+    if (sectionOnScreen('security') && !antileechLoaded) {
       loadAntileech();
     }
   });
@@ -2360,6 +2523,18 @@
     if (!settings) return;
     settings.close_to_tray_behavior = behavior;
   }
+
+  /** The parts of the window whose confirmation toasts can be turned off,
+   *  named as the sidebar names them. See `toastsFor`. */
+  const popupAreas = [
+    { id: 'downloads', key: 'popups_downloads', label: m.nav_transfers },
+    { id: 'search', key: 'popups_search', label: m.nav_search },
+    { id: 'library', key: 'popups_library', label: m.nav_library },
+    { id: 'friends', key: 'popups_friends', label: m.nav_friends },
+    { id: 'channels', key: 'popups_channels', label: m.nav_channels },
+    { id: 'feeds', key: 'popups_feeds', label: m.nav_feeds },
+    { id: 'network', key: 'popups_network', label: m.nav_group_networks },
+  ] as const;
 
   /** The master switch, which every notification event depends on. */
   let notifyOff = $derived.by(() => {
@@ -2427,10 +2602,22 @@
     getLocale(),
   ]);
 
-  /** Saves at once, like every other picker on this page. */
+  let channelLanguageSecondaryValue = $derived.by((): ChannelLanguage | null => {
+    const code = settings?.channel_language_secondary;
+    return isChannelLanguage(code) ? code : null;
+  });
+
+  /** Saves at once, like every other picker on this page. A second language
+   *  stands only beside a different first, so it goes with the first. */
   function setChannelLanguage(code: ChannelLanguage | null) {
     if (!settings) return;
     settings.channel_language = code ?? '';
+    if (!code || code === settings.channel_language_secondary) settings.channel_language_secondary = '';
+  }
+
+  function setChannelLanguageSecondary(code: ChannelLanguage | null) {
+    if (!settings) return;
+    settings.channel_language_secondary = code ?? '';
   }
 
   /** The suggestion button goes away once a language is set, so focus moves
@@ -2520,9 +2707,9 @@
 <div class="page-header sticky-header">
   <h2>{m.settings_title()}</h2>
   <div class="header-actions">
-    {#if saveMessage}
-      <span class="save-status" class:warning={saveIsWarning} role="status">{saveMessage}</span>
-    {/if}
+    <!-- Always present: a live region added together with its text is often
+         not announced. -->
+    <span class="save-status" class:warning={saveIsWarning} class:idle={!saveMessage} role="status">{saveMessage ?? ''}</span>
   </div>
   {#if restartReason}
     <!-- Stays until the restart, or until the change is undone: "Later" on
@@ -2535,6 +2722,15 @@
     </div>
   {/if}
 </div>
+
+{#snippet restartBadge(field: RestartField, id: string)}
+  <!-- Strong once a change to the field is typed or saved and waiting for the
+       restart; until then only a note that changing it needs one. -->
+  {@const pending = restartPending(field) || fieldsDirty([field])}
+  <span class="restart-badge" class:pending {id} aria-hidden="true">
+    {pending ? m.settings_restart_badge() : m.settings_restart_hint()}
+  </span>
+{/snippet}
 
 {#snippet applyButton(fields: readonly ApplyField[], name: string, blocked = false)}
   {#if fieldsDirty(fields)}
@@ -2556,7 +2752,7 @@
   {#if loadError}
     <div class="empty-state">
       <p class="empty-title" role="alert">{loadError}</p>
-      <button type="button" class="empty-action" onclick={() => { loadError = null; location.reload(); }}>{m.layout_retry()}</button>
+      <button type="button" class="empty-action" onclick={() => { loadError = null; reloadAfterToastActions(); }}>{m.layout_retry()}</button>
     </div>
   {:else if !settings}
     <div class="empty-state">
@@ -2614,6 +2810,11 @@
                   <line x1="10" y1="3" x2="10" y2="13"/>
                   <polyline points="6,9.5 10,13.5 14,9.5"/>
                   <line x1="4" y1="17" x2="16" y2="17"/>
+                </svg>
+              {:else if section === 'library'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 4h5l2 2h7v10H3V4z"/>
+                  <line x1="3" y1="9" x2="17" y2="9"/>
                 </svg>
               {:else if section === 'bandwidth'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -2676,13 +2877,18 @@
               {/if}
             </span>
             <span>{sectionLabel(section)}</span>
+            {#if pendingSections.includes(section)}
+              <span class="settings-nav-pending" aria-hidden="true"></span>
+              <span class="sr-only">{m.settings_tab_unsaved()}</span>
+            {/if}
           </button>
         {/each}
         </div>
         {:else}
           <p class="settings-filter-status" role="status">
             {plural(filterMatchCount, {
-              one: m.settings_filter_one_result,
+              one: () => m.settings_filter_one_result({ count: filterMatchCount }),
+              oneShowsCount: true,
               other: () => m.settings_filter_results({ count: filterMatchCount }),
             })}
           </p>
@@ -3096,8 +3302,12 @@
           </div>
         </div>
         <div class="card-body">
+          <!-- Two systems, kept apart: desktop notifications come from the
+               operating system and reach the user outside the window; pop-ups
+               are Ember's own, inside it. Neither group's switches govern the
+               other's. -->
           <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_delivery()}</h4>
+            <h4 class="subsection-title">{m.settings_group_desktop_notifications()}</h4>
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="notifications-enabled-label" for="notifications-enabled-switch">{m.settings_notifications_enabled_label()}</label>
@@ -3110,110 +3320,146 @@
                 ariaDescribedby="notifications-enabled-hint"
               />
             </div>
-            <div class="field toggle-row nested" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notifications-unfocused-label" for="notifications-unfocused-switch">{m.settings_notifications_unfocused_label()}</label>
-                <span class="hint" id="notifications-unfocused-hint">{m.settings_notifications_unfocused_hint()}</span>
+            <!-- Everything the switch above governs, indented under it and
+                 sorted by the part of Ember each event comes from. -->
+            <div class="nested notify-options" class:is-disabled={notifyOff}>
+              <div class="field toggle-row" class:is-disabled={notifyOff}>
+                <div class="toggle-info">
+                  <label class="toggle-title" id="notifications-unfocused-label" for="notifications-unfocused-switch">{m.settings_notifications_unfocused_label()}</label>
+                  <span class="hint" id="notifications-unfocused-hint">{m.settings_notifications_unfocused_hint()}</span>
+                </div>
+                <ToggleSwitch
+                  id="notifications-unfocused-switch"
+                  bind:checked={settings.notifications_only_when_unfocused}
+                  disabled={notifyOff}
+                  ariaLabelledby="notifications-unfocused-label"
+                  ariaDescribedby="notifications-unfocused-hint"
+                />
               </div>
-              <ToggleSwitch
-                id="notifications-unfocused-switch"
-                bind:checked={settings.notifications_only_when_unfocused}
-                disabled={notifyOff}
-                ariaLabelledby="notifications-unfocused-label"
-                ariaDescribedby="notifications-unfocused-hint"
-              />
+
+              <div class="settings-subgroup" role="group" aria-labelledby="notify-transfers-title">
+                <h5 class="subgroup-title" id="notify-transfers-title">{m.nav_transfers()}</h5>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-download-complete-label" for="notify-download-complete-switch">{m.settings_notify_download_complete()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-download-complete-switch"
+                    bind:checked={settings.notify_download_complete}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-download-complete-label"
+                  />
+                </div>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-download-failed-label" for="notify-download-failed-switch">{m.settings_notify_download_failed()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-download-failed-switch"
+                    bind:checked={settings.notify_download_failed}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-download-failed-label"
+                  />
+                </div>
+              </div>
+
+              <div class="settings-subgroup" role="group" aria-labelledby="notify-friends-title">
+                <h5 class="subgroup-title" id="notify-friends-title">{m.nav_friends()}</h5>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-friend-online-label" for="notify-friend-online-switch">{m.settings_notify_friend_online()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-friend-online-switch"
+                    bind:checked={settings.notify_friend_online}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-friend-online-label"
+                  />
+                </div>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-friend-message-label" for="notify-friend-message-switch">{m.settings_notify_friend_message()}</label>
+                    <span class="hint" id="notify-friend-message-hint">{m.settings_notify_friend_message_hint()}</span>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-friend-message-switch"
+                    bind:checked={settings.notify_friend_message}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-friend-message-label"
+                    ariaDescribedby="notify-friend-message-hint"
+                  />
+                </div>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-friend-request-label" for="notify-friend-request-switch">{m.settings_notify_friend_request()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-friend-request-switch"
+                    bind:checked={settings.notify_friend_request}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-friend-request-label"
+                  />
+                </div>
+              </div>
+
+              <div class="settings-subgroup" role="group" aria-labelledby="notify-library-title">
+                <h5 class="subgroup-title" id="notify-library-title">{m.nav_library()}</h5>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-shares-browsed-label" for="notify-shares-browsed-switch">{m.settings_notify_shares_browsed()}</label>
+                    <span class="hint" id="notify-shares-browsed-hint">{m.settings_notify_shares_browsed_hint()}</span>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-shares-browsed-switch"
+                    bind:checked={settings.notify_shares_browsed}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-shares-browsed-label"
+                    ariaDescribedby="notify-shares-browsed-hint"
+                  />
+                </div>
+              </div>
+
+              <div class="settings-subgroup" role="group" aria-labelledby="notify-channels-title">
+                <h5 class="subgroup-title" id="notify-channels-title">{m.nav_channels()}</h5>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-channel-message-label" for="notify-channel-message-switch">{m.settings_notify_channel_message()}</label>
+                    <span class="hint" id="notify-channel-message-hint">
+                      {m.settings_notify_channel_message_hint()}
+                      <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
+                        {m.settings_notify_channel_manage()}
+                      </button>
+                    </span>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-channel-message-switch"
+                    bind:checked={settings.notify_channel_message}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-channel-message-label"
+                    ariaDescribedby="notify-channel-message-hint"
+                  />
+                </div>
+              </div>
             </div>
           </div>
 
           <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_notifications_events_label()}</h4>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-download-complete-label" for="notify-download-complete-switch">{m.settings_notify_download_complete()}</label>
-              </div>
-              <ToggleSwitch
-                id="notify-download-complete-switch"
-                bind:checked={settings.notify_download_complete}
-                disabled={notifyOff}
-                ariaLabelledby="notify-download-complete-label"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-download-failed-label" for="notify-download-failed-switch">{m.settings_notify_download_failed()}</label>
-              </div>
-              <ToggleSwitch
-                id="notify-download-failed-switch"
-                bind:checked={settings.notify_download_failed}
-                disabled={notifyOff}
-                ariaLabelledby="notify-download-failed-label"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-friend-online-label" for="notify-friend-online-switch">{m.settings_notify_friend_online()}</label>
-              </div>
-              <ToggleSwitch
-                id="notify-friend-online-switch"
-                bind:checked={settings.notify_friend_online}
-                disabled={notifyOff}
-                ariaLabelledby="notify-friend-online-label"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-friend-message-label" for="notify-friend-message-switch">{m.settings_notify_friend_message()}</label>
-                <span class="hint" id="notify-friend-message-hint">{m.settings_notify_friend_message_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="notify-friend-message-switch"
-                bind:checked={settings.notify_friend_message}
-                disabled={notifyOff}
-                ariaLabelledby="notify-friend-message-label"
-                ariaDescribedby="notify-friend-message-hint"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-friend-request-label" for="notify-friend-request-switch">{m.settings_notify_friend_request()}</label>
-              </div>
-              <ToggleSwitch
-                id="notify-friend-request-switch"
-                bind:checked={settings.notify_friend_request}
-                disabled={notifyOff}
-                ariaLabelledby="notify-friend-request-label"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-shares-browsed-label" for="notify-shares-browsed-switch">{m.settings_notify_shares_browsed()}</label>
-                <span class="hint" id="notify-shares-browsed-hint">{m.settings_notify_shares_browsed_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="notify-shares-browsed-switch"
-                bind:checked={settings.notify_shares_browsed}
-                disabled={notifyOff}
-                ariaLabelledby="notify-shares-browsed-label"
-                ariaDescribedby="notify-shares-browsed-hint"
-              />
-            </div>
-            <div class="field toggle-row" class:is-disabled={notifyOff}>
-              <div class="toggle-info">
-                <label class="toggle-title" id="notify-channel-message-label" for="notify-channel-message-switch">{m.settings_notify_channel_message()}</label>
-                <span class="hint" id="notify-channel-message-hint">
-                  {m.settings_notify_channel_message_hint()}
-                  <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
-                    {m.settings_notify_channel_manage()}
-                  </button>
-                </span>
-              </div>
-              <ToggleSwitch
-                id="notify-channel-message-switch"
-                bind:checked={settings.notify_channel_message}
-                disabled={notifyOff}
-                ariaLabelledby="notify-channel-message-label"
-                ariaDescribedby="notify-channel-message-hint"
-              />
+            <h4 class="subsection-title" id="popups-title">{m.settings_popups_title()}</h4>
+            <p class="hint" id="popups-hint">{m.settings_popups_hint()}</p>
+            <div class="toggle-grid">
+              {#each popupAreas as area (area.key)}
+                <div class="field toggle-row">
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="popups-{area.id}-label" for="popups-{area.id}-switch">{area.label()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="popups-{area.id}-switch"
+                    bind:checked={settings[area.key]}
+                    ariaLabelledby="popups-{area.id}-label"
+                    ariaDescribedby="popups-hint"
+                  />
+                </div>
+              {/each}
             </div>
           </div>
         </div>
@@ -3374,6 +3620,21 @@
                 ariaDescribedby="add-paused-hint"
               />
             </div>
+            <!-- A view choice kept on this device rather than a saved setting;
+                 the Transfers page's More menu sets the same one. -->
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="completed-first-label" for="completed-first-switch">{m.settings_completed_first()}</label>
+                <span class="hint" id="completed-first-hint">{m.settings_completed_first_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="completed-first-switch"
+                checked={$completedFirst}
+                onchange={(on) => completedFirst.set(on)}
+                ariaLabelledby="completed-first-label"
+                ariaDescribedby="completed-first-hint"
+              />
+            </div>
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="auto-remove-label" for="auto-remove-switch">{m.settings_auto_remove()}</label>
@@ -3423,62 +3684,6 @@
                 bind:checked={settings.web_sources_enabled}
                 ariaLabelledby="web-sources-label"
                 ariaDescribedby="web-sources-hint"
-              />
-            </div>
-          </div>
-
-          <!-- Shared folders are chosen in the Library, so this only points
-               there; the switch is about what we send when uploading. -->
-          <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_sharing()}</h4>
-            <div class="field">
-              <span class="field-label">{m.settings_shared_folders_label()}</span>
-              <span class="hint">
-                {m.settings_shared_folders_hint()}
-                <a href="/library" onclick={(e) => { e.preventDefault(); void goto('/library'); }}>{m.settings_open_page({ page: m.nav_library() })}</a>
-              </span>
-            </div>
-            <div class="field toggle-row">
-              <div class="toggle-info">
-                <label class="toggle-title" id="skip-compress-video-label" for="skip-compress-video-switch">{m.settings_skip_compress_video()}</label>
-                <span class="hint" id="skip-compress-video-hint">{m.settings_skip_compress_video_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="skip-compress-video-switch"
-                bind:checked={settings.skip_compress_video}
-                ariaLabelledby="skip-compress-video-label"
-                ariaDescribedby="skip-compress-video-hint"
-              />
-            </div>
-          </div>
-
-          <!-- Both automatic uses of the tag, under one explanation of what the
-               tag is, so neither switch has to be understood on its own. -->
-          <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_name_tag()}</h4>
-            <p class="hint section-intro">{m.settings_name_tag_intro()}</p>
-            <div class="field toggle-row">
-              <div class="toggle-info">
-                <label class="toggle-title" id="tag-downloads-label" for="tag-downloads-switch">{m.settings_tag_downloads()}</label>
-                <span class="hint" id="tag-downloads-hint">{m.settings_tag_downloads_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="tag-downloads-switch"
-                bind:checked={settings.tag_completed_downloads}
-                ariaLabelledby="tag-downloads-label"
-                ariaDescribedby="tag-downloads-hint"
-              />
-            </div>
-            <div class="field toggle-row">
-              <div class="toggle-info">
-                <label class="toggle-title" id="tag-imports-label" for="tag-imports-switch">{m.settings_tag_imports()}</label>
-                <span class="hint" id="tag-imports-hint">{m.settings_tag_imports_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="tag-imports-switch"
-                bind:checked={settings.tag_shared_imports}
-                ariaLabelledby="tag-imports-label"
-                ariaDescribedby="tag-imports-hint"
               />
             </div>
           </div>
@@ -3549,6 +3754,92 @@
               {#if historyClearMsg}
                 <span class="hint" role="status">{historyClearMsg}</span>
               {/if}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Library -->
+      <section class="card" class:hidden={!filtering && activeSection !== 'library'} id={panelId('library')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('library')}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 4h5l2 2h7v10H3V4z"/>
+              <line x1="3" y1="9" x2="17" y2="9"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.nav_library()}</h3>
+            <p class="card-desc">{m.settings_library_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <!-- Shared folders are chosen in the Library itself, so this only
+               points there; the switches decide who sees the files and what
+               an upload sends. -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_sharing()}</h4>
+            <div class="field">
+              <span class="field-label">{m.settings_shared_folders_label()}</span>
+              <span class="hint">
+                {m.settings_shared_folders_hint()}
+                <a href="/library" onclick={(e) => { e.preventDefault(); void goto('/library'); }}>{m.settings_open_page({ page: m.nav_library() })}</a>
+              </span>
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="allow-shared-browse-label" for="allow-shared-browse-switch">{m.settings_allow_shared_browse_label()}</label>
+                <span class="hint" id="allow-shared-browse-hint">{m.settings_allow_shared_browse_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="allow-shared-browse-switch"
+                bind:checked={settings.allow_shared_files_browse}
+                ariaLabelledby="allow-shared-browse-label"
+                ariaDescribedby="allow-shared-browse-hint"
+              />
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="skip-compress-video-label" for="skip-compress-video-switch">{m.settings_skip_compress_video()}</label>
+                <span class="hint" id="skip-compress-video-hint">{m.settings_skip_compress_video_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="skip-compress-video-switch"
+                bind:checked={settings.skip_compress_video}
+                ariaLabelledby="skip-compress-video-label"
+                ariaDescribedby="skip-compress-video-hint"
+              />
+            </div>
+          </div>
+
+          <!-- Both automatic uses of the tag, under one explanation of what the
+               tag is, so neither switch has to be understood on its own. -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_name_tag()}</h4>
+            <p class="hint section-intro">{m.settings_name_tag_intro()}</p>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="tag-downloads-label" for="tag-downloads-switch">{m.settings_tag_downloads()}</label>
+                <span class="hint" id="tag-downloads-hint">{m.settings_tag_downloads_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="tag-downloads-switch"
+                bind:checked={settings.tag_completed_downloads}
+                ariaLabelledby="tag-downloads-label"
+                ariaDescribedby="tag-downloads-hint"
+              />
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="tag-imports-label" for="tag-imports-switch">{m.settings_tag_imports()}</label>
+                <span class="hint" id="tag-imports-hint">{m.settings_tag_imports_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="tag-imports-switch"
+                bind:checked={settings.tag_shared_imports}
+                ariaLabelledby="tag-imports-label"
+                ariaDescribedby="tag-imports-hint"
+              />
             </div>
           </div>
         </div>
@@ -3853,7 +4144,7 @@
             <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
               <div class="apply-input">
                 <div class="apply-grow">
-                  <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} />
+                  <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} onescape={() => revertTyped(['max_upload_speed'])} />
                 </div>
                 {@render applyButton(['max_upload_speed'], m.settings_max_upload_speed())}
               </div>
@@ -3862,7 +4153,7 @@
             <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
               <div class="apply-input">
                 <div class="apply-grow">
-                  <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} />
+                  <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} onescape={() => revertTyped(['max_download_speed'])} />
                 </div>
                 {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
               </div>
@@ -3905,13 +4196,13 @@
             <div class="field nested alt-speed-limits" class:is-inactive={!settings.alt_speed_enabled}>
               <div class="apply-input">
                 <div class="apply-grow">
-                  <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} idScope="alt" onenter={() => void applyFields(['alt_max_upload_speed'])} />
+                  <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} onenter={() => void applyFields(['alt_max_upload_speed'])} onescape={() => revertTyped(['alt_max_upload_speed'])} />
                 </div>
                 {@render applyButton(['alt_max_upload_speed'], m.settings_alt_max_upload_speed())}
               </div>
               <div class="apply-input">
                 <div class="apply-grow">
-                  <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} idScope="alt" onenter={() => void applyFields(['alt_max_download_speed'])} />
+                  <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} onenter={() => void applyFields(['alt_max_download_speed'])} onescape={() => revertTyped(['alt_max_download_speed'])} />
                 </div>
                 {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
               </div>
@@ -3935,6 +4226,16 @@
                 ariaDescribedby="schedule-hint"
               />
             </div>
+
+            <!-- The rules' switches look like the instant ones elsewhere but wait
+                 for Apply, and switching the schedule off hides them, so what
+                 is still unapplied is said up here. -->
+            {#if fieldsDirty(['bandwidth_schedule'])}
+              <div class="field schedule-unsaved" role="status">
+                <span>{settings.bandwidth_schedule_enabled ? m.settings_schedule_unsaved() : m.settings_schedule_unsaved_hidden()}</span>
+                {@render applyButton(['bandwidth_schedule'], m.settings_schedule_label(), scheduleHasError)}
+              </div>
+            {/if}
 
             <!-- Hidden while the feature is off: the rules are not in force, and
                  a timetable nobody is using is a card of controls that do
@@ -4036,17 +4337,12 @@
                     </div>
 
                     <div class="schedule-limits">
-                      <!-- `idScope` keeps each rule's two fields from colliding
-                           with every other rule's, and with the manual limits
-                           above, which all share these labels. -->
                       <SpeedInput
                         label={m.settings_max_upload_speed()}
-                        idScope={rule.id}
                         bind:value={rule.max_upload_speed}
                       />
                       <SpeedInput
                         label={m.settings_max_download_speed()}
-                        idScope={rule.id}
                         bind:value={rule.max_download_speed}
                       />
                     </div>
@@ -4071,8 +4367,17 @@
                   <!-- The backend refuses the whole schedule for one malformed
                        rule, and the rejection names no rule. Blocking here
                        instead points at the row that is wrong, which is already
-                       showing its own reason. -->
-                  {@render applyButton(['bandwidth_schedule'], m.settings_schedule_label(), scheduleHasError)}
+                       showing its own reason. A second Apply, for a long list;
+                       a failure shows once, in the bar above. -->
+                  {#if fieldsDirty(['bandwidth_schedule'])}
+                    <button
+                      type="button"
+                      class="action-btn primary field-apply"
+                      disabled={scheduleHasError}
+                      onclick={() => void applyFields(['bandwidth_schedule'])}
+                      aria-label={m.settings_apply_field_aria({ name: m.settings_schedule_label() })}
+                    >{m.settings_apply()}</button>
+                  {/if}
                 </div>
               </div>
             {/if}
@@ -4135,8 +4440,12 @@
                 field?.select();
               }}
               onEnableUpnp={() => {
-                if (settings) settings.upnp_enabled = true;
+                if (!settings) return false;
+                settings.upnp_enabled = true;
+                return enqueueSave(() => saveFields(['upnp_enabled'], { revertOnFailure: true }));
               }}
+              upnpPendingRestart={settings.upnp_enabled && restartPending('upnp_enabled')}
+              onRestart={performRestart}
             />
           </div>
           <div class="settings-group">
@@ -4148,7 +4457,7 @@
                      announced as the input's description instead. -->
                 <label for="tcp-port">
                   {m.settings_tcp_port()}
-                  <span class="restart-badge" class:pending={restartPending('tcp_port')} id="tcp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
+                  {@render restartBadge('tcp_port', 'tcp-port-restart')}
                 </label>
                 <div class="apply-input">
                   <input id="tcp-port" type="number" min="1" max="65535" aria-describedby="tcp-port-restart" bind:value={settings.tcp_port} onkeydown={(e) => applyOnEnter(e, ['tcp_port'])} />
@@ -4159,7 +4468,7 @@
               <div class="field half">
                 <label for="udp-port">
                   {m.settings_udp_port()}
-                  <span class="restart-badge" class:pending={restartPending('udp_port')} id="udp-port-restart" aria-hidden="true">{m.settings_restart_badge()}</span>
+                  {@render restartBadge('udp_port', 'udp-port-restart')}
                 </label>
                 <div class="apply-input">
                   <input id="udp-port" type="number" min="1" max="65535" aria-describedby="udp-port-restart" bind:value={settings.udp_port} onkeydown={(e) => applyOnEnter(e, ['udp_port'])} />
@@ -4170,7 +4479,7 @@
             </div>
             <div class="field toggle-row">
               <div class="toggle-info">
-                <label class="toggle-title" id="upnp-label" for="upnp-switch">{m.settings_upnp_label()} <span class="restart-badge" class:pending={restartPending('upnp_enabled')} id="upnp-restart" aria-hidden="true">{m.settings_restart_badge()}</span></label>
+                <label class="toggle-title" id="upnp-label" for="upnp-switch">{m.settings_upnp_label()} {@render restartBadge('upnp_enabled', 'upnp-restart')}</label>
                 <span class="hint" id="upnp-hint">{m.settings_upnp_hint()}</span>
               </div>
               <ToggleSwitch
@@ -4480,22 +4789,6 @@
               </div>
             {/if}
           </div>
-
-          <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_visibility()}</h4>
-            <div class="field toggle-row">
-              <div class="toggle-info">
-                <label class="toggle-title" id="allow-shared-browse-label" for="allow-shared-browse-switch">{m.settings_allow_shared_browse_label()}</label>
-                <span class="hint" id="allow-shared-browse-hint">{m.settings_allow_shared_browse_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="allow-shared-browse-switch"
-                bind:checked={settings.allow_shared_files_browse}
-                ariaLabelledby="allow-shared-browse-label"
-                ariaDescribedby="allow-shared-browse-hint"
-              />
-            </div>
-          </div>
         </div>
       </section>
 
@@ -4754,6 +5047,22 @@
               </div>
               <span class="hint" id="channel-language-hint">{m.settings_channel_language_hint()}</span>
             </div>
+            {#if channelLanguageValue}
+              <div class="field">
+                <label for="channel-language-secondary">{m.settings_channel_language_secondary_label()}</label>
+                <ChannelLanguagePicker
+                  id="channel-language-secondary"
+                  bind:value={() => channelLanguageSecondaryValue, setChannelLanguageSecondary}
+                  exclude={channelLanguageValue}
+                  noneLabel={m.settings_channel_language_secondary_none()}
+                  noneAriaLabel={m.settings_channel_language_secondary_value({
+                    language: m.settings_channel_language_secondary_none(),
+                  })}
+                  valueLabel={(language) => m.settings_channel_language_secondary_value({ language })}
+                  listLabel={m.settings_channel_language_secondary_label()}
+                />
+              </div>
+            {/if}
           </div>
 
           <div class="settings-group">
@@ -4977,6 +5286,12 @@
 
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_backup()}</h4>
+            {#if keyringFallback}
+              <p class="backup-callout" role="note">
+                <span class="backup-callout-icon" aria-hidden="true">!</span>
+                <span>{m.settings_identity_keyring_fallback()}</span>
+              </p>
+            {/if}
             <div class="field">
               <span class="field-label">{m.settings_backup_contents_label()}</span>
               <span class="hint">{m.settings_backup_contents_hint()}</span>
@@ -5000,12 +5315,17 @@
                 type="password"
                 autocomplete="new-password"
                 bind:value={backupPassphraseConfirm}
+                aria-invalid={backupPassphraseMismatch}
+                aria-describedby={backupPassphraseMismatch ? 'backup-passphrase-mismatch' : undefined}
               />
+              {#if backupPassphraseMismatch}
+                <span class="feedback error" id="backup-passphrase-mismatch">{m.settings_backup_passphrase_mismatch()}</span>
+              {/if}
               <div class="action-row">
                 <button
                   class="action-btn primary"
                   onclick={handleExportBackup}
-                  disabled={backupBusy || backupPassphrase.length === 0}
+                  disabled={backupBusy || backupPassphrase.length === 0 || backupPassphrase !== backupPassphraseConfirm}
                 >{m.settings_backup_export()}</button>
               </div>
               <p class="backup-callout" role="note">
@@ -5441,11 +5761,27 @@
 <ConfirmDialog
   bind:open={leaveConfirmOpen}
   title={m.settings_unsaved_leave_title()}
-  message={m.settings_unsaved_leave_message()}
+  message={pendingSections.length > 0
+    ? `${m.settings_unsaved_leave_message()} ${m.settings_unsaved_leave_sections({ sections: pendingSectionNames })}`
+    : m.settings_unsaved_leave_message()}
   confirmLabel={m.settings_unsaved_leave_confirm()}
   danger={true}
   onconfirm={resumeLeave}
   oncancel={() => { pendingLeaveHref = null; }}
+/>
+
+<ConfirmDialog
+  bind:open={unsavedConfirmOpen}
+  title={m.settings_language_unsaved_title()}
+  message={unsavedExitKind === 'restart'
+    ? m.settings_restart_unsaved_message({ sections: pendingSectionNames })
+    : m.settings_language_unsaved_message({ sections: pendingSectionNames })}
+  confirmLabel={unsavedExitKind === 'restart' ? m.settings_restart_apply_restart() : m.settings_language_apply_switch()}
+  altLabel={unsavedExitKind === 'restart' ? m.settings_restart_discard_restart() : m.settings_language_discard_switch()}
+  cancelLabel={m.common_keep_editing()}
+  onconfirm={() => void applyThenExit()}
+  onalt={discardThenExit}
+  oncancel={() => { pendingExit = null; }}
 />
 
 <!--
@@ -5515,6 +5851,11 @@
   .save-status.warning {
     color: var(--warning);
     background: color-mix(in srgb, var(--warning) 12%, transparent);
+  }
+
+  .save-status.idle {
+    padding: 0;
+    background: none;
   }
 
   /* ── Card grid ─────────────────────────────────── */
@@ -5610,6 +5951,16 @@
   .settings-nav-item:hover .settings-nav-icon,
   .settings-nav-item.active .settings-nav-icon {
     opacity: 1;
+  }
+
+  /* A change typed in this section and not applied yet. */
+  .settings-nav-pending {
+    width: 7px;
+    height: 7px;
+    margin-left: auto;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--warning);
   }
 
   .cards-grid {
@@ -5908,14 +6259,15 @@
     letter-spacing: 0.3px;
     padding: 1px 6px;
     border-radius: var(--radius-pill);
-    color: var(--warning);
-    background: color-mix(in srgb, var(--warning) 14%, transparent);
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--text-muted) 12%, transparent);
     vertical-align: middle;
     line-height: 1.5;
   }
 
-  /* Saved, and waiting for the restart the header banner offers. */
+  /* Changed, and waiting for the restart the header banner offers. */
   .restart-badge.pending {
+    color: var(--warning);
     background: color-mix(in srgb, var(--warning) 26%, transparent);
     box-shadow: inset 0 0 0 1px var(--warning);
   }
@@ -5964,6 +6316,39 @@
     margin-top: -8px;
     padding-left: 12px;
     border-left: 2px solid color-mix(in srgb, var(--border) 70%, transparent);
+  }
+
+  /* Several such settings at once: the group's own rhythm, inside the rule. */
+  .notify-options {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  /* A run of fields within a group, named for the part of Ember they are
+     about. Quieter than the group heading above it. */
+  .settings-subgroup {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+  }
+
+  .subgroup-title {
+    margin: 0 0 -7px;
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .notify-options.is-disabled .subgroup-title {
+    opacity: 0.55;
+  }
+
+  /* Short switches with one-word labels, two to a row. */
+  .toggle-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 18px 32px;
   }
 
   /* Its control is disabled; the words go quiet with it. The control dims
@@ -6896,7 +7281,8 @@
   }
 
   @media (max-width: 760px) {
-    .behavior-picker {
+    .behavior-picker,
+    .toggle-grid {
       grid-template-columns: 1fr;
     }
 
@@ -7102,6 +7488,20 @@
   .schedule-error {
     color: var(--danger);
     font-size: var(--font-size-sm);
+  }
+
+  .field.schedule-unsaved {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--warning) 8%, var(--bg-surface));
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
   }
 
   .schedule-footer {

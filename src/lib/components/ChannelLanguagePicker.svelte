@@ -21,6 +21,7 @@
     noneAriaLabel = noneLabel,
     valueLabel = (language: string) => m.channels_language_flag_title({ language }),
     listLabel = m.channels_language_label(),
+    exclude = null,
   }: {
     value?: ChannelLanguage | null;
     /** Rendered as `aria-disabled`, not `disabled`: a save that disables the
@@ -37,6 +38,8 @@
     noneAriaLabel?: string;
     valueLabel?: (language: string) => string;
     listLabel?: string;
+    /** Left out of the list, as a second language leaves out the first. */
+    exclude?: ChannelLanguage | null;
   } = $props();
 
   type Option = { code: ChannelLanguage | null; name: string; native: string; search: string };
@@ -58,7 +61,7 @@
 
   let allOptions: Option[] = $derived([
     { code: null, name: noneLabel, native: '', search: '' },
-    ...languageOptions,
+    ...languageOptions.filter((o) => o.code !== exclude),
   ]);
 
   let open = $state(false);

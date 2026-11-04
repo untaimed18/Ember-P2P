@@ -186,9 +186,79 @@ pub struct ServerSession {
     /// Raw OP_SERVERLIST payload received during login (if any)
     pub server_list_data: Option<Vec<u8>>,
     /// MOTD messages received during login (for frontend display)
-    pub motd_messages: Vec<String>,
+    pub motd_messages: Vec<ServerMessageLine>,
     /// Server-reported public IP from OP_IDCHANGE (offset 12, if present).
     pub server_reported_ip: u32,
+    /// The dynamic hostname the welcome announced (`[emDynIP: host]`).
+    pub dyn_host: Option<String>,
+}
+
+/// One line of an `OP_SERVERMESSAGE`, sorted as eMule sorts it
+/// (`CServerSocket::ProcessPacket`): a line starting `ERROR` or `WARNING` is
+/// reported at that level, without the word, and any other line as the
+/// server's own text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerMessageLine {
+    Info(String),
+    Warning(String),
+    Error(String),
+}
+
+impl ServerMessageLine {
+    /// The line as the server log shows it.
+    pub fn log_line(&self) -> String {
+        match self {
+            Self::Info(text) => format!("Server: {text}"),
+            Self::Warning(text) => format!("Server warning: {text}"),
+            Self::Error(text) => format!("Server error: {text}"),
+        }
+    }
+}
+
+/// Characters kept from one server message, all its lines together.
+const MAX_SERVER_MESSAGE_CHARS: usize = 4096;
+
+/// An `OP_SERVERMESSAGE` payload's lines, and the dynamic hostname a
+/// `[emDynIP: host]` line announces, or `None` for a malformed payload.
+///
+/// Split before sanitizing: the sanitizer drops line breaks, which ran every
+/// line of a welcome into one.
+pub fn read_server_message(payload: &[u8]) -> Option<(Vec<ServerMessageLine>, Option<String>)> {
+    let len = usize::from(u16::from_le_bytes([*payload.first()?, *payload.get(1)?]));
+    let text = String::from_utf8_lossy(payload.get(2..2 + len)?);
+    let mut lines = Vec::new();
+    let mut dyn_host = None;
+    let mut budget = MAX_SERVER_MESSAGE_CHARS;
+    for raw in text.split(['\r', '\n']) {
+        if budget == 0 {
+            break;
+        }
+        if dyn_host.is_none() {
+            dyn_host = dyn_host_in(raw);
+        }
+        let line = crate::security::sanitize_remote_text(raw, budget);
+        if line.is_empty() {
+            continue;
+        }
+        budget = budget.saturating_sub(line.chars().count());
+        let rest = |word: &str| line[word.len()..].trim_matches([' ', ':']).to_string();
+        lines.push(if line.starts_with("ERROR") {
+            ServerMessageLine::Error(rest("ERROR"))
+        } else if line.starts_with("WARNING") {
+            ServerMessageLine::Warning(rest("WARNING"))
+        } else {
+            ServerMessageLine::Info(line)
+        });
+    }
+    Some((lines, dyn_host))
+}
+
+/// The hostname in a `[emDynIP: host]` line, as eMule reads it.
+fn dyn_host_in(line: &str) -> Option<String> {
+    const MARKER: &str = "[emDynIP: ";
+    let start = line.find(MARKER)? + MARKER.len();
+    let end = start + line[start..].find(']')?;
+    super::server_list::valid_dyn_host(&line[start..end])
 }
 
 /// One per server connection, held for its lifetime. Same reasoning as the
@@ -411,6 +481,7 @@ impl Ed2kServerConnection {
             server_list_data: None,
             motd_messages: Vec::new(),
             server_reported_ip: 0,
+            dyn_host: None,
         };
 
         let mut packets_read = 0u32;
@@ -439,16 +510,12 @@ impl Ed2kServerConnection {
 
             match opcode {
                 OP_SERVERMESSAGE => {
-                    if payload.len() >= 2 {
-                        let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                        if payload.len() >= 2 + len {
-                            let msg = crate::security::sanitize_remote_text(
-                                &String::from_utf8_lossy(&payload[2..2 + len]),
-                                4096,
-                            );
-                            info!("Server MOTD: {msg}");
-                            session.motd_messages.push(msg);
+                    if let Some((lines, dyn_host)) = read_server_message(&payload) {
+                        for line in &lines {
+                            info!("Server MOTD: {line:?}");
                         }
+                        session.motd_messages.extend(lines);
+                        session.dyn_host = dyn_host.or(session.dyn_host.take());
                     }
                 }
                 OP_IDCHANGE => {
@@ -1321,7 +1388,9 @@ pub enum ServerEvent {
         user_hash: Option<[u8; 16]>,
     },
     CallbackFailed,
-    Message(String),
+    Message(ServerMessageLine),
+    /// The server announced the hostname it can be found by on a dynamic IP.
+    DynHost(String),
     StatusUpdate {
         users: u32,
         files: u32,
@@ -1379,15 +1448,9 @@ fn parse_server_event(opcode: u8, payload: &[u8]) -> Vec<ServerEvent> {
             events.push(ServerEvent::CallbackFailed);
         }
         OP_SERVERMESSAGE => {
-            if payload.len() >= 2 {
-                let len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-                if payload.len() >= 2 + len {
-                    let msg = crate::security::sanitize_remote_text(
-                        &String::from_utf8_lossy(&payload[2..2 + len]),
-                        4096,
-                    );
-                    events.push(ServerEvent::Message(msg));
-                }
+            if let Some((lines, dyn_host)) = read_server_message(payload) {
+                events.extend(lines.into_iter().map(ServerEvent::Message));
+                events.extend(dyn_host.map(ServerEvent::DynHost));
             }
         }
         OP_SERVERSTATUS => {
@@ -1616,6 +1679,56 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 
+    fn message_payload(text: &str) -> Vec<u8> {
+        let mut payload = (text.len() as u16).to_le_bytes().to_vec();
+        payload.extend_from_slice(text.as_bytes());
+        payload
+    }
+
+    /// A welcome is read line by line as eMule reads it: ERROR and WARNING
+    /// lines at their level, the rest as text, and a `[emDynIP: host]` line
+    /// for the server's hostname.
+    #[test]
+    fn a_server_message_is_read_line_by_line() {
+        let (lines, dyn_host) = read_server_message(&message_payload(
+            "Welcome to Dyn\r\nERROR : you are banned\r\nWARNING: low id\r\n\r\n[emDynIP: Dyn.Example.org]\r\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                ServerMessageLine::Info("Welcome to Dyn".into()),
+                ServerMessageLine::Error("you are banned".into()),
+                ServerMessageLine::Warning("low id".into()),
+                ServerMessageLine::Info("[emDynIP: Dyn.Example.org]".into()),
+            ]
+        );
+        assert_eq!(dyn_host.as_deref(), Some("dyn.example.org"));
+        assert_eq!(lines[1].log_line(), "Server error: you are banned");
+
+        let (_, none) = read_server_message(&message_payload("[emDynIP: 1.2.3.4]")).unwrap();
+        assert_eq!(none, None, "an address is not a hostname");
+        assert!(read_server_message(&[5, 0, b'h']).is_none(), "shorter than it says");
+        assert!(read_server_message(&[1]).is_none());
+    }
+
+    /// One long welcome cannot grow past the old single-line limit by being
+    /// split into lines.
+    #[test]
+    fn a_server_message_keeps_to_its_character_budget() {
+        let text = format!("{}\n{}", "a".repeat(4000), "b".repeat(4000));
+        let (lines, _) = read_server_message(&message_payload(&text)).unwrap();
+        let kept: usize = lines
+            .iter()
+            .map(|line| match line {
+                ServerMessageLine::Info(t) | ServerMessageLine::Warning(t) | ServerMessageLine::Error(t) => {
+                    t.chars().count()
+                }
+            })
+            .sum();
+        assert_eq!(kept, MAX_SERVER_MESSAGE_CHARS);
+    }
+
     #[test]
     fn server_ident_skips_standard_unknown_tag_before_name() {
         let mut payload = vec![0u8; 26];
@@ -1704,7 +1817,7 @@ mod tests {
 
         assert!(matches!(
             events.as_slice(),
-            [ServerEvent::Message(msg)] if msg == "hi"
+            [ServerEvent::Message(ServerMessageLine::Info(msg))] if msg == "hi"
         ));
     }
 
@@ -1726,6 +1839,7 @@ mod tests {
             server_list_data: None,
             motd_messages: Vec::new(),
             server_reported_ip: 0,
+            dyn_host: None,
         }
     }
 
@@ -1776,7 +1890,7 @@ mod tests {
 
         peer.write_all(&server_message("hi")).await.unwrap();
         let (events, closed) = drain_until(&mut link, |events, _| !events.is_empty()).await;
-        assert!(matches!(events.as_slice(), [ServerEvent::Message(msg)] if msg == "hi"));
+        assert!(matches!(events.as_slice(), [ServerEvent::Message(ServerMessageLine::Info(msg))] if msg == "hi"));
         assert!(closed.is_none());
     }
 
@@ -1814,7 +1928,7 @@ mod tests {
         drop(peer);
 
         let (events, closed) = drain_until(&mut link, |_, closed| closed.is_some()).await;
-        assert!(matches!(events.as_slice(), [ServerEvent::Message(msg)] if msg == "bye"));
+        assert!(matches!(events.as_slice(), [ServerEvent::Message(ServerMessageLine::Info(msg))] if msg == "bye"));
         assert!(closed.is_some(), "the reader must report the close");
     }
 

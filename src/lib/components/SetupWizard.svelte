@@ -25,6 +25,7 @@
   } from '$lib/api/settings';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { clampInputUtf8Bytes, formatSpeed, NICKNAME_MAX_BYTES } from '$lib/utils';
 
@@ -205,6 +206,7 @@
 
   // The input stops at the byte cap as you type; this guards a value that did
   // not arrive by typing, such as a prefill.
+  let nicknameBytes = $derived(new TextEncoder().encode(nickname).length);
   let nicknameTooLong = $derived(new TextEncoder().encode(nickname.trim()).length > NICKNAME_MAX_BYTES);
 
   /** Whether the current step's required fields pass validation. */
@@ -313,6 +315,31 @@
 
   let importStatus = $state<'idle' | 'pending' | 'ok'>('idle');
   let importPercent: number | null = $state(null);
+  /** The last finish stopped at the import, so the error offers a way past it. */
+  let importFailed = $state(false);
+  /** Finish without the import the user chose. Not `emuleSelection = null`,
+   *  which would also put back the steps eMule's settings filled in. */
+  let skipImport = $state(false);
+  let willImport = $derived(emuleSelection !== null && !skipImport);
+
+  function skipImportAndFinish() {
+    skipImport = true;
+    void finish();
+  }
+
+  // Picking again after a Skip is a new choice to import, whichever way the
+  // user got back to the import step.
+  $effect(() => {
+    void emuleSelection;
+    untrack(() => (skipImport = false));
+  });
+
+  function changeImport() {
+    skipImport = false;
+    importFailed = false;
+    saveError = '';
+    step = IMPORT_STEP;
+  }
 
   /** Stage the chosen import once the download folder it needs is saved. */
   async function stageImport(selection: EmuleImportSelection): Promise<boolean> {
@@ -329,6 +356,7 @@
     } catch (e) {
       importStatus = 'idle';
       saveError = m.wizard_import_failed({ error: translateError(e, m.emule_import_stage_failed()) });
+      importFailed = true;
       return false;
     } finally {
       unlisten?.();
@@ -354,6 +382,7 @@
     udpPort = udp;
     saving = true;
     saveError = '';
+    importFailed = false;
 
     // Bootstrap downloads (ipfilter enable) bump `settings_revision` out of
     // band. Always start from the live revision so a retry after a partial
@@ -395,28 +424,39 @@
     }
     saving = false;
 
-    downloading = true;
-    dlNodesStatus = 'pending';
-    dlIpStatus = 'pending';
+    // A retry after the import failed fetches only what did not arrive the
+    // first time.
+    const fetched = (status: DlStatus) => status === 'ok' || status === 'deferred';
+    const fetchNodes = !fetched(dlNodesStatus);
+    const fetchIp = !fetched(dlIpStatus);
+    if (fetchNodes || fetchIp) {
+      downloading = true;
+      if (fetchNodes) dlNodesStatus = 'pending';
+      if (fetchIp) dlIpStatus = 'pending';
 
-    const [nodesResult, ipResult] = await Promise.allSettled([
-      downloadNodesDat(),
-      downloadIpfilter(),
-    ]);
+      const [nodesResult, ipResult] = await Promise.allSettled([
+        fetchNodes ? downloadNodesDat() : null,
+        fetchIp ? downloadIpfilter() : null,
+      ]);
 
-    dlNodesStatus = nodesResult.status === 'fulfilled'
-      ? structuredDownloadStatus(nodesResult.value)
-      : 'error';
-    dlIpStatus = ipResult.status === 'fulfilled'
-      ? structuredDownloadStatus(ipResult.value)
-      : 'error';
+      if (fetchNodes) {
+        dlNodesStatus = nodesResult.status === 'fulfilled' && nodesResult.value
+          ? structuredDownloadStatus(nodesResult.value)
+          : 'error';
+      }
+      if (fetchIp) {
+        dlIpStatus = ipResult.status === 'fulfilled' && ipResult.value
+          ? structuredDownloadStatus(ipResult.value)
+          : 'error';
+      }
 
-    // Brief pause so the user can see the green checkmarks
-    await new Promise(r => setTimeout(r, 900));
+      // Brief pause so the user can see the green checkmarks
+      await new Promise(r => setTimeout(r, 900));
+    }
 
     // Staged before `setup_complete` flips, so a failure leaves the wizard up
     // to retry or skip it, and the relaunch below is the one that applies it.
-    if (emuleSelection && importStatus !== 'ok') {
+    if (emuleSelection && !skipImport && importStatus !== 'ok') {
       importing = true;
       downloading = false;
       const staged = await stageImport(emuleSelection);
@@ -470,9 +510,10 @@
       await relaunch();
     } catch (e) {
       relaunching = false;
-      saveError = m.settings_restart_failed({ error: translateError(e) });
       // Settings are already persisted with setup_complete=true; dismiss the
       // wizard so the user can use the app and restart manually if needed.
+      // The wizard is gone by then, so the error has to outlive it.
+      addToast('error', m.settings_restart_failed({ error: translateError(e) }), 0);
       await oncomplete(final);
     }
   }
@@ -510,23 +551,28 @@
 >
   <div class="wizard-card" class:transitioning bind:this={cardEl}>
     <!-- Progress -->
-    <div class="wizard-progress">
+    <ol class="wizard-progress">
       {#each stepLabels as label, i}
-        <div class="progress-dot" class:active={i + 1 === step} class:done={i + 1 < step}>
-          <div class="dot">
-            {#if i + 1 < step}
-              <svg viewBox="0 0 16 16" fill="currentColor" width="10" height="10"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
-            {:else}
-              {i + 1}
-            {/if}
+        <li class="progress-step" aria-current={i + 1 === step ? 'step' : undefined}>
+          <div class="progress-dot" class:active={i + 1 === step} class:done={i + 1 < step}>
+            <div class="dot" aria-hidden="true">
+              {#if i + 1 < step}
+                <svg viewBox="0 0 16 16" fill="currentColor" width="10" height="10"><path d="M6.5 12.5l-4-4 1.4-1.4 2.6 2.6 5.6-5.6 1.4 1.4z"/></svg>
+              {:else}
+                {i + 1}
+              {/if}
+            </div>
+            <span class="dot-label">
+              {#if i + 1 === step}<span class="sr-only">{m.wizard_progress_step({ current: step, total: TOTAL_STEPS })}</span>{/if}
+              {label()}
+            </span>
           </div>
-          <span class="dot-label">{label()}</span>
-        </div>
-        {#if i < stepLabels.length - 1}
-          <div class="progress-line" class:filled={i + 1 < step}></div>
-        {/if}
+          {#if i < stepLabels.length - 1}
+            <div class="progress-line" class:filled={i + 1 < step} aria-hidden="true"></div>
+          {/if}
+        </li>
       {/each}
-    </div>
+    </ol>
 
     <!-- Step content -->
     <div class="wizard-body">
@@ -595,12 +641,16 @@
               oncompositionend={(e) => (nickname = clampInputUtf8Bytes(e, NICKNAME_MAX_BYTES, nickname))}
               class="text-input"
               placeholder={m.wizard_nickname_placeholder()}
+              aria-describedby="nickname-counter nickname-hint"
             />
+            <span id="nickname-counter" class="field-counter" class:full={nicknameBytes >= NICKNAME_MAX_BYTES}>
+              {m.wizard_nickname_counter({ used: nicknameBytes, max: NICKNAME_MAX_BYTES })}
+            </span>
           </div>
           {#if nicknameFromEmule}
             <p class="step-hint from-emule">{m.wizard_from_emule()}</p>
           {/if}
-          <p class="step-hint">{m.wizard_nickname_hint()}</p>
+          <p class="step-hint" id="nickname-hint">{m.wizard_nickname_hint()}</p>
         </div>
 
       {:else if step === 4}
@@ -775,7 +825,7 @@
             </div>
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_folder()}</span>
-              <span class="summary-value mono">{downloadFolder}</span>
+              <span class="summary-value mono" title={downloadFolder}>{downloadFolder}</span>
             </div>
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_ports()}</span>
@@ -798,15 +848,27 @@
               <span class="summary-value">{selectedTheme === 'dark' ? m.wizard_theme_dark() : m.wizard_theme_light()}</span>
             </div>
             <div class="summary-row">
+              <span class="summary-label">{m.wizard_launch_at_login_label()}</span>
+              <span class="summary-value">{launchAtLogin ? m.common_yes() : m.common_no()}</span>
+            </div>
+            <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_import()}</span>
-              <span class="summary-value">{emuleSelection ? m.wizard_summary_import_yes() : m.wizard_summary_import_no()}</span>
+              <span class="summary-value">{willImport ? m.wizard_summary_import_yes() : m.wizard_summary_import_no()}</span>
             </div>
           </div>
           <!-- Said before the button rather than discovered after it: the
                finish step restarts the app, which is alarming if unannounced. -->
           <p class="step-hint">{m.wizard_ready_restart_note()}</p>
           {#if saveError}
-            <p class="save-error">{saveError}</p>
+            <div class="save-error" role="alert">
+              <p>{saveError}</p>
+              {#if importFailed && !saving && !downloading && !importing}
+                <div class="error-actions">
+                  <button type="button" class="error-action" onclick={skipImportAndFinish}>{m.wizard_import_skip_finish()}</button>
+                  <button type="button" class="error-action" onclick={changeImport}>{m.wizard_import_change()}</button>
+                </div>
+              {/if}
+            </div>
           {/if}
 
           {#if downloading || dlNodesStatus !== 'idle' || dlIpStatus !== 'idle'}
@@ -850,7 +912,7 @@
                   <span class="dl-warn">{m.wizard_dl_ipfilter_failed()}</span>
                 {/if}
               </div>
-              {#if emuleSelection}
+              {#if willImport}
                 <div class="dl-item">
                   {#if importStatus === 'pending'}
                     <span class="spinner sm" aria-hidden="true"></span>
@@ -940,7 +1002,7 @@
     flex-direction: column;
     align-items: center;
     gap: 16px;
-    animation: wizard-in 400ms ease-out;
+    animation: wizard-in 250ms ease-out;
   }
 
   .relaunch-title {
@@ -965,7 +1027,7 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow-md);
-    animation: wizard-in 400ms ease-out;
+    animation: wizard-in 250ms ease-out;
     overflow: hidden;
   }
 
@@ -977,10 +1039,22 @@
   /* Progress bar */
   .wizard-progress {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0;
+    margin: 0;
     padding: 20px 28px 0;
+    list-style: none;
     flex-shrink: 0;
+  }
+
+  .progress-step {
+    display: flex;
+    align-items: flex-start;
+    flex: 1;
+  }
+
+  .progress-step:last-child {
+    flex: 0 0 auto;
   }
 
   .progress-dot {
@@ -1019,7 +1093,7 @@
   }
 
   .dot-label {
-    font-size: 9px;
+    font-size: var(--font-size-2xs);
     font-weight: 600;
     color: var(--text-muted);
     text-transform: uppercase;
@@ -1039,8 +1113,7 @@
     flex: 1;
     height: 2px;
     background: var(--border);
-    margin: 0 2px;
-    margin-bottom: 18px;
+    margin: 12px 2px 0;
     transition: background var(--transition-normal) ease;
   }
 
@@ -1205,6 +1278,19 @@
 
   .text-input:focus {
     border-color: var(--accent);
+  }
+
+  .field-counter {
+    display: block;
+    margin-top: 4px;
+    text-align: right;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .field-counter.full {
+    color: var(--warning);
   }
 
   .port-input {
@@ -1505,6 +1591,8 @@
   .summary-value.mono {
     font-family: var(--font-mono);
     font-size: var(--font-size-xs);
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   /* Footer */
@@ -1587,6 +1675,33 @@
     color: var(--danger);
     font-size: var(--font-size-md);
     line-height: 1.4;
+  }
+
+  .save-error p {
+    margin: 0;
+  }
+
+  .error-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .error-action {
+    padding: 6px 14px;
+    border: 1px solid currentColor;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .error-action:hover {
+    border-color: var(--accent);
+    color: var(--accent);
   }
 
   .dl-progress {
@@ -1682,7 +1797,12 @@
    */
   @media (max-width: 900px) {
     .progress-dot:not(.active) .dot-label {
-      display: none;
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
     }
   }
 
@@ -1691,8 +1811,13 @@
       padding: 16px 16px 0;
     }
 
-    .dot-label {
-      display: none;
+    .progress-dot .dot-label {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
     }
 
     .wizard-body {

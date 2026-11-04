@@ -28,8 +28,12 @@ pub(in crate::network) async fn on_server_connect_result(
     server_tcp_source_timer: &mut tokio::time::Interval,
 ) {
     state.pending_server_connect = None;
+    if let Ok(ServerConnectResult { ip, port, moved_to: Some(new_ip), .. }) = &result {
+        follow_moved_server(state, settings, app_handle, shared_server_addr, ip, *port, new_ip).await;
+        return;
+    }
     match result {
-        Ok(ServerConnectResult { addr, ip, port, login_tcp_port, result: Ok((conn, session)) }) => {
+        Ok(ServerConnectResult { addr, ip, port, login_tcp_port, result: Ok((conn, session)), .. }) => {
             // Check server IP against IP filter (eMule: FilterServerByIP)
             if settings.filter_servers_by_ip {
                 let server_ipv4 = match addr.ip() {
@@ -75,7 +79,14 @@ pub(in crate::network) async fn on_server_connect_result(
             let addr = SocketAddr::new(addr.ip(), port);
 
             for motd in &session.motd_messages {
-                emit_server_log(app_handle, &format!("Server: {motd}"));
+                emit_server_log(app_handle, &motd.log_line());
+            }
+            if let Some(host) = &session.dyn_host {
+                if state.server_list.set_dyn_host(&ip, port, host) {
+                    info!("Server {ip}:{port} is on a dynamic IP, known as {host}");
+                    let met_path = state.data_dir.join("server.met");
+                    spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
+                }
             }
 
             let mut conn = conn.into_link(session.clone());
@@ -110,6 +121,7 @@ pub(in crate::network) async fn on_server_connect_result(
                 );
             }
             state.server_connected = true;
+            refresh_hello_client_id(state);
             state.server_last_attempt_failed = false;
             ed2k::server::set_server_flags_mirror(session.server_flags);
             ed2k::server::set_server_session_up(true);
@@ -246,7 +258,8 @@ pub(in crate::network) async fn on_server_connect_result(
                     // SetPublicIP(dwServerReportedIP)`. LowID keeps us
                     // firewalled, so unlike the HighID branch we do NOT touch
                     // firewalled status here beyond note_tcp_firewalled above;
-                    // this only teaches us our external IP.
+                    // this only teaches us our external IP. Our Hellos keep
+                    // advertising the LowID (`hello_client_id_for`).
                     let ext_ip = Ipv4Addr::from(session.server_reported_ip.to_le_bytes());
                     if !crate::security::is_special_use_v4(ext_ip)
                         && state.external_ip.is_none()
@@ -487,6 +500,55 @@ pub(in crate::network) async fn on_server_connect_result(
                     .unwrap_or_else(|| "server connection task failed".to_string());
                 abandon_server_auto_reconnect(state, app_handle, &detail);
             }
+        }
+    }
+}
+
+/// A server on a dynamic IP turned out, by its hostname, to be at `new_ip`
+/// now. Move its list entry (and the preferred server, if it was this one)
+/// and connect again there, through the same checks as any connect, so the
+/// IP filter judges the new address before anything is sent to it.
+#[allow(clippy::too_many_arguments)]
+async fn follow_moved_server(
+    state: &mut NetworkState,
+    settings: &AppSettings,
+    app_handle: &tauri::AppHandle,
+    shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
+    ip: &str,
+    port: u16,
+    new_ip: &str,
+) {
+    /// A second move this soon is a flipping DNS answer, not a server moving:
+    /// it waits out the usual backoff as a failed attempt instead.
+    const MIN_MOVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    if state.server_last_moved_at.is_some_and(|at| at.elapsed() < MIN_MOVE_INTERVAL) {
+        let error = format!("its hostname now points to {new_ip}, after moving moments ago");
+        record_server_connect_failure(state, settings, app_handle, ip, port, &error);
+        state.server_last_attempt_failed = true;
+        state.server_last_connect_attempt = Some(std::time::Instant::now());
+        *shared_server_addr.write().await = None;
+        state.stats.server_status = "disconnected".to_string();
+        let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
+        return;
+    }
+    state.server_last_moved_at = Some(std::time::Instant::now());
+    info!("Server {ip}:{port} has moved to {new_ip}:{port}");
+    emit_server_log(app_handle, &format!("Server {ip}:{port} has moved to {new_ip}:{port}."));
+    if state.server_list.move_server(ip, port, new_ip) {
+        let met_path = state.data_dir.join("server.met");
+        spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
+    }
+    if state.preferred_ed2k_server.as_ref().is_some_and(|(pip, pport)| pip == ip && *pport == port) {
+        state.preferred_ed2k_server = Some((new_ip.to_string(), port));
+    }
+    *shared_server_addr.write().await = None;
+    if let Err(reason) =
+        initiate_server_connect(state, settings, app_handle, shared_server_addr, new_ip.to_string(), port).await
+    {
+        state.stats.server_status = "disconnected".to_string();
+        let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "disconnected" }));
+        if state.server_auto_reconnect {
+            abandon_server_auto_reconnect(state, app_handle, &format!("server {new_ip}:{port}: {reason}"));
         }
     }
 }

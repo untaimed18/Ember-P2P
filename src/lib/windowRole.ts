@@ -47,10 +47,13 @@ export interface ChatWindowPresence {
 /** Main window only. Null while the chat window is closed. */
 export const chatWindowPresence = writable<ChatWindowPresence | null>(null);
 
-/** The chat window is showing this conversation where the user can see it. */
+/** The user is reading this conversation in the chat window. Visible is not
+ *  enough: a window behind another app is not being read. */
 export function chatWindowShows(hash: string): boolean {
   const presence = get(chatWindowPresence);
-  return !!presence && presence.visible && presence.activeHash === hash.toLowerCase();
+  return (
+    !!presence && presence.visible && presence.focused && presence.activeHash === hash.toLowerCase()
+  );
 }
 
 /** The user is working in the chat window, which is working in Ember. */

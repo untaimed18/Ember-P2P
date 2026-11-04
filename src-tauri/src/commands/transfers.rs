@@ -371,10 +371,10 @@ async fn persist_transfer_statuses(state: &AppState, statuses: Vec<(String, Stri
 }
 
 /// The ids among `ids` with no source discovery running before a resume: a
-/// queued row Stop or a full disk ended (both drop its pending download and
-/// its control), or an active row with no worker that the resume may park in
-/// the queue when the cap is full (see `TransferManager::resume`). A paused
-/// queued row is not one: its pending download survives the pause.
+/// queued row Stop, Pause or a full disk ended, or an active row with no
+/// worker that the resume may park in the queue when the cap is full (see
+/// `TransferManager::resume`). Pause counts: it cancels the control its
+/// pending download holds, and the source-retry tick then drops that entry.
 fn rows_needing_discovery(
     manager: &crate::sharing::manager::TransferManager,
     ids: &[String],
@@ -383,7 +383,10 @@ fn rows_needing_discovery(
         .filter(|id| {
             manager.queue.iter().any(|t| {
                 &t.id == *id
-                    && matches!(t.status, TransferStatus::Stopped | TransferStatus::Insufficient)
+                    && matches!(
+                        t.status,
+                        TransferStatus::Stopped | TransferStatus::Paused | TransferStatus::Insufficient
+                    )
             }) || manager.active.get(id.as_str()).is_some_and(|t| {
                 matches!(t.status, TransferStatus::Paused | TransferStatus::Insufficient)
             })
@@ -832,9 +835,51 @@ pub(crate) async fn cleanup_partial_files(db: &Arc<Database>, download_roots: &[
     }
 }
 
+/// Downloads cleaned at once within one folder. Each can spend seconds
+/// retrying a file that is still held open, so one at a time a long batch
+/// ran past the folder's budget on a folder that did answer.
+const PARTIAL_CLEANUP_CONCURRENCY: usize = 8;
+
+/// Run each download's cleanup, [`PARTIAL_CLEANUP_CONCURRENCY`] at a time,
+/// until `deadline`. Returns the ids whose cleanup did not finish.
+async fn clean_ids_until<Fut>(
+    cleanups: Vec<(&str, Fut)>,
+    deadline: tokio::time::Instant,
+) -> Vec<&str>
+where
+    Fut: std::future::Future<Output = ()>,
+{
+    use futures::StreamExt;
+    async fn cleaned<Fut: std::future::Future<Output = ()>>(id: &str, cleaning: Fut) -> &str {
+        cleaning.await;
+        id
+    }
+    let ids: Vec<&str> = cleanups.iter().map(|(id, _)| *id).collect();
+    let mut queue = cleanups.into_iter();
+    let mut running = futures::stream::FuturesUnordered::new();
+    let mut done = std::collections::HashSet::new();
+    let run = async {
+        loop {
+            while running.len() < PARTIAL_CLEANUP_CONCURRENCY {
+                let Some((id, cleaning)) = queue.next() else {
+                    break;
+                };
+                running.push(cleaned(id, cleaning));
+            }
+            let Some(id) = running.next().await else {
+                break;
+            };
+            done.insert(id);
+        }
+    };
+    let _ = tokio::time::timeout_at(deadline, run).await;
+    ids.into_iter().filter(|id| !done.contains(id)).collect()
+}
+
 /// [`cleanup_partial_files`] for many downloads at once: each folder is asked
 /// whether it can be reached once, and cleaned for all of them within one
-/// [`PARTIAL_CLEANUP_FOLDER_BUDGET`].
+/// [`PARTIAL_CLEANUP_FOLDER_BUDGET`]. Only the downloads a folder did not get
+/// through in time are left for when it answers.
 async fn cleanup_partial_files_many(
     db: &Arc<Database>,
     download_roots: &[String],
@@ -861,31 +906,34 @@ async fn cleanup_partial_files_many(
             crate::network::ed2k::part_tracker::suppress_met_saves(&paths(id)[1]);
         }
         let allowed = vec![root.clone()];
-        let cleanup = async {
-            let folder = std::path::PathBuf::from(root);
-            let reachable = tokio::task::spawn_blocking(move || {
+        let deadline = tokio::time::Instant::now() + PARTIAL_CLEANUP_FOLDER_BUDGET;
+        let folder = std::path::PathBuf::from(root);
+        let reachable = tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || {
                 crate::storage::part_folders::folder_reachable(&folder)
-            })
-            .await
-            .unwrap_or(false);
-            if reachable {
-                for id in ids {
-                    let [part_path, met_path] = paths(id);
+            }),
+        )
+        .await
+        .is_ok_and(|reached| reached.unwrap_or(false));
+        let unfinished = if reachable {
+            let allowed = &allowed;
+            let mut cleanups = Vec::with_capacity(ids.len());
+            for &id in ids.iter() {
+                let [part_path, met_path] = paths(id);
+                cleanups.push((id, async move {
                     tokio::join!(
-                        cleanup_one_partial(&part_path, &allowed, 6, 500),
-                        cleanup_one_partial(&met_path, &allowed, 6, 500),
+                        cleanup_one_partial(&part_path, allowed, 6, 500),
+                        cleanup_one_partial(&met_path, allowed, 6, 500),
                     );
-                }
+                }));
             }
-            reachable
+            clean_ids_until(cleanups, deadline).await
+        } else {
+            ids.clone()
         };
-        let cleaned = tokio::time::timeout(PARTIAL_CLEANUP_FOLDER_BUDGET, cleanup)
-            .await
-            .unwrap_or(false);
-        if cleaned {
-            return Vec::new();
-        }
-        ids.iter()
+        unfinished
+            .into_iter()
             .filter(|id| crate::storage::part_folders::may_hold_parts(id, Path::new(root)))
             .flat_map(|id| {
                 tracing::warn!("Removing {id}'s part files from {root} once it answers");
@@ -1469,23 +1517,154 @@ async fn attach_link_web_sources(state: &AppState, file_hash: &str, urls: Vec<St
     else {
         return;
     };
-    let added = crate::network::ed2k::web_sources::register(
+    let registered = crate::network::ed2k::web_sources::register_replacing_retired(
         hash,
         urls.into_iter()
             .take(crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE * 2),
     );
-    if added.is_empty() {
+    if registered.added.is_empty() && registered.revived.is_empty() {
         return;
     }
-    tracing::info!("Download of {file_hash} has {} web source(s) from its link", added.len());
+    tracing::info!(
+        "Download of {file_hash} has {} web source(s) from its link, {} tried again",
+        registered.added.len(),
+        registered.revived.len()
+    );
+    save_web_sources(state, file_hash, registered.added, registered.replaced).await;
+}
+
+/// Save web sources just registered for `file_hash`, so the download keeps
+/// them across restarts and re-queues, and forget the retired ones they
+/// replaced, so a restart does not bring those back in their place.
+async fn save_web_sources(state: &AppState, file_hash: &str, added: Vec<String>, replaced: Vec<String>) {
     let db = state.db.clone();
     let fh = file_hash.to_string();
     db_blocking(move || {
+        for url in &replaced {
+            if let Err(e) = db.delete_transfer_web_source(&fh, url) {
+                tracing::warn!("Failed to forget a retired web source of {fh}: {e}");
+            }
+        }
         if let Err(e) = db.add_transfer_web_sources(&fh, &added) {
             tracing::warn!("Failed to save the web sources of {fh}: {e}");
         }
     })
     .await;
+}
+
+/// Lines the Add web mirror dialog may send at once: past the per-file cap
+/// already, with room for a few the cap would refuse to be reported as such.
+const MAX_WEB_SOURCE_LINES: usize = 20;
+
+/// What adding web mirrors by hand did, for the dialog to say.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AddedWebSources {
+    /// Mirrors now in use: new ones, and ones given up on after failures and
+    /// asked for again.
+    pub added: u32,
+    /// Mirrors it already had in use, or had retired for sending bad data.
+    pub already: u32,
+    /// Valid mirrors left out because the download has as many as it keeps.
+    pub over_limit: u32,
+    /// Lines that can never be a mirror (not http or https, carrying a
+    /// password, naming this computer or the local network), whole: the
+    /// dialog puts them back for the user to correct.
+    pub refused: Vec<String>,
+}
+
+/// Add web mirrors to a download still in progress, the same way pasting its
+/// link again with `s=` mirrors does: validated, capped per file, used at once
+/// and kept across restarts. The main window's alone: it has Ember fetch
+/// addresses from the internet, and the chat window imports the module its
+/// wrapper is in, so the denied list cannot name it.
+#[tauri::command]
+pub async fn add_transfer_web_sources(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppState>,
+    transfer_id: String,
+    urls: Vec<String>,
+) -> Result<AddedWebSources, String> {
+    use crate::network::ed2k::web_sources;
+    crate::commands::chat_window::require_main_window(&window)?;
+    // The dialog sends no blank lines, so the count is checked before any is
+    // looked at.
+    if urls.len() > MAX_WEB_SOURCE_LINES {
+        return Err(coded(
+            "transfers_too_many_web_sources",
+            "Enter at most 20 web mirrors at once",
+        ));
+    }
+    if !web_sources::enabled() {
+        return Err(coded(
+            "transfers_web_sources_off",
+            "Web sources are turned off in Settings > Transfers",
+        ));
+    }
+    let file_hash = {
+        let manager = state.transfer_manager.read().await;
+        let Some(transfer) = manager.get_transfer(&transfer_id) else {
+            return Err(coded("transfers_transfer_not_found", "Transfer not found"));
+        };
+        // A part is never fetched again once the file is being checked,
+        // moved or done, so a mirror added then would only sit in the table.
+        if transfer.direction != TransferDirection::Download
+            || matches!(
+                transfer.status,
+                TransferStatus::Verifying
+                    | TransferStatus::Completing
+                    | TransferStatus::Hashing
+                    | TransferStatus::Completed
+                    | TransferStatus::Failed
+            )
+        {
+            return Err(coded(
+                "transfers_cannot_add_web_sources",
+                "Web mirrors can only be added to a download that is still in progress",
+            ));
+        }
+        transfer.file_hash.clone()
+    };
+    let Some(hash) = hex::decode(&file_hash).ok().and_then(|b| <[u8; 16]>::try_from(b).ok()) else {
+        return Err(coded(
+            "transfers_cannot_add_web_sources",
+            "Web mirrors can only be added to a download that is still in progress",
+        ));
+    };
+
+    let (result, registered) = register_web_source_lines(hash, &urls);
+    if result.added > 0 {
+        tracing::info!(
+            "Download of {file_hash} has {} web source(s) added by hand, {} tried again",
+            registered.added.len(),
+            registered.revived.len()
+        );
+        save_web_sources(&state, &file_hash, registered.added, registered.replaced).await;
+    }
+    Ok(result)
+}
+
+/// Register the dialog's lines as web sources of `hash` and count what each
+/// line came to.
+fn register_web_source_lines(
+    hash: [u8; 16],
+    lines: &[String],
+) -> (AddedWebSources, crate::network::ed2k::web_sources::Registered) {
+    use crate::network::ed2k::web_sources;
+    let mut result = AddedWebSources::default();
+    let mut valid: Vec<String> = Vec::new();
+    for line in lines.iter().map(|line| line.trim()).filter(|line| !line.is_empty()) {
+        match web_sources::normalize_web_source_url(line) {
+            None => result.refused.push(line.to_string()),
+            Some(url) if valid.contains(&url) => result.already += 1,
+            Some(url) => valid.push(url),
+        }
+    }
+    let registered = web_sources::register_replacing_retired(hash, valid);
+    // One given up on and asked for again is in use again: added, to the user.
+    result.added = (registered.added.len() + registered.revived.len()) as u32;
+    result.already += registered.already as u32;
+    result.over_limit = registered.over_limit as u32;
+    (result, registered)
 }
 
 #[tauri::command]
@@ -2269,12 +2448,14 @@ pub async fn resume_transfers_batch(
 
 #[tauri::command]
 pub async fn stop_transfers_batch(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
     let transfer_ids = without_completing(&state, transfer_ids).await;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
+    let mut stopped_statuses = Vec::new();
     let mut send_error = None;
     for transfer_id in transfer_ids {
         let (stopped, promoted) = {
@@ -2290,6 +2471,7 @@ pub async fn stop_transfers_batch(
         // See `stop_transfer`.
         if stopped {
             persist_transfer_status(&state, &transfer_id, &TransferStatus::Stopped).await;
+            stopped_statuses.push((transfer_id.clone(), TransferStatus::Stopped));
         }
         // Bounded, and the first failure ends the batch — see the note in
         // `pause_transfers_batch` for why carrying on is worse than stopping.
@@ -2306,6 +2488,7 @@ pub async fn stop_transfers_batch(
             break;
         }
     }
+    emit_transfer_statuses(&app, &stopped_statuses);
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
     match send_error {
@@ -2342,11 +2525,39 @@ async fn without_completing(state: &AppState, transfer_ids: Vec<String>) -> Vec<
         .collect()
 }
 
+/// Cancel's network teardown for `transfer_id`, sent once the network queue
+/// has room, for a batch that could not send it within the bound. The row is
+/// already gone from the manager; without this its worker, searches and
+/// published source entry outlived it for the session.
+fn send_cancel_teardown_later(
+    network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
+    transfer_id: &str,
+) {
+    let network_tx = network_tx.clone();
+    let transfer_id = transfer_id.to_string();
+    tokio::spawn(async move {
+        // The deleting form: Some ack, whether or not anyone waits on it.
+        let (ack_tx, _) = tokio::sync::oneshot::channel();
+        if network_tx
+            .send(NetworkCommand::CancelDownload {
+                transfer_id: transfer_id.clone(),
+                cleanup_ack: Some(ack_tx),
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!("Cancel of {transfer_id} never reached the network task");
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn cancel_transfers_batch(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     check_batch_size(&transfer_ids)?;
     let transfer_ids = without_completing(&state, transfer_ids).await;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
@@ -2355,6 +2566,7 @@ pub async fn cancel_transfers_batch(
     let mut history_rows: Vec<(String, String, u64, &str)> =
         Vec::with_capacity(transfer_ids.len());
     let mut teardown_failures = 0usize;
+    let mut network_unresponsive = false;
     for transfer_id in transfer_ids {
         let (promoted, cancelled_info) = {
             let mut manager = state.transfer_manager.write().await;
@@ -2378,17 +2590,32 @@ pub async fn cancel_transfers_batch(
         }
         cancelled_ids.push(transfer_id.clone());
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        if let Err(e) = state.network_tx.try_send(NetworkCommand::CancelDownload {
-            transfer_id: transfer_id.clone(),
-            cleanup_ack: Some(ack_tx),
-        }) {
-            tracing::warn!(
-                "cancel_transfers_batch: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
-            );
+        if network_unresponsive {
+            send_cancel_teardown_later(&state.network_tx, &transfer_id);
             teardown_failures += 1;
-        } else {
-            pending_acks.push((transfer_id.clone(), ack_rx));
+            continue;
+        }
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        match bounded_send(
+            &state.network_tx,
+            NetworkCommand::CancelDownload {
+                transfer_id: transfer_id.clone(),
+                cleanup_ack: Some(ack_tx),
+            },
+        )
+        .await
+        {
+            Ok(()) => pending_acks.push((transfer_id.clone(), ack_rx)),
+            Err(e) => {
+                tracing::warn!(
+                    "cancel_transfers_batch: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
+                );
+                // One wait out per batch: the rest go straight to the
+                // background instead of each waiting out the bound again.
+                network_unresponsive = true;
+                send_cancel_teardown_later(&state.network_tx, &transfer_id);
+                teardown_failures += 1;
+            }
         }
     }
 
@@ -2441,9 +2668,13 @@ pub async fn cancel_transfers_batch(
         })
         .await;
     }
-    for transfer_id in cancelled_ids {
-        cleanup_partial_files(&state.db, &dl_roots, &transfer_id).await;
-        spawn_deferred_partial_cleanup(state.db.clone(), dl_roots.clone(), transfer_id.clone());
+    cleanup_partial_files_many(&state.db, &dl_roots, &cancelled_ids).await;
+    {
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            cleanup_partial_files_many(&db, &dl_roots, &cancelled_ids).await;
+        });
     }
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
@@ -2985,7 +3216,7 @@ pub async fn delete_finished_downloads(
         };
         match deleted {
             Ok(()) => {
-                if let Err(e) = remove_transfer(state.clone(), transfer_id.clone()).await {
+                if let Err(e) = discard_transfer(&state, transfer_id.clone(), true).await {
                     tracing::warn!("The file of {transfer_id} was deleted but its row could not be removed: {e}");
                 }
                 report.removed.push(transfer_id);
@@ -3011,9 +3242,11 @@ pub async fn delete_finished_downloads(
 
 #[tauri::command]
 pub async fn remove_transfer(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     discard_transfer(&state, transfer_id, true).await
 }
 
@@ -3276,6 +3509,20 @@ pub async fn set_transfer_priority(
     {
         let mut manager = state.transfer_manager.write().await;
         manager.set_priority(&transfer_id, &priority);
+    }
+    if let Err(e) = bounded_send(
+        &state.network_tx,
+        NetworkCommand::SetPendingPriority {
+            transfer_id: transfer_id.clone(),
+            priority,
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            "Priority of {} saved, but its pending source search keeps the old one until it restarts: {e}",
+            transfer_id_short(&transfer_id)
+        );
     }
     Ok(())
 }
@@ -3793,16 +4040,22 @@ pub async fn set_preview_priority(
     transfer_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let transfer = {
+    let known = {
         let mut manager = state.transfer_manager.write().await;
         manager.set_preview_priority(&transfer_id, enabled);
-        manager.get_transfer(&transfer_id).cloned()
+        manager.get_transfer(&transfer_id).is_some()
     };
-    if let Some(t) = transfer {
-        if let Err(error) = persist_transfer(&state, &t).await {
+    if known {
+        let db = state.db.clone();
+        let tid = transfer_id.clone();
+        let saved = tokio::task::spawn_blocking(move || db.update_transfer_preview_priority(&tid, enabled))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|result| result.map_err(|e| e.to_string()));
+        if let Err(error) = saved {
             tracing::warn!(
                 "Failed to persist preview-priority change for transfer {}: {error}",
-                transfer_id_short(&t.id)
+                transfer_id_short(&transfer_id)
             );
         }
     }
@@ -4010,9 +4263,11 @@ pub async fn clear_completed(
 
 #[tauri::command]
 pub async fn recover_archive(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<String, String> {
+    crate::commands::chat_window::require_main_window(&window)?;
     static RECOVERY_CONCURRENCY: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     let permit = RECOVERY_CONCURRENCY
@@ -4366,6 +4621,54 @@ mod ipc_lifecycle_tests {
         assert!(!in_new(&b).exists());
         assert!(in_old(&kept).exists(), "a download not cleared keeps its part files");
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// One download whose files stay held does not keep the rest of the batch
+    /// from being cleaned, and only what was not cleaned is left for later.
+    #[tokio::test]
+    async fn a_batch_cleanup_leaves_only_the_unfinished_for_later() {
+        let ids: Vec<String> = (0..PARTIAL_CLEANUP_CONCURRENCY * 2).map(|i| format!("id{i}")).collect();
+        let cleanups: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let held = if id == "id0" { 60_000 } else { 50 };
+                (id.as_str(), async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(held)).await;
+                })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        let unfinished = clean_ids_until(cleanups, deadline).await;
+        assert_eq!(unfinished, ["id0"]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// The Add web mirror dialog's counts, and its refused lines handed back
+    /// whole so a corrected one is the address the user typed.
+    #[test]
+    fn adding_web_mirrors_counts_each_line_and_echoes_refused_ones_whole() {
+        use crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE;
+        let hash: [u8; 16] = *uuid::Uuid::new_v4().as_bytes();
+        let long_refused = format!("ftp://mirror.example/{}", "a".repeat(400));
+        let mut lines: Vec<String> = (0..MAX_WEB_SOURCES_PER_FILE + 2)
+            .map(|i| format!("https://m{i}.example/file"))
+            .collect();
+        lines.push("  https://m0.example/file#again  ".to_string());
+        lines.push("   ".to_string());
+        lines.push(long_refused.clone());
+        lines.push("http://user:pass@m9.example/file".to_string());
+
+        let (result, registered) = register_web_source_lines(hash, &lines);
+        assert_eq!(result.added as usize, MAX_WEB_SOURCES_PER_FILE);
+        assert_eq!(registered.added.len(), MAX_WEB_SOURCES_PER_FILE);
+        assert_eq!(result.already, 1, "the same mirror twice in one paste");
+        assert_eq!(result.over_limit, 2);
+        assert_eq!(result.refused, [long_refused, "http://user:pass@m9.example/file".to_string()]);
+
+        let (again, _) = register_web_source_lines(hash, &lines[..1]);
+        assert_eq!((again.added, again.already), (0, 1), "a mirror already in use");
+        crate::network::ed2k::web_sources::forget(&hash);
     }
 
     /// Resume is offered on a failed row only while its `.part` is there, in
@@ -4989,5 +5292,33 @@ mod ipc_lifecycle_tests {
 
         assert!(!met.exists(), ".part.met must still be deleted if .part is missing");
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Pausing a queued download ends its pending source discovery, so a
+    /// resume that leaves it queued has to start that again.
+    #[test]
+    fn a_paused_queued_download_needs_discovery_on_resume() {
+        let row = |id: &str, status: &str| -> Transfer {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "file_name": "movie.bin",
+                "file_hash": "00".repeat(16),
+                "peer_id": "",
+                "peer_name": "",
+                "direction": "download",
+                "status": status,
+                "progress": 0.0,
+                "speed": 0,
+                "total_size": 100,
+                "transferred": 0,
+                "started_at": 0,
+            }))
+            .unwrap()
+        };
+        let mut manager = crate::sharing::manager::TransferManager::new(1);
+        manager.queue.push_back(row("paused", "paused"));
+        manager.queue.push_back(row("waiting", "queued"));
+        let ids = vec!["paused".to_string(), "waiting".to_string()];
+        assert_eq!(rows_needing_discovery(&manager, &ids), vec!["paused".to_string()]);
     }
 }

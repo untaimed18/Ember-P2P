@@ -3622,7 +3622,8 @@ pub(super) async fn handle_inbound_channel_edit(
 /// reply does by design; charging nothing at all would leave the per-hop budget
 /// as the only bound, and at a full batch per frame that is over a thousand
 /// database writes a second from one peer. Per member, a flood costs the flooder
-/// their own allowance and nobody else's.
+/// their own allowance and nobody else's. Only a recent reaction is charged: an
+/// old one is catch-up or a replay, bounded by the room's entry budget instead.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_inbound_channel_reactions(
     socket: &UdpSocket,
@@ -3665,7 +3666,13 @@ pub(super) async fn handle_inbound_channel_reactions(
         if refused.contains(&entry.member) {
             continue;
         }
-        if !allowed.contains(&entry.member) {
+        // Only a reaction its member is making now is charged to them. The
+        // signature does not cover the envelope, so an old one can be sent
+        // again under any number of fresh ones; charged, each copy would spend
+        // the member's allowance on every node it reached and silence their
+        // chat there. Old ones are what catch-up serves, and the room budget
+        // above still bounds them.
+        if ember::channel::gossip_fresh_for_relay(entry.reacted_at, now) && !allowed.contains(&entry.member) {
             if channel_author_gossip_ok(state, gossip.channel_id, &entry.member) {
                 allowed.insert(entry.member);
             } else {

@@ -66,7 +66,8 @@
     incomingCollection,
     markIncomingCollectionPresented,
   } from '$lib/stores/collection';
-  import { addActionToast, toast as toastInfo, toastSuccess, toastError, toastWarning } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { addActionToast, toast: toastInfo, toastSuccess, toastError, toastWarning } = toastsFor('library');
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
     formatSize,
@@ -78,7 +79,7 @@
   } from '$lib/utils';
   import type { FileInfo, MediaMetadata } from '$lib/types';
   import { onMount, tick, untrack } from 'svelte';
-  import { fly } from 'svelte/transition';
+  import { fade, fly, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
 
   import { listen } from '@tauri-apps/api/event';
@@ -109,14 +110,15 @@
   import { openChatFilesFolder } from '$lib/api/friends';
   import { openChannelFilesFolder } from '$lib/api/channels';
   import { openFeedFilesFolder } from '$lib/api/feeds';
-  import { inertBackground, trapTabKey } from '$lib/a11y';
+  import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
   import { appSettings } from '$lib/stores/settings';
   import { openWebService } from '$lib/api/settings';
   import { serviceAvailableFor } from '$lib/webServices';
-  import { MQ_MAX_LG } from '$lib/layoutBreakpoints';
+  import { BP_SM, MQ_MAX_LG } from '$lib/layoutBreakpoints';
   import { createMaxWaitDebounce } from '$lib/debounce';
+  import { createSortMemo, sortWithMemo } from '$lib/sortMemo';
   import { isShortcutLetter } from '$lib/shortcutKey';
   import {
     applySharedFileStats,
@@ -169,12 +171,20 @@
   let confirmOpen = $state(false);
   let confirmTitle = $state('');
   let confirmMessage = $state('');
+  let confirmLabel = $state<string | undefined>(undefined);
+  let confirmDanger = $state(true);
   let confirmResolver: ((confirmed: boolean) => void) | null = null;
 
-  function askConfirm(message: string, title: string): Promise<boolean> {
+  function askConfirm(
+    message: string,
+    title: string,
+    opts: { confirmLabel?: string; danger?: boolean } = {},
+  ): Promise<boolean> {
     confirmResolver?.(false);
     confirmMessage = message;
     confirmTitle = title;
+    confirmLabel = opts.confirmLabel;
+    confirmDanger = opts.danger ?? true;
     confirmOpen = true;
     return new Promise<boolean>((resolve) => {
       confirmResolver = resolve;
@@ -203,10 +213,25 @@
   /** Bumped whenever an action or event decides `stoppedByUser`, so the
    *  mount-time `getHashingPaused` answer cannot undo a Resume made first. */
   let hashingStateEpoch = 0;
-  let fileByPath = $derived.by(() => {
-    const map = new Map<string, FileInfo>();
-    for (const f of files) map.set(f.path, f);
+  /** Where each path sits in `treeFiles`, and so in `files`: upload counters
+   *  replace rows in place without moving any, so this is not rebuilt for them. */
+  let rowIndexByPath = $derived.by(() => {
+    const map = new Map<string, number>();
+    for (let i = 0; i < treeFiles.length; i++) map.set(treeFiles[i].path, i);
     return map;
+  });
+  let fileByPath = $derived.by(() => {
+    const index = rowIndexByPath;
+    const rows = files;
+    return {
+      get(path: string): LibraryRow | undefined {
+        const i = index.get(path);
+        if (i === undefined) return undefined;
+        const row = rows[i];
+        return row?.path === path ? row : rows.find((f) => f.path === path);
+      },
+      has: (path: string) => index.has(path),
+    };
   });
   let selectedFile = $derived(selectedPath ? (fileByPath.get(selectedPath) ?? null) : null);
   let selectedHash = $derived.by(() => selectedFile?.hash || null);
@@ -310,13 +335,7 @@
     renameDialog.error = null;
     try {
       const { path: newPath, warning } = await renameLibraryFile(path, value);
-      if (selectedPath === path) selectedPath = newPath;
-      if (checkedPaths.has(path)) {
-        const next = new Set(checkedPaths);
-        next.delete(path);
-        next.add(newPath);
-        checkedPaths = next;
-      }
+      followRenamedPaths([{ from: path, to: newPath }]);
       renameDialog.busy = false;
       closeRename();
       await refresh();
@@ -357,7 +376,8 @@
       const count = loadedCollection.files.length;
       const name = loadedCollection.name;
       toastSuccess(plural(count, {
-        one: () => m.library_collection_loaded_one({ name }),
+        one: () => m.library_collection_loaded_one({ name, count: formatNumber(count) }),
+        oneShowsCount: true,
         few: () => m.library_collection_loaded_few({ name, count: formatNumber(count) }),
         other: () => m.library_collection_loaded({ name, count: formatNumber(count) }),
       }));
@@ -400,20 +420,23 @@
       }
       if (queued > 0) {
         toastSuccess(plural(queued, {
-          one: m.library_queued_files_download_one,
+          one: () => m.library_queued_files_download_one({ count: formatNumber(queued) }),
+          oneShowsCount: true,
           other: () => m.library_queued_files_download({ count: formatNumber(queued) }),
         }));
       }
       if (skipped > 0 || oversize > 0) {
         const totalSkipped = skipped + oversize;
         toastWarning(plural(totalSkipped, {
-          one: m.library_collection_entries_skipped_one,
+          one: () => m.library_collection_entries_skipped_one({ count: formatNumber(totalSkipped) }),
+          oneShowsCount: true,
           other: () => m.library_collection_entries_skipped({ count: formatNumber(totalSkipped) }),
         }));
       }
       if (failed > 0) {
         toastWarning(plural(failed, {
-          one: m.library_collection_start_failed_one,
+          one: () => m.library_collection_start_failed_one({ count: formatNumber(failed) }),
+          oneShowsCount: true,
           other: () => m.library_collection_start_failed({ count: formatNumber(failed) }),
         }));
       }
@@ -573,7 +596,8 @@
       const name = newCollName.trim();
       const count = formatNumber(collFiles.length);
       toastSuccess(plural(collFiles.length, {
-        one: () => m.library_collection_created_one({ name }),
+        one: () => m.library_collection_created_one({ name, count }),
+        oneShowsCount: true,
         few: () => m.library_collection_created_few({ name, count }),
         other: () => m.library_collection_created({ name, count }),
       }));
@@ -748,11 +772,13 @@
       const count = Math.max(missingTotalCount, missingPathSet.size);
       const confirmed = await askConfirm(
         plural(count, {
-          one: m.library_confirm_remove_missing_one,
+          one: () => m.library_confirm_remove_missing_one({ count: formatNumber(count) }),
+          oneShowsCount: true,
           few: () => m.library_confirm_remove_missing_few({ count: formatNumber(count) }),
           other: () => m.library_confirm_remove_missing_other({ count: formatNumber(count) }),
         }),
         m.library_remove_missing_title(),
+        { confirmLabel: m.common_remove() },
       );
       if (!confirmed) return;
       let removed = 0;
@@ -780,8 +806,9 @@
     if (!f || !missingPathSet.has(f.path)) return;
     try {
       const confirmed = await askConfirm(
-        m.library_confirm_remove_missing_one(),
+        m.library_confirm_remove_missing_one({ count: formatNumber(1) }),
         m.library_remove_missing_title(),
+        { confirmLabel: m.common_remove() },
       );
       if (!confirmed) return;
       const removed = await removeMissingFiles([f.path]);
@@ -799,8 +826,7 @@
       missingTotalCount = Math.max(0, missingTotalCount - 1);
       if (selectedPath === f.path) selectedPath = null;
       if (showMissingOnly && missingPathSet.size === 0) showMissingOnly = false;
-      await refreshMissingSet(true);
-      await refresh();
+      await Promise.all([refreshMissingSet(true), refresh()]);
     } catch (e: unknown) {
       toastError(toErr(e));
     }
@@ -1066,6 +1092,7 @@
       // Unshared files stay listed, as Not shared, so they can be shared again
       // from here.
       const listed = snapshot.files;
+      const previousIndex = movedAway ? rowIndexByPath : null;
       if (listed) {
         files = listed.map(withMatchKeys);
         treeFiles = files;
@@ -1089,16 +1116,19 @@
       // bulk-bar count and later bulk ops could reference ghost paths.
       if (listed && (checkedPaths.size > 0 || selectedPath)) {
         const present = new Set(listed.map((f) => f.path));
+        const moved = movedAway && previousIndex ? movedPathsIn(listed, present, previousIndex, movedAway) : null;
+        const follow = (p: string): string | null => (present.has(p) ? p : (moved?.get(p) ?? null));
         if (checkedPaths.size > 0) {
-          let removed = false;
+          let changed = false;
           const nextChecked = new Set<string>();
           for (const p of checkedPaths) {
-            if (present.has(p)) nextChecked.add(p);
-            else removed = true;
+            const now = follow(p);
+            if (now !== null) nextChecked.add(now);
+            if (now !== p) changed = true;
           }
-          if (removed) {
+          if (changed) {
             checkedPaths = nextChecked;
-            if (lastClickedPath && !present.has(lastClickedPath)) lastClickedPath = null;
+            if (lastClickedPath && !present.has(lastClickedPath)) lastClickedPath = follow(lastClickedPath);
           }
         }
         // `selectedFile`/the details drawer derive from `selectedPath`
@@ -1107,7 +1137,7 @@
         // computing its current index as -1 and jumping to row 0
         // unexpectedly, and Space/Enter/Delete acting as if nothing is
         // selected until the user clicks a row again.
-        if (selectedPath && !present.has(selectedPath)) selectedPath = null;
+        if (selectedPath && !present.has(selectedPath)) selectedPath = follow(selectedPath);
       }
     } catch (e) {
       if (!mounted || gen !== loadGen) return;
@@ -1154,7 +1184,8 @@
 
   function copiedLinksText(count: number): string {
     return plural(count, {
-      one: m.library_copied_link_one,
+      one: () => m.library_copied_link_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_copied_links_other({ count: formatNumber(count) }),
     });
   }
@@ -1169,28 +1200,32 @@
       return;
     }
     toastWarning(plural(unshared, {
-      one: m.library_copied_unshared_one,
+      one: () => m.library_copied_unshared_one({ count: formatNumber(unshared) }),
+      // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
       other: () => m.library_copied_unshared_other({ count: formatNumber(unshared) }),
     }));
   }
 
   function removedMissingText(count: number): string {
     return plural(count, {
-      one: m.library_removed_missing_one,
+      one: () => m.library_removed_missing_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_removed_missing_other({ count: formatNumber(count) }),
     });
   }
 
   function unsharedText(count: number): string {
     return plural(count, {
-      one: m.library_unshared_one,
+      one: () => m.library_unshared_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       other: () => m.library_unshared_other({ count: formatNumber(count) }),
     });
   }
 
   function starsText(count: number): string {
     return plural(count, {
-      one: m.library_star_one,
+      one: () => m.library_star_one({ count }),
+      oneShowsCount: true,
       few: () => m.library_star_few({ count }),
       other: () => m.library_star_other({ count }),
     });
@@ -1200,7 +1235,8 @@
     const author = collection.author || m.common_unknown();
     const count = formatNumber(collection.files.length);
     return plural(collection.files.length, {
-      one: () => m.library_collection_meta_one({ author }),
+      one: () => m.library_collection_meta_one({ author, count }),
+      oneShowsCount: true,
       few: () => m.library_collection_meta_few({ author, count }),
       other: () => m.library_collection_meta_other({ author, count }),
     });
@@ -1226,8 +1262,7 @@
     try {
       await openSharedFileCommand(path);
     } catch (e: unknown) {
-      error = toErr(e);
-      toastError(error);
+      toastError(toErr(e));
     }
   }
 
@@ -1240,8 +1275,7 @@
     try {
       await openSharedFileCommand(path);
     } catch (e: unknown) {
-      error = toErr(e);
-      toastError(error);
+      toastError(toErr(e));
     }
   }
 
@@ -1249,8 +1283,7 @@
     try {
       await openSharedFolderCommand(path);
     } catch (e: unknown) {
-      error = toErr(e);
-      toastError(error);
+      toastError(toErr(e));
     }
   }
 
@@ -1260,8 +1293,7 @@
     try {
       await openLibraryFolder(path);
     } catch (e: unknown) {
-      error = toErr(e);
-      toastError(error);
+      toastError(toErr(e));
     }
   }
 
@@ -1290,12 +1322,42 @@
    *  when `f` is in it, as for the other bulk actions, less those no
    *  category can move. */
   function categoryMoveTargets(f: FileInfo): FileInfo[] {
-    const rows = checkedCount > 1 && checkedPaths.has(f.path) ? getCheckedFiles() : [f];
+    const rows = ctxActsOnChecked(f) ? getCheckedFiles() : [f];
     return rows.filter((row) => categorySubdirOfFile(row) !== null);
   }
 
   /** The backend's cap on one move request. */
   const MAX_CATEGORY_MOVE_BATCH = 5_000;
+
+  /** Path to hash of each file a category move is running for, so a reload
+   *  can keep the open file and the checked rows on them. */
+  let movedAway: Map<string, string> | null = null;
+
+  /** Old path to new for the files of `moved` that `listed` no longer has.
+   *  The move reports counts, not paths, so each is found by its hash among
+   *  the rows that were not there before. */
+  function movedPathsIn(
+    listed: FileInfo[],
+    present: Set<string>,
+    previous: Map<string, number>,
+    moved: Map<string, string>,
+  ): Map<string, string> {
+    const arrived = new Map<string, string[]>();
+    for (const f of listed) {
+      if (!f.hash || previous.has(f.path)) continue;
+      const paths = arrived.get(f.hash);
+      if (paths) paths.push(f.path);
+      else arrived.set(f.hash, [f.path]);
+    }
+    const out = new Map<string, string>();
+    if (arrived.size === 0) return out;
+    for (const [from, hash] of moved) {
+      if (present.has(from)) continue;
+      const to = arrived.get(hash)?.shift();
+      if (to !== undefined) out.set(from, to);
+    }
+    return out;
+  }
 
   async function moveToCategory(targets: FileInfo[], category: string) {
     // Waits on the other bulk actions as they wait on each other: a delete or
@@ -1303,6 +1365,7 @@
     // find paths already gone and report failures for files that moved.
     if (targets.length === 0 || bulkBusy) return;
     bulkBusy = true;
+    movedAway = new Map(targets.filter((t) => !!t.hash).map((t) => [t.path, t.hash]));
     const folder = categoryDestinationLabel(categorySubdir(category, categoryFolders));
     try {
       const report = { moved: 0, unchanged: 0, recategorized: 0, failed: [] as string[], warning: null as string | null };
@@ -1328,7 +1391,8 @@
           targets.length === 1
             ? m.library_moved_one({ name: targets[0].name, folder })
             : plural(report.moved, {
-                one: () => m.library_moved_count_one({ folder }),
+                one: () => m.library_moved_count_one({ folder, count: formatNumber(report.moved) }),
+                oneShowsCount: true,
                 other: () => m.library_moved_count_other({ count: formatNumber(report.moved), folder }),
               }),
         );
@@ -1347,10 +1411,10 @@
       }
       if (report.warning) toastWarning(translateError(report.warning, m.transfers_operation_failed()));
     } catch (e: unknown) {
-      error = toErr(e);
-      toastError(error);
+      toastError(toErr(e));
     } finally {
       await refresh();
+      movedAway = null;
       bulkBusy = false;
     }
   }
@@ -1444,6 +1508,7 @@
       const confirmed = await askConfirm(
         m.library_copy_all_confirm({ count: formatNumber(targets.length) }),
         m.library_copy_all_confirm_title(),
+        { confirmLabel: m.common_copy(), danger: false },
       );
       if (!confirmed) return;
     }
@@ -1465,7 +1530,6 @@
   }
 
   async function onFoldersPicked(selected: SharedFolderPick) {
-    error = null;
     try {
       if (!mounted) return;
       // Part of the selection did not land. The rest is reported below, so
@@ -1490,12 +1554,14 @@
         if (folderNames.size === 1) {
           const name = [...folderNames][0];
           toastSuccess(plural(sharedFiles.length, {
-            one: () => m.library_shared_from_one({ name }),
+            one: () => m.library_shared_from_one({ name, count: formatNumber(sharedFiles.length) }),
+            oneShowsCount: true,
             other: () => m.library_shared_from_other({ count: formatNumber(sharedFiles.length), name }),
           }));
         } else {
           toastSuccess(plural(sharedFiles.length, {
-            one: m.library_shared_one,
+            one: () => m.library_shared_one({ count: formatNumber(sharedFiles.length) }),
+            oneShowsCount: true,
             other: () => m.library_shared_other({ count: formatNumber(sharedFiles.length) }),
           }));
         }
@@ -1512,7 +1578,7 @@
     } catch (e: unknown) {
       if (mounted) {
         scanning = false;
-        error = toErr(e);
+        toastError(toErr(e));
       }
     }
   }
@@ -1521,16 +1587,40 @@
     addFolderOpen = true;
   }
 
+  /** Folders with a priority change running, and the pick made since for
+   *  each. Arrowing through the closed select fires a change per step; one
+   *  runs at a time per folder and only the latest waiting one follows it. */
+  const folderPriorityBusy = new Set<string>();
+  const folderPriorityNext = new Map<string, { priority: string; el?: HTMLSelectElement }>();
+
   async function handleSetFolderPriority(path: string, priority: string, el?: HTMLSelectElement) {
+    if (folderPriorityBusy.has(path)) {
+      folderPriorityNext.set(path, { priority, el });
+      return;
+    }
+    folderPriorityBusy.add(path);
+    try {
+      await applyFolderPriority(path, priority, el);
+    } finally {
+      folderPriorityBusy.delete(path);
+      const next = folderPriorityNext.get(path);
+      folderPriorityNext.delete(path);
+      if (next && mounted && next.priority !== (folderPriorities[path] ?? '')) {
+        void handleSetFolderPriority(path, next.priority, next.el);
+      }
+    }
+  }
+
+  async function applyFolderPriority(path: string, priority: string, el?: HTMLSelectElement) {
     const previous = folderPriorities[path] ?? '';
     try {
-      error = null;
       const count = await setFolderPriority(path, priority);
       if (!mounted) return;
       if (priority) {
         folderPriorities = { ...folderPriorities, [path]: priority };
         toastSuccess(plural(count, {
-          one: m.library_folder_priority_set_one,
+          one: () => m.library_folder_priority_set_one({ count: formatNumber(count) }),
+          oneShowsCount: true,
           other: () => m.library_folder_priority_set({ count: formatNumber(count) }),
         }));
       } else {
@@ -1542,12 +1632,13 @@
       await refresh();
     } catch (e: unknown) {
       if (mounted) {
-        error = toErr(e);
+        toastError(toErr(e));
         // Svelte only rewrites a one-way `value={...}` when the expression
         // itself changes; it never reconciles against the DOM. `folderPriorities`
         // is untouched on failure, so without this the select would keep showing
         // the rejected choice permanently — a later refresh doesn't clear it.
-        if (el) el.value = previous;
+        // A pick still waiting to run is left showing.
+        if (el && !folderPriorityNext.has(path)) el.value = previous;
       }
     }
   }
@@ -1558,19 +1649,20 @@
       const displayName = path.split(/[\\/]/).filter(Boolean).pop() || path;
       const body = stats > 0
         ? plural(stats, {
-            one: () => m.library_confirm_remove_folder_one({ name: displayName }),
+            one: () => m.library_confirm_remove_folder_one({ name: displayName, count: formatNumber(stats) }),
+            oneShowsCount: true,
             other: () => m.library_confirm_remove_folder_other({ name: displayName, count: formatNumber(stats) }),
           })
         : m.library_confirm_remove_folder_empty({ name: displayName });
-      const confirmed = await askConfirm(body, m.library_remove_folder_title());
+      const confirmed = await askConfirm(body, m.library_remove_folder_title(), { confirmLabel: m.common_remove() });
       if (!confirmed || !mounted) return;
-      error = null;
       await removeSharedFolder(path);
       if (!mounted) return;
       if (filterFolder !== null && (pathsEqualForFolder(filterFolder, path) || isPathInFolder(filterFolder, path))) filterFolder = null;
+      toastSuccess(m.library_folder_removed({ name: displayName }));
       await refresh();
     } catch (e: unknown) {
-      if (mounted) error = toErr(e);
+      if (mounted) toastError(toErr(e));
     }
   }
 
@@ -1595,7 +1687,7 @@
       // here so the scanning banner doesn't linger until the 3s status poll.
       if (mounted) {
         scanning = false;
-        error = toErr(e);
+        toastError(toErr(e));
         await syncHashingPaused();
       }
     } finally {
@@ -1713,7 +1805,7 @@
       // the next explicit user action (Resume / Reload / Add folder).
       if (mounted) await refresh();
     } catch (e: unknown) {
-      if (mounted) error = toErr(e);
+      if (mounted) toastError(toErr(e));
     } finally {
       stoppingHashing = false;
     }
@@ -1729,7 +1821,7 @@
       await refresh();
     } catch (e: unknown) {
       if (!mounted) return;
-      error = toErr(e);
+      toastError(toErr(e));
       scanning = false;
       await syncHashingPaused();
     }
@@ -1786,13 +1878,14 @@
 
   let libraryTotalSize = $derived.by(() => {
     let bytes = 0;
-    for (const f of files) bytes += f.size;
+    for (const f of treeFiles) bytes += f.size;
     return bytes;
   });
 
   function filesCountLabel(count: number): string {
     return plural(count, {
-      one: m.library_stat_files_one,
+      one: () => m.library_stat_files_one({ count: formatNumber(count) }),
+      oneShowsCount: true,
       few: () => m.library_stat_files_few({ count: formatNumber(count) }),
       other: () => m.library_stat_files({ count: formatNumber(count) }),
     });
@@ -1814,7 +1907,7 @@
   /** Counts per sharing state, for the labels in the sharing-state filter. */
   let shareScopeCounts = $derived.by(() => {
     const counts: Record<Exclude<ShareScopeFilter, 'all'>, number> = { not_shared: 0, friends_only: 0, unpublished: 0, hashing: 0 };
-    for (const f of files) {
+    for (const f of treeFiles) {
       const scope = shareScopeOf(f);
       if (scope) counts[scope]++;
     }
@@ -1834,7 +1927,7 @@
   let hasActiveLibraryFilters = $derived(!!filterFolder || !!searchQuery.trim() || typeFilter !== 'All' || sizeFilter !== 'any' || showDuplicatesOnly || showMissingOnly || showNeverRequestedOnly || shareScopeFilter !== 'all');
   let libraryHashedCount = $derived.by(() => {
     let hashed = 0;
-    for (const f of files) if (f.hash) hashed++;
+    for (const f of treeFiles) if (f.hash) hashed++;
     return hashed;
   });
   let allHashedFilesSelected = $derived.by(() => {
@@ -1866,47 +1959,52 @@
   let checkedCount = $derived.by(() => {
     return checkedPaths.size;
   });
+  // The selection counts read no upload counter, so they walk `treeFiles` and
+  // are not redone on every `shared-file-stats` tick.
   let checkedHashedCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash) n++;
     return n;
   });
   /** What the selection weighs, for the bulk bar: worth knowing before a
    *  Delete or a collection. */
   let checkedTotalSize = $derived.by(() => {
     let bytes = 0;
-    for (const p of checkedPaths) bytes += fileByPath.get(p)?.size ?? 0;
+    for (const p of checkedPaths) {
+      const i = rowIndexByPath.get(p);
+      if (i !== undefined) bytes += treeFiles[i].size;
+    }
     return bytes;
   });
   let checkedRestrictCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared && !f.friends_only) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && f.shared && !f.friends_only) n++;
     return n;
   });
   let checkedUnrestrictCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared && f.friends_only) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && f.shared && f.friends_only) n++;
     return n;
   });
   let checkedUnshareCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && f.shared) n++;
     return n;
   });
   let checkedShareCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && !f.shared) n++;
     return n;
   });
   /** Checked, hashed files the tag could go on, and ones it could come off. */
   let checkedTaggableCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && !hasEmberTag(f.name)) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && !hasEmberTag(f.name)) n++;
     return n;
   });
   let checkedUntaggableCount = $derived.by(() => {
     let n = 0;
-    for (const f of files) if (checkedPaths.has(f.path) && f.hash && hasEmberTag(f.name)) n++;
+    for (const f of treeFiles) if (checkedPaths.has(f.path) && f.hash && hasEmberTag(f.name)) n++;
     return n;
   });
   // Selections persist across filter changes and bulk actions operate on the
@@ -1919,7 +2017,7 @@
     const visible = new Set(sortedFiles.map((f) => f.path));
     let n = 0;
     for (const p of checkedPaths) {
-      if (!visible.has(p) && fileByPath.has(p)) n++;
+      if (!visible.has(p) && rowIndexByPath.has(p)) n++;
     }
     return n;
   });
@@ -2020,10 +2118,11 @@
         (paths) => batchSetPriority(paths, priority),
       );
       toastSuccess(plural(count, {
-        one: () => m.library_set_priority_one({ priority: priorityLabel(priority) }),
+        one: () => m.library_set_priority_one({ priority: priorityLabel(priority), count: formatNumber(count) }),
+        oneShowsCount: true,
         other: () => m.library_set_priority_other({ priority: priorityLabel(priority), count: formatNumber(count) }),
       }));
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
     finally {
       // Earlier batches may have committed before a later IPC batch failed.
       // Always reconcile the table with the backend, not only on full success.
@@ -2047,7 +2146,7 @@
     try {
       const count = await runBulkBatches(targets, batchUnshare);
       offerUnshareUndo(unsharedText(count), copies);
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
     finally {
       await refresh();
       bulkBusy = false;
@@ -2074,14 +2173,29 @@
       {
         label: m.common_undo(),
         undo: true,
-        run: () => {
-          void runBulkBatches(copies, shareLibraryFiles)
-            .catch((e: unknown) => toastError(toErr(e)))
-            .finally(() => refresh());
-        },
+        // Waits its turn like the tag's Undo: `runBulkBatches` reports into
+        // the one progress slot, which a running bulk action is using.
+        run: () => void whenBulkIdle().then(() => reshareCopies(copies)),
       },
       () => {},
     );
+  }
+
+  async function reshareCopies(copies: FileInfo[]) {
+    if (bulkBusy) return;
+    bulkBusy = true;
+    try {
+      const count = await runBulkBatches(copies, shareLibraryFiles);
+      toastSuccess(plural(count, {
+        one: () => m.library_shared_one({ count: formatNumber(count) }),
+        oneShowsCount: true,
+        other: () => m.library_shared_other({ count: formatNumber(count) }),
+      }));
+    } catch (e: unknown) { toastError(toErr(e)); }
+    finally {
+      await refresh();
+      bulkBusy = false;
+    }
   }
 
   async function bulkShare() {
@@ -2098,10 +2212,11 @@
     try {
       const count = await runBulkBatches(targets, shareLibraryFiles);
       toastSuccess(plural(count, {
-        one: m.library_shared_one,
+        one: () => m.library_shared_one({ count: formatNumber(count) }),
+        oneShowsCount: true,
         other: () => m.library_shared_other({ count: formatNumber(count) }),
       }));
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
     finally {
       await refresh();
       bulkBusy = false;
@@ -2129,19 +2244,45 @@
       toastSuccess(
         friendsOnly
           ? plural(count, {
-              one: m.library_friends_only_on_count_one,
+              one: () => m.library_friends_only_on_count_one({ count: formatNumber(count) }),
+              oneShowsCount: true,
               other: () => m.library_friends_only_on_count({ count: formatNumber(count) }),
             })
           : plural(count, {
-              one: m.library_friends_only_off_count_one,
+              one: () => m.library_friends_only_off_count_one({ count: formatNumber(count) }),
+              oneShowsCount: true,
               other: () => m.library_friends_only_off_count({ count: formatNumber(count) }),
             }),
       );
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
     finally {
       await refresh();
       bulkBusy = false;
     }
+  }
+
+  /** Rows of `targets` the active filters keep off screen. */
+  function hiddenByFilters(targets: FileInfo[]): FileInfo[] {
+    if (!hasActiveLibraryFilters) return [];
+    const visible = new Set(sortedFiles.map((f) => f.path));
+    return targets.filter((f) => !visible.has(f.path));
+  }
+
+  /** Delete names what it cannot show: a checked row a filter hides is
+   *  deleted all the same. */
+  function deleteHiddenNote(hidden: FileInfo[]): string {
+    const names = hidden.slice(0, STOP_FOLDERS_NAMED).map((f) => f.name);
+    if (hidden.length > STOP_FOLDERS_NAMED + 1) {
+      names.push(m.library_stop_confirm_more_folders({ count: formatNumber(hidden.length - STOP_FOLDERS_NAMED) }));
+    } else if (hidden.length === STOP_FOLDERS_NAMED + 1) {
+      names.push(hidden[STOP_FOLDERS_NAMED].name);
+    }
+    const count = formatNumber(hidden.length);
+    return plural(hidden.length, {
+      one: () => m.library_confirm_delete_hidden_one({ count, names: names.join(', ') }),
+      oneShowsCount: true,
+      other: () => m.library_confirm_delete_hidden_other({ count, names: names.join(', ') }),
+    });
   }
 
   async function bulkDelete() {
@@ -2153,19 +2294,24 @@
     try {
       const size = formatSize(totalBytes);
       const count = formatNumber(targets.length);
+      const question = $appSettings?.delete_permanently
+        ? plural(targets.length, {
+            one: () => m.library_confirm_delete_one_permanent({ size, count }),
+            // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
+            few: () => m.library_confirm_delete_few_permanent({ count, size }),
+            other: () => m.library_confirm_delete_other_permanent({ count, size }),
+          })
+        : plural(targets.length, {
+            one: () => m.library_confirm_delete_one({ size, count }),
+            // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
+            few: () => m.library_confirm_delete_few({ count, size }),
+            other: () => m.library_confirm_delete_other({ count, size }),
+          });
+      const hidden = hiddenByFilters(targets);
       const confirmed = await askConfirm(
-        $appSettings?.delete_permanently
-          ? plural(targets.length, {
-              one: () => m.library_confirm_delete_one_permanent({ size }),
-              few: () => m.library_confirm_delete_few_permanent({ count, size }),
-              other: () => m.library_confirm_delete_other_permanent({ count, size }),
-            })
-          : plural(targets.length, {
-              one: () => m.library_confirm_delete_one({ size }),
-              few: () => m.library_confirm_delete_few({ count, size }),
-              other: () => m.library_confirm_delete_other({ count, size }),
-            }),
+        hidden.length > 0 ? `${question}\n\n${deleteHiddenNote(hidden)}` : question,
         m.library_delete_files_title(),
+        { confirmLabel: m.common_delete() },
       );
       if (!confirmed) return;
       let deleted = 0;
@@ -2200,7 +2346,8 @@
       await refresh();
       if (deleted > 0) {
         const base = plural(deleted, {
-          one: m.library_deleted_one,
+          one: () => m.library_deleted_one({ count: formatNumber(deleted) }),
+          oneShowsCount: true,
           other: () => m.library_deleted_other({ count: formatNumber(deleted) }),
         });
         toastSuccess(failures.length ? m.library_deleted_with_failures({ base, failed: formatNumber(failures.length) }) : base);
@@ -2208,7 +2355,7 @@
       if (failures.length > 0) {
         toastError(failures[0]);
       }
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
     finally {
       bulkProgress = null;
       bulkBusy = false;
@@ -2222,7 +2369,7 @@
    *  when `f` is in it, as for the other bulk actions, less those it would
    *  not change. */
   function emberTagTargets(f: FileInfo, add: boolean): FileInfo[] {
-    const rows = checkedCount > 1 && checkedPaths.has(f.path) ? getCheckedFiles() : [f];
+    const rows = ctxActsOnChecked(f) ? getCheckedFiles() : [f];
     return rows.filter((row) => !!row.hash && hasEmberTag(row.name) !== add);
   }
 
@@ -2319,11 +2466,13 @@
         const count = formatNumber(renamed.length);
         const message = add
           ? plural(renamed.length, {
-              one: m.library_tag_added_one,
+              one: () => m.library_tag_added_one({ count }),
+              oneShowsCount: true,
               other: () => m.library_tag_added_other({ count }),
             })
           : plural(renamed.length, {
-              one: m.library_tag_removed_one,
+              one: () => m.library_tag_removed_one({ count }),
+              oneShowsCount: true,
               other: () => m.library_tag_removed_other({ count }),
             });
         addActionToast(
@@ -2351,8 +2500,7 @@
       }
       if (warning) toastWarning(translateError(warning, m.transfers_operation_failed()));
     } catch (e: unknown) {
-      error = toErr(e);
-      toastError(error);
+      toastError(toErr(e));
     } finally {
       bulkProgress = null;
       await refresh();
@@ -2364,11 +2512,42 @@
     while (bulkBusy) await new Promise((resolve) => setTimeout(resolve, 200));
   }
 
-  /** Keep the open file and the checked rows on files that were renamed. */
+  /** Keep the open file and the checked rows on files that were renamed.
+   *
+   *  The rows are renamed here too rather than left to the reload: until it
+   *  landed, the open file's new path named no row, so the drawer closed and
+   *  the comment being written was reset. */
   function followRenamedPaths(renamed: { from: string; to: string }[]) {
     if (renamed.length === 0) return;
     const to = new Map(renamed.map((r) => [r.from, r.to]));
+    const rename = (rows: LibraryRow[]): LibraryRow[] =>
+      rows.map((row) => {
+        const path = to.get(row.path);
+        if (path === undefined) return row;
+        const name = path.replace(/^.*[/\\]/, '');
+        const ext = extensionFromPath(name);
+        const extension = ext.toLowerCase() === row.extension.toLowerCase() ? row.extension : ext;
+        return {
+          ...row,
+          path,
+          name,
+          extension,
+          matchName: name.toLowerCase(),
+          matchType: fileTypeKey(extension),
+          matchPath: normalizePathForMatch(path),
+        };
+      });
+    // Renamed in step so that `rowIndexByPath`, built from `treeFiles`, still
+    // finds each row at its index in `files`.
+    if (files === treeFiles) {
+      files = rename(files);
+      treeFiles = files;
+    } else {
+      files = rename(files);
+      treeFiles = rename(treeFiles);
+    }
     if (selectedPath && to.has(selectedPath)) selectedPath = to.get(selectedPath) ?? selectedPath;
+    if (lastClickedPath && to.has(lastClickedPath)) lastClickedPath = to.get(lastClickedPath) ?? lastClickedPath;
     if (renamed.some((r) => checkedPaths.has(r.from))) {
       checkedPaths = new Set([...checkedPaths].map((p) => to.get(p) ?? p));
     }
@@ -2395,7 +2574,7 @@
         return;
       }
       reportCopied(targets, copiedLinksText(files.length));
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
   }
 
   // --- Sorting ---
@@ -2424,8 +2603,32 @@
 
   const priorityOrder: Record<string, number> = { verylow: 0, low: 1, normal: 2, high: 3, release: 4, auto: 5 };
 
+  const sortMemo = createSortMemo();
+
+  /** Everything the comparator below reads besides the path, or `null` for
+   *  the upload counters, which `shared-file-stats` moves about once a second. */
+  function sortOrderKey(field: SortField): ((f: LibraryRow) => string) | null {
+    switch (field) {
+      case 'requests':
+      case 'accepted':
+      case 'bytes_transferred':
+        return null;
+      case 'name':
+        return (f) => f.name;
+      case 'extension':
+        return (f) => `${f.matchType}\0${f.extension}\0${f.name}`;
+      default: {
+        const key = field;
+        return (f) => `${f[key]}\0${f.name}`;
+      }
+    }
+  }
+
+  // An upload tick hands over a new `files` with only counters changed; unless
+  // the sort is on one of those, the last order is kept and only the rows are
+  // swapped in, instead of collating every name again.
   let sortedFiles = $derived.by(() => {
-    const copy = [...filteredFiles];
+    const field = sortField;
     const dir = sortAsc ? 1 : -1;
     // The Type column shows the category label where there is one, so sort by
     // that label rather than the raw extension.
@@ -2439,9 +2642,9 @@
       }
       return label;
     };
-    copy.sort((a, b) => {
+    const compare = (a: LibraryRow, b: LibraryRow): number => {
       let cmp = 0;
-      switch (sortField) {
+      switch (field) {
         case 'name': cmp = compareFileNames(a.name, b.name); break;
         case 'size': cmp = a.size - b.size; break;
         case 'extension': cmp = compareFileNames(typeSortKey(a), typeSortKey(b)) || compareFileNames(a.extension, b.extension); break;
@@ -2459,15 +2662,15 @@
       // dates don't render in arbitrary order. The tiebreakers always read
       // ascending regardless of the primary sort direction so names stay A→Z.
       if (cmp === 0) {
-        if (sortField !== 'name') {
+        if (field !== 'name') {
           const byName = compareFileNames(a.name, b.name);
           if (byName !== 0) return byName;
         }
         return compareFileNames(a.path, b.path);
       }
       return dir * cmp;
-    });
-    return copy;
+    };
+    return sortWithMemo(filteredFiles, compare, sortMemo, `${field}:${dir}`, (f) => f.path, sortOrderKey(field));
   });
 
   // One pass over the library builds the whole sidebar: the tree's top level
@@ -2535,8 +2738,9 @@
   let topFiles = $derived.by(() => {
     const bestByHash = new Map<string, FileInfo>();
     for (const file of files) {
+      if (topValueFor(file) <= 0) continue;
       const hash = file.hash.trim().toLowerCase();
-      if (!hash || topValueFor(file) <= 0) continue;
+      if (!hash) continue;
       const existing = bestByHash.get(hash);
       if (!existing || topValueFor(file) > topValueFor(existing)) {
         bestByHash.set(hash, file);
@@ -2747,7 +2951,7 @@
       }, 2500);
     } catch (e: unknown) {
       if (selectedHash !== hash) return;
-      error = toErr(e);
+      toastError(toErr(e));
       commentSaveState = 'error';
       commentSaveMessage = m.library_save_failed();
     }
@@ -2770,11 +2974,12 @@
   let ctxSendSub = $state(false);
   let ctxWebSub = $state(false);
   let ctxCategorySub = $state(false);
+  let ctxFeedSub = $state(false);
 
   // Submenus open on hover, on click and from the keyboard; see `hoverSubmenus`.
-  type HoverSub = 'priority' | 'copy' | 'send' | 'web' | 'category';
+  type HoverSub = 'priority' | 'copy' | 'send' | 'web' | 'category' | 'feed';
   const ctxSubs = hoverSubmenus<HoverSub>(
-    () => (ctxPrioritySub ? 'priority' : ctxCopySub ? 'copy' : ctxSendSub ? 'send' : ctxWebSub ? 'web' : ctxCategorySub ? 'category' : null),
+    () => (ctxPrioritySub ? 'priority' : ctxCopySub ? 'copy' : ctxSendSub ? 'send' : ctxWebSub ? 'web' : ctxCategorySub ? 'category' : ctxFeedSub ? 'feed' : null),
     (which) => {
       ctxPrioritySub = which === 'priority';
       ctxCopySub = which === 'copy';
@@ -2782,8 +2987,53 @@
       ctxSendSub = which === 'send';
       ctxWebSub = which === 'web';
       ctxCategorySub = which === 'category';
+      if (which === 'feed' && !ctxFeedSub) void loadMyFeeds();
+      ctxFeedSub = which === 'feed';
     },
   );
+
+  /** This identity's feeds, for "Add to feed"; `null` while they load. */
+  let myFeeds: { salt: string; title: string; item_count: number }[] | null = $state(null);
+  /** Feeds exist only while Ember is on. */
+  let feedsAvailable = $derived($appSettings?.ember_native_enabled === true);
+
+  async function loadMyFeeds() {
+    myFeeds = null;
+    try {
+      const { listMyFeeds } = await import('$lib/api/feeds');
+      myFeeds = (await listMyFeeds()).map((feed) => ({
+        salt: feed.salt,
+        title: feed.title,
+        item_count: feed.items.length,
+      }));
+    } catch {
+      myFeeds = [];
+    }
+  }
+
+  /** What "Add to feed" adds: the clicked file, or the selection it is part
+   *  of, narrowed to files a feed can list: shared with everyone, with the
+   *  Ember digest a follower checks them by. */
+  function feedTargets(f: FileInfo): FileInfo[] {
+    const rows = ctxActsOnChecked(f) ? getCheckedFiles() : [f];
+    return rows.filter((row) => !!row.hash && row.shared && !row.friends_only && row.ember_file_hash.length === 64);
+  }
+
+  async function addToFeed(targets: FileInfo[], salt: string) {
+    const feed = myFeeds?.find((candidate) => candidate.salt === salt);
+    if (!feed || targets.length === 0) return;
+    const { addFeedItems } = await import('$lib/api/feeds');
+    const result = await addFeedItems(salt, [...new Set(targets.map((t) => t.hash))]);
+    const title = feed.title || m.library_feed_untitled();
+    if (result.added > 0) {
+      toastSuccess(m.library_feed_added({ count: formatNumber(result.added), title }));
+    } else if (result.already > 0 && result.dropped.length === 0) {
+      toastInfo(m.library_feed_already({ title }));
+    }
+    if (result.dropped.length > 0) {
+      toastWarning(m.library_feed_dropped({ count: formatNumber(result.dropped.length) }));
+    }
+  }
   const openHoverSub = ctxSubs.open;
   const enterHoverSub = ctxSubs.enter;
   const leaveHoverSub = ctxSubs.leave;
@@ -2822,6 +3072,13 @@
     }
   }
   let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
+
+  /** Whether `f`'s menu acts on the whole checked selection: it does when
+   *  `f` is one of several checked rows, as the bulk bar would. */
+  function ctxActsOnChecked(f: FileInfo): boolean {
+    return checkedCount > 1 && checkedPaths.has(f.path);
+  }
+
   /** What had focus when the menu opened, so it can be handed back rather
    *  than dropped on the body when the menu unmounts. */
   let ctxReturnFocus: HTMLElement | null = null;
@@ -2973,7 +3230,7 @@
     if (!f) return;
     try {
       await deleteOneFile(f);
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
   }
 
   async function copyLinkForSelection() {
@@ -2998,7 +3255,7 @@
           return;
         }
         reportCopied(targets, copiedLinksText(files.length));
-      } catch (e: unknown) { error = toErr(e); }
+      } catch (e: unknown) { toastError(toErr(e)); }
       return;
     }
     if (selectedFile && !selectedFile.hash) {
@@ -3017,13 +3274,15 @@
         toastError(m.library_copy_failed());
         return;
       }
-      reportCopied([selectedFile], m.library_copied_link_one());
-    } catch (e: unknown) { error = toErr(e); }
+      reportCopied([selectedFile], m.library_copied_link_one({ count: formatNumber(1) }));
+    } catch (e: unknown) { toastError(toErr(e)); }
   }
 
   function onPageKeyDown(e: KeyboardEvent) {
     if (!mounted) return;
     if ((ctxMenu || folderCtx) && e.key === 'Escape') { closeCtxAndRefocus(); e.preventDefault(); e.stopPropagation(); return; }
+    // Tab leaves the menu, so the menu goes with it, as the column menu does.
+    if ((ctxMenu || folderCtx) && e.key === 'Tab') { closeCtxAndRefocus(); return; }
     if ((ctxMenu || folderCtx) && handleCtxMenuKey(e)) return;
     // A menu that is open owns the keyboard: Delete or F2 here would act on
     // the selected row, which is often not the one right-clicked.
@@ -3050,6 +3309,13 @@
     // dock has the keyboard; it handles its own Escape.
     if (document.querySelector('[aria-modal="true"]')) return;
     if (e.target instanceof Element && e.target.closest('.chat-dock')) return;
+
+    if (foldersPanelOpen && e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeFoldersPanel();
+      return;
+    }
 
     const typing = isTypingTarget(e.target);
 
@@ -3221,6 +3487,8 @@
     // actions were unaffected either way, but copy_link, send_to_friend and
     // republish would carry the ed2k identity the file no longer has.
     const f = fileByPath.get(ctxMenu.file.path) ?? ctxMenu.file;
+    // The bulk versions below act on the checked rows, which then include `f`.
+    const multi = ctxActsOnChecked(f);
     closeCtxAndRefocus();
     try {
       switch (action) {
@@ -3240,6 +3508,9 @@
         case 'tag_remove': await applyEmberTag(emberTagTargets(f, false).map((t) => t.path), false); break;
         case 'move_category':
           if (extra !== undefined) await moveToCategory(categoryMoveTargets(f), extra);
+          break;
+        case 'add_to_feed':
+          if (extra) await addToFeed(feedTargets(f), extra);
           break;
         case 'edit_categories': categoriesOpen = true; break;
         // The backend reads the template from settings by index and does the
@@ -3283,19 +3554,25 @@
           break;
         }
         case 'delete':
-          await deleteOneFile(f);
+          if (multi) await bulkDelete();
+          else await deleteOneFile(f);
           break;
         case 'priority':
-          if (extra) await applyFilePriority(f, extra as FileInfo['priority']);
+          if (!extra) break;
+          if (multi) await bulkSetPriority(extra as FileInfo['priority']);
+          else await applyFilePriority(f, extra as FileInfo['priority']);
           break;
         case 'copy_link':
-          await copyFileLink(f, extra === 'aich' || extra === 'sources' ? extra : undefined);
+          if (multi && !extra) await bulkCopyLinks();
+          else await copyFileLink(f, extra === 'aich' || extra === 'sources' ? extra : undefined);
           break;
         case 'unshare':
-          await unshareOneFile(f);
+          if (multi) await bulkUnshare();
+          else await unshareOneFile(f);
           break;
         case 'share':
-          await shareOneFile(f);
+          if (multi) await bulkShare();
+          else await shareOneFile(f);
           break;
         case 'send_to_friend': {
           if (!extra) break;
@@ -3305,7 +3582,8 @@
           break;
         }
         case 'friends_only':
-          await applyFriendsOnly(f, !f.friends_only);
+          if (multi) await bulkFriendsOnly(!f.friends_only);
+          else await applyFriendsOnly(f, !f.friends_only);
           break;
         case 'republish': {
           if (!f.hash || !f.shared) break;
@@ -3318,7 +3596,7 @@
           break;
         }
       }
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
   }
 
   // One file's settings and links, for the context menu and the details
@@ -3350,6 +3628,7 @@
           ? m.library_confirm_delete_single_permanent({ name: f.name })
           : m.library_confirm_delete_single({ name: f.name }),
         m.library_delete_file_title(),
+        { confirmLabel: m.common_delete() },
       );
       if (!confirmed) return;
       await deleteSharedFile(f.path, f.hash || undefined);
@@ -3364,7 +3643,7 @@
   async function applyFilePriority(f: FileInfo, priority: FileInfo['priority']) {
     await setFilePriority(f.path, priority);
     await refresh();
-    toastSuccess(m.library_set_priority_one({ priority: priorityLabel(priority) }));
+    toastSuccess(m.library_set_priority_one({ priority: priorityLabel(priority), count: formatNumber(1) }));
   }
 
   async function applyFriendsOnly(f: FileInfo, restrict: boolean) {
@@ -3449,7 +3728,7 @@
     try {
       if (await copyFileLink(f)) flashCopied('link');
     } catch (e: unknown) {
-      error = toErr(e);
+      toastError(toErr(e));
     }
   }
 
@@ -3469,7 +3748,7 @@
     try {
       await action();
     } catch (e: unknown) {
-      error = toErr(e);
+      toastError(toErr(e));
     } finally {
       drawerBusy = false;
       drawerSettled += 1;
@@ -3488,16 +3767,18 @@
       }
       const confirmed = await askConfirm(
         plural(sharedCount, {
-          one: () => m.library_confirm_unshare_folder_one({ name: displayName }),
+          one: () => m.library_confirm_unshare_folder_one({ name: displayName, count: formatNumber(sharedCount) }),
+          // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
           other: () => m.library_confirm_unshare_folder_other({ count: formatNumber(sharedCount), name: displayName }),
         }),
         m.library_unshare_folder_title(),
+        { confirmLabel: m.library_bulk_unshare() },
       );
       if (!confirmed) return;
       await unshareFolder(path);
       await refresh();
       toastSuccess(unsharedText(sharedCount));
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
   }
 
   // The confirmation is a native dialog raised by the backend, not
@@ -3509,7 +3790,7 @@
       if (report.approved.length === 0) return;
       afterReapproved(report);
       await refresh();
-    } catch (e: unknown) { error = toErr(e); }
+    } catch (e: unknown) { toastError(toErr(e)); }
   }
 
   let reapprovingAll = $state(false);
@@ -3524,7 +3805,7 @@
       // and the banner should stop offering what it cannot do.
       await refresh();
     } catch (e: unknown) {
-      error = toErr(e);
+      toastError(toErr(e));
     } finally {
       reapprovingAll = false;
     }
@@ -3686,6 +3967,68 @@
     }
   });
 
+  /** Heights of the bars under the table. Where the details drawer lies over
+   *  the table it stops above them, so Delete and Clear stay in reach. */
+  let bulkBarHeight = $state(0);
+  let statusBarHeight = $state(0);
+
+  // --- Narrow window: the sidebar becomes a slide-out panel ---
+  let narrowLayout = $state(false);
+  let foldersPanelOpen = $state(false);
+  let foldersToggleEl: HTMLButtonElement | undefined = $state(undefined);
+  let foldersPanelEl: HTMLDivElement | undefined = $state(undefined);
+
+  $effect(() => {
+    const mq = window.matchMedia(`(max-width: ${BP_SM}px)`);
+    const sync = () => {
+      narrowLayout = mq.matches;
+      if (!mq.matches) foldersPanelOpen = false;
+    };
+    sync();
+    mq.addEventListener('change', sync);
+    return () => mq.removeEventListener('change', sync);
+  });
+
+  function openFoldersPanel() {
+    foldersPanelOpen = true;
+    void tick().then(() => {
+      const panel = foldersPanelEl;
+      (panel?.querySelector<HTMLElement>('.tree-item.active .tree-select') ?? panel?.querySelector<HTMLElement>('.tree-select'))?.focus();
+    });
+  }
+
+  function closeFoldersPanel() {
+    if (!foldersPanelOpen) return;
+    foldersPanelOpen = false;
+    foldersToggleEl?.focus();
+  }
+
+  // What the backdrop covers is out of reach while the panel is open, so Tab
+  // and a screen reader cannot wander under it. The header above stays live,
+  // as it is not dimmed, and the page's dialogs sit outside this layout.
+  $effect(() => {
+    const panel = foldersPanelEl;
+    if (!narrowLayout || !foldersPanelOpen || !panel?.parentElement) return;
+    const covered = Array.from(panel.parentElement.children).filter(
+      (el) => el !== panel && !el.classList.contains('sidebar-backdrop') && !el.hasAttribute('inert'),
+    );
+    for (const el of covered) el.setAttribute('inert', '');
+    return () => {
+      for (const el of covered) el.removeAttribute('inert');
+    };
+  });
+
+  function onFoldersPanelKeydown(e: KeyboardEvent) {
+    if (narrowLayout && foldersPanelOpen) trapTabKey(e, foldersPanelEl);
+  }
+
+  /** Show one folder's files (`null`: all of them). In the slide-out panel the
+   *  choice is the reason it was opened, so it closes on it. */
+  function selectFolder(folder: string | null) {
+    filterFolder = folder;
+    if (narrowLayout) closeFoldersPanel();
+  }
+
   // --- Sidebar resize ---
   let sidebarWidth = $state(200);
   let sidebarDragging = $state(false);
@@ -3734,9 +4077,13 @@
   $effect(() => {
     const incoming = $incomingCollection;
     if (incoming) {
+      const previous = untrack(() => loadedCollection);
       loadedCollection = incoming;
       collectionsOpen = true;
       markIncomingCollectionPresented();
+      if (previous && previous !== incoming) {
+        toastInfo(m.library_collection_replaced({ name: incoming.name, previous: previous.name }));
+      }
     }
   });
 
@@ -3776,6 +4123,7 @@
     filtersRestored = true;
 
     refresh();
+    void refreshMissingSet();
 
     // Poll every 3s: detect scan completion. The poll never INITIATES the
     // scanning UI state -- only progress events do that. This prevents the
@@ -4050,7 +4398,8 @@
   bind:open={confirmOpen}
   title={confirmTitle}
   message={confirmMessage}
-  danger={true}
+  {confirmLabel}
+  danger={confirmDanger}
   onconfirm={() => settleConfirm(true)}
   oncancel={() => settleConfirm(false)}
 />
@@ -4081,6 +4430,25 @@
 <div class="page-header">
   <h2>{m.library_title()}</h2>
   <div class="header-actions">
+    <!-- A narrow window has no room for the folder sidebar, so it slides out
+         from here instead. -->
+    {#if narrowLayout}
+      <button
+        type="button"
+        class="ghost folder-btn"
+        bind:this={foldersToggleEl}
+        aria-expanded={foldersPanelOpen}
+        aria-controls="library-folders"
+        onclick={() => (foldersPanelOpen ? closeFoldersPanel() : openFoldersPanel())}
+      >
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+        </svg>
+        {m.library_shared_folders()}
+      </button>
+      <button type="button" onclick={handleAddFolder}>{m.library_add_folder()}</button>
+      <span class="header-divider" aria-hidden="true"></span>
+    {/if}
     <!-- Files people handed you, kept apart from Downloads and not shared. -->
     <button
       type="button"
@@ -4124,6 +4492,7 @@
       {/if}
     </button>
     <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
+    <button class="ghost" onclick={() => (categoriesOpen = true)} title={m.transfers_categories_subtitle()}>{m.library_categories_button()}</button>
     <button class="ghost" onclick={handleReload} disabled={reloading}>{m.library_reload()}</button>
   </div>
 </div>
@@ -4171,11 +4540,13 @@
       class="dupes-toggle"
       class:active={showDuplicatesOnly}
       disabled={duplicateHashes.size === 0 && !showDuplicatesOnly}
+      aria-pressed={showDuplicatesOnly}
       onclick={() => (showDuplicatesOnly = !showDuplicatesOnly)}
       title={duplicateHashes.size === 0
         ? m.library_no_duplicates()
         : plural(duplicateHashes.size, {
-            one: () => m.library_duplicates_tooltip_one({ files: formatNumber(duplicateFileCount) }),
+            one: () => m.library_duplicates_tooltip_one({ files: formatNumber(duplicateFileCount), hashes: formatNumber(duplicateHashes.size) }),
+            oneShowsCount: true,
             other: () => m.library_duplicates_tooltip({ files: formatNumber(duplicateFileCount), hashes: formatNumber(duplicateHashes.size) }),
           })}
     >
@@ -4185,6 +4556,7 @@
       class="dupes-toggle missing-toggle"
       class:active={showMissingOnly}
       disabled={!showMissingOnly && (missingScanInFlight || (missingTotalCount === 0 && missingPathSet.size === 0))}
+      aria-pressed={showMissingOnly}
       onclick={() => (showMissingOnly = !showMissingOnly)}
       title={
         missingScanInFlight
@@ -4237,7 +4609,8 @@
           ? m.library_copy_all_none()
           : hasActiveLibraryFilters
             ? plural(filteredHashedFiles.length, {
-                one: m.library_copy_all_filtered_title_one,
+                one: () => m.library_copy_all_filtered_title_one({ count: formatNumber(filteredHashedFiles.length) }),
+                oneShowsCount: true,
                 few: () => m.library_copy_all_filtered_title_few({ count: formatNumber(filteredHashedFiles.length) }),
                 other: () => m.library_copy_all_filtered_title({ count: formatNumber(filteredHashedFiles.length) }),
               })
@@ -4265,18 +4638,21 @@
     </button>
     <span class="inline-stats">
       <span class="inline-stat">{plural(files.length, {
-        one: m.library_stat_files_one,
+        one: () => m.library_stat_files_one({ count: formatNumber(files.length) }),
+        oneShowsCount: true,
         few: () => m.library_stat_files_few({ count: formatNumber(files.length) }),
         other: () => m.library_stat_files({ count: formatNumber(files.length) }),
       })}</span>
       <span class="inline-sep">&middot;</span>
       <span class="inline-stat">{plural(libraryHashedCount, {
-        one: m.library_stat_hashed_one,
+        one: () => m.library_stat_hashed_one({ count: formatNumber(libraryHashedCount) }),
+        oneShowsCount: true,
         other: () => m.library_stat_hashed({ count: formatNumber(libraryHashedCount) }),
       })}</span>
       <span class="inline-sep">&middot;</span>
       <span class="inline-stat">{plural(folders.length, {
-        one: m.library_stat_folders_one,
+        one: () => m.library_stat_folders_one({ count: formatNumber(folders.length) }),
+        oneShowsCount: true,
         few: () => m.library_stat_folders_few({ count: formatNumber(folders.length) }),
         other: () => m.library_stat_folders({ count: formatNumber(folders.length) }),
       })}</span>
@@ -4350,7 +4726,7 @@
 <ShareFolderBrowser
   bind:open={addFolderOpen}
   onshared={(selected) => void onFoldersPicked(selected)}
-  onerror={(e) => { error = toErr(e); }}
+  onerror={(e) => toastError(toErr(e))}
 />
 
 {#if createCollectionOpen}
@@ -4371,8 +4747,12 @@
         void handleCreateCollection();
       }
     }
-  }}>
-    <div class="modal-content coll-modal" bind:this={createCollectionModal}>
+  }} transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }} onoutrostart={inertDuringOutro}>
+    <div
+      class="modal-content coll-modal"
+      bind:this={createCollectionModal}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="modal-header">
         <span id="create-coll-title" class="modal-title">{m.library_create_collection()}</span>
         <button type="button" class="icon-close" onclick={closeCreateDialog} disabled={creatingCollection} aria-label={m.common_close()}><IconX size={15} /></button>
@@ -4398,7 +4778,8 @@
                 {selectedFileHashes.size === 0
                   ? m.library_coll_summary_none()
                   : plural(selectedFileHashes.size, {
-                      one: () => m.library_coll_summary_one({ size: formatSize(selectedCollectionBytes) }),
+                      one: () => m.library_coll_summary_one({ size: formatSize(selectedCollectionBytes), count: formatNumber(selectedFileHashes.size) }),
+                      oneShowsCount: true,
                       few: () => m.library_coll_summary_few({ count: formatNumber(selectedFileHashes.size), size: formatSize(selectedCollectionBytes) }),
                       other: () => m.library_coll_summary_other({ count: formatNumber(selectedFileHashes.size), size: formatSize(selectedCollectionBytes) }),
                     })}
@@ -4530,8 +4911,14 @@
       }
       trapTabKey(e, renameModalEl);
     }}
+    transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
+    onoutrostart={inertDuringOutro}
   >
-    <div class="modal-content rename-modal" bind:this={renameModalEl}>
+    <div
+      class="modal-content rename-modal"
+      bind:this={renameModalEl}
+      transition:scale={{ start: 0.96, opacity: 0, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="modal-header">
         <span id="lib-rename-title" class="modal-title">{m.library_rename_title()}</span>
         <button type="button" class="icon-close" onclick={closeRename} disabled={renameDialog.busy} aria-label={m.common_close()}><IconX size={15} /></button>
@@ -4605,7 +4992,7 @@
 
 {#snippet globeIcon(off: boolean)}
   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-    <!-- Same 12-unit span as the folder and trash glyphs beside it. The "off"
+    <!-- Same 12-unit span as the folder glyphs beside it. The "off"
          outline opens at the bottom right, where the X sits. -->
     {#if off}
       <path d="M9.55 13.8A6 6 0 1 1 13.8 9.55"/>
@@ -4634,26 +5021,36 @@
 
 <div class="shared-layout" class:dragging={sidebarDragging}>
   <!-- Sidebar: folder filter tree -->
-  <div class="sidebar" style="width: {sidebarWidth}px; min-width: {sidebarWidth}px;">
+  {#if narrowLayout && foldersPanelOpen}
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <div class="sidebar-backdrop" onclick={closeFoldersPanel}></div>
+  {/if}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="sidebar"
+    class:panel-open={narrowLayout && foldersPanelOpen}
+    id="library-folders"
+    bind:this={foldersPanelEl}
+    onkeydown={onFoldersPanelKeydown}
+    style={narrowLayout ? undefined : `width: ${sidebarWidth}px; min-width: ${sidebarWidth}px;`}
+  >
     <div class="sidebar-header">
       <span class="sidebar-header-title">{m.library_shared_folders()}</span>
       <button type="button" class="sidebar-add-btn" onclick={handleAddFolder}>
         {m.library_add_folder()}
       </button>
+      {#if narrowLayout}
+        <button type="button" class="icon-close" onclick={closeFoldersPanel} aria-label={m.common_close()} title={m.common_close()}><IconX size={13} /></button>
+      {/if}
     </div>
     <div class="folder-tree">
+      <!-- The card takes a click anywhere on it; the keyboard and screen
+           readers get the name button, so the buttons beside it stay their own. -->
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
       <div
         class="tree-item"
         class:active={filterFolder === null}
-        onclick={() => filterFolder = null}
-        role="button"
-        tabindex="0"
-        onkeydown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            filterFolder = null;
-          }
-        }}
+        onclick={() => selectFolder(null)}
       >
         <span class="tree-main">
           <span class="tree-icon">
@@ -4662,7 +5059,14 @@
               <path d="M3 11V3.5a1 1 0 0 1 1-1H10"/>
             </svg>
           </span>
-          <span class="tree-folder-name">{m.library_all_files()}</span>
+          <button
+            type="button"
+            class="tree-select"
+            aria-current={filterFolder === null ? 'true' : undefined}
+            onclick={(e) => { e.stopPropagation(); selectFolder(null); }}
+          >
+            <span class="tree-folder-name">{m.library_all_files()}</span>
+          </button>
         </span>
         <div class="tree-meta">
           <span class="tree-stats">
@@ -4677,30 +5081,15 @@
         {@const folder = row.path}
         {@const rowCategories = row.isShare ? [] : categoriesOfTreeFolder(folder).map(downloadCategoryLabel)}
         {@const namedOtherwise = rowCategories.some((label) => label.toLocaleLowerCase() !== row.name.toLocaleLowerCase())}
+        {@const isActive = filterFolder !== null && pathsEqualForFolder(filterFolder, folder)}
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
         <div
           class="tree-item"
           class:child={!row.isShare}
-          class:active={filterFolder !== null && pathsEqualForFolder(filterFolder, folder)}
+          class:active={isActive}
           style="--depth: {row.depth}"
-          onclick={() => filterFolder = folder}
+          onclick={() => selectFolder(folder)}
           oncontextmenu={(e) => onFolderCtx(e, folder, row.isShare)}
-          role="button"
-          tabindex="0"
-          aria-expanded={row.hasChildren ? row.expanded : undefined}
-          onkeydown={(e) => {
-            // The row holds its own buttons and a select; leave their keys alone.
-            if (e.target !== e.currentTarget) return;
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              filterFolder = folder;
-            } else if (e.key === 'ArrowRight' && row.hasChildren && !row.expanded) {
-              e.preventDefault();
-              toggleFolderExpanded(folder);
-            } else if (e.key === 'ArrowLeft' && row.expanded) {
-              e.preventDefault();
-              toggleFolderExpanded(folder);
-            }
-          }}
         >
           <span class="tree-main">
             {#if row.hasChildren}
@@ -4711,6 +5100,7 @@
                 onclick={(e) => toggleFolderExpanded(folder, e)}
                 title={row.expanded ? m.library_folder_collapse() : m.library_folder_expand()}
                 aria-label={row.expanded ? m.library_folder_collapse() : m.library_folder_expand()}
+                aria-expanded={row.expanded}
               >
                 {#if row.expanded}
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" aria-hidden="true">
@@ -4730,9 +5120,24 @@
                 </svg>
               </span>
             {/if}
-            <span class="tree-folder-name" title={folder}>
-              {row.name}
-            </span>
+            <button
+              type="button"
+              class="tree-select"
+              title={folder}
+              aria-current={isActive ? 'true' : undefined}
+              onclick={(e) => { e.stopPropagation(); selectFolder(folder); }}
+              onkeydown={(e) => {
+                if (e.key === 'ArrowRight' && row.hasChildren && !row.expanded) {
+                  e.preventDefault();
+                  toggleFolderExpanded(folder);
+                } else if (e.key === 'ArrowLeft' && row.expanded) {
+                  e.preventDefault();
+                  toggleFolderExpanded(folder);
+                }
+              }}
+            >
+              <span class="tree-folder-name">{row.name}</span>
+            </button>
             {#if rowCategories.length > 0}
               <!-- Where finished downloads of these categories go: says what the
                    folder is for, and names the category when the folder is
@@ -4768,11 +5173,11 @@
                   title={m.library_remove_folder_btn_title()}
                   aria-label={m.library_remove_folder_btn_title()}
                 >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <polyline points="3 6 5 6 21 6" />
-                    <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-                    <line x1="10" y1="11" x2="10" y2="17" />
-                    <line x1="14" y1="11" x2="14" y2="17" />
+                  <!-- A folder with a minus, not the trash can: this takes the
+                       folder out of the Library and leaves the disk alone. -->
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2 4.5a1 1 0 0 1 1-1h3l1.5 1.5H13a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/>
+                    <path d="M5.5 9h5"/>
                   </svg>
                 </button>
               </span>
@@ -4910,7 +5315,8 @@
                     {topPanelMetric === 'bytes'
                       ? formatSize(val)
                       : plural(val, {
-                          one: m.library_uploads_one,
+                          one: () => m.library_uploads_one({ count: formatNumber(val) }),
+                          oneShowsCount: true,
                           few: () => m.library_uploads_few({ count: formatNumber(val) }),
                           other: () => m.library_uploads_other({ count: formatNumber(val) }),
                         })}
@@ -4943,7 +5349,7 @@
   ></div>
 
   <!-- Main: file list -->
-  <div class="file-list-area">
+  <div class="file-list-area" class:drawer-open={!!selectedFile}>
     {#if stoppingHashing || scanning || hashProgress}
       <div class="scan-banner">
         <span class="spinner xs"></span>
@@ -5103,8 +5509,8 @@
     {/if}
 
     {#if checkedCount > 0}
-      <div class="bulk-action-bar">
-        <span class="bulk-count">{plural(checkedCount, { one: m.library_bulk_count_one, other: () => m.library_bulk_count_other({ count: formatNumber(checkedCount) }) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
+      <div class="bulk-action-bar" bind:offsetHeight={bulkBarHeight}>
+        <span class="bulk-count">{plural(checkedCount, { one: () => m.library_bulk_count_one({ count: formatNumber(checkedCount) }), oneShowsCount: true, other: () => m.library_bulk_count_other({ count: formatNumber(checkedCount) }) })}<span class="bulk-size"> · {formatSize(checkedTotalSize)}</span></span>
         {#if checkedHiddenCount > 0}
           <button
             type="button"
@@ -5114,7 +5520,7 @@
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="11" height="11" aria-hidden="true">
               <path d="M2 3h12l-4.5 5.5V13l-3 1.5V8.5z"/>
             </svg>
-            {plural(checkedHiddenCount, { one: m.library_bulk_hidden_one, other: () => m.library_bulk_hidden_other({ count: formatNumber(checkedHiddenCount) }) })}
+            {plural(checkedHiddenCount, { one: () => m.library_bulk_hidden_one({ count: formatNumber(checkedHiddenCount) }), oneShowsCount: true, other: () => m.library_bulk_hidden_other({ count: formatNumber(checkedHiddenCount) }) })}
           </button>
         {/if}
         <div class="bulk-prio-group">
@@ -5159,7 +5565,7 @@
       </div>
     {/if}
 
-    <div class="status-bar">
+    <div class="status-bar" bind:offsetHeight={statusBarHeight}>
       {#if hasActiveLibraryFilters && filteredFiles.length !== files.length}
         <span>{m.library_status_showing({ shown: formatNumber(filteredFiles.length), total: formatNumber(files.length) })}</span>
         <span class="status-sep">&middot;</span>
@@ -5174,7 +5580,11 @@
 
   <!-- Side drawer for file details + comments -->
   {#if selectedFile}
-    <div class="detail-drawer" transition:fly={{ x: 24, duration: prefersReducedMotion.current ? 0 : 200 }}>
+    <div
+      class="detail-drawer"
+      style:--drawer-clear="{(checkedCount > 0 ? bulkBarHeight : 0) + statusBarHeight}px"
+      transition:fly={{ x: 24, duration: prefersReducedMotion.current ? 0 : 200 }}
+    >
       <div class="drawer-header">
         <FileTypeIcon kind={selectedKind} size={40} />
         <div class="drawer-header-text">
@@ -5478,7 +5888,7 @@
               {/if}
               {#if selectedMedia.bitrate}
                 <span class="meta-label">{m.library_meta_bitrate()}</span>
-                <span class="meta-value">{m.library_meta_bitrate_value({ kbps: selectedMedia.bitrate })}</span>
+                <span class="meta-value">{m.library_meta_bitrate_value({ kbps: formatNumber(selectedMedia.bitrate) })}</span>
               {/if}
               {#if selectedMedia.codec}
                 <span class="meta-label">{m.library_meta_codec()}</span>
@@ -5572,11 +5982,12 @@
                     {m.library_comment_emule_limit({ count: formatNumber(ourComment.length), limit: formatNumber(EMULE_COMMENT_LIMIT) })}
                   </div>
                 {/if}
-                {#if commentSaveState !== 'idle'}
-                  <div class="comment-save-state" class:error={commentSaveState === 'error'}>
-                    {commentSaveMessage}
-                  </div>
-                {/if}
+                <!-- Always in the page, so screen readers hear what is put in it. -->
+                <div class="comment-save-state" class:error={commentSaveState === 'error'} role="status">
+                  {#if commentSaveState !== 'idle'}
+                    <span class="comment-save-msg">{commentSaveMessage}</span>
+                  {/if}
+                </div>
               </div>
               {#if commentInfo?.peer_comments?.length}
                 <div class="comment-peers">
@@ -5616,6 +6027,10 @@
   {@const moveTargets = categoryMoveTargets(ctxMenu.file)}
   {@const tagAddTargets = emberTagTargets(ctxMenu.file, true)}
   {@const tagRemoveTargets = emberTagTargets(ctxMenu.file, false)}
+  {@const feedTargetCount = feedsAvailable ? feedTargets(ctxMenu.file).length : 0}
+  {@const multi = ctxActsOnChecked(ctxMenu.file)}
+  {@const bulkLocked = multi && bulkBusy}
+  <!-- `bulkLocked`: the bulk actions drop a request made while another runs. -->
   <div class="ctx-menu" role="menu" bind:this={ctxMenuEl} use:ctxMenuPosition={{ x: ctxMenu.x, y: ctxMenu.y }}>
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
@@ -5631,14 +6046,14 @@
       onclick={() => ctxAction('rename')}
     >{m.library_rename()}</button>
     {#if tagAddTargets.length > 0}
-      <button class="ctx-item" role="menuitem" title={m.library_bulk_tag_title()} onclick={() => ctxAction('tag_add')}>
+      <button class="ctx-item" role="menuitem" disabled={bulkBusy} title={m.library_bulk_tag_title()} onclick={() => ctxAction('tag_add')}>
         {tagAddTargets.length > 1
           ? m.library_ctx_tag_count({ count: formatNumber(tagAddTargets.length) })
           : m.library_bulk_tag()}
       </button>
     {/if}
     {#if tagRemoveTargets.length > 0}
-      <button class="ctx-item" role="menuitem" title={m.library_bulk_untag_title()} onclick={() => ctxAction('tag_remove')}>
+      <button class="ctx-item" role="menuitem" disabled={bulkBusy} title={m.library_bulk_untag_title()} onclick={() => ctxAction('tag_remove')}>
         {tagRemoveTargets.length > 1
           ? m.library_ctx_untag_count({ count: formatNumber(tagRemoveTargets.length) })
           : m.library_bulk_untag()}
@@ -5685,6 +6100,7 @@
               <button
                 class="ctx-item"
                 role="menuitem"
+                disabled={bulkBusy}
                 title={isHere ? m.library_move_already_here() : undefined}
                 onclick={() => ctxAction('move_category', category)}
               >
@@ -5694,6 +6110,42 @@
             {/each}
             <div class="ctx-sep" role="separator"></div>
             <button class="ctx-item" role="menuitem" onclick={() => ctxAction('edit_categories')}>{m.library_ctx_edit_categories()}</button>
+          </div>
+        {/if}
+      </div>
+    {/if}
+    {#if feedsAvailable && feedTargetCount > 0}
+      <!-- Only for files a feed can list: shared with everyone, with their
+           Ember digest. Added as an edit; the feed is published from Feeds. -->
+      <div
+        class="ctx-item ctx-sub"
+        class:ctx-sub-open={ctxFeedSub}
+        role="menuitem"
+        tabindex="0"
+        aria-haspopup="menu"
+        aria-expanded={ctxFeedSub}
+        onmouseenter={() => enterHoverSub('feed')}
+        onmouseleave={leaveHoverSub}
+        onclick={(e) => clickHoverSub(e, 'feed')}
+        onkeydown={(e) => onSubmenuKey(e, 'feed')}
+      >
+        {feedTargetCount > 1
+          ? m.library_ctx_add_to_feed_count({ count: formatNumber(feedTargetCount) })
+          : m.library_ctx_add_to_feed()}
+        {#if ctxFeedSub}
+          <div class="ctx-submenu ctx-scroll" role="menu" use:ctxSubmenuPlacement>
+            {#if myFeeds === null}
+              <div class="ctx-label ctx-note" role="presentation">{m.common_loading()}</div>
+            {:else if myFeeds.length === 0}
+              <div class="ctx-label ctx-note" role="presentation">{m.library_ctx_no_feeds()}</div>
+            {:else}
+              {#each myFeeds as feed (feed.salt)}
+                <button class="ctx-item" role="menuitem" onclick={() => ctxAction('add_to_feed', feed.salt)}>
+                  <bdi dir="auto">{feed.title || m.library_feed_untitled()}</bdi>
+                  <span class="ctx-hint">{formatNumber(feed.item_count)}</span>
+                </button>
+              {/each}
+            {/if}
           </div>
         {/if}
       </div>
@@ -5712,15 +6164,20 @@
         onclick={(e) => clickHoverSub(e, 'priority')}
         onkeydown={(e) => onSubmenuKey(e, 'priority')}
       >
-        {m.library_col_priority()}
-        <span class="ctx-hint">{priorityLabel(ctxMenu.file.priority)}</span>
+        {#if multi}
+          {m.library_ctx_priority_count({ count: formatNumber(checkedHashedCount) })}
+        {:else}
+          {m.library_col_priority()}
+          <span class="ctx-hint">{priorityLabel(ctxMenu.file.priority)}</span>
+        {/if}
         {#if ctxPrioritySub}
           <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
             {#each ['verylow', 'low', 'normal', 'high', 'release'] as prio}
               <button
                 class="ctx-item"
                 role="menuitemradio"
-                aria-checked={ctxMenu.file.priority === prio}
+                aria-checked={!multi && ctxMenu.file.priority === prio}
+                disabled={bulkLocked}
                 onclick={() => ctxAction('priority', prio)}
               >{priorityLabel(prio)}</button>
             {/each}
@@ -5728,7 +6185,8 @@
             <button
               class="ctx-item"
               role="menuitemradio"
-              aria-checked={ctxMenu.file.priority === 'auto'}
+              aria-checked={!multi && ctxMenu.file.priority === 'auto'}
+              disabled={bulkLocked}
               onclick={() => ctxAction('priority', 'auto')}
             >{m.library_priority_auto()}</button>
           </div>
@@ -5749,7 +6207,9 @@
         {m.servers_copy_ed2k_link()}
         {#if ctxCopySub}
           <div class="ctx-submenu" role="menu" use:ctxSubmenuPlacement>
-            <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>{m.library_copy_link_plain()}</button>
+            <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link')}>
+              {multi ? m.library_ctx_copy_links_count({ count: formatNumber(checkedHashedCount) }) : m.library_copy_link_plain()}
+            </button>
             {#if ctxMenu.file.aich_hash}
               <button class="ctx-item" role="menuitem" onclick={() => ctxAction('copy_link', 'aich')}>{m.library_copy_link_aich()}</button>
             {/if}
@@ -5860,18 +6320,27 @@
           class="ctx-item"
           role="menuitemcheckbox"
           aria-checked={!!ctxMenu.file.friends_only}
+          disabled={bulkLocked}
           onclick={() => ctxAction('friends_only')}
           title={m.library_friends_only_hint()}
-        >{m.library_friends_only_toggle()}</button>
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('unshare')}>{m.library_bulk_unshare()}</button>
+        >{multi
+          ? m.library_ctx_friends_only_count({ count: formatNumber(ctxMenu.file.friends_only ? checkedUnrestrictCount : checkedRestrictCount) })
+          : m.library_friends_only_toggle()}</button>
+        <button class="ctx-item" role="menuitem" disabled={bulkLocked} onclick={() => ctxAction('unshare')}>
+          {multi ? m.library_ctx_unshare_count({ count: formatNumber(checkedUnshareCount) }) : m.library_bulk_unshare()}
+        </button>
       {:else}
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('share')}>{m.library_bulk_share()}</button>
+        <button class="ctx-item" role="menuitem" disabled={bulkLocked} onclick={() => ctxAction('share')}>
+          {multi ? m.library_ctx_share_count({ count: formatNumber(checkedShareCount) }) : m.library_bulk_share()}
+        </button>
       {/if}
     {:else}
       <button class="ctx-item ctx-disabled" role="menuitem" disabled>{m.library_hashing_in_progress()}</button>
     {/if}
     <div class="ctx-sep" role="separator"></div>
-    <button class="ctx-item ctx-danger" role="menuitem" onclick={() => ctxAction('delete')}>{m.common_delete()}</button>
+    <button class="ctx-item ctx-danger" role="menuitem" disabled={bulkLocked} onclick={() => ctxAction('delete')}>
+      {multi ? m.library_ctx_delete_count({ count: formatNumber(checkedCount) }) : m.common_delete()}
+    </button>
   </div>
 {/if}
 
@@ -6068,7 +6537,14 @@
     text-transform: none;
     letter-spacing: normal;
   }
-  .folder-tree { flex: 1 1 auto; overflow-y: auto; padding: 8px; min-height: 80px; }
+  .folder-tree { flex: 1 1 auto; overflow-y: auto; padding: 8px; min-height: 80px; container-type: inline-size; }
+  /* Beside a share's three buttons a narrow sidebar left the name almost no
+     room, so below this the buttons take a line of their own under it. */
+  @container (max-width: 220px) {
+    .tree-item:not(.child) .tree-main { flex-wrap: wrap; row-gap: 4px; }
+    .tree-item:not(.child) .tree-actions { flex-basis: 100%; padding-left: 32px; }
+    .tree-main .tree-category { flex: 0 1 auto; min-width: 0; }
+  }
 
   /* --- Top Uploads (popularity) panel --- */
   .sidebar-section {
@@ -6273,10 +6749,33 @@
     box-shadow: inset 3px 0 0 var(--accent);
     color: var(--text-primary);
   }
-  .tree-item:focus-visible {
+  .tree-item:has(.tree-select:focus-visible) {
     outline: 2px solid var(--accent);
     outline-offset: 1px;
   }
+  /* The name is the row's one control; the card around it draws its focus. */
+  button.tree-select {
+    display: flex;
+    align-items: center;
+    flex: 1 1 auto;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    border: none;
+    border-radius: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    transform: none;
+  }
+  button.tree-select:hover,
+  button.tree-select:active:not(:disabled) {
+    background: none;
+    color: inherit;
+    transform: none;
+  }
+  button.tree-select:focus-visible { outline: none; }
   .tree-main {
     display: inline-flex;
     align-items: center;
@@ -6286,7 +6785,6 @@
   }
   /* A card's first line: icon, name, then the share's actions pushed right. */
   .tree-item:not(.child) .tree-main { display: flex; }
-  .tree-item:not(.child) .tree-folder-name { flex: 1 1 auto; }
   /* Second line: what the folder holds, then its upload priority, lined up
      with the folder name (icon chip 24px + 8px gap). It wraps when the
      sidebar is narrow rather than squeezing the name. */
@@ -6337,8 +6835,9 @@
   }
   .tree-folder-name {
     min-width: 0;
-    overflow-wrap: anywhere;
-    word-break: break-word;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     line-height: 1.3;
     font-size: var(--font-size-md);
     font-weight: 600;
@@ -7369,6 +7868,7 @@
     padding: 0 1px;
     line-height: 1;
   }
+  .star-btn { transition: transform var(--transition-fast) ease; }
   .star-btn:hover { transform: scale(1.2); }
   .star-clear {
     display: inline-flex;
@@ -7421,13 +7921,16 @@
   }
   .comment-save:hover { opacity: 0.85; }
   .comment-save-state {
-    margin-top: 6px;
     font-size: var(--font-size-xs);
     color: var(--success);
     font-weight: 600;
   }
   .comment-save-state.error {
     color: var(--danger);
+  }
+  .comment-save-msg {
+    display: block;
+    margin-top: 6px;
   }
   .comment-limit-note {
     margin-top: 6px;
@@ -7560,7 +8063,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    animation: modal-fade-in 0.15s ease;
   }
   .modal-content {
     background: var(--bg-secondary);
@@ -7572,21 +8074,6 @@
     display: flex;
     flex-direction: column;
     max-height: 80vh;
-    animation: modal-pop-in 0.2s ease;
-  }
-  @keyframes modal-fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  @keyframes modal-pop-in {
-    from { opacity: 0; transform: scale(0.96); }
-    to { opacity: 1; transform: scale(1); }
-  }
-  @media (prefers-reduced-motion: reduce) {
-    .modal-overlay,
-    .modal-content {
-      animation: none;
-    }
   }
   /* Create Collection, laid out like the File Details window: the collection
      up front, then details, format and files each on their own card. */
@@ -7879,14 +8366,22 @@
   /* Overlay the detail drawer earlier so the file table keeps usable width
      on 16" / mid laptop layouts (shared breakpoint --bp-lg ≈ 1200). */
   @media (max-width: 1200px) {
-    .shared-layout { position: relative; }
+    .shared-layout {
+      position: relative;
+      --drawer-w: min(90vw, 480px);
+    }
     .detail-drawer {
       position: absolute;
-      inset: 0 0 0 auto;
-      width: min(90vw, 480px);
+      inset: 0 0 var(--drawer-clear, 0px) auto;
+      width: var(--drawer-w);
       min-width: 0;
       z-index: 1100;
       box-shadow: var(--shadow-panel-left);
+    }
+    /* What lies under the drawer cannot be scrolled out from under it, so the
+       table gives up that width and keeps its scrollbar beside the drawer. */
+    .file-list-area.drawer-open :global(.library-virtual-table-root) {
+      margin-right: var(--drawer-w);
     }
   }
 
@@ -7900,9 +8395,31 @@
       width: 100%;
     }
     .inline-stats { display: none; }
-    .sidebar,
+    /* No room for the sidebar beside the table: it slides out over it from
+       the header's Shared Folders button. */
     .sidebar-divider { display: none; }
-    .detail-drawer { width: min(100vw, 480px); }
+    .sidebar {
+      position: absolute;
+      inset: 0 auto 0 0;
+      z-index: 1050;
+      width: min(85vw, 320px);
+      box-shadow: 4px 0 18px rgba(0, 0, 0, 0.18);
+      visibility: hidden;
+      transform: translateX(-100%);
+      transition: transform var(--transition-normal) ease, visibility 0s linear var(--transition-normal);
+    }
+    .sidebar.panel-open {
+      visibility: visible;
+      transform: none;
+      transition: transform var(--transition-normal) ease;
+    }
+    .sidebar-backdrop {
+      position: absolute;
+      inset: 0;
+      z-index: 1049;
+      background: var(--overlay-bg);
+    }
+    .shared-layout { --drawer-w: min(100vw, 480px); }
     .modal-body { padding: 12px; }
     .modal-footer,
     .modal-header { padding-left: 12px; padding-right: 12px; }

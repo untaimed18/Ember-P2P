@@ -945,6 +945,26 @@ impl RoutingTable {
             }
         }
 
+        // The global caps count leads in every bucket, and a lead's address
+        // costs nothing to gossip: leads planted at a peer's address or /24
+        // from node ids in other buckets used up the share it needed, and
+        // the own-bucket search above could not reach them. A proven
+        // newcomer takes the share back from a lead holding it anywhere.
+        if contact.is_verified() {
+            let ip_capped = self.global_ip_count.get(&ip).copied().unwrap_or(0) >= max_per_ip;
+            let subnet_capped =
+                self.global_subnet_count.get(&subnet).copied().unwrap_or(0) >= max_subnet_global;
+            if ip_capped || subnet_capped {
+                if let Some((at, pos)) = self.lead_holding(ip_capped.then_some(ip), subnet, bucket_idx) {
+                    let evicted = self.buckets[at].contacts.remove(pos).unwrap();
+                    self.residents.remove(&evicted);
+                    self.release_subnet(evicted.subnet_key());
+                    self.release_ip(evicted.addr.ip());
+                    self.add_to_cache(at, evicted, scale);
+                }
+            }
+        }
+
         let bucket = &mut self.buckets[bucket_idx];
 
         // Subnet diversity check: per-bucket
@@ -1087,9 +1107,33 @@ impl RoutingTable {
         // entries use `last_seen == 0`) must not rewrite addr/keys or reset
         // freshness — that bypassed subnet caps (eclipse) and could clobber
         // a live contact with `last_seen = 0`.
+        //
+        // Except over a lead that has already missed a ping. Otherwise the
+        // first endpoint anyone named for a node id held it: correct gossip and
+        // the address book's entry for that node were ignored until the wrong
+        // one had missed all `MAX_FAILED_QUERIES`, and gossip could put it back
+        // the moment it faulted out. Waiting for a miss means every endpoint is
+        // tried before another can displace it, and the strikes stay with the
+        // node id so rotating endpoints cannot keep an unanswering slot alive.
         if contact.last_seen <= 0 {
-            bucket.contacts.insert(pos, existing);
-            return AddResult::Added;
+            let yields = !existing.is_verified()
+                && existing.failed_queries > 0
+                && contact.noise_pub != [0u8; 32]
+                && (contact.addr != existing.addr || contact.noise_pub != existing.noise_pub);
+            if !yields {
+                bucket.contacts.insert(pos, existing);
+                return AddResult::Added;
+            }
+            return self.readdress_lead(
+                bucket_idx,
+                pos,
+                existing,
+                contact,
+                max_per_ip,
+                max_subnet_global,
+                max_subnet_bucket,
+                admit_new_addr,
+            );
         }
 
         // Pin the Noise static key once this node_id has answered us. The DHT
@@ -1104,8 +1148,6 @@ impl RoutingTable {
             return AddResult::Rejected;
         }
 
-        let subnet = contact.subnet_key();
-        let ip = contact.addr.ip();
         let (old_addr, was_verified) = (existing.addr, existing.is_verified());
         if contact.addr != existing.addr {
             if !admit_new_addr {
@@ -1126,32 +1168,11 @@ impl RoutingTable {
                 bucket.contacts.insert(pos, existing);
                 return AddResult::Added;
             }
-            let old_subnet = existing.subnet_key();
-            let old_ip = existing.addr.ip();
-            if subnet != old_subnet {
-                if bucket.subnet_count(subnet) >= max_subnet_bucket {
-                    bucket.contacts.insert(pos, existing);
-                    return AddResult::Rejected;
-                }
-                let global_count = self.global_subnet_count.get(&subnet).copied().unwrap_or(0);
-                if global_count >= max_subnet_global {
-                    bucket.contacts.insert(pos, existing);
-                    return AddResult::Rejected;
-                }
-            }
-            if ip != old_ip && self.global_ip_count.get(&ip).copied().unwrap_or(0) >= max_per_ip {
-                let bucket = &mut self.buckets[bucket_idx];
-                bucket.contacts.insert(pos, existing);
+            if !self.move_fits(bucket_idx, old_addr, contact.addr, max_per_ip, max_subnet_global, max_subnet_bucket) {
+                self.buckets[bucket_idx].contacts.insert(pos, existing);
                 return AddResult::Rejected;
             }
-            if subnet != old_subnet {
-                self.release_subnet(old_subnet);
-                *self.global_subnet_count.entry(subnet).or_insert(0) += 1;
-            }
-            if ip != old_ip {
-                self.release_ip(old_ip);
-                *self.global_ip_count.entry(ip).or_insert(0) += 1;
-            }
+            self.recount_move(old_addr, contact.addr);
             existing.addr = contact.addr;
         }
 
@@ -1165,6 +1186,78 @@ impl RoutingTable {
         bucket.contacts.push_back(existing);
         bucket.last_activity = contact.last_seen;
         AddResult::Added
+    }
+
+    /// Give the lead `existing`, just taken from `pos` in bucket `bucket_idx`,
+    /// the endpoint `contact` names. Admitted on the same terms as a verified
+    /// contact's move, and it stays a lead: unverified, in its place in the
+    /// bucket, with the strikes it already has.
+    #[allow(clippy::too_many_arguments)]
+    fn readdress_lead(
+        &mut self,
+        bucket_idx: usize,
+        pos: usize,
+        mut existing: EmberContact,
+        contact: EmberContact,
+        max_per_ip: usize,
+        max_subnet_global: usize,
+        max_subnet_bucket: usize,
+        admit_new_addr: bool,
+    ) -> AddResult {
+        let old_addr = existing.addr;
+        if contact.addr != old_addr
+            && (!admit_new_addr
+                || !self.move_fits(bucket_idx, old_addr, contact.addr, max_per_ip, max_subnet_global, max_subnet_bucket))
+        {
+            self.buckets[bucket_idx].contacts.insert(pos, existing);
+            return AddResult::Rejected;
+        }
+        self.recount_move(old_addr, contact.addr);
+        existing.addr = contact.addr;
+        existing.noise_pub = contact.noise_pub;
+        existing.ed25519_pub = contact.ed25519_pub;
+        self.residents.readdress(existing.node_id, old_addr, existing.addr);
+        trace!(
+            "Lead {} moved from {old_addr} to {} after a missed ping",
+            existing.node_id,
+            existing.addr
+        );
+        self.buckets[bucket_idx].contacts.insert(pos, existing);
+        AddResult::Added
+    }
+
+    /// Whether a resident of bucket `bucket_idx` may move from `from` to `to`
+    /// under the diversity caps, its own share at `from` aside.
+    fn move_fits(
+        &self,
+        bucket_idx: usize,
+        from: SocketAddr,
+        to: SocketAddr,
+        max_per_ip: usize,
+        max_subnet_global: usize,
+        max_subnet_bucket: usize,
+    ) -> bool {
+        let (old_subnet, subnet) = (super::subnet_key_of(from.ip()), super::subnet_key_of(to.ip()));
+        if subnet != old_subnet
+            && (self.buckets[bucket_idx].subnet_count(subnet) >= max_subnet_bucket
+                || self.global_subnet_count.get(&subnet).copied().unwrap_or(0) >= max_subnet_global)
+        {
+            return false;
+        }
+        to.ip() == from.ip() || self.global_ip_count.get(&to.ip()).copied().unwrap_or(0) < max_per_ip
+    }
+
+    /// Move one resident's claims on the global quotas from `from` to `to`.
+    fn recount_move(&mut self, from: SocketAddr, to: SocketAddr) {
+        let (old_subnet, subnet) = (super::subnet_key_of(from.ip()), super::subnet_key_of(to.ip()));
+        if subnet != old_subnet {
+            self.release_subnet(old_subnet);
+            *self.global_subnet_count.entry(subnet).or_insert(0) += 1;
+        }
+        if to.ip() != from.ip() {
+            self.release_ip(from.ip());
+            *self.global_ip_count.entry(to.ip()).or_insert(0) += 1;
+        }
     }
 
     /// The replacement-cache entry `bucket_idx` should promote next, or `None`
@@ -1329,6 +1422,26 @@ impl RoutingTable {
         self.release_ip(removed.addr.ip());
         self.residents.remove(&removed);
         true
+    }
+
+    /// A resident lead outside bucket `except` holding the share a proven
+    /// newcomer needs: one at `ip` when the address cap binds (which frees
+    /// its /24's share too), otherwise one in `subnet`. As
+    /// `(bucket, position)`.
+    fn lead_holding(&self, ip: Option<IpAddr>, subnet: u64, except: usize) -> Option<(usize, usize)> {
+        self.buckets.iter().enumerate().filter(|(at, _)| *at != except).find_map(|(at, bucket)| {
+            bucket
+                .contacts
+                .iter()
+                .position(|c| {
+                    !c.is_verified()
+                        && match ip {
+                            Some(ip) => c.addr.ip() == ip,
+                            None => c.subnet_key() == subnet,
+                        }
+                })
+                .map(|pos| (at, pos))
+        })
     }
 
     /// Drop one contact's claim on its subnet quota.
@@ -3033,6 +3146,106 @@ mod tests {
         assert_eq!(kept.last_seen, 1_700_000_000);
     }
 
+    /// A lead for `id` at `ip`, as gossip names it.
+    fn lead_at(id: u8, ip: Ipv4Addr, key: u8) -> EmberContact {
+        EmberContact {
+            noise_pub: [key; 32],
+            last_seen: 0,
+            ..contact_with(make_id(id).0, ip)
+        }
+    }
+
+    /// The first endpoint named for a node id used to hold it until it had
+    /// missed every ping, whatever correct gossip or the address book said.
+    /// Once it has missed one, another endpoint takes its place — still a
+    /// lead, where it was, with the strike it inherited.
+    #[test]
+    fn a_lead_that_missed_a_ping_yields_to_another_endpoint() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let fake = lead_at(1, Ipv4Addr::new(66, 6, 6, 6), 0x66);
+        let real = lead_at(1, Ipv4Addr::new(80, 1, 1, 1), 0x11);
+        assert!(matches!(rt.add_contact(fake.clone()), AddResult::Added));
+
+        assert!(matches!(rt.add_contact(real.clone()), AddResult::Added));
+        assert_eq!(
+            rt.get_contact(&real.node_id).unwrap().addr,
+            fake.addr,
+            "an untried endpoint is pinged before anything displaces it"
+        );
+
+        rt.mark_failed(&fake.node_id);
+        assert!(matches!(rt.add_contact(real.clone()), AddResult::Added));
+        let held = rt.get_contact(&real.node_id).unwrap();
+        assert_eq!((held.addr, held.noise_pub), (real.addr, real.noise_pub));
+        assert!(!held.is_verified());
+        assert_eq!(held.failed_queries, 1, "the strike stays with the node id");
+        assert_eq!(rt.total_contacts(), 1);
+        assert!(rt.contact_at(fake.addr).is_none());
+        assert_eq!(rt.contact_at(real.addr).map(|c| c.node_id), Some(real.node_id));
+        assert_eq!(rt.global_ip_count.get(&fake.addr.ip()), None);
+        assert_eq!(rt.global_ip_count.get(&real.addr.ip()), Some(&1));
+        rt.assert_residents_indexed();
+
+        // It now answers at the endpoint it was moved to.
+        rt.mark_alive(&real.node_id, real.addr, &real.noise_pub);
+        assert!(rt.get_contact(&real.node_id).unwrap().is_verified());
+    }
+
+    /// Rotating endpoints cannot keep an unanswering node id in the table: the
+    /// strikes accumulate across them.
+    #[test]
+    fn rotating_a_leads_endpoint_does_not_reset_its_strikes() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        rt.add_contact(lead_at(1, Ipv4Addr::new(66, 6, 6, 1), 0x61));
+        for round in 2..=super::super::MAX_FAILED_QUERIES {
+            assert!(!rt.mark_failed(&make_id(1)));
+            rt.add_contact(lead_at(1, Ipv4Addr::new(66, 6, 6, round), 0x60 + round));
+            assert_eq!(rt.get_contact(&make_id(1)).unwrap().addr.ip(), Ipv4Addr::new(66, 6, 6, round));
+        }
+        assert!(rt.mark_failed(&make_id(1)), "faults out on schedule");
+    }
+
+    /// Gossip still never rewrites a contact that has answered us, however
+    /// many pings it has missed since.
+    #[test]
+    fn a_verified_contact_with_strikes_is_not_readdressed_by_gossip() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let proven = contact_with(make_id(1).0, Ipv4Addr::new(80, 1, 1, 1));
+        rt.add_contact(proven.clone());
+        rt.mark_failed(&proven.node_id);
+        rt.add_contact(lead_at(1, Ipv4Addr::new(66, 6, 6, 6), 0x66));
+        let held = rt.get_contact(&proven.node_id).unwrap();
+        assert_eq!((held.addr, held.noise_pub), (proven.addr, proven.noise_pub));
+        assert!(held.is_verified());
+    }
+
+    /// The endpoint a lead moves to is admitted on the same terms as any
+    /// other: one the per-address cap refuses leaves the lead as it was.
+    #[test]
+    fn a_lead_does_not_move_to_an_address_the_caps_refuse() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let crowded = Ipv4Addr::new(90, 9, 9, 9);
+        let cap = rt.admission_scale().max_contacts_per_ip();
+        for i in 0..cap {
+            let mut id = [0u8; 16];
+            id[1] = 0x80 >> i;
+            rt.add_contact(EmberContact { last_seen: 0, ..contact_with(id, crowded) });
+        }
+        let first = lead_at(0x01, Ipv4Addr::new(80, 1, 1, 1), 0x11);
+        rt.add_contact(first.clone());
+        rt.mark_failed(&first.node_id);
+
+        assert!(matches!(rt.add_contact(lead_at(0x01, crowded, 0x22)), AddResult::Rejected));
+        let held = rt.get_contact(&first.node_id).unwrap();
+        assert_eq!((held.addr, held.noise_pub), (first.addr, first.noise_pub));
+        assert_eq!(rt.global_ip_count.get(&IpAddr::V4(crowded)).copied(), Some(cap));
+        rt.assert_residents_indexed();
+    }
+
     #[test]
     fn mark_alive_resets_failures() {
         let local = make_id(0);
@@ -3566,6 +3779,39 @@ mod tests {
             "the lead of another /24 is not the one to go"
         );
         assert_eq!(bucket.subnet_count(live.subnet_key()), cap);
+    }
+
+    /// Leads planted at a peer's address from node ids in other buckets took
+    /// the whole per-address share; the peer, answering, must get it back.
+    #[test]
+    fn a_verified_peer_takes_its_address_back_from_leads_in_other_buckets() {
+        let local = make_id(0);
+        let mut rt = RoutingTable::new(local, false);
+        let max_per_ip = scale::NetworkScale::Bootstrap.max_contacts_per_ip();
+        let ip = IpAddr::V4(Ipv4Addr::new(80, 1, 1, 9));
+        for n in 1..=max_per_ip {
+            let mut id = [0u8; 16];
+            id[n / 8] = 0x80 >> (n % 8);
+            let lead = EmberContact {
+                node_id: EmberNodeId(id),
+                addr: SocketAddr::new(ip, 4000 + n as u16),
+                noise_pub: [n as u8; 32],
+                ed25519_pub: [n as u8; 32],
+                last_seen: 0,
+                failed_queries: 0,
+            };
+            assert!(matches!(rt.add_contact(lead), AddResult::Added));
+        }
+        assert_eq!(rt.global_ip_count.get(&ip).copied(), Some(max_per_ip));
+
+        let live = contact_at(0x80, 80, 1, 1, 9);
+        assert!(
+            matches!(rt.add_contact(live.clone()), AddResult::Added),
+            "a lead elsewhere gives up the address's share"
+        );
+        let bucket = &rt.buckets[local.bucket_index(&live.node_id).expect("a bucket")];
+        assert!(bucket.find(&live.node_id).is_some());
+        assert_eq!(rt.global_ip_count.get(&ip).copied(), Some(max_per_ip), "still within the cap");
     }
 
     /// The per-address cap is the tightest: only a lead at the newcomer's own

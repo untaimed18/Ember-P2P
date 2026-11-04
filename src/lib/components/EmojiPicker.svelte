@@ -156,6 +156,15 @@
     background: var(--bg-surface);
     box-shadow: var(--shadow-md);
     color: var(--text-primary);
+    transform-origin: bottom;
+    animation: emoji-picker-in 0.12s ease-out;
+  }
+
+  /* The chat's reaction picker motion: it opens upward, so it scales rather
+     than lifts. */
+  @keyframes emoji-picker-in {
+    from { opacity: 0; transform: scale(0.96); }
+    to { opacity: 1; transform: scale(1); }
   }
 
   .emoji-picker:focus {

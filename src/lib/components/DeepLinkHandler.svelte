@@ -32,10 +32,13 @@
     openPendingCollection,
     previewDeepLink,
     type DeepLinkPreview,
+    type PendingDeepLink,
   } from '$lib/api/deeplink';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import IconX from '$lib/components/IconX.svelte';
   import { cancelIncomingCollection, presentIncomingCollection } from '$lib/stores/collection';
-  import { toastSuccess, toastError } from '$lib/stores/toast';
+  import { toastsFor } from '$lib/stores/toast';
+  const { toastSuccess, toastError } = toastsFor('downloads');
   import { codedErrorOf, translateError } from '$lib/i18n';
   import { serverMetDownloadedText } from '$lib/commandReplies';
   import { plural } from '$lib/plural';
@@ -105,19 +108,100 @@
     }
   }
 
+  /** Most files a batch confirmation names before summing up the rest. */
+  const BATCH_LISTED = 8;
+
+  function batchConfirmationMessage(previews: DeepLinkPreview[]): string {
+    const lines = previews
+      .slice(0, BATCH_LISTED)
+      .map((p) => `${p.name ?? ''} (${formatBytes(p.size ?? 0)})`);
+    if (previews.length > BATCH_LISTED) {
+      lines.push(m.deeplink_batch_more({ count: formatNumber(previews.length - BATCH_LISTED) }));
+    }
+    return lines.join('\n');
+  }
+
   let confirmOpen = $state(false);
+  let confirmTitle = $state('');
   let confirmMessage = $state('');
   let confirmLabel = $state('');
+  let confirmCancelLabel = $state('');
   let confirmResolver: ((decision: ConfirmDecision) => void) | null = null;
-
-  function requestConfirmation(preview: DeepLinkPreview): Promise<ConfirmDecision> {
+  function openConfirmation(title: string, message: string, label: string, cancelLabel: string): Promise<ConfirmDecision> {
     if (destroyed) return Promise.resolve('defer');
-    confirmMessage = deepLinkConfirmationMessage(preview);
-    confirmLabel = deepLinkConfirmLabel(preview);
+    confirmTitle = title;
+    confirmMessage = message;
+    confirmLabel = label;
+    confirmCancelLabel = cancelLabel;
     confirmOpen = true;
     return new Promise((resolve) => {
       confirmResolver = resolve;
     });
+  }
+
+  function requestConfirmation(preview: DeepLinkPreview): Promise<ConfirmDecision> {
+    return openConfirmation(
+      m.deeplink_confirm_title(),
+      deepLinkConfirmationMessage(preview),
+      deepLinkConfirmLabel(preview),
+      m.deeplink_confirm_ignore(),
+    );
+  }
+
+  /** What was settled for a link before its own turn: its preview, and for a
+   *  file opened together with others, the answer to the one dialog asking
+   *  about all of them. */
+  type Prepared = { preview: DeepLinkPreview; decision?: ConfirmDecision };
+
+  /**
+   * Several file links opened at once (a page's "download all", a multi-select
+   * in a browser) used to ask one dialog per file. When two or more of the
+   * links waiting are files, ask once for all of them. Anything else keeps
+   * its own dialog, and a lone file link is asked about as before.
+   */
+  async function confirmFileBatch(
+    links: PendingDeepLink[],
+    known?: Map<string, DeepLinkPreview>,
+  ): Promise<Map<string, Prepared>> {
+    const prepared = new Map<string, Prepared>();
+    if (links.length < 2) return prepared;
+    const files: { id: string; preview: DeepLinkPreview }[] = [];
+    for (const link of links) {
+      if (destroyed) return prepared;
+      // A link that fails to preview is left to its own turn, which reports it.
+      const preview = known?.get(link.id) ?? (await previewDeepLink(link.payload.trim()).catch(() => null));
+      if (!preview) continue;
+      prepared.set(link.id, { preview });
+      if (preview.kind === 'file') files.push({ id: link.id, preview });
+    }
+    if (files.length < 2) return prepared;
+    const decision = await openConfirmation(
+      m.deeplink_batch_title(),
+      batchConfirmationMessage(files.map((f) => f.preview)),
+      m.deeplink_batch_download_all(),
+      m.deeplink_batch_ignore_all(),
+    );
+    for (const f of files) prepared.set(f.id, { preview: f.preview, decision });
+    return prepared;
+  }
+
+  /** Reviewing a parked file link brings back every parked file link, to be
+   *  asked about together as they were when they arrived. Empty when the
+   *  link under review is not a file, which is then asked about alone. */
+  async function deferredFileLinks(pending: PendingDeepLink[], reviewId: string): Promise<Map<string, DeepLinkPreview>> {
+    const files = new Map<string, DeepLinkPreview>();
+    const reviewed = pending.find((link) => link.id === reviewId);
+    if (!reviewed) return files;
+    const first = await previewDeepLink(reviewed.payload.trim()).catch(() => null);
+    if (first?.kind !== 'file') return files;
+    for (const link of pending) {
+      if (destroyed) break;
+      if (!deferredIds.has(link.id) || completedIds.has(link.id)) continue;
+      const preview =
+        link.id === reviewId ? first : await previewDeepLink(link.payload.trim()).catch(() => null);
+      if (preview?.kind === 'file') files.set(link.id, preview);
+    }
+    return files;
   }
 
   function resolveConfirmation(decision: ConfirmDecision) {
@@ -127,20 +211,29 @@
     resolve?.(decision);
   }
 
-  async function handlePayload(raw: string, pendingId: string): Promise<HandleResult> {
+  /** Files queued from the current batch dialog, announced in one toast once
+   *  the batch is through rather than one toast each. */
+  let batchQueued = 0;
+
+  async function handlePayload(raw: string, pendingId: string, prepared?: Prepared): Promise<HandleResult> {
     const payload = raw.trim();
     let preview: DeepLinkPreview;
-    try {
-      preview = await previewDeepLink(payload);
-    } catch (e: unknown) {
-      // Parsing/validation errors are permanent for this immutable durable
-      // payload. Surface once, then acknowledge so malformed links cannot
-      // occupy all queue slots forever.
-      if (!destroyed) toastError(translateError(e));
-      return destroyed ? 'defer' : 'done';
+    if (prepared) {
+      preview = prepared.preview;
+    } else {
+      try {
+        preview = await previewDeepLink(payload);
+      } catch (e: unknown) {
+        // Parsing/validation errors are permanent for this immutable durable
+        // payload. Surface once, then acknowledge so malformed links cannot
+        // occupy all queue slots forever.
+        if (!destroyed) toastError(translateError(e));
+        return destroyed ? 'defer' : 'done';
+      }
     }
 
-    const decision = await requestConfirmation(preview);
+    const batched = prepared?.decision !== undefined;
+    const decision = prepared?.decision ?? (await requestConfirmation(preview));
     if (destroyed || decision === 'defer') return 'defer';
     // Explicit "Ignore link" is a terminal user decision: ack without
     // executing the network/filesystem action.
@@ -171,11 +264,14 @@
           // the confirmation dialog. `parseEd2kLink` does no sanitizing, and
           // toasts have no bidi isolation.
           const displayName = preview.name ?? info.name;
-          toastSuccess(
-            res.already_queued
-              ? alreadyQueuedText(res, displayName)
-              : m.search_queued_name({ name: displayName }),
-          );
+          if (batched && !res.already_queued) batchQueued += 1;
+          else {
+            toastSuccess(
+              res.already_queued
+                ? alreadyQueuedText(res, displayName)
+                : m.search_queued_name({ name: displayName }),
+            );
+          }
         }
       } else if (preview.kind === 'server') {
         // Prefer the previewed endpoint so a browser-encoded argv payload
@@ -249,7 +345,8 @@
         if (!destroyed) {
           const count = formatNumber(coll.files.length);
           toastSuccess(plural(coll.files.length, {
-            one: () => m.library_collection_loaded_one({ name: coll.name }),
+            one: () => m.library_collection_loaded_one({ name: coll.name, count }),
+            oneShowsCount: true,
             few: () => m.library_collection_loaded_few({ name: coll.name, count }),
             other: () => m.library_collection_loaded({ name: coll.name, count }),
           }));
@@ -280,6 +377,10 @@
     }
   }
 
+  /** Batch answers for links not yet acknowledged, so a drain that stopped at
+   *  a failed acknowledgement does not ask about the rest of the batch again. */
+  const batchDecisions = new Map<string, Prepared>();
+
   let processing = false;
   let rerun = false;
   let deferredCount = $state(deferredIds.size);
@@ -289,8 +390,13 @@
   // into a component that no longer exists.
   let destroyed = false;
 
+  /** How many links were waiting when the notice was closed. It stays closed
+   *  until another link is parked; closing it leaves the links waiting. */
+  let noticeDismissedAt = $state(0);
+
   function syncDeferredCount() {
     deferredCount = deferredIds.size;
+    if (deferredCount < noticeDismissedAt) noticeDismissedAt = deferredCount;
   }
 
   function reviewDeferredLink() {
@@ -315,6 +421,7 @@
     try {
       await ackPendingDeepLink(id);
       completedIds.delete(id);
+      batchDecisions.delete(id);
       return true;
     } catch (e) {
       console.warn('Failed to acknowledge completed deep link; retrying:', e);
@@ -349,20 +456,45 @@
           reviewRequestedId = null;
         }
         if (deferredChanged) syncDeferredCount();
+        for (const id of batchDecisions.keys()) {
+          if (!pendingIds.has(id)) batchDecisions.delete(id);
+        }
 
+        const reviewFiles = reviewRequestedId
+          ? await deferredFileLinks(pending, reviewRequestedId)
+          : new Map<string, DeepLinkPreview>();
         const links = pending.filter(
-          (link) => !deferredIds.has(link.id) || link.id === reviewRequestedId,
+          (link) => !deferredIds.has(link.id) || link.id === reviewRequestedId || reviewFiles.has(link.id),
         );
+        // A lone deferred link under review is asked about on its own.
+        const prepared = await confirmFileBatch(
+          links.filter(
+            (link) =>
+              !completedIds.has(link.id) &&
+              (link.id !== reviewRequestedId || reviewFiles.size > 1) &&
+              !batchDecisions.has(link.id),
+          ),
+          reviewFiles,
+        );
+        for (const [id, p] of prepared) {
+          if (p.decision !== undefined) batchDecisions.set(id, p);
+        }
+        batchQueued = 0;
         for (const link of links) {
           if (destroyed) break;
           const reviewingDeferred = link.id === reviewRequestedId;
           if (!completedIds.has(link.id)) {
-            const result = await handlePayload(link.payload, link.id);
+            const result = await handlePayload(
+              link.payload,
+              link.id,
+              batchDecisions.get(link.id) ?? prepared.get(link.id),
+            );
             if (reviewingDeferred) reviewRequestedId = null;
             if (result === 'done') {
               if (deferredIds.delete(link.id)) syncDeferredCount();
               completedIds.add(link.id);
             } else {
+              batchDecisions.delete(link.id);
               // 'defer' (user dismissed) and 'fail' (usually transient — a busy
               // network task, a timed-out command) are both parked: the durable
               // entry is kept and surfaced in the pending banner so Review can
@@ -379,6 +511,15 @@
           // before running additional side effects.
           if (!(await acknowledgeCompletedLink(link.id))) break;
         }
+        if (batchQueued > 0 && !destroyed) {
+          const count = formatNumber(batchQueued);
+          toastSuccess(plural(batchQueued, {
+            one: () => m.search_bulk_queued_one({ count }),
+            oneShowsCount: true,
+            other: () => m.search_bulk_queued_other({ count }),
+          }));
+        }
+        batchQueued = 0;
       } while (rerun);
     } catch (e) {
       // A failed durable-list read must not leave the Review action latched
@@ -426,24 +567,27 @@
   });
 </script>
 
+<!-- Can appear unasked, and Ignore is permanent: a stray Enter must land on
+     neither button. -->
 <ConfirmDialog
   bind:open={confirmOpen}
-  title={m.deeplink_confirm_title()}
+  title={confirmTitle || m.deeplink_confirm_title()}
   message={confirmMessage}
   confirmLabel={confirmLabel || m.deeplink_confirm_open()}
-  cancelLabel={m.deeplink_confirm_ignore()}
+  cancelLabel={confirmCancelLabel || m.deeplink_confirm_ignore()}
   isolateMessage={true}
-  focusCancel
+  focusDialog
   onconfirm={() => resolveConfirmation('accept')}
   oncancel={() => resolveConfirmation('reject')}
   ondismiss={() => resolveConfirmation('defer')}
 />
 
-{#if deferredCount > 0}
+{#if deferredCount > 0 && deferredCount > noticeDismissedAt}
   <div class="deferred-link-notice" role="status" aria-live="polite">
     <span>
       {plural(deferredCount, {
-        one: m.deeplink_pending_one,
+        one: () => m.deeplink_pending_one({ count: deferredCount }),
+        oneShowsCount: true,
         few: () => m.deeplink_pending_few({ count: deferredCount }),
         other: () => m.deeplink_pending_other({ count: deferredCount }),
       })}
@@ -455,19 +599,29 @@
     >
       {m.deeplink_review_pending()}
     </button>
+    <button
+      type="button"
+      class="notice-dismiss"
+      onclick={() => (noticeDismissedAt = deferredCount)}
+      title={m.common_dismiss()}
+      aria-label={m.common_dismiss()}
+    >
+      <IconX size={12} />
+    </button>
   </div>
 {/if}
 
 <style>
+  /* Clear of the sidebar, whose footer it used to cover, at either width. */
   .deferred-link-notice {
     position: fixed;
-    left: 18px;
+    left: calc(var(--sidebar-width) + 18px);
     bottom: calc(var(--statusbar-height) + 10px);
     z-index: 9400;
     display: flex;
     align-items: center;
     gap: 12px;
-    max-width: min(440px, calc(100vw - 36px));
+    max-width: min(440px, calc(100vw - var(--sidebar-width) - 36px));
     padding: 10px 12px 10px 14px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
@@ -485,8 +639,30 @@
     flex-shrink: 0;
   }
 
+  :global(.app-shell:has(.sidebar.collapsed)) .deferred-link-notice {
+    left: calc(64px + 18px);
+  }
+
   .deferred-link-notice button[aria-disabled='true'] {
     cursor: wait;
     opacity: 0.65;
+  }
+
+  .deferred-link-notice .notice-dismiss {
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-muted);
+  }
+
+  .deferred-link-notice .notice-dismiss:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
 </style>

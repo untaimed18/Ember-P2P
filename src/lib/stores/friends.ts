@@ -1,7 +1,7 @@
 import { writable, get } from 'svelte/store';
 import { emit, listen } from '@tauri-apps/api/event';
 import type { UnlistenFn } from '@tauri-apps/api/event';
-import { confusableSkeleton, isAppVisible, mixesLookalikeScripts } from '$lib/utils';
+import { confusableSkeleton, isAppFocused, mixesLookalikeScripts } from '$lib/utils';
 import {
   getFriendRequests,
   getFriends,
@@ -16,10 +16,12 @@ import {
   type IncomingFileOffer,
 } from '$lib/api/friends';
 import type { FriendStatus, StartDownloadResponse } from '$lib/types';
-import { toast, toastError, toastSuccess } from '$lib/stores/toast';
+import { toastsFor } from '$lib/stores/toast';
 import { notify, shouldNotify } from '$lib/notifications';
 import { chatWindowShows, isChatWindow } from '$lib/windowRole';
 import * as m from '$lib/paraglide/messages';
+
+const { toast, toastError, toastSuccess } = toastsFor('friends');
 
 export const onlineFriends = writable<Set<string>>(new Set());
 /** The status each online friend last sent, by lowercase hash. Only read
@@ -649,10 +651,10 @@ export async function initFriendsStore() {
         // `unreadCounts` would leave a phantom badge until the
         // tab loses focus and is reactivated. `ChatConversation`
         // separately marks the message read on the backend.
-        // A mounted conversation in a hidden/minimized window is NOT being
-        // read, so it must still raise a badge.
+        // A mounted conversation in a hidden, minimized or unfocused window
+        // is NOT being read, so it must still raise a badge.
         const beingRead =
-          (isAppVisible() && get(activeChatHash) === hash) || chatWindowShows(hash);
+          (isAppFocused() && get(activeChatHash) === hash) || chatWindowShows(hash);
         if (!beingRead) {
           if (seedLive) {
             if (!seedLive.unread.has(hash)) seedLive.unread.set(hash, false);
@@ -759,7 +761,7 @@ export async function initFriendsStore() {
           const oldest = announcedAttachments.values().next().value;
           if (oldest !== undefined) announcedAttachments.delete(oldest);
         }
-        if (get(activeChatHash) === a.user_hash && isAppVisible()) return;
+        if (get(activeChatHash) === a.user_hash && isAppFocused()) return;
         if (chatWindowShows(a.user_hash)) return;
         if (!shouldNotify('friend_message', a.user_hash)) return;
         const name = friendDisplayName(a.user_hash);

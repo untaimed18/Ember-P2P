@@ -25,8 +25,18 @@
     type RoomDmMessageEvent,
     type RoomDmStatusEvent,
   } from '$lib/api/roomDm';
-  import { dmTabKey, dmThreads, keepDmTab, refreshDmThreads, viewingDm } from '$lib/stores/roomDm';
+  import {
+    cancelHeldDmAnswer,
+    declineDmRequest,
+    dmAnswersHeld,
+    dmTabKey,
+    dmThreads,
+    keepDmTab,
+    refreshDmThreads,
+    viewingDm,
+  } from '$lib/stores/roomDm';
   import { activeChatHash } from '$lib/stores/friends';
+  import { clearDraft, getDraft, registerDraftFlusher, setDraft } from '$lib/stores/chatTabs';
   import { appSettings } from '$lib/stores/settings';
   import { toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
@@ -48,11 +58,21 @@
 
   // Fixed for this instance: the dock remounts for another member.
   const who = untrack(() => member.toLowerCase());
+  const tabKey = dmTabKey(who);
 
   let messages = $state<RoomDmMessage[]>([]);
   let loading = $state(true);
-  let draft = $state('');
+  /** Kept in the dock's draft map under the tab key, as a friend's is, so a
+   *  switch, Escape or pop-out does not lose it. */
+  let draft = $state(getDraft(tabKey));
   let sending = $state(false);
+  /** The draft a send in flight took; not kept as the draft meanwhile. */
+  let sendingDraft: string | null = null;
+  let mounted = true;
+
+  function saveDraft() {
+    setDraft(tabKey, draft === sendingDraft ? '' : draft);
+  }
   let answering = $state(false);
   let listEl: HTMLDivElement | undefined = $state();
 
@@ -65,9 +85,14 @@
    *  a declined conversation offers to write: doing so lifts the refusal. */
   let declinedHere = $state(false);
   let justDeclined = $derived(declinedHere && thread?.state === 'declined');
+  /** A Decline or Ignore of this request waiting out its Undo, here or in
+   *  another window: answered as far as this view goes. */
+  let heldAnswer = $derived(thread?.state === 'request' ? ($dmAnswersHeld.get(who) ?? null) : null);
 
   /** Why nothing can be written here, or null when something can. */
   let blocked = $derived.by((): string | null => {
+    if (heldAnswer === 'decline') return m.channels_dm_you_declined({ name: shownName });
+    if (heldAnswer === 'ignore') return m.channels_dm_ignoring_toast({ name: shownName });
     if (thread?.state === 'request') return null;
     if (justDeclined) return m.channels_dm_you_declined({ name: shownName });
     if (thread?.is_friend) return m.channels_dm_is_friend();
@@ -98,6 +123,15 @@
     if (listEl && stick) listEl.scrollTop = listEl.scrollHeight;
   }
 
+  /** Messages one read brings: the newest at first, then each older page. */
+  const PAGE_SIZE = 100;
+  /** Storage holds messages older than the oldest shown, as far as is known. */
+  let hasOlder = $state(false);
+  /** An older page found nothing new: the conversation's start is shown. */
+  let reachedStart = false;
+  let loadingOlder = $state(false);
+  let olderError = $state(false);
+
   let loadSeq = 0;
   /** Read the conversation from storage. `replace` when what is stored may
    *  have lost rows (declined, deleted): only rows that arrived during the
@@ -107,14 +141,53 @@
     const shownBefore = new Set(messages.map(rowKey));
     loading = true;
     try {
-      const rows = await getRoomDmMessages(who);
+      const rows = await getRoomDmMessages(who, undefined, PAGE_SIZE);
       if (seq !== loadSeq) return;
       messages = merged(rows, replace ? messages.filter((row) => !shownBefore.has(rowKey(row))) : messages);
+      if (replace) reachedStart = false;
+      hasOlder = !reachedStart && rows.length >= PAGE_SIZE;
       await scrollToEnd(true);
     } catch (e) {
       if (seq === loadSeq) toastError(translateError(e, m.error_operation_failed()));
     } finally {
       if (seq === loadSeq) loading = false;
+    }
+  }
+
+  /** Read the page before the oldest message shown, keeping the view where it
+   *  was. Paged by that message's timestamp and stored row, since timestamps
+   *  are the sender's and can repeat. One not read back from storage has no
+   *  row, so the page then takes its timestamp in and the merge drops what is
+   *  shown already. */
+  async function loadOlder() {
+    if (loadingOlder || !hasOlder || messages.length === 0) return;
+    const seq = loadSeq;
+    loadingOlder = true;
+    olderError = false;
+    try {
+      const oldest = messages[0];
+      const rows =
+        oldest.seq > 0
+          ? await getRoomDmMessages(who, oldest.timestamp, PAGE_SIZE, oldest.seq)
+          : await getRoomDmMessages(who, oldest.timestamp + 1, PAGE_SIZE);
+      if (seq !== loadSeq) return;
+      const shown = new Set(messages.map(rowKey));
+      const fresh = rows.filter((row) => !shown.has(rowKey(row)));
+      if (fresh.length === 0 || rows.length < PAGE_SIZE) reachedStart = true;
+      hasOlder = !reachedStart;
+      if (fresh.length === 0) return;
+      const height = listEl?.scrollHeight ?? 0;
+      const top = listEl?.scrollTop ?? 0;
+      // The older page first: the sort is stable and by timestamp alone, so
+      // among messages sharing one it keeps them ahead of those shown, and the
+      // next page's cursor is the oldest row.
+      messages = merged(fresh, messages);
+      await tick();
+      if (listEl) listEl.scrollTop = top + (listEl.scrollHeight - height);
+    } catch {
+      olderError = true;
+    } finally {
+      loadingOlder = false;
     }
   }
 
@@ -160,8 +233,8 @@
     void load();
     // Tells the chat window's presence report, and through it the main
     // window, which conversation is on screen.
-    const tabKey = dmTabKey(who);
     activeChatHash.set(tabKey);
+    const unregisterFlusher = registerDraftFlusher(saveDraft);
     const onSeen = () => void markReadIfSeen();
     document.addEventListener('visibilitychange', onSeen);
     window.addEventListener('focus', onSeen);
@@ -179,6 +252,7 @@
             text: msg.text,
             timestamp: msg.timestamp,
             status: 'received',
+            seq: 0,
           };
           messages = merged(messages, [row]);
           void scrollToEnd();
@@ -189,6 +263,7 @@
           messages = messages.map((row) =>
             row.direction === 'out' && row.message_id === update.message_id ? { ...row, status: update.status } : row,
           );
+          if (update.status === 'failed') void announceFailed();
         }),
       ]);
       if (alive) unlisten.push(...fns);
@@ -196,46 +271,69 @@
     })();
     return () => {
       alive = false;
+      mounted = false;
       unlisten.forEach((fn) => fn());
       document.removeEventListener('visibilitychange', onSeen);
       window.removeEventListener('focus', onSeen);
+      unregisterFlusher();
+      saveDraft();
       if (get(activeChatHash) === tabKey) activeChatHash.set(null);
     };
   });
 
   async function send() {
-    const text = draft.trim();
+    const raw = draft;
+    const text = raw.trim();
     if (!text || tooLong || sending || blocked) return;
     sending = true;
+    sendingDraft = raw;
+    clearDraft(tabKey);
     try {
       const sent = await sendRoomDm(who, text);
       messages = merged(messages, [sent]);
-      draft = '';
+      // Not what was typed since pressing Send.
+      if (draft === raw) draft = '';
       void refreshDmThreads();
       await scrollToEnd(true);
     } catch (e) {
+      // Closed meanwhile: keep it as the draft for when it is opened again.
+      if (!mounted && !getDraft(tabKey)) setDraft(tabKey, raw);
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       sending = false;
+      sendingDraft = null;
     }
   }
 
-  async function answer(accept: boolean) {
+  /** Behind an Undo, as from the Channels banner: what they wrote goes with
+   *  it. Once sent, the state change marks it declined here. */
+  function decline() {
+    if (answering) return;
+    declineDmRequest(who, shownName);
+  }
+
+  async function accept() {
     if (answering) return;
     answering = true;
+    cancelHeldDmAnswer(who);
     try {
-      await answerRoomDmRequest(who, accept);
-      if (accept) keepDmTab(who, shownName);
-      else {
-        declinedHere = true;
-        messages = [];
-      }
+      await answerRoomDmRequest(who, true);
+      keepDmTab(who, shownName);
       await refreshDmThreads();
     } catch (e) {
       toastError(translateError(e, m.error_operation_failed()));
     } finally {
       answering = false;
     }
+  }
+
+  /** Said aloud when one of ours fails; cleared first so a second failure in
+   *  a row is announced again. */
+  let failedAnnouncement = $state('');
+  async function announceFailed() {
+    failedAnnouncement = '';
+    await tick();
+    failedAnnouncement = m.channels_dm_status_failed();
   }
 
   async function retry(row: RoomDmMessage) {
@@ -273,14 +371,14 @@
 </script>
 
 <div class="dm">
-  {#if thread?.state === 'request'}
+  {#if thread?.state === 'request' && !heldAnswer}
     <div class="dm-banner" role="region" aria-label={m.channels_dm_request_banner({ name: shownName })}>
       <span>{m.channels_dm_request_banner({ name: shownName })}</span>
       <div class="dm-banner-actions">
-        <button type="button" class="primary" disabled={answering} onclick={() => void answer(true)}>
+        <button type="button" class="primary" disabled={answering} onclick={() => void accept()}>
           {m.channels_dm_accept()}
         </button>
-        <button type="button" class="ghost" disabled={answering} onclick={() => void answer(false)}>
+        <button type="button" class="ghost" disabled={answering} onclick={decline}>
           {m.channels_dm_decline()}
         </button>
       </div>
@@ -300,16 +398,37 @@
     {:else if messages.length === 0 && !justDeclined}
       <p class="dm-empty">{m.channels_dm_empty_hint()}</p>
     {/if}
+    {#if hasOlder && messages.length > 0}
+      <div class="dm-load-older">
+        <button class="dm-load-older-btn" type="button" onclick={() => void loadOlder()} disabled={loadingOlder}>
+          {loadingOlder ? m.chat_loading_short() : (olderError ? m.common_retry() : m.chat_load_older())}
+        </button>
+        {#if olderError}
+          <span class="dm-load-older-error" role="alert">{m.chat_load_older_failed()}</span>
+        {/if}
+      </div>
+    {/if}
     {#each messages as row (rowKey(row))}
+      {@const failed = row.direction === 'out' && row.status === 'failed'}
       <div class="dm-row" class:out={row.direction === 'out'}>
-        <div class="dm-bubble">
+        <div class="dm-bubble" class:failed>
           <p class="dm-text"><bdi dir="auto">{row.text}</bdi></p>
           <span class="dm-meta">
             {timeOf(row.timestamp)}
-            {#if row.direction === 'out' && row.status !== 'received'}
-              · <span class:dm-failed={row.status === 'failed'}>{statusLabel(row)}</span>
+            {#if row.direction === 'out' && row.status !== 'received' && !failed}
+              · <span>{statusLabel(row)}</span>
             {/if}
           </span>
+          {#if failed}
+            <span class="dm-failed">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="8" cy="8" r="6.2"/>
+                <path d="M8 4.8v3.6"/>
+                <path d="M8 11.1v.1"/>
+              </svg>
+              {statusLabel(row)}
+            </span>
+          {/if}
           {#if row.status === 'failed' && !blocked}
             <button
               type="button"
@@ -322,6 +441,7 @@
       </div>
     {/each}
   </div>
+  <span class="sr-only" role="alert">{failedAnnouncement}</span>
 
   {#if blocked}
     <p class="dm-blocked" role="status">{blocked}</p>
@@ -390,6 +510,35 @@
     font-size: var(--font-size-sm);
   }
 
+  .dm-load-older {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 8px;
+  }
+
+  .dm-load-older-btn {
+    padding: 6px 12px;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--border);
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .dm-load-older-btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .dm-load-older-error {
+    font-size: var(--font-size-xs);
+    color: var(--danger);
+  }
+
   .dm-row {
     display: flex;
   }
@@ -423,8 +572,28 @@
     opacity: 0.75;
   }
 
+  /* Off the accent fill, so the error colour reads against the bubble. */
+  .dm-row.out .dm-bubble.failed {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--danger);
+  }
+
   .dm-failed {
+    display: flex;
+    align-items: flex-start;
+    gap: 4px;
+    margin-top: 4px;
+    color: var(--danger);
+    font-size: var(--font-size-xs);
     font-weight: 600;
+  }
+
+  .dm-failed svg {
+    flex-shrink: 0;
+    width: 13px;
+    height: 13px;
+    margin-top: 1px;
   }
 
   .dm-retry {

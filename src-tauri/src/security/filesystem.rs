@@ -554,6 +554,22 @@ impl ApprovedRootRegistry {
             .map(|record| record.canonical.clone())
     }
 
+    /// The canonical target recorded when `configured` was approved, and the
+    /// serial of the volume it was on, from memory: no disk access. `None`
+    /// without a record, or one written before serials were.
+    pub fn recorded_target(&self, configured: &Path) -> Option<(PathBuf, u64)> {
+        self.roots
+            .read()
+            .get(&path_key(configured))
+            .filter(|record| record.target_identity.volume_serial != 0)
+            .map(|record| {
+                (
+                    PathBuf::from(&record.canonical),
+                    record.target_identity.volume_serial,
+                )
+            })
+    }
+
     /// Whether `configured` has an approval record, from memory: no disk
     /// access.
     pub fn is_recorded(&self, configured: &Path) -> bool {
@@ -1109,6 +1125,26 @@ pub(crate) fn object_identity_from_file(file: &File) -> io::Result<ObjectIdentit
 
 pub fn opened_file_identity(file: &File) -> io::Result<ObjectIdentity> {
     object_identity_from_file(file)
+}
+
+/// The serial of the volume `path` is on, past any junction, symlink or
+/// mount point that leads to it: what [`ObjectIdentity::volume_serial`]
+/// records for an object there.
+#[cfg(windows)]
+pub(crate) fn volume_serial(path: &Path) -> io::Result<u64> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES};
+    let file = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    Ok(object_identity_from_file(&file)?.volume_serial)
+}
+
+#[cfg(unix)]
+pub(crate) fn volume_serial(path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)?.dev())
 }
 
 #[cfg(unix)]

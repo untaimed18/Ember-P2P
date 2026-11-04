@@ -828,7 +828,7 @@ pub fn encode_message(
     // Sign everything so far, plus the domain tag and our Noise static key.
     // Appended and then cut back rather than signed over a copy, so binding the
     // session costs no allocation on a path that runs per outbound frame.
-    let suffix_len = frame_signing_suffix(&mut buf, sender_noise_pub);
+    let suffix_len = frame_signing_suffix(&mut buf, msg.version, sender_noise_pub);
     let sig = crypto::sign(signing_key, &buf);
     buf.truncate(buf.len() - suffix_len);
     buf.write_all(&sig).unwrap();
@@ -868,20 +868,40 @@ fn oversized_store_record(payload: &DhtPayload) -> Option<usize> {
 /// bytes — and no record body ends with this tag followed by a static key.
 ///
 /// The version is inside the tag deliberately: changing the wire format changes
-/// the domain, so a v4 signature can never be replayed as a v5 one. It has to
-/// be edited by hand alongside [`EMBER_DHT_VERSION`], which the test below
-/// pins.
-const DHT_FRAME_DOMAIN: &[u8] = b"ember-dht-frame-v4";
+/// the domain, so a v4 signature can never be replayed as a v5 one. It is the
+/// frame's *own* version byte, in decimal, not this build's: a build that
+/// speaks a range has to sign and verify each version under that version's
+/// tag, or raising [`EMBER_DHT_VERSION`] would move the domain of every v4
+/// frame it still sends. For v4 the tag is `ember-dht-frame-v4`, which the
+/// tests pin byte for byte.
+const DHT_FRAME_DOMAIN_PREFIX: &[u8] = b"ember-dht-frame-v";
+
+/// Longest the domain tag can be: the prefix and three decimal digits.
+const DHT_FRAME_DOMAIN_MAX_LEN: usize = DHT_FRAME_DOMAIN_PREFIX.len() + 3;
+
+/// Append the domain tag for a frame of `version`, returning its length.
+fn push_frame_domain(buf: &mut Vec<u8>, version: u8) -> usize {
+    let start = buf.len();
+    buf.extend_from_slice(DHT_FRAME_DOMAIN_PREFIX);
+    if version >= 100 {
+        buf.push(b'0' + version / 100);
+    }
+    if version >= 10 {
+        buf.push(b'0' + version / 10 % 10);
+    }
+    buf.push(b'0' + version % 10);
+    buf.len() - start
+}
 
 /// Append the bytes a frame signature covers beyond the frame itself, returning
 /// how many were added so the caller can cut them back off.
 ///
 /// Kept in one place because the encoder and the verifier have to agree byte
 /// for byte, and they are three hundred lines apart.
-fn frame_signing_suffix(buf: &mut Vec<u8>, noise_pub: &[u8; 32]) -> usize {
-    buf.extend_from_slice(DHT_FRAME_DOMAIN);
+fn frame_signing_suffix(buf: &mut Vec<u8>, version: u8, noise_pub: &[u8; 32]) -> usize {
+    let domain_len = push_frame_domain(buf, version);
     buf.extend_from_slice(noise_pub);
-    DHT_FRAME_DOMAIN.len() + 32
+    domain_len + 32
 }
 
 /// The version byte of a DHT frame, if it is outside the range this build
@@ -1097,6 +1117,21 @@ pub fn decode_message(
     let Some(ref pk_bytes) = sender_pub_key else {
         anyhow::bail!("DHT message carries no public key, so it cannot be authenticated");
     };
+    // Bind sender_id to the public key. The signature only proves the
+    // sender holds *some* key; without this check a peer could sign with
+    // their own key while claiming a victim's sender_id (routing-table
+    // poisoning / impersonation in FOUND_NODE, STORE_RECORD, etc.).
+    // `node_id == BLAKE3(pubkey)[..16]` everywhere else in Ember.
+    //
+    // Checked before the signature, on the raw bytes: one BLAKE3, where the
+    // key's decompression and the verify are the expensive part of reading a
+    // frame, and a frame that fails this is refused whatever its signature
+    // says. The same derivation as `crypto::node_id_from_public_key`, whose
+    // input is these bytes as received; the decompression below still refuses
+    // a key that is not a curve point.
+    if blake3::hash(pk_bytes).as_bytes()[..16] != sender_id.0 {
+        anyhow::bail!("DHT message sender_id does not match its public key");
+    }
     let Some(pk) = crypto::verifying_key_from_bytes(pk_bytes) else {
         anyhow::bail!("Invalid Ed25519 public key in DHT message");
     };
@@ -1104,19 +1139,11 @@ pub fn decode_message(
     // check against the key the handshake proved for *this* session, so a frame
     // captured from another session fails here rather than being accepted as
     // proof that its sender_id lives at the address that delivered it.
-    let mut signed_data = Vec::with_capacity(sig_offset + DHT_FRAME_DOMAIN.len() + 32);
+    let mut signed_data = Vec::with_capacity(sig_offset + DHT_FRAME_DOMAIN_MAX_LEN + 32);
     signed_data.extend_from_slice(&data[..sig_offset]);
-    frame_signing_suffix(&mut signed_data, session_noise_pub);
+    frame_signing_suffix(&mut signed_data, version, session_noise_pub);
     if !crypto::verify(&pk, &signed_data, &signature) {
         anyhow::bail!("DHT message signature verification failed");
-    }
-    // Bind sender_id to the public key. The signature only proves the
-    // sender holds *some* key; without this check a peer could sign with
-    // their own key while claiming a victim's sender_id (routing-table
-    // poisoning / impersonation in FOUND_NODE, STORE_RECORD, etc.).
-    // `node_id == BLAKE3(pubkey)[..16]` everywhere else in Ember.
-    if !crypto::verify_ember_hash_binding(pk_bytes, &sender_id.0) {
-        anyhow::bail!("DHT message sender_id does not match its public key");
     }
 
     let payload = decode_payload(msg_type, payload_data)?;
@@ -2266,6 +2293,12 @@ pub(crate) fn decode_contact_list(data: &[u8]) -> anyhow::Result<Vec<EmberContac
         let Some(derived_id) = crypto::node_id_from_ed25519_bytes(&ed25519_pub) else {
             continue;
         };
+        // Likewise a low-order Noise key, all-zero included: no peer can hold
+        // its private half, and an IK message 1 sealed to it is readable by
+        // anyone on the path, so the contact is never worth dialling.
+        if crate::network::ember::transport::noise_key_is_low_order(&noise_pub) {
+            continue;
+        }
 
         contacts.push(EmberContact {
             node_id: EmberNodeId(derived_id),
@@ -2697,17 +2730,69 @@ mod tests {
         }
     }
 
-    /// The domain tag carries the wire version, so a signature made under one
-    /// format can never verify under another. That only holds while the two are
-    /// edited together, and nothing but this test makes them.
+    /// The domain tag carries the frame's own version, so a signature made
+    /// under one format can never verify under another, and a build that
+    /// speaks several signs each under its own tag. v4's is pinned byte for
+    /// byte: every deployed peer signs and verifies under exactly it.
     #[test]
-    fn the_frame_domain_names_the_wire_version() {
-        let tag = std::str::from_utf8(DHT_FRAME_DOMAIN).expect("the tag is ASCII");
-        assert!(
-            tag.ends_with(&format!("-v{EMBER_DHT_VERSION}")),
-            "DHT_FRAME_DOMAIN is {tag:?} but the wire version is {EMBER_DHT_VERSION}; \
-             bump the tag with it or a v{EMBER_DHT_VERSION} signature inherits the old domain"
-        );
+    fn the_frame_domain_names_the_frames_own_version() {
+        let domain = |version: u8| {
+            let mut buf = Vec::new();
+            let len = push_frame_domain(&mut buf, version);
+            assert_eq!(len, buf.len());
+            assert!(len <= DHT_FRAME_DOMAIN_MAX_LEN);
+            buf
+        };
+        assert_eq!(domain(4), b"ember-dht-frame-v4");
+        assert_eq!(domain(5), b"ember-dht-frame-v5");
+        assert_eq!(domain(12), b"ember-dht-frame-v12");
+        assert_eq!(domain(255), b"ember-dht-frame-v255");
+        assert_eq!(domain(EMBER_DHT_VERSION), format!("ember-dht-frame-v{EMBER_DHT_VERSION}").into_bytes());
+        for version in 0..=u8::MAX {
+            assert_eq!(domain(version), format!("ember-dht-frame-v{version}").into_bytes());
+        }
+    }
+
+    /// A v4 frame's signature covers exactly the bytes it did when the tag
+    /// was a constant: the frame, `ember-dht-frame-v4`, and the sender's Noise
+    /// key. Anything else and a deployed peer would refuse every frame we send.
+    #[test]
+    fn a_v4_frame_signs_the_same_bytes_as_deployed_peers() {
+        let (sk, id) = test_keypair();
+        let msg = build_ping(id, 7);
+        assert_eq!(msg.version, 4);
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let (body, sig) = encoded.split_at(encoded.len() - 64);
+        let mut preimage = body.to_vec();
+        preimage.extend_from_slice(b"ember-dht-frame-v4");
+        preimage.extend_from_slice(&TEST_NOISE_PUB);
+        let vk = sk.verifying_key();
+        assert!(crypto::verify(&vk, &preimage, sig.try_into().unwrap()));
+    }
+
+    /// The identity binding is refused before the signature is looked at, so a
+    /// frame naming someone else's node id costs no Ed25519 work. With a valid
+    /// signature and a wrong id, and a wrong id with a garbage signature, the
+    /// refusal is the binding's.
+    #[test]
+    fn a_frame_claiming_another_node_id_is_refused_before_its_signature() {
+        let (sk, id) = test_keypair();
+        let mut other = id;
+        other.0[0] ^= 1;
+        let mut msg = build_ping(other, 7);
+        msg.sender_id = other;
+        let encoded = encode_message(&msg, &sk, true, &TEST_NOISE_PUB);
+        let err = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap_err();
+        assert!(err.to_string().contains("does not match its public key"), "{err}");
+
+        let mut garbage = encoded.clone();
+        let n = garbage.len();
+        garbage[n - 64..].fill(0x5A);
+        let err = decode_message(&garbage, true, &TEST_NOISE_PUB).unwrap_err();
+        assert!(err.to_string().contains("does not match its public key"), "{err}");
+
+        let honest = encode_message(&build_ping(id, 7), &sk, true, &TEST_NOISE_PUB);
+        assert!(decode_message(&honest, true, &TEST_NOISE_PUB).is_ok());
     }
 
     #[test]
@@ -2794,7 +2879,7 @@ mod tests {
             // Same domain tag and session binding `encode_message` applies.
             // Without them nothing here clears signature verification and the
             // fuzz never reaches the payload decoders it exists to exercise.
-            let suffix = frame_signing_suffix(&mut buf, &TEST_NOISE_PUB);
+            let suffix = frame_signing_suffix(&mut buf, EMBER_DHT_VERSION, &TEST_NOISE_PUB);
             let sig = crypto::sign(&sk, &buf);
             buf.truncate(buf.len() - suffix);
             buf.extend_from_slice(&sig);
@@ -2911,6 +2996,26 @@ mod tests {
         encoded.extend_from_slice(&[0x02; 32]); // noise_pub
         encoded.extend_from_slice(&bad_ed); // invalid ed25519_pub
 
+        let decoded = decode_contact_list(&encoded).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].node_id, good.node_id);
+    }
+
+    /// A gossiped contact whose Noise key is a low-order point is dropped at
+    /// decode, the rest of the list kept: dialling it would send our first
+    /// request sealed under keys anyone on the path can compute.
+    #[test]
+    fn contact_list_drops_low_order_noise_keys() {
+        let good = test_contact(23, "9.9.9.9:1111", 0x01);
+        let mut zero = test_contact(24, "8.8.8.8:2000", 0x02);
+        zero.noise_pub = [0; 32];
+        let mut one = test_contact(25, "8.8.4.4:2000", 0x03);
+        one.noise_pub = [0; 32];
+        one.noise_pub[0] = 1;
+        let mut high_bit = test_contact(26, "8.8.4.5:2000", 0x04);
+        high_bit.noise_pub = [0; 32];
+        high_bit.noise_pub[31] = 0x80;
+        let encoded = encode_contact_list(&[zero, good.clone(), one, high_bit]);
         let decoded = decode_contact_list(&encoded).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].node_id, good.node_id);

@@ -184,19 +184,26 @@ pub async fn list_room_dm_threads(state: tauri::State<'_, AppState>) -> Result<V
     .await
 }
 
-/// A conversation's messages, oldest first: the newest `limit` before
-/// `before`, or the newest of all.
+/// A conversation's messages, oldest first: the newest `limit` before the
+/// message at `before` (its timestamp) and `before_seq` (its row), or the
+/// newest of all.
 #[tauri::command]
 pub async fn get_room_dm_messages(
     state: tauri::State<'_, AppState>,
     member: String,
     before: Option<i64>,
+    before_seq: Option<i64>,
     limit: Option<u32>,
 ) -> Result<Vec<DmMessage>, String> {
     let member = member_hex(&member)?;
     let db = state.db.clone();
     let limit = limit.unwrap_or(100).clamp(1, 500) as usize;
-    blocking(move || db.dm_messages(&member, limit, before), "channels_dm_failed", "Could not read private messages").await
+    blocking(
+        move || db.dm_messages(&member, limit, before, before_seq),
+        "channels_dm_failed",
+        "Could not read private messages",
+    )
+    .await
 }
 
 /// Write to a member privately, through a room both are in.
@@ -272,6 +279,7 @@ pub async fn send_room_dm(
         text,
         timestamp: now,
         status: "sending".into(),
+        seq: 0,
     })
 }
 

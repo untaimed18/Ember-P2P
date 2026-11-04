@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
-use super::dead_sources::MIN_REQUESTTIME_SECS;
+use super::dead_sources::{FILEREASKTIME_SECS, MIN_REQUESTTIME_SECS};
 use super::messages::{
     PeerCapabilities, OP_AICHFILEHASHREQ, OP_AICHREQUEST, OP_ASKSHAREDDIRS, OP_ASKSHAREDFILES,
     OP_ASKSHAREDFILESDIR, OP_EDONKEYHEADER, OP_EMULEPROT, OP_HASHSETREQ, OP_HASHSETREQUEST2,
@@ -252,6 +252,151 @@ pub fn upload_request_wait(
         .filter_map(|at| UPLOAD_REQUEST_INTERVAL.checked_sub(at.elapsed()))
         .filter(|wait| !wait.is_zero())
         .max()
+}
+
+// ---------------------------------------------------------------------------
+// The file we are queued for or downloading at each peer
+
+/// How long a place on a peer's queue outlives the connection that took it.
+/// The reask loop keeps a queued source warm for a `FILEREASKTIME`.
+const QUEUED_FILE_LINGER: Duration = Duration::from_secs(FILEREASKTIME_SECS as u64);
+
+struct FileClaimEntry {
+    user_hash: Option<[u8; 16]>,
+    ip: Ipv4Addr,
+    ports: Vec<u16>,
+    file: [u8; 16],
+    queued: bool,
+    /// Set once the connection ended with us still on the peer's queue.
+    lingers_until: Option<Instant>,
+}
+
+impl FileClaimEntry {
+    fn matches(&self, user_hash: Option<[u8; 16]>, ip: Ipv4Addr, ports: &[u16]) -> bool {
+        if self.ip != ip {
+            return false;
+        }
+        let same_port = ports.iter().any(|p| *p != 0 && self.ports.contains(p));
+        let same_user = matches!((self.user_hash, user_hash), (Some(a), Some(b)) if a == b);
+        same_port || same_user
+    }
+
+    fn live(&self, now: Instant) -> bool {
+        self.lingers_until.is_none_or(|until| now < until)
+    }
+}
+
+#[derive(Default)]
+struct FileClaims {
+    next_id: u64,
+    entries: HashMap<u64, FileClaimEntry>,
+}
+
+fn file_claims() -> MutexGuard<'static, FileClaims> {
+    static CLAIMS: OnceLock<Mutex<FileClaims>> = OnceLock::new();
+    lock(CLAIMS.get_or_init(Mutex::default))
+}
+
+/// The file one of our downloads holds a place for at a peer, kept until the
+/// download's connection ends, or for [`QUEUED_FILE_LINGER`] past that while
+/// we are still on the peer's queue.
+#[must_use = "the place is only recorded while this guard is alive"]
+pub struct PeerFileClaim {
+    id: u64,
+}
+
+impl PeerFileClaim {
+    /// Whether we are on the peer's queue (the place outlives the
+    /// connection), rather than holding its slot: eMule's uploader forgets a
+    /// client whose slot connection ends.
+    pub fn set_queued(&self, queued: bool) {
+        if let Some(entry) = file_claims().entries.get_mut(&self.id) {
+            entry.queued = queued;
+        }
+    }
+}
+
+impl Drop for PeerFileClaim {
+    fn drop(&mut self) {
+        let mut claims = file_claims();
+        match claims.entries.get_mut(&self.id) {
+            Some(entry) if entry.queued => {
+                entry.lingers_until = Some(Instant::now() + QUEUED_FILE_LINGER);
+            }
+            Some(_) => {
+                claims.entries.remove(&self.id);
+            }
+            None => {}
+        }
+    }
+}
+
+fn other_file_at(
+    claims: &FileClaims,
+    now: Instant,
+    user_hash: Option<[u8; 16]>,
+    ip: Ipv4Addr,
+    ports: &[u16],
+    file_hash: &[u8; 16],
+) -> Option<[u8; 16]> {
+    let user_hash = known_hash(user_hash);
+    claims
+        .entries
+        .values()
+        .find(|e| e.file != *file_hash && e.live(now) && e.matches(user_hash, ip, ports))
+        .map(|e| e.file)
+}
+
+/// The file another of our downloads is queued for or downloading at this
+/// peer, if not `file_hash`. eMule asks one peer for one file at a time and
+/// keeps the others as A4AF sources, so asking it for this one now would move
+/// our place in its queue to a different file.
+pub fn queued_for_other_file(
+    user_hash: Option<[u8; 16]>,
+    ip: Ipv4Addr,
+    ports: &[u16],
+    file_hash: &[u8; 16],
+) -> Option<[u8; 16]> {
+    other_file_at(&file_claims(), Instant::now(), user_hash, ip, ports, file_hash)
+}
+
+/// Records that we are asking this peer for `file_hash`, queued until
+/// [`PeerFileClaim::set_queued`] says otherwise. Replaces a place an earlier
+/// connection left for the same file. Not for Ember peers, which keep
+/// parallel connections apart (see [`PeerSession::mark_ember`]).
+pub fn claim_file(
+    user_hash: Option<[u8; 16]>,
+    ip: Ipv4Addr,
+    ports: &[u16],
+    file_hash: [u8; 16],
+) -> PeerFileClaim {
+    let user_hash = known_hash(user_hash);
+    let now = Instant::now();
+    let mut claims = file_claims();
+    claims.entries.retain(|_, e| {
+        e.live(now) && !(e.lingers_until.is_some() && e.file == file_hash && e.matches(user_hash, ip, ports))
+    });
+    claims.next_id += 1;
+    let id = claims.next_id;
+    claims.entries.insert(
+        id,
+        FileClaimEntry {
+            user_hash,
+            ip,
+            ports: ports.iter().copied().filter(|p| *p != 0).collect(),
+            file: file_hash,
+            queued: true,
+            lingers_until: None,
+        },
+    );
+    PeerFileClaim { id }
+}
+
+/// Forgets every place held for `file_hash`, once its download is over or
+/// stopped. Connections still closing lose theirs too, so their guards find
+/// nothing to leave lingering.
+pub fn release_file_claims(file_hash: &[u8; 16]) {
+    file_claims().entries.retain(|_, e| e.file != *file_hash);
 }
 
 const UPLOAD_REQUESTS_FILE: &str = "recent_upload_requests.json";
@@ -826,6 +971,52 @@ mod tests {
         assert!(wait > Duration::from_secs(MIN_REQUESTTIME_SECS as u64));
         assert!(upload_request_wait(Some(hash), peer(11), &[1], &file).is_some(), "by hash");
         assert!(upload_request_wait(Some(hash), peer(10), &[4662], &[0x33; 16]).is_none());
+    }
+
+    #[test]
+    fn a_peer_we_are_queued_at_for_one_file_is_not_asked_for_another() {
+        let (a, b) = ([0xA1u8; 16], [0xB2u8; 16]);
+        let hash = [0x61u8; 16];
+        let claim = claim_file(Some(hash), peer(50), &[4662], a);
+        assert_eq!(queued_for_other_file(None, peer(50), &[4662], &b), Some(a));
+        assert_eq!(queued_for_other_file(Some(hash), peer(50), &[], &b), Some(a), "by hash");
+        assert_eq!(queued_for_other_file(Some(hash), peer(50), &[4662], &a), None);
+        assert_eq!(queued_for_other_file(Some(hash), peer(51), &[4662], &b), None);
+
+        // Still queued when the connection ends: the place outlives it.
+        drop(claim);
+        assert_eq!(queued_for_other_file(None, peer(50), &[4662], &b), Some(a));
+        let later = Instant::now() + QUEUED_FILE_LINGER + Duration::from_secs(1);
+        assert_eq!(
+            other_file_at(&file_claims(), later, None, peer(50), &[4662], &b),
+            None,
+            "for a FILEREASKTIME"
+        );
+        release_file_claims(&a);
+        assert_eq!(queued_for_other_file(None, peer(50), &[4662], &b), None);
+
+        // Released while the connection is still closing: nothing lingers after.
+        let closing = claim_file(Some(hash), peer(54), &[4662], a);
+        release_file_claims(&a);
+        drop(closing);
+        assert_eq!(queued_for_other_file(None, peer(54), &[4662], &b), None);
+    }
+
+    #[test]
+    fn a_slot_we_held_is_forgotten_with_its_connection() {
+        let (a, b) = ([0xA3u8; 16], [0xB4u8; 16]);
+        let claim = claim_file(None, peer(52), &[4662], a);
+        claim.set_queued(false);
+        assert_eq!(queued_for_other_file(None, peer(52), &[4662], &b), Some(a));
+        drop(claim);
+        assert_eq!(queued_for_other_file(None, peer(52), &[4662], &b), None);
+
+        // A new ask for the same file replaces the place an old one left.
+        drop(claim_file(None, peer(53), &[4662], a));
+        let again = claim_file(None, peer(53), &[4662], a);
+        again.set_queued(false);
+        drop(again);
+        assert_eq!(queued_for_other_file(None, peer(53), &[4662], &b), None);
     }
 
     #[test]

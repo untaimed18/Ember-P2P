@@ -860,6 +860,7 @@ mod tests {
             banned,
             moderator: false,
             language: String::new(),
+            language2: String::new(),
         };
         let frame = |peer: [u8; 32], payload: DmPayload, kind: DmFrameKind| PacedFrame {
             room,

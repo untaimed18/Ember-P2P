@@ -293,6 +293,7 @@ pub(super) async fn promote_kad_connected_and_first_publish(
         return;
     }
     state.stats.status = NetworkStatus::Connected;
+    crate::network::kad_io::refresh_hello_client_id(state);
     let _ = app_handle.emit("network-status", NetworkStatus::Connected);
     if state.first_publish_done {
         return;
@@ -420,19 +421,21 @@ pub(super) fn apply_publish_badges(
     }
 }
 
-/// How many files currently carry each publish badge.
+/// How many files currently carry each Library badge: the three publish
+/// badges, and AICH, which a root computed after a download completed earns.
 ///
 /// Used to decide whether a cache refresh is worth telling the Library about.
 /// Counting rather than diffing pairwise keeps this allocation-free and
 /// independent of index ordering; the rare case where one file gains a badge
 /// in the same tick another loses it is covered by the next refresh, and an
 /// unshare emits its own event anyway.
-pub(super) fn badge_counts(files: &[FileInfo]) -> (usize, usize, usize) {
-    files.iter().fold((0, 0, 0), |(kad, ed2k, ember), f| {
+pub(super) fn badge_counts(files: &[FileInfo]) -> (usize, usize, usize, usize) {
+    files.iter().fold((0, 0, 0, 0), |(kad, ed2k, ember, aich), f| {
         (
             kad + f.shared_kad as usize,
             ed2k + f.shared_ed2k as usize,
             ember + f.shared_ember as usize,
+            aich + usize::from(!f.aich_hash.is_empty()),
         )
     })
 }

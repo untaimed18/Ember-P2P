@@ -38,6 +38,9 @@ export interface OwnFeed {
   followers: { count: number; at_least: boolean; checked_at: number } | null;
   /** Followers who downloaded each file from this identity, by eD2K hash. */
   downloads: Record<string, number>;
+  /** How followers can fetch it now: through source records (`direct`),
+   *  only through Ember's server (`server`), or not at all (`none`). */
+  reach: 'unknown' | 'direct' | 'server' | 'none';
 }
 
 /** A feed this identity follows. */
@@ -87,6 +90,11 @@ export interface FeedActivity {
   fetching: { secs: number; bytes: number; sources: number } | null;
   /** When the next fetch may start after one gave up, in seconds; 0 if none did. */
   retry_at: number;
+  /** Its last fetch found no one holding its list, its publisher included,
+   *  and none has since. */
+  unsourced: boolean;
+  /** Its publisher is being reached directly for its list. */
+  reaching: boolean;
 }
 
 /** What a lookup of a followed feed came to; `deleted`, its tombstone found. */
@@ -118,11 +126,13 @@ export interface FollowedItem extends FeedItem {
   /** A type that can run code or change settings: asked about before it is
    *  downloaded, and never downloaded automatically. */
   risky: boolean;
+  /** The spam filter takes it for spam: never downloaded automatically. */
+  spam: boolean;
   status: FeedItemStatus;
   /** 0 to 100, for one on its way. */
   progress: number;
   /** Why auto-download has not started it. */
-  held: 'risky' | 'too_large' | 'day_limit' | 'disk' | null;
+  held: 'risky' | 'too_large' | 'day_limit' | 'disk' | 'spam' | null;
   /** Its download, while it is in the transfer list. */
   transfer: FeedItemTransfer | null;
   /** For one held in another followed feed's folder: that feed's title. */
@@ -168,6 +178,8 @@ export interface DiscoveredFeed {
   link: string;
   /** Its publisher signed the listing in the last few hours: running. */
   active: boolean;
+  /** Its listing says its files can't be fetched right now. */
+  cannot_share: boolean;
   following: boolean;
   own: boolean;
 }
@@ -207,6 +219,13 @@ export const setFeedItems = (
   salt: string,
   items: { ed2k: string; note: string }[],
 ): Promise<{ items: FeedItem[]; dropped: string[] }> => invoke('set_feed_items', { salt, items });
+/** Add Library files to the end of a feed, saved as an edit to publish.
+ *  `already`: files it lists. `dropped`: names of files not shared with
+ *  everyone, or without an Ember digest yet. */
+export const addFeedItems = (
+  salt: string,
+  ed2ks: string[],
+): Promise<{ added: number; already: number; dropped: string[] }> => invoke('add_feed_items', { salt, ed2ks });
 export const publishFeed = (salt: string): Promise<OwnFeed> => invoke('publish_feed', { salt });
 export const deleteFeed = (salt: string): Promise<void> => invoke('delete_feed', { salt });
 

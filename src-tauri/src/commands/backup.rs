@@ -94,7 +94,50 @@ const KDF_MAX_P_COST: u32 = 8;
 /// profile and is recoverable only by hand from `pre-restore-*`.
 const STAGED_RESTORE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
 
-const MIN_PASSPHRASE_LEN: usize = 10;
+/// Applies to new backups only. A restore takes whatever passphrase the backup
+/// was written with, so archives made under the old 10-character rule still open.
+const MIN_PASSPHRASE_LEN: usize = 12;
+/// What [`passphrase_strength_bits`] must reach. Twelve random lowercase letters
+/// score about 56 bits; `Password2026`, `Qwerty123456!` and a 12-digit number
+/// fall short.
+const MIN_PASSPHRASE_BITS: f64 = 48.0;
+/// The base words guessers try first, in the languages Ember ships, matched
+/// case-insensitively and through the usual digit and symbol stand-ins
+/// (`P@ssw0rd`). Longest first, so the longer of two overlapping words wins.
+const COMMON_PASSPHRASE_WORDS: &[&str] = &[
+    "motdepasse",
+    "contrasena",
+    "qwertyuiop",
+    "asdfghjkl",
+    "iloveyou",
+    "password",
+    "passwort",
+    "football",
+    "princess",
+    "sunshine",
+    "welcome",
+    "letmein",
+    "zxcvbnm",
+    "dragon",
+    "monkey",
+    "master",
+    "shadow",
+    "qwerty",
+    "qwertz",
+    "azerty",
+    "passwd",
+    "parola",
+    "secret",
+    "admin",
+    "ember",
+    "haslo",
+    "senha",
+];
+/// A word from [`COMMON_PASSPHRASE_WORDS`] counts as one pick from a list of
+/// about a thousand, whatever its length.
+const COMMON_WORD_BITS: f64 = 10.0;
+/// A year from 1900 to 2099 counts as one pick of two hundred.
+const YEAR_BITS: f64 = 7.64;
 const MAX_PASSPHRASE_LEN: usize = 1024;
 const MAX_PATH_LEN: usize = 4 * 1024;
 
@@ -127,6 +170,11 @@ struct BackupFile {
     /// Copied with SQLite's `VACUUM INTO` instead of read off disk, so rows
     /// still sitting in the write-ahead log make it into the backup.
     database: bool,
+    /// Listed under [`Manifest::extra_files`] rather than `files`. Readers
+    /// that predate a file refuse an archive whose `files` names it, but ignore
+    /// the extra list, so a file added since 1.7.5 goes there and an older
+    /// Ember restores the backup without it instead of rejecting the backup.
+    listed_apart: bool,
 }
 
 const fn plain(name: &'static str) -> BackupFile {
@@ -134,6 +182,16 @@ const fn plain(name: &'static str) -> BackupFile {
         name,
         secret: false,
         database: false,
+        listed_apart: false,
+    }
+}
+
+const fn plain_apart(name: &'static str) -> BackupFile {
+    BackupFile {
+        name,
+        secret: false,
+        database: false,
+        listed_apart: true,
     }
 }
 
@@ -142,6 +200,7 @@ const fn secret(name: &'static str) -> BackupFile {
         name,
         secret: true,
         database: false,
+        listed_apart: false,
     }
 }
 
@@ -166,6 +225,7 @@ const BACKUP_FILES: &[BackupFile] = &[
         name: "ember.db",
         secret: false,
         database: true,
+        listed_apart: false,
     },
     // eMule-compatible catalogues: known files, AICH recovery data, credits.
     plain("known.met"),
@@ -180,6 +240,12 @@ const BACKUP_FILES: &[BackupFile] = &[
     plain("nodes.dat"),
     // Filters, reputation and learned spam, all expensive to rebuild.
     plain("ipfilter.dat"),
+    // The user's own ranges, put back on every list the daily update installs,
+    // and whether the installed list is the default one that update replaces.
+    // Without them a restored custom list or edit lasted until that update.
+    // New in 1.7.6, so listed apart: see `BackupFile::listed_apart`.
+    plain_apart("ipfilter_edits.json"),
+    plain_apart("ipfilter_update.json"),
     plain("antileech.dat"),
     plain("reputation.json"),
     plain("search_spam.json"),
@@ -353,6 +419,10 @@ struct Manifest {
     /// refuse one written by a newer Ember instead of corrupting itself.
     schema_version: i64,
     files: Vec<ManifestEntry>,
+    /// Files [`BackupFile::listed_apart`]: verified and restored exactly like
+    /// `files`, but in a list older readers do not look at.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_files: Vec<ManifestEntry>,
     /// The app window's preferences, when the backup carries them; see
     /// [`WEBVIEW_PREFS_NAME`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -821,6 +891,7 @@ fn build_archive(
         .compression_method(zip::CompressionMethod::Deflated);
 
     let mut entries = Vec::new();
+    let mut extra_entries = Vec::new();
     let mut skipped = Vec::new();
     for spec in BACKUP_FILES {
         let bytes = if spec.database {
@@ -886,12 +957,17 @@ fn build_archive(
             .map_err(|e| coded_ctx("backup_export_failed", "Failed to add a file", e))?;
         zip.write_all(&bytes)
             .map_err(|e| coded_ctx("backup_export_failed", "Failed to add a file", e))?;
-        entries.push(ManifestEntry {
+        let entry = ManifestEntry {
             name: spec.name.to_string(),
             size: bytes.len() as u64,
             blake3: blake3::hash(&bytes).to_hex().to_string(),
             rewrap: spec.secret,
-        });
+        };
+        if spec.listed_apart {
+            extra_entries.push(entry);
+        } else {
+            entries.push(entry);
+        }
     }
 
     let webview_prefs = match webview_prefs {
@@ -922,6 +998,7 @@ fn build_archive(
         created_at: chrono::Utc::now().timestamp(),
         schema_version: db.schema_version(),
         files: entries,
+        extra_files: extra_entries,
         webview_prefs,
     };
     let manifest_json = serde_json::to_vec_pretty(&manifest)
@@ -935,6 +1012,86 @@ fn build_archive(
     Ok((zip_path, manifest, skipped))
 }
 
+/// A pessimistic guess at how many bits a passphrase is worth to someone
+/// guessing it offline against a stolen backup, and whether it holds a common
+/// word or a year.
+///
+/// Each character is worth the alphabet its classes span, except one that
+/// repeats or steps from the one before (`aa`, `ab`, `ba`, `12`), or that ends
+/// a three-character run already seen earlier: those are worth nothing, so
+/// `aaaa…`, `1234…` and `passwordpassword` score as what they are. A word from
+/// [`COMMON_PASSPHRASE_WORDS`] and a four-digit year each score as one token.
+/// Other words are not recognised, so a dictionary phrase scores higher than it
+/// deserves: this is a floor against patterns, not a strength meter.
+fn passphrase_strength_bits(passphrase: &str) -> (f64, bool) {
+    let chars: Vec<char> = passphrase.chars().collect();
+    let plain: Vec<char> = chars
+        .iter()
+        .map(|&c| match c.to_ascii_lowercase() {
+            '@' | '4' => 'a',
+            '3' => 'e',
+            '1' | '!' => 'i',
+            '0' => 'o',
+            '$' | '5' => 's',
+            '7' => 't',
+            other => other,
+        })
+        .collect();
+    let digit_at = |i: usize| chars.get(i).is_some_and(char::is_ascii_digit);
+    let mut pool = 0u32;
+    if chars.iter().any(char::is_ascii_lowercase) {
+        pool += 26;
+    }
+    if chars.iter().any(char::is_ascii_uppercase) {
+        pool += 26;
+    }
+    if chars.iter().any(char::is_ascii_digit) {
+        pool += 10;
+    }
+    if chars.iter().any(|c| !c.is_ascii_alphanumeric()) {
+        pool += 33;
+    }
+    if pool == 0 {
+        return (0.0, false);
+    }
+    let per_char = f64::from(pool).log2();
+    let mut bits = 0.0;
+    let mut common = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let word = COMMON_PASSPHRASE_WORDS.iter().find(|word| {
+            word.chars().count() <= plain.len() - i && word.chars().zip(&plain[i..]).all(|(a, &b)| a == b)
+        });
+        if let Some(word) = word {
+            bits += COMMON_WORD_BITS;
+            common = true;
+            i += word.chars().count();
+            continue;
+        }
+        let is_year = (i == 0 || !digit_at(i - 1))
+            && (i..i + 4).all(digit_at)
+            && !digit_at(i + 4)
+            && matches!((chars[i], chars[i + 1]), ('1', '9') | ('2', '0'));
+        if is_year {
+            bits += YEAR_BITS;
+            common = true;
+            i += 4;
+            continue;
+        }
+        let c = chars[i];
+        let steps_from_previous = i > 0 && (c as i64 - chars[i - 1] as i64).abs() <= 1;
+        let repeats_a_run = i >= 2 && {
+            let run = &chars[i - 2..=i];
+            chars[..i].windows(3).any(|earlier| earlier == run)
+        };
+        if !steps_from_previous && !repeats_a_run {
+            bits += per_char;
+        }
+        i += 1;
+    }
+    (bits, common)
+}
+
 fn validate_passphrase(passphrase: &str) -> Result<(), String> {
     if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
         return Err(coded_ctx(
@@ -943,10 +1100,26 @@ fn validate_passphrase(passphrase: &str) -> Result<(), String> {
             format!("minimum {MIN_PASSPHRASE_LEN} characters"),
         ));
     }
+    // Before the strength estimate, whose repeated-run scan is quadratic.
     if passphrase.len() > MAX_PASSPHRASE_LEN {
         return Err(coded(
             "backup_weak_passphrase",
             "That passphrase is unreasonably long",
+        ));
+    }
+    let (bits, common) = passphrase_strength_bits(passphrase);
+    if bits < MIN_PASSPHRASE_BITS && common {
+        return Err(coded_ctx(
+            "backup_guessable_passphrase",
+            "Choose a less predictable passphrase",
+            "built on a common word or a year",
+        ));
+    }
+    if bits < MIN_PASSPHRASE_BITS {
+        return Err(coded_ctx(
+            "backup_weak_passphrase",
+            "Choose a less predictable passphrase",
+            "repeated or sequential characters",
         ));
     }
     Ok(())
@@ -1175,7 +1348,7 @@ async fn write_backup(
             Ok(BackupSummary {
                 path: dest.to_string_lossy().to_string(),
                 bytes,
-                files: manifest.files.len(),
+                files: manifest.files.len() + manifest.extra_files.len(),
                 created_at: manifest.created_at,
                 skipped,
             })
@@ -1257,7 +1430,7 @@ fn read_manifest(archive: &mut Archive) -> Result<Manifest, String> {
         ));
     }
     let mut seen = std::collections::HashSet::new();
-    for entry in &manifest.files {
+    for entry in manifest.files.iter().chain(&manifest.extra_files) {
         if !seen.insert(entry.name.as_str()) {
             return Err(coded_ctx(
                 "backup_corrupt_archive",
@@ -1315,7 +1488,7 @@ fn read_archive(
 
     let mut total = 0u64;
     let mut out = Vec::new();
-    for entry in &manifest.files {
+    for entry in manifest.files.iter().chain(&manifest.extra_files) {
         // A file this version no longer restores. Skipped before the
         // allow-list test and never read, so an archive from a version that
         // still backed it up restores cleanly rather than being rejected
@@ -1679,6 +1852,7 @@ pub async fn preview_backup(
                 manifest
                     .files
                     .iter()
+                    .chain(&manifest.extra_files)
                     .filter(|f| !is_legacy_ignored(&f.name))
             };
             // Sizes are the manifest's word, not the archive's; a crafted one
@@ -3231,7 +3405,39 @@ mod tests {
     #[test]
     fn short_passphrases_are_refused() {
         assert!(validate_passphrase("short").is_err());
+        assert!(validate_passphrase("tenletters").is_err(), "the old minimum is no longer enough");
         assert!(validate_passphrase("long enough passphrase").is_ok());
+    }
+
+    #[test]
+    fn predictable_passphrases_are_refused() {
+        for weak in ["aaaaaaaaaaaaaaaa", "123456789012", "abcdefghijklmnop", "abcxyzabcxyzabcxyz"] {
+            let err = validate_passphrase(weak).expect_err(weak);
+            assert!(err.contains("backup_weak_passphrase"), "{weak}: {err}");
+        }
+        // Told what is actually wrong with them, not that they are a pattern.
+        for weak in [
+            "Password1234",
+            "Password2026",
+            "Password1234!",
+            "P@ssw0rd2026",
+            "Qwerty123456!",
+            "Welcome2024!",
+            "iloveyou1990",
+            "Ember2026Ember2026",
+            "passwordpassword",
+        ] {
+            let err = validate_passphrase(weak).expect_err(weak);
+            assert!(err.contains("backup_guessable_passphrase"), "{weak}: {err}");
+        }
+        for strong in [
+            "correct horse battery staple",
+            "MyEmberBackup2026",
+            "qhzvtmkwpxrb",
+            "我的备份口令是今晚的月亮很圆",
+        ] {
+            assert!(validate_passphrase(strong).is_ok(), "{strong} should be accepted");
+        }
     }
 
     #[test]
@@ -4247,6 +4453,7 @@ mod tests {
                     rewrap: false,
                 })
                 .collect(),
+            extra_files: Vec::new(),
             webview_prefs: None,
         }
     }
@@ -4667,6 +4874,53 @@ mod tests {
             read_webview_prefs(&zip_path, &manifest).unwrap(),
             Some(sample_prefs())
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 1.7.5 refuses an archive whose `files` names anything it does not know,
+    /// and it does not know the IP filter's edit and update files. Listed apart,
+    /// they leave `files` to names 1.7.5 restores, so going back a version
+    /// keeps the backup usable; this build still restores them.
+    #[test]
+    fn files_newer_than_1_7_5_are_listed_where_1_7_5_does_not_look() {
+        let dir = scratch("listed-apart");
+        let entry = |name: &str, bytes: &[u8]| ManifestEntry {
+            name: name.to_string(),
+            size: bytes.len() as u64,
+            blake3: blake3::hash(bytes).to_hex().to_string(),
+            rewrap: false,
+        };
+        let mut manifest = manifest_for(&[("config.json", b"{}")]);
+        manifest.extra_files = vec![
+            entry("ipfilter_edits.json", b"[]"),
+            entry("ipfilter_update.json", b"{}"),
+        ];
+        let in_zip: &[(&str, &[u8])] = &[
+            ("config.json", b"{}"),
+            ("ipfilter_edits.json", b"[]"),
+            ("ipfilter_update.json", b"{}"),
+        ];
+        let zip_path = write_archive(&dir, in_zip, &manifest);
+
+        let mut raw = Vec::new();
+        open_archive(&zip_path)
+            .unwrap()
+            .by_name(MANIFEST_NAME)
+            .unwrap()
+            .read_to_end(&mut raw)
+            .unwrap();
+        let previous: PreviousManifest = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            previous
+                .files
+                .iter()
+                .all(|f| backup_file(&f.name).is_some_and(|spec| !spec.listed_apart)),
+            "every name 1.7.5 checks is one it knows"
+        );
+
+        let (_, read) = read_archive(&zip_path, &dir.join("entries")).unwrap();
+        let names: Vec<&str> = read.iter().map(|e| e.spec.name).collect();
+        assert_eq!(names, vec!["config.json", "ipfilter_edits.json", "ipfilter_update.json"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

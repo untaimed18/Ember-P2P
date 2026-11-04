@@ -3,7 +3,7 @@ import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { goto } from '$app/navigation';
 import * as m from '$lib/paraglide/messages';
-import { translateError } from '$lib/i18n';
+import { getLocale, translateError } from '$lib/i18n';
 import {
   activeChatTab,
   chatDockOpen,
@@ -51,7 +51,6 @@ const PRESENCE_EVENT = 'ember-ui:chat-presence';
 const READY_EVENT = 'ember-ui:chat-ready';
 const DRAFTS_EVENT = 'ember-ui:chat-drafts';
 const STASH_EVENT = 'ember-ui:chat-drafts-stash';
-const REDOCK_EVENT = 'ember-ui:chat-redock';
 const NAVIGATE_EVENT = 'ember-ui:chat-navigate';
 /** Emitted by the backend when the chat window is destroyed. */
 const CLOSED_EVENT = 'ember:chat-window-closed';
@@ -119,6 +118,9 @@ export const chatPoppedOut = writable<boolean>(readStorage(MODE_KEY) === 'window
 /** Drafts waiting for the chat window to ask for them. Held in memory only,
  *  for the reason the dock keeps its drafts off disk. */
 let pendingDrafts: Record<string, string> = {};
+/** The conversation the chat window last said was active, stashed with its
+ *  drafts, to open when the chat docks back. */
+let pendingActiveHash: string | null = null;
 
 const hook: ChatPopoutHook = {
   forward(op) {
@@ -129,9 +131,20 @@ const hook: ChatPopoutHook = {
   },
 };
 
+/** An open already on its way: a second ask while the window is being made
+ *  waits for it rather than racing it. */
+let showing: Promise<void> | null = null;
+
 /** Open the chat window, or bring it to the front. Falls back to the dock if
  *  the window cannot be made, so asking for the chat always shows it. */
-export async function showChatWindow(): Promise<void> {
+export function showChatWindow(): Promise<void> {
+  showing ??= openOrFallBack().finally(() => {
+    showing = null;
+  });
+  return showing;
+}
+
+async function openOrFallBack(): Promise<void> {
   try {
     await openChatWindow(m.chat_window_title(), loadBounds());
     // Opening it puts it in front of the user, with the conversation that was
@@ -172,6 +185,7 @@ function redockHere(payload: { activeHash?: unknown; drafts?: unknown } | undefi
   if (active && get(chatTabs).some((t) => t.hash === active)) activeChatTab.set(active);
   restoreFriendDrafts(parseDrafts(payload?.drafts));
   pendingDrafts = {};
+  pendingActiveHash = null;
   chatDockOpen.set(true);
   void focusMainWindow().catch(() => {});
 }
@@ -200,19 +214,21 @@ export async function initChatPopoutMain(): Promise<() => void> {
       await listen(PRESENCE_EVENT, (e) => chatWindowPresence.set(parsePresence(e.payload))),
       await listen(CLOSED_EVENT, () => {
         chatWindowPresence.set(null);
-        // Gone without docking back first: hung, or closed before it could
-        // answer. Dock it back here with the drafts it last stashed.
-        if (get(chatPoppedOut)) redockHere({ drafts: pendingDrafts });
+        // The window is gone, by its own Dock back, hung, or closed before it
+        // could answer: dock the chat back here with what it last stashed.
+        // Only now, so a window that failed to close is never left open
+        // beside a dock that took the chat back.
+        if (get(chatPoppedOut)) redockHere({ activeHash: pendingActiveHash, drafts: pendingDrafts });
       }),
       await listen(READY_EVENT, () => {
         const drafts = pendingDrafts;
         pendingDrafts = {};
         void emit(DRAFTS_EVENT, { drafts }).catch(() => {});
       }),
-      await listen<{ drafts?: unknown }>(STASH_EVENT, (e) => {
+      await listen<{ activeHash?: unknown; drafts?: unknown }>(STASH_EVENT, (e) => {
         pendingDrafts = parseDrafts(e.payload?.drafts);
+        pendingActiveHash = validHash(e.payload?.activeHash) ?? pendingActiveHash;
       }),
-      await listen<{ activeHash?: unknown; drafts?: unknown }>(REDOCK_EVENT, (e) => redockHere(e.payload)),
       await listen<{ path?: unknown }>(NAVIGATE_EVENT, (e) => {
         const path = e.payload?.path;
         if (typeof path === 'string' && NAVIGABLE.has(path)) {
@@ -247,19 +263,23 @@ function applyTabOp(raw: unknown) {
 let dockingBack = false;
 
 /** Put the chat back into the main window's dock, drafts and all, and close
- *  this window. What its X does. */
+ *  this window. What its X does.
+ *
+ *  The main window docks the chat when it hears the window is gone, from what
+ *  is stashed here first. Telling it to dock before the close, as this used
+ *  to, left the chat docked there and still open here whenever the close
+ *  failed. */
 export async function dockBack(): Promise<void> {
   if (dockingBack) return;
   dockingBack = true;
   const drafts = takeFriendDrafts();
-  // Closed even if the main window did not hear this: it docks the chat back
-  // itself when the window goes, from the drafts last stashed with it.
-  await emit(STASH_EVENT, { drafts }).catch(() => {});
-  await emit(REDOCK_EVENT, { activeHash: get(activeChatTab), drafts }).catch(() => {});
+  await emit(STASH_EVENT, { activeHash: get(activeChatTab), drafts }).catch(() => {});
   try {
     await closeChatWindow();
   } catch (e) {
     dockingBack = false;
+    // Still open, so the drafts stay with it.
+    restoreFriendDrafts(drafts);
     toastError(translateError(e, m.error_operation_failed()));
   }
 }
@@ -294,8 +314,22 @@ export async function initChatWindowSide(): Promise<() => void> {
     };
     void emit(PRESENCE_EVENT, presence).catch(() => {});
   };
-  const stash = () => {
-    void emit(STASH_EVENT, { drafts: takeFriendDrafts() }).catch(() => {});
+  const stash = () =>
+    emit(STASH_EVENT, { activeHash: get(activeChatTab), drafts: takeFriendDrafts() }).catch(() => {});
+
+  // A language change reloads only the main window; this one keeps the
+  // locale it loaded in until it reloads too. Checked on focus rather than
+  // when the stored choice changes, which is while the main window is itself
+  // reloading and could not take the drafts. They go to it first, and it
+  // hands them back once the reloaded window asks.
+  const loadedLocale = getLocale();
+  let reloading = false;
+  const followLocale = (): boolean => {
+    if (reloading) return true;
+    if (getLocale() === loadedLocale) return false;
+    reloading = true;
+    void stash().finally(() => location.reload());
+    return true;
   };
 
   let boundsTimer: ReturnType<typeof setTimeout> | undefined;
@@ -325,14 +359,15 @@ export async function initChatWindowSide(): Promise<() => void> {
   };
 
   const onFocus = () => {
-    report();
     // Changed in the main window while this one was in the background.
+    if (followLocale()) return;
+    report();
     initTheme();
     void loadAppSettings().catch(() => {});
   };
   const onBlur = () => {
     report();
-    stash();
+    void stash();
   };
   window.addEventListener('focus', onFocus);
   window.addEventListener('blur', onBlur);

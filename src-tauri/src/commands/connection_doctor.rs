@@ -21,8 +21,6 @@ use crate::types::NetworkStats;
 /// A clock this far from the rendezvous server's breaks signed records and
 /// session timestamps; less is ordinary drift.
 const CLOCK_SKEW_WARN_SECS: i64 = 300;
-/// How long the UDP probe may take to arrive after the server says it sent it.
-const UDP_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 /// How long after start a session with no TCP finding is still checking:
 /// time for Kad to connect and run its check, or a server to give an ID.
 const SETTLING_SECS: u64 = 15 * 60;
@@ -124,6 +122,9 @@ pub struct Signals {
     pub upnp_enabled: bool,
     pub upnp_mapped: bool,
     pub upnp_stood_down: bool,
+    /// Internet traffic leaves through a VPN's adapter, which the router's
+    /// UPnP cannot open ports on; the VPN's own port forwarding is what can.
+    pub behind_vpn: bool,
     /// The router's own WAN address is private or carrier-grade.
     pub router_behind_nat: bool,
     /// The router told us its WAN address.
@@ -131,6 +132,9 @@ pub struct Signals {
     pub kad_tcp: Option<bool>,
     pub kad_udp: Option<bool>,
     pub low_id: Option<bool>,
+    /// A LowID the outside test contradicts, so the server is being logged in
+    /// to again for a fresh ID.
+    pub logging_in_again: bool,
     pub nat_symmetric: bool,
     pub nat_known: bool,
     pub buddy_connected: bool,
@@ -222,6 +226,8 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
         check("upnp", Warn, "stood_down");
     } else if s.upnp_mapped {
         check("upnp", Pass, "mapped");
+    } else if s.behind_vpn {
+        check("upnp", Skip, "vpn");
     } else {
         check("upnp", Fail, "not_mapped");
     }
@@ -260,6 +266,7 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     }
     match s.low_id {
         Some(false) => check("server_id", Pass, "high_id"),
+        Some(true) if s.logging_in_again => check("server_id", Skip, "logging_in_again"),
         Some(true) => check("server_id", Fail, "low_id"),
         None => check("server_id", Skip, "not_connected"),
     }
@@ -317,7 +324,9 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     if unreachable && s.router_behind_nat {
         fixes.push(Fix { id: "carrier_nat", action: None });
     } else if unreachable && settled && !s.restart_pending {
-        if s.upnp_stood_down {
+        // A forward the router did make still counts behind a VPN: a client
+        // that tunnels only some programs can leave Ember outside it.
+        if s.upnp_stood_down || (s.behind_vpn && !s.upnp_mapped) {
             fixes.push(Fix { id: "vpn", action: None });
         } else if !s.upnp_enabled {
             fixes.push(Fix { id: "enable_upnp", action: Some("enable_upnp") });
@@ -433,17 +442,12 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
     let (probe_tcp, probe_udp) = probe_ports(&stats, tcp_port, bound_udp);
     let wan = router_wan(&stats.upnp_wan_ip);
 
+    // Read after the probe, which spends its time waiting on the server.
     #[cfg(target_os = "windows")]
-    let firewall_rules = {
+    let firewall_check = {
         let (tcp, udp, quic) = (tcp_port, bound_udp, stats.quic_udp_port);
         tokio::task::spawn_blocking(move || crate::security::firewall::rules_in_place(tcp, udp, quic))
-            .await
-            .ok()
-            .flatten()
     };
-    #[cfg(not(target_os = "windows"))]
-    let firewall_rules = None;
-    let firewall_check_failed = cfg!(target_os = "windows") && firewall_rules.is_none();
 
     let mut signals = Signals {
         kad_connected: stats.status == crate::types::NetworkStatus::Connected,
@@ -451,11 +455,10 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         dht_contacts: stats.ember_dht_verified_contacts,
         tcp_listen_failed: stats.tcp_listen_failed,
         udp_port_moved: bound_udp != session_udp,
-        firewall_rules,
-        firewall_check_failed,
         upnp_enabled,
         upnp_mapped: stats.upnp_mapped,
         upnp_stood_down: stats.upnp_stood_down,
+        behind_vpn: crate::vpn::default_route_is_vpn().unwrap_or(false),
         router_behind_nat: wan.is_some_and(behind_another_nat),
         router_wan_known: wan.is_some(),
         kad_tcp: status_of(&stats.tcp_status),
@@ -476,39 +479,35 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
     if probe {
         use crate::network::rendezvous::Reachability;
         let url = crate::commands::channels::rendezvous_url(state).await;
-        let mut nonce = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-        let _expecting = crate::network::reachability::expect_probe(nonce);
-        match crate::network::rendezvous::request_reachability(&url, probe_tcp, probe_udp, &nonce).await {
+        // Also kept as the network's outside verdict, so a check run here
+        // tells Ember whether peers can reach it, as the background one does.
+        match crate::network::reachability::outside_in_probe(&url, probe_tcp, probe_udp).await {
             // Ember listens on IPv4 only: an answer about another address
             // says nothing about the ports peers reach.
-            Ok(Reachability::Probed(answer)) if answer.ip.parse::<Ipv4Addr>().is_ok() => {
+            Ok((Reachability::Probed(answer), udp_arrived)) if answer.ip.parse::<Ipv4Addr>().is_ok() => {
                 probed = true;
                 signals.probe_tcp = Some(match answer.tcp.as_str() {
                     "open" => TcpProbe::Open,
                     "closed" => TcpProbe::Closed,
                     _ => TcpProbe::Timeout,
                 });
-                if answer.udp_sent {
-                    let deadline = tokio::time::Instant::now() + UDP_PROBE_WAIT;
-                    let mut arrived = crate::network::reachability::probe_received(&nonce);
-                    while !arrived && tokio::time::Instant::now() < deadline {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        arrived = crate::network::reachability::probe_received(&nonce);
-                    }
-                    signals.probe_udp = Some(arrived);
-                }
+                signals.probe_udp = udp_arrived;
                 if answer.server_time > 0 {
                     signals.clock_skew_secs = Some(chrono::Utc::now().timestamp() - answer.server_time);
                 }
             }
-            Ok(Reachability::RateLimited) => signals.probe_rate_limited = true,
-            Ok(Reachability::Busy) => signals.probe_busy = true,
-            Ok(Reachability::Declined { server_time }) if server_time > 0 => {
+            Ok((Reachability::RateLimited, _)) => signals.probe_rate_limited = true,
+            Ok((Reachability::Busy, _)) => signals.probe_busy = true,
+            Ok((Reachability::Declined { server_time }, _)) if server_time > 0 => {
                 signals.clock_skew_secs = Some(chrono::Utc::now().timestamp() - server_time);
             }
             _ => {}
         }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        signals.firewall_rules = firewall_check.await.ok().flatten();
+        signals.firewall_check_failed = signals.firewall_rules.is_none();
     }
     Ok(Gathered { signals, stats, tcp_port, udp_port: bound_udp, probed })
 }
@@ -516,7 +515,13 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
 /// Run every check and say what they mean.
 #[tauri::command]
 pub async fn run_connection_check(state: tauri::State<'_, AppState>) -> Result<ConnectionReport, String> {
-    let gathered = gather(&state, true).await?;
+    let mut gathered = gather(&state, true).await?;
+    // The outside test reached the TCP port the server would test, so a LowID
+    // is from before whatever opened it, and lasts until a login asks again.
+    let s = &gathered.signals;
+    if s.low_id == Some(true) && s.probe_tcp == Some(TcpProbe::Open) && !s.tcp_listen_failed {
+        gathered.signals.logging_in_again = log_in_again(&state, false).await;
+    }
     let (verdict, checks, helping, fixes) = assess(&gathered.signals);
     Ok(ConnectionReport {
         verdict,
@@ -546,13 +551,21 @@ pub async fn connection_doctor_action(
             Ok(true)
         }
         "recheck" => {
+            // A server that gave a LowID tests the port only at a login, so
+            // checking again logs in again too.
+            let low_id = network_stats(&state).await?.ed2k_low_id == Some(true);
+            let logged_in_again = low_id && log_in_again(&state, false).await;
             let (tx, rx) = tokio::sync::oneshot::channel();
             state
                 .network_tx
                 .try_send(NetworkCommand::RecheckFirewall { tx })
                 .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
-            await_reply(rx, "doctor_failed", "Could not start the checks again").await??;
-            Ok(true)
+            match await_reply(rx, "doctor_failed", "Could not start the checks again").await? {
+                Ok(_) => Ok(true),
+                // Kad had nobody to ask, but the server is testing the port.
+                Err(_) if logged_in_again => Ok(true),
+                Err(e) => Err(e),
+            }
         }
         #[cfg(target_os = "windows")]
         "add_firewall_rules" => {
@@ -561,17 +574,96 @@ pub async fn connection_doctor_action(
             let settings = state.config.read().await.settings.clone();
             let (tcp, udp, _, _) = session_ports(&stats, &settings);
             let quic = stats.quic_udp_port;
-            tokio::task::spawn_blocking(move || crate::security::firewall::add_rules_elevated(tcp, udp, quic))
-                .await
-                .map_err(|e| coded_ctx("doctor_failed", "Task error", e))
+            // The permission prompt belongs to this window, so it opens in
+            // front of Ember rather than behind it.
+            let owner = window.hwnd().map(|hwnd| hwnd.0 as isize).unwrap_or(0);
+            let added = tokio::task::spawn_blocking(move || {
+                crate::security::firewall::add_rules_elevated(tcp, udp, quic, owner)
+            })
+            .await
+            .map_err(|e| coded_ctx("doctor_failed", "Task error", e))?;
+            if added {
+                retest_ports(&state, stats.ed2k_low_id == Some(true)).await;
+            }
+            Ok(added)
         }
         _ => Err(coded("doctor_unknown_action", "That fix is not available here")),
     }
 }
 
+/// Have the ports tested again once rules let peers in: Kad's firewall check
+/// answers within a minute, and an eD2K server that gave a LowID (`low_id`)
+/// only hands out another ID at a fresh login, so that one logs in again.
+#[cfg(target_os = "windows")]
+async fn retest_ports(state: &AppState, low_id: bool) {
+    let (tx, _) = tokio::sync::oneshot::channel();
+    let _ = state.network_tx.try_send(NetworkCommand::RecheckFirewall { tx });
+    if low_id {
+        // New rules are exactly what a fresh login has to see, so they are
+        // not held back by the pause between checks.
+        log_in_again(state, true).await;
+    }
+}
+
+/// How long after one login the doctor asks for another. A LowID that a fresh
+/// login does not clear is a real finding; logging in on every check hid it
+/// behind "logging in again" and dropped the server connection each time.
+const RELOGIN_PAUSE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+static LAST_RELOGIN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Run `ask` if a login may be asked for now, and record the login only when
+/// `ask` says it went out, so a login that could not be queued does not hold
+/// back the next one. `force` skips the pause but still records the login.
+fn take_relogin_slot(force: bool, ask: impl FnOnce() -> bool) -> bool {
+    let mut last = LAST_RELOGIN.lock().unwrap_or_else(|e| e.into_inner());
+    if !force && last.is_some_and(|at| at.elapsed() < RELOGIN_PAUSE) {
+        return false;
+    }
+    let asked = ask();
+    if asked {
+        *last = Some(std::time::Instant::now());
+    }
+    asked
+}
+
+/// Log in to the eD2K server we are on again, which is when a server tests our
+/// port and hands out an ID. Returns whether a login was asked for; at most one
+/// per [`RELOGIN_PAUSE`] unless `force`.
+async fn log_in_again(state: &AppState, force: bool) -> bool {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if state.network_tx.try_send(NetworkCommand::GetConnectedServerSnapshot { tx }).is_err() {
+        return false;
+    }
+    let Ok(Some(server)) = rx.await else {
+        return false;
+    };
+    take_relogin_slot(force, || {
+        let (tx, _) = tokio::sync::oneshot::channel();
+        state
+            .network_tx
+            .try_send(NetworkCommand::ConnectToServer { ip: server.ip, port: server.port, tx })
+            .is_ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A LowID a fresh login did not clear stays on screen as a finding: the
+    /// next check inside the pause does not log in again and hide it.
+    #[test]
+    fn a_second_login_waits_out_the_pause_unless_forced() {
+        *LAST_RELOGIN.lock().unwrap() = None;
+        assert!(!take_relogin_slot(false, || false), "a login that was not queued");
+        assert!(take_relogin_slot(false, || true), "does not hold back the first that is");
+        assert!(!take_relogin_slot(false, || true), "a second check inside the pause does not log in");
+        assert!(take_relogin_slot(true, || true), "new firewall rules still get their login");
+        *LAST_RELOGIN.lock().unwrap() = Some(std::time::Instant::now() - RELOGIN_PAUSE);
+        assert!(take_relogin_slot(false, || true), "after the pause a check logs in again");
+        *LAST_RELOGIN.lock().unwrap() = None;
+    }
 
     fn reachable() -> Signals {
         Signals {
@@ -646,6 +738,55 @@ mod tests {
         assert_eq!(fix_ids(&cgnat), vec!["carrier_nat"]);
         let vpn = Signals { upnp_stood_down: true, ..closed };
         assert_eq!(fix_ids(&vpn), vec!["vpn"]);
+    }
+
+    /// A LowID the outside test contradicts is from before the port opened:
+    /// the server line says a login is asking again rather than failing, and
+    /// the verdict follows the probe.
+    #[test]
+    fn a_low_id_from_before_the_port_opened_is_not_a_failure_while_logging_in_again() {
+        let stale = Signals { low_id: Some(true), logging_in_again: true, ..reachable() };
+        let (verdict, checks, _, fixes) = assess(&stale);
+        assert_eq!(verdict, Verdict::Reachable);
+        let server = checks.iter().find(|c| c.id == "server_id").expect("a server line");
+        assert_eq!((server.status, server.detail), (CheckStatus::Skip, "logging_in_again"));
+        assert!(fixes.is_empty());
+
+        let still_low = Signals { low_id: Some(true), ..reachable() };
+        let (_, checks, _, _) = assess(&still_low);
+        assert!(checks.iter().any(|c| c.id == "server_id" && c.status == CheckStatus::Fail));
+    }
+
+    /// Behind a VPN no router answers UPnP, which is how it should be, so
+    /// that is neither a failure nor a reason to visit the router: the VPN's
+    /// own port forwarding is. The Windows rules still come first.
+    #[test]
+    fn behind_a_vpn_upnp_is_not_a_failure_and_the_vpn_is_the_fix() {
+        let tunnelled = Signals {
+            kad_tcp: Some(false),
+            kad_udp: Some(false),
+            low_id: Some(true),
+            probe_tcp: Some(TcpProbe::Timeout),
+            probe_udp: Some(false),
+            upnp_mapped: false,
+            behind_vpn: true,
+            firewall_rules: Some(false),
+            ..reachable()
+        };
+        let (_, checks, _, _) = assess(&tunnelled);
+        let upnp = checks.iter().find(|c| c.id == "upnp").expect("a UPnP line");
+        assert_eq!((upnp.status, upnp.detail), (CheckStatus::Skip, "vpn"));
+        assert_eq!(fix_ids(&tunnelled), vec!["windows_firewall", "vpn"]);
+
+        let upnp_off = Signals { upnp_enabled: false, ..tunnelled.clone() };
+        assert_eq!(fix_ids(&upnp_off), vec!["windows_firewall", "vpn"], "turning UPnP on would not help");
+
+        // Some VPN clients tunnel only chosen programs, and a forward the
+        // router made for Ember outside the tunnel is real.
+        let split = Signals { upnp_mapped: true, ..tunnelled };
+        let (_, checks, _, _) = assess(&split);
+        assert!(checks.iter().any(|c| c.id == "upnp" && c.status == CheckStatus::Pass));
+        assert_eq!(fix_ids(&split), vec!["windows_firewall", "forward_ports"]);
     }
 
     /// Whatever answers on a port Ember could not open is another program,

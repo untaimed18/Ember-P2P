@@ -10,6 +10,7 @@ pub mod dead_sources;
 pub mod ember_auth;
 pub mod friend_connect;
 pub mod hash;
+pub mod key_link;
 pub mod messages;
 pub mod multi_source;
 pub mod part_tracker;

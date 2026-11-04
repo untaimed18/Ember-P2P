@@ -36,6 +36,9 @@
     // Focus Cancel on open without the danger styling, for a prompt that can
     // appear unasked, where a stray Enter must not confirm.
     focusCancel = false,
+    // Focus the dialog itself rather than either button, for a prompt whose
+    // Cancel is as permanent as its Confirm. Escape still dismisses.
+    focusDialog = false,
   }: {
     open?: boolean;
     title?: string;
@@ -44,6 +47,7 @@
     cancelLabel?: string;
     danger?: boolean;
     focusCancel?: boolean;
+    focusDialog?: boolean;
     isolateMessage?: boolean;
     alert?: boolean;
     onconfirm?: () => void;
@@ -130,7 +134,8 @@
       const active = typeof document !== 'undefined' ? document.activeElement : null;
       if (active instanceof HTMLElement && active !== document.body) returnFocusEl = active;
       openFocusFrame = requestAnimationFrame(() => {
-        if (preferCancel) cancelBtn?.focus();
+        if (focusDialog) overlayEl?.focus();
+        else if (preferCancel) cancelBtn?.focus();
         else confirmBtn?.focus();
       });
     }
@@ -198,3 +203,9 @@
     </div>
   </div>
 {/if}
+
+<style>
+  .confirm-overlay:focus {
+    outline: none;
+  }
+</style>

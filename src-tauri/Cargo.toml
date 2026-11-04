@@ -1,6 +1,6 @@
 [package]
 name = "ember"
-version = "1.7.5"
+version = "1.7.6"
 description = "A decentralized P2P file sharing application"
 authors = ["untaimed18"]
 license = "GPL-3.0-only"
@@ -137,7 +137,12 @@ rustls = { version = "0.23", features = ["ring"] }
 # ASN.1/DER parser walks the actual certificate structure and cannot
 # be fooled that way.
 x509-cert = { version = "0.3", default-features = false }
-zip = "8"
+# Stored and Deflate only: backups are written Deflated, and the only zips read
+# are those backups and ipfilter.zip. Every other method fails as unsupported
+# instead of reaching the zstd (C), xz/lzma, PPMd, bzip2 or deflate64 decoders
+# with a third-party archive. `zlib-rs` is the backend flate2 already uses.
+# `time` stamps backup entries with the export time.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "time"] }
 fs2 = "0.4"
 maxminddb = "0.32"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
@@ -197,6 +202,15 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 windows-sys = { version = "0.61", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    # `GetBestInterface` and `GetIfEntry2`, to tell whether internet traffic
+    # leaves through a VPN's adapter (see `src/vpn.rs`); the other two carry
+    # the types `MIB_IF_ROW2` and `GetIfEntry2` are declared with.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    # `RasEnumConnectionsW`, so a PPP route is judged by its connection's
+    # device type: a VPN's, or PPPoE broadband's (see `src/vpn.rs`).
+    "Win32_NetworkManagement_Rras",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
@@ -215,6 +229,12 @@ windows-sys = { version = "0.61", features = [
     # idle before friends see them as Away (see `src/idle.rs`).
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # `ShellExecuteExW` and `CoInitializeEx`, to ask for elevation from
+    # Ember's own window so the permission prompt opens in front of it (see
+    # `security::firewall::run_elevated`).
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 

@@ -177,6 +177,20 @@ impl EmberObservedIpVotes {
 
         self.prune(now);
 
+        // One live vote per net among the addresses still contending. The cap
+        // below drops the least recently updated address, so a single /24
+        // naming a fresh address on every reply used to push out the honest
+        // votes for ours before they reached a quorum. A vote for the confirmed
+        // address stays where it is: withdrawing it would let one backer lapse
+        // a confirmation that a bare quorum holds.
+        let confirmed = self.confirmed;
+        self.votes.retain(|addr, v| {
+            if *addr != reported_ip && Some(*addr) != confirmed {
+                v.nets.remove(&net);
+            }
+            !v.nets.is_empty()
+        });
+
         if self.votes.len() >= MAX_TRACKED_ADDRS && !self.votes.contains_key(&reported_ip) {
             // Drop the least-recently-updated address to make room, so a peer
             // reporting a fresh address on every reply cannot grow this map.
@@ -188,7 +202,6 @@ impl EmberObservedIpVotes {
             // rival take the address over, which is the takeover the tie rule
             // exists to refuse. The plain minimum is still the fallback so the
             // cap holds even when the confirmed entry is the only candidate.
-            let confirmed = self.confirmed;
             let victim = self
                 .votes
                 .iter()
@@ -683,10 +696,11 @@ mod tests {
 
         // Every filler is strictly newer, so the confirmed address is the LRU
         // victim on every insert once the map is full.
+        // One net per filler, since a net's vote moves with it.
         let later = t0 + Duration::from_secs(1);
         for i in 0..(MAX_TRACKED_ADDRS as u8 * 2) {
             let filler = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 9, i + 1), 5000));
-            votes.record_vote_at(filler, reporter(2, 2, 2), later);
+            votes.record_vote_at(filler, reporter(2, i, 2), later);
         }
 
         assert_eq!(
@@ -870,7 +884,7 @@ mod tests {
         assert_eq!(votes.confirmed(), Some(addr(50, 4672)));
     }
 
-    /// A peer answering with a different address each time must not grow the
+    /// Peers answering with a different address each time must not grow the
     /// map without bound.
     #[test]
     fn the_vote_map_is_bounded() {
@@ -881,12 +895,63 @@ mod tests {
                 Ipv4Addr::new(8, 8, 8, (i % 250) as u8 + 1),
                 4000 + i,
             ));
-            votes.record_vote_at(reported, reporter(1, 1, 1), now);
+            votes.record_vote_at(reported, reporter(1, i as u8, 1), now);
         }
         assert!(
             votes.votes.len() <= MAX_TRACKED_ADDRS,
             "tracked {} addresses, above the cap",
             votes.votes.len()
+        );
+    }
+
+    /// One /24 naming a fresh address on every reply filled the tracked set
+    /// and evicted the honest votes for our address before they could reach a
+    /// quorum. A net now holds one vote among the contending addresses, so it
+    /// cannot outnumber anyone.
+    #[test]
+    fn one_net_cannot_flush_the_votes_for_an_unconfirmed_address() {
+        let mut votes = EmberObservedIpVotes::new();
+        let ours = addr(50, 4672);
+        let t0 = Instant::now();
+        votes.record_vote_at(ours, reporter(1, 0, 1), t0);
+        votes.record_vote_at(ours, reporter(1, 1, 1), t0);
+
+        let later = t0 + Duration::from_secs(1);
+        for i in 0..(MAX_TRACKED_ADDRS as u16 * 2) {
+            let junk = SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(8, 9, (i / 250) as u8, (i % 250) as u8 + 1),
+                5000,
+            ));
+            votes.record_vote_at(junk, reporter(66, 6, 6), later);
+        }
+        assert_eq!(votes.votes.len(), 2, "ours, and the flooding net's latest");
+        assert_eq!(
+            votes.record_vote_at(ours, reporter(1, 2, 1), later),
+            Some(ours),
+            "the honest votes survived to make the quorum"
+        );
+    }
+
+    /// The vote a net gives the confirmed address is not withdrawn by its vote
+    /// for another, so one backer of a bare quorum cannot lapse it.
+    #[test]
+    fn a_backer_voting_elsewhere_does_not_lapse_the_confirmation() {
+        let mut votes = EmberObservedIpVotes::new();
+        let current = addr(50, 4672);
+        let now = Instant::now();
+        for net in 0..3u8 {
+            votes.record_vote_at(current, reporter(1, net, 1), now);
+        }
+        assert_eq!(votes.confirmed(), Some(current));
+
+        votes.record_vote_at(addr(51, 4672), reporter(1, 0, 1), now);
+        votes.record_vote_at(addr(52, 4672), reporter(1, 0, 1), now);
+        assert_eq!(votes.confirmed(), Some(current));
+        assert_eq!(votes.votes[&current.ip()].nets.len(), 3);
+        assert_eq!(
+            votes.votes.get(&addr(51, 0).ip()).map(|v| v.nets.len()),
+            None,
+            "its vote moved on to the newer rival"
         );
     }
 

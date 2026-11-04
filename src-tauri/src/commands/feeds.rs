@@ -76,7 +76,7 @@ const LISTING_FALLBACK_SECS: i64 = 15 * 60;
 /// listing with it. Most storers are builds that keep a head they cannot
 /// read for a day and never hand it on when they leave, so a day between
 /// republishes let a head vanish as its storers came and went.
-const REPUBLISH_SECS: i64 = 60 * 60;
+const REPUBLISH_SECS: i64 = crate::network::ember::feed::FEED_LISTING_RESIGN_SECS;
 /// How often a deleted feed's withdrawal is sent again.
 const WITHDRAWAL_RESEND_SECS: i64 = 24 * 3600;
 /// How often a deleted feed's tombstone head is signed and sent again, as
@@ -276,6 +276,8 @@ pub struct OwnFeedInfo {
     pub followers: Option<FollowerCount>,
     /// Followers who downloaded each file from us, by lowercase eD2K hash.
     pub downloads: HashMap<String, u32>,
+    /// How followers can fetch it now.
+    pub reach: crate::network::feed_reach::Reach,
 }
 
 async fn own_feed_info(state: &AppState, feed: OwnFeed) -> Result<OwnFeedInfo, String> {
@@ -292,6 +294,7 @@ async fn own_feed_info(state: &AppState, feed: OwnFeed) -> Result<OwnFeedInfo, S
     Ok(OwnFeedInfo {
         publisher: hex::encode(state.identity.ed25519_public_key),
         link: link_for(&state.identity.ed25519_public_key, &salt),
+        reach: crate::network::feed_reach::reach(&salt),
         feed,
         items,
         followers,
@@ -385,11 +388,13 @@ async fn count_followers(state: &AppState, dir: &Path, feed: &OwnFeed) -> Option
     let own = state.identity.ed25519_public_key;
     let mut followers = std::collections::HashSet::new();
     let (mut answered, mut at_least) = (false, false);
-    for list in &lists {
+    let lookups = futures::future::join_all(lists.iter().map(|list| {
         let key = crate::network::ember::dht::publish::source_key(list);
-        let Some((blobs, responded)) =
-            crate::commands::channels::find_raw_keys_counted(state, vec![key], LOOKUP_TIMEOUT_MS).await.ok().flatten()
-        else {
+        crate::commands::channels::find_raw_keys_counted(state, vec![key], LOOKUP_TIMEOUT_MS)
+    }))
+    .await;
+    for (list, lookup) in lists.iter().zip(lookups) {
+        let Some((blobs, responded)) = lookup.ok().flatten() else {
             continue;
         };
         if responded == 0 {
@@ -615,6 +620,45 @@ async fn send_listing(state: &AppState, feed: &OwnFeed, now: i64) {
     }
 }
 
+/// Whether the last listing sent of each feed of ours said followers could
+/// fetch its files, and when it went, so a listing goes again when that
+/// changes.
+fn listing_share_sent() -> &'static parking_lot::Mutex<HashMap<FeedSalt, (bool, Instant)>> {
+    type Sent = HashMap<FeedSalt, (bool, Instant)>;
+    static SENT: std::sync::OnceLock<parking_lot::Mutex<Sent>> = std::sync::OnceLock::new();
+    SENT.get_or_init(Default::default)
+}
+
+/// How soon after a listing another may go for a change in whether its
+/// files can be fetched: a buddy coming and going must not re-sign it every
+/// minute.
+const LISTING_SHARE_RESEND: Duration = Duration::from_secs(10 * 60);
+
+/// Send again the listings of our listed feeds whose last one said otherwise
+/// about whether followers can fetch their files.
+async fn resend_changed_listings(state: &AppState, now: i64) {
+    let db = state.db.clone();
+    let Ok(Ok(feeds)) = tokio::task::spawn_blocking(move || db.feeds_own()).await else {
+        return;
+    };
+    for feed in feeds.iter().filter(|feed| feed.listed && feed.sequence > 0) {
+        let Ok(salt) = hex_to16(&feed.salt) else { continue };
+        let sent = listing_share_sent().lock().get(&salt).copied();
+        let can_share = crate::network::feed_reach::can_share(&salt);
+        // None sent this session: the one at storers said its files could be
+        // fetched, unless sent before the restart saying otherwise, which the
+        // next hourly republish puts right.
+        let changed = match sent {
+            Some((said, at)) => said != can_share && at.elapsed() >= LISTING_SHARE_RESEND,
+            None => !can_share,
+        };
+        if changed {
+            listing_share_sent().lock().insert(salt, (can_share, Instant::now()));
+            send_listing(state, feed, now).await;
+        }
+    }
+}
+
 /// Sign and queue `due`: the feed's listing naming `head`, or its
 /// withdrawal, which names nothing of the feed.
 async fn queue_listing(state: &AppState, due: &DueListing, head: &FeedHead) {
@@ -623,7 +667,18 @@ async fn queue_listing(state: &AppState, due: &DueListing, head: &FeedHead) {
     };
     let head = if due.withdrawn { withdrawal_head() } else { head.clone() };
     let signing = crate::network::ember::crypto::signing_key_from_bytes(&state.identity.ed25519_secret_key);
-    let Some(record) = SignedRecord::feed_listing_record(&salt, &head, due.withdrawn, &signing, due.stamp) else {
+    let flags = if due.withdrawn {
+        crate::network::ember::feed::FEED_LISTING_WITHDRAWN
+    } else {
+        let can_share = crate::network::feed_reach::can_share(&salt);
+        listing_share_sent().lock().insert(salt, (can_share, Instant::now()));
+        if can_share {
+            0
+        } else {
+            crate::network::ember::feed::FEED_LISTING_CANNOT_SHARE
+        }
+    };
+    let Some(record) = SignedRecord::feed_listing_record_flagged(&salt, &head, flags, &signing, due.stamp) else {
         return;
     };
     if let Err(error) = crate::commands::channels::queue_signed_record(state, record).await {
@@ -684,37 +739,22 @@ pub async fn set_feed_items(
         .into_iter()
         .map(|item| (item.ed2k, item.name))
         .collect();
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::with_capacity(items.len());
     let mut saved = SavedFeedItems::default();
-    {
+    let out = {
         let index = state.local_index.read().await;
-        for input in items {
-            let ed2k = input.ed2k.trim().to_ascii_lowercase();
-            if !seen.insert(ed2k.clone()) {
-                continue;
-            }
-            let shared = index.get_by_hash(&ed2k).filter(|file| file.is_public_listable() && file.ember_file_hash.len() == 64);
-            let Some(file) = shared else {
-                let name = index.get_by_hash(&ed2k).map(|file| file.name.clone()).or_else(|| held.get(&ed2k).cloned());
-                saved.dropped.push(name.unwrap_or(ed2k));
-                continue;
-            };
-            out.push(FeedItem {
-                ed2k,
-                name: file.name.clone(),
-                size: file.size as i64,
-                aich: file.aich_hash.clone(),
-                blake3: file.ember_file_hash.to_ascii_lowercase(),
-                note: clip(&crate::security::sanitize_remote_text(&input.note, 4096), FEED_NOTE_MAX),
-            });
-        }
-    }
+        library_items(&index, items, &held, &mut saved.dropped)
+    };
     if !saved.dropped.is_empty() && crate::commands::sharing::startup_library_loading() {
         return Err(library_loading());
     }
     // Not while a Publish reads the items and drops those no longer shared.
     let _editing = edit_lock().lock().await;
+    let (db, key) = (state.db.clone(), salt.clone());
+    let now = blocking(move || db.feed_own_items(&key), "feeds_failed", "Could not read feeds").await?;
+    let out = with_added(out, &held, now);
+    if out.len() > FEED_ITEMS_MAX {
+        return Err(coded("feeds_too_many_items", "A feed holds at most 2,000 files"));
+    }
     let db = state.db.clone();
     let (found, out) = blocking(move || Ok((db.feed_own_set_items(&salt, &out)?, out)), "feeds_failed", "Could not save the feed").await?;
     if !found {
@@ -722,6 +762,147 @@ pub async fn set_feed_items(
     }
     saved.items = out;
     Ok(saved)
+}
+
+/// `out`, as the editor saves it, with the items listed `now` that were not
+/// when `held` was read: added from the Library while the save read it,
+/// which the editor's list never had and so cannot have left out.
+fn with_added(mut out: Vec<FeedItem>, held: &HashMap<String, String>, now: Vec<FeedItem>) -> Vec<FeedItem> {
+    let saving: std::collections::HashSet<String> = out.iter().map(|item| item.ed2k.clone()).collect();
+    out.extend(now.into_iter().filter(|item| !held.contains_key(&item.ed2k) && !saving.contains(&item.ed2k)));
+    out
+}
+
+/// Each of `inputs` as a feed item, from the Library: a file shared with
+/// everyone, with the BLAKE3 a follower checks it by. Any other goes in
+/// `dropped` by its Library name, else its name in `held`, else its hash. A
+/// repeat of an earlier input is skipped.
+fn library_items(
+    index: &crate::search::index::LocalIndex,
+    inputs: impl IntoIterator<Item = FeedItemInput>,
+    held: &HashMap<String, String>,
+    dropped: &mut Vec<String>,
+) -> Vec<FeedItem> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for input in inputs {
+        if !seen.insert(input.ed2k.trim().to_ascii_lowercase()) {
+            continue;
+        }
+        match library_item(index, input, held) {
+            Ok(item) => out.push(item),
+            Err(name) => dropped.push(name),
+        }
+    }
+    out
+}
+
+/// One input of [`library_items`]: its feed item, or the name it is
+/// reported dropped by.
+fn library_item(
+    index: &crate::search::index::LocalIndex,
+    input: FeedItemInput,
+    held: &HashMap<String, String>,
+) -> Result<FeedItem, String> {
+    let ed2k = input.ed2k.trim().to_ascii_lowercase();
+    let shared = index.get_by_hash(&ed2k).filter(|file| file.is_public_listable() && file.ember_file_hash.len() == 64);
+    let Some(file) = shared else {
+        let name = index.get_by_hash(&ed2k).map(|file| file.name.clone()).or_else(|| held.get(&ed2k).cloned());
+        return Err(name.unwrap_or(ed2k));
+    };
+    Ok(FeedItem {
+        ed2k,
+        name: file.name.clone(),
+        size: file.size as i64,
+        aich: file.aich_hash.clone(),
+        blake3: file.ember_file_hash.to_ascii_lowercase(),
+        note: clip(&crate::security::sanitize_remote_text(&input.note, 4096), FEED_NOTE_MAX),
+    })
+}
+
+/// What adding Library files to a feed did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AddedFeedItems {
+    /// Files added to the end of the feed.
+    pub added: u32,
+    /// Files the feed already lists, left where they are.
+    pub already: u32,
+    /// The names of files left out because they are not shared with everyone
+    /// or have no Ember digest yet.
+    pub dropped: Vec<String>,
+}
+
+/// Add files from the Library to the end of a feed's items, for the Library's
+/// "Add to feed". Saved as an edit is: the feed shows as changed until it is
+/// published from the Feeds page.
+#[tauri::command]
+pub async fn add_feed_items(
+    state: tauri::State<'_, AppState>,
+    salt: String,
+    ed2ks: Vec<String>,
+) -> Result<AddedFeedItems, String> {
+    let salt = hex::encode(hex_salt(&salt)?);
+    if ed2ks.len() > FEED_ITEMS_MAX {
+        return Err(coded("feeds_too_many_items", "A feed holds at most 2,000 files"));
+    }
+    // Before the edit lock: a library scan can hold the index a while, and
+    // every Save and Publish waits on that lock.
+    let (found, loading) = {
+        let index = state.local_index.read().await;
+        let mut seen = std::collections::HashSet::new();
+        let found: Vec<(String, Result<FeedItem, String>)> = ed2ks
+            .into_iter()
+            .map(|ed2k| ed2k.trim().to_ascii_lowercase())
+            .filter(|ed2k| seen.insert(ed2k.clone()))
+            .map(|ed2k| {
+                let item = library_item(&index, FeedItemInput { ed2k: ed2k.clone(), note: String::new() }, &HashMap::new());
+                (ed2k, item)
+            })
+            .collect();
+        (found, crate::commands::sharing::startup_library_loading())
+    };
+    // Across the read and the save, so a save from the editor in between is
+    // neither undone by this one nor undoes it (see `with_added`).
+    let _editing = edit_lock().lock().await;
+    let (db, key) = (state.db.clone(), salt.clone());
+    let mut items = blocking(move || db.feed_own_items(&key), "feeds_failed", "Could not read feeds").await?;
+    let result = append_items(&mut items, found)?;
+    if !result.dropped.is_empty() && loading {
+        return Err(library_loading());
+    }
+    if result.added == 0 {
+        return Ok(result);
+    }
+    let db = state.db.clone();
+    let found = blocking(move || db.feed_own_set_items(&salt, &items), "feeds_failed", "Could not save the feed").await?;
+    if !found {
+        return Err(coded("feeds_not_found", "That feed could not be found"));
+    }
+    Ok(result)
+}
+
+/// Add to the end of `items` the files of `found`, by eD2K hash, that it does
+/// not list yet, in the order found; those it lists stay where they are.
+fn append_items(items: &mut Vec<FeedItem>, found: Vec<(String, Result<FeedItem, String>)>) -> Result<AddedFeedItems, String> {
+    let listed: std::collections::HashSet<String> = items.iter().map(|item| item.ed2k.clone()).collect();
+    let mut result = AddedFeedItems::default();
+    let mut fresh = Vec::new();
+    for (ed2k, item) in found {
+        if listed.contains(&ed2k) {
+            result.already += 1;
+            continue;
+        }
+        match item {
+            Ok(item) => fresh.push(item),
+            Err(name) => result.dropped.push(name),
+        }
+    }
+    if items.len() + fresh.len() > FEED_ITEMS_MAX {
+        return Err(coded("feeds_too_many_items", "A feed holds at most 2,000 files"));
+    }
+    result.added = fresh.len() as u32;
+    items.extend(fresh);
+    Ok(result)
 }
 
 /// Refusal for a save or publish that would drop items while the startup scan
@@ -788,6 +969,18 @@ fn served_rebuild_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(Default::default)
 }
 
+/// The feeds of ours the rendezvous heartbeat registers, newest published
+/// first (see `network::feed_reach`).
+async fn refresh_registered_feeds(state: &AppState) {
+    let db = state.db.clone();
+    let Ok(Ok(mut feeds)) = tokio::task::spawn_blocking(move || db.feeds_own()).await else {
+        return;
+    };
+    feeds.retain(|feed| feed.sequence > 0);
+    feeds.sort_by_key(|feed| std::cmp::Reverse(feed.published_at));
+    crate::network::feed_reach::set_own_feeds(feeds.iter().filter_map(|feed| hex_to16(&feed.salt).ok()).collect());
+}
+
 /// Let followers stream our feeds' files (see `network::feed_direct`): every
 /// file the published or pending list of a feed of ours names, as followers
 /// may hold either, that is still shared with everyone, from where the
@@ -795,13 +988,15 @@ fn served_rebuild_lock() -> &'static tokio::sync::Mutex<()> {
 /// has been sent. Left as it was while the Library is still loading or busy
 /// re-indexing.
 async fn refresh_served_files(state: &AppState) {
+    refresh_registered_feeds(state).await;
     if crate::commands::sharing::startup_library_loading() {
         return;
     }
     let _rebuilding = served_rebuild_lock().lock().await;
     let db = state.db.clone();
     let us = hex::encode(state.identity.ed25519_public_key);
-    let feeds = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, Vec<(String, String)>)>> {
+    type OwnServed = (String, Vec<[u8; 16]>, Vec<(String, String)>);
+    let feeds = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<OwnServed>> {
         let mut out = Vec::new();
         let mut lists_used = std::collections::HashSet::new();
         for feed in db.feeds_own()? {
@@ -810,14 +1005,14 @@ async fn refresh_served_files(state: &AppState) {
             let mut files = Vec::new();
             let mut lists = published.into_iter().chain(pending).filter_map(|hash| hex_to16(hash).ok()).collect::<Vec<_>>();
             lists.dedup();
-            for hash in lists {
-                lists_used.insert(hash);
-                match own_list_files(&hash, &us, &feed.salt) {
+            for hash in &lists {
+                lists_used.insert(*hash);
+                match own_list_files(hash, &us, &feed.salt) {
                     Some(listed) => files.extend(listed.iter().cloned()),
                     None => tracing::debug!("Feed {}: list {} is not served; its files are not either", feed.salt, hex::encode(hash)),
                 }
             }
-            out.push((feed.salt, files));
+            out.push((feed.salt, lists, files));
         }
         own_list_files_cache().lock().retain(|hash, _| lists_used.contains(hash));
         Ok(out)
@@ -827,8 +1022,25 @@ async fn refresh_served_files(state: &AppState) {
     let publisher = state.identity.ed25519_public_key;
     let Ok(index) = state.local_index.try_read() else { return };
     let mut served = HashMap::new();
-    for (salt, files) in &feeds {
+    for (salt, lists, files) in &feeds {
         let Ok(salt) = hex_to16(salt) else { continue };
+        // The list itself, for a follower who reached us through the
+        // rendezvous server rather than a source record.
+        for hash in lists {
+            let Some(share) = feed_files::hidden_share(hash) else { continue };
+            let (Ok(digest), Some(folder)) = (hex_to32(&share.ember_file_hash), share.path.parent()) else { continue };
+            let folder = folder.to_path_buf();
+            let (id, entry) = crate::network::feed_direct::served_list_entry(
+                &publisher,
+                &salt,
+                hash,
+                digest,
+                share.path.clone(),
+                share.size,
+                folder,
+            );
+            served.insert(id, entry);
+        }
         for (ed2k_hex, blake3) in files {
             let (Some(file), Ok(ed2k), Ok(digest)) = (index.get_by_hash(ed2k_hex), hex_to16(ed2k_hex), hex_to32(blake3)) else {
                 continue;
@@ -1429,6 +1641,12 @@ pub struct FeedActivity {
     /// When the next fetch of its list may start, after one gave up; 0 if
     /// none did.
     pub retry_at: i64,
+    /// Its last fetch gave up without finding anyone holding its list, its
+    /// publisher included, and none has found anyone since.
+    pub unsourced: bool,
+    /// Its publisher is being reached through the rendezvous server for its
+    /// list, as no source record names one.
+    pub reaching: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1454,6 +1672,8 @@ fn activity_of(feed: &FollowedFeed) -> FeedActivity {
         too_large: too_large().lock().contains(&key),
         fetching,
         retry_at: gave_up().lock().get(&key).map_or(0, |at| at + FETCH_RETRY_SECS),
+        unsourced: unsourced().lock().contains(&key),
+        reaching: reaching().lock().0.contains(&key),
     }
 }
 
@@ -1521,6 +1741,13 @@ pub async fn refresh_feed(
         return Err(coded("feeds_not_found", "That feed could not be found"));
     }
     let outcome = look_up_head(&app, &state, &publisher, &salt).await;
+    let key = (publisher.clone(), salt.clone());
+    // Nobody had its list last time: reach its publisher at once, beside
+    // the fetch Retry starts.
+    if unsourced().lock().contains(&key) {
+        reaching().lock().1.remove(&key);
+        tauri::async_runtime::spawn(reach_publisher(app.clone(), publisher.clone(), salt.clone()));
+    }
     if outcome != LookupOutcome::Updated {
         gave_up().lock().remove(&(publisher.clone(), salt.clone()));
         // A list that did not match its head is fetched once more, from the
@@ -1624,6 +1851,8 @@ pub async fn get_feed_items(
     // space says so rather than nothing.
     let mut room = if feed.auto_download { auto_download_room(&state).await } else { u64::MAX };
     mark("free space", &mut at);
+    let spam = spam_items(&state, items.iter().map(|item| &item.item)).await;
+    mark("spam filter", &mut at);
     let elapsed = started.elapsed();
     if elapsed >= Duration::from_secs(1) {
         let phases: Vec<String> = phases.iter().map(|(phase, ms)| format!("{phase} {ms} ms")).collect();
@@ -1687,10 +1916,12 @@ pub async fn get_feed_items(
                 })
                 .map(|(_, _, _, transfer)| transfer.clone());
             let elsewhere = copy_elsewhere.filter(|_| status == ItemStatus::Elsewhere);
+            let is_spam = spam.contains(&hash);
             // In the order a pass takes them, each counted off the 24-hour
             // cap as it would be started.
             let held = if status == ItemStatus::None && auto_takes(&feed, &item) {
                 match auto_choice(&feed, &item.item, spent, room, false) {
+                    AutoChoice::Start if is_spam => Some("spam"),
                     AutoChoice::Start => {
                         spent = spent.saturating_add(item.item.size);
                         room = room.saturating_sub(size);
@@ -1704,6 +1935,7 @@ pub async fn get_feed_items(
             };
             FollowedItemInfo {
                 risky: auto_download_refuses(&item.item.name),
+                spam: is_spam,
                 status,
                 progress,
                 held,
@@ -1850,11 +2082,15 @@ pub struct FollowedItemInfo {
     /// A type that can run code or change settings, which automatic
     /// downloads never take: the page asks before downloading it.
     pub risky: bool,
+    /// The spam filter takes it for spam (see [`spam_items`]): shown as such,
+    /// and never downloaded automatically.
+    pub spam: bool,
     pub status: ItemStatus,
     /// Of a download on its way, 0 to 100.
     pub progress: f64,
     /// Why auto-download has not started it: `risky`, `too_large`,
-    /// `day_limit` or `disk` (too little free space, or none could be read).
+    /// `day_limit`, `disk` (too little free space, or none could be read) or
+    /// `spam`.
     pub held: Option<&'static str>,
     /// Its download, while it is in the transfer list.
     pub transfer: Option<ItemTransfer>,
@@ -2145,13 +2381,67 @@ fn spawn_hold_watcher(app: tauri::AppHandle) {
         loop {
             tick.tick().await;
             if let Some(state) = app.try_state::<AppState>() {
-                watch_holds(&state).await;
+                watch_holds(&app, &state).await;
             }
         }
     });
 }
 
-async fn watch_holds(state: &AppState) {
+/// How long a feed download may find no source before its publisher is
+/// reached by a hole punch, past its hold and the lookup that ended it.
+const ITEM_REACH_AFTER: Duration = Duration::from_secs(90);
+/// How soon one publisher is punched again for its items.
+const ITEM_REACH_RETRY: Duration = Duration::from_secs(10 * 60);
+
+/// When each publisher was last punched for its items, by key.
+fn item_reaches() -> &'static parking_lot::Mutex<HashMap<[u8; 32], Instant>> {
+    static REACHES: std::sync::OnceLock<parking_lot::Mutex<HashMap<[u8; 32], Instant>>> = std::sync::OnceLock::new();
+    REACHES.get_or_init(Default::default)
+}
+
+/// Whether the publisher with `key` may be punched for its items now, which
+/// marks it as punched.
+fn item_reach_due(key: &[u8; 32]) -> bool {
+    let mut reaches = item_reaches().lock();
+    reaches.retain(|_, at| at.elapsed() < ITEM_REACH_RETRY);
+    if reaches.contains_key(key) {
+        return false;
+    }
+    reaches.insert(*key, Instant::now());
+    true
+}
+
+/// Reach the publisher with `key` by a hole punch, through the feed `salt`'s
+/// presence, and stream every download of its feeds that has no source from
+/// it (see `network::feed_direct::punched`).
+async fn reach_for_items(app: tauri::AppHandle, key: [u8; 32], salt: [u8; 16]) {
+    let Some(state) = app.try_state::<AppState>() else {
+        item_reaches().lock().remove(&key);
+        return;
+    };
+    let Some(network) = reach_network(&state).await else {
+        // Nothing was tried: the next tick may, once we are registered.
+        item_reaches().lock().remove(&key);
+        tracing::debug!("feed {}: its publisher cannot be punched for its files: we are not on the rendezvous server", hex::encode(salt));
+        return;
+    };
+    let ctx = crate::network::feed_reach::ReachContext::new(
+        network,
+        state.identity.ember_hash,
+        state.identity.ed25519_public_key,
+        state.identity.ed25519_secret_key,
+    );
+    match tokio::time::timeout(REACH_MAX, crate::network::feed_reach::punch_for_items(&ctx, &key, &salt)).await {
+        Ok(Ok((addr, endpoint))) => {
+            tracing::info!("feed {}: reached its publisher by a hole punch for its files", hex::encode(salt));
+            crate::network::feed_direct::punched(&key, addr, endpoint);
+        }
+        Ok(Err(e)) => tracing::info!("feed {}: could not punch through to its publisher for its files: {e}", hex::encode(salt)),
+        Err(_) => tracing::info!("feed {}: punching through to its publisher for its files ran out of time", hex::encode(salt)),
+    }
+}
+
+async fn watch_holds(app: &tauri::AppHandle, state: &AppState) {
     use crate::network::feed_direct::{self, Poll};
     use TransferStatus as S;
     let watched = feed_direct::watched();
@@ -2166,7 +2456,7 @@ async fn watch_holds(state: &AppState) {
                 let active = manager.active.contains_key(&id);
                 let row = manager
                     .get_transfer(&id)
-                    .map(|t| (t.transferred, t.status.clone(), t.file_hash.clone(), t.total_size, active));
+                    .map(|t| (t.transferred, t.status.clone(), t.file_hash.clone(), t.total_size, active, t.active_sources));
                 (id, begun, row)
             })
             .collect()
@@ -2180,9 +2470,20 @@ async fn watch_holds(state: &AppState) {
             }
             continue;
         }
-        let Some((transferred, status, hash, size, active)) = row else { continue };
+        let Some((transferred, status, hash, size, active, sending)) = row else { continue };
         // Waiting for a download slot is not the publisher's to answer for.
         let counting = active && !matches!(status, S::Paused | S::Stopped);
+        // Nobody sending, and its publisher placed no record the stream
+        // could reach: reach the publisher by a hole punch instead. Sources
+        // known but not sending, as a firewalled record's callback that never
+        // comes, do not hold that off.
+        if counting && sending == 0 && now.saturating_duration_since(begun) >= ITEM_REACH_AFTER {
+            if let Some((key, salt)) = feed_direct::needs_publisher(&transfer_id) {
+                if item_reach_due(&key) {
+                    tauri::async_runtime::spawn(reach_for_items(app.clone(), key, salt));
+                }
+            }
+        }
         // Watched on once let go, for as long as the download lasts: its
         // publisher's stream outlives the hold, and is forgotten with it.
         if let Poll::Released(why) = feed_direct::poll(&transfer_id, transferred, counting, now) {
@@ -2423,6 +2724,7 @@ pub async fn unfollow_feed(
     push_gates().lock().remove(&key);
     missed_lookups().lock().remove(&key);
     gave_up().lock().remove(&key);
+    unsourced().lock().remove(&key);
     too_large().lock().remove(&key);
     listing_fallbacks().lock().remove(&key);
     let dir = feeds_dir(&app);
@@ -2893,12 +3195,23 @@ struct Fetching {
     bytes: u64,
     /// Sources it has now, sending or queued at.
     sources: u32,
+    /// Whether it ever had one.
+    sourced: bool,
 }
 
 impl Fetching {
     fn new(publisher: &str, salt: &str, sequence: i64) -> Self {
         let now = Instant::now();
-        Self { publisher: publisher.into(), salt: salt.into(), sequence, started: now, progressed: now, bytes: 0, sources: 0 }
+        Self {
+            publisher: publisher.into(),
+            salt: salt.into(),
+            sequence,
+            started: now,
+            progressed: now,
+            bytes: 0,
+            sources: 0,
+            sourced: false,
+        }
     }
 
     /// Note what its transfer holds now: `bytes` on disk and `sources`.
@@ -2908,6 +3221,7 @@ impl Fetching {
         }
         self.bytes = self.bytes.max(bytes);
         self.sources = sources;
+        self.sourced |= sources > 0;
     }
 
     /// Given up: no byte and no source for [`FETCH_TIMEOUT`], or running
@@ -2926,6 +3240,145 @@ fn fetching() -> &'static parking_lot::Mutex<HashMap<String, Fetching>> {
 fn gave_up() -> &'static parking_lot::Mutex<HashMap<(String, String), i64>> {
     static GAVE_UP: std::sync::OnceLock<parking_lot::Mutex<HashMap<(String, String), i64>>> = std::sync::OnceLock::new();
     GAVE_UP.get_or_init(Default::default)
+}
+
+/// How long a list fetch may find no source before its publisher is reached
+/// through the rendezvous server instead (see `network::feed_reach`).
+const REACH_AFTER: Duration = Duration::from_secs(3 * 60);
+/// How long after one such attempt the next may start, unless the user asks.
+const REACH_RETRY: Duration = Duration::from_secs(20 * 60);
+/// How long one may run in all: a lookup, a direct dial, a punch and a relay.
+const REACH_MAX: Duration = Duration::from_secs(4 * 60);
+
+/// Feeds whose publisher is being reached now, and when each last was.
+fn reaching() -> &'static parking_lot::Mutex<(std::collections::HashSet<(String, String)>, HashMap<(String, String), Instant>)> {
+    type Reaching = (std::collections::HashSet<(String, String)>, HashMap<(String, String), Instant>);
+    static REACHING: std::sync::OnceLock<parking_lot::Mutex<Reaching>> = std::sync::OnceLock::new();
+    REACHING.get_or_init(Default::default)
+}
+
+/// Whether the publisher of `(publisher, salt)` may be reached now: none
+/// running for it, and the last at least [`REACH_RETRY`] ago.
+fn reach_due(publisher: &str, salt: &str) -> bool {
+    let key = (publisher.to_string(), salt.to_string());
+    let reaching = reaching().lock();
+    !reaching.0.contains(&key) && reaching.1.get(&key).is_none_or(|at| at.elapsed() >= REACH_RETRY)
+}
+
+/// What the network task holds for reaching a publisher, or `None` while it
+/// is not registered on the rendezvous server or does not answer.
+async fn reach_network(state: &AppState) -> Option<crate::network::feed_reach::NetworkReach> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    bounded_send(&state.network_tx, NetworkCommand::FeedReachNetwork { tx }).await.ok()?;
+    tokio::time::timeout(crate::commands::errors::CMD_REPLY_TIMEOUT, rx).await.ok()?.ok()?
+}
+
+/// Takes a feed off [`reaching`]'s running set when its attempt ends.
+struct ReachRunning((String, String));
+
+impl Drop for ReachRunning {
+    fn drop(&mut self) {
+        reaching().lock().0.remove(&self.0);
+    }
+}
+
+/// Reach the publisher of a followed feed through the rendezvous server for
+/// the list its head names, and take it up as a fetched one would be.
+async fn reach_publisher(app: tauri::AppHandle, publisher: String, salt: String) {
+    let key = (publisher.clone(), salt.clone());
+    if !reaching().lock().0.insert(key.clone()) {
+        return;
+    }
+    let _running = ReachRunning(key.clone());
+    let Some(state) = app.try_state::<AppState>() else { return };
+    let db = state.db.clone();
+    let (key_pub, key_salt) = (publisher.clone(), salt.clone());
+    let Ok(Ok(Some(feed))) = tokio::task::spawn_blocking(move || db.feed_followed(&key_pub, &key_salt)).await else {
+        return;
+    };
+    if !list_owed(&feed) {
+        return;
+    }
+    let (Ok(publisher_key), Ok(salt_bytes), Ok(ed2k), Ok(blake3)) =
+        (hex_to32(&feed.publisher), hex_to16(&feed.salt), hex_to16(&feed.list_ed2k), hex_to32(&feed.list_blake3))
+    else {
+        return;
+    };
+    let target = crate::network::feed_reach::ListTarget {
+        publisher: publisher_key,
+        salt: salt_bytes,
+        ed2k,
+        blake3,
+        size: feed.list_size.max(0) as u64,
+    };
+    let Some(network) = reach_network(&state).await else {
+        tracing::debug!("feed {}: its publisher cannot be reached through the rendezvous server: we are not registered there", feed.salt);
+        return;
+    };
+    // Spent only on an attempt that reaches the network.
+    reaching().lock().1.insert(key, Instant::now());
+    let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": feed.publisher, "salt": feed.salt }));
+    let ctx = crate::network::feed_reach::ReachContext::new(
+        network,
+        state.identity.ember_hash,
+        state.identity.ed25519_public_key,
+        state.identity.ed25519_secret_key,
+    );
+    match tokio::time::timeout(REACH_MAX, crate::network::feed_reach::fetch_list(&ctx, &target)).await {
+        Ok(Ok((bytes, by))) => {
+            tracing::info!("feed {}: fetched its list from its publisher through the rendezvous server ({by:?})", feed.salt);
+            take_reached_list(&app, &state, &feed, bytes).await;
+        }
+        Ok(Err(e)) => tracing::info!("feed {}: could not reach its publisher through the rendezvous server: {e}", feed.salt),
+        Err(_) => tracing::info!("feed {}: reaching its publisher through the rendezvous server ran out of time", feed.salt),
+    }
+    let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": feed.publisher, "salt": feed.salt }));
+}
+
+/// Take up a list fetched from its publisher by [`reach_publisher`] for
+/// `reached`'s head: in place of the fetch still looking for sources, as
+/// that fetch's own completion would be.
+async fn take_reached_list(app: &tauri::AppHandle, state: &AppState, reached: &FollowedFeed, bytes: Vec<u8>) {
+    let followed = followed_lock().lock().await;
+    let db = state.db.clone();
+    let (key_pub, key_salt) = (reached.publisher.clone(), reached.salt.clone());
+    let Ok(Ok(Some(feed))) = tokio::task::spawn_blocking(move || db.feed_followed(&key_pub, &key_salt)).await else {
+        return;
+    };
+    if feed.sequence != reached.sequence || !list_owed(&feed) {
+        return;
+    }
+    for id in fetches_for(&feed.publisher, &feed.salt) {
+        cancel_fetch(state, &id).await;
+    }
+    let dest = followed_list_path(&feeds_dir(app), &feed.publisher, &feed.salt, feed.sequence);
+    let path = dest.clone();
+    let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &bytes)
+    })
+    .await;
+    if !matches!(written, Ok(Ok(()))) {
+        tracing::warn!("feed {}: could not save the list its publisher sent", feed.salt);
+        return;
+    }
+    gave_up().lock().remove(&(feed.publisher.clone(), feed.salt.clone()));
+    let list = take_list_held(app, state, feed, dest).await;
+    drop(followed);
+    if let Some(list) = list {
+        after_list(app, state, list).await;
+    }
+}
+
+/// Feeds whose last fetch of their list gave up without finding anyone
+/// holding it, the publisher included, until a fetch finds someone: what
+/// the page says while their lists cannot be had.
+fn unsourced() -> &'static parking_lot::Mutex<std::collections::HashSet<(String, String)>> {
+    static UNSOURCED: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<(String, String)>>> =
+        std::sync::OnceLock::new();
+    UNSOURCED.get_or_init(Default::default)
 }
 
 fn fetches_for(publisher: &str, salt: &str) -> Vec<String> {
@@ -3283,6 +3736,8 @@ async fn take_list_held(app: &tauri::AppHandle, state: &AppState, feed: Followed
     let db = state.db.clone();
     let task_feed = feed.clone();
     let now = chrono::Utc::now().timestamp();
+    // The list came from someone, or was held already.
+    unsourced().lock().remove(&(feed.publisher.clone(), feed.salt.clone()));
     let took = tokio::task::spawn_blocking(move || {
         let feed = task_feed;
         let owner = followed_owner(&feed.publisher, &feed.salt);
@@ -3412,6 +3867,184 @@ fn auto_download_refuses(name: &str) -> bool {
         || crate::security::is_dangerous_extension(name)
 }
 
+/// Of `items`, the eD2K hashes (lowercase) the spam filter takes for spam,
+/// each scored as a search result is from what a feed says of a file: its
+/// name and size, against the user's own verdicts (hashes marked spam, names
+/// like those) and the name checks. A feed is one publisher's list, not a
+/// result set, so the signals drawn from many results together do not apply,
+/// and a file in the Library is never spam. Empty with the filter off.
+async fn spam_items<'a>(
+    state: &AppState,
+    items: impl IntoIterator<Item = &'a FeedItem>,
+) -> std::collections::HashSet<String> {
+    use crate::search::spam::SpamFilterProfile;
+    let (enabled, profile) = {
+        let config = state.config.read().await;
+        (
+            config.settings.spam_filter_enabled,
+            SpamFilterProfile::from_setting(&config.settings.spam_filter_profile),
+        )
+    };
+    if !enabled {
+        return Default::default();
+    }
+    let results: Vec<crate::types::SearchResult> = items.into_iter().map(feed_item_result).collect();
+    // A scan holds the index through a whole re-index, and the page asks
+    // every few seconds: a busy index is not waited for.
+    let owned: Option<Vec<String>> = state.local_index.try_read().ok().map(|index| {
+        results
+            .iter()
+            .map(|result| result.file.hash.clone())
+            .filter(|hash| index.get_by_hash(hash).is_some())
+            .collect()
+    });
+    let filter = state.spam_filter.read().await;
+    feed_spam_verdict(&filter, profile, &results, owned, spam_verdicts())
+}
+
+/// [`spam_items`] once the Library is asked: `owned` is which of `results`
+/// it holds, or `None` while the index is busy.
+///
+/// The page asks every few seconds, and scoring compares each name with
+/// every name the user marked spam: a feed's verdicts are kept until its
+/// items, the Library's copies of them, the filter or the profile change.
+/// While the index is busy, the last verdict on the same items that knew
+/// the Library stands, or after a filter change the Library's copies last
+/// known for them, so the user's own files keep their exemption.
+fn feed_spam_verdict(
+    filter: &crate::search::spam::SpamFilter,
+    profile: crate::search::spam::SpamFilterProfile,
+    results: &[crate::types::SearchResult],
+    owned: Option<Vec<String>>,
+    verdicts: &parking_lot::Mutex<std::collections::VecDeque<SpamVerdict>>,
+) -> std::collections::HashSet<String> {
+    use crate::search::spam::{BatchSpamContext, CommunityRating, SpamKeywords};
+    let items = {
+        let mut hasher = blake3::Hasher::new();
+        for result in results {
+            hasher.update(result.file.hash.as_bytes());
+            hasher.update(&result.file.size.to_le_bytes());
+            hasher.update(&(result.file.name.len() as u64).to_le_bytes());
+            hasher.update(result.file.name.as_bytes());
+        }
+        *hasher.finalize().as_bytes()
+    };
+    let scored = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&filter.generation().to_le_bytes());
+        hasher.update(format!("{profile:?}").as_bytes());
+        hasher.update(&items);
+        *hasher.finalize().as_bytes()
+    };
+    let mut owned = owned;
+    {
+        let held = verdicts.lock();
+        let same = || held.iter().rev().filter(move |verdict| verdict.scored == scored);
+        let hit = match &owned {
+            Some(owned) => same().find(|verdict| verdict.owned.as_ref() == Some(owned)),
+            None => same().find(|verdict| verdict.owned.is_some()).or_else(|| same().next()),
+        };
+        if let Some(hit) = hit {
+            return hit.spam.clone();
+        }
+        if owned.is_none() {
+            owned = held
+                .iter()
+                .rev()
+                .filter(|verdict| verdict.items == items)
+                .find_map(|verdict| verdict.owned.clone());
+        }
+    }
+    let batch = BatchSpamContext::for_owned_hashes(owned.clone().unwrap_or_default());
+    let keywords = SpamKeywords::new(&[]);
+    let spam: std::collections::HashSet<String> = results
+        .iter()
+        .filter(|result| {
+            filter
+                .explain_result_with_keywords(result, &keywords, None, profile, CommunityRating::default(), &batch)
+                .is_spam
+        })
+        .map(|result| result.file.hash.clone())
+        .collect();
+    let mut cache = verdicts.lock();
+    if cache.len() >= SPAM_VERDICTS_KEPT {
+        cache.pop_front();
+    }
+    cache.push_back(SpamVerdict { scored, items, owned, spam: spam.clone() });
+    spam
+}
+
+/// Verdict sets [`spam_items`] keeps: a few feeds' pages and passes at once.
+const SPAM_VERDICTS_KEPT: usize = 8;
+
+/// One scoring by [`feed_spam_verdict`]: what it was taken from (the items
+/// alone, and with the filter and profile), the Library copies it exempted
+/// (`None` when the index was busy and none were known), and its verdict.
+struct SpamVerdict {
+    scored: [u8; 32],
+    items: [u8; 32],
+    owned: Option<Vec<String>>,
+    spam: std::collections::HashSet<String>,
+}
+
+/// The verdicts of [`spam_items`]' last scorings.
+fn spam_verdicts() -> &'static parking_lot::Mutex<std::collections::VecDeque<SpamVerdict>> {
+    static VERDICTS: std::sync::OnceLock<parking_lot::Mutex<std::collections::VecDeque<SpamVerdict>>> =
+        std::sync::OnceLock::new();
+    VERDICTS.get_or_init(Default::default)
+}
+
+/// A feed item as the spam filter scores a search result: a file offered over
+/// Ember, with nothing known of it beyond its listing.
+fn feed_item_result(item: &FeedItem) -> crate::types::SearchResult {
+    let extension = Path::new(&item.name)
+        .extension()
+        .map(|extension| extension.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::types::SearchResult {
+        file: crate::types::FileInfo {
+            id: item.ed2k.to_ascii_lowercase(),
+            name: item.name.clone(),
+            path: String::new(),
+            size: u64::try_from(item.size).unwrap_or(0),
+            hash: item.ed2k.to_ascii_lowercase(),
+            aich_hash: item.aich.clone(),
+            ember_file_hash: item.blake3.clone(),
+            extension: extension.clone(),
+            modified_at: 0,
+            priority: "normal".to_string(),
+            requests: 0,
+            accepted: 0,
+            bytes_transferred: 0,
+            alltime_requests: 0,
+            alltime_accepted: 0,
+            alltime_transferred: 0,
+            complete_sources: 0,
+            folder: String::new(),
+            shared: false,
+            friends_only: false,
+            shared_kad: false,
+            shared_ed2k: false,
+            shared_ember: false,
+        },
+        peer_id: String::new(),
+        peer_name: String::new(),
+        availability: 1,
+        file_type: crate::search::index::infer_file_type(&extension),
+        source_addresses: Vec::new(),
+        rating: None,
+        comment: None,
+        media: None,
+        spam_rating: 0,
+        is_spam: false,
+        clean_name: String::new(),
+        result_origin: crate::search::merge::ORIGIN_EMBER.to_string(),
+        origin_server_ip: None,
+        spam_reasons: Vec::new(),
+        spam_reason_details: Vec::new(),
+    }
+}
+
 /// What auto-download does with one item of a pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutoChoice {
@@ -3523,8 +4156,13 @@ async fn auto_download(app: &tauri::AppHandle, state: &AppState, publisher: &str
     // Measured once: what this pass starts is not on disk yet, so it is
     // counted off as it goes.
     let mut room = auto_download_room(state).await;
+    let spam = spam_items(state, added).await;
     let mut started = 0;
     for item in added {
+        // Shown on the page as held for it, and started only by hand.
+        if spam.contains(&item.ed2k.to_ascii_lowercase()) {
+            continue;
+        }
         // Held already, or on its way. A feed's files are in no library, so
         // one this feed started before counts as held. Not looked for, under
         // two locks, when its type or a cap holds it back: `auto_choice`
@@ -4065,7 +4703,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
             })
             .collect()
     };
-    let stale: Vec<(String, Fetching)> = {
+    let (stale, sourced, sourceless): (Vec<(String, Fetching)>, Vec<(String, String)>, Vec<(String, String)>) = {
         let mut fetching = fetching().lock();
         let instant = Instant::now();
         for (id, fetch) in fetching.iter_mut() {
@@ -4073,8 +4711,27 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
                 fetch.note(*bytes, *sources, instant);
             }
         }
-        fetching.iter().filter(|(_, f)| f.stalled(instant)).map(|(id, f)| (id.clone(), f.clone())).collect()
+        (
+            fetching.iter().filter(|(_, f)| f.stalled(instant)).map(|(id, f)| (id.clone(), f.clone())).collect(),
+            fetching.values().filter(|f| f.sourced).map(|f| (f.publisher.clone(), f.salt.clone())).collect(),
+            fetching
+                .values()
+                .filter(|f| !f.sourced && f.started.elapsed() >= REACH_AFTER)
+                .map(|f| (f.publisher.clone(), f.salt.clone()))
+                .collect(),
+        )
     };
+    {
+        let mut unsourced = unsourced().lock();
+        for key in &sourced {
+            unsourced.remove(key);
+        }
+    }
+    for (publisher, salt) in sourceless {
+        if reach_due(&publisher, &salt) {
+            tauri::async_runtime::spawn(reach_publisher(app.clone(), publisher, salt));
+        }
+    }
     for (id, fetch) in stale {
         tracing::info!(
             "feed {}: gave up fetching its list after {} min ({} bytes, no source for {} min)",
@@ -4084,7 +4741,11 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
             fetch.progressed.elapsed().as_secs() / 60
         );
         cancel_fetch(state, &id).await;
-        gave_up().lock().insert((fetch.publisher.clone(), fetch.salt.clone()), now);
+        let key = (fetch.publisher.clone(), fetch.salt.clone());
+        if !fetch.sourced {
+            unsourced().lock().insert(key.clone());
+        }
+        gave_up().lock().insert(key, now);
         let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": fetch.publisher, "salt": fetch.salt }));
     }
     feed_files::forget_cancelled_fetches(CANCELLED_FETCH_GRACE);
@@ -4095,6 +4756,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
         return;
     }
     send_due_withdrawals(state, now).await;
+    resend_changed_listings(state, now).await;
     // Deleted feeds' tombstones, off the tick: each waits on the network.
     if !sending_tombstones().swap(true, std::sync::atomic::Ordering::AcqRel) {
         let app = app.clone();
@@ -4313,6 +4975,170 @@ mod tests {
     }
 
     const ROOM: u64 = u64::MAX;
+
+    /// An item named `{tag}.flac`, its eD2K hash `tag` over and over.
+    fn listed(tag: &str) -> FeedItem {
+        FeedItem { ed2k: tag.repeat(32), ..item(&format!("{tag}.flac"), 1) }
+    }
+
+    fn in_library(tag: &str) -> (String, Result<FeedItem, String>) {
+        (listed(tag).ed2k, Ok(listed(tag)))
+    }
+
+    fn names(items: &[FeedItem]) -> Vec<&str> {
+        items.iter().map(|item| item.name.as_str()).collect()
+    }
+
+    /// "Add to feed" appends the files the feed does not list, in the order
+    /// given, counts those it does, and names those the Library could not
+    /// give; past 2,000 items it adds nothing.
+    #[test]
+    fn adding_to_a_feed_appends_only_new_files_in_order() {
+        let mut items = vec![listed("a")];
+        let result = append_items(&mut items, vec![in_library("b"), in_library("a"), ("c".repeat(32), Err("c.mkv".into())), in_library("d")]).unwrap();
+        assert_eq!(result, AddedFeedItems { added: 2, already: 1, dropped: vec!["c.mkv".into()] });
+        assert_eq!(names(&items), ["a.flac", "b.flac", "d.flac"]);
+
+        let mut full: Vec<FeedItem> =
+            (0..FEED_ITEMS_MAX - 1).map(|i| FeedItem { ed2k: format!("{i:032x}"), ..item("x", 1) }).collect();
+        assert!(append_items(&mut full, vec![in_library("b"), in_library("d")]).is_err());
+        assert_eq!(full.len(), FEED_ITEMS_MAX - 1, "nothing added");
+        let result = append_items(&mut full, vec![in_library("b")]).unwrap();
+        assert_eq!((result.added, full.len()), (1, FEED_ITEMS_MAX), "up to the cap");
+    }
+
+    /// A Save from the editor keeps a file "Add to feed" put in while the
+    /// save read the Library, and still leaves out what the editor took out.
+    #[test]
+    fn a_save_keeps_a_file_added_while_it_ran() {
+        let path = std::env::temp_dir().join(format!("ember-feed-add-{}-{}.db", std::process::id(), rand::random::<u64>()));
+        let db = crate::storage::database::Database::open_at(&path).expect("open db");
+        let salt = "00".repeat(16);
+        assert!(db.feed_own_create(&salt, "T", "", false, 0, 10).unwrap());
+        db.feed_own_set_items(&salt, &[listed("a"), listed("b")]).unwrap();
+
+        // The save reads what the feed holds, then an Add lands.
+        let held: HashMap<String, String> =
+            db.feed_own_items(&salt).unwrap().into_iter().map(|item| (item.ed2k, item.name)).collect();
+        let mut items = db.feed_own_items(&salt).unwrap();
+        append_items(&mut items, vec![in_library("c")]).unwrap();
+        db.feed_own_set_items(&salt, &items).unwrap();
+
+        // The editor's list, which took "a" out and never had "c".
+        let out = with_added(vec![listed("b")], &held, db.feed_own_items(&salt).unwrap());
+        db.feed_own_set_items(&salt, &out).unwrap();
+        assert_eq!(names(&db.feed_own_items(&salt).unwrap()), ["b.flac", "c.flac"]);
+        assert_eq!(names(&with_added(vec![listed("c"), listed("b")], &held, out)), ["c.flac", "b.flac"], "not twice");
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A feed item is scored as a search result for the same file is: one
+    /// whose hash the user marked spam is spam in a feed too, and an
+    /// ordinary file beside it is not.
+    #[test]
+    fn a_feed_item_the_user_marked_spam_scores_as_spam() {
+        use crate::search::spam::{BatchSpamContext, CommunityRating, SpamFilter, SpamFilterProfile, SpamKeywords};
+        let dir = std::env::temp_dir().join(format!("ember-feed-spam-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut filter = SpamFilter::load(&dir);
+        let fake = FeedItem { ed2k: "a".repeat(32), ..item("Album.2026.FLAC.zip", 300) };
+        let honest = FeedItem { ed2k: "b".repeat(32), ..item("holiday photos.zip", 40) };
+        filter.mark_spam(&feed_item_result(&fake), &[], None);
+
+        let score = |item: &FeedItem| {
+            filter
+                .explain_result_with_keywords(
+                    &feed_item_result(item),
+                    &SpamKeywords::new(&[]),
+                    None,
+                    SpamFilterProfile::Balanced,
+                    CommunityRating::default(),
+                    &BatchSpamContext::default(),
+                )
+                .is_spam
+        };
+        assert!(score(&fake), "the hash the user marked");
+        assert!(!score(&honest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A feed's verdict is asked for again and again: it is kept while what it
+    /// was taken from holds, and a Mark spam, which moves the filter on, has
+    /// it scored again.
+    #[test]
+    fn a_feed_spam_verdict_is_kept_until_the_filter_changes() {
+        use crate::search::spam::{SpamFilter, SpamFilterProfile};
+        let dir = std::env::temp_dir().join(format!("ember-feed-spam-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut filter = SpamFilter::load(&dir);
+        let fake = "a".repeat(32);
+        let results = vec![feed_item_result(&FeedItem { ed2k: fake.clone(), ..item("Album.2026.FLAC.zip", 300) })];
+        let verdicts = parking_lot::Mutex::new(std::collections::VecDeque::new());
+        let verdict = |filter: &SpamFilter| {
+            feed_spam_verdict(filter, SpamFilterProfile::Balanced, &results, Some(Vec::new()), &verdicts)
+        };
+        assert!(verdict(&filter).is_empty());
+        assert!(verdict(&filter).is_empty());
+        assert_eq!(verdicts.lock().len(), 1, "asked again, the kept verdict answers");
+        filter.mark_spam(&results[0], &[], None);
+        assert!(verdict(&filter).contains(&fake), "scored again after the mark");
+        assert_eq!(verdicts.lock().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While the Library index is busy, a file the Library holds keeps the
+    /// exemption the last look at the Library gave it.
+    #[test]
+    fn a_busy_library_index_keeps_the_last_exemption() {
+        use crate::search::spam::{SpamFilter, SpamFilterProfile};
+        let dir = std::env::temp_dir().join(format!("ember-feed-spam-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut filter = SpamFilter::load(&dir);
+        let name = "Holiday Video Collection Uncut.avi";
+        filter.mark_spam(&feed_item_result(&FeedItem { ed2k: "a".repeat(32), ..item(name, 300) }), &[], None);
+        let held = "b".repeat(32);
+        let results = vec![feed_item_result(&FeedItem { ed2k: held.clone(), ..item(name, 300) })];
+        let verdicts = parking_lot::Mutex::new(std::collections::VecDeque::new());
+        let verdict = |owned: Option<Vec<String>>| {
+            feed_spam_verdict(&filter, SpamFilterProfile::Aggressive, &results, owned, &verdicts)
+        };
+        assert!(verdict(None).contains(&held), "busy, and the Library never seen: no exemption");
+        assert!(verdict(Some(vec![held.clone()])).is_empty(), "in the Library");
+        assert!(verdict(None).is_empty(), "busy: still exempt");
+        assert!(verdict(Some(Vec::new())).contains(&held), "gone from the Library");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Mark spam made while the Library index is busy does not take the
+    /// exemption from a file the Library was last seen to hold.
+    #[test]
+    fn a_filter_change_while_the_index_is_busy_keeps_the_exemption() {
+        use crate::search::spam::{SpamFilter, SpamFilterProfile};
+        let dir = std::env::temp_dir().join(format!("ember-feed-spam-busy-change-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut filter = SpamFilter::load(&dir);
+        let name = "Holiday Video Collection Uncut.avi";
+        let held = "b".repeat(32);
+        let results = vec![feed_item_result(&FeedItem { ed2k: held.clone(), ..item(name, 300) })];
+        let verdicts = parking_lot::Mutex::new(std::collections::VecDeque::new());
+        let verdict = |filter: &SpamFilter, owned: Option<Vec<String>>| {
+            feed_spam_verdict(filter, SpamFilterProfile::Aggressive, &results, owned, &verdicts)
+        };
+        assert!(verdict(&filter, Some(vec![held.clone()])).is_empty(), "in the Library");
+        filter.mark_spam(&feed_item_result(&FeedItem { ed2k: "a".repeat(32), ..item(name, 300) }), &[], None);
+        assert!(verdict(&filter, None).is_empty(), "busy after the mark: still exempt");
+        assert!(verdict(&filter, None).is_empty(), "and on the next poll");
+        assert!(verdict(&filter, Some(Vec::new())).contains(&held), "gone from the Library");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn auto_download_keeps_to_its_caps_and_never_starts_a_program() {
@@ -4658,12 +5484,15 @@ mod tests {
         assert!(!fetch.stalled(start + FETCH_TIMEOUT - Duration::from_secs(1)));
         assert!(fetch.stalled(start + FETCH_TIMEOUT), "no byte and no source");
 
+        assert!(!fetch.sourced, "found nobody");
+
         let mut fetch = Fetching::new("p", "s", 1);
         let start = fetch.started;
         fetch.note(0, 1, start + FETCH_TIMEOUT - Duration::from_secs(1));
         assert!(!fetch.stalled(start + FETCH_TIMEOUT), "queued at a source");
         let later = start + FETCH_TIMEOUT * 2;
         fetch.note(500, 0, later);
+        assert!(fetch.sourced, "a source lost since was still found");
         assert!(!fetch.stalled(later + FETCH_TIMEOUT - Duration::from_secs(1)), "bytes came");
         fetch.note(400, 0, later + Duration::from_secs(60));
         assert_eq!(fetch.bytes, 500, "a part file read short is not a loss");

@@ -90,6 +90,8 @@ export interface ChannelMemberInfo {
   /** The language the member publishes, a code from `CHANNEL_LANGUAGES`;
    *  empty when they publish none or run a build without it. */
   language: string;
+  /** A second language they publish beside it; empty for none. */
+  language2: string;
 }
 
 /** The windows the roster's presence dots are drawn with.

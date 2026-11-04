@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { get } from 'svelte/store';
 import {
   addActionToast, addToast, clearAllToasts, flushToastActions, onPendingUndoChange, pauseToastDismiss,
-  removeToast, resumeToastDismiss, runLatestUndo, toasts,
+  reloadAfterToastActions, removeToast, resumeToastDismiss, runLatestUndo, setHiddenToastAreas, toasts, toastsFor,
 } from './toast';
+import { hiddenToastAreas } from './settings';
+import type { AppSettings } from '$lib/types';
 
 describe('action toasts', () => {
   beforeEach(() => {
@@ -108,6 +110,83 @@ describe('action toasts', () => {
     expect(get(toasts).some((t) => t.message === 'consent')).toBe(true);
   });
 
+  it('restarts an identical toast instead of stacking a copy', () => {
+    const first = addToast('warning', 'Disk full', 1000);
+    vi.advanceTimersByTime(800);
+    expect(addToast('warning', 'Disk full', 1000)).toBe(first);
+    expect(get(toasts)).toHaveLength(1);
+    vi.advanceTimersByTime(800);
+    expect(get(toasts)).toHaveLength(1);
+    vi.advanceTimersByTime(200);
+    expect(get(toasts)).toHaveLength(0);
+  });
+
+  it('counts a repeat on the toast it folds into, so it can be shown and announced again', () => {
+    const first = addToast('error', 'Failed to mark spam');
+    expect(get(toasts)[0].repeats).toBeUndefined();
+    addToast('error', 'Failed to mark spam');
+    addToast('error', 'Failed to mark spam');
+    expect(get(toasts)).toEqual([expect.objectContaining({ id: first, repeats: 2 })]);
+  });
+
+  it('reloads only once what an Undo held back has been sent', async () => {
+    let land!: () => void;
+    const commit = new Promise<void>((resolve) => { land = resolve; });
+    const onExpire = vi.fn(() => commit);
+    addActionToast('info', 'Ignored', { label: 'Undo', run: vi.fn(), undo: true }, onExpire);
+    const reload = vi.fn();
+    reloadAfterToastActions(reload);
+    expect(onExpire).toHaveBeenCalledTimes(1);
+    await Promise.resolve();
+    expect(reload).not.toHaveBeenCalled();
+    land();
+    await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+  });
+
+  it('still flushes the rest and reloads when an expiry throws', async () => {
+    const pending: boolean[] = [];
+    onPendingUndoChange((p) => {
+      pending.push(p);
+    });
+    const throws = vi.fn(() => {
+      throw new Error('boom');
+    });
+    const after = vi.fn();
+    addActionToast('info', 'Ignored', { label: 'Undo', run: vi.fn(), undo: true }, throws);
+    addActionToast('info', 'Removed', { label: 'Undo', run: vi.fn(), undo: true }, after);
+    const reload = vi.fn();
+    reloadAfterToastActions(reload);
+    expect(throws).toHaveBeenCalledTimes(1);
+    expect(after).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
+    expect(pending.at(-1)).toBe(false);
+    onPendingUndoChange(null);
+  });
+
+  it('keeps toasts that differ in type or message apart', () => {
+    addToast('warning', 'Disk full');
+    addToast('error', 'Disk full');
+    addToast('warning', 'Disk nearly full');
+    expect(get(toasts)).toHaveLength(3);
+  });
+
+  it('never folds a repeat into a toast offering an action', () => {
+    const onExpire = vi.fn();
+    addActionToast('info', 'Removed', { label: 'Undo', run: vi.fn() }, onExpire);
+    addToast('info', 'Removed');
+    expect(get(toasts)).toHaveLength(2);
+    expect(onExpire).not.toHaveBeenCalled();
+  });
+
+  it('keeps a sticky toast sticky when it repeats, and a sticky repeat pins a timed one', () => {
+    addToast('warning', 'Folder unavailable', 0);
+    addToast('warning', 'Folder unavailable', 1000);
+    addToast('info', 'Copied', 1000);
+    addToast('info', 'Copied', 0);
+    vi.advanceTimersByTime(60_000);
+    expect(get(toasts).map((t) => t.message)).toEqual(['Folder unavailable', 'Copied']);
+  });
+
   it('holds the expiry while the stack is hovered', () => {
     const onExpire = vi.fn();
     addActionToast('info', 'Cancelled', { label: 'Undo', run: vi.fn() }, onExpire, 1000);
@@ -118,5 +197,61 @@ describe('action toasts', () => {
     // A toast whose time ran out while hovered keeps a short floor to be read.
     vi.advanceTimersByTime(1200);
     expect(onExpire).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('toast areas', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    setHiddenToastAreas([]);
+    clearAllToasts();
+    vi.useRealTimers();
+  });
+
+  it('drops a hidden area’s confirmations and keeps everything else', () => {
+    setHiddenToastAreas(['search']);
+    const search = toastsFor('search');
+    const onExpire = vi.fn();
+    search.toastSuccess('Download queued');
+    search.toast('Already in your library');
+    expect(search.addToast('info', 'Copied')).toBe(-1);
+    search.toastWarning('Enter a search');
+    search.toastError('Search failed');
+    search.addToast('info', 'Pinned notice', 0);
+    search.addActionToast('info', 'Marked as spam', { label: 'Undo', run: vi.fn() }, onExpire);
+    toastsFor('downloads').toastSuccess('Download started');
+    expect(get(toasts).map((t) => t.message)).toEqual([
+      'Enter a search',
+      'Search failed',
+      'Pinned notice',
+      'Marked as spam',
+      'Download started',
+    ]);
+  });
+
+  it('shows an area again once it is no longer hidden', () => {
+    const library = toastsFor('library');
+    setHiddenToastAreas(['library']);
+    library.toastSuccess('Shared');
+    setHiddenToastAreas([]);
+    library.toastSuccess('Shared');
+    expect(get(toasts).map((t) => t.message)).toEqual(['Shared']);
+  });
+
+  it('reads the hidden areas from settings, showing everything when they are unknown', () => {
+    expect(hiddenToastAreas(null)).toEqual([]);
+    const settings = {
+      popups_downloads: true,
+      popups_search: false,
+      popups_library: true,
+      popups_friends: false,
+      popups_channels: true,
+      popups_feeds: true,
+      popups_network: true,
+    } as AppSettings;
+    expect(hiddenToastAreas(settings)).toEqual(['search', 'friends']);
+    expect(hiddenToastAreas({} as AppSettings)).toEqual([]);
   });
 });

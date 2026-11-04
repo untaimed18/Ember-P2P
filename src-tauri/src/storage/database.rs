@@ -52,6 +52,18 @@ const UPDATE_TRANSFER_STATUS_SQL: &str = "UPDATE transfers
      END
      WHERE id = ?2";
 
+/// One download's progress for [`Database::update_transfer_progress_batch`].
+#[derive(Debug, Clone)]
+pub struct TransferProgressRow {
+    pub transfer_id: String,
+    pub transferred: u64,
+    pub progress: f64,
+    pub speed: u64,
+    /// The download folder holding the `.part`, when known; `None` keeps the
+    /// one on record.
+    pub part_folder: Option<String>,
+}
+
 /// Whether a row in `status` keeps `code` across a restart. Failed keeps any.
 /// Stopped keeps only "part files removed": that row was zeroed when its part
 /// files were found gone, and without the code a later start shows a plain
@@ -444,6 +456,10 @@ pub type CreditRowRef<'a> = (
     u32,
 );
 
+/// One `credit_key_links` row: user hash, the Ember node id its key-link
+/// proof named, and the SecIdent key the user hash was proven under then.
+pub type CreditKeyLink = ([u8; 16], [u8; 16], Vec<u8>);
+
 /// Borrowed `ember_credits` row, in `load_ember_credits` column order.
 pub type EmberCreditRowRef<'a> = (&'a [u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool);
 
@@ -643,6 +659,8 @@ pub struct StoredChannelMember {
     pub moderator: bool,
     /// From the member's own presence record; empty for none.
     pub language: String,
+    /// The second language beside it, from the same record; empty for none.
+    pub language2: String,
 }
 
 /// What [`Database::upsert_channel_member`] did to the roster row.
@@ -853,6 +871,27 @@ pub struct ChannelOwnerSilence {
     /// Our first stamp after.
     pub silent_until: i64,
 }
+
+/// The silence from our last stamp `last` until `until`, when it was long
+/// enough for `nominee` to claim the room.
+fn claimable_owner_silence(
+    last: i64,
+    nominee: &str,
+    claim_after_days: i64,
+    until: i64,
+) -> Option<ChannelOwnerSilence> {
+    (last > 0
+        && !nominee.is_empty()
+        && claim_after_days > 0
+        && until.saturating_sub(last) >= claim_after_days.saturating_mul(86_400))
+    .then(|| ChannelOwnerSilence {
+        nominee: nominee.to_ascii_lowercase(),
+        claim_after_days,
+        silent_from: last,
+        silent_until: until,
+    })
+}
+
 const CHAT_KEY_FILE: &str = "chat-history.key";
 const CHAT_CIPHERTEXT_PREFIX: &str = "EMBRCHAT1:";
 const CHAT_UNAVAILABLE_TEXT: &str = "[Message unavailable]";
@@ -3552,6 +3591,14 @@ impl Database {
         // for one never placed, which keeps its `started_at` order. Outside
         // the numbered chain for the same reason.
         Self::add_column_if_missing(&conn, "transfers", "queue_order", "INTEGER")?;
+        // A download's "download first and last parts first" choice. Outside
+        // the numbered chain for the same reason.
+        Self::add_column_if_missing(
+            &conn,
+            "transfers",
+            "preview_priority",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // When a friend's note first held an offer we sent, and whether a
         // session ending has let it go since; see
         // `hold_chat_attachment_offer`. Outside the numbered chain for the
@@ -3584,6 +3631,16 @@ impl Database {
             "language",
             "TEXT NOT NULL DEFAULT ''",
         )?;
+        // And the second language beside it, for the same reason.
+        Self::add_column_if_missing(
+            &conn,
+            "channel_members",
+            "language2",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        // Key links for Ember-stream credit, also outside the chain: a table
+        // 1.7.5 never names, so its backups and downgrades are untouched.
+        Self::ensure_credit_key_links_locked(&conn)?;
         // Finish a v23 encryption pass that was deferred because chat was
         // locked at the time. The version is already 23 or later, so the
         // migration itself will never run again — without this the history
@@ -5022,6 +5079,26 @@ impl Database {
         Ok(())
     }
 
+    /// Forget the Ember digest a download is held to, after its completion
+    /// check refuted a digest only remote say-so stood behind. Narrow, unlike
+    /// `save_transfer`, so it cannot race the status writes.
+    pub fn clear_transfer_ember_file_hash(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE transfers SET ember_file_hash = NULL WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Save a download's preview priority. Narrow, and not part of
+    /// `save_transfer`, so a stale snapshot written back cannot undo it.
+    pub fn update_transfer_preview_priority(&self, id: &str, enabled: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE transfers SET preview_priority = ?1 WHERE id = ?2",
+            params![enabled, id],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn get_incomplete_downloads(&self) -> anyhow::Result<Vec<Transfer>> {
         self.get_incomplete_downloads_page(usize::MAX, 0)
@@ -5037,7 +5114,7 @@ impl Database {
         // still owned by a known transfer id and survive orphan sweep. They are
         // restored into the manager as Failed (not auto-started).
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only, failure_code
+            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only, failure_code, preview_priority
              FROM transfers
              WHERE status NOT IN ('completed', 'noneneeded')
                AND status NOT LIKE 'queue_overflow%'
@@ -5167,7 +5244,7 @@ impl Database {
                         upload_time: 0,
                         a4af_sources: 0,
                         max_sources: 0,
-                        preview_priority: false,
+                        preview_priority: row.get::<_, i64>(18).unwrap_or(0) != 0,
                         preview_ready: false,
                         ember_sources: 0,
                         client_software: String::new(),
@@ -5534,8 +5611,8 @@ impl Database {
         Ok(())
     }
 
-    /// Progress update that refuses to reopen a row that has already reached a
-    /// terminal state.
+    /// Progress update for running downloads that refuses to reopen a row
+    /// that has already reached a terminal state.
     ///
     /// The periodic progress flush is fire-and-forget on the blocking pool and
     /// carries no sequence number, so it can be executed *after* the
@@ -5544,36 +5621,37 @@ impl Database {
     /// show — and the `.part.met` is gone by then, so nothing can repair it.
     /// Terminal states are only left via a deliberate re-queue, which writes
     /// its own progress.
-    /// `part_folder`, when known, is the download folder holding the
-    /// `.part` the progress is in; `None` keeps the one on record.
-    pub fn update_transfer_progress_if_active(
-        &self,
-        transfer_id: &str,
-        transferred: u64,
-        progress: f64,
-        speed: u64,
-        part_folder: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ///
+    /// All rows go in one transaction, so the flush costs one WAL fsync under
+    /// `synchronous=FULL` rather than one per running download.
+    pub fn update_transfer_progress_batch(&self, rows: &[TransferProgressRow]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let mut conn = self.conn.lock();
-        if part_folder.is_some() {
+        if rows.iter().any(|row| row.part_folder.is_some()) {
             Self::ensure_transfer_part_folders_locked(&conn)?;
         }
         // One transaction: progress on record without the folder it is in
         // would let a restart start the download over elsewhere.
         let tx = conn.transaction()?;
-        let updated = tx.execute(
-            "UPDATE transfers
-             SET transferred = ?1, progress = ?2, speed = ?3
-             WHERE id = ?4 AND status NOT IN ('completed', 'cancelled')",
-            params![
-                i64::try_from(transferred).unwrap_or(i64::MAX),
-                progress,
-                i64::try_from(speed).unwrap_or(i64::MAX),
-                transfer_id
-            ],
-        )?;
-        if let Some(folder) = part_folder.filter(|_| updated > 0) {
-            Self::upsert_part_folder(&tx, transfer_id, folder)?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE transfers
+                 SET transferred = ?1, progress = ?2, speed = ?3
+                 WHERE id = ?4 AND status NOT IN ('completed', 'cancelled')",
+            )?;
+            for row in rows {
+                let updated = stmt.execute(params![
+                    i64::try_from(row.transferred).unwrap_or(i64::MAX),
+                    row.progress,
+                    i64::try_from(row.speed).unwrap_or(i64::MAX),
+                    row.transfer_id
+                ])?;
+                if let Some(folder) = row.part_folder.as_deref().filter(|_| updated > 0) {
+                    Self::upsert_part_folder(&tx, &row.transfer_id, folder)?;
+                }
+            }
         }
         tx.commit()?;
         Ok(())
@@ -5890,6 +5968,24 @@ impl Database {
         Ok(())
     }
 
+    /// The Ember node id each peer's key signed a key-link proof for
+    /// (`CreditRecord::signed_ember_hash`), with the SecIdent key the user
+    /// hash was proven under on that session. What Ember-stream credit is
+    /// keyed on, so kept apart from `credit_ember_links`, whose rows builds
+    /// before 1.7.6 wrote from a replayable public key. A table of its own
+    /// for the reason that table is: no numbered migration, so a backup
+    /// still restores on 1.7.5, which never reads it.
+    fn ensure_credit_key_links_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS credit_key_links (
+                user_hash BLOB PRIMARY KEY,
+                ember_hash BLOB NOT NULL,
+                secident_key BLOB NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
     /// Content the Library has already decided about for the `[Ember-P2P]`
     /// tag on new shared files, by eD2K hash: tagged then, or already there
     /// when the setting was turned on. A table of its own, as
@@ -5979,6 +6075,62 @@ impl Database {
             for (user_hash, ember_hash) in links {
                 match ember_hash {
                     Some(eh) => upsert.execute(params![&user_hash[..], &eh[..]])?,
+                    None => delete.execute(params![&user_hash[..]])?,
+                };
+            }
+            for user_hash in removed {
+                delete.execute(params![&user_hash[..]])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every stored key link: `(user_hash, ember_hash, secident_key)`.
+    pub fn load_credit_key_links(&self) -> anyhow::Result<Vec<CreditKeyLink>> {
+        let conn = self.conn.lock();
+        Self::ensure_credit_key_links_locked(&conn)?;
+        let mut stmt =
+            conn.prepare("SELECT user_hash, ember_hash, secident_key FROM credit_key_links")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .filter_map(|row| {
+                let (user_hash, ember_hash, secident_key) = row.ok()?;
+                Some((user_hash.try_into().ok()?, ember_hash.try_into().ok()?, secident_key))
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    /// [`Self::save_credit_ember_links`] for the key links: `Some` stores one,
+    /// `None` and `removed` clear one, and `full_sync` first clears the table.
+    pub fn save_credit_key_links(
+        &self,
+        links: &[([u8; 16], Option<([u8; 16], Vec<u8>)>)],
+        removed: &[[u8; 16]],
+        full_sync: bool,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_credit_key_links_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        if full_sync {
+            tx.execute("DELETE FROM credit_key_links", [])?;
+        }
+        {
+            let mut upsert = tx.prepare(
+                "INSERT OR REPLACE INTO credit_key_links (user_hash, ember_hash, secident_key)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            let mut delete = tx.prepare("DELETE FROM credit_key_links WHERE user_hash = ?1")?;
+            for (user_hash, link) in links {
+                match link {
+                    Some((eh, key)) => upsert.execute(params![&user_hash[..], &eh[..], key])?,
                     None => delete.execute(params![&user_hash[..]])?,
                 };
             }
@@ -11889,9 +12041,9 @@ impl Database {
             tx.execute(
                 "INSERT OR IGNORE INTO channel_members
                     (channel_id, member_pubkey, nickname, last_seen, banned, moderator,
-                     ban_revised_at, language)
+                     ban_revised_at, language, language2)
                  SELECT ?2, member_pubkey, nickname, last_seen, banned, moderator,
-                     ban_revised_at, language
+                     ban_revised_at, language, language2
                  FROM channel_members WHERE channel_id = ?1",
                 params![old_channel_id, successor_channel_id],
             )?;
@@ -12433,6 +12585,40 @@ impl Database {
                 },
             )
             .optional()?)
+    }
+
+    /// The silence a room we own is in now, if its nominee could have claimed
+    /// it and we have signed nothing for it since: the silence the next stamp
+    /// will record, running until `now`. A device back after that long reads
+    /// it before it signs, so a claim it finds then was made while it was away
+    /// (see `owner_return_waits_for_claims`).
+    pub fn channel_owner_pending_silence(
+        &self,
+        channel_id: &str,
+        now: i64,
+    ) -> anyhow::Result<Option<ChannelOwnerSilence>> {
+        let conn = self.conn.lock();
+        let row: Option<(i64, i64, String, i64, bool)> = conn
+            .query_row(
+                "SELECT owner_snapshot_at, moderation_updated_at, successor_nominee,
+                        claim_after_days, is_owner
+                 FROM channels WHERE channel_id = ?1 AND deleted = 0",
+                params![channel_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get::<_, i64>(4)? != 0,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(snapshot_at, moderated_at, nominee, claim_after_days, is_owner)| {
+            claimable_owner_silence(snapshot_at.max(moderated_at), &nominee, claim_after_days, now)
+                .filter(|_| is_owner)
+        }))
     }
 
     /// [`Self::channel_owner_silence`] while a claim found now could still be
@@ -13170,19 +13356,21 @@ impl Database {
         )
     }
 
-    /// `language` is `Some` only from the member's own presence record, the
-    /// one thing allowed to say what they speak, and `Some("")` there clears
-    /// it. `None` — a beacon, a chat line, a moderation snapshot — keeps the
-    /// row's, as an empty `nickname` keeps its name.
+    /// `languages` (first, second) are `Some` only from the member's own
+    /// presence record, the one thing allowed to say what they speak, and an
+    /// empty code there clears that one. `None` — a beacon, a chat line, a
+    /// moderation snapshot — keeps the row's, as an empty `nickname` keeps
+    /// its name.
     pub fn upsert_channel_member_with_language(
         &self,
         channel_id: &str,
         member_pubkey: &str,
         nickname: &str,
-        language: Option<&str>,
+        languages: Option<(&str, &str)>,
         last_seen: i64,
         local_pubkey: Option<&str>,
     ) -> anyhow::Result<ChannelMemberWrite> {
+        let (language, language2) = (languages.map(|l| l.0), languages.map(|l| l.1));
         let now = chrono::Utc::now().timestamp();
         // Signed records can claim a last_seen up to an hour ahead of us
         // (DHT store CLOCK_SKEW). Eviction sorts by last_seen, so an
@@ -13194,24 +13382,25 @@ impl Database {
         if !Self::channel_live_locked(&tx, channel_id)? {
             return Ok(ChannelMemberWrite::Refused);
         }
-        let prior: Option<(String, i64, String)> = tx
+        let prior: Option<(String, i64, (String, String))> = tx
             .query_row(
-                "SELECT nickname, last_seen, language FROM channel_members
+                "SELECT nickname, last_seen, language, language2 FROM channel_members
                  WHERE channel_id = ?1 AND member_pubkey = ?2",
                 params![channel_id, member_pubkey],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, (row.get(2)?, row.get(3)?))),
             )
             .optional()?;
         let existed = prior.is_some();
         tx.execute(
             "INSERT INTO channel_members
-                (channel_id, member_pubkey, nickname, last_seen, banned, moderator, language)
-             VALUES (?1, ?2, ?3, ?4, 0, 0, COALESCE(?5, ''))
+                (channel_id, member_pubkey, nickname, last_seen, banned, moderator, language, language2)
+             VALUES (?1, ?2, ?3, ?4, 0, 0, COALESCE(?5, ''), COALESCE(?6, ''))
              ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
                 nickname = CASE WHEN excluded.nickname = '' THEN channel_members.nickname ELSE excluded.nickname END,
                 last_seen = MAX(channel_members.last_seen, excluded.last_seen),
-                language = COALESCE(?5, channel_members.language)",
-            params![channel_id, member_pubkey, nickname, last_seen, language],
+                language = COALESCE(?5, channel_members.language),
+                language2 = COALESCE(?6, channel_members.language2)",
+            params![channel_id, member_pubkey, nickname, last_seen, language, language2],
         )?;
         // Presence ingest and private-room chat can still grow the table.
         // Banned rows stay: a ban has to survive eviction or it can be
@@ -13280,9 +13469,10 @@ impl Database {
         }
         Ok(match prior {
             None => ChannelMemberWrite::Inserted,
-            Some((old_nick, old_seen, old_language)) => {
+            Some((old_nick, old_seen, (old_language, old_language2))) => {
                 let nick_changed = !nickname.is_empty() && nickname != old_nick;
-                let language_changed = language.is_some_and(|code| code != old_language);
+                let language_changed = languages
+                    .is_some_and(|(first, second)| first != old_language || second != old_language2);
                 if nick_changed || language_changed {
                     ChannelMemberWrite::Updated
                 } else if last_seen > old_seen {
@@ -13434,7 +13624,7 @@ impl Database {
     ) -> anyhow::Result<Vec<StoredChannelMember>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT member_pubkey, nickname, last_seen, banned, moderator, language
+            "SELECT member_pubkey, nickname, last_seen, banned, moderator, language, language2
              FROM channel_members WHERE channel_id = ?1
              ORDER BY nickname COLLATE NOCASE, member_pubkey",
         )?;
@@ -13447,6 +13637,7 @@ impl Database {
                     banned: row.get::<_, i64>(3)? != 0,
                     moderator: row.get::<_, i64>(4)? != 0,
                     language: row.get(5)?,
+                    language2: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -13970,11 +14161,8 @@ impl Database {
         if let (Some((snapshot_at, moderated_at, nominee, claim_after_days, true)), Some(stamp)) =
             (prior, stamp)
         {
-            let last = snapshot_at.max(moderated_at);
-            if last > 0
-                && !nominee.is_empty()
-                && claim_after_days > 0
-                && stamp.saturating_sub(last) >= claim_after_days.saturating_mul(86_400)
+            if let Some(silence) =
+                claimable_owner_silence(snapshot_at.max(moderated_at), &nominee, claim_after_days, stamp)
             {
                 Self::ensure_channel_owner_silences_locked(conn)?;
                 conn.execute(
@@ -13986,7 +14174,13 @@ impl Database {
                         claim_after_days = excluded.claim_after_days,
                         silent_from = excluded.silent_from,
                         silent_until = excluded.silent_until",
-                    params![channel_id, nominee.to_ascii_lowercase(), claim_after_days, last, stamp],
+                    params![
+                        channel_id,
+                        silence.nominee,
+                        silence.claim_after_days,
+                        silence.silent_from,
+                        silence.silent_until
+                    ],
                 )?;
             }
         }
@@ -14598,21 +14792,22 @@ impl Database {
         Ok(n)
     }
 
-    /// Set our own language on our roster rows across every room, empty for
-    /// none. Returns the rooms whose row it changed.
+    /// Set our own first and second languages on our roster rows across every
+    /// room, empty for none. Returns the rooms whose row it changed.
     pub fn set_self_channel_member_language(
         &self,
         member_pubkey: &str,
         language: &str,
+        language2: &str,
     ) -> anyhow::Result<Vec<String>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "UPDATE channel_members SET language = ?2
-             WHERE member_pubkey = ?1 AND language != ?2
+            "UPDATE channel_members SET language = ?2, language2 = ?3
+             WHERE member_pubkey = ?1 AND (language != ?2 OR language2 != ?3)
              RETURNING channel_id",
         )?;
         let rooms = stmt
-            .query_map(params![member_pubkey, language], |row| row.get(0))?
+            .query_map(params![member_pubkey, language, language2], |row| row.get(0))?
             .collect::<Result<Vec<String>, _>>()?;
         Ok(rooms)
     }
@@ -18778,6 +18973,47 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    #[test]
+    fn transfer_preview_priority_survives_restart_and_full_saves() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-preview-priority-transfer-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO transfers (
+                    id, file_name, file_hash, peer_id, peer_name, direction, status,
+                    progress, speed, total_size, transferred, started_at, priority,
+                    category, expected_aich, ember_file_hash
+                 ) VALUES (?1, 'file.bin', ?2, '', '', 'download', 'paused', 0, 0, 4, 0, 1, 'normal', '', NULL, NULL)",
+                params!["transfer-preview", "33".repeat(16)],
+            )
+            .unwrap();
+        assert!(!db.get_incomplete_downloads().unwrap()[0].preview_priority);
+
+        db.update_transfer_preview_priority("transfer-preview", true).unwrap();
+        let mut row = db.get_incomplete_downloads().unwrap().remove(0);
+        assert!(row.preview_priority);
+        assert_eq!(row.status, TransferStatus::Paused, "only the flag is written");
+
+        row.preview_priority = false;
+        db.save_transfer(&row).unwrap();
+        assert!(
+            db.get_incomplete_downloads().unwrap()[0].preview_priority,
+            "a full-row save does not carry the flag"
+        );
+        db.update_transfer_preview_priority("transfer-preview", false).unwrap();
+        assert!(!db.get_incomplete_downloads().unwrap()[0].preview_priority);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
     /// The Known Ember Peers links are written per flushed row, cleared with
     /// `None` or a removed row, and mirrored exactly on a full sync — in a
     /// table of their own, so the schema version 1.7.0 checks stays put.
@@ -18797,6 +19033,128 @@ mod tests {
 
         db.save_credit_ember_links(&[(a, Some([0xA2; 16]))], &[], true).unwrap();
         assert_eq!(db.load_credit_ember_links().unwrap(), vec![(a, [0xA2; 16])]);
+    }
+
+    /// A database from before key links (1.7.5's) gets `credit_key_links` at
+    /// open, with the schema version left where 1.7.5 can still open it, and
+    /// its rows follow the flushed credit rows as the display links do.
+    #[test]
+    fn credit_key_links_are_added_at_open_without_a_schema_bump() {
+        let path = temp_db_path("key-links");
+        let db = Database::open_at(&path).expect("open");
+        db.save_credit_ember_links(&[([9u8; 16], Some([0x99; 16]))], &[], false).unwrap();
+        db.conn
+            .lock()
+            .execute_batch("DROP TABLE credit_key_links;")
+            .expect("back to 1.7.5");
+        drop(db);
+
+        let db = Database::open_at(&path).expect("reopen");
+        assert_eq!(db.schema_version(), MAX_SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 62, "1.7.5 has to open this database");
+        let tables: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'credit_key_links'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1, "created at open");
+        assert!(db.load_credit_key_links().unwrap().is_empty());
+        assert_eq!(
+            db.load_credit_ember_links().unwrap(),
+            vec![([9u8; 16], [0x99; 16])],
+            "the display links are untouched"
+        );
+
+        let (a, b, c) = ([1u8; 16], [2u8; 16], [3u8; 16]);
+        db.save_credit_key_links(
+            &[(a, Some(([0xA1; 16], b"rsa-a".to_vec()))), (b, Some(([0xB1; 16], b"rsa-b".to_vec())))],
+            &[],
+            false,
+        )
+        .unwrap();
+        let mut links = db.load_credit_key_links().unwrap();
+        links.sort();
+        assert_eq!(
+            links,
+            vec![(a, [0xA1; 16], b"rsa-a".to_vec()), (b, [0xB1; 16], b"rsa-b".to_vec())]
+        );
+        db.save_credit_key_links(&[(a, None), (c, Some(([0xC1; 16], b"rsa-c".to_vec())))], &[b], false)
+            .unwrap();
+        assert_eq!(db.load_credit_key_links().unwrap(), vec![(c, [0xC1; 16], b"rsa-c".to_vec())]);
+        db.save_credit_key_links(&[(a, Some(([0xA2; 16], b"rsa-a".to_vec())))], &[], true).unwrap();
+        assert_eq!(db.load_credit_key_links().unwrap(), vec![(a, [0xA2; 16], b"rsa-a".to_vec())]);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The batched progress flush writes every running row in one go and
+    /// still refuses to reopen a finished or cancelled one.
+    #[test]
+    fn a_progress_batch_updates_running_rows_and_leaves_finished_ones() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-progress-batch-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        for (id, status) in [("t-a", "downloading"), ("t-b", "paused"), ("t-done", "completed"), ("t-gone", "cancelled")] {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority,
+                        category, expected_aich, ember_file_hash
+                     ) VALUES (?1, 'file.bin', ?2, '', '', 'download', ?3, 100, 0, 4, 4, 1, 'normal', '', NULL, NULL)",
+                    params![id, "55".repeat(16), status],
+                )
+                .unwrap();
+        }
+        let row = |id: &str, transferred: u64, folder: Option<&str>| TransferProgressRow {
+            transfer_id: id.to_string(),
+            transferred,
+            progress: 25.0 * transferred as f64,
+            speed: 7,
+            part_folder: folder.map(str::to_string),
+        };
+        db.update_transfer_progress_batch(&[
+            row("t-a", 1, Some("D:/a")),
+            row("t-b", 2, None),
+            row("t-done", 1, Some("D:/done")),
+            row("t-gone", 1, None),
+            row("t-missing", 1, Some("D:/missing")),
+        ])
+        .unwrap();
+        db.update_transfer_progress_batch(&[]).unwrap();
+
+        let stored = |id: &str| -> (i64, f64) {
+            db.conn
+                .lock()
+                .query_row("SELECT transferred, progress FROM transfers WHERE id = ?1", params![id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+        };
+        assert_eq!(stored("t-a"), (1, 25.0));
+        assert_eq!(stored("t-b"), (2, 50.0));
+        assert_eq!(stored("t-done"), (4, 100.0), "a completed row keeps 100%");
+        assert_eq!(stored("t-gone"), (4, 100.0));
+        let folders = db.download_part_folders().unwrap();
+        assert_eq!(folders.get("t-a").map(String::as_str), Some("D:/a"));
+        assert!(!folders.contains_key("t-done"));
+        assert!(!folders.contains_key("t-missing"), "no row, no folder");
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     /// A download's part folder lives in a table of its own, not a column of
@@ -18829,9 +19187,16 @@ mod tests {
                 .unwrap();
         }
 
-        db.update_transfer_progress_if_active("t-active", 2, 50.0, 0, Some("D:/old")).unwrap();
-        db.update_transfer_progress_if_active("t-done", 2, 50.0, 0, Some("D:/old")).unwrap();
-        db.update_transfer_progress_if_active("t-active", 3, 75.0, 0, None).unwrap();
+        let progress_row = |id: &str, transferred: u64, progress: f64, folder: Option<&str>| TransferProgressRow {
+            transfer_id: id.to_string(),
+            transferred,
+            progress,
+            speed: 0,
+            part_folder: folder.map(str::to_string),
+        };
+        db.update_transfer_progress_batch(&[progress_row("t-active", 2, 50.0, Some("D:/old"))]).unwrap();
+        db.update_transfer_progress_batch(&[progress_row("t-done", 2, 50.0, Some("D:/old"))]).unwrap();
+        db.update_transfer_progress_batch(&[progress_row("t-active", 3, 75.0, None)]).unwrap();
         let folders = db.download_part_folders().unwrap();
         assert_eq!(folders.get("t-active").map(String::as_str), Some("D:/old"));
         assert!(!folders.contains_key("t-done"), "a finished row records no folder");
@@ -23714,31 +24079,39 @@ mod tests {
             ChannelMemberWrite::Inserted
         );
         assert_eq!(language(&db), "", "a beacon-made row starts with none");
+        let second = |db: &Database| db.list_channel_members(&channel_id).unwrap()[0].language2.clone();
         assert_eq!(
-            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some("ja"), 100, None)
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("ja", "en")), 100, None)
                 .unwrap(),
             ChannelMemberWrite::Updated
         );
-        assert_eq!(language(&db), "ja");
+        assert_eq!((language(&db), second(&db)), ("ja".to_string(), "en".to_string()));
         assert_eq!(
             db.upsert_channel_member(&channel_id, &pk, "", 200, None).unwrap(),
             ChannelMemberWrite::Touched,
             "a write without a language keeps it and is no relabel"
         );
-        assert_eq!(language(&db), "ja");
+        assert_eq!((language(&db), second(&db)), ("ja".to_string(), "en".to_string()));
         assert_eq!(
-            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some("ja"), 200, None)
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("ja", "en")), 200, None)
                 .unwrap(),
             ChannelMemberWrite::Unchanged
         );
         assert_eq!(
-            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some("ko"), 200, None)
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("ko", "en")), 200, None)
                 .unwrap(),
             ChannelMemberWrite::Updated,
             "a language moving alone is drawn again"
         );
         assert_eq!(
-            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(""), 300, None)
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("ko", "")), 200, None)
+                .unwrap(),
+            ChannelMemberWrite::Updated,
+            "and so is the second one"
+        );
+        assert_eq!(second(&db), "");
+        assert_eq!(
+            db.upsert_channel_member_with_language(&channel_id, &pk, "Ada", Some(("", "")), 300, None)
                 .unwrap(),
             ChannelMemberWrite::Updated
         );
@@ -23748,16 +24121,18 @@ mod tests {
         db.insert_channel(&other_room, &"ce".repeat(32), "Other", "public", false, None, None)
             .unwrap();
         db.upsert_channel_member(&other_room, &pk, "Ada", 300, None).unwrap();
-        let mut rooms = db.set_self_channel_member_language(&pk, "de").unwrap();
+        let mut rooms = db.set_self_channel_member_language(&pk, "de", "").unwrap();
         rooms.sort();
         let mut both = vec![channel_id.clone(), other_room.clone()];
         both.sort();
         assert_eq!(rooms, both);
         assert_eq!(language(&db), "de");
         assert!(
-            db.set_self_channel_member_language(&pk, "de").unwrap().is_empty(),
+            db.set_self_channel_member_language(&pk, "de", "").unwrap().is_empty(),
             "rows already carrying it are not reported"
         );
+        assert_eq!(db.set_self_channel_member_language(&pk, "de", "fr").unwrap().len(), 2);
+        assert_eq!(second(&db), "fr");
         drop(db);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -24926,7 +25301,7 @@ mod tests {
         let successor_pk = "9c".repeat(32);
         db.insert_channel(&old_id, &"a1".repeat(32), "Room", "private", true, None, None)
             .expect("insert channel");
-        db.upsert_channel_member_with_language(&old_id, &"b2".repeat(32), "Them", Some("ko"), 100, None)
+        db.upsert_channel_member_with_language(&old_id, &"b2".repeat(32), "Them", Some(("ko", "ja")), 100, None)
             .unwrap();
         db.insert_channel_message(&old_id, &"b2".repeat(32), "received", "hello", "m1", 100, "", true)
             .unwrap();
@@ -24963,6 +25338,7 @@ mod tests {
         let copied_members = db.list_channel_members(&successor_id).unwrap();
         assert_eq!(copied_members.len(), 1);
         assert_eq!(copied_members[0].language, "ko", "a member keeps their language");
+        assert_eq!(copied_members[0].language2, "ja", "and their second one");
         assert_eq!(
             db.get_channel_messages(&successor_id, 10, None).unwrap().len(),
             1
@@ -25939,7 +26315,21 @@ mod tests {
             )
             .unwrap();
 
+        // Before signing anything, the silence the stamp will record runs
+        // until now, and a stamp ends it.
+        assert_eq!(
+            db.channel_owner_pending_silence(&room, now - 60).unwrap(),
+            Some(ChannelOwnerSilence {
+                nominee: nominee.to_ascii_lowercase(),
+                claim_after_days: 14,
+                silent_from: last,
+                silent_until: now - 60,
+            })
+        );
+        assert!(db.channel_owner_pending_silence(&room, last + 13 * day).unwrap().is_none(), "not yet claimable");
+
         assert_eq!(db.stamp_owner_snapshot(&room, now).unwrap(), Some(now));
+        assert!(db.channel_owner_pending_silence(&room, now + 60).unwrap().is_none(), "signed since");
         assert_eq!(
             db.channel_owner_silence(&room).unwrap(),
             Some(ChannelOwnerSilence {
@@ -25970,6 +26360,7 @@ mod tests {
                 params![room, nominee, now - 13 * day],
             )
             .unwrap();
+        assert!(quiet_db.channel_owner_pending_silence(&room, now).unwrap().is_none());
         quiet_db.stamp_owner_snapshot(&room, now).unwrap();
         assert!(
             quiet_db.channel_owner_silence(&room).unwrap().is_none(),
