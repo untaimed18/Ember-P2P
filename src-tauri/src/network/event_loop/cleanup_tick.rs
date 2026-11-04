@@ -290,10 +290,7 @@ pub(in crate::network) async fn on_cleanup_tick(
                 state.user_hash,
                 ember_hash,
                 settings.nickname.clone(),
-                state
-                    .external_ip
-                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                    .unwrap_or(0),
+                crate::network::ed2k::messages::hello_client_id(),
                 advertised_tcp_port(state),
                 advertised_udp_port(state),
                 settings.friend_session_encryption,
@@ -340,10 +337,7 @@ pub(in crate::network) async fn on_cleanup_tick(
                 state.user_hash,
                 ember_hash,
                 settings.nickname.clone(),
-                state
-                    .external_ip
-                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                    .unwrap_or(0),
+                crate::network::ed2k::messages::hello_client_id(),
                 advertised_tcp_port(state),
                 advertised_udp_port(state),
                 settings.friend_session_encryption,

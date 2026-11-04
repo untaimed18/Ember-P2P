@@ -188,6 +188,7 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
     }
     state.low_id = false;
     state.server_client_id = 0;
+    crate::network::kad_io::refresh_hello_client_id(state);
     // A new connection (even to the same server) is a fresh session that
     // has no memory of any previous OP_OFFERFILES we sent — the dedup
     // signature in the `SharedFilesChanged` handler must not carry over,

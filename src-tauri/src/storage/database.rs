@@ -3591,6 +3591,14 @@ impl Database {
         // for one never placed, which keeps its `started_at` order. Outside
         // the numbered chain for the same reason.
         Self::add_column_if_missing(&conn, "transfers", "queue_order", "INTEGER")?;
+        // A download's "download first and last parts first" choice. Outside
+        // the numbered chain for the same reason.
+        Self::add_column_if_missing(
+            &conn,
+            "transfers",
+            "preview_priority",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // When a friend's note first held an offer we sent, and whether a
         // session ending has let it go since; see
         // `hold_chat_attachment_offer`. Outside the numbered chain for the
@@ -5080,6 +5088,17 @@ impl Database {
         Ok(())
     }
 
+    /// Save a download's preview priority. Narrow, and not part of
+    /// `save_transfer`, so a stale snapshot written back cannot undo it.
+    pub fn update_transfer_preview_priority(&self, id: &str, enabled: bool) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE transfers SET preview_priority = ?1 WHERE id = ?2",
+            params![enabled, id],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn get_incomplete_downloads(&self) -> anyhow::Result<Vec<Transfer>> {
         self.get_incomplete_downloads_page(usize::MAX, 0)
@@ -5095,7 +5114,7 @@ impl Database {
         // still owned by a known transfer id and survive orphan sweep. They are
         // restored into the manager as Failed (not auto-started).
         let mut stmt = conn.prepare(
-            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only, failure_code
+            "SELECT id, file_name, file_hash, peer_id, peer_name, direction, status, progress, speed, total_size, transferred, started_at, priority, category, expected_aich, ember_file_hash, friends_only, failure_code, preview_priority
              FROM transfers
              WHERE status NOT IN ('completed', 'noneneeded')
                AND status NOT LIKE 'queue_overflow%'
@@ -5225,7 +5244,7 @@ impl Database {
                         upload_time: 0,
                         a4af_sources: 0,
                         max_sources: 0,
-                        preview_priority: false,
+                        preview_priority: row.get::<_, i64>(18).unwrap_or(0) != 0,
                         preview_ready: false,
                         ember_sources: 0,
                         client_software: String::new(),
@@ -18947,6 +18966,47 @@ mod tests {
         restricted.friends_only = false;
         db.save_transfer(&restricted).unwrap();
         assert!(db.get_incomplete_downloads().unwrap()[0].friends_only);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn transfer_preview_priority_survives_restart_and_full_saves() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-preview-priority-transfer-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).unwrap();
+        db.conn
+            .lock()
+            .execute(
+                "INSERT INTO transfers (
+                    id, file_name, file_hash, peer_id, peer_name, direction, status,
+                    progress, speed, total_size, transferred, started_at, priority,
+                    category, expected_aich, ember_file_hash
+                 ) VALUES (?1, 'file.bin', ?2, '', '', 'download', 'paused', 0, 0, 4, 0, 1, 'normal', '', NULL, NULL)",
+                params!["transfer-preview", "33".repeat(16)],
+            )
+            .unwrap();
+        assert!(!db.get_incomplete_downloads().unwrap()[0].preview_priority);
+
+        db.update_transfer_preview_priority("transfer-preview", true).unwrap();
+        let mut row = db.get_incomplete_downloads().unwrap().remove(0);
+        assert!(row.preview_priority);
+        assert_eq!(row.status, TransferStatus::Paused, "only the flag is written");
+
+        row.preview_priority = false;
+        db.save_transfer(&row).unwrap();
+        assert!(
+            db.get_incomplete_downloads().unwrap()[0].preview_priority,
+            "a full-row save does not carry the flag"
+        );
+        db.update_transfer_preview_priority("transfer-preview", false).unwrap();
+        assert!(!db.get_incomplete_downloads().unwrap()[0].preview_priority);
 
         drop(db);
         let _ = std::fs::remove_file(&path);

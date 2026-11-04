@@ -552,12 +552,19 @@ fn secs(s: i64) -> std::time::Duration {
 /// The server source-request clocks here are monotonic, as eMule's
 /// `::GetTickCount()` ones are: on the wall clock a step back closed the frame,
 /// and held every file's re-ask floor, for the length of the step.
+///
+/// The periodic sweep ticks on the frame interval itself, a little before the
+/// stamp its previous frame closed with, so the frame counts as open a few
+/// seconds early; without that every other sweep found it shut.
 pub(super) fn server_tcp_srcreq_frame_open(state: &NetworkState, now: std::time::Instant) -> bool {
+    const TICK_SLACK_SECS: i64 = 5;
     state.server_connected
         && state
             .server_logged_in_at
             .is_some_and(|at| now.saturating_duration_since(at) >= secs(SERVER_SOURCE_SETTLE_SECS))
-        && state.server_tcp_srcreq_next_at.is_none_or(|at| now >= at)
+        && state
+            .server_tcp_srcreq_next_at
+            .is_none_or(|at| now + secs(TICK_SLACK_SECS) >= at)
 }
 
 /// Close the frame after sending, mirroring eMule's
@@ -892,6 +899,17 @@ pub(super) const MAX_UDP_CONSECUTIVE_FAILURES: u32 = 2;
 pub(super) const SERVER_UDP_SOURCE_REASK_SECS: i64 = 30 * 60;
 pub(super) const SERVER_UDP_SOURCE_REPLY_TTL_SECS: i64 = 120;
 
+/// Whether a server may be asked over UDP about a file again, given when it
+/// last was. The periodic sweep runs on the same 30-minute period, and the
+/// stamp it compares against was taken a little after the previous sweep's
+/// tick, so an exact comparison failed every other sweep and doubled the
+/// interval. The slack covers that lag without letting another path ask
+/// meaningfully early.
+fn server_udp_source_reask_due(last: std::time::Instant, now: std::time::Instant) -> bool {
+    const SLACK_SECS: i64 = 30;
+    now.saturating_duration_since(last) + secs(SLACK_SECS) >= secs(SERVER_UDP_SOURCE_REASK_SECS)
+}
+
 pub(super) fn is_eligible_udp_server(
     server: &ed2k::server_list::ServerEntry,
     connected_addr: Option<SocketAddr>,
@@ -957,9 +975,11 @@ pub(super) fn build_all_getsources_packets(
             continue;
         }
         let key = (server.ip.clone(), server.port, *file_hash);
-        if state.server_udp_source_reask_at.get(&key).is_some_and(|last| {
-            now.saturating_duration_since(*last) < secs(SERVER_UDP_SOURCE_REASK_SECS)
-        }) {
+        if state
+            .server_udp_source_reask_at
+            .get(&key)
+            .is_some_and(|last| !server_udp_source_reask_due(*last, now))
+        {
             continue;
         }
         if let Some(packet) =
@@ -1026,9 +1046,10 @@ pub(super) fn build_all_getsources_packets_multi(
                     return false;
                 }
                 let key = (server.ip.clone(), server.port, *fh);
-                state.server_udp_source_reask_at.get(&key).is_none_or(|last| {
-                    now.saturating_duration_since(*last) >= secs(SERVER_UDP_SOURCE_REASK_SECS)
-                })
+                state
+                    .server_udp_source_reask_at
+                    .get(&key)
+                    .is_none_or(|last| server_udp_source_reask_due(*last, now))
             })
             .copied()
             .collect();
@@ -1100,9 +1121,18 @@ pub(super) fn inject_source_into_active_transfers(
                 });
             let already_known = pfs.has_source(v4, source.peer_port);
             if already_known {
+                pfs.learn_udp_port(v4, source.peer_port, udp_port);
                 // Worker may have soft-dropped this peer (no free parts).
                 // Re-inject only when PFS says another attempt is due.
                 pfs.is_eligible_for_reinject(v4, source.peer_port)
+            } else if state.dead_sources.is_dead_source_for_file(
+                &file_hash,
+                u32::from(v4),
+                source.peer_port,
+            ) {
+                // A source retired for failing stays out until its block
+                // lapses, as eMule's `IsDeadSource` keeps it from being re-added.
+                false
             } else {
                 let added = pfs.add_source_full(v4, source.peer_port, udp_port);
                 if added {
@@ -1130,10 +1160,11 @@ pub(super) fn inject_source_into_active_transfers(
             SourceInjectionResult::Injected => {
                 stats.injected += 1;
                 // Claim the PFS slot so rediscovery does not re-spam until
-                // the worker adopts or soft-drops the peer.
+                // the worker adopts or soft-drops the peer. The worker's own
+                // `connecting` report stamps the ask when it really dials.
                 if let Some(v4) = parsed_ip {
                     if let Some(pfs) = state.per_file_sources.get_mut(transfer_id) {
-                        pfs.set_connecting(v4, source.peer_port, None);
+                        pfs.claim_for_inject(v4, source.peer_port);
                     }
                 }
             }
@@ -1464,5 +1495,17 @@ mod server_udp_source_admission_tests {
             &[0x45; 16],
             at(100)
         ));
+    }
+
+    /// The 30-minute sweep stamps a little after its tick, so the next tick
+    /// lands just short of 30 minutes and must still count.
+    #[test]
+    fn a_sweep_landing_just_short_of_the_interval_is_due() {
+        let t0 = std::time::Instant::now();
+        let interval = secs(SERVER_UDP_SOURCE_REASK_SECS);
+        assert!(server_udp_source_reask_due(t0, t0 + interval));
+        assert!(server_udp_source_reask_due(t0, t0 + interval - secs(2)));
+        assert!(!server_udp_source_reask_due(t0, t0 + interval - secs(120)));
+        assert!(!server_udp_source_reask_due(t0, t0 + secs(60)));
     }
 }

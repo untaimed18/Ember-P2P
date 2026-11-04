@@ -470,14 +470,12 @@ pub(super) struct NetworkState {
     /// `0` means unknown (no trusted source has reported our public IP yet);
     /// any non-zero value is our public IPv4 confirmed by a trusted source
     /// (ed2k server HighID, multi-reporter KAD consensus, or UPnP→firewall
-    /// re-verification). The upload listener reads this atomic when building
-    /// an outgoing `OP_HELLOANSWER`: advertising our real ID here instead
-    /// of a hardcoded `0` lets strict eMule forks and older clients
-    /// correctly treat us as HighID in their queue scoring and callback
-    /// logic, rather than relying on BaseClient.cpp's forgiving
-    /// `m_nUserIDHybrid == 0 → use connect IP` auto-heal. Keeps this in
-    /// sync with `external_ip` via `set_external_ip` below so there is no
-    /// way to update one without the other.
+    /// re-verification). The upload listener reads it where it needs the
+    /// address peers see us at, such as checking a SecIdent signature made
+    /// over it. Never the client ID a Hello advertises: a LowID node knows
+    /// its public IP too (see `ed2k::messages::hello_client_id`). Keeps this
+    /// in sync with `external_ip` via `set_external_ip` so there is no way to
+    /// update one without the other.
     pub(super) external_ip_shared: Arc<std::sync::atomic::AtomicU32>,
     /// Whether we've done the initial self-lookup (FindNode for own ID)
     pub(super) self_lookup_done: bool,
@@ -692,7 +690,8 @@ pub(super) struct NetworkState {
     pub(super) udp_fw_node_search: Option<SearchId>,
     /// Whether we have LowID from the server
     pub(super) low_id: bool,
-    /// Our server-assigned client ID
+    /// Our server-assigned client ID. One input to the ID our Hellos
+    /// advertise; changes must be followed by `refresh_hello_client_id`.
     pub(super) server_client_id: u32,
     /// The TCP port we advertised in `OP_LOGINREQUEST` for the current
     /// session. eD2k has no "update my port" message once logged in — the

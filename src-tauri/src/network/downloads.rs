@@ -94,11 +94,26 @@ pub(super) fn kad_source_search_interval(search_count: u32) -> std::time::Durati
     )
 }
 
+/// eMule `KADEMLIATOTALFILE` (`Opcodes.h`): file source searches Kad runs at
+/// once.
+pub(super) const KADEMLIATOTALFILE: usize = 5;
+
+/// Download source searches still walking.
+fn running_kad_file_source_searches(state: &NetworkState) -> usize {
+    state
+        .download_source_searches
+        .keys()
+        .filter(|sid| state.search_manager.get(sid).is_some_and(|s| !s.completed))
+        .count()
+}
+
 /// Whether a file's KAD source search may start: none of its own is still
-/// running (eMule's `GetKadFileSearchID()` check) and its clock in
+/// running (eMule's `GetKadFileSearchID()` check), fewer than
+/// [`KADEMLIATOTALFILE`] are running for any file, and its clock in
 /// `active_kad_search_state` has run out. Every path that starts one asks
 /// this, so a resume, a promotion or the Find Sources button cannot restart
-/// the backoff or follow a search a minute after the last.
+/// the backoff or follow a search a minute after the last. A file turned away
+/// by the concurrency limit keeps its clock and is asked again next sweep.
 pub(super) fn kad_source_search_may_start(
     state: &NetworkState,
     tid: &str,
@@ -112,6 +127,29 @@ pub(super) fn kad_source_search_may_start(
         && state.active_kad_search_state.get(tid).is_none_or(|&(at, count)| {
             now.saturating_duration_since(at) + SLACK >= kad_source_search_interval(count)
         })
+        && running_kad_file_source_searches(state) < KADEMLIATOTALFILE
+}
+
+/// Take back the stamp [`note_kad_source_search`] made for a search that was
+/// evicted before it finished, so the file is due again at once rather than
+/// waiting out an interval for a search it never got.
+pub(super) fn undo_kad_source_search(
+    clocks: &mut HashMap<String, (std::time::Instant, u32)>,
+    tid: &str,
+    now: std::time::Instant,
+) {
+    let Some(&(_, count)) = clocks.get(tid) else {
+        return;
+    };
+    let prior = count.saturating_sub(1);
+    match now.checked_sub(kad_source_search_interval(prior)) {
+        Some(at) if prior > 0 => {
+            clocks.insert(tid.to_string(), (at, prior));
+        }
+        _ => {
+            clocks.remove(tid);
+        }
+    }
 }
 
 /// Stamp the start of a KAD source search on the file's clock and return how
@@ -1160,7 +1198,7 @@ async fn start_pending_download_worker(
         let mut sm = source_manager.write().await;
         for (ip, port) in &live_sources {
             if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                sm.register_source(hash_bytes, v4, *port, None);
+                sm.register_source_if_absent(hash_bytes, v4, *port);
             }
         }
     }
@@ -1738,5 +1776,27 @@ mod kad_source_search_interval_tests {
         assert_eq!(kad_source_search_interval(2), hours(2));
         assert_eq!(kad_source_search_interval(7), hours(7));
         assert_eq!(kad_source_search_interval(u32::MAX), hours(7));
+    }
+
+    /// An evicted search gives its file back the wait it started.
+    #[test]
+    fn undoing_an_evicted_search_makes_the_file_due_again() {
+        let now = std::time::Instant::now();
+        let mut clocks: HashMap<String, (std::time::Instant, u32)> = HashMap::new();
+        clocks.insert("first".into(), (now, 1));
+        undo_kad_source_search(&mut clocks, "first", now);
+        assert!(!clocks.contains_key("first"), "a first search leaves no clock behind");
+
+        undo_kad_source_search(&mut clocks, "unknown", now);
+        assert!(clocks.is_empty());
+
+        clocks.insert("third".into(), (now, 3));
+        undo_kad_source_search(&mut clocks, "third", now);
+        // Absent only when an `Instant` this close to boot cannot be moved
+        // back two hours.
+        if let Some(&(at, count)) = clocks.get("third") {
+            assert_eq!(count, 2);
+            assert!(now.saturating_duration_since(at) >= kad_source_search_interval(2));
+        }
     }
 }

@@ -385,6 +385,68 @@ pub(in crate::network) async fn on_source_retry_tick(
         }
     }
 
+    // A source search evicted for another search was cut short, so the wait
+    // its start put on the file is taken back.
+    let evicted_targets = state.search_manager.take_evicted_source_targets();
+    if !evicted_targets.is_empty() {
+        let undo: Vec<String> = {
+            let mgr = transfer_manager.read().await;
+            state
+                .active_kad_search_state
+                .keys()
+                .filter(|tid| !state.download_source_searches.values().any(|(t, _)| t == *tid))
+                .filter(|tid| {
+                    state
+                        .pending_downloads
+                        .get(*tid)
+                        .map(|pd| pd.file_hash.as_str())
+                        .or_else(|| mgr.get_transfer(tid).map(|t| t.file_hash.as_str()))
+                        .and_then(parse_ed2k_hash16)
+                        .is_some_and(|fh| evicted_targets.contains(&md4_bytes_to_kad_id(&fh)))
+                })
+                .cloned()
+                .collect()
+        };
+        for tid in &undo {
+            undo_kad_source_search(&mut state.active_kad_search_state, tid, tick_now);
+        }
+    }
+
+    // Sources whose attempts keep failing are dropped and blocked, as eMule
+    // removes a source it cannot connect to; left listed, they counted as
+    // known sources until discovery stopped looking for more.
+    {
+        let mut retired: Vec<([u8; 16], Ipv4Addr, u16)> = Vec::new();
+        for pfs in state.per_file_sources.values_mut() {
+            for (ip, port, firewalled) in pfs.retire_failing_sources() {
+                state
+                    .dead_sources
+                    .add_dead_source(0, u32::from(ip), port, firewalled);
+                retired.push((pfs.file_hash, ip, port));
+            }
+        }
+        if !retired.is_empty() {
+            state.ember_payload_dirty = true;
+            let mut sm = source_manager.write().await;
+            for (fh, ip, port) in &retired {
+                sm.remove_source(fh, ip, *port);
+            }
+            debug!("Retired {} repeatedly failing source(s)", retired.len());
+        }
+    }
+
+    // A `LowToLowIp` park is only right while we cannot be called back
+    // either. Once we can, the parked peers get their callback or dial again.
+    if !ember_tcp_firewalled_or_presumed(state) {
+        let mut released = 0usize;
+        for pfs in state.per_file_sources.values_mut() {
+            released += pfs.release_low_to_low_parks();
+        }
+        if released > 0 {
+            info!("Reachable again: released {released} LowID-to-LowID source(s) for retry");
+        }
+    }
+
     // Always process cancellations even when offline.
     {
         let to_cancel: Vec<String> = state.pending_downloads.iter()
@@ -421,8 +483,10 @@ pub(in crate::network) async fn on_source_retry_tick(
                 continue;
             }
             // Stop/Pause/Insufficient already cancelled the control
-            // and removed it from the manager. Prefer those statuses
-            // over rewriting the row as Failed ("Cancelled").
+            // and removed it from the manager, and a finished or
+            // finishing transfer cancels its control on the way out.
+            // Prefer those statuses over rewriting the row as Failed
+            // ("Cancelled").
             let skip_fail = {
                 let mgr = transfer_manager.read().await;
                 mgr.get_transfer(tid)
@@ -432,6 +496,10 @@ pub(in crate::network) async fn on_source_retry_tick(
                             TransferStatus::Stopped
                                 | TransferStatus::Paused
                                 | TransferStatus::Insufficient
+                                | TransferStatus::Verifying
+                                | TransferStatus::Completing
+                                | TransferStatus::Completed
+                                | TransferStatus::Failed
                         )
                     })
                     .unwrap_or(false)
@@ -1149,7 +1217,7 @@ pub(in crate::network) async fn on_source_retry_tick(
                 let mut sm = source_manager.write().await;
                 for (ip, port) in &live_sources {
                     if let Ok(v4) = ip.parse::<Ipv4Addr>() {
-                        sm.register_source(hash_bytes, v4, *port, None);
+                        sm.register_source_if_absent(hash_bytes, v4, *port);
                     }
                 }
             }
@@ -1422,6 +1490,15 @@ pub(in crate::network) async fn on_source_retry_tick(
                 }
             }
         }
+        // Building the bitmap reads the part file, so only for a download that
+        // has a source due this tick; one that falls due meanwhile is caught
+        // on the next.
+        reask_ids.retain(|tid| {
+            state
+                .per_file_sources
+                .get(tid)
+                .is_some_and(|pfs| pfs.sources.iter().any(|s| s.needs_udp_reask()))
+        });
         let mut reask_bitmaps: HashMap<String, Vec<bool>> = HashMap::new();
         for tid in &reask_ids {
             if let Some(parts) = udp_reask_serveable_parts(state, tid).await {
@@ -1495,6 +1572,19 @@ pub(in crate::network) async fn on_source_retry_tick(
                         .unwrap_or(*orig_udp);
                     if udp_port == 0 {
                         pfs.mark_udp_reask_sent(*orig_ip, *orig_tcp);
+                        continue;
+                    }
+                    // Rows from server answers, source exchange and A4AF
+                    // start without a UDP port; keeping the one found here
+                    // lets the ack find its row and spares the next lookup.
+                    pfs.learn_udp_port(ip, tcp_port, udp_port);
+                    // eMule's `UDPReaskForDownload` skips a client it has a
+                    // connected socket to; that session does the asking.
+                    // Left due, so it is pinged once the session is over.
+                    let user_hash = sm
+                        .get_user_hash(&pfs.file_hash, ip, tcp_port)
+                        .or_else(|| pfs.source_user_hash_at(ip, tcp_port));
+                    if ed2k::peer_sessions::is_busy(user_hash, ip, tcp_port) {
                         continue;
                     }
                     if sent_this_tick.contains(&(ip, tcp_port)) {

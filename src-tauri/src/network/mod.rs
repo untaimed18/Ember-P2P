@@ -2248,8 +2248,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     server_udp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut uss_ping_timer = tokio::time::interval(std::time::Duration::from_secs(2));
     uss_ping_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Batch TCP OP_GETSOURCES to connected server (eMule ~4 min ProcessLocalRequests cycle)
-    let mut server_tcp_source_timer = tokio::time::interval(std::time::Duration::from_secs(4 * 60));
+    // Batch TCP OP_GETSOURCES to connected server, once per source-request
+    // frame (a shorter period only finds the frame still closed)
+    let mut server_tcp_source_timer = tokio::time::interval(std::time::Duration::from_secs(
+        SERVER_TCP_SRCREQ_INTERVAL_SECS as u64,
+    ));
     server_tcp_source_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     let mut ember_refresh_timer = tokio::time::interval(std::time::Duration::from_secs(30));

@@ -856,7 +856,7 @@ async fn buddy_hello_handshake_outgoing(
     };
     let hello = crate::network::ed2k::messages::build_hello_with_buddy_opts(
         user_hash,
-        0,
+        crate::network::ed2k::messages::hello_client_id(),
         tcp_port,
         nickname,
         None,

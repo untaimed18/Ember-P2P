@@ -151,9 +151,11 @@ pub(in crate::network) async fn on_kad_callback_conn(
     // Adopted streams must keep the ephemeral connection
     // port in `DownloadSource` — that is the live TCP
     // remote port the worker keys UI/PFS rows on. Metadata
-    // fallback inject (no live stream) prefers the Hello
-    // listening port for HighID so we never seed a dial
-    // of an undialable ephemeral address.
+    // fallback inject (no live stream) exists only for a
+    // HighID peer's Hello listening port: a LowID peer's
+    // inbound port is ephemeral, and a dialable row for it
+    // would only ever fail. It stays known through its
+    // callback rows and is reached by the next callback.
     let download_source = DownloadSource {
         peer_ip: cb_peer_ip.to_string(),
         peer_port: cb_peer_port,
@@ -161,19 +163,15 @@ pub(in crate::network) async fn on_kad_callback_conn(
         peer_user_hash: uh,
         peer_connect_options: None,
     };
-    let inject_source = DownloadSource {
-        peer_ip: cb_peer_ip.to_string(),
-        peer_port: if cb_peer_caps.is_high_id()
-            && cb_peer_hello_port > 0
-        {
-            cb_peer_hello_port
-        } else {
-            cb_peer_port
-        },
-        available_parts: Vec::new(),
-        peer_user_hash: uh,
-        peer_connect_options: None,
-    };
+    let inject_source = (cb_peer_caps.is_high_id() && cb_peer_hello_port > 0).then(|| {
+        DownloadSource {
+            peer_ip: cb_peer_ip.to_string(),
+            peer_port: cb_peer_hello_port,
+            available_parts: Vec::new(),
+            peer_user_hash: uh,
+            peer_connect_options: None,
+        }
+    });
 
     // Try to hand off the live stream to the first
     // matching active download. A single inbound
@@ -363,26 +361,28 @@ pub(in crate::network) async fn on_kad_callback_conn(
     }
 
     if !stream_dispatched {
-        // Last-resort: legacy metadata injection.
-        // The live stream is gone, so the dial-
-        // back will likely fail for true LowID
-        // peers — but the call mirrors the
-        // pre-fix behaviour and at least registers
-        // the peer for SX / future retry rounds.
-        let stats = inject_source_into_active_transfers(
-            state,
-            cb_file_hash,
-            &matching_tids,
-            &inject_source,
-            0,
-        );
-        if stats.injected > 0 {
-            info!(
-                "Injected LowID callback peer {}:{} (metadata-only fallback) into {} active download(s) for {}",
-                inject_source.peer_ip, inject_source.peer_port, stats.injected, hash_hex,
+        // Last-resort: metadata injection at the HighID peer's
+        // listening port, so a later round can dial it.
+        if let Some(inject_source) = inject_source {
+            let stats = inject_source_into_active_transfers(
+                state,
+                cb_file_hash,
+                &matching_tids,
+                &inject_source,
+                0,
             );
+            if stats.injected > 0 {
+                info!(
+                    "Injected callback peer {}:{} (metadata-only fallback) into {} active download(s) for {}",
+                    inject_source.peer_ip, inject_source.peer_port, stats.injected, hash_hex,
+                );
+            } else {
+                debug!("No active download accepts callback peer for {hash_hex}");
+            }
         } else {
-            debug!("No active download accepts callback peer for {hash_hex}");
+            debug!(
+                "Callback stream from LowID peer {cb_peer_ip}:{cb_peer_port} for {hash_hex} was not adopted; not listing its ephemeral port as a source",
+            );
         }
     }
 }

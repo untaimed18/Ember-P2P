@@ -129,6 +129,37 @@ fn charge_web_sources(
     ed2k::web_sources::note_corrupt_range(file_hash, part_start, part_end, peers_wrote)
 }
 
+/// The source to ask for `part_index`'s AICH recovery data after another
+/// could not give it. eMule asks one that has the part
+/// (`CPartFile::RequestAICHRecovery`), so one that reported it complete comes
+/// first, then one whose parts are not known yet; never one that reported it
+/// missing, one in `failed_ips`, or one not waiting to be asked.
+fn aich_recovery_candidate<'a>(
+    pfs: &'a ed2k::sources::PerFileSourceList,
+    part_index: u32,
+    failed_ips: &[Ipv4Addr],
+) -> Option<&'a ed2k::sources::DownloadSourceEntry> {
+    let askable = pfs.sources.iter().filter(|s| {
+        !failed_ips.contains(&s.ip)
+            && matches!(
+                s.state,
+                ed2k::sources::DownloadSourceState::OnQueue { .. }
+                    | ed2k::sources::DownloadSourceState::New
+            )
+    });
+    let mut unknown = None;
+    for source in askable {
+        match source.available_parts.get(part_index as usize) {
+            Some(&true) => return Some(source),
+            None if source.available_parts.is_empty() => {
+                unknown.get_or_insert(source);
+            }
+            _ => {}
+        }
+    }
+    unknown
+}
+
 /// Failed moves of a verified download into `Downloads` before it is left
 /// Failed instead of re-queued.
 const COMPLETION_MOVE_ATTEMPTS: u32 = 2;
@@ -263,9 +294,44 @@ fn drop_superseded_terminal_event(event: &DownloadEvent, mgr: &mut TransferManag
         .is_some_and(|(sender, registered)| sender != registered.generation());
     if superseded {
         mgr.finish_restore_verification(transfer_id, generation, true);
+        // The replaced worker's move was what held the row in Completing, and
+        // the newer worker reports its own progress from here.
+        if mgr
+            .active
+            .get(transfer_id)
+            .is_some_and(|row| row.status == TransferStatus::Completing)
+        {
+            mgr.update_status(transfer_id, TransferStatus::Searching);
+        }
         debug!("Ignoring {transfer_id}'s result from a worker that has since been replaced");
     }
     superseded
+}
+
+/// Mark `transfer_id` Completing for a [`DownloadEvent::Completing`]. Not a
+/// row the user settled first, nor for a worker since replaced: that worker's
+/// `Failed`, should its move fail, is dropped as superseded, and nothing would
+/// take the row out of Completing again. `true` when it was marked.
+fn mark_completing(mgr: &mut TransferManager, transfer_id: &str, generation: Option<u64>) -> bool {
+    let superseded = generation
+        .zip(mgr.get_control(transfer_id))
+        .is_some_and(|(sender, registered)| sender != registered.generation());
+    let markable = mgr.active.get(transfer_id).is_some_and(|row| {
+        !matches!(
+            row.status,
+            TransferStatus::Paused
+                | TransferStatus::Stopped
+                | TransferStatus::Insufficient
+                | TransferStatus::Completing
+                | TransferStatus::Completed
+                | TransferStatus::Failed
+        )
+    });
+    if superseded || !markable {
+        return false;
+    }
+    mgr.update_status(transfer_id, TransferStatus::Completing);
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -359,6 +425,22 @@ pub(in crate::network) async fn on_download_event(
     if matches!(event, DownloadEvent::Failed { .. })
         && drop_superseded_terminal_event(&event, &mut *transfer_manager.write().await)
     {
+        return;
+    }
+    if let DownloadEvent::Completing { ref transfer_id, generation } = event {
+        if mark_completing(&mut *transfer_manager.write().await, transfer_id, generation) {
+            spawn_transfer_status_write(
+                transfer_status_writes,
+                db.clone(),
+                transfer_id.clone(),
+                "completing",
+            );
+            crate::commands::transfers::emit_transfer_status(
+                app_handle,
+                transfer_id,
+                &TransferStatus::Completing,
+            );
+        }
         return;
     }
     let mut completed_worker = None;
@@ -517,8 +599,10 @@ pub(in crate::network) async fn on_download_event(
                     // Prefer the hashset already verified during
                     // the transfer, then a valid cached set, before
                     // re-reading the completed file.
+                    // known.met holds eMule's form, `MD4("")` included for an
+                    // exact multiple of PARTSIZE; the worker's may be one per part.
                     let part_hashes = if !event_part_hashes.is_empty() {
-                        event_part_hashes.clone()
+                        ed2k::hash::ed2k_known_met_hashset(event_part_hashes, file_size)
                     } else if existing.as_ref().is_some_and(|record| {
                         record.part_hashes.len()
                             == ed2k::hash::ed2k_known_met_part_hash_count(file_size)
@@ -655,24 +739,44 @@ pub(in crate::network) async fn on_download_event(
                         aich: record.aich_hash.is_empty(),
                         ember: record.ember_file_hash.is_empty(),
                     };
-                    if recompute_parts || want.aich || want.ember {
-                        let hash_path = completed_path.clone();
-                        let hashset_tx = part_hashset_result_tx.clone();
-                        let digest_tx = completed_digest_result_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            // Another whole-file read the library scheduler
-                            // would otherwise not see. It rations reads per
-                            // physical drive, and this one lands on the same
-                            // spindle a scan may be working through.
-                            let _drive_busy = crate::sharing::disk::note_external_read(&hash_path);
+                    // The full AICH set (for serving AICH recovery) is built in
+                    // the same task, after this pass, and recorded only when
+                    // its root matches one tied to this download's ed2k hash:
+                    // the root the pass computed alongside a matching ed2k
+                    // hash, or else the one known.met already holds.
+                    let recorded_aich = hex::decode(&record.aich_hash)
+                        .ok()
+                        .and_then(|root| <[u8; 20]>::try_from(root.as_slice()).ok());
+                    let check_ed2k =
+                        recompute_parts || want.aich || want.ember || recorded_aich.is_none();
+                    let hash_path = completed_path.clone();
+                    let hashset_tx = part_hashset_result_tx.clone();
+                    let digest_tx = completed_digest_result_tx.clone();
+                    let aich_data_dir = state.data_dir.clone();
+                    let aich_tx = aich_set_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        // Another whole-file read the library scheduler
+                        // would otherwise not see. It rations reads per
+                        // physical drive, and this one lands on the same
+                        // spindle a scan may be working through.
+                        let _drive_busy = crate::sharing::disk::note_external_read(&hash_path);
+                        let mut file = match std::fs::File::open(&hash_path) {
+                            Ok(file) => file,
+                            Err(e) => {
+                                debug!("Could not hash completed {}: {e}", hash_path.display());
+                                return;
+                            }
+                        };
+                        let mut trusted_aich = recorded_aich;
+                        if check_ed2k {
                             static NEVER_CANCELLED: std::sync::atomic::AtomicBool =
                                 std::sync::atomic::AtomicBool::new(false);
-                            let digests = std::fs::File::open(&hash_path)
-                                .map_err(anyhow::Error::from)
-                                .and_then(|mut file| {
-                                    ed2k::hash::hash_open_file_digests_cancellable(&mut file, want, &NEVER_CANCELLED)
-                                });
-                            let digests = match digests {
+                            let pass = ed2k::hash::WantedDigests { aich: true, ..want };
+                            let digests = match ed2k::hash::hash_open_file_digests_cancellable(
+                                &mut file,
+                                pass,
+                                &NEVER_CANCELLED,
+                            ) {
                                 Ok(digests) => digests,
                                 Err(e) => {
                                     debug!("Could not hash completed {}: {e}", hash_path.display());
@@ -689,15 +793,44 @@ pub(in crate::network) async fn on_download_event(
                             if recompute_parts && !digests.part_hashes.is_empty() {
                                 let _ = hashset_tx.send((fh, digests.part_hashes));
                             }
-                            if digests.aich.is_some() || digests.ember.is_some() {
+                            let new_aich = digests.aich.filter(|_| want.aich);
+                            if new_aich.is_some() || digests.ember.is_some() {
                                 let _ = digest_tx.send(CompletedDigests {
                                     file_hash: fh,
-                                    aich: digests.aich,
+                                    aich: new_aich,
                                     ember: digests.ember,
                                 });
                             }
-                        });
-                    }
+                            trusted_aich = digests.aich;
+                        }
+                        match ed2k::aich::AICHRecoveryHashSet::build_from_open_file(&mut file) {
+                            Ok(hs) if Some(hs.root_hash) == trusted_aich => {
+                                let aich_hex = hex::encode(hs.root_hash);
+                                let cache_path = aich_data_dir.join("aich_cache.dat");
+                                if let Err(error) =
+                                    persist_aich_cache_entry(&cache_path, fh, hs.root_hash)
+                                {
+                                    tracing::warn!(
+                                        "Failed to persist AICH cache entry: {error}"
+                                    );
+                                }
+                                tracing::info!("Computed AICH root for completed download: {aich_hex}");
+                                if let Err(e) = aich_tx.try_send(hs) {
+                                    tracing::warn!("AICH hash-set queue full/closed, hash set not stored: {e}");
+                                }
+                            }
+                            Ok(hs) => {
+                                tracing::warn!(
+                                    "AICH root {} of completed {} does not match the one its ed2k check vouched for; not recording its AICH set",
+                                    hex::encode(hs.root_hash),
+                                    hash_path.display()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to compute AICH for completed download: {e}");
+                            }
+                        }
+                    });
                     let completed_friends_only = record.friends_only;
                     known_files.add_or_update(record.clone());
                     if completed_friends_only {
@@ -894,34 +1027,6 @@ pub(in crate::network) async fn on_download_event(
                         "Indexed completed download: {} (shared={})",
                         file_name, shared_file.shared
                     );
-
-                    // Build full AICH hash set for the completed file
-                    // (enables AICH-based verification when serving to other peers)
-                    let aich_path = completed_path.clone();
-                    let aich_data_dir = state.data_dir.clone();
-                    let aich_tx = aich_set_tx.clone();
-                    tokio::task::spawn_blocking(move || {
-                        match ed2k::aich::AICHRecoveryHashSet::build_from_file(&aich_path) {
-                            Ok(hs) => {
-                                let aich_hex = hex::encode(hs.root_hash);
-                                let cache_path = aich_data_dir.join("aich_cache.dat");
-                                if let Err(error) =
-                                    persist_aich_cache_entry(&cache_path, fh, hs.root_hash)
-                                {
-                                    tracing::warn!(
-                                        "Failed to persist AICH cache entry: {error}"
-                                    );
-                                }
-                                tracing::info!("Computed AICH root for completed download: {aich_hex}");
-                                if let Err(e) = aich_tx.try_send(hs) {
-                                    tracing::warn!("AICH hash-set queue full/closed, hash set not stored: {e}");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to compute AICH for completed download: {e}");
-                            }
-                        }
-                    });
                 }
             }
         }
@@ -1827,6 +1932,14 @@ pub(in crate::network) async fn on_download_event(
     }
     if let DownloadEvent::PartVerified { ref file_hash, part_start, part_end, ref sender_user_hash, .. } = event {
         state.corruption_blackbox.verified_part(file_hash, part_start, part_end);
+        // A part that verified needs no recovery, and one that fails later
+        // starts its AICH retries afresh.
+        if let (Ok(part_index), Ok(mut map)) = (
+            u32::try_from(part_start / ed2k::hash::PARTSIZE),
+            state.aich_recovery_pending.write(),
+        ) {
+            map.remove(&(*file_hash, part_index));
+        }
         ed2k::web_sources::note_verified_range(file_hash, part_start, part_end);
         if let Some(ref uh) = sender_user_hash {
             state.reputation.record_event(uh, ember::reputation::ReputationEvent::SuccessfulChunk);
@@ -1955,32 +2068,52 @@ pub(in crate::network) async fn on_download_event(
         }
     }
     if let DownloadEvent::AichRecoveryFailed { ref file_hash, part_index, failed_ip, .. } = event {
-        if let Ok(mut map) = state.aich_recovery_pending.write() {
+        let noted = state.aich_recovery_pending.write().ok().map(|mut map| {
             let entry = map.entry((*file_hash, part_index)).or_insert_with(|| (Vec::new(), 0));
             if !entry.0.contains(&failed_ip) {
                 entry.0.push(failed_ip);
             }
             entry.1 += 1;
-            let retry_count = entry.1;
-            let failed_ips = entry.0.clone();
-            drop(map);
-
+            (entry.1, entry.0.clone())
+        });
+        if let Some((retry_count, failed_ips)) = noted {
             if retry_count < 3 {
                 let hash_hex = hex::encode(file_hash);
-                let candidate = state.per_file_sources.values().find(|pfs| pfs.file_hash == *file_hash).and_then(|pfs| {
-                    pfs.sources.iter().find(|s| {
-                        !failed_ips.contains(&s.ip)
-                            && matches!(
-                                s.state,
-                                ed2k::sources::DownloadSourceState::OnQueue { .. }
-                                    | ed2k::sources::DownloadSourceState::New
-                            )
-                    })
-                });
-                if let Some(src) = candidate {
+                let candidate = state
+                    .per_file_sources
+                    .values()
+                    .find(|pfs| pfs.file_hash == *file_hash)
+                    .and_then(|pfs| aich_recovery_candidate(pfs, part_index, &failed_ips))
+                    .map(|src| {
+                        (
+                            ed2k::multi_source::DownloadSource {
+                                peer_ip: src.ip.to_string(),
+                                peer_port: src.tcp_port,
+                                available_parts: src.available_parts.clone(),
+                                peer_user_hash: src.source_user_hash,
+                                peer_connect_options: None,
+                            },
+                            src.udp_port,
+                        )
+                    });
+                if let Some((src, udp_port)) = candidate {
                     debug!(
                         "AICH retry {retry_count}/3 for file {} part {part_index}: next candidate {}:{}",
-                        hash_hex, src.ip, src.tcp_port
+                        hash_hex, src.peer_ip, src.peer_port
+                    );
+                    // Handed to the worker to connect to. The pending entry
+                    // is what names the part to ask it to recover, and the
+                    // addresses already tried.
+                    let matching_ids = {
+                        let mgr = transfer_manager.read().await;
+                        matching_active_transfer_ids_for_hash(state, &mgr, &hash_hex)
+                    };
+                    inject_source_into_active_transfers(
+                        state,
+                        *file_hash,
+                        &matching_ids,
+                        &src,
+                        udp_port,
                     );
                 } else {
                     debug!(
@@ -2003,7 +2136,12 @@ pub(in crate::network) async fn on_download_event(
                 if fh_bytes.len() == 16 {
                     let mut fh = [0u8; 16];
                     fh.copy_from_slice(&fh_bytes);
-                    state.corruption_blackbox.remove_file(&fh);
+                    // A failure re-queues with the `.part` and its bytes kept,
+                    // so who sent them is still the evidence a later corrupt
+                    // part is judged on. Cancel and Remove clear it too.
+                    if matches!(event, DownloadEvent::Completed { .. }) {
+                        state.corruption_blackbox.remove_file(&fh);
+                    }
                     if let Ok(mut map) = state.aich_recovery_pending.write() {
                         map.retain(|(file_hash, _), _| *file_hash != fh);
                     }
@@ -2226,6 +2364,109 @@ mod superseded_failure_tests {
         assert!(mgr.is_restore_verification_running("dl"));
         assert!(drop_superseded_terminal_event(&failed("dl", Some(check.generation())), &mut mgr));
         assert!(!mgr.is_restore_verification_running("dl"));
+    }
+}
+
+#[cfg(test)]
+mod completing_tests {
+    use super::*;
+
+    fn verifying(id: &str) -> Transfer {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "file_name": "movie.bin",
+            "file_hash": "00".repeat(16),
+            "peer_id": "",
+            "peer_name": "",
+            "direction": "download",
+            "status": "verifying",
+            "progress": 100.0,
+            "speed": 0,
+            "total_size": 100,
+            "transferred": 100,
+            "started_at": 0,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn the_registered_workers_move_marks_the_row_completing() {
+        let mut mgr = TransferManager::new(2);
+        mgr.active.insert("dl".into(), verifying("dl"));
+        let worker = TransferControl::new();
+        mgr.register_control("dl", worker.clone());
+
+        assert!(mark_completing(&mut mgr, "dl", Some(worker.generation())));
+        assert_eq!(mgr.get_transfer("dl").unwrap().status, TransferStatus::Completing);
+        assert!(!mark_completing(&mut mgr, "dl", Some(worker.generation())), "once");
+    }
+
+    #[test]
+    fn a_settled_row_or_a_replaced_workers_move_is_not_marked() {
+        let mut mgr = TransferManager::new(2);
+        let mut paused = verifying("paused");
+        paused.status = TransferStatus::Paused;
+        mgr.active.insert("paused".into(), paused);
+        assert!(!mark_completing(&mut mgr, "paused", None));
+        assert_eq!(mgr.get_transfer("paused").unwrap().status, TransferStatus::Paused);
+
+        mgr.active.insert("dl".into(), verifying("dl"));
+        let old = TransferControl::new();
+        mgr.register_control("dl", old.clone());
+        mgr.register_control("dl", TransferControl::new());
+        assert!(!mark_completing(&mut mgr, "dl", Some(old.generation())));
+        assert_eq!(mgr.get_transfer("dl").unwrap().status, TransferStatus::Verifying);
+
+        assert!(!mark_completing(&mut mgr, "gone", None));
+    }
+
+    #[test]
+    fn a_replaced_workers_failed_move_does_not_leave_the_row_completing() {
+        let mut mgr = TransferManager::new(2);
+        mgr.active.insert("dl".into(), verifying("dl"));
+        let old = TransferControl::new();
+        mgr.register_control("dl", old.clone());
+        assert!(mark_completing(&mut mgr, "dl", Some(old.generation())));
+        mgr.register_control("dl", TransferControl::new());
+
+        let failed = DownloadEvent::Failed {
+            transfer_id: "dl".into(),
+            error: "move failed".into(),
+            failure_kind: ed2k::transfer::SourceFailureKind::Transient,
+            generation: Some(old.generation()),
+        };
+        assert!(drop_superseded_terminal_event(&failed, &mut mgr));
+        assert_eq!(mgr.get_transfer("dl").unwrap().status, TransferStatus::Searching);
+    }
+
+    #[test]
+    fn aich_recovery_is_asked_of_a_source_that_has_the_part() {
+        let mut pfs = ed2k::sources::PerFileSourceList::new([0x11; 16], 50);
+        let (failed, missing, unknown, has) = (
+            Ipv4Addr::new(203, 0, 113, 1),
+            Ipv4Addr::new(203, 0, 113, 2),
+            Ipv4Addr::new(203, 0, 113, 3),
+            Ipv4Addr::new(203, 0, 113, 4),
+        );
+        for ip in [failed, missing, unknown, has] {
+            assert!(pfs.add_source_full(ip, 4662, 0));
+        }
+        for source in pfs.sources.iter_mut() {
+            source.available_parts = if source.ip == missing {
+                vec![true, false]
+            } else if source.ip == unknown {
+                Vec::new()
+            } else {
+                vec![true, true]
+            };
+        }
+
+        let pick = |pfs: &ed2k::sources::PerFileSourceList, failed_ips: &[Ipv4Addr]| {
+            aich_recovery_candidate(pfs, 1, failed_ips).map(|s| s.ip)
+        };
+        assert_eq!(pick(&pfs, &[failed]), Some(has));
+        assert_eq!(pick(&pfs, &[failed, has]), Some(unknown), "parts not known yet");
+        assert_eq!(pick(&pfs, &[failed, has, unknown]), None, "never one missing the part");
     }
 }
 

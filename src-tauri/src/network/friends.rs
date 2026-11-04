@@ -1223,10 +1223,7 @@ pub(super) fn spawn_rendezvous_friend_lookup(
     let our_uh = state.user_hash;
     let our_eh = ember_hash;
     let nick = settings.nickname.clone();
-    let cid = state
-        .external_ip
-        .map(|eip| u32::from_le_bytes(eip.octets()))
-        .unwrap_or(0);
+    let cid = ed2k::messages::hello_client_id();
     let tcp = advertised_tcp_port(state);
     let udp = advertised_udp_port(state);
     let obfuscate = settings.friend_session_encryption;

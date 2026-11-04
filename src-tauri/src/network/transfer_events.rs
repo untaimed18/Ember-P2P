@@ -1043,6 +1043,7 @@ pub(super) async fn handle_download_event(
             // Handled directly in the network event loop (EPX source injection / peer tracking / friend requests).
         }
         DownloadEvent::DataReceived { .. }
+        | DownloadEvent::Completing { .. }
         | DownloadEvent::PartVerified { .. }
         | DownloadEvent::PartCorrupted { .. }
         | DownloadEvent::AichRecoveryFailed { .. }

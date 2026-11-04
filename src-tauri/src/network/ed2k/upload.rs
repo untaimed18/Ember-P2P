@@ -1201,7 +1201,7 @@ fn stored_md4_hashset(
         return Some(vec![*file_hash]);
     }
     let on_disk_mtime = on_disk_mtime?;
-    let part_hashes = {
+    let mut part_hashes = {
         let records = records.read().unwrap_or_else(|poisoned| poisoned.into_inner());
         let record = records.find_by_hash(file_hash).filter(|record| {
             record.file_size == file_size
@@ -1212,7 +1212,13 @@ fn stored_md4_hashset(
         })?;
         record.part_hashes.clone()
     };
-    super::transfer::verify_hashset(file_hash, &part_hashes, file_size).then_some(part_hashes)
+    if !super::transfer::verify_hashset(file_hash, &part_hashes, file_size) {
+        return None;
+    }
+    // One hash per part, like a freshly computed set: an exact multiple's
+    // trailing entry is `wire_md4_hashset`'s to add, not the record's.
+    part_hashes.truncate(ed2k_part_count_for_size(file_size));
+    Some(part_hashes)
 }
 
 /// The file's modification time in whole seconds, as known.met records it.
@@ -3763,13 +3769,9 @@ struct UploadHandler {
     /// promote `tcp_status` without treating UPnP clears as proof.
     tcp_connect_back_shared: Arc<std::sync::atomic::AtomicBool>,
     /// Our current external IPv4 as a HighID-format little-endian u32, or
-    /// `0` when we don't yet have a trusted public IP. Read on every
-    /// incoming Hello so the `OP_HELLOANSWER` we send advertises our real
-    /// client_id — strict eMule forks and older clients rely on this value
-    /// for HighID/LowID classification, queue scoring, and callback-routing
-    /// decisions. When this is 0 we fall through to sending client_id=0,
-    /// which stock eMule (BaseClient.cpp:608) auto-heals to the connect IP
-    /// but other clients may interpret as LowID. Kept in sync with
+    /// `0` when we don't yet have a trusted public IP. The address peers see
+    /// us at, for checking SecIdent signatures made over it; never the ID a
+    /// Hello advertises, which is `hello_client_id()`. Kept in sync with
     /// `NetworkState::external_ip` via `set_external_ip`.
     external_ip_shared: Arc<std::sync::atomic::AtomicU32>,
     /// IPs expected as incoming KAD callback connections (source -> file_hash)
@@ -5153,6 +5155,18 @@ pub(crate) fn index_offers_hash(index: &LocalIndex, hash: &[u8; 16]) -> bool {
 /// Entries whose hash doesn't decode to at least 16 bytes are skipped rather
 /// than aborting the whole answer — a single corrupt index row shouldn't
 /// hide the rest of the user's shares from a legitimate browse request.
+/// Our ID and port as a browse answer lists them beside each file. eMule's
+/// `CreateOfferedFilePacket` names us only while `IsConnected() &&
+/// !IsFirewalled()`, which is exactly a HighID from `GetID()`, and writes 0/0
+/// otherwise.
+fn browse_answer_owner(hello_client_id: u32, tcp_port: u16) -> (u32, u16) {
+    if is_low_client_id(hello_client_id) {
+        (0, 0)
+    } else {
+        (hello_client_id, tcp_port)
+    }
+}
+
 fn encode_shared_files_answer(
     files: &[(String, String, u64, String)],
     client_id: u32,
@@ -5470,10 +5484,9 @@ pub async fn start_upload_server(
     // Set true when a firewall-probe IP connects back; network loop consumes it.
     tcp_connect_back_shared: Arc<std::sync::atomic::AtomicBool>,
     // Our current external IPv4 in ed2k HighID encoding (little-endian u32
-    // of the four IP octets), or 0 when we don't yet have a trusted public
-    // IP to advertise. Kept in sync with `NetworkState::external_ip` by
-    // `set_external_ip` in network/mod.rs so this listener always reads the
-    // freshest value without taking a lock.
+    // of the four IP octets), or 0 when unknown. Kept in sync with
+    // `NetworkState::external_ip` by `set_external_ip` so this listener
+    // always reads the freshest value without taking a lock.
     external_ip_shared: Arc<std::sync::atomic::AtomicU32>,
     pending_kad_callbacks: PendingKadCallbacks,
     kad_callback_tx: tokio::sync::mpsc::Sender<KadCallbackParts>,
@@ -6953,15 +6966,10 @@ impl UploadHandler {
     ///
     /// Only files the user actively shares (`FileInfo::shared`) are
     /// included — this mirrors what the Settings/Library UI calls "shared",
-    /// not in-progress downloads. `client_id`/`self.tcp_port` are our real
-    /// identity (not the server's magic compression IDs): this answer goes
-    /// straight to the peer that already has our real address, so there's
-    /// nothing to obscure.
-    async fn build_shared_files_answer(
-        &self,
-        client_id: u32,
-        peer_supports_large_files: bool,
-    ) -> Vec<u8> {
+    /// not in-progress downloads. Our ID and port are the real ones (not the
+    /// server's magic compression IDs) when we are HighID; see
+    /// [`browse_answer_owner`].
+    async fn build_shared_files_answer(&self, peer_supports_large_files: bool) -> Vec<u8> {
         // Real libraries rarely exceed a few hundred thousand files; this
         // bounds the worst case (huge or pathological index) so a single
         // browse request can't force us to build and hold an unbounded
@@ -6998,12 +7006,9 @@ impl UploadHandler {
                 .collect()
         };
 
-        encode_shared_files_answer(
-            &files,
-            client_id,
-            self.advertised_tcp_port(),
-            peer_supports_large_files,
-        )
+        let (client_id, tcp_port) =
+            browse_answer_owner(hello_client_id(), self.advertised_tcp_port());
+        encode_shared_files_answer(&files, client_id, tcp_port, peer_supports_large_files)
     }
 
     /// The browsable set, with the folder each file sits in.
@@ -7099,17 +7104,18 @@ impl UploadHandler {
         &self,
         requested: &str,
         files: &[BrowseEntry],
-        client_id: u32,
         peer_supports_large_files: bool,
     ) -> Vec<u8> {
         let mut buf = Vec::new();
         // Echoed verbatim, as eMule does with `strOrgReqDir` — the asker keys
         // its pending request on the exact string it sent.
         super::messages::write_ed2k_string(&mut buf, requested);
+        let (client_id, tcp_port) =
+            browse_answer_owner(hello_client_id(), self.advertised_tcp_port());
         buf.extend_from_slice(&encode_shared_files_answer(
             files,
             client_id,
-            self.advertised_tcp_port(),
+            tcp_port,
             peer_supports_large_files,
         ));
         buf
@@ -7924,9 +7930,7 @@ impl UploadHandler {
     ) -> anyhow::Result<()> {
         {
             // Outbound Hello (we initiate: send OP_HELLO, expect OP_HELLOANSWER).
-            let our_client_id = self
-                .external_ip_shared
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let our_client_id = hello_client_id();
             let buddy = self.shared_buddy_info.read().await.clone();
             let hello_options = self.hello_options().await;
             let nickname = self.nickname_snapshot().await;
@@ -8356,9 +8360,7 @@ impl UploadHandler {
 
                 let buddy = self.shared_buddy_info.read().await.clone();
                 let hello_options = self.hello_options().await;
-                let our_client_id = self
-                    .external_ip_shared
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let our_client_id = hello_client_id();
                 let nickname = self.nickname_snapshot().await;
                 let hello_payload = build_hello_answer_with_buddy_opts(
                     &self.user_hash,
@@ -8538,15 +8540,7 @@ impl UploadHandler {
 
                                 let buddy = self.shared_buddy_info.read().await.clone();
                                 let hello_options = self.hello_options().await;
-                                // Advertise our real HighID client_id when we have a
-                                // trusted public IP. Falls back to `0` pre-handshake,
-                                // which stock eMule auto-heals from the connect IP
-                                // (BaseClient.cpp:608) but strict/older clients may
-                                // interpret as LowID. See the
-                                // `external_ip_shared` field docs.
-                                let our_client_id = self
-                                    .external_ip_shared
-                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                let our_client_id = hello_client_id();
                                 let nickname = self.nickname_snapshot().await;
                                 let hello_payload = build_hello_answer_with_buddy_opts(
                                     &self.user_hash,
@@ -8724,11 +8718,7 @@ impl UploadHandler {
 
                         let buddy = self.shared_buddy_info.read().await.clone();
                         let hello_options = self.hello_options().await;
-                        // Advertise our real HighID client_id when known (see the
-                        // matching block in the obfuscated path above for rationale).
-                        let our_client_id = self
-                            .external_ip_shared
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let our_client_id = hello_client_id();
                         let nickname = self.nickname_snapshot().await;
                         let hello_payload = build_hello_answer_with_buddy_opts(
                             &self.user_hash,
@@ -10874,21 +10864,14 @@ impl UploadHandler {
                         // stuck in IS_IDNEEDED / IS_IDFAILED and renders
                         // "Identification: Invalid".
                         if let Some((challenge, state)) = pending_peer_challenge.take() {
-                            // Pass our actual public IPv4 (from
-                            // `external_ip_shared`) so the signed
-                            // response selects CRYPT_CIP_LOCALCLIENT
-                            // consistently with our HighID Hello
-                            // advertisement. Hardcoding 0 here was a
-                            // leftover from when this handler didn't
-                            // know our external IP and forced every
-                            // signed response into REMOTECLIENT mode —
-                            // which verifies fine but advertises us as
-                            // LowID for SecIdent purposes, blocking
-                            // peers from caching our credit record
-                            // under our public IP.
-                            let our_client_id = self
-                                .external_ip_shared
-                                .load(std::sync::atomic::Ordering::Relaxed);
+                            // eMule's `SendSignaturePacket` signs
+                            // CRYPT_CIP_LOCALCLIENT over its own ID only
+                            // when that ID is a HighID, and otherwise
+                            // CRYPT_CIP_REMOTECLIENT over the peer's IP.
+                            // The ID is the one our Hello advertised, so
+                            // a LowID node never vouches for an address
+                            // it told the peer it cannot be reached at.
+                            let our_client_id = hello_client_id();
                             super::transfer::respond_to_secident_challenge(
                                 &mut writer,
                                 Some(&self.credit_manager),
@@ -10969,13 +10952,9 @@ impl UploadHandler {
                             "Deferred SecIdent challenge from {peer_addr} — awaiting their public key"
                         );
                     } else {
-                        // See the OP_PUBLICKEY handler above — pass our
-                        // public IP so the signed response uses
-                        // CRYPT_CIP_LOCALCLIENT when we're HighID
-                        // instead of always REMOTECLIENT.
-                        let our_client_id = self
-                            .external_ip_shared
-                            .load(std::sync::atomic::Ordering::Relaxed);
+                        // Signed over our Hello ID, as in the
+                        // OP_PUBLICKEY handler above.
+                        let our_client_id = hello_client_id();
                         super::transfer::respond_to_secident_challenge(
                             &mut writer,
                             Some(&self.credit_manager),
@@ -11001,9 +10980,13 @@ impl UploadHandler {
                     // blocks upload-credit accrual for the rest of the
                     // session even though the peer's signature was
                     // actually valid. The helper computes `local_ip`
-                    // from `our_client_id` the same way transfer.rs
+                    // from what we pass the same way transfer.rs
                     // does for downloads.
-                    let our_client_id = self
+                    //
+                    // Our public IP, not our Hello ID: a REMOTECLIENT
+                    // signature covers the address the peer sees us at,
+                    // which is the public one even while we are LowID.
+                    let our_public_ip = self
                         .external_ip_shared
                         .load(std::sync::atomic::Ordering::Relaxed);
                     let verified_here = super::transfer::handle_secident_signature(
@@ -11013,7 +10996,7 @@ impl UploadHandler {
                         peer_addr,
                         peer_secure_ident_level,
                         &payload,
-                        our_client_id,
+                        our_public_ip,
                     ).await;
                     if verified_here {
                         secident_verified_here = true;
@@ -13463,14 +13446,8 @@ impl UploadHandler {
                             continue;
                         }
                         last_browse = Some(std::time::Instant::now());
-                        let client_id = self
-                            .external_ip_shared
-                            .load(std::sync::atomic::Ordering::Relaxed);
                         let resp = self
-                            .build_shared_files_answer(
-                                client_id,
-                                hello_caps.supports_large_files,
-                            )
+                            .build_shared_files_answer(hello_caps.supports_large_files)
                             .await;
                         // A full shared-file listing can reach ~500 KiB from a
                         // 6-byte request. `MIN_BROWSE_INTERVAL` bounds the rate
@@ -13613,13 +13590,9 @@ impl UploadHandler {
                     let files = dir_browse
                         .as_ref()
                         .map_or(&[][..], |listing| listing.files_in(&requested));
-                    let client_id = self
-                        .external_ip_shared
-                        .load(std::sync::atomic::Ordering::Relaxed);
                     let resp = self.build_shared_files_dir_answer(
                         &requested,
                         files,
-                        client_id,
                         hello_caps.supports_large_files,
                     );
                     self.acquire_upload_bandwidth((6 + resp.len()) as u64)
@@ -16151,13 +16124,19 @@ fn compute_part_hashes(file: &mut std::fs::File) -> anyhow::Result<Vec<[u8; 16]>
 /// `size / PARTSIZE + 1` hashes (`GetTheoreticalMD4PartHashCount`,
 /// `FileIdentifier.cpp:187, :226-234`), throwing "bad hashset" otherwise —
 /// which sets `DS_ERROR` and dead-sources us for that file.
+///
+/// The trailing entry is always our own `MD4("")`, whether the input carried
+/// one or not: a stored n+1 set (a known.met or part.met written by eMule)
+/// passes `verify_hashset` whatever its last entry holds, and serving that
+/// entry on would fail eMule's own check of the set.
 fn wire_md4_hashset(mut hashes: Vec<[u8; 16]>, file_size: u64) -> Vec<[u8; 16]> {
     use digest::Digest;
-    if file_size > 0
-        && file_size.is_multiple_of(PARTSIZE)
-        && hashes.len() as u64 == file_size / PARTSIZE
-    {
-        hashes.push(md4::Md4::digest(b"").into());
+    if file_size > 0 && file_size.is_multiple_of(PARTSIZE) {
+        let parts = (file_size / PARTSIZE) as usize;
+        if hashes.len() == parts || hashes.len() == parts + 1 {
+            hashes.truncate(parts);
+            hashes.push(md4::Md4::digest(b"").into());
+        }
     }
     hashes
 }
@@ -17930,6 +17909,35 @@ mod abuse_and_seniority_tests {
         assert_eq!(wire_md4_hashset(already.clone(), PARTSIZE * 2), already);
     }
 
+    /// A stored n+1 set passes `verify_hashset` whatever its last entry is;
+    /// what goes on the wire must still end in MD4("").
+    #[test]
+    fn wire_hashset_replaces_a_stray_trailing_entry_with_the_empty_part() {
+        use digest::Digest;
+        let empty: [u8; 16] = md4::Md4::digest(b"").into();
+        let stray = vec![[1u8; 16], [2u8; 16], [0xEE; 16]];
+        assert_eq!(
+            wire_md4_hashset(stray, PARTSIZE * 2),
+            vec![[1u8; 16], [2u8; 16], empty]
+        );
+        let one_part_stray = vec![[1u8; 16], [0xEE; 16]];
+        assert_eq!(
+            wire_md4_hashset(one_part_stray, PARTSIZE),
+            vec![[1u8; 16], empty]
+        );
+    }
+
+    /// eMule lists our address beside each browsed file only when it is one a
+    /// peer can dial.
+    #[test]
+    fn browse_answer_names_us_only_as_a_highid() {
+        let high = u32::from_le_bytes([203, 0, 113, 7]);
+        assert_eq!(browse_answer_owner(high, 4662), (high, 4662));
+        assert_eq!(browse_answer_owner(0x0012_3456, 4662), (0, 0));
+        assert_eq!(browse_answer_owner(1, 4662), (0, 0));
+        assert_eq!(browse_answer_owner(0, 4662), (0, 0));
+    }
+
     /// The purge clock has to be the last *request*, not the join time, or a peer
     /// that re-asks exactly as the protocol tells it to is still evicted an hour
     /// after it arrived — and a peer behind a long queue can then never reach the
@@ -19588,6 +19596,35 @@ mod abuse_and_seniority_tests {
             Some(vec![[0x55; 16]]),
             "a file under one part is its own part hash"
         );
+    }
+
+    /// eMule's known.met keeps n+1 hashes for an exact multiple of PARTSIZE.
+    /// The stored extra entry, whatever it holds, is never what we serve.
+    #[test]
+    fn an_exact_multiples_stored_extra_hash_is_replaced_on_the_wire() {
+        use digest::Digest;
+        let empty: [u8; 16] = md4::Md4::digest(b"").into();
+        let parts = vec![[0x11u8; 16], [0x22u8; 16]];
+        let file_size = PARTSIZE * 2;
+        let file_hash: [u8; 16] = md4::Md4::digest([parts.concat(), empty.to_vec()].concat()).into();
+        let canonical = vec![[0x11u8; 16], [0x22u8; 16], empty];
+
+        let served = |stored: Vec<[u8; 16]>| {
+            let mut known = crate::storage::known_files::KnownFileList::new();
+            known.add_or_update(known_record(file_hash, file_size, stored));
+            let records: SharedKnownRecords = Default::default();
+            publish_known_records(&records, &known);
+            stored_md4_hashset(&records, &file_hash, file_size, Some(0))
+        };
+        for stored in [parts.clone(), canonical.clone()] {
+            let hashes = served(stored.clone());
+            assert_eq!(hashes.as_ref(), Some(&parts), "stored {stored:02x?}");
+            assert_eq!(wire_md4_hashset(hashes.unwrap(), file_size), canonical);
+        }
+        // Either refused (the file is hashed instead) or served canonically.
+        if let Some(hashes) = served(vec![[0x11u8; 16], [0x22u8; 16], [0xEE; 16]]) {
+            assert_eq!(wire_md4_hashset(hashes, file_size), canonical);
+        }
     }
 
     /// Block requests are gap-driven, so a short mid-file range is normal —

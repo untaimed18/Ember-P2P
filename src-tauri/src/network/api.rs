@@ -150,6 +150,11 @@ pub enum NetworkCommand {
     PauseDownload {
         transfer_id: String,
     },
+    /// A download's priority changed: re-rank its pending source discovery.
+    SetPendingPriority {
+        transfer_id: String,
+        priority: String,
+    },
     BootstrapContacts {
         contacts: Vec<kad::types::KadContact>,
         tx: oneshot::Sender<usize>,

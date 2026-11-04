@@ -293,6 +293,7 @@ pub(super) async fn promote_kad_connected_and_first_publish(
         return;
     }
     state.stats.status = NetworkStatus::Connected;
+    crate::network::kad_io::refresh_hello_client_id(state);
     let _ = app_handle.emit("network-status", NetworkStatus::Connected);
     if state.first_publish_done {
         return;

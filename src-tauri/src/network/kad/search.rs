@@ -1452,6 +1452,9 @@ pub struct SearchManager {
     /// `start_search` so finalize can run immediately. Drained by the main
     /// loop via `drain_pending_release`.
     pending_release: Vec<KadId>,
+    /// Targets of live `FindSource` searches evicted to make room, so the
+    /// source sweep can hand their files back the search they lost.
+    evicted_source_targets: Vec<KadId>,
 }
 
 impl SearchManager {
@@ -1482,7 +1485,13 @@ impl SearchManager {
             active: HashMap::new(),
             target_map: HashMap::new(),
             pending_release: Vec::new(),
+            evicted_source_targets: Vec::new(),
         }
+    }
+
+    /// Targets of `FindSource` searches evicted since the last call.
+    pub fn take_evicted_source_targets(&mut self) -> Vec<KadId> {
+        std::mem::take(&mut self.evicted_source_targets)
     }
 
     /// Start a search. Returns `(new_id, evicted_ids, released_in_use, preserved_results)`.
@@ -1555,27 +1564,42 @@ impl SearchManager {
             }
             if self.active_count() >= MAX_ACTIVE_SEARCHES {
                 let new_importance = Self::search_importance(search_type);
-                let eviction = self
-                    .active
-                    .iter()
-                    .filter(|(_, state)| {
-                        !state.completed
-                            && Self::search_importance(state.search_type) <= new_importance
-                    })
-                    .min_by_key(|(_, state)| {
-                        (
-                            Self::search_importance(state.search_type),
-                            state.started_at,
-                            state.id.0,
-                        )
-                    })
-                    .map(|(id, _)| *id);
+                let is_source = |t: SearchType| matches!(t, SearchType::FindSource { .. });
+                // A source search never takes a live slot, as eMule only starts
+                // one while Kad has room (`KADEMLIATOTALFILE`). Evicting another
+                // file's lookup, or a publish, cost that file its search while
+                // its reask wait still ran. Other searches take a source search
+                // only when nothing else can go.
+                let eviction = if is_source(search_type) {
+                    None
+                } else {
+                    self.active
+                        .iter()
+                        .filter(|(_, state)| {
+                            !state.completed
+                                && Self::search_importance(state.search_type) <= new_importance
+                        })
+                        .min_by_key(|(_, state)| {
+                            (
+                                is_source(state.search_type),
+                                Self::search_importance(state.search_type),
+                                state.started_at,
+                                state.id.0,
+                            )
+                        })
+                        .map(|(id, _)| *id)
+                };
 
                 if let Some(id) = eviction {
                     if let Some(mut state) = self.active.remove(&id) {
                         let old_key = (state.target, state.search_type);
                         if self.target_map.get(&old_key) == Some(&id) {
                             self.target_map.remove(&old_key);
+                        }
+                        if is_source(state.search_type)
+                            && self.evicted_source_targets.len() < MAX_ACTIVE_SEARCHES
+                        {
+                            self.evicted_source_targets.push(state.target);
                         }
                         if state.search_type.accepts_search_results() && !state.results.is_empty() {
                             preserved_results
@@ -2947,5 +2971,45 @@ mod tests {
         assert!(source_ids.contains(&evicted[0]));
         assert!(manager.get(&keyword).is_some());
         assert!(manager.get(&evicted[0]).is_none());
+        assert_eq!(
+            manager.take_evicted_source_targets().len(),
+            1,
+            "the evicted source search is reported so its file's wait can be undone"
+        );
+        assert!(manager.take_evicted_source_targets().is_empty());
+    }
+
+    #[test]
+    fn find_source_at_the_active_cap_evicts_nothing() {
+        let mut manager = SearchManager::new();
+        for i in 0..10u8 {
+            let (sid, ..) = manager.start_search(kad_id(i), SearchType::StoreKeyword, Vec::new());
+            assert_ne!(sid, SearchId(0));
+        }
+        for i in 10..20u8 {
+            let (sid, ..) =
+                manager.start_search(kad_id(i), SearchType::FindSource { file_size: 1 }, Vec::new());
+            assert_ne!(sid, SearchId(0));
+        }
+        let (sid, evicted, ..) =
+            manager.start_search(kad_id(30), SearchType::FindSource { file_size: 1 }, Vec::new());
+        assert_eq!(sid, SearchId(0), "deferred, not started over another search");
+        assert!(evicted.is_empty(), "neither a publish nor another file's lookup is evicted");
+        assert_eq!(manager.active_count(), 20);
+        assert!(manager.take_evicted_source_targets().is_empty());
+    }
+
+    #[test]
+    fn find_keyword_prefers_any_other_search_over_a_source_search() {
+        let mut manager = SearchManager::new();
+        for i in 0..19u8 {
+            manager.start_search(kad_id(i), SearchType::FindSource { file_size: 1 }, Vec::new());
+        }
+        let (node, ..) = manager.start_search(kad_id(19), SearchType::FindNode, Vec::new());
+        let (keyword, evicted, ..) =
+            manager.start_search(kad_id(21), SearchType::FindKeyword, Vec::new());
+        assert_ne!(keyword, SearchId(0));
+        assert_eq!(evicted, vec![node]);
+        assert!(manager.take_evicted_source_targets().is_empty());
     }
 }

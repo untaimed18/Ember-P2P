@@ -196,6 +196,11 @@ const MAX_CALLBACK_REASKS: u32 = 6;
 /// still-banned peer is refused locally and no packet leaves.
 const BANNED_PARK_SECS: u64 = 3600;
 
+/// `fail_count` at which a `Failed` row is retired; see
+/// [`PerFileSourceList::retire_failing_sources`]. Three plain connect
+/// failures, or one permanent one.
+const RETIRE_FAIL_COUNT: u32 = 3;
+
 fn source_state_blocks_outbound_tcp(state: &DownloadSourceState) -> bool {
     matches!(
         state,
@@ -499,8 +504,12 @@ impl DownloadSourceEntry {
     /// Only a source that has us queued: `CPartFile::Process` calls
     /// `UDPReaskForDownload` from its `DS_ONQUEUE` case alone. A failed source
     /// has no queue entry to keep, and is retried over TCP on its own timer.
+    ///
+    /// Not gated on `udp_port`: rows from server answers, source exchange and
+    /// A4AF are created without one, and the port the peer's Hello carried is
+    /// recorded in the `SourceManager`, where the caller looks it up.
     pub fn needs_udp_reask(&self) -> bool {
-        if self.udp_port == 0 {
+        if self.ip.is_unspecified() {
             return false;
         }
         // Gate on the most recent ask of EITHER kind so we neither spam UDP
@@ -605,6 +614,17 @@ impl PerFileSourceList {
 
     pub fn add_source_full(&mut self, ip: Ipv4Addr, tcp_port: u16, udp_port: u16) -> bool {
         self.add_source_with_identity(ip, tcp_port, udp_port, None)
+    }
+
+    /// Record the UDP port of the row at `ip:tcp_port`, when there is one to
+    /// record. `apply_udp_reask_ack` finds the row by it.
+    pub fn learn_udp_port(&mut self, ip: Ipv4Addr, tcp_port: u16, udp_port: u16) {
+        if udp_port == 0 || ip.is_unspecified() {
+            return;
+        }
+        if let Some(s) = self.find_mut(ip, tcp_port, None) {
+            s.udp_port = udp_port;
+        }
     }
 
     /// Register a KAD callback source. Firewalled type 3/5 publishes omit
@@ -840,6 +860,25 @@ impl PerFileSourceList {
         if let Some(s) = self.find_mut(ip, port, user_hash) {
             s.state = DownloadSourceState::Connecting;
             s.last_asked = Instant::now();
+            s.state_changed = Instant::now();
+        }
+    }
+
+    /// Hold a source just handed to a running worker, so rediscovery does not
+    /// hand it over again before the worker dials it or lets it go.
+    ///
+    /// Unlike [`Self::set_connecting`] this does not stamp `last_asked`: the
+    /// worker may never dial it, and a row reset from `Connecting` would then
+    /// sit out a whole reask interval without having been asked. A row never
+    /// asked at all is armed instead, since its creation stamp is not an ask.
+    pub fn claim_for_inject(&mut self, ip: Ipv4Addr, port: u16) {
+        if let Some(s) = self.find_mut(ip, port, None) {
+            if matches!(s.state, DownloadSourceState::New) {
+                s.last_asked = Instant::now()
+                    .checked_sub(Duration::from_secs(FILEREASKTIME_SECS as u64 + 1))
+                    .unwrap_or(s.last_asked);
+            }
+            s.state = DownloadSourceState::Connecting;
             s.state_changed = Instant::now();
         }
     }
@@ -1169,11 +1208,46 @@ impl PerFileSourceList {
     /// this placeholder to `WaitCallbackKad` and lets the existing Ember
     /// hole-punch/relay broker path take over — rather than the source
     /// permanently sitting as a dead end.
+    ///
+    /// A row that is connecting, transferring or queued keeps its state, for
+    /// the reasons on [`callback_park_would_interrupt`].
     pub fn set_low_to_low(&mut self, ip: Ipv4Addr, port: u16, user_hash: Option<[u8; 16]>) {
         if let Some(s) = self.find_mut(ip, port, user_hash) {
+            if callback_park_would_interrupt(&s.state) {
+                return;
+            }
             s.state = DownloadSourceState::LowToLowIp;
             s.state_changed = Instant::now();
         }
+    }
+
+    /// We can be called back now, so release every `LowToLowIp` park.
+    ///
+    /// The park never comes due, so otherwise only a fresh report of the peer
+    /// ends it, and that can be hours away. A row with a callback buddy goes
+    /// back to the callback route with a fresh budget; one with an address we
+    /// may dial goes back to `New`. Returns how many moved.
+    pub fn release_low_to_low_parks(&mut self) -> usize {
+        let mut released = 0;
+        for s in &mut self.sources {
+            if !matches!(s.state, DownloadSourceState::LowToLowIp) {
+                continue;
+            }
+            let has_callback_route = s.callback_buddy_ip.is_some()
+                && (s.callback_buddy_hash.is_some() || s.callback_ember_buddy_noise.is_some());
+            if has_callback_route {
+                s.state = DownloadSourceState::WaitCallbackKad;
+                s.arm_callback_reask();
+            } else if !s.ip.is_unspecified() && s.tcp_port != 0 && !s.callback_addr_unverified_claim
+            {
+                s.state = DownloadSourceState::New;
+            } else {
+                continue;
+            }
+            s.state_changed = Instant::now();
+            released += 1;
+        }
+        released
     }
 
     /// Both sides are Low-ID but Ember relay/hole-punch is being attempted.
@@ -1428,6 +1502,43 @@ impl PerFileSourceList {
     /// Remove persistently bad sources after repeated failures.
     pub fn purge_dead_sources(&mut self) {
         self.sources.retain(|s| s.fail_count <= 8);
+    }
+
+    /// Remove the sources whose attempts keep failing and return them as
+    /// `(ip, tcp_port, is_firewalled)`, for the caller to block and forget.
+    ///
+    /// eMule drops a source whose connection fails and blocks it in the dead
+    /// source list (`CDownloadQueue::RemoveSource`, `DeadSourceList.cpp`).
+    /// Ember retries a failed row on its reask timer instead, and since a
+    /// queue rank or a transfer pays the count back, a row reaching
+    /// [`RETIRE_FAIL_COUNT`] in `Failed` has failed that often with nothing
+    /// to show for it. Only `Failed` rows qualify: every other state either
+    /// has a session behind it or was never dialed.
+    pub fn retire_failing_sources(&mut self) -> Vec<(Ipv4Addr, u16, bool)> {
+        let mut retired = Vec::new();
+        self.sources.retain(|s| {
+            let retire = matches!(s.state, DownloadSourceState::Failed)
+                && s.fail_count >= RETIRE_FAIL_COUNT
+                && !s.ip.is_unspecified();
+            if retire {
+                retired.push((s.ip, s.tcp_port, s.callback_buddy_ip.is_some()));
+            }
+            !retire
+        });
+        retired
+    }
+
+    /// Keep a source A4AF has just moved to another file, cooled off for this
+    /// one, as eMule keeps it in the file's A4AF list instead of deleting it.
+    /// It is already queued for the other file, so this file leaves it alone
+    /// for the no-needed-parts interval.
+    pub fn cool_after_a4af_swap(&mut self, ip: Ipv4Addr, port: u16) {
+        if let Some(s) = self.find_mut(ip, port, None) {
+            let now = Instant::now();
+            s.state = DownloadSourceState::NoneNeededParts;
+            s.state_changed = now;
+            s.last_asked = now;
+        }
     }
 
     /// Reset sources stuck in Connecting/Downloading back to Failed so they
@@ -1693,6 +1804,24 @@ impl SourceManager {
         origin: Option<crate::types::SourceOrigin>,
     ) {
         self.register_source_with_hash(file_hash, ip, tcp_port, [0u8; 16], origin);
+    }
+
+    /// [`Self::register_source`] for a source a starting worker was seeded
+    /// with, which leaves a row we already hold untouched.
+    ///
+    /// Re-registering refreshed `last_seen`, which is what says some network
+    /// still reports the peer. Every worker start did it for every row it
+    /// read, so peers nobody had mentioned in hours counted as live sources
+    /// forever, and once enough had piled up `wants_more_sources` turned
+    /// discovery off.
+    pub fn register_source_if_absent(&mut self, file_hash: [u8; 16], ip: Ipv4Addr, tcp_port: u16) {
+        let known = self
+            .sources
+            .get(&file_hash)
+            .is_some_and(|entries| entries.iter().any(|e| e.ip == ip && e.tcp_port == tcp_port));
+        if !known {
+            self.register_source(file_hash, ip, tcp_port, None);
+        }
     }
 
     pub fn register_source_with_hash(
@@ -5665,5 +5794,184 @@ mod tests {
         }
 
         assert_eq!(pfs.sources_needing_udp_reask(), vec![(queued, 4662, 4672)]);
+    }
+
+    /// A queued row found by a server, source exchange or A4AF has no UDP port
+    /// of its own, and is still due; the port found elsewhere is kept on it.
+    #[test]
+    fn a_queued_source_without_a_udp_port_is_still_due() {
+        let hash = [0x78; 16];
+        let ip = Ipv4Addr::new(198, 51, 100, 9);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+        assert!(pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 4662, 0, Some([0x79; 16])));
+        for row in &mut pfs.sources {
+            row.state = DownloadSourceState::OnQueue { rank: None };
+            row.last_asked = Instant::now() - Duration::from_secs(FILEREASKTIME_SECS as u64);
+            row.last_udp_reask = row.last_asked;
+        }
+
+        assert_eq!(pfs.sources_needing_udp_reask(), vec![(ip, 4662, 0)]);
+
+        pfs.learn_udp_port(ip, 4662, 4672);
+        pfs.learn_udp_port(ip, 4662, 0);
+        assert_eq!(pfs.sources[0].udp_port, 4672, "a zero port never overwrites a known one");
+        pfs.apply_udp_reask_ack(ip, 4672, Some(7), None);
+        assert!(matches!(
+            pfs.sources[0].state,
+            DownloadSourceState::OnQueue { rank: Some(7) }
+        ));
+    }
+
+    /// The LowID-to-LowID park is a callback park too, and must not break off
+    /// a session or a queue place any more than the others do.
+    #[test]
+    fn low_to_low_does_not_park_a_live_row() {
+        let hash = [0x7A; 16];
+        let ip = Ipv4Addr::new(198, 51, 100, 10);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_full(ip, 4662, 0));
+        pfs.set_on_queue(ip, 4662, Some(4), None);
+        pfs.set_low_to_low(ip, 4662, None);
+        assert!(matches!(pfs.sources[0].state, DownloadSourceState::OnQueue { .. }));
+        pfs.set_downloading(ip, 4662, None);
+        pfs.set_low_to_low(ip, 4662, None);
+        assert!(matches!(pfs.sources[0].state, DownloadSourceState::Downloading));
+        pfs.set_failed_with_penalty(ip, 4662, 1, None);
+        pfs.set_low_to_low(ip, 4662, None);
+        assert!(matches!(pfs.sources[0].state, DownloadSourceState::LowToLowIp));
+    }
+
+    #[test]
+    fn releasing_low_to_low_parks_restores_a_route() {
+        let hash = [0x7B; 16];
+        let buddied = Ipv4Addr::new(198, 51, 100, 11);
+        let dialable = Ipv4Addr::new(198, 51, 100, 12);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_full(buddied, 4662, 0));
+        assert!(pfs.add_source_full(dialable, 4662, 0));
+        assert!(pfs.add_source_with_identity(Ipv4Addr::UNSPECIFIED, 0, 0, Some([0x7C; 16])));
+        pfs.set_kad_callback_buddy(
+            buddied,
+            4662,
+            Ipv4Addr::new(203, 0, 113, 1),
+            4672,
+            [0xAB; 16],
+            None,
+            true,
+        );
+        for _ in 0..MAX_CALLBACK_REASKS {
+            pfs.mark_callback_requested(buddied, 4662, None);
+        }
+        for row in &mut pfs.sources {
+            row.state = DownloadSourceState::LowToLowIp;
+        }
+
+        assert_eq!(pfs.release_low_to_low_parks(), 2);
+        let row = &pfs.sources[0];
+        assert!(matches!(row.state, DownloadSourceState::WaitCallbackKad));
+        assert!(row.kad_callback_reask_due(), "a fresh callback budget, due at once");
+        assert!(matches!(pfs.sources[1].state, DownloadSourceState::New));
+        assert!(
+            matches!(pfs.sources[2].state, DownloadSourceState::LowToLowIp),
+            "no buddy and no address: nothing to retry it with"
+        );
+        assert_eq!(pfs.release_low_to_low_parks(), 0);
+    }
+
+    /// Handing a source to a worker is not asking it.
+    #[test]
+    fn an_inject_claim_does_not_count_as_an_ask() {
+        let hash = [0x7D; 16];
+        let failed = Ipv4Addr::new(198, 51, 100, 13);
+        let fresh = Ipv4Addr::new(198, 51, 100, 14);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_full(failed, 4662, 0));
+        assert!(pfs.add_source_full(fresh, 4662, 0));
+        pfs.set_failed_with_penalty(failed, 4662, 1, None);
+        let asked = Instant::now() - Duration::from_secs(FILEREASKTIME_SECS as u64 + 5);
+        pfs.sources[0].last_asked = asked;
+
+        pfs.claim_for_inject(failed, 4662);
+        pfs.claim_for_inject(fresh, 4662);
+        assert!(matches!(pfs.sources[0].state, DownloadSourceState::Connecting));
+        assert_eq!(pfs.sources[0].last_asked, asked);
+
+        // The worker let both go without dialing.
+        pfs.reset_active_states();
+        assert_eq!(pfs.sources[0].time_until_reask(), 0);
+        assert_eq!(pfs.sources[1].time_until_reask(), 0, "never asked, so not benched");
+        assert!(pfs.sources[1].can_try_tcp());
+    }
+
+    #[test]
+    fn only_repeatedly_failed_rows_are_retired() {
+        let hash = [0x7E; 16];
+        let dead = Ipv4Addr::new(198, 51, 100, 15);
+        let once = Ipv4Addr::new(198, 51, 100, 16);
+        let queued = Ipv4Addr::new(198, 51, 100, 17);
+        let firewalled = Ipv4Addr::new(198, 51, 100, 18);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        for ip in [dead, once, queued, firewalled] {
+            assert!(pfs.add_source_full(ip, 4662, 0));
+        }
+        for _ in 0..RETIRE_FAIL_COUNT {
+            pfs.set_failed_with_penalty(dead, 4662, 1, None);
+        }
+        pfs.set_failed_with_penalty(once, 4662, 1, None);
+        pfs.set_failed_with_penalty(queued, 4662, 4, None);
+        pfs.set_on_queue(queued, 4662, Some(9), None);
+        pfs.set_kad_callback_buddy(
+            firewalled,
+            4662,
+            Ipv4Addr::new(203, 0, 113, 2),
+            4672,
+            [0xCD; 16],
+            None,
+            false,
+        );
+        pfs.set_failed_with_penalty(firewalled, 4662, 4, None);
+
+        let mut retired = pfs.retire_failing_sources();
+        retired.sort();
+        assert_eq!(retired, vec![(dead, 4662, false), (firewalled, 4662, true)]);
+        let left: Vec<Ipv4Addr> = pfs.sources.iter().map(|s| s.ip).collect();
+        assert_eq!(left, vec![once, queued]);
+    }
+
+    /// A4AF keeps the source on the file it moved away from, resting.
+    #[test]
+    fn an_a4af_swap_cools_the_old_row_instead_of_deleting_it() {
+        let hash = [0x7F; 16];
+        let ip = Ipv4Addr::new(198, 51, 100, 19);
+        let mut pfs = PerFileSourceList::new(hash, MAX_SOURCES_PER_FILE);
+        assert!(pfs.add_source_full(ip, 4662, 4672));
+        pfs.set_none_needed_parts(ip, 4662, None);
+        pfs.sources[0].last_asked = Instant::now() - Duration::from_secs(2 * FILEREASKTIME_SECS as u64);
+        assert_eq!(pfs.sources[0].time_until_reask(), 0);
+
+        pfs.cool_after_a4af_swap(ip, 4662);
+        assert_eq!(pfs.sources.len(), 1);
+        assert!(matches!(pfs.sources[0].state, DownloadSourceState::NoneNeededParts));
+        assert!(pfs.sources[0].time_until_reask() > FILEREASKTIME_SECS as u64);
+    }
+
+    /// Seeding a worker must not pass for a fresh report of the peer.
+    #[test]
+    fn registering_a_seeded_source_leaves_a_known_row_alone() {
+        let hash = [0x80; 16];
+        let known = Ipv4Addr::new(198, 51, 100, 20);
+        let new = Ipv4Addr::new(198, 51, 100, 21);
+        let mut sm = SourceManager::new();
+        sm.register_source(hash, known, 4662, None);
+        let stale = chrono::Utc::now().timestamp() - SOURCE_EXPIRY_SECS - 60;
+        sm.sources.get_mut(&hash).unwrap()[0].last_seen = stale;
+
+        sm.register_source_if_absent(hash, known, 4662);
+        sm.register_source_if_absent(hash, new, 4662);
+        let entries = &sm.sources[&hash];
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].last_seen, stale);
+        assert_eq!(sm.source_count(&hash), 1, "the stale row no longer counts");
     }
 }

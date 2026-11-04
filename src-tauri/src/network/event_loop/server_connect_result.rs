@@ -121,6 +121,7 @@ pub(in crate::network) async fn on_server_connect_result(
                 );
             }
             state.server_connected = true;
+            refresh_hello_client_id(state);
             state.server_last_attempt_failed = false;
             ed2k::server::set_server_flags_mirror(session.server_flags);
             ed2k::server::set_server_session_up(true);
@@ -257,7 +258,8 @@ pub(in crate::network) async fn on_server_connect_result(
                     // SetPublicIP(dwServerReportedIP)`. LowID keeps us
                     // firewalled, so unlike the HighID branch we do NOT touch
                     // firewalled status here beyond note_tcp_firewalled above;
-                    // this only teaches us our external IP.
+                    // this only teaches us our external IP. Our Hellos keep
+                    // advertising the LowID (`hello_client_id_for`).
                     let ext_ip = Ipv4Addr::from(session.server_reported_ip.to_le_bytes());
                     if !crate::security::is_special_use_v4(ext_ip)
                         && state.external_ip.is_none()

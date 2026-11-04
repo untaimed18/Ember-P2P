@@ -371,10 +371,10 @@ async fn persist_transfer_statuses(state: &AppState, statuses: Vec<(String, Stri
 }
 
 /// The ids among `ids` with no source discovery running before a resume: a
-/// queued row Stop or a full disk ended (both drop its pending download and
-/// its control), or an active row with no worker that the resume may park in
-/// the queue when the cap is full (see `TransferManager::resume`). A paused
-/// queued row is not one: its pending download survives the pause.
+/// queued row Stop, Pause or a full disk ended, or an active row with no
+/// worker that the resume may park in the queue when the cap is full (see
+/// `TransferManager::resume`). Pause counts: it cancels the control its
+/// pending download holds, and the source-retry tick then drops that entry.
 fn rows_needing_discovery(
     manager: &crate::sharing::manager::TransferManager,
     ids: &[String],
@@ -383,7 +383,10 @@ fn rows_needing_discovery(
         .filter(|id| {
             manager.queue.iter().any(|t| {
                 &t.id == *id
-                    && matches!(t.status, TransferStatus::Stopped | TransferStatus::Insufficient)
+                    && matches!(
+                        t.status,
+                        TransferStatus::Stopped | TransferStatus::Paused | TransferStatus::Insufficient
+                    )
             }) || manager.active.get(id.as_str()).is_some_and(|t| {
                 matches!(t.status, TransferStatus::Paused | TransferStatus::Insufficient)
             })
@@ -2445,12 +2448,14 @@ pub async fn resume_transfers_batch(
 
 #[tauri::command]
 pub async fn stop_transfers_batch(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
     let transfer_ids = without_completing(&state, transfer_ids).await;
     let mut promoted_by_id: HashMap<String, Transfer> = HashMap::new();
+    let mut stopped_statuses = Vec::new();
     let mut send_error = None;
     for transfer_id in transfer_ids {
         let (stopped, promoted) = {
@@ -2466,6 +2471,7 @@ pub async fn stop_transfers_batch(
         // See `stop_transfer`.
         if stopped {
             persist_transfer_status(&state, &transfer_id, &TransferStatus::Stopped).await;
+            stopped_statuses.push((transfer_id.clone(), TransferStatus::Stopped));
         }
         // Bounded, and the first failure ends the batch — see the note in
         // `pause_transfers_batch` for why carrying on is worse than stopping.
@@ -2482,6 +2488,7 @@ pub async fn stop_transfers_batch(
             break;
         }
     }
+    emit_transfer_statuses(&app, &stopped_statuses);
     let promoted: Vec<Transfer> = promoted_by_id.into_values().collect();
     start_promoted_downloads(&state, &promoted).await;
     match send_error {
@@ -2518,6 +2525,32 @@ async fn without_completing(state: &AppState, transfer_ids: Vec<String>) -> Vec<
         .collect()
 }
 
+/// Cancel's network teardown for `transfer_id`, sent once the network queue
+/// has room, for a batch that could not send it within the bound. The row is
+/// already gone from the manager; without this its worker, searches and
+/// published source entry outlived it for the session.
+fn send_cancel_teardown_later(
+    network_tx: &tokio::sync::mpsc::Sender<NetworkCommand>,
+    transfer_id: &str,
+) {
+    let network_tx = network_tx.clone();
+    let transfer_id = transfer_id.to_string();
+    tokio::spawn(async move {
+        // The deleting form: Some ack, whether or not anyone waits on it.
+        let (ack_tx, _) = tokio::sync::oneshot::channel();
+        if network_tx
+            .send(NetworkCommand::CancelDownload {
+                transfer_id: transfer_id.clone(),
+                cleanup_ack: Some(ack_tx),
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!("Cancel of {transfer_id} never reached the network task");
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn cancel_transfers_batch(
     window: tauri::WebviewWindow,
@@ -2533,6 +2566,7 @@ pub async fn cancel_transfers_batch(
     let mut history_rows: Vec<(String, String, u64, &str)> =
         Vec::with_capacity(transfer_ids.len());
     let mut teardown_failures = 0usize;
+    let mut network_unresponsive = false;
     for transfer_id in transfer_ids {
         let (promoted, cancelled_info) = {
             let mut manager = state.transfer_manager.write().await;
@@ -2556,17 +2590,32 @@ pub async fn cancel_transfers_batch(
         }
         cancelled_ids.push(transfer_id.clone());
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        if let Err(e) = state.network_tx.try_send(NetworkCommand::CancelDownload {
-            transfer_id: transfer_id.clone(),
-            cleanup_ack: Some(ack_tx),
-        }) {
-            tracing::warn!(
-                "cancel_transfers_batch: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
-            );
+        if network_unresponsive {
+            send_cancel_teardown_later(&state.network_tx, &transfer_id);
             teardown_failures += 1;
-        } else {
-            pending_acks.push((transfer_id.clone(), ack_rx));
+            continue;
+        }
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        match bounded_send(
+            &state.network_tx,
+            NetworkCommand::CancelDownload {
+                transfer_id: transfer_id.clone(),
+                cleanup_ack: Some(ack_tx),
+            },
+        )
+        .await
+        {
+            Ok(()) => pending_acks.push((transfer_id.clone(), ack_rx)),
+            Err(e) => {
+                tracing::warn!(
+                    "cancel_transfers_batch: network task unavailable for {transfer_id}; proceeding with best-effort cleanup ({e})"
+                );
+                // One wait out per batch: the rest go straight to the
+                // background instead of each waiting out the bound again.
+                network_unresponsive = true;
+                send_cancel_teardown_later(&state.network_tx, &transfer_id);
+                teardown_failures += 1;
+            }
         }
     }
 
@@ -3461,6 +3510,20 @@ pub async fn set_transfer_priority(
         let mut manager = state.transfer_manager.write().await;
         manager.set_priority(&transfer_id, &priority);
     }
+    if let Err(e) = bounded_send(
+        &state.network_tx,
+        NetworkCommand::SetPendingPriority {
+            transfer_id: transfer_id.clone(),
+            priority,
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            "Priority of {} saved, but its pending source search keeps the old one until it restarts: {e}",
+            transfer_id_short(&transfer_id)
+        );
+    }
     Ok(())
 }
 
@@ -3977,16 +4040,22 @@ pub async fn set_preview_priority(
     transfer_id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let transfer = {
+    let known = {
         let mut manager = state.transfer_manager.write().await;
         manager.set_preview_priority(&transfer_id, enabled);
-        manager.get_transfer(&transfer_id).cloned()
+        manager.get_transfer(&transfer_id).is_some()
     };
-    if let Some(t) = transfer {
-        if let Err(error) = persist_transfer(&state, &t).await {
+    if known {
+        let db = state.db.clone();
+        let tid = transfer_id.clone();
+        let saved = tokio::task::spawn_blocking(move || db.update_transfer_preview_priority(&tid, enabled))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|result| result.map_err(|e| e.to_string()));
+        if let Err(error) = saved {
             tracing::warn!(
                 "Failed to persist preview-priority change for transfer {}: {error}",
-                transfer_id_short(&t.id)
+                transfer_id_short(&transfer_id)
             );
         }
     }
@@ -5223,5 +5292,33 @@ mod ipc_lifecycle_tests {
 
         assert!(!met.exists(), ".part.met must still be deleted if .part is missing");
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// Pausing a queued download ends its pending source discovery, so a
+    /// resume that leaves it queued has to start that again.
+    #[test]
+    fn a_paused_queued_download_needs_discovery_on_resume() {
+        let row = |id: &str, status: &str| -> Transfer {
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "file_name": "movie.bin",
+                "file_hash": "00".repeat(16),
+                "peer_id": "",
+                "peer_name": "",
+                "direction": "download",
+                "status": status,
+                "progress": 0.0,
+                "speed": 0,
+                "total_size": 100,
+                "transferred": 0,
+                "started_at": 0,
+            }))
+            .unwrap()
+        };
+        let mut manager = crate::sharing::manager::TransferManager::new(1);
+        manager.queue.push_back(row("paused", "paused"));
+        manager.queue.push_back(row("waiting", "queued"));
+        let ids = vec!["paused".to_string(), "waiting".to_string()];
+        assert_eq!(rows_needing_discovery(&manager, &ids), vec!["paused".to_string()]);
     }
 }

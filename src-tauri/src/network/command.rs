@@ -86,6 +86,16 @@ pub(in crate::network) fn take_part_presence_grew() -> bool {
     std::mem::take(&mut part_presence().lock().grew)
 }
 
+fn release_peer_file_claims(file_hash_hex: Option<&str>) {
+    let Some(hash) = file_hash_hex
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|raw| <[u8; 16]>::try_from(raw.as_slice()).ok())
+    else {
+        return;
+    };
+    ed2k::peer_sessions::release_file_claims(&hash);
+}
+
 /// The roots a cancelled download's tracker may delete its `.part.met` under.
 /// The tracker names the file in the folder its `.part` is in, which is an
 /// earlier download folder for a download started before the folder changed.
@@ -956,6 +966,9 @@ async fn handle_command_inner(
             // delete them. Only the deleting form may discard the part writer's
             // trailing fsync — see `TransferControl::discard`.
             let deleting = cleanup_ack.is_some();
+            // A download that no longer asks anyone has no queue place worth
+            // keeping our other downloads away from.
+            release_peer_file_claims(cancel_hash.as_deref());
 
             // Cancel control first so detached per-source tasks bail before
             // we ACK cleanup / delete .part files (N1).
@@ -1090,7 +1103,10 @@ async fn handle_command_inner(
                         state.source_publish_acks.remove(&kad_hash);
                         let mut fh_arr = [0u8; 16];
                         fh_arr.copy_from_slice(&hb[..16]);
-                        state.corruption_blackbox.remove_file(&fh_arr);
+                        // Stop keeps the `.part`, and who sent its bytes with it.
+                        if deleting {
+                            state.corruption_blackbox.remove_file(&fh_arr);
+                        }
                         if let Ok(mut map) = state.aich_recovery_pending.write() {
                             map.retain(|(file_hash, _), _| *file_hash != fh_arr);
                         }
@@ -1148,6 +1164,12 @@ async fn handle_command_inner(
             }
         }
 
+        NetworkCommand::SetPendingPriority { transfer_id, priority } => {
+            if let Some(pending) = state.pending_downloads.get_mut(&transfer_id) {
+                pending.priority = priority_str_to_u32(&priority);
+            }
+        }
+
         NetworkCommand::PauseDownload { transfer_id } => {
             // eMule PauseFile: tear down active network state but keep source
             // knowledge so the download can be resumed quickly.
@@ -1158,6 +1180,9 @@ async fn handle_command_inner(
                 if let Some(control) = mgr.get_control(&transfer_id) {
                     control.cancel();
                 }
+                release_peer_file_claims(
+                    mgr.get_transfer(&transfer_id).map(|t| t.file_hash.as_str()),
+                );
             }
             if let Some(handle) = state.download_handles.remove(&transfer_id) {
                 // Same reasoning as `CancelDownload`: snapshot the tracker
@@ -1992,6 +2017,19 @@ async fn handle_command_inner(
                 // fetch for the feeds code: it is not the user's download, and
                 // the feeds code asks again after a restart.
                 if !crate::sharing::feed_files::is_internal_fetch(&transfer_id) {
+                    // Discovery for a queued or added-paused row is not a
+                    // start, and a control paused or cancelled while this
+                    // command waited is the user's later word: either way the
+                    // status already saved stands.
+                    let write_searching =
+                        !discovery_only && !control.is_paused() && !control.is_cancelled();
+                    // A row the user cancelled while this command waited is
+                    // gone from the manager and must not be saved back.
+                    let tracked_status = transfer_manager
+                        .read()
+                        .await
+                        .get_transfer(&transfer_id)
+                        .map(|t| t.status.clone());
                     let db_ref = db.clone();
                     let tid = transfer_id.clone();
                     let fname = file_name.clone();
@@ -2005,8 +2043,10 @@ async fn handle_command_inner(
                     let seq = clock.next_seq();
                     tokio::task::spawn_blocking(move || {
                         if db_ref.transfer_exists(&tid) {
-                            apply_transfer_status_write(&clock, &db_ref, &tid, "searching", seq);
-                        } else {
+                            if write_searching {
+                                apply_transfer_status_write(&clock, &db_ref, &tid, "searching", seq);
+                            }
+                        } else if let Some(status) = tracked_status {
                             let db_transfer = Transfer {
                                 id: tid,
                                 file_name: fname,
@@ -2014,7 +2054,7 @@ async fn handle_command_inner(
                                 peer_id: String::new(),
                                 peer_name: String::new(),
                                 direction: TransferDirection::Download,
-                                status: TransferStatus::Searching,
+                                status,
                                 progress: 0.0,
                                 speed: 0,
                                 total_size: file_size,
@@ -6489,10 +6529,7 @@ async fn handle_command_inner(
                                 let our_user_hash = state.user_hash;
                                 let our_ember_hash = ember_hash;
                                 let nickname = settings.nickname.clone();
-                                let client_id = state
-                                    .external_ip
-                                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                                    .unwrap_or(0);
+                                let client_id = crate::network::ed2k::messages::hello_client_id();
                                 let tcp = advertised_tcp_port(state);
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
@@ -6617,10 +6654,7 @@ async fn handle_command_inner(
                             let our_uh = state.user_hash;
                             let our_eh = ember_hash;
                             let nick = settings.nickname.clone();
-                            let cid = state
-                                .external_ip
-                                .map(|eip| u32::from_le_bytes(eip.octets()))
-                                .unwrap_or(0);
+                            let cid = crate::network::ed2k::messages::hello_client_id();
                             let tcp = advertised_tcp_port(state);
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
@@ -6863,10 +6897,7 @@ async fn handle_command_inner(
                                 let our_user_hash = state.user_hash;
                                 let our_ember_hash = ember_hash;
                                 let nickname = settings.nickname.clone();
-                                let client_id = state
-                                    .external_ip
-                                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                                    .unwrap_or(0);
+                                let client_id = crate::network::ed2k::messages::hello_client_id();
                                 let tcp = advertised_tcp_port(state);
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
@@ -6980,10 +7011,7 @@ async fn handle_command_inner(
                             let our_uh = state.user_hash;
                             let our_eh = ember_hash;
                             let nick = settings.nickname.clone();
-                            let cid = state
-                                .external_ip
-                                .map(|eip| u32::from_le_bytes(eip.octets()))
-                                .unwrap_or(0);
+                            let cid = crate::network::ed2k::messages::hello_client_id();
                             let tcp = advertised_tcp_port(state);
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
@@ -7156,10 +7184,7 @@ async fn handle_command_inner(
                 state.user_hash,
                 ember_hash,
                 settings.nickname.clone(),
-                state
-                    .external_ip
-                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                    .unwrap_or(0),
+                crate::network::ed2k::messages::hello_client_id(),
                 advertised_tcp_port(state),
                 advertised_udp_port(state),
                 settings.friend_session_encryption,
@@ -7219,10 +7244,7 @@ async fn handle_command_inner(
                 state.user_hash,
                 ember_hash,
                 settings.nickname.clone(),
-                state
-                    .external_ip
-                    .map(|eip| u32::from_le_bytes(eip.octets()))
-                    .unwrap_or(0),
+                crate::network::ed2k::messages::hello_client_id(),
                 advertised_tcp_port(state),
                 advertised_udp_port(state),
                 settings.friend_session_encryption,

@@ -759,6 +759,53 @@ pub fn share_browsing_allowed() -> bool {
     SHARE_BROWSING_ALLOWED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide client ID every Hello / HelloAnswer advertises, computed by
+/// [`emule_client_id`]. Mirrored for the same reason as
+/// [`SHARE_BROWSING_ALLOWED`]: the upload listener, the per-source download
+/// tasks and the probe paths build Hellos without a `NetworkState`.
+///
+/// Not our public IP. A firewalled node usually knows that too, but a Hello
+/// carrying it makes eMule file us as HighID (`ID == socket IP`), so when our
+/// upload slot comes it drops us from its queue and dials us — which fails —
+/// and Source Exchange hands us on as directly dialable.
+static HELLO_CLIENT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_hello_client_id(id: u32) {
+    HELLO_CLIENT_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Our client ID as Hellos advertise it right now.
+pub fn hello_client_id() -> u32 {
+    HELLO_CLIENT_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// eMule's `CemuleApp::GetID()`: KAD's public IP while KAD is connected and
+/// not firewalled; otherwise the ID the server assigned (a LowID when
+/// firewalled, our IP when HighID); otherwise `1` for a firewalled KAD-only
+/// node; otherwise `0`. `server_client_id` is `None` when not logged in to a
+/// server. IPs are in eD2K HighID form (the octets read little-endian).
+pub fn emule_client_id(
+    kad_connected: bool,
+    kad_firewalled: bool,
+    kad_ip: Option<std::net::Ipv4Addr>,
+    server_client_id: Option<u32>,
+) -> u32 {
+    if kad_connected && !kad_firewalled {
+        kad_ip.map_or(0, |ip| u32::from_le_bytes(ip.octets()))
+    } else if let Some(id) = server_client_id {
+        id
+    } else if kad_connected {
+        1
+    } else {
+        0
+    }
+}
+
+/// Whether an eD2K client ID is a LowID (`0` included).
+pub fn is_low_client_id(id: u32) -> bool {
+    id < super::server::LOWID_THRESHOLD
+}
+
 /// Peer capability flags parsed from Hello/EmuleInfo exchanges.
 #[derive(Debug, Clone, Default)]
 pub struct PeerCapabilities {
@@ -3354,6 +3401,49 @@ pub fn parse_file_status(payload: &[u8]) -> io::Result<([u8; 16], Vec<bool>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PUBLIC: std::net::Ipv4Addr = std::net::Ipv4Addr::new(203, 0, 113, 7);
+    const PUBLIC_ID: u32 = u32::from_le_bytes([203, 0, 113, 7]);
+    const LOW_ID: u32 = 0x0012_3456;
+
+    /// The case that lost us queue places: a LowID node that knows its public
+    /// IP must still advertise the LowID, or eMule takes the Hello for a
+    /// HighID one and dials us when the slot comes.
+    #[test]
+    fn a_firewalled_node_advertises_its_server_lowid_not_its_public_ip() {
+        let id = emule_client_id(false, true, Some(PUBLIC), Some(LOW_ID));
+        assert_eq!(id, LOW_ID);
+        assert!(is_low_client_id(id));
+        assert_eq!(emule_client_id(true, true, Some(PUBLIC), Some(LOW_ID)), LOW_ID);
+    }
+
+    #[test]
+    fn client_id_follows_emule_get_id_precedence() {
+        // KAD open wins, over a server LowID too.
+        assert_eq!(emule_client_id(true, false, Some(PUBLIC), Some(LOW_ID)), PUBLIC_ID);
+        assert_eq!(emule_client_id(true, false, Some(PUBLIC), None), PUBLIC_ID);
+        // KAD open with no known address is KAD's own 0, as in eMule.
+        assert_eq!(emule_client_id(true, false, None, Some(LOW_ID)), 0);
+        // Server HighID when KAD is firewalled or down.
+        assert_eq!(emule_client_id(true, true, Some(PUBLIC), Some(PUBLIC_ID)), PUBLIC_ID);
+        assert_eq!(emule_client_id(false, false, Some(PUBLIC), Some(PUBLIC_ID)), PUBLIC_ID);
+        // An open verdict means nothing while KAD is disconnected.
+        assert_eq!(emule_client_id(false, false, Some(PUBLIC), Some(LOW_ID)), LOW_ID);
+        // Firewalled KAD only: the placeholder LowID 1.
+        assert_eq!(emule_client_id(true, true, Some(PUBLIC), None), 1);
+        // Nothing connected.
+        assert_eq!(emule_client_id(false, false, Some(PUBLIC), None), 0);
+        assert_eq!(emule_client_id(false, true, None, None), 0);
+    }
+
+    #[test]
+    fn low_client_id_threshold() {
+        assert!(is_low_client_id(0));
+        assert!(is_low_client_id(1));
+        assert!(is_low_client_id(super::super::server::LOWID_THRESHOLD - 1));
+        assert!(!is_low_client_id(super::super::server::LOWID_THRESHOLD));
+        assert!(!is_low_client_id(PUBLIC_ID));
+    }
 
     /// eMule's ET_FEATURES holds the SecIdent level and the preview bit and
     /// nothing else; crypt preferences come from the Hello alone, so a mod

@@ -219,10 +219,7 @@ pub(in crate::network) async fn on_broker_tick(
                     // channel).
                     let greet_tx = kad_callback_tx.clone();
                     let greet_user_hash = state.user_hash;
-                    let greet_client_id = state
-                        .external_ip
-                        .map(|ip| u32::from_le_bytes(ip.octets()))
-                        .unwrap_or(0);
+                    let greet_client_id = crate::network::ed2k::messages::hello_client_id();
                     // The active broker-event receiver prevents a
                     // whole-struct borrow here. Inline the same
                     // STUN-over-TCP-confirmed fallback used by
