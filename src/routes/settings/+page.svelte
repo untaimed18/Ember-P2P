@@ -32,6 +32,7 @@
   import ChannelLanguagePicker from '$lib/components/ChannelLanguagePicker.svelte';
   import { setAppSettings, appSettings } from '$lib/stores/settings';
   import { transfers } from '$lib/stores/transfers';
+  import { completedFirst } from '$lib/stores/transfersView';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
   import {
@@ -823,7 +824,7 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'library' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
 
   /// Sidebar order, and the order the cards are declared in below. Keep them
   /// in step: while filtering, every matching card is on screen in DOM order,
@@ -833,6 +834,7 @@
     'general',
     'notifications',
     'downloads',
+    'library',
     'search',
     'webservices',
     'bandwidth',
@@ -1065,6 +1067,7 @@
       case 'general': return m.settings_section_general();
       case 'notifications': return m.settings_section_notifications();
       case 'downloads': return m.settings_section_downloads();
+      case 'library': return m.nav_library();
       case 'bandwidth': return m.settings_section_bandwidth();
       case 'network': return m.settings_section_network();
       case 'security': return m.settings_section_security();
@@ -2808,6 +2811,11 @@
                   <polyline points="6,9.5 10,13.5 14,9.5"/>
                   <line x1="4" y1="17" x2="16" y2="17"/>
                 </svg>
+              {:else if section === 'library'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M3 4h5l2 2h7v10H3V4z"/>
+                  <line x1="3" y1="9" x2="17" y2="9"/>
+                </svg>
               {:else if section === 'bandwidth'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <line x1="7" y1="3" x2="7" y2="17"/>
@@ -3612,6 +3620,21 @@
                 ariaDescribedby="add-paused-hint"
               />
             </div>
+            <!-- A view choice kept on this device rather than a saved setting;
+                 the Transfers page's More menu sets the same one. -->
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="completed-first-label" for="completed-first-switch">{m.settings_completed_first()}</label>
+                <span class="hint" id="completed-first-hint">{m.settings_completed_first_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="completed-first-switch"
+                checked={$completedFirst}
+                onchange={(on) => completedFirst.set(on)}
+                ariaLabelledby="completed-first-label"
+                ariaDescribedby="completed-first-hint"
+              />
+            </div>
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="auto-remove-label" for="auto-remove-switch">{m.settings_auto_remove()}</label>
@@ -3661,62 +3684,6 @@
                 bind:checked={settings.web_sources_enabled}
                 ariaLabelledby="web-sources-label"
                 ariaDescribedby="web-sources-hint"
-              />
-            </div>
-          </div>
-
-          <!-- Shared folders are chosen in the Library, so this only points
-               there; the switch is about what we send when uploading. -->
-          <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_sharing()}</h4>
-            <div class="field">
-              <span class="field-label">{m.settings_shared_folders_label()}</span>
-              <span class="hint">
-                {m.settings_shared_folders_hint()}
-                <a href="/library" onclick={(e) => { e.preventDefault(); void goto('/library'); }}>{m.settings_open_page({ page: m.nav_library() })}</a>
-              </span>
-            </div>
-            <div class="field toggle-row">
-              <div class="toggle-info">
-                <label class="toggle-title" id="skip-compress-video-label" for="skip-compress-video-switch">{m.settings_skip_compress_video()}</label>
-                <span class="hint" id="skip-compress-video-hint">{m.settings_skip_compress_video_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="skip-compress-video-switch"
-                bind:checked={settings.skip_compress_video}
-                ariaLabelledby="skip-compress-video-label"
-                ariaDescribedby="skip-compress-video-hint"
-              />
-            </div>
-          </div>
-
-          <!-- Both automatic uses of the tag, under one explanation of what the
-               tag is, so neither switch has to be understood on its own. -->
-          <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_name_tag()}</h4>
-            <p class="hint section-intro">{m.settings_name_tag_intro()}</p>
-            <div class="field toggle-row">
-              <div class="toggle-info">
-                <label class="toggle-title" id="tag-downloads-label" for="tag-downloads-switch">{m.settings_tag_downloads()}</label>
-                <span class="hint" id="tag-downloads-hint">{m.settings_tag_downloads_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="tag-downloads-switch"
-                bind:checked={settings.tag_completed_downloads}
-                ariaLabelledby="tag-downloads-label"
-                ariaDescribedby="tag-downloads-hint"
-              />
-            </div>
-            <div class="field toggle-row">
-              <div class="toggle-info">
-                <label class="toggle-title" id="tag-imports-label" for="tag-imports-switch">{m.settings_tag_imports()}</label>
-                <span class="hint" id="tag-imports-hint">{m.settings_tag_imports_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="tag-imports-switch"
-                bind:checked={settings.tag_shared_imports}
-                ariaLabelledby="tag-imports-label"
-                ariaDescribedby="tag-imports-hint"
               />
             </div>
           </div>
@@ -3787,6 +3754,92 @@
               {#if historyClearMsg}
                 <span class="hint" role="status">{historyClearMsg}</span>
               {/if}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Library -->
+      <section class="card" class:hidden={!filtering && activeSection !== 'library'} id={panelId('library')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('library')}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 4h5l2 2h7v10H3V4z"/>
+              <line x1="3" y1="9" x2="17" y2="9"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.nav_library()}</h3>
+            <p class="card-desc">{m.settings_library_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <!-- Shared folders are chosen in the Library itself, so this only
+               points there; the switches decide who sees the files and what
+               an upload sends. -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_sharing()}</h4>
+            <div class="field">
+              <span class="field-label">{m.settings_shared_folders_label()}</span>
+              <span class="hint">
+                {m.settings_shared_folders_hint()}
+                <a href="/library" onclick={(e) => { e.preventDefault(); void goto('/library'); }}>{m.settings_open_page({ page: m.nav_library() })}</a>
+              </span>
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="allow-shared-browse-label" for="allow-shared-browse-switch">{m.settings_allow_shared_browse_label()}</label>
+                <span class="hint" id="allow-shared-browse-hint">{m.settings_allow_shared_browse_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="allow-shared-browse-switch"
+                bind:checked={settings.allow_shared_files_browse}
+                ariaLabelledby="allow-shared-browse-label"
+                ariaDescribedby="allow-shared-browse-hint"
+              />
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="skip-compress-video-label" for="skip-compress-video-switch">{m.settings_skip_compress_video()}</label>
+                <span class="hint" id="skip-compress-video-hint">{m.settings_skip_compress_video_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="skip-compress-video-switch"
+                bind:checked={settings.skip_compress_video}
+                ariaLabelledby="skip-compress-video-label"
+                ariaDescribedby="skip-compress-video-hint"
+              />
+            </div>
+          </div>
+
+          <!-- Both automatic uses of the tag, under one explanation of what the
+               tag is, so neither switch has to be understood on its own. -->
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_name_tag()}</h4>
+            <p class="hint section-intro">{m.settings_name_tag_intro()}</p>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="tag-downloads-label" for="tag-downloads-switch">{m.settings_tag_downloads()}</label>
+                <span class="hint" id="tag-downloads-hint">{m.settings_tag_downloads_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="tag-downloads-switch"
+                bind:checked={settings.tag_completed_downloads}
+                ariaLabelledby="tag-downloads-label"
+                ariaDescribedby="tag-downloads-hint"
+              />
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="tag-imports-label" for="tag-imports-switch">{m.settings_tag_imports()}</label>
+                <span class="hint" id="tag-imports-hint">{m.settings_tag_imports_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="tag-imports-switch"
+                bind:checked={settings.tag_shared_imports}
+                ariaLabelledby="tag-imports-label"
+                ariaDescribedby="tag-imports-hint"
+              />
             </div>
           </div>
         </div>
@@ -4735,22 +4788,6 @@
                 {/if}
               </div>
             {/if}
-          </div>
-
-          <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_visibility()}</h4>
-            <div class="field toggle-row">
-              <div class="toggle-info">
-                <label class="toggle-title" id="allow-shared-browse-label" for="allow-shared-browse-switch">{m.settings_allow_shared_browse_label()}</label>
-                <span class="hint" id="allow-shared-browse-hint">{m.settings_allow_shared_browse_hint()}</span>
-              </div>
-              <ToggleSwitch
-                id="allow-shared-browse-switch"
-                bind:checked={settings.allow_shared_files_browse}
-                ariaLabelledby="allow-shared-browse-label"
-                ariaDescribedby="allow-shared-browse-hint"
-              />
-            </div>
           </div>
         </div>
       </section>

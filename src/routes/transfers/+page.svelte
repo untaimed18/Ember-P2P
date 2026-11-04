@@ -15,6 +15,7 @@
   import { removeToast, setToastMessage, toastsFor } from '$lib/stores/toast';
   const { addActionToast, toastError, toastSuccess, toastWarning } = toastsFor('downloads');
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
+  import { completedFirst as completedFirstPref } from '$lib/stores/transfersView';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
@@ -621,19 +622,8 @@
   $effect(() => {
     try { localStorage.setItem(COMPLETED_COLLAPSED_KEY, completedCollapsed ? '1' : '0'); } catch { /* ignore */ }
   });
-  // The Completed / Failed section above the downloads still running, for
-  // whoever reads the list for what has just finished. Each section keeps its
-  // own sort either way. Off unless chosen, and kept like the collapsed state.
-  const COMPLETED_FIRST_KEY = 'transfers-completed-first';
-  function loadCompletedFirst(): boolean {
-    try {
-      return localStorage.getItem(COMPLETED_FIRST_KEY) === '1';
-    } catch { return false; }
-  }
-  let completedFirst = $state(loadCompletedFirst());
-  $effect(() => {
-    try { localStorage.setItem(COMPLETED_FIRST_KEY, completedFirst ? '1' : '0'); } catch { /* ignore */ }
-  });
+  // Each section keeps its own sort either way.
+  let completedFirst = $derived($completedFirstPref);
 
   // --- Source detail panel (eMule-style) ---
   let expandedTransferId: string | null = $state(null);
@@ -6007,7 +5997,7 @@
               <button type="button" role="menuitem" onclick={(e) => runFromMore(e, clearCompletedWithUndo)}>{m.transfers_clear_completed()}</button>
             {/if}
             <div class="toolbar-more-sep" role="separator"></div>
-            <button type="button" role="menuitemcheckbox" aria-checked={completedFirst} onclick={(e) => runFromMore(e, () => (completedFirst = !completedFirst))}>{m.transfers_completed_first()}</button>
+            <button type="button" role="menuitemcheckbox" aria-checked={completedFirst} onclick={(e) => runFromMore(e, () => completedFirstPref.update((on) => !on))}>{m.transfers_completed_first()}</button>
           </div>
         </details>
       </div>
