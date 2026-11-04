@@ -125,7 +125,7 @@
   <section class="download-band" id="download">
     <div class="container">
       <img src="icon.png" alt="" width="72" height="72">
-      <h2>Download Ember 1.7.5</h2>
+      <h2>Download Ember 1.7.6</h2>
       <p>Free for Windows 10 and 11, and for x86-64 Linux as a <code>.deb</code> or an AppImage. Every release is signed, and Ember updates itself.</p>
       <div class="btn-group">
         <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-light" target="_blank" rel="noopener"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download from GitHub</a>
@@ -142,6 +142,124 @@
           <h2>Release notes</h2>
           <p>Every Ember release, newest first. These are the same notes published on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
         </div>
+
+        <article class="release" id="release-1-7-6">
+              <div class="release-header">
+                <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.6" target="_blank" rel="noopener">Ember v1.7.6</a></h3>
+                <time class="release-date" datetime="2026-11-04">November 4, 2026</time>
+              </div>
+              <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.6" target="_blank" rel="noopener"><code>v1.7.6</code></a></p>
+              <div class="release-notes">
+                <p>Channels leave beta, and downloading from eMule users gets markedly better: a firewalled Ember now tells uploaders it is firewalled, so it keeps its place in their queues, waiting sources are asked again over UDP as eMule expects, and a peer that stops sending is dropped after 100 seconds instead of minutes. Feeds whose publisher sits behind a firewall now load, web mirrors no longer wait behind a slow peer, and the Windows Firewall rules keep Ember reachable when a VPN changes its port. Ember also speaks Polish, lets you turn off its pop-ups by area, gains a Library section in Settings, and went through a full audit of every page, the eMule protocols, uploads, search and downloads.</p>
+
+                <h4>Before you upgrade</h4>
+
+                <ul>
+                  <li><strong>The Ember DHT wire version is unchanged at version 4, and no Channels format changes,</strong> so 1.7.6 shares rooms with 1.7.5 and sees every release back to 1.6 on the overlay. Channels have left beta: their formats have been frozen since 1.7.5</li>
+                  <li><strong>A second room language shows only on 1.7.6.</strong> A member on 1.7.5 sees your first language&rsquo;s flag alone</li>
+                  <li><strong>A feed whose publisher is behind a firewall loads only when the publisher runs 1.7.6,</strong> since only 1.7.6 registers its feeds so followers can reach it</li>
+                  <li><strong>Credit for files received over Ember&rsquo;s own streams</strong> (feeds, files in friend chat and room transfers) counts only between two 1.7.6 clients, once each has proven its identity to the other. eMule and 1.7.5 ignore the new proof, and nothing changes for eD2K transfers</li>
+                  <li><strong>Settings moved:</strong> the <code>[Ember-P2P]</code> name tag switches, sending video without transfer compression and letting others browse your shared files are now under Settings &gt; Library. Their values are kept</li>
+                  <li><strong>New installs run 10 downloads at once instead of 5.</strong> An existing setting keeps its value</li>
+                  <li><strong>A new backup needs a passphrase of at least 12 characters</strong> that is not a repeated or sequential pattern or built on a common word or year. Restoring still takes any passphrase a backup was made with, and a 1.7.6 backup restores on 1.7.5</li>
+                  <li><strong>On Windows, Ember&rsquo;s firewall rules now cover every port for Ember&rsquo;s own program,</strong> as the rules Windows writes for a program do, instead of one port each. Rules from an older Ember are widened the next time Ember may change them</li>
+                </ul>
+
+                <h4>What&rsquo;s New</h4>
+
+                <h5>Downloads and uploads with eMule users</h5>
+                <ul>
+                  <li><strong>A firewalled Ember keeps its place in eMule queues.</strong> It now tells uploaders its LowID, as eMule does, where it sent its public address, so an eMule uploader whose turn came tried to connect to it, failed and dropped it from the queue</li>
+                  <li><strong>Waiting sources are asked again over UDP,</strong> including those found through servers and source exchange, so they keep you in their queues without reconnecting</li>
+                  <li><strong>A source that stops sending is dropped after 100 seconds</strong> and its blocks asked of others, as eMule does, where a silent peer could hold a part for minutes. A slow peer that is still sending keeps its slot, and a slow first packet is allowed to finish</li>
+                  <li><strong>A peer that has already connected to you</strong> (a callback, or an uploader giving you its slot) no longer waits behind connection attempts, so the slot is no longer lost</li>
+                  <li><strong>Kad source searches run five at a time,</strong> as in eMule, so a burst at startup no longer cancels itself and leaves files waiting an hour for their next try</li>
+                  <li><strong>Each download can use its share of the connection budget</strong> rather than a flat 50 sources, and progress is saved in one write every few seconds instead of one per download</li>
+                  <li><strong>Peers are treated the way eMule treats them:</strong> one that said it does not have the file is not asked again, two of your downloads no longer ask one eMule user for different files at once, sources that keep failing are retired, and corrupt-part recovery asks another source that has the part</li>
+                  <li><strong>Uploads to distant peers are faster on Windows,</strong> as Windows now sizes each upload&rsquo;s send buffer to the connection instead of capping it at 256&nbsp;KiB</li>
+                  <li><strong>Download part files are sparse,</strong> so a download no longer takes disk space for data it has not received</li>
+                </ul>
+
+                <h5>Transfers</h5>
+                <ul>
+                  <li><strong>Completed first</strong> lists finished and failed downloads above the ones still running, from the Transfers page&rsquo;s More menu or Settings &gt; Transfers</li>
+                  <li><strong>Add Web Mirror</strong> on an unfinished download&rsquo;s menu adds HTTP or HTTPS mirrors, one per line, up to five per file, kept across restarts</li>
+                  <li><strong>Web mirrors no longer sit idle behind a slow peer:</strong> once every part has someone on it, a mirror joins the part with the most left to fetch, and several mirrors split a part between them</li>
+                  <li><strong>A finished download is moved, not copied,</strong> within a drive that has no hard links (exFAT, FAT32, network shares), so it no longer needs twice the space</li>
+                </ul>
+
+                <h5>Feeds</h5>
+                <ul>
+                  <li><strong>Feeds from publishers behind a firewall load.</strong> A 1.7.6 publisher registers its newest feeds with the Rendezvous server, sealed so only link holders can read them, and a follower who finds no source reaches it directly, by hole punching or through the server&rsquo;s relay. The feed page says when the publisher cannot be reached, and Discover shows a publisher who is online but whose files are unavailable</li>
+                  <li><strong>Add to feed</strong> on Library rows appends the file or the selection to one of your feeds</li>
+                  <li><strong>Feed items are checked by the spam filter.</strong> One taken for spam shows the Spam badge and is not downloaded automatically</li>
+                </ul>
+
+                <h5>Rooms</h5>
+                <ul>
+                  <li><strong>Channels have left beta</strong></li>
+                  <li><strong>A second language</strong> under Settings &gt; Channels shows a second flag beside your name</li>
+                  <li><strong><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>Up</kbd>/<kbd>Down</kbd> goes to the next room with something unread,</strong> a member filter appears from ten members, and private conversations load older messages a page at a time</li>
+                  <li><strong>Private-room keys reach the nodes that hold them,</strong> so a member no longer misses a rotated key, and an owner coming back after a long silence follows a handoff its members made</li>
+                </ul>
+
+                <h5>Network and connection</h5>
+                <ul>
+                  <li><strong>The connection doctor recognises a VPN</strong> and points to the VPN&rsquo;s own port forwarding, logs in to a server that gave a LowID again after its fixes, and its Windows permission prompt opens in front of Ember</li>
+                  <li><strong>An Ember-only node learns whether others can reach it</strong> from the Rendezvous server&rsquo;s outside test, run in the background</li>
+                  <li><strong>Friends behind restricted NATs connect:</strong> a meet whose first message the far router dropped now completes</li>
+                  <li><strong>Sharing on the Ember network is several times faster,</strong> as lookups for waiting files run as soon as the previous ones finish</li>
+                  <li><strong>eD2K servers:</strong> a server that moves to a new address is followed there, its messages are shown line by line, and errors and warnings at their own level. Kad keywords with rare characters now find the same files as in eMule</li>
+                  <li><strong>A Search More you stop</strong> can be carried on later</li>
+                </ul>
+
+                <h5>Settings, look and languages</h5>
+                <ul>
+                  <li><strong>Polish</strong> is the tenth language</li>
+                  <li><strong>Pop-ups in Ember can be turned off by area</strong> (Transfers, Search, Library, Friends, Channels, Feeds and Networks) under Settings &gt; Notifications, which now explains desktop notifications and pop-ups separately. Warnings, errors and Undo offers always show</li>
+                  <li><strong>Settings &gt; Library</strong> gathers your shared folders, who may browse them, video compression and the file name tag</li>
+                  <li><strong>The Ember page opens on a clear answer,</strong> Connected, Connecting or No peers found, with your reachability and sharing beside it, and its tables laid out like the KAD page</li>
+                  <li><strong>Every page says what it is about to do:</strong> removing a friend, joining a room from Discover, deleting a message and marking spam ask first or offer Undo, and forms keep what you typed when something fails</li>
+                  <li><strong>The light theme reaches the dark theme&rsquo;s contrast,</strong> the sidebar and Servers page are tidier, and every animation respects reduced motion</li>
+                </ul>
+
+                <h5>Security</h5>
+                <ul>
+                  <li><strong>The popped-out chat window can no longer</strong> quit Ember, change friends, use room owner powers or reach the other commands it has no use for</li>
+                  <li><strong>The Ember network is harder to abuse:</strong> a stranger can no longer make a download fail at completion with a forged file digest, and searches, storers, buddies and gossip limit each network block rather than each key</li>
+                  <li><strong>Settings says when your identity keys could not use the system keyring,</strong> and Ember&rsquo;s archive handling no longer includes zstd, which closes the memory-safety advisories it carried</li>
+                </ul>
+
+                <h4>What&rsquo;s Fixed</h4>
+
+                <ul>
+                  <li><strong>Chat:</strong> messages are marked read, and friends sent a Seen receipt, only while Ember has focus, so a disappearing message no longer starts its timer while you are in another program. Drafts to room members are kept, and a slow send can no longer go out twice</li>
+                  <li><strong>Downloads:</strong> a download added paused stays paused after a restart, cancelling one while its finished file is moved no longer leaves the file behind, and a finished download is no longer shown as failed</li>
+                  <li><strong>Hashsets:</strong> for a file whose size is an exact multiple of 9,728,000 bytes, Ember no longer keeps or serves a hashset with a bad trailing entry, which made eMule drop it as a source</li>
+                  <li><strong>Uploads:</strong> a peer whose slot ended no longer wins it straight back</li>
+                  <li><strong>Library:</strong> renaming or tagging a file keeps the open file and an unsaved comment, large libraries no longer stutter while uploading, every file gets its AICH root, and Stop during the startup scan no longer empties the Library</li>
+                  <li><strong>Transfers:</strong> the list says it is loading while the last session is restored instead of No downloads, and Add eD2K Links keeps its text and says why when links fail</li>
+                  <li><strong>Settings:</strong> switching a speed box to MB/s keeps the number you typed, and Restart now asks about changes you have not applied</li>
+                  <li><strong>KAD, Security and Servers pages:</strong> a lasting network error stays on the KAD page, its bootstrap dialog can be closed while it works, and the Security list no longer goes blank after an edit</li>
+                  <li><strong>eMule clients without Unicode</strong> see underscores in file names instead of garbled text</li>
+                  <li><strong>Backups</strong> carry your IP filter edits, so a restored custom list survives the daily update</li>
+                  <li><strong>Room relays:</strong> the first member to join a room through the Rendezvous relay no longer times out</li>
+                  <li><strong>Russian</strong> counts such as 21 and 31 take the right form</li>
+                  <li><strong>Keyboard and screen readers:</strong> focus returns where it was after dialogs and menus, Chinese and Japanese input no longer saves half-typed names, and menus, lists and confirmations can be used and heard throughout</li>
+                </ul>
+
+                <p class="full-changelog">
+                  <strong>Full Changelog</strong>
+                  <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.7.5...v1.7.6" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.7.5...v1.7.6</a>
+                </p>
+              </div>
+            </article>
+
+        <details class="older-releases">
+          <summary>
+            <span class="when-closed">Show 43 older releases</span><span class="when-open">Hide older releases</span>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+          </summary>
 
         <article class="release" id="release-1-7-5">
               <div class="release-header">
@@ -248,12 +366,6 @@
                 </p>
               </div>
             </article>
-
-        <details class="older-releases">
-          <summary>
-            <span class="when-closed">Show 42 older releases</span><span class="when-open">Hide older releases</span>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
-          </summary>
 
         <article class="release" id="release-1-7-4">
               <div class="release-header">
