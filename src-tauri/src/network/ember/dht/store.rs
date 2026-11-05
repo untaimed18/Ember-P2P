@@ -59,7 +59,10 @@ const MAX_RECORDS_PER_KEY: usize = 1000;
 /// them from their *own* store. That costs nothing in discoverability — every
 /// record is still published to the nodes closest to the key, which is where
 /// searchers look — and it is the same allowance we grant everyone else.
-const MAX_RECORDS_PER_PUBLISHER_PER_KEY: usize = 150;
+///
+/// Public because publishers hold themselves to it: a record past it is refused
+/// by every storer, so sending one buys nothing but the refusal.
+pub const MAX_RECORDS_PER_PUBLISHER_PER_KEY: usize = 150;
 /// [`MAX_RECORDS_PER_PUBLISHER_PER_KEY`] for feed listings, which share
 /// sixteen index keys among every publisher. One identity keeps at most
 /// `feed::FEEDS_PER_IDENTITY` feeds, so twice that leaves room for the

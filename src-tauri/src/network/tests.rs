@@ -2999,6 +2999,140 @@ fn a_key_that_never_lands_spends_its_retries_once() {
     );
 }
 
+/// A key every storer refused for a reason another try would meet again — over
+/// our share under that word, say — gets no partial retry: the round is
+/// published on its siblings and the file waits out the ordinary interval.
+#[test]
+fn a_key_refused_for_good_is_not_retried() {
+    let mut sched = TestSchedule::default();
+    let landed = record_ref(7, 70);
+    let refused = record_ref(7, 71);
+    let now = std::time::Instant::now();
+    track_ember_record_pending(sched.borrow(), landed);
+    track_ember_record_pending(sched.borrow(), refused);
+    assert!(!place_ember_record_pending(sched.borrow(), landed, now));
+    assert!(fail_ember_record_pending_with(sched.borrow(), refused, now, true));
+    assert!(!sched.retry_keys.contains_key(&landed.file_hash), "no retry for a refusal that would repeat");
+    assert_eq!(sched.rounds_failed(landed), 0);
+    assert_eq!(sched.keyword_at[&landed.file_hash].duration_since(now), EMBER_KEYWORD_REPUBLISH);
+}
+
+/// A round in which nothing landed and every loss was a lasting refusal is
+/// deferred a full interval at once, not charged round by round to the same end.
+#[test]
+fn a_round_refused_for_good_everywhere_is_deferred_at_once() {
+    let mut sched = TestSchedule::default();
+    let reference = record_ref(8, 80);
+    let now = std::time::Instant::now();
+    track_ember_record_pending(sched.borrow(), reference);
+    assert!(!fail_ember_record_pending_with(sched.borrow(), reference, now, true));
+    assert!(!sched.unplaced.contains_key(&(reference.file_hash, reference.kind)));
+    assert_eq!(sched.rounds_failed(reference), 0, "no attempt charged");
+    assert_eq!(
+        sched.keyword_at[&reference.file_hash].duration_since(now),
+        EMBER_KEYWORD_REPUBLISH,
+        "deferred the full interval"
+    );
+
+    // A retryable loss keeps the ordinary charge.
+    let mut sched = TestSchedule::default();
+    track_ember_record_pending(sched.borrow(), reference);
+    assert!(!fail_ember_record_pending_with(sched.borrow(), reference, now, false));
+    assert_eq!(sched.rounds_failed(reference), 1);
+    assert!(!sched.keyword_at.contains_key(&reference.file_hash));
+}
+
+/// Only the files closest to an over-subscribed keyword keep a slot under it,
+/// and a keyword under the cap is left out of the map entirely.
+#[test]
+fn the_keyword_cap_keeps_the_closest_files_under_a_crowded_word() {
+    let cap = ember::dht::store::MAX_RECORDS_PER_PUBLISHER_PER_KEY;
+    let crowded = [0u8; 16];
+    let quiet = [0xAA; 16];
+    let files: Vec<([u8; 16], HashSet<[u8; 16]>)> = (0..(cap as u16 + 10))
+        .map(|i| {
+            let mut file = [0u8; 16];
+            file[14..].copy_from_slice(&i.to_be_bytes());
+            let mut keys = HashSet::from([crowded]);
+            if i < 3 {
+                keys.insert(quiet);
+            }
+            (file, keys)
+        })
+        .collect();
+    let allowance = ember_keyword_cap_from(files.clone());
+    assert!(!allowance.contains_key(&quiet), "three files are well under the cap");
+    let kept = &allowance[&crowded];
+    assert_eq!(kept.len(), cap);
+    // The key is all zeroes, so closeness is the file hash itself: the lowest
+    // `cap` hashes keep their slots.
+    let mut lowest = [0u8; 16];
+    lowest[14..].copy_from_slice(&0u16.to_be_bytes());
+    let mut highest = [0u8; 16];
+    highest[14..].copy_from_slice(&(cap as u16 + 9).to_be_bytes());
+    assert!(ember_keyword_within_cap(&allowance, &lowest, &crowded));
+    assert!(!ember_keyword_within_cap(&allowance, &highest, &crowded));
+    assert!(ember_keyword_within_cap(&allowance, &highest, &quiet), "uncapped words admit everyone");
+
+    // Stable: the same library yields the same choice.
+    assert_eq!(ember_keyword_cap_from(files), allowance);
+}
+
+/// Friend contact asks double while they teach us nobody new, up to a ceiling.
+#[test]
+fn friend_contact_asks_back_off_while_fruitless() {
+    assert_eq!(ember_friend_contact_backoff(0), EMBER_FRIEND_CONTACT_ASK_INTERVAL);
+    assert_eq!(ember_friend_contact_backoff(1), EMBER_FRIEND_CONTACT_ASK_INTERVAL * 2);
+    assert_eq!(ember_friend_contact_backoff(3), EMBER_FRIEND_CONTACT_ASK_INTERVAL * 8);
+    assert_eq!(ember_friend_contact_backoff(30), EMBER_FRIEND_CONTACT_BACKOFF_MAX);
+    assert_eq!(ember_friend_contact_backoff(u32::MAX), EMBER_FRIEND_CONTACT_BACKOFF_MAX);
+}
+
+/// Contacts that have not stated their reachability are asked a few at a time,
+/// never twice inside the interval, and never on top of a liveness ping.
+#[test]
+fn silent_contacts_are_asked_for_their_reachability_sparingly() {
+    let contact = |n: u8| ember::dht::EmberContact {
+        node_id: ember::dht::EmberNodeId([n; 16]),
+        addr: SocketAddr::from(([80, n, 1, 1], 4672)),
+        noise_pub: [n; 32],
+        ed25519_pub: [n; 32],
+        last_seen: 1,
+        failed_queries: 0,
+    };
+    let now = std::time::Instant::now();
+    let silent: Vec<_> = (1..=5).map(contact).collect();
+    let mut probed = HashMap::new();
+    probed.insert(ember::dht::EmberNodeId([1; 16]), now);
+    let due = vec![contact(2)];
+    let picked = ember_reach_probe_targets(silent.clone(), &probed, &due, usize::MAX, now);
+    let ids: Vec<u8> = picked.iter().map(|c| c.node_id.0[0]).collect();
+    assert_eq!(picked.len(), EMBER_REACH_PROBES_PER_TICK);
+    assert!(!ids.contains(&1), "asked moments ago");
+    assert!(!ids.contains(&2), "the liveness pass is already pinging it");
+
+    // Only what the liveness pass left of the cycle's ping budget.
+    assert_eq!(ember_reach_probe_targets(silent.clone(), &probed, &due, 1, now).len(), 1);
+    assert!(ember_reach_probe_targets(silent, &probed, &due, 0, now).is_empty());
+
+    let later = now + EMBER_REACH_PROBE_INTERVAL;
+    let picked = ember_reach_probe_targets(vec![contact(1)], &probed, &[], usize::MAX, later);
+    assert_eq!(picked.len(), 1, "due again once the interval has passed");
+}
+
+/// What our PINGs say about our UDP port: open on the advert's proof,
+/// firewalled only on a concluded check, and silence otherwise.
+#[test]
+fn our_reachability_claim_needs_a_concluded_check() {
+    use ember::dht::messages::UdpReach;
+    assert_eq!(ember_advertised_reach(true, false, false), Some(UdpReach::Open));
+    assert_eq!(ember_advertised_reach(false, true, true), Some(UdpReach::Open), "Ember's own proof");
+    assert_eq!(ember_advertised_reach(true, true, false), Some(UdpReach::Firewalled));
+    assert_eq!(ember_advertised_reach(true, true, true), Some(UdpReach::Open), "evidence beats the check");
+    assert_eq!(ember_advertised_reach(false, false, false), None, "not checked is not a claim");
+    assert_eq!(ember_advertised_reach(false, true, false), None);
+}
+
 /// The same when the last key is dropped before it reaches the wire.
 #[test]
 fn a_round_that_placed_one_key_is_published_when_its_last_key_is_dropped() {

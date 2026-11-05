@@ -1884,7 +1884,13 @@ pub(super) async fn ask_friends_for_ember_contacts(state: &mut NetworkState) -> 
     let frame =
         ed2k::messages::build_ember_ext_frame(ed2k::messages::EMBER_EXT_DHT_CONTACT_REQ, &target.0);
 
-    let due = ember_friend_ask_order(live, &state.ember_friend_contacts_asked, now);
+    let mut due = ember_friend_ask_order(live, &state.ember_friend_contacts_asked, now);
+    due.retain(|(eh, _)| {
+        state
+            .ember_friend_contact_backoff
+            .get(eh)
+            .is_none_or(|(_, next)| *next <= now)
+    });
     let mut asked = 0usize;
     for (eh, tx) in due {
         if asked >= EMBER_FRIEND_CONTACT_ASKS_PER_TICK {
@@ -1896,6 +1902,11 @@ pub(super) async fn ask_friends_for_ember_contacts(state: &mut NetworkState) -> 
             continue;
         }
         state.ember_friend_contacts_asked.insert(eh, now);
+        // Assumed fruitless until an answer teaches us someone new, which
+        // clears this; a friend that never answers backs off the same way.
+        let backoff = state.ember_friend_contact_backoff.entry(eh).or_insert((0, now));
+        backoff.1 = now + ember_friend_contact_backoff(backoff.0);
+        backoff.0 = backoff.0.saturating_add(1);
         asked += 1;
         state.ember_diagnostics.ember_dht_friend_contact_asks = state
             .ember_diagnostics
@@ -1906,6 +1917,20 @@ pub(super) async fn ask_friends_for_ember_contacts(state: &mut NetworkState) -> 
         debug!("Ember DHT: asked {asked} friend session(s) for contacts while the table is thin");
     }
     asked
+}
+
+/// How long after an ask a friend waits for the next one, given how many asks
+/// in a row have taught us nobody new.
+///
+/// A small overlay is thin for good, and its friends know the same few peers
+/// we do: one field run asked 346 times in twelve hours and learned one
+/// contact. Doubling from the ask interval to [`EMBER_FRIEND_CONTACT_BACKOFF_MAX`]
+/// keeps a friend that does know someone new a minute away, and costs a
+/// friend that knows no one new a handful of frames an hour.
+pub(super) fn ember_friend_contact_backoff(fruitless_asks: u32) -> std::time::Duration {
+    EMBER_FRIEND_CONTACT_ASK_INTERVAL
+        .saturating_mul(1u32 << fruitless_asks.min(16))
+        .min(EMBER_FRIEND_CONTACT_BACKOFF_MAX)
 }
 
 /// Friends due to be asked for contacts, least recently asked first.
@@ -1990,7 +2015,12 @@ pub(super) async fn answer_friend_ember_contact_request(
     state.ember_friend_contacts_served.insert(friend, now);
 
     let target = ember::dht::EmberNodeId(target.unwrap_or(state.ember_dht.local_id().0));
-    let contacts = ember_friend_contact_answer(state.ember_dht.routing(), &target);
+    let mut contacts = ember_friend_contact_answer(state.ember_dht.routing(), &target);
+    // A friend can no more reach a contact that says it is firewalled than any
+    // other asker can (see `EmberDht::closest_excluding`).
+    contacts.retain(|c| {
+        state.ember_dht.peer_reach(&c.node_id) != Some(ember::dht::messages::UdpReach::Firewalled)
+    });
     let body = ember::dht::messages::encode_contact_list(&contacts);
     let frame =
         ed2k::messages::build_ember_ext_frame(ed2k::messages::EMBER_EXT_DHT_CONTACTS, &body);
@@ -2061,6 +2091,7 @@ pub(super) async fn ingest_friend_ember_contacts(
     }
     let (learned, pressure) = offer_friend_ember_contacts(&mut state.ember_dht, &contacts);
     if learned > 0 {
+        state.ember_friend_contact_backoff.remove(&friend);
         state.ember_diagnostics.ember_dht_friend_contacts_learned = state
             .ember_diagnostics
             .ember_dht_friend_contacts_learned

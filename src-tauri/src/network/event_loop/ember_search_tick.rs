@@ -340,7 +340,7 @@ pub(in crate::network) async fn on_ember_search_tick(
             .ember_dht_stores_failed
             .saturating_add(abandoned.len() as u32);
         for reference in abandoned {
-            note_ember_store_attempt_failed(state, reference, now);
+            note_ember_store_attempt_failed(state, reference, None, now);
         }
     }
 

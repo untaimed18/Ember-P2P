@@ -425,6 +425,22 @@ export interface EmberDiagnostics {
   /** Storer replication is off because the overlay is no larger than one
    *  replica set, so the backlog's zero means "not needed", not "caught up". */
   ember_dht_replication_paused?: boolean;
+  /** Our records storers refused: over the 150-per-publisher cap under a key. */
+  ember_dht_our_refused_publisher_cap?: number;
+  /** Our records refused because the key or the storer's store was full. */
+  ember_dht_our_refused_full?: number;
+  /** Our records refused because the storer knows closer nodes to the key. */
+  ember_dht_our_refused_not_closest?: number;
+  /** Our records refused as invalid or out of date. */
+  ember_dht_our_refused_invalid?: number;
+  /** Our records refused with no reason given (older storers). */
+  ember_dht_our_refused_unexplained?: number;
+  /** Verified contacts that say unsolicited UDP reaches them. */
+  ember_dht_contacts_reach_open?: number;
+  /** Verified contacts that say their UDP port is filtered (kept out of our replies). */
+  ember_dht_contacts_reach_firewalled?: number;
+  /** Verified contacts that say nothing about their UDP port. */
+  ember_dht_contacts_reach_unknown?: number;
   /** Seconds since any Ember DHT frame arrived, or null if none ever has (0 is
    *  a frame this second). Separates "still joining" from "joined and quiet"
    *  from "stuck". */

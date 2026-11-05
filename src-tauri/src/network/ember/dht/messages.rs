@@ -74,6 +74,89 @@ pub const CALLBACK_WIRE_LEN: usize = 16 + 4 + 2 + 1 + 16 + 16;
 /// has already bound to `sender_id`, so it is not repeated here.
 pub const BUDDY_ENDORSE_WIRE_LEN: usize = 4 + 2 + 32 + 8 + 64;
 
+/// Why a storer turned a record away, reported per record in the block trailing
+/// a `STORE_BATCH_ACK`.
+///
+/// The bitmap alone could not tell "over your 150 under this word" from a lost
+/// datagram, so a publisher retried both alike — several rounds an interval for
+/// a refusal every storer would repeat. The block is additive: the ack decoder
+/// has always read the bitmap and ignored what follows, so a storer that sends
+/// it costs an older publisher nothing, and a publisher reading an older storer
+/// simply has no reasons and behaves as it always has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreRefusal {
+    /// Failed parsing, signature, key binding or the source-address bind.
+    Invalid,
+    /// Creation time outside the window, or older than the copy held.
+    Stale,
+    /// The storer knows k nodes closer to the key than itself.
+    NotResponsible,
+    /// The publisher already holds its share under this key.
+    PublisherFull,
+    /// The key itself is full.
+    KeyFull,
+    /// The storer has no room for another key.
+    StoreFull,
+    /// Refused for a reason this build does not name.
+    Other,
+}
+
+impl StoreRefusal {
+    fn code(self) -> u8 {
+        match self {
+            StoreRefusal::Invalid => 1,
+            StoreRefusal::Stale => 2,
+            StoreRefusal::NotResponsible => 3,
+            StoreRefusal::PublisherFull => 4,
+            StoreRefusal::KeyFull => 5,
+            StoreRefusal::StoreFull => 6,
+            StoreRefusal::Other => 7,
+        }
+    }
+
+    /// `None` for zero, which marks a record that was taken. A code this build
+    /// does not know is still a refusal, read as [`StoreRefusal::Other`].
+    fn from_code(code: u8) -> Option<Self> {
+        Some(match code {
+            0 => return None,
+            1 => StoreRefusal::Invalid,
+            2 => StoreRefusal::Stale,
+            3 => StoreRefusal::NotResponsible,
+            4 => StoreRefusal::PublisherFull,
+            5 => StoreRefusal::KeyFull,
+            6 => StoreRefusal::StoreFull,
+            _ => StoreRefusal::Other,
+        })
+    }
+
+    /// Whether another try at the same storer this round would meet the same
+    /// answer. Proximity is not: the publisher's view of who is closest moves
+    /// with its next lookup. An unnamed reason is given the benefit of a retry.
+    pub fn is_permanent(self) -> bool {
+        matches!(
+            self,
+            StoreRefusal::Invalid
+                | StoreRefusal::Stale
+                | StoreRefusal::PublisherFull
+                | StoreRefusal::KeyFull
+                | StoreRefusal::StoreFull
+        )
+    }
+}
+
+/// The refusal a `STORE_BATCH_ACK` reported for record `index`, if any.
+pub fn store_refusal_at(reasons: &[u8], index: usize) -> Option<StoreRefusal> {
+    reasons.get(index).copied().and_then(StoreRefusal::from_code)
+}
+
+/// Encode one refusal (or `None` for a record taken) as its wire code.
+pub fn store_refusal_code(refusal: Option<StoreRefusal>) -> u8 {
+    refusal.map_or(0, StoreRefusal::code)
+}
+
+/// Tag introducing the per-record reasons after a `STORE_BATCH_ACK` bitmap.
+const STORE_ACK_REASONS_TAG: u8 = 0x01;
+
 /// Records one `STORE_BATCH` may carry.
 ///
 /// This bounds the decode-side allocation and the width of the ack bitmap
@@ -609,12 +692,16 @@ pub enum DhtPayload {
         /// `None` is a build predating the block — every peer today — and
         /// means "assume `EMBER_DHT_VERSION` and nothing else".
         versions: Option<VersionRange>,
+        /// The sender's word on its own UDP port. `None` from a build
+        /// predating the claim, or one whose check has not concluded.
+        reach: Option<UdpReach>,
     },
     /// Optional observed address of the ping sender (slice 19). Empty
     /// payload decodes as `None` for backward compatibility.
     Pong {
         observed: Option<SocketAddr>,
         versions: Option<VersionRange>,
+        reach: Option<UdpReach>,
     },
     FindNode {
         target: EmberNodeId,
@@ -662,6 +749,9 @@ pub enum DhtPayload {
     /// full batch.
     StoreBatchAck {
         accepted: u64,
+        /// One [`StoreRefusal`] code per record position, zero for a record
+        /// that was taken. Empty from a storer predating the block.
+        reasons: Vec<u8>,
     },
     FindValue {
         keys: Vec<[u8; 16]>,
@@ -959,6 +1049,32 @@ pub const OUR_VERSION_RANGE: VersionRange = VersionRange {
 const VERSION_RANGE_TAG: u8 = 0x01;
 const VERSION_RANGE_VALUE_LEN: u8 = 2;
 
+/// TLV tag for [`UdpReach`] in the same block, after the version range.
+///
+/// After it, not before: a build that knows only the range stops reading at the
+/// range tag, so whatever follows is invisible to it however it is shaped.
+const UDP_REACH_TAG: u8 = 0x02;
+const UDP_REACH_VALUE_LEN: u8 = 1;
+const UDP_REACH_OPEN: u8 = 1;
+const UDP_REACH_FIREWALLED: u8 = 2;
+
+/// What a node says about its own UDP port: whether a datagram from a host it
+/// never contacted reaches it.
+///
+/// Only the node itself can answer this. A peer that answers *our* queries has
+/// proved nothing to third parties: behind a NAT it is answering through a
+/// mapping its own traffic to us opened. So a contact list built on "answered
+/// us" kept handing out NATed peers that every asker then probed in vain. The
+/// claim comes from the node's own firewall check, and a false "open" buys a
+/// liar nothing it could not get by answering anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpReach {
+    /// Unsolicited UDP reaches this node.
+    Open,
+    /// Its check found unsolicited UDP filtered.
+    Firewalled,
+}
+
 /// Append the tag/len/value block advertising `range`.
 ///
 /// Additive on the same terms as the `FIND_VALUE` constraint block and a keyword
@@ -977,6 +1093,50 @@ fn encode_version_block(range: &VersionRange, buf: &mut Vec<u8>) {
     buf.push(VERSION_RANGE_VALUE_LEN);
     buf.push(range.min);
     buf.push(range.max);
+}
+
+/// Append the whole trailing block: the range, then the reachability claim.
+fn encode_advert_block(versions: Option<&VersionRange>, reach: Option<UdpReach>, buf: &mut Vec<u8>) {
+    if let Some(range) = versions {
+        encode_version_block(range, buf);
+    }
+    if let Some(reach) = reach {
+        buf.push(UDP_REACH_TAG);
+        buf.push(UDP_REACH_VALUE_LEN);
+        buf.push(match reach {
+            UdpReach::Open => UDP_REACH_OPEN,
+            UdpReach::Firewalled => UDP_REACH_FIREWALLED,
+        });
+    }
+}
+
+/// Read a [`UdpReach`] out of the trailing block, if it carries one.
+///
+/// `None` for absent, truncated or an unknown value, on the same reasoning as
+/// [`decode_version_block`]: the claim is advisory and must never cost a frame.
+fn decode_reach_block(data: &[u8]) -> Option<UdpReach> {
+    let mut at = 0usize;
+    while at + 2 <= data.len() {
+        let tag = data[at];
+        let len = data[at + 1] as usize;
+        let value = at + 2;
+        let end = value.checked_add(len)?;
+        if end > data.len() {
+            return None;
+        }
+        if tag == UDP_REACH_TAG {
+            if len != UDP_REACH_VALUE_LEN as usize {
+                return None;
+            }
+            return match data[value] {
+                UDP_REACH_OPEN => Some(UdpReach::Open),
+                UDP_REACH_FIREWALLED => Some(UdpReach::Firewalled),
+                _ => None,
+            };
+        }
+        at = end;
+    }
+    None
 }
 
 /// Read a [`VersionRange`] out of the trailing block, if it carries one.
@@ -1160,7 +1320,13 @@ pub fn decode_message(
 }
 
 /// Build a PING message.
+#[cfg(test)]
 pub fn build_ping(sender_id: EmberNodeId, request_id: u32) -> DhtMessage {
+    build_ping_advertising(sender_id, request_id, None)
+}
+
+/// Build a PING message carrying our claim about our own UDP port.
+pub fn build_ping_advertising(sender_id: EmberNodeId, request_id: u32, reach: Option<UdpReach>) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
         msg_type: MSG_PING,
@@ -1169,13 +1335,26 @@ pub fn build_ping(sender_id: EmberNodeId, request_id: u32) -> DhtMessage {
         sender_pub_key: None,
         payload: DhtPayload::Ping {
             versions: Some(OUR_VERSION_RANGE),
+            reach,
         },
         signature: [0u8; 64], // filled by encode_message
     }
 }
 
 /// Build a PONG response carrying the sender's observed address.
+#[cfg(test)]
 pub fn build_pong(sender_id: EmberNodeId, request_id: u32, observed: SocketAddr) -> DhtMessage {
+    build_pong_advertising(sender_id, request_id, observed, None)
+}
+
+/// Build a PONG response carrying the sender's observed address and our claim
+/// about our own UDP port.
+pub fn build_pong_advertising(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    observed: SocketAddr,
+    reach: Option<UdpReach>,
+) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
         msg_type: MSG_PONG,
@@ -1185,6 +1364,7 @@ pub fn build_pong(sender_id: EmberNodeId, request_id: u32, observed: SocketAddr)
         payload: DhtPayload::Pong {
             observed: Some(observed),
             versions: Some(OUR_VERSION_RANGE),
+            reach,
         },
         signature: [0u8; 64],
     }
@@ -1348,14 +1528,25 @@ pub fn build_store_batch(
 }
 
 /// Build the reply to a STORE_BATCH, reporting which records were accepted.
+#[cfg(test)]
 pub fn build_store_batch_ack(sender_id: EmberNodeId, request_id: u32, accepted: u64) -> DhtMessage {
+    build_store_batch_ack_with_reasons(sender_id, request_id, accepted, Vec::new())
+}
+
+/// [`build_store_batch_ack`] with one [`StoreRefusal`] code per record.
+pub fn build_store_batch_ack_with_reasons(
+    sender_id: EmberNodeId,
+    request_id: u32,
+    accepted: u64,
+    reasons: Vec<u8>,
+) -> DhtMessage {
     DhtMessage {
         version: EMBER_DHT_VERSION,
         msg_type: MSG_STORE_BATCH_ACK,
         request_id,
         sender_id,
         sender_pub_key: None,
-        payload: DhtPayload::StoreBatchAck { accepted },
+        payload: DhtPayload::StoreBatchAck { accepted, reasons },
         signature: [0u8; 64],
     }
 }
@@ -1592,15 +1783,17 @@ pub fn build_found_value(
 
 fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
     match payload {
-        DhtPayload::Ping { versions } => {
+        DhtPayload::Ping { versions, reach } => {
             let mut buf = Vec::new();
-            if let Some(range) = versions {
-                encode_version_block(range, &mut buf);
-            }
+            encode_advert_block(versions.as_ref(), *reach, &mut buf);
             buf
         }
-        DhtPayload::Pong { observed, versions } => {
-            let mut buf = Vec::with_capacity(19);
+        DhtPayload::Pong {
+            observed,
+            versions,
+            reach,
+        } => {
+            let mut buf = Vec::with_capacity(22);
             if let Some(addr) = observed {
                 encode_socket_addr(addr, &mut buf);
                 // Only behind an address: the block trails the fields a reader
@@ -1608,9 +1801,7 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
                 // an older build would read the tag byte as an address type and
                 // reject the whole frame. A PONG without an observed address is
                 // the pre-slice-19 shape, so it stays byte-for-byte itself.
-                if let Some(range) = versions {
-                    encode_version_block(range, &mut buf);
-                }
+                encode_advert_block(versions.as_ref(), *reach, &mut buf);
             }
             buf
         }
@@ -1665,7 +1856,16 @@ fn encode_payload(payload: &DhtPayload) -> Vec<u8> {
             }
             buf
         }
-        DhtPayload::StoreBatchAck { accepted } => accepted.to_le_bytes().to_vec(),
+        DhtPayload::StoreBatchAck { accepted, reasons } => {
+            let mut buf = accepted.to_le_bytes().to_vec();
+            // Bounded like the batch it answers, so the length byte holds it.
+            if !reasons.is_empty() && reasons.len() <= MAX_STORE_BATCH_RECORDS {
+                buf.push(STORE_ACK_REASONS_TAG);
+                buf.push(reasons.len() as u8);
+                buf.extend_from_slice(reasons);
+            }
+            buf
+        }
         DhtPayload::FindValue {
             keys,
             start_position,
@@ -1899,18 +2099,21 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
     match msg_type {
         MSG_PING => Ok(DhtPayload::Ping {
             versions: decode_version_block(data),
+            reach: decode_reach_block(data),
         }),
         MSG_PONG => {
             if data.is_empty() {
                 Ok(DhtPayload::Pong {
                     observed: None,
                     versions: None,
+                    reach: None,
                 })
             } else {
                 let (addr, consumed) = decode_socket_addr(data)?;
                 Ok(DhtPayload::Pong {
                     observed: Some(addr),
                     versions: decode_version_block(&data[consumed..]),
+                    reach: decode_reach_block(&data[consumed..]),
                 })
             }
         }
@@ -2016,8 +2219,19 @@ fn decode_payload(msg_type: u8, data: &[u8]) -> anyhow::Result<DhtPayload> {
             }
             let mut bits = [0u8; 8];
             bits.copy_from_slice(&data[..8]);
+            // The reasons are advisory: a block that is absent, malformed or
+            // oversized leaves the bitmap standing on its own, as it always has.
+            let reasons = match data.get(8..10) {
+                Some(&[STORE_ACK_REASONS_TAG, len])
+                    if (len as usize) <= MAX_STORE_BATCH_RECORDS && data.len() >= 10 + len as usize =>
+                {
+                    data[10..10 + len as usize].to_vec()
+                }
+                _ => Vec::new(),
+            };
             Ok(DhtPayload::StoreBatchAck {
                 accepted: u64::from_le_bytes(bits),
+                reasons,
             })
         }
         MSG_STORE_ACK | MSG_PROXY_STORE_ACK => {
@@ -2574,7 +2788,7 @@ mod tests {
         let encoded = encode_message(&ping, &sk, true, &TEST_NOISE_PUB);
         let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
-            DhtPayload::Ping { versions } => {
+            DhtPayload::Ping { versions, .. } => {
                 assert_eq!(versions, Some(OUR_VERSION_RANGE));
             }
             other => panic!("expected Ping, got {other:?}"),
@@ -2584,7 +2798,7 @@ mod tests {
         let encoded = encode_message(&pong, &sk, true, &TEST_NOISE_PUB);
         let decoded = decode_message(&encoded, true, &TEST_NOISE_PUB).unwrap();
         match decoded.payload {
-            DhtPayload::Pong { observed, versions } => {
+            DhtPayload::Pong { observed, versions, .. } => {
                 assert_eq!(
                     observed,
                     Some("198.51.100.9:4672".parse().unwrap()),
@@ -2639,14 +2853,137 @@ mod tests {
         // will keep doing until they update.
         assert!(matches!(
             decode_payload(MSG_PING, &[]).unwrap(),
-            DhtPayload::Ping { versions: None }
+            DhtPayload::Ping {
+                versions: None,
+                reach: None
+            }
         ));
         assert!(matches!(
             decode_payload(MSG_PONG, &bare_pong).unwrap(),
             DhtPayload::Pong {
                 observed: Some(_),
-                versions: None
+                versions: None,
+                reach: None
             }
+        ));
+    }
+
+    /// The reachability claim rides the same block, after the range, and both
+    /// survive the round trip on a `PING` and a `PONG`.
+    #[test]
+    fn ping_and_pong_carry_the_reachability_claim() {
+        let (sk, id) = test_keypair();
+        for reach in [UdpReach::Open, UdpReach::Firewalled] {
+            let ping = build_ping_advertising(id, 5, Some(reach));
+            let decoded =
+                decode_message(&encode_message(&ping, &sk, true, &TEST_NOISE_PUB), true, &TEST_NOISE_PUB)
+                    .unwrap();
+            match decoded.payload {
+                DhtPayload::Ping { versions, reach: got } => {
+                    assert_eq!(versions, Some(OUR_VERSION_RANGE));
+                    assert_eq!(got, Some(reach));
+                }
+                other => panic!("expected Ping, got {other:?}"),
+            }
+
+            let observed: SocketAddr = "198.51.100.9:4672".parse().unwrap();
+            let pong = build_pong_advertising(id, 5, observed, Some(reach));
+            let decoded =
+                decode_message(&encode_message(&pong, &sk, true, &TEST_NOISE_PUB), true, &TEST_NOISE_PUB)
+                    .unwrap();
+            match decoded.payload {
+                DhtPayload::Pong {
+                    observed: got_addr,
+                    versions,
+                    reach: got,
+                } => {
+                    assert_eq!(got_addr, Some(observed));
+                    assert_eq!(versions, Some(OUR_VERSION_RANGE));
+                    assert_eq!(got, Some(reach));
+                }
+                other => panic!("expected Pong, got {other:?}"),
+            }
+        }
+    }
+
+    /// What a 1.7 peer reads from a 1.8 frame: its range decoder stops at the
+    /// range tag, so the claim after it changes nothing it parses.
+    #[test]
+    fn the_reachability_claim_is_invisible_to_a_range_only_reader() {
+        let mut buf = Vec::new();
+        encode_advert_block(Some(&OUR_VERSION_RANGE), Some(UdpReach::Firewalled), &mut buf);
+        assert_eq!(decode_version_block(&buf), Some(OUR_VERSION_RANGE));
+        assert_eq!(&buf[..4], &[VERSION_RANGE_TAG, 2, OUR_VERSION_RANGE.min, OUR_VERSION_RANGE.max]);
+        assert_eq!(decode_reach_block(&buf), Some(UdpReach::Firewalled));
+    }
+
+    /// Refusal reasons survive the round trip, and the bitmap in front of them
+    /// is byte for byte what a 1.7 publisher reads.
+    #[test]
+    fn a_store_batch_ack_carries_reasons_behind_the_bitmap() {
+        let (sk, id) = test_keypair();
+        let reasons = vec![
+            store_refusal_code(None),
+            store_refusal_code(Some(StoreRefusal::PublisherFull)),
+            store_refusal_code(Some(StoreRefusal::NotResponsible)),
+        ];
+        let ack = build_store_batch_ack_with_reasons(id, 9, 0b001, reasons.clone());
+        let payload = encode_payload(&ack.payload);
+        assert_eq!(&payload[..8], &0b001u64.to_le_bytes(), "the bitmap leads, unchanged");
+        let decoded =
+            decode_message(&encode_message(&ack, &sk, true, &TEST_NOISE_PUB), true, &TEST_NOISE_PUB).unwrap();
+        match decoded.payload {
+            DhtPayload::StoreBatchAck { accepted, reasons: got } => {
+                assert_eq!(accepted, 0b001);
+                assert_eq!(got, reasons);
+                assert_eq!(store_refusal_at(&got, 0), None);
+                assert_eq!(store_refusal_at(&got, 1), Some(StoreRefusal::PublisherFull));
+                assert_eq!(store_refusal_at(&got, 2), Some(StoreRefusal::NotResponsible));
+                assert_eq!(store_refusal_at(&got, 3), None, "past the end is no claim");
+            }
+            other => panic!("expected StoreBatchAck, got {other:?}"),
+        }
+    }
+
+    /// A bare bitmap still decodes, a malformed block is ignored rather than
+    /// fatal, and a code this build does not know is still a refusal.
+    #[test]
+    fn store_ack_reasons_are_advisory() {
+        let bare = 0b11u64.to_le_bytes();
+        assert!(matches!(
+            decode_payload(MSG_STORE_BATCH_ACK, &bare).unwrap(),
+            DhtPayload::StoreBatchAck { accepted: 0b11, ref reasons } if reasons.is_empty()
+        ));
+        let mut truncated = bare.to_vec();
+        truncated.extend_from_slice(&[STORE_ACK_REASONS_TAG, 4, 1, 2]);
+        assert!(matches!(
+            decode_payload(MSG_STORE_BATCH_ACK, &truncated).unwrap(),
+            DhtPayload::StoreBatchAck { ref reasons, .. } if reasons.is_empty()
+        ));
+        let mut oversized = bare.to_vec();
+        oversized.extend_from_slice(&[STORE_ACK_REASONS_TAG, 65]);
+        oversized.extend_from_slice(&[1u8; 65]);
+        assert!(matches!(
+            decode_payload(MSG_STORE_BATCH_ACK, &oversized).unwrap(),
+            DhtPayload::StoreBatchAck { ref reasons, .. } if reasons.is_empty()
+        ));
+        assert_eq!(store_refusal_at(&[200], 0), Some(StoreRefusal::Other));
+        assert!(!StoreRefusal::NotResponsible.is_permanent());
+        assert!(!StoreRefusal::Other.is_permanent());
+        assert!(StoreRefusal::PublisherFull.is_permanent());
+    }
+
+    /// A malformed or unknown claim reads as no claim, never as a frame error.
+    #[test]
+    fn a_malformed_reachability_claim_reads_as_no_claim() {
+        assert_eq!(decode_reach_block(&[UDP_REACH_TAG, 1]), None, "truncated");
+        assert_eq!(decode_reach_block(&[UDP_REACH_TAG, 2, 1, 1]), None, "wrong length");
+        assert_eq!(decode_reach_block(&[UDP_REACH_TAG, 1, 0]), None, "unknown value");
+        assert_eq!(decode_reach_block(&[UDP_REACH_TAG, 1, 9]), None, "unknown value");
+        assert_eq!(decode_reach_block(&[]), None);
+        assert!(matches!(
+            decode_payload(MSG_PING, &[UDP_REACH_TAG, 1, 7]).unwrap(),
+            DhtPayload::Ping { reach: None, .. }
         ));
     }
 
@@ -2659,6 +2996,7 @@ mod tests {
         let payload = encode_payload(&DhtPayload::Pong {
             observed: None,
             versions: Some(OUR_VERSION_RANGE),
+            reach: Some(UdpReach::Open),
         });
         assert!(
             payload.is_empty(),

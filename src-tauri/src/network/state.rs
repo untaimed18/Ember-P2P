@@ -903,6 +903,17 @@ pub(super) struct NetworkState {
     /// placed at least one record, so the round counts as published however
     /// its last key resolves.
     pub(super) ember_publish_placed: HashSet<([u8; 16], EmberPublishKind)>,
+    /// Records some storer has failed to place this round, with whether every
+    /// such failure so far was a refusal another try would meet again. See
+    /// `note_ember_store_attempt_failed`.
+    pub(super) ember_publish_refusals: HashMap<EmberRecordRef, bool>,
+    /// Our files allowed under each over-subscribed keyword. See
+    /// `ember_keyword_cap_from`.
+    pub(super) ember_keyword_cap: HashMap<[u8; 16], HashSet<[u8; 16]>>,
+    /// When `ember_keyword_cap` was last worked out, and over how many
+    /// publishable files.
+    pub(super) ember_keyword_cap_at: Option<std::time::Instant>,
+    pub(super) ember_keyword_cap_files: usize,
     /// Rounds in `ember_publish_unplaced` in which at least one key failed on
     /// every replica, with those keys, so a round that also placed others
     /// comes back soon for the ones that did not.
@@ -1103,6 +1114,12 @@ pub(super) struct NetworkState {
     /// cannot throttle each other: a friend asking us on its own schedule says
     /// nothing about when we should next ask them.
     pub(super) ember_friend_contacts_asked: HashMap<[u8; 16], std::time::Instant>,
+    /// Per friend: asks in a row that taught us nobody new, and when the next
+    /// ask is due. See `ember_friend_contact_backoff`.
+    pub(super) ember_friend_contact_backoff: HashMap<[u8; 16], (u32, std::time::Instant)>,
+    /// When each contact that had not stated its reachability was last pinged
+    /// to ask. See `ember_reach_probe_targets`.
+    pub(super) ember_reach_probed: HashMap<ember::dht::EmberNodeId, std::time::Instant>,
     pub(super) ember_friend_contacts_served: HashMap<[u8; 16], std::time::Instant>,
 
     /// The same pair for `EMBER_EXT_DHT_MEET`: when we last asked each friend

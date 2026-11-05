@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use tracing::trace;
 
-use super::messages::{self, DhtPayload, VersionRange};
+use super::messages::{self, DhtPayload, StoreRefusal, UdpReach, VersionRange};
 use super::publish::{
     source_key, SignedRecord, SourceBuddy, SourceContact, RECORD_TYPE_CHANNEL, RECORD_TYPE_FEED,
     RECORD_TYPE_FEED_LISTING, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
@@ -358,6 +358,9 @@ pub struct DhtInbound {
     pub store_ack_request_id: Option<u32>,
     /// The frame was a `STORE_BATCH_ACK`: `(request_id, accepted bitmap)`.
     pub store_batch_ack: Option<(u32, u64)>,
+    /// That ack's per-record refusal codes (see [`messages::store_refusal_at`]),
+    /// empty when the storer sent none.
+    pub store_batch_ack_reasons: Vec<u8>,
     /// How many records an inbound `STORE_BATCH` contributed to our store.
     pub batch_records_stored: u16,
     /// For a `FOUND_VALUE`, the page it carried.
@@ -504,8 +507,31 @@ enum StoreOutcome {
     /// The same publisher signature arrived again inside the replay window.
     Replay,
     /// Failed verification, key binding, anti-reflection, the creation-date
-    /// window, proximity, or a store capacity limit.
-    Rejected,
+    /// window, proximity, or a store capacity limit — which one, for the ack.
+    Rejected(StoreRefusal),
+}
+
+/// Which limit refused a record the store turned away, read from which of its
+/// refusal counters moved across the call.
+///
+/// The store keeps those counters per cause already, so this asks them rather
+/// than threading a reason through every return in it. A refusal that moved
+/// none of them — a budget eviction declining the newcomer — is
+/// [`StoreRefusal::Other`], which a publisher treats as worth a retry.
+fn store_refusal_between(before: StoreRejectStats, after: StoreRejectStats) -> StoreRefusal {
+    if after.publisher_cap > before.publisher_cap {
+        StoreRefusal::PublisherFull
+    } else if after.per_key_cap > before.per_key_cap || after.source_ip_cap > before.source_ip_cap {
+        StoreRefusal::KeyFull
+    } else if after.key_cap > before.key_cap {
+        StoreRefusal::StoreFull
+    } else if after.timestamp > before.timestamp {
+        StoreRefusal::Stale
+    } else if after.signature > before.signature || after.unparseable > before.unparseable {
+        StoreRefusal::Invalid
+    } else {
+        StoreRefusal::Other
+    }
 }
 
 /// Owns our DHT identity, routing table, and local record store, and
@@ -641,6 +667,12 @@ pub struct EmberDht {
     /// Whether we replicate onward and apply the filtered shares. See
     /// [`SELECTIVE_STORER_ON_CONTACTS`].
     selective_storer: SelectiveStorerGate,
+    /// What our `PING`s and `PONG`s say about our own UDP port, as the network
+    /// loop last concluded. `None` until a check has.
+    advertised_reach: Option<UdpReach>,
+    /// What each peer last said about its own UDP port. Held, bounded and
+    /// pruned exactly as [`Self::peer_versions`] is.
+    peer_reach: HashMap<EmberNodeId, UdpReach>,
 }
 
 /// A candidate buddy's signed statement of its own endpoint, issued to us.
@@ -747,6 +779,8 @@ impl EmberDht {
             buddy_endorse_asked: HashMap::new(),
             endorsed: HashMap::new(),
             selective_storer: SelectiveStorerGate::default(),
+            advertised_reach: None,
+            peer_reach: HashMap::new(),
         }
     }
 
@@ -1211,6 +1245,61 @@ impl EmberDht {
         self.peer_versions.insert(id, range);
     }
 
+    /// Record what a `PING` or `PONG` said about its sender's UDP port.
+    ///
+    /// Unlike the range, an absent claim *replaces* a held one: every build
+    /// that knows the claim sends it on every frame it applies to once it has
+    /// concluded, so a frame without it is a node whose check has lapsed, and
+    /// the old answer is no longer its word. A build predating the claim never
+    /// had an entry to clear.
+    fn note_peer_reach(&mut self, id: EmberNodeId, reach: Option<UdpReach>) {
+        let Some(reach) = reach else {
+            self.peer_reach.remove(&id);
+            return;
+        };
+        if self.routing.get_contact(&id).is_none() {
+            return;
+        }
+        if self.peer_reach.len() >= MAX_TRACKED_PEER_VERSIONS && !self.peer_reach.contains_key(&id) {
+            return;
+        }
+        self.peer_reach.insert(id, reach);
+    }
+
+    /// What `id` last said about its own UDP port, if it has said.
+    pub fn peer_reach(&self, id: &EmberNodeId) -> Option<UdpReach> {
+        self.peer_reach.get(id).copied()
+    }
+
+    /// Set what our own `PING`s and `PONG`s claim about our UDP port.
+    pub fn set_advertised_reach(&mut self, reach: Option<UdpReach>) {
+        self.advertised_reach = reach;
+    }
+
+    /// Verified contacts that have said nothing about their own UDP port.
+    pub fn contacts_without_reach_claim(&self) -> Vec<EmberContact> {
+        let mut silent = self.routing.all_contacts();
+        silent.retain(|c| c.is_verified() && !self.peer_reach.contains_key(&c.node_id));
+        silent
+    }
+
+    /// Verified contacts by what they say about their own UDP port: open,
+    /// firewalled, and silent on it (older builds, or a check not concluded).
+    pub fn reach_census(&self) -> (usize, usize, usize) {
+        let mut census = (0, 0, 0);
+        for contact in self.routing.all_contacts() {
+            if !contact.is_verified() {
+                continue;
+            }
+            match self.peer_reach(&contact.node_id) {
+                Some(UdpReach::Open) => census.0 += 1,
+                Some(UdpReach::Firewalled) => census.1 += 1,
+                None => census.2 += 1,
+            }
+        }
+        census
+    }
+
     /// Forget advertised ranges for peers no longer in the routing table —
     /// neither a bucket nor a replacement cache. Returns how many were dropped.
     ///
@@ -1224,6 +1313,7 @@ impl EmberDht {
         self.answered.retain(|id, at| {
             routing.get_contact(id).is_some() && now.saturating_duration_since(*at) < ANSWERED_TTL
         });
+        self.peer_reach.retain(|id, _| routing.get_contact(id).is_some());
         if self.peer_versions.is_empty() {
             return 0;
         }
@@ -1340,7 +1430,7 @@ impl EmberDht {
         // enforces capacity.
         let Some(parsed) = SignedRecord::parse_unverified(&record, record_signature) else {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         };
 
         // Anti-reflection for source records: HighID / direct sources must
@@ -1358,37 +1448,37 @@ impl EmberDht {
         };
         if !source_ip_ok {
             self.store_reject_source_ip = self.store_reject_source_ip.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         }
 
         if parsed.record_type == RECORD_TYPE_CHANNEL && !parsed.channel_store_ok() {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         }
         if parsed.record_type == RECORD_TYPE_FEED && !parsed.feed_store_ok() {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         }
         if parsed.record_type == RECORD_TYPE_FEED_LISTING && !parsed.feed_listing_store_ok() {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         }
         // An index shard key holds listings only. A keyword record, whose key
         // nothing can check, filed there took a shard's slot that the full
         // shard's eviction, which drops listings alone, never gave back.
         if parsed.record_type != RECORD_TYPE_FEED_LISTING && crate::network::ember::feed::is_feed_index_key(&key) {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         }
         // A room index shard key likewise holds rooms' listings only.
         if crate::network::ember::channel::is_index_key(&key) && !super::store::is_room_listing(&record) {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         }
 
         if key != parsed.keyword_hash {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         }
         // For a keyword record the word itself is not carried, so `keyword_hash`
         // cannot be recomputed and the check above is all there is. A source
@@ -1400,7 +1490,7 @@ impl EmberDht {
         // of which of our records to displace.
         if parsed.record_type == RECORD_TYPE_SOURCE && key != source_key(&parsed.file_hash) {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         }
 
         // Slice 14: collapse identical STORE frames (same publisher
@@ -1459,12 +1549,12 @@ impl EmberDht {
         }
 
         if !self.store.created_at_admissible(&key, &record, parsed.timestamp) {
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Stale);
         }
 
         if !self.verify_inbound_record(&parsed) {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Invalid);
         }
 
         // The other way a seen signature stops being held is the publisher
@@ -1485,7 +1575,7 @@ impl EmberDht {
                     && h.created_at > parsed.timestamp
             })
         {
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::Stale);
         }
 
         // A firewalled source's declared address is exempt from the bind
@@ -1532,7 +1622,7 @@ impl EmberDht {
         // grown, and the count above must see every genuine record, kept or not.
         if !self.store_proximity_ok(&key) {
             self.store_reject_proximity = self.store_reject_proximity.saturating_add(1);
-            return StoreOutcome::Rejected;
+            return StoreOutcome::Rejected(StoreRefusal::NotResponsible);
         }
         // A type byte this build does not know still parses — the header is
         // shared — and is stored like a keyword record, because refusing it
@@ -1548,6 +1638,7 @@ impl EmberDht {
                 | RECORD_TYPE_FEED
                 | RECORD_TYPE_FEED_LISTING
         );
+        let rejects_before = self.store.reject_stats();
         if self
             .store
             .store_attributed(key, record, record_signature, attributed_ip)
@@ -1574,7 +1665,7 @@ impl EmberDht {
             }
             StoreOutcome::Stored
         } else {
-            StoreOutcome::Rejected
+            StoreOutcome::Rejected(store_refusal_between(rejects_before, self.store.reject_stats()))
         }
     }
 
@@ -2376,12 +2467,24 @@ impl EmberDht {
     ) -> Vec<EmberContact> {
         let budget = messages::MAX_CONTACTS_PER_DATAGRAM;
         let mut closest = self.routing.find_closest(target, 2 * budget + 1);
-        closest.retain(|c| c.node_id != asker);
-        // Contacts that have answered us first, nearest first within each
-        // group: one that has only ever pinged us may be behind a NAT the asker
-        // cannot cross. It still fills a reply the answered ones cannot.
+        // A contact that told us its own UDP port is filtered is one the asker
+        // cannot reach: it reaches us through a mapping its own traffic opened.
+        // Handing it out cost every asker a probe, and a lookup that seeded it a
+        // query timeout, for an address that was never going to answer.
+        closest.retain(|c| {
+            c.node_id != asker && self.peer_reach(&c.node_id) != Some(UdpReach::Firewalled)
+        });
+        // Contacts that have answered us first, then within each group the ones
+        // that say unsolicited UDP reaches them, nearest first within each
+        // tier: one that has only ever pinged us, and says nothing about its
+        // port, may be behind a NAT the asker cannot cross. It still fills a
+        // reply the others cannot.
         let now = Instant::now();
-        closest.sort_by_key(|c| !self.has_answered(&c.node_id, now));
+        closest.sort_by_key(|c| {
+            let answered = self.has_answered(&c.node_id, now);
+            let open = self.peer_reach(&c.node_id) == Some(UdpReach::Open);
+            (!answered, !open)
+        });
         closest.truncate(budget);
         // LAN/CGNAT session peers live beside the public table when
         // `block_private_ips` is on. A neighbour on that island already
@@ -2424,7 +2527,7 @@ impl EmberDht {
     /// never seen us can verify the signature and learn our identity.
     pub fn build_ping(&mut self) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
-        let msg = messages::build_ping(self.local_id, request_id);
+        let msg = messages::build_ping_advertising(self.local_id, request_id, self.advertised_reach);
         let bytes = messages::encode_message(&msg, &self.signing_key, true, &self.local_noise_pub);
         (request_id, bytes)
     }
@@ -3103,16 +3206,23 @@ impl EmberDht {
             }
         }
         match msg.payload {
-            DhtPayload::Ping { versions } => {
+            DhtPayload::Ping { versions, reach } => {
                 out.ping_received = true;
                 self.note_peer_versions(msg.sender_id, versions);
-                let pong = messages::build_pong(self.local_id, msg.request_id, from);
+                self.note_peer_reach(msg.sender_id, reach);
+                let pong =
+                    messages::build_pong_advertising(self.local_id, msg.request_id, from, self.advertised_reach);
                 out.responses
                     .push(messages::encode_message(&pong, &self.signing_key, true, &self.local_noise_pub));
             }
-            DhtPayload::Pong { observed, versions } => {
+            DhtPayload::Pong {
+                observed,
+                versions,
+                reach,
+            } => {
                 out.pong_received = true;
                 self.note_peer_versions(msg.sender_id, versions);
+                self.note_peer_reach(msg.sender_id, reach);
                 out.pong_request_id = Some(msg.request_id);
                 out.pong_observed = observed;
                 // The PONG proves liveness of this session's endpoint; refresh
@@ -3166,7 +3276,7 @@ impl EmberDht {
                     // match its content, or (for a non-firewalled source)
                     // whose claimed IP doesn't match the sender, is dropped
                     // with no ACK.
-                    StoreOutcome::Rejected => {}
+                    StoreOutcome::Rejected(_) => {}
                 }
             }
             DhtPayload::StoreBatch { records } => {
@@ -3179,11 +3289,13 @@ impl EmberDht {
                 // total would let one accepted record retire the whole batch.
                 let mut accepted = 0u64;
                 let mut stored = 0u16;
+                let mut reasons = Vec::with_capacity(records.len());
                 for (i, rec) in records.into_iter().enumerate() {
-                    match self.accept_record(rec.key, rec.record, rec.record_signature, from) {
+                    let refusal = match self.accept_record(rec.key, rec.record, rec.record_signature, from) {
                         StoreOutcome::Stored => {
                             accepted |= 1u64 << i;
                             stored = stored.saturating_add(1);
+                            None
                         }
                         StoreOutcome::Replay => {
                             // A replay means we already hold this exact
@@ -3191,21 +3303,30 @@ impl EmberDht {
                             // it counts as placed.
                             accepted |= 1u64 << i;
                             out.store_replay_rejected = true;
+                            None
                         }
-                        StoreOutcome::Rejected => {}
-                    }
+                        StoreOutcome::Rejected(why) => Some(why),
+                    };
+                    reasons.push(messages::store_refusal_code(refusal));
                 }
                 out.stored_record = stored > 0;
                 out.batch_records_stored = stored;
+                // A batch taken whole needs no reasons, and an older publisher
+                // reads none either way.
+                if accepted.count_ones() as usize == reasons.len() {
+                    reasons.clear();
+                }
                 // Always answer, even with nothing accepted: the publisher
                 // needs to tell "stored nothing" apart from "never arrived"
                 // so it can retry rather than assume the records are placed.
-                let ack = messages::build_store_batch_ack(self.local_id, msg.request_id, accepted);
+                let ack =
+                    messages::build_store_batch_ack_with_reasons(self.local_id, msg.request_id, accepted, reasons);
                 out.responses
                     .push(messages::encode_message(&ack, &self.signing_key, true, &self.local_noise_pub));
             }
-            DhtPayload::StoreBatchAck { accepted } => {
+            DhtPayload::StoreBatchAck { accepted, reasons } => {
                 out.store_batch_ack = Some((msg.request_id, accepted));
+                out.store_batch_ack_reasons = reasons;
             }
             DhtPayload::ProxyStore {
                 key,
@@ -4529,6 +4650,83 @@ mod tests {
         assert!(engine.contact_count() <= before);
     }
 
+    /// A storer names why it turned each record away, and the publisher reads
+    /// the reasons back position for position; a batch taken whole carries none.
+    #[test]
+    fn a_store_batch_ack_says_why_each_refused_record_was_refused() {
+        let mut a = dht(32);
+        let mut b = dht(33);
+        let a_noise = a.local_noise_pub;
+        let b_noise = b.local_noise_pub;
+        let a_addr = addr(32, 4672);
+        let b_addr = addr(33, 4672);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+        let good = SignedRecord::keyword("alpha", [1; 16], [0u8; 32], 100, "alpha.iso", &sk);
+        let other = SignedRecord::keyword("beta", [2; 16], [0u8; 32], 100, "beta.iso", &sk);
+        let records = vec![
+            messages::BatchedRecord {
+                key: good.keyword_hash,
+                record: good.data.clone(),
+                record_signature: good.signature,
+            },
+            // Filed under a key its own body does not name.
+            messages::BatchedRecord {
+                key: good.keyword_hash,
+                record: other.data.clone(),
+                record_signature: other.signature,
+            },
+            // A body nothing can parse.
+            messages::BatchedRecord {
+                key: other.keyword_hash,
+                record: vec![0xFF; 8],
+                record_signature: [0u8; 64],
+            },
+        ];
+        let (rid, frame, taken) = a.build_store_batch(&records).expect("a batch");
+        assert_eq!(taken, 3);
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1000);
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 2000);
+        let (ack_rid, accepted) = on_a.store_batch_ack.expect("ack decodes");
+        assert_eq!(ack_rid, rid);
+        assert_eq!(accepted, 0b001);
+        let reasons = &on_a.store_batch_ack_reasons;
+        assert_eq!(messages::store_refusal_at(reasons, 0), None, "taken");
+        assert_eq!(messages::store_refusal_at(reasons, 1), Some(StoreRefusal::Invalid));
+        assert_eq!(messages::store_refusal_at(reasons, 2), Some(StoreRefusal::Invalid));
+
+        // Taken whole: the ack is the bare bitmap a 1.7 storer sends.
+        let fresh = SignedRecord::keyword("gamma", [3; 16], [0u8; 32], 100, "gamma.iso", &sk);
+        let (_, frame, _) = a
+            .build_store_batch(&[messages::BatchedRecord {
+                key: fresh.keyword_hash,
+                record: fresh.data.clone(),
+                record_signature: fresh.signature,
+            }])
+            .expect("a batch");
+        let on_b = b.handle_message(&frame, a_addr, a_noise, 1001);
+        let on_a = a.handle_message(&on_b.responses[0], b_addr, b_noise, 2001);
+        assert_eq!(on_a.store_batch_ack.map(|(_, bits)| bits), Some(0b1));
+        assert!(on_a.store_batch_ack_reasons.is_empty());
+    }
+
+    /// The store's refusal counters name the limit that turned a record away.
+    #[test]
+    fn a_store_refusal_is_read_from_the_counter_that_moved() {
+        let base = StoreRejectStats::default();
+        let moved = |f: fn(&mut StoreRejectStats)| {
+            let mut after = base;
+            f(&mut after);
+            store_refusal_between(base, after)
+        };
+        assert_eq!(moved(|s| s.publisher_cap += 1), StoreRefusal::PublisherFull);
+        assert_eq!(moved(|s| s.per_key_cap += 1), StoreRefusal::KeyFull);
+        assert_eq!(moved(|s| s.source_ip_cap += 1), StoreRefusal::KeyFull);
+        assert_eq!(moved(|s| s.key_cap += 1), StoreRefusal::StoreFull);
+        assert_eq!(moved(|s| s.timestamp += 1), StoreRefusal::Stale);
+        assert_eq!(moved(|s| s.signature += 1), StoreRefusal::Invalid);
+        assert_eq!(moved(|_| {}), StoreRefusal::Other);
+    }
+
     /// Batching is a framing change only: many records reach a peer in one
     /// datagram, and each is subject to exactly the checks a lone STORE would
     /// apply.
@@ -4751,6 +4949,55 @@ mod tests {
         let mut slow = SelectiveStorerGate::default();
         assert!(!slow.note(0, t0));
         assert!(!slow.note(SELECTIVE_STORER_ON_CONTACTS, t0 + SELECTIVE_STORER_HOLD));
+    }
+
+    /// A contact that says its UDP port is filtered is left out of what we hand
+    /// others, one that says it is open ranks ahead of one that says nothing,
+    /// and a frame without the claim clears a held one.
+    #[test]
+    fn contact_replies_follow_what_peers_say_about_their_own_port() {
+        let mut d = dht(6);
+        let local = d.local_id();
+        let seen = chrono::Utc::now().timestamp();
+        let firewalled = contact_in_bucket(local, 3, seen);
+        let open = contact_in_bucket(local, 4, seen);
+        let silent = contact_in_bucket(local, 5, seen);
+        for c in [&firewalled, &open, &silent] {
+            assert!(d.add_contact(c.clone()));
+        }
+        d.note_peer_reach(firewalled.node_id, Some(UdpReach::Firewalled));
+        d.note_peer_reach(open.node_id, Some(UdpReach::Open));
+
+        let asker = EmberNodeId([0xAB; 16]);
+        let reply = d.closest_excluding(&local, asker, &[]);
+        let ids: Vec<EmberNodeId> = reply.iter().map(|c| c.node_id).collect();
+        assert!(!ids.contains(&firewalled.node_id), "a firewalled contact is nobody's to reach");
+        let open_at = ids.iter().position(|id| *id == open.node_id).unwrap();
+        let silent_at = ids.iter().position(|id| *id == silent.node_id).unwrap();
+        assert!(open_at < silent_at, "an open claim ranks ahead of silence");
+        assert_eq!(d.reach_census(), (1, 1, 1));
+
+        // Its check lapsed: no claim on the next frame is no longer firewalled.
+        d.note_peer_reach(firewalled.node_id, None);
+        let reply = d.closest_excluding(&local, asker, &[]);
+        assert!(reply.iter().any(|c| c.node_id == firewalled.node_id));
+        assert_eq!(d.reach_census(), (1, 0, 2));
+    }
+
+    /// Our own claim rides every `PING` and `PONG` we build.
+    #[test]
+    fn our_pings_and_pongs_carry_our_claim() {
+        let mut a = dht(7);
+        a.set_advertised_reach(Some(UdpReach::Open));
+        let (_rid, frame) = a.build_ping();
+        let decoded = messages::decode_message(&frame, true, &a.local_noise_pub).unwrap();
+        assert!(matches!(
+            decoded.payload,
+            DhtPayload::Ping {
+                reach: Some(UdpReach::Open),
+                ..
+            }
+        ));
     }
 
     /// An overlay of twenty-odd nodes is one replica set: every record already

@@ -118,6 +118,22 @@ pub(super) fn note_ember_verified_contacts_on(
     dirty
 }
 
+/// Count why a storer turned one of our records away.
+pub(super) fn note_ember_refusal_reason(
+    diag: &mut EmberDiagnostics,
+    refusal: Option<ember::dht::messages::StoreRefusal>,
+) {
+    use ember::dht::messages::StoreRefusal;
+    let counter = match refusal {
+        Some(StoreRefusal::PublisherFull) => &mut diag.ember_dht_our_refused_publisher_cap,
+        Some(StoreRefusal::KeyFull | StoreRefusal::StoreFull) => &mut diag.ember_dht_our_refused_full,
+        Some(StoreRefusal::NotResponsible) => &mut diag.ember_dht_our_refused_not_closest,
+        Some(StoreRefusal::Invalid | StoreRefusal::Stale) => &mut diag.ember_dht_our_refused_invalid,
+        Some(StoreRefusal::Other) | None => &mut diag.ember_dht_our_refused_unexplained,
+    };
+    *counter = counter.saturating_add(1);
+}
+
 pub(super) fn record_ember_find_value_quality(
     diag: &mut EmberDiagnostics,
     search: &ember::dht::search::IterativeSearch,
@@ -155,10 +171,29 @@ pub(super) fn record_ember_find_value_quality(
 /// A round that placed any of its other keys is then published, not failed;
 /// one that placed nothing is charged. Returns whether the file was stamped
 /// published, which the caller owes [`note_ember_file_published`].
+#[cfg(test)]
 pub(super) fn fail_ember_record_pending(
+    schedule: EmberPublishSchedule<'_>,
+    reference: EmberRecordRef,
+    now: std::time::Instant,
+) -> bool {
+    fail_ember_record_pending_with(schedule, reference, now, false)
+}
+
+/// [`fail_ember_record_pending`], told whether every storer that turned the
+/// record away gave a reason another try would meet again
+/// ([`ember::dht::messages::StoreRefusal::is_permanent`]).
+///
+/// Such a key is not lost for want of trying, so it gets no partial retry; and
+/// a round in which every lost key was refused that way, with nothing placed,
+/// is deferred a full interval at once rather than charged round by round to
+/// the same end. A timeout, a proximity refusal or a storer that gave no reason
+/// keeps the ordinary retries.
+pub(super) fn fail_ember_record_pending_with(
     mut schedule: EmberPublishSchedule<'_>,
     reference: EmberRecordRef,
     now: std::time::Instant,
+    permanent: bool,
 ) -> bool {
     if reference.kind == EmberPublishKind::Replication {
         return false;
@@ -174,26 +209,63 @@ pub(super) fn fail_ember_record_pending(
         return false;
     }
     let round_open = !unplaced.is_empty();
-    schedule.partial.entry(slot).or_default().insert(reference.key);
+    if !permanent {
+        schedule.partial.entry(slot).or_default().insert(reference.key);
+    }
     if round_open {
         return false;
     }
+    let retryable = schedule.partial.get(&slot).is_some_and(|keys| !keys.is_empty());
     if schedule.finish_round(slot, now) {
         return true;
+    }
+    if !retryable {
+        schedule.attempts.remove(&slot);
+        if reference.kind == EmberPublishKind::Keyword {
+            schedule.retry_keys.remove(&reference.file_hash);
+        }
+        schedule.stamp(reference.file_hash, reference.kind, now);
+        debug!(
+            "Ember publish: every storer refused {} for good; deferring a full interval",
+            hex::encode(reference.file_hash)
+        );
+        return false;
     }
     charge_ember_publish_round(schedule, reference.file_hash, reference.kind, now);
     false
 }
 
+/// Records whose failed attempts this round are all permanent refusals, held at
+/// most this many at once. Past it a failure is simply not recorded, which reads
+/// as an ordinary retryable failure — the behaviour before refusals had reasons.
+const EMBER_PUBLISH_REFUSALS_MAX: usize = super::ember_publish::EMBER_BATCH_QUEUE_MAX;
+
+/// One storer did not place `reference`: it refused it, with the reason it
+/// gave if any, or its batch went unanswered (`refusal` is `None` for both of
+/// those, and for a storer that predates reasons — all read as retryable).
 pub(super) fn note_ember_store_attempt_failed(
     state: &mut NetworkState,
     reference: EmberRecordRef,
+    refusal: Option<ember::dht::messages::StoreRefusal>,
     now: std::time::Instant,
 ) {
+    let permanent = refusal.is_some_and(|r| r.is_permanent());
+    if reference.kind != EmberPublishKind::Replication {
+        let refusals = &mut state.ember_publish_refusals;
+        if let Some(all_permanent) = refusals.get_mut(&reference) {
+            *all_permanent &= permanent;
+        } else if refusals.len() < EMBER_PUBLISH_REFUSALS_MAX {
+            refusals.insert(reference, permanent);
+        }
+    }
     if state.ember_batch_publish.record_still_outstanding(reference) {
         return;
     }
-    if fail_ember_record_pending(state.publish_schedule(), reference, now) {
+    let permanent = state
+        .ember_publish_refusals
+        .remove(&reference)
+        .unwrap_or(false);
+    if fail_ember_record_pending_with(state.publish_schedule(), reference, now, permanent) {
         note_ember_file_published(state, reference.file_hash, reference.kind);
     }
 }
@@ -361,6 +433,59 @@ pub(super) fn ember_rendezvous_advert_reachable(
     ember_udp_reachable: bool,
 ) -> bool {
     (udp_fw_verified && !udp_firewalled) || ember_udp_reachable
+}
+
+/// Contacts with no reachability claim asked per maintenance cycle.
+pub(super) const EMBER_REACH_PROBES_PER_TICK: usize = 2;
+
+/// How long before a contact that still has not said is asked again. Builds
+/// before 1.8 never will, so this is what bounds their cost: one `PING` per
+/// contact per half hour.
+pub(super) const EMBER_REACH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Which of `silent` (verified contacts with no reachability claim) to ask this
+/// cycle: not asked within [`EMBER_REACH_PROBE_INTERVAL`], not already being
+/// pinged by the liveness pass, least recently asked first, and no more than
+/// the `room` the liveness pass left in the cycle's ping budget.
+pub(super) fn ember_reach_probe_targets(
+    silent: Vec<ember::dht::EmberContact>,
+    probed: &HashMap<ember::dht::EmberNodeId, std::time::Instant>,
+    already_due: &[ember::dht::EmberContact],
+    room: usize,
+    now: std::time::Instant,
+) -> Vec<ember::dht::EmberContact> {
+    let mut candidates: Vec<ember::dht::EmberContact> = silent
+        .into_iter()
+        .filter(|c| !already_due.iter().any(|d| d.node_id == c.node_id))
+        .filter(|c| {
+            probed
+                .get(&c.node_id)
+                .is_none_or(|at| now.saturating_duration_since(*at) >= EMBER_REACH_PROBE_INTERVAL)
+        })
+        .collect();
+    candidates.sort_by_key(|c| probed.get(&c.node_id).copied());
+    candidates.truncate(EMBER_REACH_PROBES_PER_TICK.min(room));
+    candidates
+}
+
+/// What our DHT `PING`s and `PONG`s say about our own UDP port.
+///
+/// Open on the same proof the rendezvous advert requires. Firewalled only on a
+/// concluded check that found the port filtered with no Ember evidence against
+/// it; anything less is silence, which peers read as they always have, so a
+/// node that has not finished checking is never left out of anyone's replies.
+pub(super) fn ember_advertised_reach(
+    udp_fw_verified: bool,
+    udp_firewalled: bool,
+    ember_udp_reachable: bool,
+) -> Option<ember::dht::messages::UdpReach> {
+    if ember_rendezvous_advert_reachable(udp_fw_verified, udp_firewalled, ember_udp_reachable) {
+        Some(ember::dht::messages::UdpReach::Open)
+    } else if udp_fw_verified && udp_firewalled {
+        Some(ember::dht::messages::UdpReach::Firewalled)
+    } else {
+        None
+    }
 }
 
 /// Whether the tracked rendezvous lookup id `tracked` has come to name some
@@ -926,6 +1051,11 @@ pub(super) const EMBER_FRIEND_CONTACT_ANSWER_WINDOW: std::time::Duration =
 /// rotation that matters.
 pub(super) const EMBER_FRIEND_CONTACT_STAMP_TTL: std::time::Duration =
     std::time::Duration::from_secs(240);
+
+/// The longest a friend waits between contact asks once they keep teaching us
+/// nobody new. See `ember_friend_contact_backoff`.
+pub(super) const EMBER_FRIEND_CONTACT_BACKOFF_MAX: std::time::Duration =
+    std::time::Duration::from_secs(32 * 60);
 
 /// Minimum spacing between *answering* one friend's contact request.
 ///
@@ -1556,6 +1686,13 @@ pub(super) async fn run_ember_maintenance(
 ) -> EmberMaintenanceResult {
     let mut result = EmberMaintenanceResult::default();
 
+    let reach = ember_advertised_reach(
+        state.udp_fw_verified,
+        state.udp_firewalled,
+        ember_udp_reachable(state),
+    );
+    state.ember_dht.set_advertised_reach(reach);
+
     // 0) Disconnect / empty-table re-arm *before* the bridge. Both paths
     //    clear `ember_kad_bridge_attempted` so the peers we already tried
     //    become candidates again; running the bridge first spent this
@@ -1982,10 +2119,26 @@ pub(super) async fn run_ember_maintenance(
         ember_dht_starved(state),
         state.ember_dht.contact_count(),
     );
-    let due =
+    let mut due =
         state
             .ember_dht
             .contacts_due_for_ping(now, EMBER_CONTACT_PING_SECS, ping_budget, force);
+    // A peer's word on its own UDP port rides only `PING` and `PONG`, and the
+    // pass above pings only contacts gone quiet — so a chatty one, which is
+    // exactly the kind that ends up in the replies we hand out, could go the
+    // whole session without saying. Ask the ones that have not, a few a cycle.
+    let probed_now = std::time::Instant::now();
+    let reach_probes = ember_reach_probe_targets(
+        state.ember_dht.contacts_without_reach_claim(),
+        &state.ember_reach_probed,
+        &due,
+        ping_budget.saturating_sub(due.len()),
+        probed_now,
+    );
+    for contact in &reach_probes {
+        state.ember_reach_probed.insert(contact.node_id, probed_now);
+    }
+    due.extend(reach_probes);
     for contact in due {
         // One probe per contact at a time. The gossip-probe and bucket-pressure
         // paths already check this; without it here, a contact could carry two
@@ -2305,6 +2458,15 @@ pub(super) async fn run_ember_maintenance(
     state.ember_friend_contacts_served.retain(|_, at| {
         prune_now.saturating_duration_since(*at) < EMBER_FRIEND_CONTACT_SERVE_INTERVAL
     });
+    // A backoff left a full maximum interval past its due time belongs to a
+    // friend we no longer ask — offline, or our table is healthy — and the next
+    // ask after that starts fresh.
+    state.ember_friend_contact_backoff.retain(|_, (_, next)| {
+        prune_now.saturating_duration_since(*next) < EMBER_FRIEND_CONTACT_BACKOFF_MAX
+    });
+    state
+        .ember_reach_probed
+        .retain(|_, at| prune_now.saturating_duration_since(*at) < EMBER_REACH_PROBE_INTERVAL);
     // A meet ask that has not turned the friend into a contact by its interval
     // did not work; dropping it is what lets the next one go out.
     state
@@ -3100,7 +3262,12 @@ pub(super) async fn handle_ember_dht_message(
     // of being locked out for the full republish interval.
     if let Some((rid, accepted)) = inbound.store_batch_ack {
         if let Some(from_id) = inbound.sender_id {
-            let outcome = state.ember_batch_publish.note_ack(rid, accepted, from_id);
+            let outcome = state.ember_batch_publish.note_ack_with_reasons(
+                rid,
+                accepted,
+                &inbound.store_batch_ack_reasons,
+                from_id,
+            );
             state.ember_diagnostics.ember_dht_stores_acked = state
                 .ember_diagnostics
                 .ember_dht_stores_acked
@@ -3119,8 +3286,9 @@ pub(super) async fn handle_ember_dht_message(
                     .ember_diagnostics
                     .ember_dht_stores_failed
                     .saturating_add(outcome.refused.len() as u32);
-                for reference in outcome.refused {
-                    note_ember_store_attempt_failed(state, reference, now);
+                for (reference, refusal) in outcome.refused.into_iter().zip(outcome.refusals) {
+                    note_ember_refusal_reason(&mut state.ember_diagnostics, refusal);
+                    note_ember_store_attempt_failed(state, reference, refusal, now);
                 }
             }
         }

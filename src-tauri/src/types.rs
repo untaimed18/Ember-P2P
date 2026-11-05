@@ -883,6 +883,34 @@ pub struct EmberDiagnostics {
     /// work deliberately not done rather than work finished.
     #[serde(default)]
     pub ember_dht_replication_paused: bool,
+    /// Of our records a storer refused this session, those refused because we
+    /// already held our share under that key (the 150-per-publisher cap).
+    #[serde(default)]
+    pub ember_dht_our_refused_publisher_cap: u32,
+    /// Refused because the key, or the storer's whole store, was full.
+    #[serde(default)]
+    pub ember_dht_our_refused_full: u32,
+    /// Refused because the storer knows closer nodes to the key.
+    #[serde(default)]
+    pub ember_dht_our_refused_not_closest: u32,
+    /// Refused as invalid or out of date — a sign of clock skew or a bug.
+    #[serde(default)]
+    pub ember_dht_our_refused_invalid: u32,
+    /// Refused with no reason given: a storer predating reasons, or one this
+    /// build does not name.
+    #[serde(default)]
+    pub ember_dht_our_refused_unexplained: u32,
+    /// Verified contacts that say unsolicited UDP reaches them.
+    #[serde(default)]
+    pub ember_dht_contacts_reach_open: u32,
+    /// Verified contacts that say their UDP port is filtered. These are left out
+    /// of the contact lists we hand others.
+    #[serde(default)]
+    pub ember_dht_contacts_reach_firewalled: u32,
+    /// Verified contacts that say nothing about their port: older builds, or a
+    /// check not yet concluded.
+    #[serde(default)]
+    pub ember_dht_contacts_reach_unknown: u32,
     /// Seconds since any Ember DHT frame arrived, or `None` if none ever has
     /// (zero is a frame this second). The one number that separates "still
     /// joining" from "joined and quiet" from "stuck", none of which the other
