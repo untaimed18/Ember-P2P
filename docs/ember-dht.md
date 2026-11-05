@@ -191,6 +191,19 @@ standing gap is now narrower and different: not "nothing advertises a range" but
 "a shape change still partitions every peer running a build older than this
 one", which the advertiser count is what measures.
 
+**1.8.0 put the second tag in the block, as it was built to allow.** After the
+range, `UDP_REACH_TAG` (`0x02`) carries the sender's word on its own UDP port:
+open or firewalled, from its own firewall check (`ember_advertised_reach`), and
+nothing while that check has not concluded. A build that knows only the range
+stops reading at the range tag, so the claim is invisible to it
+(`the_reachability_claim_is_invisible_to_a_range_only_reader`). The receiver
+keeps it per peer (`peer_reach`), and an absent claim clears a held one.
+Contacts claiming firewalled are left out of the replies we hand others, and
+maintenance pings a few contacts that have not stated a claim
+(`ember_reach_probe_targets`), since the liveness pass never pings a chatty
+one. A third capability would ride the same block. Item 7 lists the ones
+deferred.
+
 ### 3. Meeting a friend we cannot dial — built in 1.7.2, unvalidated live
 
 Built as designed below, as `EMBER_EXT_DHT_MEET` (`0x0D`; `0x07` was taken by
@@ -466,6 +479,143 @@ excludes `friends_only`, and refuses explicitly with `OP_ASKSHAREDDENIEDANS`. A
 filter there would let a stranger enumerate a library far past the single capped
 packet the setting was reasoned about, which is a genuine exposure change and a
 separate decision.
+
+### 7. Deferred from the 1.8.0 overlay work
+
+1.8.0 came out of a 12-hour field run on an overlay of about twenty nodes
+(1.7.6, 2026-11-04). It shipped the selective-storer switch, the joining fix,
+nodes stating their own UDP reachability, refusal reasons on `STORE_BATCH_ACK`,
+the publisher-side cap of 150 records per keyword, friend-ask backoff and the
+diagnostics that go with them (see [Closed](#closed)). The items below were
+weighed in the same work and held back, each for a stated reason and each with
+the number that says when to pick it up. None of them is a wire break.
+
+**7a. Hole punching for firewalled nodes, through an introducer.**
+
+*What.* A node that says it is firewalled (`UdpReach::Firewalled` in its `PING`
+and `PONG`) is now left out of every contact list we hand out
+(`EmberDht::closest_excluding`, the friend contact answer), because nobody but
+the peer it already talks to can reach it. That stops wasted probes, but it
+also means such a node is never a routing contact for anyone it did not dial
+first. The fix is BitTorrent's hole punch (BEP 55) on the DHT: A asks an
+introducer I, which holds the firewalled F as a live contact, to introduce
+them; I sends each side the other's address and Noise key; both dial at once,
+which opens each NAT for the other. The friend meet (item 3,
+`answer_friend_meet` and `ask_friends_to_meet` in `ember_peers.rs`) already does
+the dialling half, with crossing IK handshakes the transport settles by key. It
+uses the friend session as its signalling channel, which is why it reaches
+friends only.
+
+*Why it waited.* The case for it rested on the 1.7.6 run's directory: 20 to 21
+Ember nodes listed under the rendezvous key, only 9 of them ever DHT contacts.
+But the directory lists only nodes that proved unsolicited UDP reaches them
+(`ember_rendezvous_advert_reachable`), so the 11 others are not firewalled
+nodes. They are more likely stale adverts or changed addresses (see 7d). How
+many firewalled Ember nodes exist was therefore unknown, and this is a large
+NAT feature that cannot be tested from one machine.
+
+*When.* `ember_dht_contacts_reach_firewalled` (Ember page, "Contacts reporting
+firewalled") against the open and silent counts, once most contacts run 1.8.
+A firewalled share of verified contacts in the tens of percent is the case for
+building it.
+
+*Design notes for then.*
+
+- **Messages.** A `PUNCH_REQ` (A to I, naming F's node id) and a `PUNCH` (I to
+  each side, naming the other's observed address and Noise key). New message
+  types are safe to send blind, since a build that does not know one decodes it
+  as `DhtPayload::Unknown` and ignores it. Gate them on an advertised
+  capability anyway (a third tag in the `PING`/`PONG` block, beside
+  `VERSION_RANGE_TAG` and `UDP_REACH_TAG`), so A never waits on an introducer
+  that cannot introduce.
+- **Abuse.** I must fill in A's address from the frame's UDP source, never from
+  the payload, so F can only be told to dial the node that asked. Rate-limit
+  per requester and per target as the callback paths do
+  (`accept_callback_forward`, `CALLBACK_FORWARD_WINDOW`), and have F honour a
+  `PUNCH` only from a contact it already holds.
+- **Keeping it open.** A punched path lives only as long as F's NAT mapping
+  toward A, typically 30 to 120 seconds idle. F has to keep pinging the peers it
+  punched with, or A faults it out within a few minutes.
+- **Gossip.** For anyone to learn F, replies would have to carry it with "reach
+  through me" attached. That is a change to the contact encoding, and so a
+  trailing-block extension to `encode_contact_list`, or a separate frame.
+- **Symmetric NAT** stays out, as for friend meets. Those nodes need a relay.
+
+**7b. Offer records before sending them (`STORE_OFFER`).**
+
+*What.* Every republish sends whole records to about 20 storers that, on a
+stable overlay, nearly always hold identical bytes already. An offer would send
+`(key, record digest)` pairs, the storer would answer with a bitmap of what it
+lacks, and only those records would follow in a `STORE_BATCH`.
+
+*Why it waited.* With storer replication paused on an overlay the size of one
+replica set (`SELECTIVE_STORER_ON_CONTACTS`), what is left is our own publishing:
+roughly 13 KB a minute on the 1.7.6 run's library of 261 files. That is too
+little to justify a new two-step exchange, with a new failure mode (an offer
+answered and the batch lost), in the publish state machine
+(`ember_publish.rs`, `EmberPublishSchedule`).
+
+*When.* Once nodes routinely run as selective storers ("Republish backlog"
+showing a number rather than "Paused (small network)"), or "Stores acked"
+grows faster than the overlay does. Gate it on an advertised capability as in
+7a. A storer that predates it must never be left owing a reply.
+
+**7c. Ending source, room and directory lookups sooner.**
+
+*What.* A keyword walk ends a few seconds after the k closest live contacts
+have answered (`KEYWORD_SETTLE_SECS`). Every other `FIND_VALUE` (download
+sources, room presence, feed heads, the rendezvous directory) walks its whole
+shortlist by design, for recall, and each silent node on it costs the full
+query wait (`EMBER_SEARCH_QUEUED_QUERY_TIMEOUT`, 12 seconds) before the walk can
+end. The 1.7.6 run averaged 20 seconds a lookup, against 9.7 seconds on 1.7.3.
+
+*Why it waited.* The 20 seconds mixes the user's searches with background
+lookups, and changing walk termination without knowing which is slow risks
+recall for nothing. 1.8.0 added "Keyword search avg. time"
+(`ember_dht_keyword_search_outcomes`, `ember_dht_keyword_search_elapsed_ms_sum`)
+to tell them apart.
+
+*When.* If keyword searches stay quick while the overall average stays high,
+the slow ones are the background walks. Two changes, in this order:
+
+- Per-peer timeouts from measured round-trip times instead of the fixed 12
+  seconds, so one silent node stops setting the pace.
+- Settling for source and presence lookups, once the k closest have answered
+  and nothing new has arrived for a few seconds. Records live on the k closest,
+  so the cost is only records held by stragglers outside them.
+
+**7d. Rendezvous adverts that never become contacts.**
+
+On the 1.7.6 run, 11 of the 20 listed peers matched no contact by IP and UDP
+port (`ember_rendezvous_converted_contacts`), and the bridge found no new key to
+dial among them. They are probably adverts outliving the node behind them (a KAD
+source record lasts its full TTL) or a node that changed address within it. If
+they are reachable nodes failing to join, that is a real loss, and the log has
+no line that says which. A debug line per listed peer the bridge tries, and how
+it ended, would settle it in one run.
+
+**7e. Bring the specification up to date.**
+
+The spec PDF and its HTML source predate the 1.8.0 additive wire changes, so
+they need the following, each marked additive as the spec's convention is,
+followed by a rebuild with `scripts/build-ember-dht-spec.sh`:
+
+- **The reachability tag** in the `PING`/`PONG` trailing block (`UDP_REACH_TAG`
+  `0x02`, one byte: 1 open, 2 firewalled), after the version range.
+- **The refusal reasons** trailing a `STORE_BATCH_ACK` (`STORE_ACK_REASONS_TAG`
+  `0x01`, a length, then one code per record: 0 taken, 1 invalid, 2 stale,
+  3 not closest, 4 publisher cap, 5 key full, 6 store full, 7 other).
+- **The publisher-side rule** of 150 records per keyword.
+
+**7f. Node identities that cost something.**
+
+Node ids are free (`BLAKE3(ed25519_pub)`), so one host can mint as many as it
+likes. What that does and does not buy is in the Sybil note under
+[Hardening and ops](#hardening-and-ops). The remaining step there is a cost on
+identity, such as a proof of work on node ids, and lookups over disjoint paths
+(the S/Kademlia approach). Both change what a valid node is, so this is a
+version bump and a flag day. It matters little at twenty nodes and should land
+before the overlay is worth attacking.
 
 ---
 
@@ -1075,6 +1225,36 @@ wire additions needed a version bump:
   interval no longer backs off while the table is starved.
 - `store_attributed` binds the key but not the author or the date — all three are
   now derived from the one signed body rather than trusted from the caller.
+
+**From the 1.7.6 field run (Nov 2026), shipped in 1.8.0** — none of it a version
+bump. What was weighed and held back is item 7.
+
+- Storer replication and the filtered per-publisher shares flipped at exactly
+  k verified contacts, 76 times in twelve hours on a twenty-node overlay, and
+  each flip re-sent tens of thousands of records peers already held. They now
+  follow a selective-storer switch with hysteresis (`SelectiveStorerGate`: on at
+  25 held 15 minutes, off below 20 held as long, with a join that reaches 25 in
+  its first 15 minutes switching at once). The Ember page says "Paused (small
+  network)" rather than a backlog of 0. Decided, not overlooked: a restart
+  whose contacts take longer than 15 minutes to re-verify waits out the hold
+  once more before switching on. Widening the fast path to "while the count is
+  still climbing" would let a small overlay's first new peak switch it on,
+  which is the flapping this fixed. The delay costs only altruistic replication,
+  and the filtered shares only matter once a store is full.
+- A join that had held a working set was reopened by every new peak, so a dip
+  to 19 brought back the cold-start allowances (`EmberJoinProgress::starved`).
+- Nodes state their own UDP reachability, and contacts that say they are
+  firewalled are left out of contact lists (item 2, and 7a for what is left).
+- `STORE_BATCH_ACK` names why each refused record was refused. A record every
+  storer refused for good skips its retries, and a round lost that way
+  everywhere is deferred a full interval at once
+  (`fail_ember_record_pending_with`).
+- Publishers hold themselves to 150 records per keyword, the storers' own
+  limit, keeping the files closest to the key (`ember_keyword_cap_from`).
+- Friend contact asks back off while they teach us nobody new: 346 asks had
+  learned one contact (`ember_friend_contact_backoff`).
+- Diagnostics: keyword search time apart from the overall average, our refused
+  stores by reason, and contacts by reachability.
 
 ---
 
