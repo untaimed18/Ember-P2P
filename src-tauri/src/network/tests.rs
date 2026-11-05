@@ -3581,6 +3581,19 @@ fn a_small_overlay_settles_once_it_stops_finding_peers() {
     let full = EMBER_KAD_BRIDGE_UNTIL_CONTACTS;
     join.note(full, later);
     assert!(!join.starved(full, later));
+
+    // Nor is a dip just below it: the join already reached a working set, and
+    // a new peak above it does not reopen one.
+    join.note(full + 3, later);
+    join.note(full - 1, later);
+    assert!(
+        !join.starved(full - 1, later + EMBER_JOIN_SETTLE / 2),
+        "an overlay hovering at the working set is not joining"
+    );
+
+    // Losing most of it is a new join again.
+    join.note(full / 3, later);
+    assert!(join.starved(full / 3, later + EMBER_JOIN_SETTLE / 2));
 }
 
 /// The budget used to be one absolute rate for every table size, so a full

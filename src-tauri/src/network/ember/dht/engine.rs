@@ -240,6 +240,76 @@ const MAX_TRACKED_PEER_VERSIONS: usize = 1024;
 /// keep pinging us, and should fall back among the unproven once it does.
 const ANSWERED_TTL: Duration = Duration::from_secs(3600);
 
+/// Verified contacts that, held for [`SELECTIVE_STORER_HOLD`], make this node a
+/// selective storer: one that replicates what it holds onward and holds remote
+/// publishers to the filtered per-publisher shares.
+///
+/// A quarter of a bucket above k, not k itself. At k the switch sat on the
+/// size an overlay of twenty-odd nodes actually has, and one such run crossed it
+/// 76 times in twelve hours: each crossing found every record past its republish
+/// interval at once and spent the minutes before the next dip re-sending tens of
+/// thousands of them to peers that already held them, while the shares tightened
+/// and relaxed with it. Above k with margin, the network is genuinely larger than
+/// one replica set and churn can leave a key's closest nodes without its record.
+pub const SELECTIVE_STORER_ON_CONTACTS: usize = K_BUCKET_SIZE + K_BUCKET_SIZE / 4;
+
+/// Below this many verified contacts, held for [`SELECTIVE_STORER_HOLD`], the
+/// node stops being a selective storer: we are then among the k closest to every
+/// key, as is every peer we know, so each record already reached all of them
+/// from its publisher.
+pub const SELECTIVE_STORER_OFF_CONTACTS: usize = K_BUCKET_SIZE;
+
+/// How long the verified count must stay past a threshold before the switch
+/// follows it. A contact or two answering late, or a liveness sweep striking a
+/// few out, moves the count for minutes at a time without the overlay changing.
+pub const SELECTIVE_STORER_HOLD: Duration = Duration::from_secs(15 * 60);
+
+/// Whether this node is a selective storer, with hysteresis. See
+/// [`SELECTIVE_STORER_ON_CONTACTS`].
+#[derive(Debug, Clone, Copy, Default)]
+struct SelectiveStorerGate {
+    on: bool,
+    /// Since when the verified count has continuously argued for the other
+    /// state, or `None` while it agrees with the current one.
+    contrary_since: Option<Instant>,
+    /// When the first count was folded in, which is when the join began.
+    first_noted: Option<Instant>,
+    /// Whether the switch has changed state since then.
+    ever_switched: bool,
+}
+
+impl SelectiveStorerGate {
+    /// Fold in the current verified count. Returns whether the state changed.
+    ///
+    /// The hold is waived once: a join that reaches the on-threshold within one
+    /// hold of starting switches at once. A count climbing from zero has no
+    /// earlier state to flap against, and holding it would leave a node
+    /// restarted into a large overlay with replication paused and the loose
+    /// shares on for a quarter of an hour after every launch.
+    fn note(&mut self, verified: usize, now: Instant) -> bool {
+        let first_noted = *self.first_noted.get_or_insert(now);
+        let wants_on = if self.on {
+            verified >= SELECTIVE_STORER_OFF_CONTACTS
+        } else {
+            verified >= SELECTIVE_STORER_ON_CONTACTS
+        };
+        if wants_on == self.on {
+            self.contrary_since = None;
+            return false;
+        }
+        let joining = !self.ever_switched
+            && now.saturating_duration_since(first_noted) < SELECTIVE_STORER_HOLD;
+        let since = *self.contrary_since.get_or_insert(now);
+        if !(wants_on && joining) && now.saturating_duration_since(since) < SELECTIVE_STORER_HOLD {
+            return false;
+        }
+        self.on = wants_on;
+        self.contrary_since = None;
+        self.ever_switched = true;
+        true
+    }
+}
+
 /// What the engine produced from one inbound DHT frame.
 #[derive(Default)]
 pub struct DhtInbound {
@@ -568,6 +638,9 @@ pub struct EmberDht {
     /// Publishers we endorsed ourselves to, with the address each asked from
     /// and when, for [`MAX_ENDORSED_PER_ADDR`] and [`MAX_ENDORSED_PER_SUBNET`].
     endorsed: HashMap<EmberNodeId, (IpAddr, Instant)>,
+    /// Whether we replicate onward and apply the filtered shares. See
+    /// [`SELECTIVE_STORER_ON_CONTACTS`].
+    selective_storer: SelectiveStorerGate,
 }
 
 /// A candidate buddy's signed statement of its own endpoint, issued to us.
@@ -629,6 +702,10 @@ impl EmberDht {
         // And it holds our own records to a different standard than a remote
         // publisher's — see `DhtStore::set_local_publisher_key`.
         store.set_local_publisher_key(signing_key.verifying_key().to_bytes());
+        // In step with the selective-storer switch from the start, which is off
+        // until a join shows a larger overlay. Records restored from disk are
+        // admitted before any frame has synced the two.
+        store.set_responsibility_filtered(SelectiveStorerGate::default().on);
         Self {
             routing: RoutingTable::new(local_id, block_private_ips),
             store,
@@ -669,6 +746,7 @@ impl EmberDht {
             buddy_endorsement_seq: 0,
             buddy_endorse_asked: HashMap::new(),
             endorsed: HashMap::new(),
+            selective_storer: SelectiveStorerGate::default(),
         }
     }
 
@@ -2216,12 +2294,38 @@ impl EmberDht {
     /// Keep the store's abuse limits in step with the routing table, which is
     /// where network size is observed.
     fn sync_store_scale(&mut self) {
+        self.sync_store_scale_at(Instant::now());
+    }
+
+    /// [`Self::sync_store_scale`] with an explicit clock, so the hold on the
+    /// selective-storer switch is testable.
+    fn sync_store_scale_at(&mut self, now: Instant) {
         let scale = self.routing.scale();
         self.store.set_scale(scale);
-        // The proximity gate below is off until k contacts have answered, and
-        // the store's per-publisher shares are only meaningful while it is on.
+        let verified = self.routing.verified_len();
+        if self.selective_storer.note(verified, now) {
+            tracing::info!(
+                "Ember DHT: {} selective storage at {verified} verified contacts",
+                if self.selective_storer.on { "starting" } else { "stopping" }
+            );
+        }
+        // The filtered shares assume records reach us only for keys we are
+        // among the closest to, which holds once the overlay is larger than
+        // one replica set — the same question the switch answers.
         self.store
-            .set_responsibility_filtered(self.routing.verified_len() >= K_BUCKET_SIZE);
+            .set_responsibility_filtered(self.selective_storer.on);
+    }
+
+    /// Whether this node replicates what it holds onward and holds remote
+    /// publishers to the filtered shares. See [`SELECTIVE_STORER_ON_CONTACTS`].
+    pub fn selective_storer(&self) -> bool {
+        self.selective_storer.on
+    }
+
+    /// Re-read the routing table into the selective-storer switch, for callers
+    /// about to act on it between inbound frames.
+    pub fn refresh_selective_storer(&mut self) {
+        self.sync_store_scale();
     }
 
     /// Whether we are one of the nodes responsible for holding `key`.
@@ -4592,6 +4696,88 @@ mod tests {
         );
         // A key adjacent to our own ID is still ours.
         assert!(d.store_proximity_ok(&local.0));
+    }
+
+    /// The switch follows the verified count only once the count has held past
+    /// a threshold, and the band between the two thresholds keeps whichever
+    /// state it is in.
+    #[test]
+    fn selective_storage_switches_with_hysteresis() {
+        let mut gate = SelectiveStorerGate::default();
+        let start = Instant::now();
+        assert!(!gate.note(K_BUCKET_SIZE, start));
+        // Past the join, where the hold applies to every switch.
+        let t0 = start + SELECTIVE_STORER_HOLD;
+        assert!(!gate.note(SELECTIVE_STORER_ON_CONTACTS, t0));
+        assert!(!gate.note(SELECTIVE_STORER_ON_CONTACTS, t0 + SELECTIVE_STORER_HOLD / 2));
+        // A dip below the bar restarts the hold.
+        assert!(!gate.note(SELECTIVE_STORER_ON_CONTACTS - 1, t0 + SELECTIVE_STORER_HOLD / 2));
+        assert!(!gate.note(SELECTIVE_STORER_ON_CONTACTS, t0 + SELECTIVE_STORER_HOLD));
+        assert!(!gate.on, "the hold restarted at the dip");
+
+        let t1 = t0 + SELECTIVE_STORER_HOLD * 3;
+        assert!(gate.note(SELECTIVE_STORER_ON_CONTACTS, t1));
+        assert!(gate.on);
+
+        // Hovering at k is the band: it stays on however long that lasts.
+        for i in 0..10u32 {
+            assert!(!gate.note(K_BUCKET_SIZE + (i as usize % 2), t1 + SELECTIVE_STORER_HOLD * i));
+        }
+        assert!(gate.on);
+
+        let t2 = t1 + SELECTIVE_STORER_HOLD * 20;
+        assert!(!gate.note(K_BUCKET_SIZE - 1, t2));
+        assert!(gate.note(K_BUCKET_SIZE - 1, t2 + SELECTIVE_STORER_HOLD));
+        assert!(!gate.on);
+    }
+
+    /// A node restarted into a large overlay switches as soon as its join
+    /// reaches the bar, once; the next switch on waits out the hold again.
+    #[test]
+    fn a_join_into_a_large_overlay_switches_at_once() {
+        let mut gate = SelectiveStorerGate::default();
+        let t0 = Instant::now();
+        assert!(!gate.note(0, t0));
+        assert!(gate.note(SELECTIVE_STORER_ON_CONTACTS, t0 + SELECTIVE_STORER_HOLD / 3));
+        assert!(gate.on);
+
+        let t1 = t0 + SELECTIVE_STORER_HOLD / 2;
+        assert!(!gate.note(K_BUCKET_SIZE - 1, t1));
+        assert!(gate.note(K_BUCKET_SIZE - 1, t1 + SELECTIVE_STORER_HOLD));
+        let t2 = t1 + SELECTIVE_STORER_HOLD * 2;
+        assert!(!gate.note(SELECTIVE_STORER_ON_CONTACTS, t2), "only the join is spared the hold");
+
+        // And a join that never got there holds like anything else.
+        let mut slow = SelectiveStorerGate::default();
+        assert!(!slow.note(0, t0));
+        assert!(!slow.note(SELECTIVE_STORER_ON_CONTACTS, t0 + SELECTIVE_STORER_HOLD));
+    }
+
+    /// An overlay of twenty-odd nodes is one replica set: every record already
+    /// reached every node from its publisher, so the node must not start
+    /// replicating, however often its count touches k.
+    #[test]
+    fn an_overlay_the_size_of_one_replica_set_does_not_replicate() {
+        let mut d = dht(5);
+        let local = d.local_id();
+        let seen = chrono::Utc::now().timestamp();
+        for bucket in 0..K_BUCKET_SIZE + 3 {
+            assert!(d.add_contact(contact_in_bucket(local, bucket, seen)));
+        }
+        let t0 = Instant::now();
+        d.sync_store_scale_at(t0);
+        d.sync_store_scale_at(t0 + SELECTIVE_STORER_HOLD * 4);
+        assert!(!d.selective_storer());
+        assert!(!d.store.responsibility_filtered_for_test());
+
+        for bucket in K_BUCKET_SIZE + 3..SELECTIVE_STORER_ON_CONTACTS {
+            assert!(d.add_contact(contact_in_bucket(local, bucket, seen)));
+        }
+        d.sync_store_scale_at(t0 + SELECTIVE_STORER_HOLD * 5);
+        assert!(!d.selective_storer(), "not until the larger count has held");
+        d.sync_store_scale_at(t0 + SELECTIVE_STORER_HOLD * 6);
+        assert!(d.selective_storer());
+        assert!(d.store.responsibility_filtered_for_test());
     }
 
     #[test]

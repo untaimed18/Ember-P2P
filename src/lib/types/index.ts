@@ -422,6 +422,9 @@ export interface EmberDiagnostics {
    *  and have not been yet. Persistently high means replication is falling
    *  behind its per-cycle budget. */
   ember_dht_republish_backlog: number;
+  /** Storer replication is off because the overlay is no larger than one
+   *  replica set, so the backlog's zero means "not needed", not "caught up". */
+  ember_dht_replication_paused?: boolean;
   /** Seconds since any Ember DHT frame arrived, or null if none ever has (0 is
    *  a frame this second). Separates "still joining" from "joined and quiet"
    *  from "stuck". */
@@ -672,6 +675,10 @@ export interface EmberDiagnostics {
   ember_dht_search_elapsed_ms_sum?: number;
   /** Sum of verified records gathered across those searches. */
   ember_dht_search_records_sum?: number;
+  /** Of those searches, the user's keyword searches. */
+  ember_dht_keyword_search_outcomes?: number;
+  /** Sum of keyword-search durations in milliseconds. */
+  ember_dht_keyword_search_elapsed_ms_sum?: number;
   /** Highest verified-contact count seen today (UTC). */
   ember_dht_verified_highwater_today?: number;
   /** Highest verified-contact count ever recorded on this node. */

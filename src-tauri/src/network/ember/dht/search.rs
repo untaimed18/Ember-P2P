@@ -952,6 +952,11 @@ impl IterativeSearch {
         self.keyword_lookup = true;
     }
 
+    /// Whether [`Self::mark_keyword_lookup`] was called.
+    pub fn is_keyword_lookup(&self) -> bool {
+        self.keyword_lookup
+    }
+
     /// Records held that came from the network rather than our own store.
     ///
     /// A companion's records are not counted: they were bought from its own

@@ -135,6 +135,17 @@ pub(super) fn record_ember_find_value_quality(
     diag.ember_dht_search_records_sum = diag
         .ember_dht_search_records_sum
         .saturating_add(search.results.len() as u64);
+    // A walk feeding another search is part of that search's wait, which its
+    // main walk already spans.
+    if search.is_keyword_lookup()
+        && !matches!(search.companion, ember::dht::search::Companion::FeedsInto(_))
+    {
+        diag.ember_dht_keyword_search_outcomes =
+            diag.ember_dht_keyword_search_outcomes.saturating_add(1);
+        diag.ember_dht_keyword_search_elapsed_ms_sum = diag
+            .ember_dht_keyword_search_elapsed_ms_sum
+            .saturating_add(search.started_at.elapsed().as_millis() as u64);
+    }
 }
 
 /// Last outstanding STORE for this record failed (every replica refused or
@@ -797,10 +808,20 @@ impl EmberJoinProgress {
     }
 
     /// Whether the table is still joining: short of a working set, and either
-    /// empty or still finding peers.
+    /// empty or still finding peers on the way to one.
+    ///
+    /// A join that has already held a working set is over. On an overlay whose
+    /// size sits at the working set itself, each new peak restarted the settle
+    /// clock and the next dip below it read as a fresh join, so every cold-start
+    /// allowance — sixteen announces a cycle, the wider ping budget, the 1 Hz
+    /// bridge — fired again, filled the table with leads nobody answers and left
+    /// them to be struck out. Losing most of the overlay still resets the peak
+    /// (see [`Self::note`]), which is the dip that is a new join.
     pub(super) fn starved(&self, verified: usize, now: std::time::Instant) -> bool {
         verified < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
-            && (verified == 0 || now.saturating_duration_since(self.peak_at) < EMBER_JOIN_SETTLE)
+            && (verified == 0
+                || (self.peak < EMBER_KAD_BRIDGE_UNTIL_CONTACTS
+                    && now.saturating_duration_since(self.peak_at) < EMBER_JOIN_SETTLE))
     }
 }
 
@@ -818,10 +839,11 @@ pub(super) fn ember_dht_starved(state: &mut NetworkState) -> bool {
 }
 
 /// Whether storer-side replication is off because every peer already holds
-/// every record: with fewer than k proven contacts we are among the k closest
-/// to every key, and so is everyone we know.
+/// every record: on an overlay no larger than one replica set we are among the
+/// k closest to every key, and so is everyone we know. Decided with hysteresis
+/// by [`ember::dht::engine::SELECTIVE_STORER_ON_CONTACTS`].
 pub(super) fn ember_storer_republish_paused(state: &NetworkState) -> bool {
-    state.ember_dht.routing().verified_len() < ember::dht::K_BUCKET_SIZE
+    !state.ember_dht.selective_storer()
 }
 
 /// Records waiting on storer replication, or none while it is paused, so the
@@ -2140,13 +2162,15 @@ pub(super) async fn run_ember_maintenance(
     //    nothing at all while the queue is already backed up, so replication can
     //    never be the reason our own publishing is skipped.
     //
-    //    And nothing while fewer than k contacts have answered us. Then we are
-    //    among the k closest to every key, as is every peer we know, so each
+    //    And nothing while the overlay is no larger than one replica set (see
+    //    `SELECTIVE_STORER_ON_CONTACTS`). Then we are among the k closest to
+    //    every key, as is every peer we know, so each
     //    record already went to all of them from its publisher and a search
     //    asks all of them: storer replication re-sent identical bytes that
     //    extend nobody's copy, at two signature checks per record on the far
     //    side, against a backlog the budget could never drain.
     let republish_interval = std::time::Duration::from_secs(EMBER_RECORD_REPUBLISH_SECS);
+    state.ember_dht.refresh_selective_storer();
     let everyone_holds_everything = ember_storer_republish_paused(state);
     result.republish_due = ember_republish_backlog(state);
     let republish_budget = if everyone_holds_everything || ember_publish_queue_is_backed_up(state) {

@@ -116,8 +116,9 @@ const MAX_KEYS_PER_PUBLISHER: usize = MAX_KEYS / 8;
 /// with few keys and large records instead of many small ones.
 const MAX_BYTES_PER_PUBLISHER: usize = MAX_STORE_BYTES / 8;
 
-/// The shares while we know fewer than k proven contacts, so are among the k
-/// closest to every key and hold every record anyone publishes.
+/// The shares while the overlay is no larger than one replica set (see
+/// `engine::SELECTIVE_STORER_ON_CONTACTS`), so we are among the k closest to
+/// every key and hold every record anyone publishes.
 ///
 /// The eighth above rests on responsibility doing the filtering, and here
 /// nothing does: on an overlay of a few nodes, each holding the whole network,
@@ -912,6 +913,11 @@ impl DhtStore {
                 MAX_BYTES_PER_PUBLISHER_UNFILTERED,
             );
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn responsibility_filtered_for_test(&self) -> bool {
+        self.responsibility_filtered
     }
 
     /// Tell the store our node ID so it can rank records by responsibility

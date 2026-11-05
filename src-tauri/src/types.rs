@@ -878,6 +878,11 @@ pub struct EmberDiagnostics {
     /// replication is falling behind, which a republish count cannot show.
     #[serde(default)]
     pub ember_dht_republish_backlog: u32,
+    /// Storer replication is off because the overlay is no larger than one
+    /// replica set, so [`Self::ember_dht_republish_backlog`] reads zero for
+    /// work deliberately not done rather than work finished.
+    #[serde(default)]
+    pub ember_dht_replication_paused: bool,
     /// Seconds since any Ember DHT frame arrived, or `None` if none ever has
     /// (zero is a frame this second). The one number that separates "still
     /// joining" from "joined and quiet" from "stuck", none of which the other
@@ -1404,6 +1409,16 @@ pub struct EmberDiagnostics {
     /// Sum of verified records gathered across those searches.
     #[serde(default)]
     pub ember_dht_search_records_sum: u64,
+    /// Of [`Self::ember_dht_search_outcomes`], the user's keyword searches.
+    ///
+    /// Source, channel, feed and rendezvous lookups walk their whole shortlist
+    /// by design, so they dominate the overall average; this is the number that
+    /// says how long somebody waits on the Search page.
+    #[serde(default)]
+    pub ember_dht_keyword_search_outcomes: u32,
+    /// Sum of those keyword searches' durations in milliseconds.
+    #[serde(default)]
+    pub ember_dht_keyword_search_elapsed_ms_sum: u64,
     /// Highest verified-contact count seen today (local calendar day),
     /// persisted across restart.
     #[serde(default)]
