@@ -17,6 +17,13 @@ const FT_EMBER_FILE_HASH: u8 = 0xE2;
 /// rather than a new tag type: eMule's reader skips an unknown tag *id* but
 /// gives up on an unknown tag *type*.
 const FT_EMBER_NOTE: u8 = 0xE3;
+/// The folder one file belongs in within the collection, `/`-separated (see
+/// [`CollectionFile::folder`]). A string, for the reason [`FT_EMBER_NOTE`] is.
+const FT_EMBER_FOLDER: u8 = 0xE4;
+/// A line in a text collection naming the folder the links after it belong
+/// in, until the next such line; an empty one is the top level. Any reader of
+/// link lists skips a line that is not a link, so it costs them nothing.
+const TEXT_FOLDER_DIRECTIVE: &str = "#ember-folder:";
 const FT_COLLECTIONAUTHOR: u8 = 0x31;
 const FT_COLLECTIONAUTHORKEY: u8 = 0x32;
 
@@ -42,6 +49,13 @@ pub struct CollectionFile {
     /// none. Its own tag, which eMule's reader skips like any unknown one.
     #[serde(default)]
     pub note: String,
+    /// The folder this file belongs in within the collection (`Season 1`,
+    /// `Season 1/Extras`), `/`-separated and cleaned by
+    /// `storage::category_folders::normalize_collection_entry_folder`; empty
+    /// for the top level. A reader that does not know the tag (eMule) shows
+    /// the files flat, as it always has.
+    #[serde(default)]
+    pub folder: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +167,7 @@ impl Collection {
             let mut faich = String::new();
             let mut fember = String::new();
             let mut fnote = String::new();
+            let mut ffolder = String::new();
 
             let file_limit = file_tag_count.min(20);
             for _ in 0..file_limit {
@@ -188,6 +203,11 @@ impl Collection {
                             fnote = sanitize_collection_text(&s);
                         }
                     }
+                    FT_EMBER_FOLDER => {
+                        if let TagValue::String(s) = tag_value {
+                            ffolder = normalize_folder(&s);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -202,6 +222,7 @@ impl Collection {
                 aich_hash: faich,
                 ember_file_hash: fember,
                 note: fnote,
+                folder: ffolder,
             });
         }
 
@@ -235,6 +256,7 @@ impl Collection {
             .unwrap_or_default();
 
         let mut line_count = 0usize;
+        let mut folder = String::new();
         for line in content.lines() {
             line_count += 1;
             if line_count > MAX_COLLECTION_FILES {
@@ -244,7 +266,12 @@ impl Collection {
                 ));
             }
             let line = line.trim();
-            if let Some(cf) = parse_ed2k_link(line) {
+            if let Some(named) = line.strip_prefix(TEXT_FOLDER_DIRECTIVE) {
+                folder = normalize_folder(named);
+                continue;
+            }
+            if let Some(mut cf) = parse_ed2k_link(line) {
+                cf.folder = folder.clone();
                 files.push(cf);
             }
         }
@@ -317,6 +344,11 @@ impl Collection {
                 write_string_tag(&mut file_buf, FT_EMBER_NOTE, &file.note)?;
                 file_tags += 1;
             }
+            let folder = normalize_folder(&file.folder);
+            if !folder.is_empty() {
+                write_string_tag(&mut file_buf, FT_EMBER_FOLDER, &folder)?;
+                file_tags += 1;
+            }
 
             buf.write_u32::<LittleEndian>(file_tags)?;
             buf.write_all(&file_buf)?;
@@ -328,7 +360,15 @@ impl Collection {
     /// Serialized ed2k-link text. See [`Collection::to_binary_bytes`].
     pub fn to_text_bytes(&self) -> String {
         let mut content = String::new();
+        let mut folder = String::new();
         for file in &self.files {
+            let file_folder = normalize_folder(&file.folder);
+            if file_folder != folder {
+                content.push_str(TEXT_FOLDER_DIRECTIVE);
+                content.push_str(&file_folder);
+                content.push('\n');
+                folder = file_folder;
+            }
             let aich = if file.aich_hash.is_empty() {
                 None
             } else {
@@ -359,6 +399,12 @@ fn sanitize_collection_text(value: &str) -> String {
     crate::security::sanitize_remote_text(value, 4096)
 }
 
+/// A collection entry's folder, cleaned so it cannot leave the folder a
+/// download lands in (see `category_folders::normalize_collection_entry_folder`).
+fn normalize_folder(value: &str) -> String {
+    crate::storage::category_folders::normalize_collection_entry_folder(&sanitize_collection_text(value))
+}
+
 fn parse_ed2k_link(link: &str) -> Option<CollectionFile> {
     let (name, size, hash, aich, ember) = super::hash::parse_ed2k_link(link)?;
     Some(CollectionFile {
@@ -368,6 +414,7 @@ fn parse_ed2k_link(link: &str) -> Option<CollectionFile> {
         aich_hash: aich.unwrap_or_default(),
         ember_file_hash: ember.unwrap_or_default(),
         note: String::new(),
+        folder: String::new(),
     })
 }
 
@@ -647,6 +694,7 @@ mod tests {
                     aich_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
                     ember_file_hash: "ab".repeat(32),
                     note: String::new(),
+                    folder: "Season 1/Extras".to_string(),
                 },
                 CollectionFile {
                     name: "large video.mkv".to_string(),
@@ -655,6 +703,7 @@ mod tests {
                     aich_hash: String::new(),
                     ember_file_hash: String::new(),
                     note: String::new(),
+                    folder: String::new(),
                 },
             ],
         };
@@ -681,7 +730,84 @@ mod tests {
             assert_eq!(actual.hash, expected.hash);
             assert_eq!(actual.aich_hash, expected.aich_hash);
             assert_eq!(actual.ember_file_hash, expected.ember_file_hash);
+            assert_eq!(actual.folder, expected.folder);
         }
+    }
+
+    /// A text collection carries folders as directive lines a link reader
+    /// skips, one per change, and an older text collection has none.
+    #[test]
+    fn text_collection_round_trips_folders() {
+        let file = |name: &str, folder: &str| CollectionFile {
+            name: name.into(),
+            size: 9,
+            hash: "00112233445566778899aabbccddeeff".into(),
+            aich_hash: String::new(),
+            ember_file_hash: String::new(),
+            note: String::new(),
+            folder: folder.into(),
+        };
+        let collection = Collection {
+            name: "show".into(),
+            author: String::new(),
+            files: vec![
+                file("top.nfo", ""),
+                file("e1.mkv", "Season 1"),
+                file("e2.mkv", "Season 1"),
+                file("e3.mkv", "Season 2"),
+                file("readme.txt", ""),
+            ],
+        };
+        let text = collection.to_text_bytes();
+        assert_eq!(text.matches(TEXT_FOLDER_DIRECTIVE).count(), 3, "one line per change: {text}");
+        let path = temp_collection_path("folders", "txt");
+        std::fs::write(&path, &text).unwrap();
+        let back = Collection::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let folders: Vec<&str> = back.files.iter().map(|f| f.folder.as_str()).collect();
+        assert_eq!(folders, ["", "Season 1", "Season 1", "Season 2", ""]);
+    }
+
+    /// A folder tag is a stranger's text, cleaned before anything can use it as
+    /// a path, and an entry without one writes no tag at all, so a feed's list
+    /// (whose bytes its signed head commits to) encodes exactly as before.
+    #[test]
+    fn a_folder_cannot_climb_out_and_none_writes_no_tag() {
+        let file = |folder: &str| CollectionFile {
+            name: "a.mkv".into(),
+            size: 5,
+            hash: "00112233445566778899aabbccddeeff".into(),
+            aich_hash: String::new(),
+            ember_file_hash: String::new(),
+            note: String::new(),
+            folder: folder.into(),
+        };
+        let path = temp_collection_path("hostile-folder", "emulecollection");
+        let mut bytes = Vec::new();
+        // Written raw, past our own writer's cleaning, as another client could.
+        bytes.write_u32::<LittleEndian>(COLLECTION_FILE_VERSION2_LARGE).unwrap();
+        bytes.write_u32::<LittleEndian>(0).unwrap();
+        bytes.write_u32::<LittleEndian>(1).unwrap();
+        let mut tags = Vec::new();
+        write_string_tag(&mut tags, FT_FILENAME, "a.mkv").unwrap();
+        write_string_tag(&mut tags, FT_EMBER_FOLDER, "../../../etc/C:/x").unwrap();
+        bytes.write_u32::<LittleEndian>(2).unwrap();
+        bytes.extend_from_slice(&tags);
+        std::fs::write(&path, &bytes).unwrap();
+        let back = Collection::load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.files[0].folder, "etc/C_/x");
+
+        let flat = Collection { name: "c".into(), author: String::new(), files: vec![file("")] };
+        let tagged = Collection { name: "c".into(), author: String::new(), files: vec![file("S1")] };
+        assert!(tagged.to_binary_bytes().unwrap().len() > flat.to_binary_bytes().unwrap().len());
+        assert_eq!(
+            Collection { name: "c".into(), author: String::new(), files: vec![file(" / . / ")] }
+                .to_binary_bytes()
+                .unwrap(),
+            flat.to_binary_bytes().unwrap(),
+            "a folder that cleans to nothing writes no tag"
+        );
     }
 
     #[test]
@@ -697,6 +823,7 @@ mod tests {
                 aich_hash: String::new(),
                 ember_file_hash: digest.clone(),
                 note: String::new(),
+                folder: String::new(),
             }],
         };
         let text = collection.to_text_bytes();
@@ -719,6 +846,7 @@ mod tests {
             aich_hash: String::new(),
             ember_file_hash: "ab".repeat(32),
             note: note.into(),
+            folder: String::new(),
         };
         let with = Collection { name: "f".into(), author: String::new(), files: vec![file("Live, 1998\u{202e}")] };
         let without = Collection { name: "f".into(), author: String::new(), files: vec![file("")] };
@@ -753,6 +881,7 @@ mod tests {
                 aich_hash: String::new(),
                 ember_file_hash: String::new(),
                 note: String::new(),
+                folder: String::new(),
             }],
         };
         let path = temp_collection_path("bidi", "emulecollection");

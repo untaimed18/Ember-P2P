@@ -237,11 +237,20 @@ pub async fn create_collection_with_dialog(
         .map(Some)
 }
 
+/// Queue a collection's files for download.
+///
+/// `collection_name`, when given, keeps the collection's folders: each file
+/// finishes in a folder named after the collection, inside its category's
+/// folder, and in the entry's own folders below that (`My Show/Season 1`).
+/// Absent, every file finishes where any download does, as before. The folders
+/// are cleaned before use (`category_folders::collection_segments`), so a
+/// collection cannot name a place outside the download folder.
 #[tauri::command]
 pub async fn download_collection_files(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     files: Vec<CollectionFile>,
+    collection_name: Option<String>,
 ) -> Result<CollectionDownloadResult, String> {
     let _download_admission = state.download_admission.lock().await;
     if files.len() > 200 {
@@ -312,6 +321,10 @@ pub async fn download_collection_files(
             continue;
         }
         let safe_name = crate::security::sanitize_filename(&file.name);
+        let folder_segments = collection_name
+            .as_deref()
+            .map(|name| crate::storage::category_folders::collection_segments(name, &file.folder))
+            .unwrap_or_default();
         let transfer_id = uuid::Uuid::new_v4().to_string();
         let control = crate::sharing::manager::TransferControl::new();
         if add_paused {
@@ -415,11 +428,30 @@ pub async fn download_collection_files(
                 failed_count += 1;
                 continue;
             }
+            // Before the download can start, let alone finish: completion
+            // reads its folder from the route.
+            if !folder_segments.is_empty() {
+                crate::storage::category_folders::note_collection_folder(
+                    &transfer_id,
+                    folder_segments.clone(),
+                );
+            }
             let active_now = mgr.enqueue(transfer.clone());
             mgr.register_control(&transfer_id, control.clone());
             let persisted = mgr.get_transfer(&transfer_id).cloned().unwrap_or(transfer);
             (active_now, persisted)
         };
+        if !folder_segments.is_empty() {
+            // Beside the download's own row, so a restart finishes it in the
+            // same folder. A failure costs only that: it finishes in its
+            // category's folder after a restart instead.
+            let (db, id, folder) = (state.db.clone(), transfer_id.clone(), folder_segments.join("/"));
+            match tokio::task::spawn_blocking(move || db.set_transfer_collection_folder(&id, &folder)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!("Could not save the collection folder of {transfer_id}: {error}"),
+                Err(error) => tracing::warn!("Could not save the collection folder of {transfer_id}: {error}"),
+            }
+        }
         if let Err(error) = super::transfers::persist_transfer(&state, &persisted_transfer).await {
             // The transfer has not reached the network worker yet. Remove the
             // transient manager entry so startup can never mistake a future

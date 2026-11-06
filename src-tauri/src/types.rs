@@ -2145,6 +2145,38 @@ pub struct AppSettings {
     #[serde(default = "default_alt_max_download_speed")]
     pub alt_max_download_speed: u64,
 
+    /// Hold uploads to [`Self::upload_quota_speed`] for the rest of the local
+    /// day once [`Self::upload_quota_gb`] has been uploaded since midnight.
+    /// For connections metered by volume, and for ISPs that throttle or flag a
+    /// home line once its upload passes some daily amount. Applied after every
+    /// other upload limit, and never raises one: the lower of the two holds.
+    #[serde(default)]
+    pub upload_quota_enabled: bool,
+    /// Gigabytes (10^9 bytes) uploaded since local midnight before the quota
+    /// takes effect, `1..=MAX_UPLOAD_QUOTA_GB`.
+    #[serde(default = "default_upload_quota_gb")]
+    pub upload_quota_gb: u32,
+    /// Bytes per second uploads are held to once the quota is reached. Never 0:
+    /// a quota that stopped uploads outright would also stop the eD2K credit
+    /// that keeps downloads moving, and the manual limit is where "no uploads"
+    /// belongs.
+    #[serde(default = "default_upload_quota_speed")]
+    pub upload_quota_speed: u64,
+
+    /// Hash shared files at background CPU and disk priority, so a first scan
+    /// of a large library does not slow the rest of the machine. On by
+    /// default; off hashes at normal priority, which is faster on a busy
+    /// machine. See `sharing::disk::hash_at_background_priority`.
+    #[serde(default = "default_true")]
+    pub hash_low_priority: bool,
+    /// Watch shared folders for changes and index new or changed files as they
+    /// appear. Off, the Library picks up changes only when reloaded, at the
+    /// next launch, or when a folder is added; each watched folder costs the
+    /// operating system a watch per subfolder, which a very large tree on
+    /// Linux can run out of.
+    #[serde(default = "default_true")]
+    pub watch_shared_folders: bool,
+
     /// Register Ember to start when the user signs in. The OS entry is written
     /// when this changes, and a leftover one removed at launch while it is off.
     #[serde(default)]
@@ -2187,6 +2219,21 @@ fn default_alt_max_upload_speed() -> u64 {
     50 * 1024
 }
 
+/// Largest daily upload quota Settings accepts, in GB: a terabyte a day, past
+/// which a quota is not doing anything a home line could reach.
+pub const MAX_UPLOAD_QUOTA_GB: u32 = 1000;
+
+/// Slowest upload the quota may hold a connection to, bytes per second.
+pub const MIN_UPLOAD_QUOTA_SPEED: u64 = 1024;
+
+fn default_upload_quota_gb() -> u32 {
+    50
+}
+
+fn default_upload_quota_speed() -> u64 {
+    20 * 1024
+}
+
 fn default_alt_max_download_speed() -> u64 {
     200 * 1024
 }
@@ -2216,6 +2263,11 @@ pub struct RuntimeStatus {
     pub sleep_inhibit_supported: bool,
     /// Whether one is held right now.
     pub sleep_inhibit_held: bool,
+    /// Bytes uploaded since local midnight, in steps of 10 MB, for the daily
+    /// upload quota's "uploaded today".
+    pub uploaded_today: u64,
+    /// The daily upload quota is reached and holds uploads to its speed.
+    pub upload_quota_reached: bool,
 }
 
 /// Sanitized ed2k download limits derived from [`AppSettings`] (clamped for safety).
@@ -3207,6 +3259,11 @@ impl Default for AppSettings {
             alt_speed_enabled: false,
             alt_max_upload_speed: default_alt_max_upload_speed(),
             alt_max_download_speed: default_alt_max_download_speed(),
+            upload_quota_enabled: false,
+            upload_quota_gb: default_upload_quota_gb(),
+            upload_quota_speed: default_upload_quota_speed(),
+            hash_low_priority: true,
+            watch_shared_folders: true,
             launch_at_login: false,
             start_hidden_at_login: true,
             remember_window_position: true,

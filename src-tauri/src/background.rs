@@ -30,13 +30,55 @@ use tauri::window::{ProgressBarState, ProgressBarStatus};
 use tauri::{Emitter, Manager};
 
 use crate::app_state::AppState;
-use crate::bandwidth::schedule;
+use crate::bandwidth::{quota, schedule};
 use crate::power::WakeLock;
 use crate::sharing::manager::TransferManager;
 use crate::types::{RuntimeStatus, TransferDirection, TransferHealth, TransferStatus};
 
 /// How often the download drive's free space is read while downloads run.
 const DISK_CHECK_EVERY: u32 = 30;
+
+/// How often, in ticks, the day's upload count is written to disk. A crash
+/// loses at most this much of the count, which errs toward uploading more,
+/// never less; a clean exit writes it as well.
+const QUOTA_SAVE_EVERY: u32 = 60;
+
+/// Granularity of the upload count the UI is sent, so a busy upload does not
+/// republish the status every second for a figure shown in gigabytes.
+const PUBLISHED_UPLOAD_STEP: u64 = 10_000_000;
+
+/// Bytes uploaded since local midnight, advancing the day's count to now.
+fn uploaded_today(state: &AppState) -> u64 {
+    let session_total = state.bandwidth_limiter.total_uploaded();
+    state
+        .upload_quota
+        .lock()
+        .observe(&quota::local_today(), session_total)
+}
+
+fn published_upload_count(bytes: u64) -> u64 {
+    bytes - bytes % PUBLISHED_UPLOAD_STEP
+}
+
+/// Write the day's upload count if it moved since the last write.
+pub async fn save_upload_quota(app: &tauri::AppHandle, state: &AppState) {
+    let session_total = state.bandwidth_limiter.total_uploaded();
+    let pending = {
+        let mut quota = state.upload_quota.lock();
+        quota.observe(&quota::local_today(), session_total);
+        quota.pending_save(session_total)
+    };
+    let Some(bytes) = pending else {
+        return;
+    };
+    let path = quota::path_in(&crate::storage::paths::resolve_data_dir_with_app(app));
+    let written = bytes.clone();
+    match tokio::task::spawn_blocking(move || quota::write(&path, &written)).await {
+        Ok(Ok(())) => state.upload_quota.lock().note_saved(&bytes),
+        Ok(Err(error)) => tracing::debug!("Could not save the day's upload count: {error}"),
+        Err(error) => tracing::debug!("Could not save the day's upload count: {error}"),
+    }
+}
 const MIB: u64 = 1024 * 1024;
 
 /// Set when the main window gains focus. Whatever had failed has had a chance
@@ -100,6 +142,7 @@ async fn run(app: tauri::AppHandle) {
     // Every "last applied" value starts unset so the first tick establishes
     // the world rather than trusting that startup already matched it.
     let mut applied_limits: Option<(u64, u64)> = None;
+    let mut quota_held = false;
     let mut applied_tooltip: Option<String> = None;
     let mut holding_wake_lock = false;
     let mut applied_taskbar: Option<Taskbar> = None;
@@ -129,21 +172,40 @@ async fn run(app: tauri::AppHandle) {
 
         ticks = ticks.wrapping_add(1);
         let (weekday, minute) = schedule::local_now();
-        let (resolved, prevent_sleep, alt_speed, low_disk_mb, download_folder) = {
+        let uploaded_today = uploaded_today(&state);
+        let (resolved, quota_cap, prevent_sleep, alt_speed, low_disk_mb, download_folder) = {
             let config = state.config.read().await;
             (
                 schedule::resolve_settings(&config.settings, weekday, minute),
+                quota::cap(&config.settings, uploaded_today),
                 config.settings.prevent_sleep_while_active,
                 config.settings.alt_speed_enabled,
                 config.settings.low_disk_warning_mb,
                 config.settings.download_folder.clone(),
             )
         };
+        if quota_cap.is_some() != quota_held {
+            if quota_cap.is_some() {
+                tracing::info!(
+                    "Daily upload quota reached ({uploaded_today} bytes today); uploads held to {} B/s until midnight",
+                    quota_cap.unwrap_or_default()
+                );
+            } else if quota_held {
+                tracing::info!("Daily upload quota no longer holds uploads (a new day, or a settings change)");
+            }
+            quota_held = quota_cap.is_some();
+        }
+        if ticks.is_multiple_of(QUOTA_SAVE_EVERY) {
+            save_upload_quota(&app, &state).await;
+        }
 
         // Only on change. `set_configured_limits` is idempotent, but it also
         // arbitrates with the USS controller, and re-running that arbitration
         // once a second for no reason is how a throttle starts flickering.
-        let target = (resolved.max_upload_speed, resolved.max_download_speed);
+        let target = (
+            quota::apply(resolved.max_upload_speed, quota_cap),
+            resolved.max_download_speed,
+        );
         if applied_limits != Some(target) {
             state
                 .bandwidth_limiter
@@ -159,7 +221,9 @@ async fn run(app: tauri::AppHandle) {
                     previous.0,
                     target.1,
                     previous.1,
-                    if alt_speed {
+                    if target.0 != resolved.max_upload_speed {
+                        "daily upload quota".to_string()
+                    } else if alt_speed {
                         "alternative limits".to_string()
                     } else {
                         resolved
@@ -261,6 +325,8 @@ async fn run(app: tauri::AppHandle) {
             // claimed the machine was being kept awake while it was free to
             // suspend.
             sleep_inhibit_held: wake_lock.is_held(),
+            uploaded_today: published_upload_count(uploaded_today),
+            upload_quota_reached: quota_cap.is_some(),
         };
         // Compared against the published status itself, not a copy this task
         // keeps. `apply_effective_limits` writes the same field on every
@@ -642,9 +708,11 @@ pub fn apply_effective_limits(
     settings: &crate::types::AppSettings,
 ) {
     let (upload, download) = effective_limits_now(settings);
+    let uploaded = uploaded_today(state);
+    let quota_cap = quota::cap(settings, uploaded);
     state
         .bandwidth_limiter
-        .set_configured_limits(upload, download);
+        .set_configured_limits(quota::apply(upload, quota_cap), download);
 
     // Republish immediately rather than leaving it to the tick. The banner in
     // Settings names the rule in force and the time it runs until, so a save
@@ -670,6 +738,8 @@ pub fn apply_effective_limits(
         published.schedule = resolved.active;
         published.alt_speed = settings.alt_speed_enabled;
         published.download_ratio_cap = resolved.download_ratio_cap;
+        published.uploaded_today = published_upload_count(uploaded);
+        published.upload_quota_reached = quota_cap.is_some();
         published.clone()
     };
     if let Err(error) = app.emit("ember:runtime-status", &status) {
@@ -692,7 +762,13 @@ pub fn snapshot(state: &AppState) -> RuntimeStatus {
 /// all-zeroes snapshot would report "no schedule, unlimited" for a profile
 /// whose overnight window is open right now.
 pub fn seed_status(state: &AppState, settings: &crate::types::AppSettings) {
-    *state.runtime_status.write() = resolved_status(settings);
+    let mut status = resolved_status(settings);
+    let uploaded = uploaded_today(state);
+    let quota_cap = quota::cap(settings, uploaded);
+    status.effective_upload_speed = quota::apply(status.effective_upload_speed, quota_cap);
+    status.uploaded_today = published_upload_count(uploaded);
+    status.upload_quota_reached = quota_cap.is_some();
+    *state.runtime_status.write() = status;
 }
 
 /// The status for a given settings snapshot, with nothing held yet.
@@ -716,6 +792,8 @@ fn resolved_status(settings: &crate::types::AppSettings) -> RuntimeStatus {
         download_ratio_cap: resolved.download_ratio_cap,
         sleep_inhibit_supported: crate::power::supported(),
         sleep_inhibit_held: false,
+        uploaded_today: 0,
+        upload_quota_reached: false,
     }
 }
 

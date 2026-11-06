@@ -47,6 +47,11 @@ pub struct SharedFoldersWatcher {
     over_limit: Mutex<HashSet<PathBuf>>,
     pending: Arc<Mutex<PendingRescan>>,
     reload_tx: mpsc::Sender<()>,
+    /// Settings > Library, "Watch shared folders for changes". Off, no folder
+    /// holds an OS watch (`desired` is kept, so turning it back on restores
+    /// them) and an event already in flight is dropped. Rescans asked for
+    /// directly — a settling file, a folder newly shared in part — still run.
+    enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 const WATCH_LIMIT_HINT: &str = "the system limit on watched folders is reached. \
@@ -244,7 +249,9 @@ impl SharedFoldersWatcher {
     /// cannot be initialised (in which case live folder tracking is simply
     /// disabled — the app still functions, the user just needs to reload
     /// manually).
-    pub fn start(app: AppHandle, initial_paths: Vec<String>) -> Option<Arc<Self>> {
+    pub fn start(app: AppHandle, initial_paths: Vec<String>, enabled: bool) -> Option<Arc<Self>> {
+        let enabled = Arc::new(std::sync::atomic::AtomicBool::new(enabled));
+        let enabled_for_watcher = enabled.clone();
         // Bounded ping channel — the coalescing loop only needs to know that
         // *some* event arrived, so a small capacity plus `try_send` drops
         // extras. This caps memory under a bulk copy that fires thousands of
@@ -401,7 +408,9 @@ impl SharedFoldersWatcher {
         let pending_for_watcher = pending.clone();
         let watcher = match recommended_watcher(move |res: notify::Result<Event>| match res {
             Ok(event) => {
-                if !event_should_rescan(event.kind) {
+                if !enabled_for_watcher.load(std::sync::atomic::Ordering::Relaxed)
+                    || !event_should_rescan(event.kind)
+                {
                     return;
                 }
                 if event.paths.is_empty() || event.need_rescan() {
@@ -449,6 +458,7 @@ impl SharedFoldersWatcher {
             over_limit: Mutex::new(HashSet::new()),
             pending,
             reload_tx,
+            enabled,
         });
         // `start` runs in Tauri's synchronous `setup` hook on the main thread,
         // so registering here would put an `exists()` per shared folder — each
@@ -504,6 +514,9 @@ impl SharedFoldersWatcher {
     /// forget watches whose directory has gone away so they are re-established
     /// if it returns.
     fn resync_unwatched(&self) {
+        if !self.is_enabled() {
+            return;
+        }
         let desired = self.desired.lock().clone();
         if desired.is_empty() {
             return;
@@ -580,6 +593,37 @@ impl SharedFoldersWatcher {
         }
     }
 
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Follow Settings > Library, "Watch shared folders for changes".
+    /// Blocking, like [`Self::sync_paths`]: it adds or drops every OS watch.
+    ///
+    /// Turned back on, the roots are scanned once, as at startup: a watch
+    /// reports changes from now on, and whatever changed while it was off
+    /// would otherwise wait for the next reload.
+    pub fn set_enabled(&self, enabled: bool) {
+        let was = self
+            .enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if was == enabled {
+            return;
+        }
+        let desired = self.desired.lock().clone();
+        self.apply_watches(&desired);
+        if enabled {
+            let roots = self.watched.lock().iter().cloned().collect::<Vec<_>>();
+            if !roots.is_empty() {
+                self.pending.lock().note_paths(roots);
+                let _ = self.reload_tx.try_send(());
+            }
+            info!("FS watcher: watching shared folders for changes again");
+        } else {
+            info!("FS watcher: no longer watching shared folders; changes are picked up on reload");
+        }
+    }
+
     /// Rescan `paths` once `delay` has passed, through the same driver (and
     /// in-flight re-arm) that filesystem events use.
     pub fn queue_rescan_after(&self, paths: Vec<PathBuf>, delay: Duration) {
@@ -625,6 +669,9 @@ impl SharedFoldersWatcher {
     /// path in `snapshot` and add/remove the OS watches to match the desired
     /// list as it stands once the probes are done.
     fn apply_watches(&self, snapshot: &[String]) {
+        // Off, nothing is to be watched, so there is nothing to probe for: each
+        // probe can sit for as long as an offline share takes to give up.
+        let snapshot: &[String] = if self.is_enabled() { snapshot } else { &[] };
         let probed: HashMap<PathBuf, bool> = snapshot
             .iter()
             .map(|p| {
@@ -648,8 +695,11 @@ impl SharedFoldersWatcher {
         // The probes above can take as long as an offline share makes them,
         // and an add/remove may have replaced the list meanwhile. Applying the
         // snapshot as-is unwatched folders added since and revived removed ones.
-        let desired_now: HashSet<PathBuf> =
-            self.desired.lock().iter().map(PathBuf::from).collect();
+        let desired_now: HashSet<PathBuf> = if self.is_enabled() {
+            self.desired.lock().iter().map(PathBuf::from).collect()
+        } else {
+            HashSet::new()
+        };
         let desired_set = watch_targets(&desired_now, &probed, &current);
 
         let to_remove: Vec<PathBuf> = current.difference(&desired_set).cloned().collect();

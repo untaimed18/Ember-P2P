@@ -5429,7 +5429,50 @@ impl Database {
             "DELETE FROM transfer_feed_folders WHERE transfer_id = ?1",
             params![transfer_id],
         )?;
+        Self::ensure_transfer_collection_folders_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM transfer_collection_folders WHERE transfer_id = ?1",
+            params![transfer_id],
+        )?;
         Ok(())
+    }
+
+    /// Record that the download `transfer_id` came from a collection and
+    /// finishes in `folder` below its category's folder: the collection's name
+    /// and the entry's own folders, `/`-separated (see
+    /// `storage::category_folders::note_collection_folder`).
+    pub fn set_transfer_collection_folder(&self, transfer_id: &str, folder: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_collection_folders_locked(&conn)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO transfer_collection_folders (transfer_id, folder) VALUES (?1, ?2)",
+            params![transfer_id, folder],
+        )?;
+        Ok(())
+    }
+
+    /// The downloads from collections, each with its folder. As
+    /// [`Self::transfer_feed_folders`], rows no download has are dropped.
+    pub fn transfer_collection_folders(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let conn = self.conn.lock();
+        Self::ensure_transfer_collection_folders_locked(&conn)?;
+        let rows = {
+            let mut stmt = conn.prepare(
+                "SELECT transfer_id, folder FROM transfer_collection_folders
+                  WHERE transfer_id IN (SELECT id FROM transfers)",
+            )?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        if let Err(error) = conn.execute(
+            "DELETE FROM transfer_collection_folders WHERE transfer_id NOT IN (SELECT id FROM transfers)",
+            [],
+        ) {
+            tracing::warn!("Could not drop collection folders of downloads that are gone: {error}");
+        }
+        Ok(rows)
     }
 
     /// Record that the download `transfer_id` is from a feed, and finishes in
@@ -5495,15 +5538,19 @@ impl Database {
         let mut conn = self.conn.lock();
         Self::ensure_transfer_part_folders_locked(&conn)?;
         Self::ensure_transfer_feed_folders_locked(&conn)?;
+        Self::ensure_transfer_collection_folders_locked(&conn)?;
         let tx = conn.transaction()?;
         {
             let mut stmt = tx.prepare("DELETE FROM transfers WHERE id = ?1")?;
             let mut folders = tx.prepare("DELETE FROM transfer_part_folders WHERE transfer_id = ?1")?;
             let mut feed_folders = tx.prepare("DELETE FROM transfer_feed_folders WHERE transfer_id = ?1")?;
+            let mut collection_folders =
+                tx.prepare("DELETE FROM transfer_collection_folders WHERE transfer_id = ?1")?;
             for id in transfer_ids {
                 stmt.execute(params![id])?;
                 folders.execute(params![id])?;
                 feed_folders.execute(params![id])?;
+                collection_folders.execute(params![id])?;
             }
         }
         tx.commit()?;
@@ -13114,6 +13161,18 @@ impl Database {
     fn ensure_transfer_feed_folders_locked(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS transfer_feed_folders (
+                transfer_id TEXT PRIMARY KEY,
+                folder TEXT NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Created on first use for the same reason as
+    /// [`Self::ensure_transfer_part_folders_locked`].
+    fn ensure_transfer_collection_folders_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS transfer_collection_folders (
                 transfer_id TEXT PRIMARY KEY,
                 folder TEXT NOT NULL
             );",

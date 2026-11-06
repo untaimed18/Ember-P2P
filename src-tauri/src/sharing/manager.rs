@@ -1364,8 +1364,9 @@ impl TransferManager {
             self.speed_history.remove(id);
             self.source_details.remove(id);
             // Its file is already where it finished; a later category change
-            // must not reach a completion that is over.
-            crate::storage::category_folders::forget(id);
+            // must not reach a completion that is over. Its collection folder
+            // stays, for a category changed afterwards to keep.
+            crate::storage::category_folders::forget_category(id);
             return Some(self.promote_next());
         }
         None
@@ -1441,17 +1442,23 @@ impl TransferManager {
         }
         for id in &dropped_failed {
             self.failed_partials.remove(id);
+            crate::storage::category_folders::forget(id);
         }
         let failed = failed.min(MAX_FAILED_ROWS);
         let mut excess = (self.completed.len() - failed).saturating_sub(MAX_FINISHED_ROWS);
         if excess > 0 {
+            let mut dropped = Vec::new();
             self.completed.retain(|t| {
                 if excess == 0 || Self::is_failed_download(t) {
                     return true;
                 }
                 excess -= 1;
+                dropped.push(t.id.clone());
                 false
             });
+            for id in &dropped {
+                crate::storage::category_folders::forget(id);
+            }
         }
     }
 

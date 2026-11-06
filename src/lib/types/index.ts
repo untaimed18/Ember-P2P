@@ -1183,6 +1183,17 @@ export interface AppSettings {
   /** Bytes per second; 0 is unlimited. */
   alt_max_upload_speed: number;
   alt_max_download_speed: number;
+  /** Hold uploads to `upload_quota_speed` for the rest of the local day once
+   *  `upload_quota_gb` has been uploaded since midnight. */
+  upload_quota_enabled: boolean;
+  /** Gigabytes (10^9 bytes), 1–1000. */
+  upload_quota_gb: number;
+  /** Bytes per second once the quota is reached; at least 1024. */
+  upload_quota_speed: number;
+  /** Hash shared files at background CPU and disk priority. */
+  hash_low_priority: boolean;
+  /** Watch shared folders and index changes as they happen. */
+  watch_shared_folders: boolean;
   /** Start Ember when the user signs in. */
   launch_at_login: boolean;
   /** A launch at sign-in comes up in the tray rather than on the desktop. */
@@ -1258,4 +1269,8 @@ export interface RuntimeStatus {
    *  it rather than offering a dead switch. */
   sleep_inhibit_supported: boolean;
   sleep_inhibit_held: boolean;
+  /** Bytes uploaded since local midnight, in steps of 10 MB. */
+  uploaded_today: number;
+  /** The daily upload quota is reached and holds uploads to its speed. */
+  upload_quota_reached: boolean;
 }

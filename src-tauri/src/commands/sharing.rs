@@ -752,13 +752,15 @@ impl<'a, T: HashCandidate> HashLookahead<'a, T> {
             let progress = Arc::new(AtomicU64::new(0));
             let read = progress.clone();
             let task = tokio::task::spawn_blocking(move || {
-                let path = std::path::Path::new(&path);
-                match top_up {
-                    Some((ed2k, aich, ember, want)) => FileIndexer::hash_file_top_up_cancellable(
-                        path, ed2k, aich, ember, want, &cancel, &read,
-                    ),
-                    None => FileIndexer::hash_file_cancellable(path, &cancel, &read),
-                }
+                crate::sharing::disk::hash_at_background_priority(|| {
+                    let path = std::path::Path::new(&path);
+                    match top_up {
+                        Some((ed2k, aich, ember, want)) => FileIndexer::hash_file_top_up_cancellable(
+                            path, ed2k, aich, ember, want, &cancel, &read,
+                        ),
+                        None => FileIndexer::hash_file_cancellable(path, &cancel, &read),
+                    }
+                })
             });
             self.inflight.push_back(StartedHash {
                 index,

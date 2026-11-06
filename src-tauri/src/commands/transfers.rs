@@ -3620,6 +3620,8 @@ struct FinishedToMove {
     size: u64,
     /// The hash of the Library row at `from`, if one is there.
     indexed_hash: Option<String>,
+    /// Its collection's folders, kept below the new category's.
+    collection: Vec<String>,
 }
 
 /// Change the category of downloads, in one call for a whole selection: each
@@ -3687,6 +3689,7 @@ pub async fn set_transfers_category(
                 file_hash: t.file_hash.clone(),
                 size: t.total_size,
                 indexed_hash: None,
+                collection: crate::storage::category_folders::collection_subdir(id),
             });
         }
     }
@@ -3722,7 +3725,13 @@ pub async fn set_transfers_category(
         finished
             .into_iter()
             .map(|item| {
-                let result = move_if_still_the_download(&item, &roots, &subdir);
+                let place: Vec<String> = subdir
+                    .iter()
+                    .chain(&item.collection)
+                    .take(crate::storage::category_folders::MAX_DEPTH)
+                    .cloned()
+                    .collect();
+                let result = move_if_still_the_download(&item, &roots, &place);
                 (item, result)
             })
             .collect::<Vec<_>>()
@@ -5255,7 +5264,9 @@ mod ipc_lifecycle_tests {
         let roots = [root.to_string_lossy().into_owned()];
         let downloads = base.join("old").join("Downloads");
         let filed = downloads.join("Video").join("TV Series").join("episode.mkv");
-        let too_deep = downloads.join("a").join("b").join("c").join("d").join("episode.mkv");
+        let too_deep = (0..=crate::storage::category_folders::MAX_DEPTH)
+            .fold(downloads.clone(), |dir, level| dir.join(format!("l{level}")))
+            .join("episode.mkv");
         let beside = base.join("old").join("Documents").join("episode.mkv");
         for file in [&filed, &too_deep, &beside] {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -5267,7 +5278,7 @@ mod ipc_lifecycle_tests {
         };
 
         assert_eq!(verify(&filed).unwrap(), filed.canonicalize().unwrap());
-        assert!(verify(&too_deep).is_err(), "deeper than a category folder can be");
+        assert!(verify(&too_deep).is_err(), "deeper than a category and collection folder can be");
         assert!(verify(&beside).is_err());
         let climbed_out = downloads.join("Video").join("..").join("..").join("Documents").join("episode.mkv");
         assert!(verify(&climbed_out).is_err());

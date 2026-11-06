@@ -242,6 +242,10 @@ pub struct AppState {
     /// Synchronous `parking_lot` because both writer and readers only ever
     /// swap a small value and never await while holding it.
     pub runtime_status: Arc<parking_lot::RwLock<crate::types::RuntimeStatus>>,
+    /// Today's upload count for the daily quota
+    /// ([`crate::bandwidth::quota`]). Advanced and saved by the background
+    /// monitor, read by every resolution of the upload limit.
+    pub upload_quota: Arc<parking_lot::Mutex<crate::bandwidth::quota::UploadQuota>>,
 }
 
 impl AppState {

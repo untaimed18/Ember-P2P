@@ -911,6 +911,12 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     }
     changed |= clamp_assign(&mut settings.alt_max_upload_speed, 0, MAX_CONFIGURED_SPEED_BPS);
     changed |= clamp_assign(&mut settings.alt_max_download_speed, 0, MAX_CONFIGURED_SPEED_BPS);
+    changed |= clamp_assign(&mut settings.upload_quota_gb, 1, crate::types::MAX_UPLOAD_QUOTA_GB);
+    changed |= clamp_assign(
+        &mut settings.upload_quota_speed,
+        crate::types::MIN_UPLOAD_QUOTA_SPEED,
+        MAX_CONFIGURED_SPEED_BPS,
+    );
     // Soft-disable USS when upload is unlimited (validate rejects that combo).
     if settings.uss_enabled && settings.max_upload_speed == 0 {
         settings.uss_enabled = false;
@@ -1327,6 +1333,18 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
                 "Alternative download speed must be 0 or at most {MAX_CONFIGURED_SPEED_BPS} B/s"
             ),
             MAX_CONFIGURED_SPEED_BPS,
+        ));
+    }
+    if !(1..=crate::types::MAX_UPLOAD_QUOTA_GB).contains(&settings.upload_quota_gb) {
+        return Err(coded(
+            "settings_upload_quota_invalid",
+            "The daily upload quota must be between 1 and 1000 GB",
+        ));
+    }
+    if !(crate::types::MIN_UPLOAD_QUOTA_SPEED..=MAX_CONFIGURED_SPEED_BPS).contains(&settings.upload_quota_speed) {
+        return Err(coded(
+            "settings_upload_quota_speed_invalid",
+            "The upload speed after the quota must be at least 1 KB/s",
         ));
     }
     if !(60..=14400).contains(&settings.download_queue_wait_secs) {
@@ -2016,6 +2034,15 @@ pub async fn update_settings(
     // holding a read of the previous settings and then overwrite this target
     // with the stale one it resolved from them.
     crate::background::apply_effective_limits(&app, &state, &settings);
+
+    crate::sharing::disk::set_hash_at_low_priority(settings.hash_low_priority);
+    if settings.watch_shared_folders != old_settings.watch_shared_folders {
+        if let Some(watcher) = state.shared_folder_watcher.clone() {
+            let enabled = settings.watch_shared_folders;
+            // Adds or drops every OS watch, which can block on an offline share.
+            tokio::task::spawn_blocking(move || watcher.set_enabled(enabled));
+        }
+    }
 
     // Apply the new concurrent-download cap and promote any queued downloads
     // that the higher cap now allows. Previously this only set the field, so

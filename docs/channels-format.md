@@ -1457,6 +1457,8 @@ now" on it says the feed was deleted.
 most 2,000 entries, each with name, size, eD2K, AICH and Ember BLAKE3, and
 its name and author are the feed's title and the publisher's name. An entry
 may carry a note, tag `FT_EMBER_NOTE` (`0xE3`, a string of at most 256 bytes).
+A feed list never carries `FT_EMBER_FOLDER` (`0xE4`, a collection entry's
+relative folder), so its bytes are the same as before that tag existed.
 A follower uses a list only if its size, eD2K hash and BLAKE3 (of the sealed
 bytes) all match the head, it opens under the salt, it parses, it holds
 `item_count` entries and every entry names a file one could fetch; otherwise

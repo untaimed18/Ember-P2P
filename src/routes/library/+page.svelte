@@ -62,6 +62,7 @@
   import { formatEd2kLink, formatEd2kLinks, buildEd2kLink } from '$lib/api/search';
   import { startRelatedSearch } from '$lib/relatedSearch';
   import { pickAndLoadCollection, createCollectionWithDialog, downloadCollectionFiles, type Collection, type CollectionFile } from '$lib/api/collections';
+  import { collectionFolders } from '$lib/collectionFolders';
   import {
     incomingCollection,
     markIncomingCollectionPresented,
@@ -353,6 +354,12 @@
   let selectedFileHashes: Set<string> = $state(new Set());
   let creatingCollection = $state(false);
   let newCollFormat: 'binary' | 'text' = $state('binary');
+  /** A new collection records the folders its files are in, relative to the
+   *  folder they all share. */
+  let newCollKeepFolders = $state(true);
+  /** A loaded collection's files finish in a folder named after it, in their
+   *  own folders below that. */
+  let keepCollectionFolders = $state(true);
   let copyingCollectionLinks = $state(false);
   /** Total size of the files a new collection would list, each hash once. */
   let selectedCollectionBytes = $derived.by(() => {
@@ -394,6 +401,7 @@
     // the Close button can null out, or the deep-link handoff can replace with
     // a different collection, while the batched enqueue is awaiting.
     const entries = loadedCollection.files.slice();
+    const intoFolder = keepCollectionFolders ? loadedCollection.name : null;
     downloadingCollection = true;
     try {
       // The backend deliberately bounds each enqueue transaction to 200
@@ -409,6 +417,7 @@
         try {
           const result = await downloadCollectionFiles(
             entries.slice(start, start + batchSize),
+            intoFolder,
           );
           queued += result.queuedCount;
           skipped += result.skippedCount;
@@ -506,6 +515,9 @@
   let displayedLoadedCollectionFiles = $derived.by(() =>
     loadedCollection ? loadedCollection.files.slice(0, LOADED_COLLECTION_DISPLAY_LIMIT) : []
   );
+  let loadedCollectionHasFolders = $derived(
+    (loadedCollection as Collection | null)?.files.some((file: CollectionFile) => !!file.folder) ?? false
+  );
 
   function openCreateDialog(preselectHashes?: Iterable<string>) {
     const active = typeof document !== 'undefined' ? document.activeElement : null;
@@ -516,6 +528,7 @@
     selectedFileHashes = new Set(preselectHashes ?? []);
     collectionSearch = '';
     newCollFormat = 'binary';
+    newCollKeepFolders = true;
     createCollectionOpen = true;
     requestAnimationFrame(() => {
       createCollectionModal?.querySelector<HTMLInputElement>('#coll-name')?.focus();
@@ -575,15 +588,23 @@
       // hash should list each file once. Keep first occurrence.
       const seenHashes = new Set<string>();
       const collFiles: CollectionFile[] = [];
+      const paths: string[] = [];
       for (const f of hashedLibraryFiles) {
         if (!selectedFileHashes.has(f.hash) || seenHashes.has(f.hash)) continue;
         seenHashes.add(f.hash);
+        paths.push(f.path);
         collFiles.push({
           name: f.name,
           size: f.size,
           hash: f.hash,
           aich_hash: f.aich_hash,
           ember_file_hash: f.ember_file_hash || undefined,
+        });
+      }
+      if (newCollKeepFolders) {
+        const folders = collectionFolders(paths);
+        collFiles.forEach((file, i) => {
+          if (folders[i]) file.folder = folders[i];
         });
       }
       const msg = await createCollectionWithDialog(
@@ -4677,6 +4698,10 @@
         </span>
       </button>
       {#if loadedCollection}
+        <label class="coll-keep-folders" title={m.library_coll_keep_folders_download_hint()}>
+          <input type="checkbox" bind:checked={keepCollectionFolders} disabled={downloadingCollection} />
+          <span>{m.library_coll_keep_folders_download()}</span>
+        </label>
         <button class="coll-action-btn download-all-btn" onclick={handleDownloadAll} disabled={downloadingCollection}>
           {downloadingCollection ? m.library_queueing() : m.library_download_all()}
         </button>
@@ -4702,6 +4727,9 @@
           <table class="compact-table coll-table">
             <thead>
               <tr>
+                {#if loadedCollectionHasFolders}
+                  <th class="coll-col-folder">{m.library_coll_col_folder()}</th>
+                {/if}
                 <th>{m.library_col_filename()}</th>
                 <th class="coll-col-size">{m.library_col_size()}</th>
                 <th class="coll-col-hash">{m.library_col_hash()}</th>
@@ -4710,6 +4738,9 @@
             <tbody>
               {#each displayedLoadedCollectionFiles as cf, i (`${cf.hash}:${i}`)}
                 <tr>
+                  {#if loadedCollectionHasFolders}
+                    <td class="coll-col-folder" title={cf.folder ?? ''}><bdi dir="auto">{cf.folder ?? ''}</bdi></td>
+                  {/if}
                   <td title={cf.name}><bdi dir="auto">{cf.name}</bdi></td>
                   <td class="coll-col-size">{formatSize(cf.size)}</td>
                   <td class="coll-col-hash" title={cf.hash}>{cf.hash.substring(0, 16)}&hellip;</td>
@@ -4832,6 +4863,11 @@
               <span class="coll-format-desc">{m.library_coll_format_text_desc()}</span>
             </label>
           </div>
+          <label class="coll-format coll-keep-folders-option">
+            <input type="checkbox" bind:checked={newCollKeepFolders} />
+            <span class="coll-format-name">{m.library_coll_keep_folders()}</span>
+            <span class="coll-format-desc">{m.library_coll_keep_folders_desc()}</span>
+          </label>
         </section>
 
         <section class="coll-card" aria-labelledby="coll-sec-files">
@@ -8053,6 +8089,16 @@
   }
   .coll-col-size { width: 90px; text-align: right; }
   .coll-col-hash { width: 160px; font-family: var(--font-mono); font-size: var(--font-size-xs); color: var(--text-muted); }
+  .coll-col-folder { width: 28%; color: var(--text-secondary); }
+  .coll-keep-folders {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
 
   /* --- Create Collection modal --- */
   .modal-overlay {
@@ -8234,6 +8280,18 @@
   }
   .coll-format-name { font-size: var(--font-size-sm); font-weight: 600; color: var(--text-primary); }
   .coll-format-desc { font-size: var(--font-size-xs); line-height: 1.4; color: var(--text-muted); }
+  .coll-keep-folders-option { margin-top: 8px; }
+  .coll-format input[type="checkbox"] {
+    position: absolute;
+    top: 11px;
+    left: 12px;
+    margin: 0;
+    cursor: pointer;
+  }
+  .coll-format:has(input[type="checkbox"]:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
   .coll-search {
     position: relative;
     display: flex;
