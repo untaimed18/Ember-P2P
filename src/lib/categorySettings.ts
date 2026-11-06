@@ -7,7 +7,7 @@ import { getSettings, updateSettings } from '$lib/api/settings';
 import { setTransfersCategory } from '$lib/api/transfers';
 import { setAppSettings } from '$lib/stores/settings';
 import { setLocalCategory, transfers } from '$lib/stores/transfers';
-import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
+import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel, isUncategorized } from '$lib/downloadCategories';
 import { normalizeCategoryFolder } from '$lib/categoryFolders';
 import type { Transfer } from '$lib/types';
 
@@ -94,11 +94,19 @@ export function isCategoryTaken(name: string, userCategories: readonly string[])
   ) || userCategories.some((cat) => cat.toLocaleLowerCase() === folded);
 }
 
-/** Downloads in each category, by category value. */
+/** Downloads in each category, by category value. Those with none are not
+ *  counted; see [`countUncategorizedDownloads`]. */
 export function countDownloadCategories(list: readonly Transfer[]): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const t of list) {
-    if (t.direction === 'download' && t.category) counts[t.category] = (counts[t.category] ?? 0) + 1;
+    if (t.direction === 'download' && !isUncategorized(t.category)) {
+      counts[t.category] = (counts[t.category] ?? 0) + 1;
+    }
   }
   return counts;
+}
+
+/** Downloads with no category. */
+export function countUncategorizedDownloads(list: readonly Transfer[]): number {
+  return list.filter((t) => t.direction === 'download' && isUncategorized(t.category)).length;
 }
