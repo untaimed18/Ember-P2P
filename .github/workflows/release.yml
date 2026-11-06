@@ -177,6 +177,17 @@ jobs:
     # runner `check-linux` compiles on. An AppImage bundles everything except
     # glibc and glibc is only forwards compatible, so the distro this is built
     # on is the oldest one the result can run on.
+    #
+    # It also bundles WebKit but not FreeType, so the AppImage works around
+    # this distro's FreeType (2.11) on hosts with 2.13 or newer: see
+    # `src-tauri/src/appimage_fonts.rs`, whose `BUILT_AGAINST_FREETYPE` moves
+    # with this line. Moving the AppImage to a newer distro raises its glibc
+    # floor, and an AppImage rewrites itself in place, so an install on an
+    # older system must never be handed it: publish that build under
+    # `linux-x86_64-appimage-glibc` with its `min_glibc`, which only 1.8.0 and
+    # later read (`choose_appimage_target` in `commands/updater.rs`), and keep
+    # the plain `linux-x86_64-appimage` entry for a build that runs wherever
+    # this one does, or drop it.
     timeout-minutes: 90
     permissions:
       contents: read

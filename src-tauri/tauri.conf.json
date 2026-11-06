@@ -105,6 +105,12 @@
         "files": {
           "/usr/share/mime/packages/ember.xml": "linux/ember-mime.xml"
         }
+      },
+      "appimage": {
+        "files": {
+          "/usr/share/ember/fonts/NotoColorEmoji.ttf": "resources/appimage/NotoColorEmoji.ttf",
+          "/usr/share/ember/fonts/OFL.txt": "resources/appimage/NotoColorEmoji-OFL.txt"
+        }
       }
     }
   }

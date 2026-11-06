@@ -2848,6 +2848,12 @@ fn apply_host_desktop_env(cmd: &mut std::process::Command) {
     for key in APPIMAGE_MARKER_VARS {
         cmd.env_remove(key);
     }
+    // Ember's font configuration, but never one the user set themselves.
+    let ours = std::env::var_os(crate::appimage_fonts::OVERRIDE_MARKER);
+    if ours.is_some() && std::env::var_os("FONTCONFIG_FILE") == ours {
+        cmd.env_remove("FONTCONFIG_FILE");
+    }
+    cmd.env_remove(crate::appimage_fonts::OVERRIDE_MARKER);
     for (key, fallback) in APPIMAGE_PATH_VARS {
         let Some(value) = std::env::var_os(key) else {
             continue;

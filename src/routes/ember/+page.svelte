@@ -322,7 +322,9 @@
           ? m.updater_ready_body({ version: $updater.version ?? '' })
           : $updater.phase === 'error' || $updater.signatureMissing
             ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
-            : '',
+            : $updater.systemTooOld
+              ? m.updater_system_too_old({ version: $updater.systemTooOld.version, glibc: $updater.systemTooOld.glibc })
+              : '',
   );
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
   let verifiedCount = $derived(diag?.ember_dht_verified_contacts ?? 0);

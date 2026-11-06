@@ -5656,7 +5656,7 @@
               <div
                 class="about-update-status"
                 class:success={$updater.phase === 'uptodate' || $updater.phase === 'available' || $updater.phase === 'ready'}
-                class:error={$updater.phase === 'error' || $updater.phase === 'stalled' || $updater.signatureMissing}
+                class:error={$updater.phase === 'error' || $updater.phase === 'stalled' || $updater.signatureMissing || !!$updater.systemTooOld}
                 class:busy={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
               >
                 {#if $updater.phase === 'uptodate'}
@@ -5691,6 +5691,8 @@
                   {/if}
                 {:else if $updater.phase === 'error' || $updater.signatureMissing}
                   <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })}</span>
+                {:else if $updater.systemTooOld}
+                  <span class="feedback error">{m.updater_system_too_old({ version: $updater.systemTooOld.version, glibc: $updater.systemTooOld.glibc })}</span>
                 {:else}
                   <span class="hint">{m.settings_about_check_hint()}</span>
                 {/if}

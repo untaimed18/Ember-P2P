@@ -3941,6 +3941,7 @@
   "updater_checking": "正在檢查…",
   "updater_uptodate": "您使用的是最新版本。",
   "updater_signature_missing": "更新資訊未經簽名，因此 Ember 無法判斷你是否已是最新版本。",
+  "updater_system_too_old": "Ember {version} 已發布，但它的 AppImage 需要比目前更新的 Linux（glibc {glibc} 或更新版本）。請從 emberp2p.org 安裝 .deb 套件，或繼續使用目前版本。",
   "updater_error_title": "更新失敗",
   "updater_error_body": "無法完成更新：{detail}",
   "updater_retry": "重試",

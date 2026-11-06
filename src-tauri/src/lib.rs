@@ -22,6 +22,8 @@
 #![allow(clippy::type_complexity)]
 
 mod app_state;
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+mod appimage_fonts;
 mod auto_update;
 mod background;
 mod bandwidth;
@@ -485,6 +487,11 @@ fn show_fatal_startup_dialog(message: &str) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First: it sets environment variables, which only a process with one
+    // thread may do, and the runtime below starts several.
+    #[cfg(target_os = "linux")]
+    let appimage_fonts = appimage_fonts::prepare();
+
     // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
     //
     // Ember drives several very large async state machines — the multi-source
@@ -646,6 +653,8 @@ pub fn run() {
 
     #[cfg(target_os = "linux")]
     raise_open_file_limit();
+    #[cfg(target_os = "linux")]
+    appimage_fonts.log();
 
     // Multi-instance harness path: when `EMBER_DATA_DIR` is set, every
     // launched process is meant to be an *isolated* node (own config,

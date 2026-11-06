@@ -3941,6 +3941,7 @@
   "updater_checking": "Проверка…",
   "updater_uptodate": "У вас установлена последняя версия.",
   "updater_signature_missing": "Информация об обновлении не была подписана, поэтому Ember не может определить, установлена ли у вас последняя версия.",
+  "updater_system_too_old": "Вышел Ember {version}, но в виде AppImage ему нужен более новый Linux, чем этот (glibc {glibc} или новее). Установите пакет .deb с сайта emberp2p.org или продолжайте пользоваться этой версией.",
   "updater_error_title": "Обновление не удалось",
   "updater_error_body": "Не удалось завершить обновление: {detail}",
   "updater_retry": "Повторить",

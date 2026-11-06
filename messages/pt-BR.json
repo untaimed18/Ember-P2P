@@ -3941,6 +3941,7 @@
   "updater_checking": "Verificando…",
   "updater_uptodate": "Você está na versão mais recente.",
   "updater_signature_missing": "As informações de atualização não estavam assinadas, então o Ember não consegue saber se você está atualizado.",
+  "updater_system_too_old": "O Ember {version} já saiu, mas como AppImage ele precisa de um Linux mais novo que este (glibc {glibc} ou posterior). Instale o pacote .deb pelo emberp2p.org ou continue usando esta versão.",
   "updater_error_title": "Falha na atualização",
   "updater_error_body": "Não foi possível concluir a atualização: {detail}",
   "updater_retry": "Tentar novamente",
