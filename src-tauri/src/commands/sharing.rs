@@ -5374,6 +5374,14 @@ pub(crate) async fn add_shared_folder_approved(
                     &canonical,
                 )
             }) {
+                // Named as the folder the user never added, the overlap would
+                // read as a mistake of theirs.
+                if crate::commands::settings::is_release_share_folder(&config.settings, existing) {
+                    return Err(coded(
+                        "sharing_release_folder_managed",
+                        "The Ember releases folder is shared by release sharing; turn that off in Settings > About",
+                    ));
+                }
                 return Err(coded_ctx(
                     "sharing_folder_overlap",
                     "Shared folders must not overlap",
@@ -6781,6 +6789,14 @@ pub async fn remove_shared_folder(
             }
         }
     };
+    // The release-sharing settings add and take back this one; removed here,
+    // their next save would quietly share it again.
+    if crate::commands::settings::is_release_share_folder(&state.config.read().await.settings, &canonical_path) {
+        return Err(coded(
+            "sharing_release_folder_managed",
+            "The Ember releases folder is shared by release sharing; turn that off in Settings > About",
+        ));
+    }
     // `add_shared_folder` stores the *canonical* form in
     // `shared_folders` and `upload_shared_folders`; the cancel-flag
     // map is also keyed by canonical paths. Comparing against the

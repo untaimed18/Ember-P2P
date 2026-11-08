@@ -798,6 +798,56 @@ test("the Windows installers are built without the key and signed afterwards", (
   }
 });
 
+/** The policy fixture with the website workflow beside the release one. */
+function websiteFixture(from = "", to = "") {
+  const fixture = policyFixture();
+  const source = readFileSync(join(root, ".github/workflows/website.yml"), "utf8");
+  assert.ok(source.includes(from), `website.yml no longer contains: ${from}`);
+  writeFileSync(join(fixture, ".github/workflows/website.yml"), source.replace(from, to));
+  return fixture;
+}
+
+test("no workflow gets more than it needs, nor pastes values into a script", () => {
+  const untouched = websiteFixture();
+  try {
+    verifyWorkflow({ root: untouched });
+  } finally {
+    rmSync(untouched, { recursive: true, force: true });
+  }
+  for (const fixture of [
+    [
+      tamperedWorkflow("permissions:\n  contents: read\n", "permissions:\n  contents: read\n  actions: write\n"),
+      /release\.yml: top-level permissions must be contents: read, and only that/,
+    ],
+    [
+      tamperedWorkflow("    name: Build Linux packages\n", "    name: Build Linux packages\n    permissions: write-all\n"),
+      /build-linux may request read permissions only, not write-all/,
+    ],
+    [
+      websiteFixture("    permissions:\n      contents: write\n      pages: write\n", "    permissions: write-all\n"),
+      /downloads may request contents: write and pages: write, not write-all/,
+    ],
+    [
+      websiteFixture("      pages: write\n", "      pages: write\n      id-token: write\n"),
+      /downloads may request contents: write and pages: write, not contents: write, id-token: write, pages: write/,
+    ],
+    [
+      websiteFixture('run: node scripts/website-downloads.mjs "$TAG"', 'run: node scripts/website-downloads.mjs "${{ inputs.tag }}"'),
+      /website\.yml:\d+: a run script must not interpolate/,
+    ],
+    [
+      websiteFixture('echo "docs/index.html already offers $TAG"', 'echo "docs/index.html already offers ${{ github.event.release.tag_name }}"'),
+      /website\.yml:\d+: a run script must not interpolate/,
+    ],
+  ].map(([fixture, expected]) => ({ fixture, expected }))) {
+    try {
+      assert.throws(() => verifyWorkflow({ root: fixture.fixture }), fixture.expected);
+    } finally {
+      rmSync(fixture.fixture, { recursive: true, force: true });
+    }
+  }
+});
+
 test("workflow policy rejects mutable action references", () => {
   const fixture = policyFixture();
   try {

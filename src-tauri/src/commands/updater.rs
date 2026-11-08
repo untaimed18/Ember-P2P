@@ -1529,7 +1529,17 @@ fn parse_glibc(version: &str) -> Option<(u32, u32)> {
 fn host_glibc() -> Option<(u32, u32)> {
     // SAFETY: returns a pointer to a static NUL-terminated string.
     let version = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) };
-    parse_glibc(version.to_str().ok()?)
+    parse_host_glibc(version.to_str().ok()?)
+}
+
+/// The host's glibc as `(major, minor)`, reading past what follows them: a
+/// development build reports `2.40.9000` (Fedora Rawhide), which the strict
+/// form a manifest has to use refuses.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
+fn parse_host_glibc(version: &str) -> Option<(u32, u32)> {
+    let mut numbers = version.split(|c: char| !c.is_ascii_digit());
+    let mut number = || numbers.next().filter(|part| !part.is_empty() && part.len() <= 4)?.parse().ok();
+    Some((number()?, number()?))
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -1902,7 +1912,13 @@ async fn seed_release(job: &SeedJob) {
     let SeedJob { app, manifest, public_key, folder } = job;
     let still_wanted = || crate::release_share::seed_folder().as_deref() == Some(folder.as_path());
     let version = manifest.version.as_str();
+    // A prerelease's files are named in a form `release_share` does not read
+    // a version from, so it could neither prune nor clear them.
+    if Version::parse(version).map_or(true, |parsed| !parsed.pre.is_empty() || !parsed.build.is_empty()) {
+        return;
+    }
     let mut wrote = 0usize;
+    let mut installers_held = 0usize;
     let mut complete = true;
     let mut base: Option<Url> = None;
     let mut seen = std::collections::HashSet::new();
@@ -1916,6 +1932,7 @@ async fn seed_release(job: &SeedJob) {
         base.get_or_insert_with(|| platform.url.clone());
         let path = folder.join(&name);
         if holds_signed_artifact(&path, platform).await {
+            installers_held += 1;
             continue;
         }
         if !still_wanted() {
@@ -1929,11 +1946,11 @@ async fn seed_release(job: &SeedJob) {
                 continue;
             }
         };
-        if !still_wanted() {
-            return;
-        }
         if keep_release_file(folder, &name, bytes, &platform.sha256).await {
             wrote += 1;
+            installers_held += 1;
+        } else if !still_wanted() {
+            return;
         } else {
             complete = false;
         }
@@ -1957,9 +1974,7 @@ async fn seed_release(job: &SeedJob) {
                     };
                     if unchanged {
                         crate::release_share::note_checked(&path, CHECKED_BY_RELEASE_SIGNATURE);
-                    } else if still_wanted()
-                        && keep_release_file(folder, &name, bytes, CHECKED_BY_RELEASE_SIGNATURE).await
-                    {
+                    } else if keep_release_file(folder, &name, bytes, CHECKED_BY_RELEASE_SIGNATURE).await {
                         wrote += 1;
                     }
                 }
@@ -1969,8 +1984,8 @@ async fn seed_release(job: &SeedJob) {
                 // shared from here, including a copy kept before.
                 Ok(SignedExtra::BadSignature) => {
                     tracing::warn!("Release sharing: {name} does not match its release signature; not sharing it");
-                    let stale = path.clone();
-                    if tokio::task::spawn_blocking(move || std::fs::remove_file(stale).is_ok())
+                    let (dir, stale) = (folder.clone(), name.clone());
+                    if tokio::task::spawn_blocking(move || crate::release_share::remove(&dir, &stale))
                         .await
                         .unwrap_or(false)
                     {
@@ -1984,7 +1999,9 @@ async fn seed_release(job: &SeedJob) {
     if !still_wanted() {
         return;
     }
-    let pruned = if complete {
+    // A release none of whose installers is held here, its names unread or
+    // every fetch failed, is no reason to let the previous one go.
+    let pruned = if complete && installers_held > 0 {
         let (dir, keep) = (folder.clone(), version.to_string());
         tokio::task::spawn_blocking(move || crate::release_share::prune(&dir, &keep))
             .await
@@ -2021,15 +2038,20 @@ async fn holds_signed_artifact(path: &Path, platform: &SignedPlatform) -> bool {
 /// signature, verified by fetching it again once a session.
 const CHECKED_BY_RELEASE_SIGNATURE: &str = "release signature";
 
-/// Keep verified release bytes, recording them as checked against `against`.
-/// Whether they were kept.
+/// Keep verified release bytes, recording them as checked against `against`,
+/// while seeding still asks for `folder`. Whether they were kept.
 async fn keep_release_file(folder: &Path, name: &str, bytes: Vec<u8>, against: &str) -> bool {
     let (dir, file) = (folder.to_path_buf(), name.to_string());
-    match tokio::task::spawn_blocking(move || crate::release_share::keep(&dir, &file, &bytes)).await {
-        Ok(Ok(())) => {
+    let kept = tokio::task::spawn_blocking(move || {
+        let still_wanted = || crate::release_share::seed_folder().as_deref() == Some(dir.as_path());
+        crate::release_share::keep(&dir, &file, &bytes, still_wanted)
+    });
+    match kept.await {
+        Ok(Ok(true)) => {
             crate::release_share::note_checked(&folder.join(name), against);
             true
         }
+        Ok(Ok(false)) => false,
         Ok(Err(error)) => {
             tracing::warn!("Release sharing: could not keep {name}: {error}");
             false
@@ -2073,10 +2095,28 @@ async fn fetch_signed_release_extra(base: &Url, name: &str, public_key: &str) ->
         Err(error) if is_missing_updater_resource(&error) => return Ok(SignedExtra::Missing),
         Err(error) => return Err(error),
     };
-    Ok(match verify_minisign(&file.bytes, &signature.bytes, public_key) {
+    Ok(match verify_minisign_for_file(&file.bytes, &signature.bytes, public_key, name) {
         Ok(()) => SignedExtra::Verified(file.bytes),
         Err(_) => SignedExtra::BadSignature,
     })
+}
+
+/// [`verify_minisign`], and the signature made for a file of this name. The
+/// release workflow signs with `tauri signer`, whose trusted comment (signed
+/// with the rest) names the file, and nothing else ties a collection or notes
+/// file to its release: without it, an older release's signed collection
+/// served under a newer name would verify.
+fn verify_minisign_for_file(payload: &[u8], encoded_signature: &[u8], encoded_key: &str, name: &str) -> Result<()> {
+    verify_minisign(payload, encoded_signature, encoded_key)?;
+    let signature = parse_signature(encoded_signature)?;
+    let signed_name = signature
+        .trusted_comment()
+        .split('\t')
+        .find_map(|field| field.strip_prefix("file:"));
+    if signed_name != Some(name) {
+        bail!("signature was made for {signed_name:?}, not {name}");
+    }
+    Ok(())
 }
 
 async fn download_artifact(
@@ -3188,6 +3228,17 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         assert!(verify_minisign(b"tampered", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY).is_err());
     }
 
+    #[test]
+    fn a_release_extra_verifies_only_under_the_name_it_was_signed_for() {
+        verify_minisign_for_file(b"test", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY, "test").unwrap();
+        assert!(
+            verify_minisign_for_file(b"test", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY, "Ember_9.9.9.emulecollection")
+                .is_err(),
+            "an older release's signed file served under a newer name"
+        );
+        assert!(verify_minisign_for_file(b"tampered", TEST_SIGNATURE.as_bytes(), TEST_PUBLIC_KEY, "test").is_err());
+    }
+
     fn scratch_dir(name: &str) -> PathBuf {
         let unique = format!(
             "ember-updater-{}-{}-{name}",
@@ -3295,6 +3346,16 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         assert!(parse_glibc("2.4") < parse_glibc("2.39"), "compared as numbers");
         for bad in ["", "2", "2.", ".39", "2.39.1", "2.x", "+2.39", "2. 39", "99999.1"] {
             assert_eq!(parse_glibc(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_hosts_glibc_is_read_past_a_development_suffix() {
+        assert_eq!(parse_host_glibc("2.39"), Some((2, 39)));
+        assert_eq!(parse_host_glibc("2.40.9000"), Some((2, 40)), "Fedora Rawhide");
+        assert_eq!(parse_host_glibc("2.35-0ubuntu3"), Some((2, 35)));
+        for bad in ["", "2", ".39", "x.39", "99999.1"] {
+            assert_eq!(parse_host_glibc(bad), None, "{bad:?}");
         }
     }
 

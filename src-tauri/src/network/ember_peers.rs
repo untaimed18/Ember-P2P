@@ -2352,10 +2352,13 @@ pub(super) async fn send_ember_announce_peer(
     contact: &ember::dht::EmberContact,
 ) -> bool {
     let local_id = state.ember_dht.local_id();
-    let closest = state
+    let mut closest = state
         .ember_dht
         .routing()
         .find_closest(&contact.node_id, ember::dht::MAX_CONTACTS_PER_RESPONSE);
+    // As every other contact list we hand out: one that says nothing reaches
+    // its port unasked would only cost the peer a probe it cannot answer.
+    closest.retain(|c| state.ember_dht.peer_reach(&c.node_id) != Some(ember::dht::messages::UdpReach::Firewalled));
     let gossip = ember_announce_gossip(
         closest,
         &state.ember_session_dht_contacts,

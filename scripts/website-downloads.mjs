@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { describeInstallers } from "./ed2k-links.mjs";
+import { INSTALLERS, describeInstallers, ed2kLink, releaseDownloadUrl } from "./ed2k-links.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REPOSITORY = "untaimed18/Ember-P2P";
@@ -124,18 +124,79 @@ export function replaceBetween(html, name, content) {
   return `${html.slice(0, from + start.length)}\n${content}\n${indent}${html.slice(to)}`;
 }
 
-export function updateWebsite(html, downloads) {
-  if (!/^\d+\.\d+\.\d+$/.test(downloads.version ?? "")) {
-    throw new Error(`not a release version: ${downloads.version}`);
+const hex = (length) => new RegExp(`^[0-9a-f]{${length}}$`, "i");
+
+/**
+ * `downloads` as the page may use it. The list is a release asset with no
+ * signature of its own, so it is held to what it can only be: the release's
+ * own files, named for it, with hashes and sizes of the right form. Every
+ * URL and eD2K link on the page is built again from those, never taken as
+ * written, and labels are the page's own.
+ */
+export function checkedDownloads(downloads) {
+  const version = downloads?.version;
+  if (!/^\d+\.\d+\.\d+$/.test(version ?? "")) throw new Error(`not a release version: ${version}`);
+  const tag = `v${version}`;
+  if (downloads.tag !== tag) throw new Error(`the downloads list is for ${downloads.tag}, not ${tag}`);
+  const ownName = new RegExp(`^Ember_${version.replaceAll(".", "\\.")}[._][A-Za-z0-9_-][A-Za-z0-9._-]*$`);
+  const file = (entry, what) => {
+    const { name, size, sha256, ed2k, aich } = entry ?? {};
+    if (typeof name !== "string" || !ownName.test(name) || name.includes("..")) {
+      throw new Error(`${what}: not a file of Ember ${version}: ${JSON.stringify(name)}`);
+    }
+    if (!Number.isSafeInteger(size) || size <= 0) throw new Error(`${what}: not a size: ${JSON.stringify(size)}`);
+    if (!hex(64).test(sha256 ?? "")) throw new Error(`${what}: not a SHA-256: ${JSON.stringify(sha256)}`);
+    if (!hex(32).test(ed2k ?? "")) throw new Error(`${what}: not an eD2K hash: ${JSON.stringify(ed2k)}`);
+    if (aich != null && !hex(40).test(aich)) throw new Error(`${what}: not an AICH hash: ${JSON.stringify(aich)}`);
+    const url = releaseDownloadUrl(REPOSITORY, tag, name);
+    return {
+      name,
+      size,
+      sha256: sha256.toLowerCase(),
+      url,
+      link: ed2kLink({ name, size, ed2k, aich: aich ?? undefined, webSources: [url] }),
+    };
+  };
+  const labels = new Map(INSTALLERS.map((installer) => [installer.kind, installer.label]));
+  const installers = (Array.isArray(downloads.installers) ? downloads.installers : []).map((entry, index) => {
+    const label = labels.get(entry?.kind);
+    if (!label) throw new Error(`installer ${index}: an unknown or repeated kind: ${JSON.stringify(entry?.kind)}`);
+    labels.delete(entry.kind);
+    return { kind: entry.kind, label, ...file(entry, entry.kind) };
+  });
+  if (!installers.length) throw new Error("the release lists no installers");
+  return {
+    version,
+    tag,
+    installers,
+    collection: downloads.collection ? file(downloads.collection, "collection") : undefined,
+  };
+}
+
+/** The version the page's download section offers now, if it names one. */
+export function offeredVersion(html) {
+  return html.match(/<h2>Download Ember (\d+\.\d+\.\d+)<\/h2>/)?.[1] ?? null;
+}
+
+/** Whether `version` comes before `than`, both `major.minor.patch`. */
+export function isOlder(version, than) {
+  const parts = (text) => text.split(".").map(Number);
+  const [a, b] = [parts(version), parts(than)];
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i];
   }
-  if (!html.includes(`id="${releaseAnchor(downloads.version)}"`)) {
+  return false;
+}
+
+export function updateWebsite(html, downloads) {
+  const checked = checkedDownloads(downloads);
+  if (!html.includes(`id="${releaseAnchor(checked.version)}"`)) {
     throw new Error(
-      `docs/index.html has no release notes for ${downloads.version} (id="${releaseAnchor(downloads.version)}"); write them first`,
+      `docs/index.html has no release notes for ${checked.version} (id="${releaseAnchor(checked.version)}"); write them first`,
     );
   }
-  if (!downloads.installers?.length) throw new Error("the release lists no installers");
-  const withDownloads = replaceBetween(html, "downloads", renderDownloads(downloads));
-  return replaceBetween(withDownloads, "release-notice", renderNotice(downloads.version));
+  const withDownloads = replaceBetween(html, "downloads", renderDownloads(checked));
+  return replaceBetween(withDownloads, "release-notice", renderNotice(checked.version));
 }
 
 function downloadsFromRelease(tag) {
@@ -154,9 +215,21 @@ function downloadsFromRelease(tag) {
 }
 
 function main() {
-  const [tag, flag, assets] = process.argv.slice(2);
-  if (!/^v\d+\.\d+\.\d+$/.test(tag ?? "") || (flag !== undefined && (flag !== "--assets" || !assets))) {
-    throw new Error("usage: node scripts/website-downloads.mjs vX.Y.Z [--assets <dir>]");
+  const [tag, ...rest] = process.argv.slice(2);
+  const allowOlder = rest.includes("--allow-older");
+  const options = rest.filter((arg) => arg !== "--allow-older");
+  const assets = options[0] === "--assets" ? options[1] : undefined;
+  if (!/^v\d+\.\d+\.\d+$/.test(tag ?? "") || (options.length > 0 && (options.length !== 2 || !assets))) {
+    throw new Error("usage: node scripts/website-downloads.mjs vX.Y.Z [--assets <dir>] [--allow-older]");
+  }
+  const indexPath = join(root, "docs", "index.html");
+  const html = readFileSync(indexPath, "utf8");
+  // Republishing an older release must not take the site back to it; a
+  // deliberate rollback says so.
+  const offered = offeredVersion(html);
+  if (offered && isOlder(tag.slice(1), offered) && !allowOlder) {
+    console.log(`docs/index.html offers Ember ${offered}, newer than ${tag}; it stays as it is`);
+    return;
   }
   const downloads = assets
     ? {
@@ -165,8 +238,7 @@ function main() {
         installers: describeInstallers({ bundleDirectories: [resolve(assets)], repository: REPOSITORY, tag }),
       }
     : downloadsFromRelease(tag);
-  const indexPath = join(root, "docs", "index.html");
-  writeFileSync(indexPath, updateWebsite(readFileSync(indexPath, "utf8"), downloads));
+  writeFileSync(indexPath, updateWebsite(html, downloads));
   console.log(`docs/index.html now offers Ember ${downloads.version}`);
 }
 

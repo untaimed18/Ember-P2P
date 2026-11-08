@@ -2821,6 +2821,7 @@ pub(super) fn retract_ember_publish(
         }
         state.ember_keyword_retry_keys.remove(file_hash);
         state.ember_keyword_retries_spent.remove(file_hash);
+        state.ember_publish_refusals.retain(|reference, _| reference.file_hash != *file_hash);
         state.ember_published_sources.remove(file_hash);
         state.ember_source_publish_at.remove(file_hash);
         state.ember_source_publish_unix.remove(file_hash);
@@ -4001,19 +4002,30 @@ pub(super) fn ember_keyword_within_cap(
     cap.get(key).is_none_or(|allowed| allowed.contains(file))
 }
 
-/// The words of a file to publish this round: those its pending partial retry
-/// is for, when it has one, or else all of them. A retry whose keys the name no
-/// longer yields (renamed meanwhile) sends the whole set, as a new name needs.
-pub(super) fn ember_keywords_to_send(words: Vec<String>, retry: Option<&HashSet<[u8; 16]>>) -> Vec<String> {
+/// The words of a file to publish this round, of those `within_cap` lets it
+/// publish under: the ones its pending partial retry is for, when it has one,
+/// or else all of them. Also whether that retry is moot and should go: none
+/// of its keys is one the name still yields (renamed meanwhile) under the
+/// cap, so the whole set goes, as a new name or a rebuilt cap needs. A retry
+/// kept that way would hold the file to words it can never send again.
+pub(super) fn ember_keywords_to_send(
+    words: Vec<String>,
+    retry: Option<&HashSet<[u8; 16]>>,
+    within_cap: impl Fn(&[u8; 16]) -> bool,
+) -> (Vec<String>, bool) {
+    let words: Vec<String> = words
+        .into_iter()
+        .filter(|word| within_cap(&ember::dht::search::keyword_hash(word)))
+        .collect();
     let Some(retry) = retry else {
-        return words;
+        return (words, false);
     };
     let only: Vec<String> = words
         .iter()
         .filter(|word| retry.contains(&ember::dht::search::keyword_hash(word)))
         .cloned()
         .collect();
-    if only.is_empty() { words } else { only }
+    if only.is_empty() { (words, true) } else { (only, false) }
 }
 
 /// Publish Ember DHT *keyword* records for shared files (slice 8) so a
@@ -4121,10 +4133,11 @@ pub(super) async fn maybe_publish_ember_keywords(
             ember_keywords_to_send(
                 ember::dht::search::ember_file_keywords(&signed_name),
                 retry_keys.get(&hash),
+                |key| ember_keyword_within_cap(&cap, &hash, key),
             )
+            .0
             .iter()
             .map(|word| ember::dht::search::keyword_hash(word))
-            .filter(|key| ember_keyword_within_cap(&cap, &hash, key))
             .collect()
         };
         let pick = ember_publish_pick(
@@ -4229,10 +4242,7 @@ pub(super) async fn maybe_publish_ember_keywords(
         // the record signs it, so a word cut off to fit is not a key the
         // record's own name cannot vouch for.
         let signed_name = ember::dht::publish::keyword_record_signed_name(&file_name, media.as_ref());
-        let words = ember_keywords_to_send(
-            ember::dht::search::ember_file_keywords(&signed_name),
-            state.ember_keyword_retry_keys.get(&file_hash),
-        );
+        let words = ember::dht::search::ember_file_keywords(&signed_name);
         if words.is_empty() {
             // Nothing to publish for this name, ever. Mark it done so it does
             // not get re-selected every tick and starve the rest of the
@@ -4240,16 +4250,14 @@ pub(super) async fn maybe_publish_ember_keywords(
             files_with_no_keywords.push(file_hash);
             continue;
         }
-        let keywords: Vec<String> = words
-            .into_iter()
-            .filter(|word| {
-                ember_keyword_within_cap(
-                    &state.ember_keyword_cap,
-                    &file_hash,
-                    &ember::dht::search::keyword_hash(word),
-                )
-            })
-            .collect();
+        let (keywords, retry_moot) = ember_keywords_to_send(
+            words,
+            state.ember_keyword_retry_keys.get(&file_hash),
+            |key| ember_keyword_within_cap(&state.ember_keyword_cap, &file_hash, key),
+        );
+        if retry_moot {
+            state.ember_keyword_retry_keys.remove(&file_hash);
+        }
         if keywords.is_empty() {
             // Every word it has is held by closer files. That changes only with
             // the library, so it is looked at again when the allowance is next

@@ -243,6 +243,9 @@ export interface CategoryChanges {
   error: string | null;
   /** Finished downloads whose file was moved. */
   moved: number;
+  /** The folder below Downloads they all went to, `/`-separated, when it is
+   *  one: below the category's own when they came from a collection. */
+  moved_into: string | null;
   /** A coded error for each finished download whose file stayed where it
    *  was; its category is changed regardless. */
   move_failed: string[];

@@ -58,23 +58,14 @@ jobs:
         with:
           node-version: 24
 
-      # Republishing an older release must not take the site back to it.
-      - name: Check this is the newest release
-        id: newest
-        run: |
-          newest=$(gh release view --json tagName --jq .tagName)
-          if [ "$newest" = "$TAG" ]; then
-            echo "update=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "$TAG is not the newest release ($newest); the website stays as it is"
-          fi
-
+      # Republishing an older release must not take the site back to it: the
+      # script compares versions with the one the page offers and leaves an
+      # older one alone. GitHub's "latest" flag cannot tell, since publishing
+      # any release sets it.
       - name: Write the download table and notice
-        if: steps.newest.outputs.update == 'true'
         run: node scripts/website-downloads.mjs "$TAG"
 
       - name: Commit the website to main
-        if: steps.newest.outputs.update == 'true'
         run: |
           if git diff --quiet -- docs/index.html; then
             echo "docs/index.html already offers $TAG"

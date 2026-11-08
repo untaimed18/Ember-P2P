@@ -402,7 +402,13 @@ export function collectInstallers(directories) {
     if (found.length !== 1) {
       throw new Error(`expected exactly one ${installer.kind} bundle, found ${found.length}`);
     }
-    return { ...installer, path: found[0], name: basename(found[0]) };
+    const name = basename(found[0]);
+    // What a browser carries in a clickable `ed2k://` link and Ember reads
+    // back unchanged: a `|` comes back as a separator, `[` and `]` are refused.
+    if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+      throw new Error(`${installer.kind} bundle ${name} has characters an eD2K link cannot carry`);
+    }
+    return { ...installer, path: found[0], name };
   });
 }
 

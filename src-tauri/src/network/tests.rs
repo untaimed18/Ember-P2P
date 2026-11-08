@@ -2849,15 +2849,27 @@ fn sources_and_keywords_share_a_tick() {
 }
 
 /// A partial retry re-sends the words it is for, unless the name no longer
-/// has them.
+/// has them or the keyword cap has since taken every one of them away, when
+/// the retry goes and the whole set the cap allows is sent.
 #[test]
 fn a_partial_retry_sends_only_its_lost_words() {
+    let any = |_: &[u8; 16]| true;
     let words = vec!["ubuntu".to_string(), "desktop".to_string(), "flac".to_string()];
     let lost = HashSet::from([ember::dht::search::keyword_hash("flac")]);
-    assert_eq!(ember_keywords_to_send(words.clone(), Some(&lost)), ["flac"]);
-    assert_eq!(ember_keywords_to_send(words.clone(), None), words);
+    assert_eq!(ember_keywords_to_send(words.clone(), Some(&lost), any), (vec!["flac".to_string()], false));
+    assert_eq!(ember_keywords_to_send(words.clone(), None, any), (words.clone(), false));
     let renamed = HashSet::from([ember::dht::search::keyword_hash("gone")]);
-    assert_eq!(ember_keywords_to_send(words.clone(), Some(&renamed)), words);
+    assert_eq!(ember_keywords_to_send(words.clone(), Some(&renamed), any), (words.clone(), true));
+
+    // The cap moved "flac" to closer files after it was lost: the file must
+    // not wait on it forever while its other words lapse.
+    let flac = ember::dht::search::keyword_hash("flac");
+    let capped = |key: &[u8; 16]| *key != flac;
+    assert_eq!(
+        ember_keywords_to_send(words.clone(), Some(&lost), capped),
+        (vec!["ubuntu".to_string(), "desktop".to_string()], true)
+    );
+    assert_eq!(ember_keywords_to_send(words, None, |_: &[u8; 16]| false), (Vec::new(), false));
 }
 
 /// The gate reads what the wait rule would do without doing it.
@@ -3040,6 +3052,34 @@ fn a_round_refused_for_good_everywhere_is_deferred_at_once() {
     assert!(!fail_ember_record_pending_with(sched.borrow(), reference, now, false));
     assert_eq!(sched.rounds_failed(reference), 1);
     assert!(!sched.keyword_at.contains_key(&reference.file_hash));
+}
+
+/// A record counts as refused for good only when every storer that failed it
+/// said so: one that timed out, or gave a reason another try could meet, is
+/// enough to try again.
+#[test]
+fn a_record_is_refused_for_good_only_when_every_storer_failing_it_said_so() {
+    let none = || HashSet::new();
+    let mut refusals = HashMap::new();
+    let reference = record_ref(9, 90);
+    note_ember_refusal(&mut refusals, reference, true, none);
+    assert!(refusals[&reference]);
+    note_ember_refusal(&mut refusals, reference, false, none);
+    assert!(!refusals[&reference], "a second storer timed out");
+    note_ember_refusal(&mut refusals, reference, true, none);
+    assert!(!refusals[&reference], "and stays retryable whatever the rest say");
+
+    // Full of entries whose records are long gone: they make room.
+    let mut full: HashMap<EmberRecordRef, bool> = (0..=u8::MAX)
+        .flat_map(|file| (0..32u8).map(move |key| (record_ref(file, key), true)))
+        .take(EMBER_PUBLISH_REFUSALS_MAX)
+        .collect();
+    assert_eq!(full.len(), EMBER_PUBLISH_REFUSALS_MAX);
+    let live = record_ref(0, 0);
+    let fresh = record_ref(9, 200);
+    note_ember_refusal(&mut full, fresh, true, || HashSet::from([live]));
+    assert_eq!(full.len(), 2, "only the record still outstanding is kept beside the new one");
+    assert!(full[&fresh] && full.contains_key(&live));
 }
 
 /// Only the files closest to an over-subscribed keyword keep a slot under it,

@@ -118,11 +118,76 @@ pub fn release_file_name(url: &url::Url, version: &str) -> Option<String> {
     (safe && release_version_of(&name) == Some(version)).then_some(name)
 }
 
+/// Held while release files are written, moved or removed, so turning sharing
+/// off cannot clear the folder in the middle of a write that lands afterwards,
+/// and a write never finds its folder being cleared under it.
+fn files_lock() -> &'static parking_lot::Mutex<()> {
+    static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(Default::default)
+}
+
+/// Make `folder` when it is missing, but never the download folder it sits
+/// in: a share that is offline, or a mount point with nothing mounted, must
+/// not get a fresh tree on whatever disk is under it.
+fn ensure_folder(folder: &Path) -> std::io::Result<()> {
+    match std::fs::create_dir(folder) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && folder.is_dir() => Ok(()),
+        result => result,
+    }
+}
+
+/// [`ensure_folder`], as the shared folders list it: canonical. Blocking.
+pub fn create(folder: &Path) -> std::io::Result<PathBuf> {
+    ensure_folder(folder)?;
+    folder.canonicalize()
+}
+
 /// Keep `bytes`, which the caller has verified, as `name` in `folder`,
-/// replacing whatever was there. Blocking.
-pub fn keep(folder: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::create_dir_all(folder)?;
-    crate::security::atomic_write(&folder.join(name), bytes, false)
+/// replacing whatever was there, if `still_wanted` says so once nothing else
+/// can touch the folder. Whether it was kept. Blocking.
+pub fn keep(folder: &Path, name: &str, bytes: &[u8], still_wanted: impl FnOnce() -> bool) -> std::io::Result<bool> {
+    let _files = files_lock().lock();
+    if !still_wanted() {
+        return Ok(false);
+    }
+    ensure_folder(folder)?;
+    crate::security::atomic_write(&folder.join(name), bytes, false)?;
+    Ok(true)
+}
+
+/// Remove `name` from `folder`, if it is there. Whether it was. Blocking.
+pub fn remove(folder: &Path, name: &str) -> bool {
+    let _files = files_lock().lock();
+    std::fs::remove_file(folder.join(name)).is_ok()
+}
+
+/// What `atomic_write` leaves of a release file whose write never finished:
+/// `.<name>.<pid>.<random>.tmp`.
+fn is_leftover_write(name: &str) -> bool {
+    name.strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(release_version_of)
+        .is_some()
+}
+
+/// Each release file and leftover write in `folder`, with whether it is a
+/// leftover.
+fn release_entries(folder: &Path) -> Vec<(std::fs::DirEntry, String, bool)> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            if is_leftover_write(&name) {
+                Some((entry, name, true))
+            } else {
+                release_version_of(&name).is_some().then_some((entry, name, false))
+            }
+        })
+        .collect()
 }
 
 /// What a file looked like when its content was last checked.
@@ -170,40 +235,80 @@ pub fn holds(path: &Path, size: u64, sha256: &str) -> bool {
     std::io::copy(&mut file, &mut hasher).is_ok() && hex::encode(hasher.finalize()) == sha256
 }
 
-/// Remove every release file in `folder` that is not of `keep_version`.
-/// Returns how many went. Blocking.
+/// Remove every release file in `folder` that is not of `keep_version`, and
+/// every leftover write. Returns how many went. Blocking.
 pub fn prune(folder: &Path, keep_version: &str) -> usize {
-    let Ok(entries) = std::fs::read_dir(folder) else {
-        return 0;
-    };
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let is_file = entry.file_type().is_ok_and(|kind| kind.is_file());
-        if is_file && release_version_of(name).is_some_and(|version| version != keep_version)
-            && std::fs::remove_file(entry.path()).is_ok()
-        {
-            removed += 1;
-        }
-    }
-    removed
+    let _files = files_lock().lock();
+    release_entries(folder)
+        .into_iter()
+        .filter(|(_, name, leftover)| *leftover || release_version_of(name) != Some(keep_version))
+        .filter(|(entry, _, _)| std::fs::remove_file(entry.path()).is_ok())
+        .count()
 }
 
-/// Remove every release file in `folder`, and the folder if that leaves it
-/// empty: what turning both settings off undoes. Blocking.
+/// Remove every release file in `folder` but the installers whose names end
+/// in `installer_suffix`, and every leftover write: what is left when only
+/// the installer this install updated with is to be shared. Blocking.
+pub fn retain_installers(folder: &Path, installer_suffix: Option<&str>) -> usize {
+    let _files = files_lock().lock();
+    release_entries(folder)
+        .into_iter()
+        .filter(|(_, name, leftover)| *leftover || !installer_suffix.is_some_and(|suffix| name.ends_with(suffix)))
+        .filter(|(entry, _, _)| std::fs::remove_file(entry.path()).is_ok())
+        .count()
+}
+
+/// The end of the name of the installer this build updates with, as the
+/// release workflow names them: what [`retain_installers`] keeps.
+pub fn own_installer_suffix() -> Option<&'static str> {
+    use tauri::utils::config::BundleType;
+    match tauri::utils::platform::bundle_type()? {
+        BundleType::Nsis => Some("-setup.exe"),
+        BundleType::Msi => Some(".msi"),
+        BundleType::Deb => Some(".deb"),
+        BundleType::Rpm => Some(".rpm"),
+        BundleType::AppImage => Some(".AppImage"),
+        _ => None,
+    }
+}
+
+/// Remove every release file and leftover write in `folder`, and the folder
+/// if that leaves it empty: what turning both settings off undoes. Blocking.
 pub fn clear(folder: &Path) {
-    if let Ok(entries) = std::fs::read_dir(folder) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_str().and_then(release_version_of).is_some()
-                && entry.file_type().is_ok_and(|kind| kind.is_file())
-            {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
+    let _files = files_lock().lock();
+    for (entry, _, _) in release_entries(folder) {
+        let _ = std::fs::remove_file(entry.path());
     }
     let _ = std::fs::remove_dir(folder);
+}
+
+/// Carry the release files in `from` over to `to`, where the folder has moved
+/// with the download folder, then [`clear`] what is left of `from`. A file
+/// `to` already has is not replaced. Returns how many moved. Blocking.
+pub fn migrate(from: &Path, to: &Path) -> usize {
+    // Two spellings of one folder (a link in the download folder's path):
+    // clearing `from` would delete what `to` holds.
+    if from.canonicalize().is_ok_and(|from| to.canonicalize().is_ok_and(|to| to == from)) {
+        return 0;
+    }
+    let moved = {
+        let _files = files_lock().lock();
+        if ensure_folder(to).is_err() {
+            0
+        } else {
+            release_entries(from)
+                .into_iter()
+                .filter(|(_, name, leftover)| !*leftover && !to.join(name).exists())
+                .filter(|(entry, name, _)| {
+                    let target = to.join(name);
+                    std::fs::rename(entry.path(), &target).is_ok()
+                        || (std::fs::copy(entry.path(), &target).is_ok() && std::fs::remove_file(entry.path()).is_ok())
+                })
+                .count()
+        }
+    };
+    clear(from);
+    moved
 }
 
 /// Keep the installer an update is about to be made with, when the setting
@@ -217,11 +322,13 @@ pub fn keep_installer(url: &url::Url, version: &str, bytes: &[u8]) {
         tracing::debug!("Release sharing: {url} does not name an Ember {version} file; not keeping it");
         return;
     };
-    match keep(&folder, &name, bytes) {
-        Ok(()) => {
+    let still_wanted = || installer_folder().as_deref() == Some(folder.as_path());
+    match keep(&folder, &name, bytes, still_wanted) {
+        Ok(true) => {
             let pruned = prune(&folder, version);
             tracing::info!("Release sharing: kept {name} to share (removed {pruned} older)");
         }
+        Ok(false) => {}
         Err(error) => tracing::warn!("Release sharing: could not keep {name}: {error}"),
     }
 }
@@ -258,13 +365,18 @@ mod tests {
     #[test]
     fn only_release_files_of_other_versions_are_pruned() {
         let dir = std::env::temp_dir().join(format!("ember-release-share-{}-{}", std::process::id(), rand::random::<u64>()));
-        keep(&dir, "Ember_1.7.6_amd64.deb", b"old").unwrap();
-        keep(&dir, "Ember_1.8.0_amd64.deb", b"new").unwrap();
+        assert!(keep(&dir, "Ember_1.7.6_amd64.deb", b"old", || true).unwrap());
+        assert!(keep(&dir, "Ember_1.8.0_amd64.deb", b"new", || true).unwrap());
+        assert!(!keep(&dir, "Ember_1.8.0_x64-setup.exe", b"late", || false).unwrap(), "turned off meanwhile");
+        assert!(!dir.join("Ember_1.8.0_x64-setup.exe").exists());
         std::fs::write(dir.join("notes.txt"), b"the user's").unwrap();
         std::fs::write(dir.join("Ember_backup.zip"), b"not a release file").unwrap();
+        std::fs::write(dir.join(".Ember_1.8.0_amd64.AppImage.4242.00ff.tmp"), b"a write that never finished").unwrap();
+        std::fs::write(dir.join(".notes.txt.4242.00ff.tmp"), b"the user's own").unwrap();
         std::fs::create_dir_all(dir.join("Ember_1.7.6_folder")).unwrap();
 
-        assert_eq!(prune(&dir, "1.8.0"), 1);
+        assert_eq!(prune(&dir, "1.8.0"), 2, "the older release and the leftover write");
+        assert!(dir.join(".notes.txt.4242.00ff.tmp").exists());
         assert!(!dir.join("Ember_1.7.6_amd64.deb").exists());
         assert!(dir.join("Ember_1.8.0_amd64.deb").exists());
         assert!(dir.join("notes.txt").exists() && dir.join("Ember_backup.zip").exists());
@@ -281,13 +393,58 @@ mod tests {
         note_checked(&deb, &sha(b"new"));
         assert!(checked_unchanged(&deb, &sha(b"new")));
         assert!(!checked_unchanged(&deb, &sha(b"other")), "held to other bytes, it is checked again");
-        keep(&dir, "Ember_1.8.0_amd64.deb", b"replaced").unwrap();
+        keep(&dir, "Ember_1.8.0_amd64.deb", b"replaced", || true).unwrap();
         assert_eq!(std::fs::read(&deb).unwrap(), b"replaced");
         assert!(!checked_unchanged(&deb, &sha(b"new")), "a change is checked again");
 
         clear(&dir);
         assert!(!dir.join("Ember_1.8.0_amd64.deb").exists());
         assert!(dir.join("notes.txt").exists(), "a folder with the user's files in it stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_folder_is_never_made_where_its_download_folder_is_missing() {
+        let base = std::env::temp_dir().join(format!("ember-release-unmounted-{}-{}", std::process::id(), rand::random::<u64>()));
+        let folder = base.join("Downloads").join(FOLDER_NAME);
+        assert!(create(&folder).is_err());
+        assert!(keep(&folder, "Ember_1.8.0_amd64.deb", b"x", || true).is_err());
+        assert!(!base.exists(), "nothing made on the disk under an empty mount point");
+        std::fs::create_dir_all(base.join("Downloads")).unwrap();
+        assert!(create(&folder).unwrap().is_dir());
+        assert!(create(&folder).is_ok(), "already there");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_moved_folder_takes_its_release_files_along() {
+        let base = std::env::temp_dir().join(format!("ember-release-move-{}-{}", std::process::id(), rand::random::<u64>()));
+        let (from, to) = (base.join("old"), base.join("new"));
+        std::fs::create_dir_all(&base).unwrap();
+        keep(&from, "Ember_1.8.0_amd64.deb", b"kept", || true).unwrap();
+        keep(&from, "Ember_1.8.0.emulecollection", b"old copy", || true).unwrap();
+        keep(&to, "Ember_1.8.0.emulecollection", b"new copy", || true).unwrap();
+        std::fs::write(from.join(".Ember_1.8.0_x64-setup.exe.1.2.tmp"), b"unfinished").unwrap();
+
+        assert_eq!(migrate(&from, &to), 1);
+        assert_eq!(std::fs::read(to.join("Ember_1.8.0_amd64.deb")).unwrap(), b"kept");
+        assert_eq!(std::fs::read(to.join("Ember_1.8.0.emulecollection")).unwrap(), b"new copy", "not replaced");
+        assert!(!to.join(".Ember_1.8.0_x64-setup.exe.1.2.tmp").exists());
+        assert!(!from.exists(), "the old folder goes once it is empty");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn only_the_own_installer_stays_when_seeding_stops() {
+        let dir = std::env::temp_dir().join(format!("ember-release-retain-{}-{}", std::process::id(), rand::random::<u64>()));
+        for name in ["Ember_1.8.0_x64-setup.exe", "Ember_1.8.0_x64_en-US.msi", "Ember_1.8.0_amd64.deb", "Ember_1.8.0.emulecollection"] {
+            keep(&dir, name, b"x", || true).unwrap();
+        }
+        std::fs::write(dir.join("readme.txt"), b"the user's").unwrap();
+        assert_eq!(retain_installers(&dir, Some("-setup.exe")), 3);
+        assert!(dir.join("Ember_1.8.0_x64-setup.exe").exists());
+        assert!(dir.join("readme.txt").exists());
+        assert_eq!(retain_installers(&dir, None), 1, "a build that updates with none of them keeps none");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

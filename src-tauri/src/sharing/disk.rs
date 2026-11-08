@@ -131,6 +131,12 @@ mod background {
         done.unwrap_or_else(|| (work.take().expect("a failed spawn never ran the hash"))())
     }
 
+    /// The disk half is honoured only by the BFQ scheduler, which most
+    /// desktop distributions use for spinning disks; `none`, the usual NVMe
+    /// default, and mq-deadline ignore a best-effort level, so there the
+    /// lower CPU priority is what gives way, which is the part a fast disk
+    /// needs. The idle class would bind on more schedulers, but can starve a
+    /// first scan outright on a busy machine.
     #[cfg(target_os = "linux")]
     fn lower_this_thread() {
         const IOPRIO_WHO_PROCESS: libc::c_long = 1;

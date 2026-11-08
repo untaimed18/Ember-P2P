@@ -60,13 +60,14 @@ fn published_upload_count(bytes: u64) -> u64 {
     bytes - bytes % PUBLISHED_UPLOAD_STEP
 }
 
-/// Write the day's upload count if it moved since the last write.
-pub async fn save_upload_quota(app: &tauri::AppHandle, state: &AppState) {
+/// Write the day's upload count if it moved since the last write: by a step
+/// at least while Ember runs, by anything at all when `leaving`.
+pub async fn save_upload_quota(app: &tauri::AppHandle, state: &AppState, leaving: bool) {
     let session_total = state.bandwidth_limiter.total_uploaded();
     let pending = {
         let mut quota = state.upload_quota.lock();
         quota.observe(&quota::local_today(), session_total);
-        quota.pending_save(session_total)
+        quota.pending_save(session_total, if leaving { 0 } else { quota::SAVE_STEP })
     };
     let Some(bytes) = pending else {
         return;
@@ -196,7 +197,7 @@ async fn run(app: tauri::AppHandle) {
             quota_held = quota_cap.is_some();
         }
         if ticks.is_multiple_of(QUOTA_SAVE_EVERY) {
-            save_upload_quota(&app, &state).await;
+            save_upload_quota(&app, &state, false).await;
         }
 
         // Only on change. `set_configured_limits` is idempotent, but it also

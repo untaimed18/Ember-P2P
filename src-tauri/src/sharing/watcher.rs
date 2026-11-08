@@ -597,18 +597,26 @@ impl SharedFoldersWatcher {
         self.enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Follow Settings > Library, "Watch shared folders for changes".
-    /// Blocking, like [`Self::sync_paths`]: it adds or drops every OS watch.
+    /// Follow Settings > Library, "Watch shared folders for changes": take the
+    /// setting now, and say whether [`Self::apply_enabled`] has work to do.
+    /// Not blocking, so it can be called in order with the saves that change
+    /// it, whatever order the blocking work after them runs in.
+    pub fn note_enabled(&self, enabled: bool) -> bool {
+        self.enabled.swap(enabled, std::sync::atomic::Ordering::Relaxed) != enabled
+    }
+
+    /// Add or drop every OS watch to match the setting as it stands when this
+    /// runs. Blocking, like [`Self::sync_paths`].
     ///
     /// Turned back on, the roots are scanned once, as at startup: a watch
     /// reports changes from now on, and whatever changed while it was off
-    /// would otherwise wait for the next reload.
-    pub fn set_enabled(&self, enabled: bool) {
-        let was = self
-            .enabled
-            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
-        if was == enabled {
-            return;
+    /// would otherwise wait for the next reload. Folders once refused for the
+    /// system's watch limit are tried again, since turning watching off and
+    /// on is what the advice for raising that limit ends with.
+    pub fn apply_enabled(&self) {
+        let enabled = self.is_enabled();
+        if enabled {
+            self.over_limit.lock().clear();
         }
         let desired = self.desired.lock().clone();
         self.apply_watches(&desired);

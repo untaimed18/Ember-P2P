@@ -602,9 +602,9 @@
         });
       }
       if (newCollKeepFolders) {
-        const folders = collectionFolders(paths);
+        const entryFolders = collectionFolders(paths, folders, IS_WINDOWS);
         collFiles.forEach((file, i) => {
-          if (folders[i]) file.folder = folders[i];
+          if (entryFolders[i]) file.folder = entryFolders[i];
         });
       }
       const msg = await createCollectionWithDialog(

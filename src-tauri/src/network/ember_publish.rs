@@ -502,6 +502,16 @@ impl EmberBatchPublisher {
                 .any(|(_, recs)| recs.iter().any(|q| q.reference == reference))
     }
 
+    /// Every record still in a queued or in-flight batch: what
+    /// [`Self::record_still_outstanding`] asks of one, for many at once.
+    pub(crate) fn outstanding_records(&self) -> std::collections::HashSet<EmberRecordRef> {
+        self.in_flight
+            .values()
+            .flat_map(|b| b.live_records().map(|(_, r)| r))
+            .chain(self.queued.values().flat_map(|(_, recs)| recs.iter().map(|q| q.reference)))
+            .collect()
+    }
+
     /// Put records the flush could not send back under their destination,
     /// newest work behind them, returning the ones that had to be dropped because
     /// the destination is already holding its limit.

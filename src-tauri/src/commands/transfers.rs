@@ -3602,6 +3602,9 @@ pub struct CategoryChanges {
     error: Option<String>,
     /// Finished downloads whose file was moved.
     moved: u32,
+    /// The folder below Downloads they all went to, `/`-separated, when it is
+    /// one: below the category's own when they came from a collection.
+    moved_into: Option<String>,
     /// One coded error per finished download whose file stayed where it was.
     /// Its category is changed regardless.
     move_failed: Vec<String>,
@@ -3732,7 +3735,7 @@ pub async fn set_transfers_category(
                     .cloned()
                     .collect();
                 let result = move_if_still_the_download(&item, &roots, &place);
-                (item, result)
+                (item, place, result)
             })
             .collect::<Vec<_>>()
     })
@@ -3740,11 +3743,13 @@ pub async fn set_transfers_category(
     .map_err(|e| coded_ctx("transfers_category_task_failed", "Category update failed", e))?;
 
     let mut moves = Vec::new();
+    let mut places = std::collections::BTreeSet::new();
     {
         let mut manager = state.transfer_manager.write().await;
-        for (item, result) in outcome {
+        for (item, place, result) in outcome {
             match result {
                 Ok(Some(to)) => {
+                    places.insert(place.join("/"));
                     manager.set_completed_path(&item.id, to.to_string_lossy().into_owned());
                     tracing::info!("Moved finished download {} to {}", item.id, to.display());
                     moves.push(crate::commands::sharing::FileMove {
@@ -3765,6 +3770,9 @@ pub async fn set_transfers_category(
         }
     }
     changes.moved = u32::try_from(moves.len()).unwrap_or(u32::MAX);
+    if places.len() == 1 {
+        changes.moved_into = places.pop_first();
+    }
     changes
         .move_warnings
         .extend(crate::commands::sharing::relocate_library_files(&app, &state, &moves).await);

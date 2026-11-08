@@ -3295,7 +3295,11 @@
     // The backend sends no event for this; show what it accepted right away.
     if (changes.changed.length > 0) setLocalCategory(new Set(changes.changed), category);
     if (changes.moved > 0) {
-      const folder = categoryDestinationLabel(categorySubdir(category, $appSettings?.download_category_folders ?? {}));
+      const folder = categoryDestinationLabel(
+        changes.moved_into != null
+          ? changes.moved_into.split('/').filter((segment) => segment.length > 0)
+          : categorySubdir(category, $appSettings?.download_category_folders ?? {}),
+      );
       toastSuccess(plural(changes.moved, {
         one: () => m.transfers_category_moved_one({ folder }),
         other: () => m.transfers_category_moved_other({ count: formatNumber(changes.moved), folder }),

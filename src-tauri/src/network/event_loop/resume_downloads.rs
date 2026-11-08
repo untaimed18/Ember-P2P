@@ -585,6 +585,12 @@ pub(in crate::network) async fn resume_incomplete_downloads(
         .filter(|_| part_progress_task.is_none() && part_progress_map.is_none())
     {
         let folders = settings.download_folders();
+        // Before the listing: a download from a collection finishes below its
+        // category's folder, and the folders a completion copy is looked for
+        // in are worked out from these.
+        for transfer in pending.iter() {
+            crate::storage::category_folders::note_category(&transfer.id, &transfer.category);
+        }
         let jobs: Vec<RestoreJob> = pending
             .iter()
             .map(|t| RestoreJob {
