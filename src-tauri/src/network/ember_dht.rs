@@ -439,7 +439,7 @@ pub(super) fn ember_rendezvous_advert_reachable(
 pub(super) const EMBER_REACH_PROBES_PER_TICK: usize = 2;
 
 /// How long before a contact that still has not said is asked again. Builds
-/// before 1.8 never will, so this is what bounds their cost: one `PING` per
+/// before 1.7.7 never will, so this is what bounds their cost: one `PING` per
 /// contact per half hour.
 pub(super) const EMBER_REACH_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 

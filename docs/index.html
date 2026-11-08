@@ -181,6 +181,78 @@
           <p>Every Ember release, newest first. These are the same notes published on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
         </div>
 
+        <article class="release" id="release-1-7-7">
+              <div class="release-header">
+                <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.7" target="_blank" rel="noopener">Ember v1.7.7</a></h3>
+                <time class="release-date" datetime="2026-11-08">November 8, 2026</time>
+              </div>
+              <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.7" target="_blank" rel="noopener"><code>v1.7.7</code></a></p>
+              <div class="release-notes">
+                <p>The Linux AppImage no longer stops at the first emoji on Fedora and other recent distributions, and the Ember network stops flooding small overlays and learns which peers can be reached. Three long-requested features arrive: a daily upload quota, collections that keep their folders, and library hashing that stays out of your way. Every release can now be downloaded over eD2K by anyone who cannot reach GitHub, and update notices show readable release notes.</p>
+
+                <h4>Before you upgrade</h4>
+
+                <ul>
+                  <li><strong>The Ember DHT wire version is unchanged at version 4, and no Channels format changes,</strong> so 1.7.7 shares rooms and the overlay with 1.7.6 and every release back to 1.6. What nodes now say about their own reachability, and why a store was refused, travel in fields older releases already skip</li>
+                  <li><strong>Download All on a collection now puts its files in a folder named after the collection,</strong> inside its category&rsquo;s folder. Untick <em>Into its own folder</em> beside the button for the old behaviour</li>
+                  <li><strong>Hashing shared files now runs at low priority,</strong> so a first scan of a large library takes longer while you use the computer. Turn it off under Settings &gt; Library &gt; Scanning</li>
+                  <li><strong>A collection with folders opens in eMule and older Ember too,</strong> with its files listed without folders</li>
+                  <li><strong>The AppImage is about 10&nbsp;MB larger:</strong> it carries the emoji font described below</li>
+                </ul>
+
+                <h4>What&rsquo;s New</h4>
+
+                <h5>Downloading Ember without GitHub</h5>
+                <ul>
+                  <li><strong>Every release can be downloaded over eD2K.</strong> The website and each release list an <code>ed2k://</code> link for every installer, with its AICH hash and its GitHub download as a web source, and an eMule collection of the installers and the release notes. The download section now lists every file with its size and SHA-256 to check against</li>
+                  <li><strong>Ember can share its own releases.</strong> In Settings &gt; About, <em>Share the installer after each update</em> keeps and shares the installer Ember updated with, and <em>Share every file of each new release</em>, for a computer that stays on, fetches and shares every file of each release as soon as it is out. Both check every file against the release signature first, and keep them in the <code>Ember releases</code> folder inside your download folder</li>
+                </ul>
+
+                <h5>Updates</h5>
+                <ul>
+                  <li><strong>Release notes are readable in the update notice,</strong> laid out with headings and lists instead of raw text, with links to the full notes and the user guide. After a silent update, <em>See what&rsquo;s new</em> opens that version&rsquo;s notes</li>
+                  <li><strong>Settings &gt; About links to the user guide,</strong> and to the notes of an update that is waiting</li>
+                </ul>
+
+                <h5>Bandwidth</h5>
+                <ul>
+                  <li><strong>A daily upload quota,</strong> under Settings &gt; Bandwidth: once the day&rsquo;s uploads pass the amount you set, uploads are held to a lower speed until midnight. For metered connections and providers that throttle heavy uploaders. Settings shows today&rsquo;s count, which survives a restart</li>
+                </ul>
+
+                <h5>Library and collections</h5>
+                <ul>
+                  <li><strong>Collections keep their folders.</strong> Creating one records each file&rsquo;s folder, so a series keeps its <em>Season 1</em> and <em>Season 2</em>, and downloading it rebuilds them. The collection window shows each file&rsquo;s folder</li>
+                  <li><strong>Settings &gt; Library &gt; Scanning</strong> can stop watching shared folders for changes, so the Library updates only when you reload it, and hashing at low priority leaves the processor and the disk to the programs you are using</li>
+                </ul>
+
+                <h5>Transfers</h5>
+                <ul>
+                  <li><strong>An Uncategorized filter</strong> beside All lists the downloads that have no category yet</li>
+                  <li><strong>The built-in categories</strong> say in the Categories window that they can have their own folder, and a category without one offers a one-click folder named after it</li>
+                </ul>
+
+                <h5>Ember network</h5>
+                <ul>
+                  <li><strong>Nodes say whether others can reach them,</strong> so peers that cannot be reached are no longer handed to others as contacts, and silent contacts are asked now and then</li>
+                  <li><strong>Storers say why they refused a record,</strong> and a publisher stops retrying one every storer will refuse again. Publishers stay within the 150 records a storer keeps per keyword, and friend lookups back off while they find nobody new</li>
+                  <li><strong>The Ember page shows more:</strong> keyword search times apart from background lookups, refused stores by reason, contacts by reachability, and a republish backlog marked <em>Paused (small network)</em> rather than a misleading zero</li>
+                </ul>
+
+                <h4>What&rsquo;s Fixed</h4>
+
+                <ul>
+                  <li><strong>Linux:</strong> the AppImage&rsquo;s window no longer stops at the first emoji on Fedora 40 and later, Debian 13, Arch and other distributions with a recent FreeType, which made rooms with older messages unusable. Emoji stay in colour</li>
+                  <li><strong>Ember network:</strong> on an overlay of about twenty nodes, record replication no longer switches on and off dozens of times a day, each time re-sending tens of thousands of records to peers that already held them</li>
+                  <li><strong>Linux updates:</strong> an AppImage update checks that the system can run the new build before installing it, and says so when it cannot</li>
+                </ul>
+
+                <p class="full-changelog">
+                  <strong>Full Changelog</strong>
+                  <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.7.6...v1.7.7" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.7.6...v1.7.7</a>
+                </p>
+              </div>
+        </article>
+
         <article class="release" id="release-1-7-6">
               <div class="release-header">
                 <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.6" target="_blank" rel="noopener">Ember v1.7.6</a></h3>

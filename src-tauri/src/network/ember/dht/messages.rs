@@ -2906,8 +2906,8 @@ mod tests {
         }
     }
 
-    /// What a 1.7 peer reads from a 1.8 frame: its range decoder stops at the
-    /// range tag, so the claim after it changes nothing it parses.
+    /// What a 1.7.6 peer reads from a 1.7.7 frame: its range decoder stops at
+    /// the range tag, so the claim after it changes nothing it parses.
     #[test]
     fn the_reachability_claim_is_invisible_to_a_range_only_reader() {
         let mut buf = Vec::new();
@@ -2918,7 +2918,7 @@ mod tests {
     }
 
     /// Refusal reasons survive the round trip, and the bitmap in front of them
-    /// is byte for byte what a 1.7 publisher reads.
+    /// is byte for byte what a 1.7.6 publisher reads.
     #[test]
     fn a_store_batch_ack_carries_reasons_behind_the_bitmap() {
         let (sk, id) = test_keypair();

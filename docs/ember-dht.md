@@ -191,7 +191,7 @@ standing gap is now narrower and different: not "nothing advertises a range" but
 "a shape change still partitions every peer running a build older than this
 one", which the advertiser count is what measures.
 
-**1.8.0 put the second tag in the block, as it was built to allow.** After the
+**1.7.7 put the second tag in the block, as it was built to allow.** After the
 range, `UDP_REACH_TAG` (`0x02`) carries the sender's word on its own UDP port:
 open or firewalled, from its own firewall check (`ember_advertised_reach`), and
 nothing while that check has not concluded. A build that knows only the range
@@ -480,9 +480,9 @@ filter there would let a stranger enumerate a library far past the single capped
 packet the setting was reasoned about, which is a genuine exposure change and a
 separate decision.
 
-### 7. Deferred from the 1.8.0 overlay work
+### 7. Deferred from the 1.7.7 overlay work
 
-1.8.0 came out of a 12-hour field run on an overlay of about twenty nodes
+1.7.7 came out of a 12-hour field run on an overlay of about twenty nodes
 (1.7.6, 2026-11-04). It shipped the selective-storer switch, the joining fix,
 nodes stating their own UDP reachability, refusal reasons on `STORE_BATCH_ACK`,
 the publisher-side cap of 150 records per keyword, friend-ask backoff and the
@@ -515,7 +515,7 @@ many firewalled Ember nodes exist was therefore unknown, and this is a large
 NAT feature that cannot be tested from one machine.
 
 *When.* `ember_dht_contacts_reach_firewalled` (Ember page, "Contacts reporting
-firewalled") against the open and silent counts, once most contacts run 1.8.
+firewalled") against the open and silent counts, once most contacts run 1.7.7 or later.
 A firewalled share of verified contacts in the tens of percent is the case for
 building it.
 
@@ -571,7 +571,7 @@ end. The 1.7.6 run averaged 20 seconds a lookup, against 9.7 seconds on 1.7.3.
 
 *Why it waited.* The 20 seconds mixes the user's searches with background
 lookups, and changing walk termination without knowing which is slow risks
-recall for nothing. 1.8.0 added "Keyword search avg. time"
+recall for nothing. 1.7.7 added "Keyword search avg. time"
 (`ember_dht_keyword_search_outcomes`, `ember_dht_keyword_search_elapsed_ms_sum`)
 to tell them apart.
 
@@ -596,7 +596,7 @@ it ended, would settle it in one run.
 
 **7e. Bring the specification up to date.**
 
-The spec PDF and its HTML source predate the 1.8.0 additive wire changes, so
+The spec PDF and its HTML source predate the 1.7.7 additive wire changes, so
 they need the following, each marked additive as the spec's convention is,
 followed by a rebuild with `scripts/build-ember-dht-spec.sh`:
 
@@ -1226,7 +1226,7 @@ wire additions needed a version bump:
 - `store_attributed` binds the key but not the author or the date — all three are
   now derived from the one signed body rather than trusted from the caller.
 
-**From the 1.7.6 field run (Nov 2026), shipped in 1.8.0** — none of it a version
+**From the 1.7.6 field run (Nov 2026), shipped in 1.7.7** — none of it a version
 bump. What was weighed and held back is item 7.
 
 - Storer replication and the filtered per-publisher shares flipped at exactly

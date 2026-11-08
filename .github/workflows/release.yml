@@ -188,7 +188,7 @@ jobs:
     # with this line. Moving the AppImage to a newer distro raises its glibc
     # floor, and an AppImage rewrites itself in place, so an install on an
     # older system must never be handed it: publish that build under
-    # `linux-x86_64-appimage-glibc` with its `min_glibc`, which only 1.8.0 and
+    # `linux-x86_64-appimage-glibc` with its `min_glibc`, which only 1.7.7 and
     # later read (`choose_appimage_target` in `commands/updater.rs`), and keep
     # the plain `linux-x86_64-appimage` entry for a build that runs wherever
     # this one does, or drop it.

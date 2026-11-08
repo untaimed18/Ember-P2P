@@ -1466,7 +1466,7 @@ fn missing_updater_targets(error: &tauri_plugin_updater::Error) -> Option<String
 /// its way out of. So a build with a higher floor is published under this
 /// entry, with `min_glibc`, and the plain `linux-{arch}-appimage` entry keeps
 /// one that runs wherever earlier releases did, if it is published at all:
-/// releases before 1.8.0 read only the plain entry and check no glibc.
+/// releases before 1.7.7 read only the plain entry and check no glibc.
 const GLIBC_GATED_APPIMAGE_SUFFIX: &str = "-appimage-glibc";
 
 /// Which manifest entry an AppImage install takes its update from.

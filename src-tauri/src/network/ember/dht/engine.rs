@@ -4694,7 +4694,7 @@ mod tests {
         assert_eq!(messages::store_refusal_at(reasons, 1), Some(StoreRefusal::Invalid));
         assert_eq!(messages::store_refusal_at(reasons, 2), Some(StoreRefusal::Invalid));
 
-        // Taken whole: the ack is the bare bitmap a 1.7 storer sends.
+        // Taken whole: the ack is the bare bitmap a 1.7.6 storer sends.
         let fresh = SignedRecord::keyword("gamma", [3; 16], [0u8; 32], 100, "gamma.iso", &sk);
         let (_, frame, _) = a
             .build_store_batch(&[messages::BatchedRecord {
