@@ -13,9 +13,10 @@ name: Release
 #      `releases/latest/download/latest.json` resolve, so installed apps only
 #      see the update once you've deliberately published. Editing the draft body
 #      afterwards does not change the notes already signed into latest.json.
-#   5. Run `node scripts/website-downloads.mjs vX.Y.Z` and commit docs/: it
-#      points the website's download table and new-release notice at the
-#      published release, from the downloads list this workflow attached.
+#   5. Nothing: publishing runs `website.yml`, which points the website's
+#      download table and new-release notice at the release, from the
+#      downloads list this workflow attached, and commits that to `main`. If it
+#      fails, it says why; run it again from the Actions tab with the tag.
 #
 # Required secrets on the protected `release-signing` environment:
 #   TAURI_SIGNING_PRIVATE_KEY           contents of ember-updater.key

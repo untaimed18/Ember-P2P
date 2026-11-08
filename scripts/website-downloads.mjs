@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Refresh the website's download section and its new-release notice from a
-// published release, once its notes are in docs/index.html.
+// published release, once its notes are in docs/index.html. Publishing a
+// release runs this through `.github/workflows/website.yml`; by hand:
 //
 //   node scripts/website-downloads.mjs v1.8.0
 //       reads Ember_1.8.0_downloads.json, which the release workflow attaches

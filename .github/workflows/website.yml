@@ -1,0 +1,96 @@
+name: Website
+
+# Points the website's download table and new-release notice at a release as
+# soon as it is published, so publishing the draft is the last step of a
+# release. `scripts/website-downloads.mjs` reads the downloads list the release
+# workflow attached (sizes, SHA-256 and eD2K links) and rewrites only what lies
+# between its marker comments in docs/index.html.
+#
+# The site is served from `main`'s docs/, which is where releases are tagged,
+# so the commit goes there. Nothing on `develop` edits that section, so the
+# next release's merge into `main` keeps it. The commit is made through the
+# contents API with this job's own token rather than by `git push`, which
+# keeps credentials out of the checkout as every workflow here does, and the
+# blob it replaces is named, so a `main` that moved meanwhile refuses it
+# instead of losing a change.
+#
+# Fails loudly, by design, when the published release has no notes in
+# docs/index.html or no downloads list: the website would otherwise go on
+# offering the previous release without anyone noticing.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release to point the website at (vX.Y.Z)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website
+  cancel-in-progress: false
+
+jobs:
+  downloads:
+    name: Point the website at the release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Checkout the published site
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      # Republishing an older release must not take the site back to it.
+      - name: Check this is the newest release
+        id: newest
+        run: |
+          newest=$(gh release view --json tagName --jq .tagName)
+          if [ "$newest" = "$TAG" ]; then
+            echo "update=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$TAG is not the newest release ($newest); the website stays as it is"
+          fi
+
+      - name: Write the download table and notice
+        if: steps.newest.outputs.update == 'true'
+        run: node scripts/website-downloads.mjs "$TAG"
+
+      - name: Commit the website to main
+        if: steps.newest.outputs.update == 'true'
+        run: |
+          if git diff --quiet -- docs/index.html; then
+            echo "docs/index.html already offers $TAG"
+            exit 0
+          fi
+          body="$RUNNER_TEMP/contents.json"
+          BODY="$body" BLOB="$(git rev-parse HEAD:docs/index.html)" node -e '
+            const fs = require("node:fs");
+            fs.writeFileSync(process.env.BODY, JSON.stringify({
+              message: `Point the website at Ember ${process.env.TAG.replace(/^v/, "")}`,
+              content: fs.readFileSync("docs/index.html").toString("base64"),
+              sha: process.env.BLOB,
+              branch: "main",
+            }));
+          '
+          gh api --method PUT "repos/$GH_REPO/contents/docs/index.html" --input "$body" --jq '.commit.sha'
+          # A commit made with this token may not start a Pages build by itself.
+          gh api --method POST "repos/$GH_REPO/pages/builds" --silent \
+            || echo "::warning::committed, but could not ask GitHub Pages to rebuild; it will on the next push to main"
