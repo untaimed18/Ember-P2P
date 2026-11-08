@@ -399,6 +399,10 @@ pre code { background: none; padding: 0; color: var(--text-2); }
 .downloads code.sha256 { display: block; margin-top: 6px; padding: 0; background: none; color: var(--on-ink-2); font-size: 12px; overflow-wrap: anywhere; }
 .downloads .size { white-space: nowrap; color: var(--on-ink-2); }
 .downloads .ed2k { white-space: nowrap; }
+.downloads .ed2k-text { margin-top: 6px; color: var(--on-ink-2); font-size: 13px; }
+.downloads .ed2k-text summary { width: fit-content; cursor: pointer; }
+.downloads .ed2k-text summary:hover { color: #fff; }
+.downloads .ed2k-text code { display: block; margin-top: 6px; padding: 8px 10px; font-size: 12px; overflow-wrap: anywhere; user-select: all; }
 
 /* The newest release, above the hero. */
 .release-notice {

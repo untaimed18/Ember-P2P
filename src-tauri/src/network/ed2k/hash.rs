@@ -862,8 +862,22 @@ pub fn ed2k_link_web_sources(link: &str) -> Vec<String> {
         .take_while(|seg| !seg.starts_with('/'))
         .filter_map(|seg| seg.strip_prefix("s="))
         .filter(|url| !url.trim().is_empty())
-        .map(|url| url.trim().to_string())
+        .map(|url| decode_encoded_web_source(url.trim()))
         .collect()
+}
+
+/// A web source percent-encoded whole (`s=https%3A%2F%2F…`), as a web page has
+/// to write it: left as it is, a browser reads the `https:` in a clicked link
+/// as an empty port and drops the colon. eMule decodes the whole link, so the
+/// same link works there. One that opens with its scheme is left alone, since
+/// its escapes belong to the URL.
+fn decode_encoded_web_source(url: &str) -> String {
+    let scheme = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    if scheme.starts_with("http%3a") || scheme.starts_with("https%3a") {
+        percent_decode_str(url)
+    } else {
+        url.to_string()
+    }
 }
 
 /// Compatibility parser for collection imports. Invalid links (including
@@ -972,6 +986,28 @@ mod link_tests {
         let named = format!("ed2k://|file|s=trick|9|{HASH}|/");
         assert!(ed2k_link_web_sources(&named).is_empty());
         assert!(ed2k_link_web_sources("ed2k://|server|1.2.3.4|4661|/").is_empty());
+    }
+
+    #[test]
+    fn a_web_source_encoded_for_a_browser_reads_as_its_url() {
+        // What the website's download table links to, as a browser hands it on.
+        let clicked = format!(
+            "ed2k://%7Cfile%7Ca.bin%7C9%7C{HASH}%7Ch=AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH%7Cs=https%3A%2F%2Fgithub.com%2Fx%2Fa%2520b.bin%7C/"
+        );
+        assert_eq!(
+            ed2k_link_web_sources(&clicked),
+            vec!["https://github.com/x/a%20b.bin"]
+        );
+        let (name, size, hash, aich, _) = parse_ed2k_link_strict(&clicked).expect("clicked");
+        assert_eq!((name.as_str(), size), ("a.bin", 9));
+        assert_eq!(hash, HASH);
+        assert!(aich.is_some());
+        // Escapes inside a URL written out as usual are the URL's own.
+        let written = format!("ed2k://|file|a.bin|9|{HASH}|s=https://mirror.example/a%2Fb.bin|/");
+        assert_eq!(
+            ed2k_link_web_sources(&written),
+            vec!["https://mirror.example/a%2Fb.bin"]
+        );
     }
 
     #[test]
