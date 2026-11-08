@@ -20,6 +20,9 @@ import { svelte } from "@sveltejs/vite-plugin-svelte";
  * Svelte plugin compiles their runes, and they are transformed for the client,
  * with Svelte's client runtime, because compiled for the server an effect
  * never runs. Component tests would still need a DOM environment.
+ *
+ * Tests of what a component renders (`*.ssr.test.ts`) need none: they compile
+ * it for the server and read the HTML `svelte/server`'s `render` returns.
  */
 const alias = {
   $lib: fileURLToPath(new URL("./src/lib", import.meta.url)),
@@ -34,7 +37,16 @@ export default defineConfig({
         test: {
           name: "unit",
           include: ["src/**/*.test.ts"],
-          exclude: ["src/**/*.svelte.test.ts"],
+          exclude: ["src/**/*.svelte.test.ts", "src/**/*.ssr.test.ts"],
+          environment: "node",
+        },
+      },
+      {
+        plugins: [svelte()],
+        resolve: { alias },
+        test: {
+          name: "ssr",
+          include: ["src/**/*.ssr.test.ts"],
           environment: "node",
         },
       },

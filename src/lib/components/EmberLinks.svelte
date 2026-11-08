@@ -10,6 +10,7 @@
 
   const links: { target: EmberLink; title: () => string; desc: () => string }[] = [
     { target: 'website', title: () => m.about_link_website_title(), desc: () => m.about_link_website_desc() },
+    { target: 'guide', title: () => m.about_link_guide_title(), desc: () => m.about_link_guide_desc() },
     { target: 'github', title: () => m.about_link_github_title(), desc: () => m.about_link_github_desc() },
     { target: 'reddit', title: () => m.about_link_reddit_title(), desc: () => m.about_link_reddit_desc() },
   ];
@@ -46,6 +47,11 @@
               <circle cx="8" cy="8" r="6" />
               <path d="M2.2 6.4h11.6M2.2 9.6h11.6" />
               <path d="M8 2c-1.8 2-1.8 10 0 12 1.8-2 1.8-10 0-12z" />
+            </svg>
+          {:else if link.target === 'guide'}
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M2 3.2c2-.9 4-.9 6 .6 2-1.5 4-1.5 6-.6v9.6c-2-.9-4-.9-6 .6-2-1.5-4-1.5-6-.6z" />
+              <path d="M8 3.8v9.6" />
             </svg>
           {:else if link.target === 'github'}
             <svg viewBox="0 0 16 16" fill="currentColor">

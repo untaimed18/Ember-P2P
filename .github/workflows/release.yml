@@ -13,6 +13,9 @@ name: Release
 #      `releases/latest/download/latest.json` resolve, so installed apps only
 #      see the update once you've deliberately published. Editing the draft body
 #      afterwards does not change the notes already signed into latest.json.
+#   5. Run `node scripts/website-downloads.mjs vX.Y.Z` and commit docs/: it
+#      points the website's download table and new-release notice at the
+#      published release, from the downloads list this workflow attached.
 #
 # Required secrets on the protected `release-signing` environment:
 #   TAURI_SIGNING_PRIVATE_KEY           contents of ember-updater.key
@@ -279,6 +282,10 @@ jobs:
       # scripts that read the signatures back all have to agree.
       EMBER_WINDOWS_BUNDLE_DIR: src-tauri/target/windows-bundles
       EMBER_LINUX_BUNDLE_DIR: src-tauri/target/linux-bundles
+      # The eD2K collection, the notes it carries and the downloads list the
+      # website is refreshed from. Beside the bundles, not among them, so the
+      # signing pass does not take them for installers.
+      EMBER_ED2K_OUT_DIR: src-tauri/target/ed2k-out
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout
@@ -345,15 +352,35 @@ jobs:
               || { echo "failed to sign $bundle" >&2; exit 1; }
           done
 
+      # For everyone who cannot reach GitHub: an eD2K link for every installer,
+      # with its AICH hash and its GitHub download as a web source, an eMule
+      # collection of them and the notes, and each file's SHA-256. The script
+      # uses Node alone, so it runs nothing from the dependency tree beside the
+      # key; `scripts/ed2k-links.test.mjs` holds its hashes to Ember's own.
+      - name: Prepare the eD2K links and collection
+        id: ed2k
+        env:
+          EMBER_RELEASE_NOTES: ${{ steps.release_notes.outputs.body }}
+          EMBER_ED2K_SECTION: ${{ runner.temp }}/ed2k-section.md
+        run: node scripts/ed2k-links.mjs
+
       # A re-run finds the draft the previous attempt created and reuses it; a
       # release that has already been published is never touched.
       - name: Create or update the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EMBER_RELEASE_NOTES: ${{ steps.release_notes.outputs.body }}
+          EMBER_ED2K_SECTION: ${{ steps.ed2k.outputs.section }}
         run: |
           notes="$RUNNER_TEMP/release-notes.md"
           printf '%s\n' "$EMBER_RELEASE_NOTES" > "$notes"
+          # The body only: the in-app updater shows the notes from latest.json,
+          # where links to files the user is already updating to do not belong.
+          if [ ! -s "$EMBER_ED2K_SECTION" ]; then
+            echo "the eD2K section for the release body is missing" >&2
+            exit 1
+          fi
+          cat "$EMBER_ED2K_SECTION" >> "$notes"
           if is_draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null); then
             if [ "$is_draft" != "true" ]; then
               echo "release $GITHUB_REF_NAME is already published; refusing to modify it" >&2
@@ -369,8 +396,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ ! -d "$EMBER_ED2K_OUT_DIR" ]; then
+            echo "$EMBER_ED2K_OUT_DIR is missing; run the eD2K step before attaching" >&2
+            exit 1
+          fi
           mapfile -d '' assets < <(find "$EMBER_WINDOWS_BUNDLE_DIR" "$EMBER_LINUX_BUNDLE_DIR" \
-            -type f -print0)
+            "$EMBER_ED2K_OUT_DIR" -type f -print0)
           gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
 
       # After the upload, so the manifest can never name an asset that is not

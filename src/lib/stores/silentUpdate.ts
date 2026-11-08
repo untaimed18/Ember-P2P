@@ -3,7 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import * as m from '$lib/paraglide/messages';
 import { notify } from '$lib/notifications';
-import { addToast, toast } from '$lib/stores/toast';
+import { addActionToast, addToast, toast } from '$lib/stores/toast';
+import { openReleaseNotes } from '$lib/api/settings';
 
 /**
  * Silent updates, as the backend runs them (`auto_update::silent`).
@@ -152,7 +153,15 @@ export async function reportUpdateOutcome(): Promise<void> {
   if (!outcome) return;
   const version = outcome.targetVersion;
   whenVisible(() => {
-    if (outcome.installed) addToast('success', m.silent_update_done({ version }), 12_000);
+    if (outcome.installed) {
+      addActionToast(
+        'success',
+        m.silent_update_done({ version }),
+        { label: m.updater_see_whats_new(), run: () => void openReleaseNotes(version).catch(() => {}) },
+        () => {},
+        12_000,
+      );
+    }
     // Stays until dismissed: it is the only sign the update did not happen.
     else addToast('warning', m.silent_update_failed({ version }), 0);
   });

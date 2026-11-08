@@ -146,6 +146,9 @@
     <h3>Requirements</h3>
     <p>No external runtimes needed. No Java, no .NET, no browser engine download. Ember ships everything it needs in a single installer.</p>
 
+    <h3>If GitHub cannot be reached</h3>
+    <p>Every release can also be downloaded over the eD2K network. The <a href="index.html#download">download section</a> lists each installer with an <code>ed2k://</code> link and its SHA-256, and each release on GitHub carries an eMule collection of all of them with the release notes. Open a link in Ember, eMule or aMule; it carries the file&rsquo;s AICH hash so a damaged part is found and fetched again, and the GitHub download as a web source for whenever GitHub is reachable. Before running what you downloaded, check its SHA-256 against the one listed: on Windows, <code>certutil -hashfile &lt;file&gt; SHA256</code> in a command prompt; on Linux, <code>sha256sum &lt;file&gt;</code>. How fast it arrives depends on how many people are sharing it.</p>
+
     <h3>Updates</h3>
     <p>Ember updates itself. Every release is signed, and Ember checks the signature of both the release manifest and the package before installing anything. Each build updates with the format it was installed from, so a <code>.deb</code> install updates through <code>dpkg</code> and an AppImage replaces itself in place.</p>
     <p>With <strong>Silent updates</strong> switched on in Settings &gt; About, Ember installs a new version by itself while nobody is using it, and reopens the way you left it. This works with the Windows installer and the AppImage. The <code>.deb</code> and MSI packages need your password or administrator approval to install an update, so there Ember tells you an update is ready and you install it with one click.</p>

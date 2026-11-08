@@ -17,6 +17,8 @@
     dismissNotice,
   } from '$lib/stores/updater';
   import IconX from '$lib/components/IconX.svelte';
+  import ReleaseNotes from '$lib/components/ReleaseNotes.svelte';
+  import { openEmberLink, openReleaseNotes } from '$lib/api/settings';
   import { silentUpdate, silentUpdateHandlesIt } from '$lib/stores/silentUpdate';
 
   let showNotes = $state(false);
@@ -130,8 +132,16 @@
         {m.updater_whats_new()}
       </button>
       {#if showNotes}
-        <div class="notice-notes">{$updater.notes}</div>
+        <div class="notice-notes"><ReleaseNotes notes={$updater.notes} /></div>
       {/if}
+    {/if}
+
+    {#if ($updater.phase === 'available' || $updater.phase === 'ready') && $updater.version}
+      {@const version = $updater.version}
+      <div class="notice-links">
+        <button type="button" onclick={() => void openReleaseNotes(version).catch(() => {})}>{m.updater_full_notes()}</button>
+        <button type="button" onclick={() => void openEmberLink('guide').catch(() => {})}>{m.updater_user_guide()}</button>
+      </div>
     {/if}
 
     {#if !inProgress}
@@ -260,16 +270,32 @@
   }
 
   .notice-notes {
-    max-height: 120px;
+    max-height: min(260px, 40vh);
     overflow-y: auto;
-    font-size: var(--font-size-sm);
-    line-height: 1.5;
-    color: var(--text-secondary);
-    white-space: pre-wrap;
     padding: 8px 10px;
     background: var(--bg-primary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
+  }
+
+  .notice-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+  }
+
+  .notice-links button {
+    border: none;
+    background: transparent;
+    color: var(--accent);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .notice-links button:hover {
+    text-decoration: underline;
   }
 
   .notice-actions {

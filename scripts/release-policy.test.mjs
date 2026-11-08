@@ -691,6 +691,26 @@ test("the signing key and release write stay in the one protected job", () => {
   }
 });
 
+test("every release carries its eD2K links and collection", () => {
+  // Dropping either still produces a green release that looks complete to
+  // anyone who can reach GitHub, and leaves those who cannot with nothing.
+  for (const [from, to] of [
+    ["        run: node scripts/ed2k-links.mjs\n", "        run: true\n"],
+    ['          cat "$EMBER_ED2K_SECTION" >> "$notes"', "          true"],
+    ['            "$EMBER_ED2K_OUT_DIR" -type f -print0)', "            -type f -print0)"],
+  ]) {
+    const fixture = tamperedWorkflow(from, to);
+    try {
+      assert.throws(
+        () => verifyWorkflow({ root: fixture }),
+        /sign-publish must prepare the installers' eD2K links and attach the collection/,
+      );
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+});
+
 test("a release cannot be signed without the Linux packages it publishes", () => {
   // Dropping the dependency does not fail anything on its own: the draft is
   // still created and still signed, and `latest.json` still advertises whatever

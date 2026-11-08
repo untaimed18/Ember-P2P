@@ -681,6 +681,45 @@ fn write_hash_tag(buf: &mut Vec<u8>, name_id: u8, hash: &[u8]) -> anyhow::Result
 mod tests {
     use super::*;
 
+    /// `scripts/ed2k-links.mjs` writes each release's collection itself,
+    /// beside the signing key where nothing from this crate may run; these are
+    /// the bytes `scripts/ed2k-links.test.mjs` holds it to, and the link it
+    /// writes for the same file.
+    #[test]
+    fn a_release_collection_from_the_script_loads_in_ember() {
+        let hex_text = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../scripts/fixtures/ember-release.emulecollection.hex"
+        ));
+        let collection = Collection::from_binary_bytes(&hex::decode(hex_text.trim()).unwrap()).unwrap();
+        assert_eq!(collection.name, "Ember 9.9.9");
+        assert_eq!(collection.author, "Ember");
+        assert_eq!(collection.files.len(), 2);
+        let setup = &collection.files[0];
+        assert_eq!(setup.name, "Ember_9.9.9_x64-setup.exe");
+        assert_eq!(setup.size, 20_000_000);
+        assert_eq!(setup.hash, "00112233445566778899aabbccddeeff");
+        assert_eq!(setup.aich_hash, "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(setup.note, "Windows 10 and 11, 64-bit.");
+        let appimage = &collection.files[1];
+        assert_eq!(appimage.size, 5_000_000_000, "past 4 GiB, as a 64-bit size");
+        assert_eq!(appimage.hash, "ffeeddccbbaa99887766554433221100");
+        assert_eq!(appimage.aich_hash, "76543210fedcba9876543210fedcba9876543210");
+        assert!(appimage.note.is_empty());
+
+        assert_eq!(
+            super::super::hash::format_ed2k_link_ext(
+                "Ember_1.8.0_x64-setup.exe",
+                5,
+                "00112233445566778899aabbccddeeff",
+                Some("0123456789abcdef0123456789abcdef01234567"),
+                None,
+                &[],
+            ),
+            "ed2k://|file|Ember_1.8.0_x64-setup.exe|5|00112233445566778899AABBCCDDEEFF|h=AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH|/"
+        );
+    }
+
     #[test]
     fn binary_collection_round_trips_all_fields() {
         let collection = Collection {

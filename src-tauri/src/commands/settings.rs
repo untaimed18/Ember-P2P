@@ -3099,6 +3099,9 @@ const EMBER_GITHUB_URL: &str = "https://github.com/untaimed18/Ember-P2P";
 /// The official subreddit.
 const EMBER_REDDIT_URL: &str = "https://www.reddit.com/r/EmberP2P/";
 
+/// The user guide on the website.
+const EMBER_GUIDE_URL: &str = "https://www.emberp2p.org/guide.html";
+
 /// The project's own pages, by name. The frontend names one of these rather
 /// than passing a URL: the addresses are hardcoded here so a compromised
 /// renderer cannot point the browser at an arbitrary destination.
@@ -3107,8 +3110,30 @@ fn ember_link_url(target: &str) -> Option<&'static str> {
         "website" => Some(EMBER_WEBSITE_URL),
         "github" => Some(EMBER_GITHUB_URL),
         "reddit" => Some(EMBER_REDDIT_URL),
+        "guide" => Some(EMBER_GUIDE_URL),
         _ => None,
     }
+}
+
+/// `version`'s notes in the website's release history (`#release-1-8-0`), or
+/// `None` for anything but a plain `major.minor.patch`: the version arrives
+/// from the renderer, and only the digits may reach the address.
+fn release_notes_url(version: &str) -> Option<String> {
+    let parts: Vec<&str> = version.split('.').collect();
+    let plain = parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.len() <= 5 && part.bytes().all(|byte| byte.is_ascii_digit()));
+    plain.then(|| format!("{EMBER_WEBSITE_URL}#release-{}", parts.join("-")))
+}
+
+/// Open a release's notes on the website in the default browser.
+#[tauri::command]
+pub async fn open_release_notes(version: String) -> Result<(), String> {
+    let url = release_notes_url(&version)
+        .ok_or_else(|| coded("settings_unknown_link", "Unknown link"))?;
+    crate::security::filesystem::open_url_with_default_app(&url)
+        .map_err(|e| coded_ctx("settings_open_link_failed", "Failed to open the link", e))
 }
 
 /// Open one of the project's pages (website, GitHub, Reddit) in the default
@@ -3990,13 +4015,28 @@ mod tests {
 
     #[test]
     fn ember_links_are_a_fixed_allowlist_of_https_pages() {
-        for target in ["website", "github", "reddit"] {
+        for target in ["website", "github", "reddit", "guide"] {
             let url = ember_link_url(target).expect(target);
             assert!(url.starts_with("https://"), "{target}: {url}");
         }
         assert_eq!(ember_link_url("website"), Some(EMBER_WEBSITE_URL));
         assert_eq!(ember_link_url("GitHub"), None, "names are lowercase");
         assert_eq!(ember_link_url("https://evil.example/"), None);
+    }
+
+    #[test]
+    fn release_notes_open_only_for_a_plain_version() {
+        assert_eq!(
+            release_notes_url("1.8.0").as_deref(),
+            Some("https://www.emberp2p.org/#release-1-8-0")
+        );
+        assert_eq!(
+            release_notes_url("10.20.300").as_deref(),
+            Some("https://www.emberp2p.org/#release-10-20-300")
+        );
+        for bad in ["", "1.8", "1.8.0.1", "1.8.0-beta", "1.8.x", "1..0", "1.8.0/../x", "1.8.0#a", " 1.8.0", "123456.0.0"] {
+            assert_eq!(release_notes_url(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

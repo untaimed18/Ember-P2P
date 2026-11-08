@@ -36,6 +36,9 @@
 
   <section class="hero">
     <div class="container">
+      <!-- release-notice:start -->
+      <a class="release-notice" href="#release-1-7-6"><span class="release-notice-tag">New</span>Ember 1.7.6 is out &middot; see what&rsquo;s new</a>
+      <!-- release-notice:end -->
       <p class="eyebrow">Free and open source &middot; Windows and Linux</p>
       <h1>Modern P2P file sharing, built on the eMule network</h1>
       <p class="lede">Ember is a fast, private client that works with eMule and aMule, and adds its own encrypted network that needs no servers. No ads. No spyware.</p>
@@ -125,13 +128,48 @@
   <section class="download-band" id="download">
     <div class="container">
       <img src="icon.png" alt="" width="72" height="72">
+      <!-- Written by scripts/website-downloads.mjs from the published release. -->
+      <!-- downloads:start -->
       <h2>Download Ember 1.7.6</h2>
       <p>Free for Windows 10 and 11, and for x86-64 Linux as a <code>.deb</code> or an AppImage. Every release is signed, and Ember updates itself.</p>
       <div class="btn-group">
-        <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" class="btn btn-light" target="_blank" rel="noopener"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download from GitHub</a>
-        <a href="#releases" class="btn btn-ghost">Release notes</a>
+        <a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.7.6" class="btn btn-light" target="_blank" rel="noopener"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download from GitHub</a>
+        <a href="#release-1-7-6" class="btn btn-ghost">What&rsquo;s new in 1.7.6</a>
       </div>
-      <p class="meta">No extra runtimes needed &middot; <a href="guide.html#installation">System requirements and updates</a></p>
+      <div class="downloads">
+        <table>
+          <caption>Every file in Ember 1.7.6. Cannot reach GitHub? An eD2K link opens in Ember, eMule or aMule and fetches the same file from the eD2K network. Check what you get against its SHA-256.</caption>
+          <thead><tr><th scope="col">For</th><th scope="col">File</th><th scope="col">Size</th><th scope="col">eD2K</th></tr></thead>
+          <tbody>
+            <tr>
+              <th scope="row">Windows 10/11 (64-bit), installer</th>
+              <td><a href="https://github.com/untaimed18/Ember-P2P/releases/download/v1.7.6/Ember_1.7.6_x64-setup.exe" class="file-name">Ember_1.7.6_x64-setup.exe</a><code class="sha256" title="SHA-256">SHA-256 40cca5359e66509e3f6599db543d9a3cade6b1a37e42ba62be63d07c71b911d0</code></td>
+              <td class="size">22.0 MB</td>
+              <td><a href="ed2k://|file|Ember_1.7.6_x64-setup.exe|21991033|8561E3DACE4E44FB9804D4B84A707BE5|h=3MPEWWXCWMZSJZCQMXK6ENI6TLWCJIWP|s=https://github.com/untaimed18/Ember-P2P/releases/download/v1.7.6/Ember_1.7.6_x64-setup.exe|/" class="ed2k">eD2K link</a></td>
+            </tr>
+            <tr>
+              <th scope="row">Windows 10/11 (64-bit), MSI</th>
+              <td><a href="https://github.com/untaimed18/Ember-P2P/releases/download/v1.7.6/Ember_1.7.6_x64_en-US.msi" class="file-name">Ember_1.7.6_x64_en-US.msi</a><code class="sha256" title="SHA-256">SHA-256 7dc97ff5077d6fb21ebfb3c6deff20cc6b45c9a7c863e11fe25511667615f888</code></td>
+              <td class="size">32.9 MB</td>
+              <td><a href="ed2k://|file|Ember_1.7.6_x64_en-US.msi|32874496|CF8BA7FFC8A9857D9C5B5E17312D3C48|h=CHXPZNTP7Z45HX3JA3AGVILLT6DXERFR|s=https://github.com/untaimed18/Ember-P2P/releases/download/v1.7.6/Ember_1.7.6_x64_en-US.msi|/" class="ed2k">eD2K link</a></td>
+            </tr>
+            <tr>
+              <th scope="row">Linux x86-64, .deb</th>
+              <td><a href="https://github.com/untaimed18/Ember-P2P/releases/download/v1.7.6/Ember_1.7.6_amd64.deb" class="file-name">Ember_1.7.6_amd64.deb</a><code class="sha256" title="SHA-256">SHA-256 9a2e9a172834033e1ded191b55c336e3e1a4bcfeac0d06abc75f2f52f7dbfbc9</code></td>
+              <td class="size">32.0 MB</td>
+              <td><a href="ed2k://|file|Ember_1.7.6_amd64.deb|32045478|F9715F5533BBDCB82AD508B4DE713645|h=RYEFMDZY46CBR5QUU7FHLO2NVWIHVN4Z|s=https://github.com/untaimed18/Ember-P2P/releases/download/v1.7.6/Ember_1.7.6_amd64.deb|/" class="ed2k">eD2K link</a></td>
+            </tr>
+            <tr>
+              <th scope="row">Linux x86-64, AppImage</th>
+              <td><a href="https://github.com/untaimed18/Ember-P2P/releases/download/v1.7.6/Ember_1.7.6_amd64.AppImage" class="file-name">Ember_1.7.6_amd64.AppImage</a><code class="sha256" title="SHA-256">SHA-256 39f5e8f7a1394df42bee4415c8e224d6292d4fd48d24676992fda2bb56b01940</code></td>
+              <td class="size">107.3 MB</td>
+              <td><a href="ed2k://|file|Ember_1.7.6_amd64.AppImage|107264504|D1B5BDACB3F04A41EC6E493180896DD9|h=6WXVBBFC7BXIKUK5EV2V672H4U55AEZM|s=https://github.com/untaimed18/Ember-P2P/releases/download/v1.7.6/Ember_1.7.6_amd64.AppImage|/" class="ed2k">eD2K link</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="meta">Windows 10 or 11, 64-bit &middot; Linux x86-64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later); the AppImage also needs FUSE 2 &middot; <a href="guide.html#installation">System requirements and updates</a></p>
+      <!-- downloads:end -->
     </div>
   </section>
 

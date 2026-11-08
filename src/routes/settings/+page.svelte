@@ -9,6 +9,7 @@
     pickPreviewPlayer as pickPreviewPlayerDialog,
     importWebServicesFile,
     getExampleWebService,
+    openReleaseNotes,
     SETTINGS_CHANGED_EVENT,
     type LaunchSettings,
     type UpdateSettingsResult,
@@ -5663,6 +5664,10 @@
                   <span class="feedback success">{m.updater_uptodate()}</span>
                 {:else if $updater.phase === 'available'}
                   <span class="feedback success">{m.updater_available_status({ version: $updater.version ?? '' })}</span>
+                  {#if $updater.version}
+                    {@const version = $updater.version}
+                    <button type="button" class="about-notes-link" onclick={() => void openReleaseNotes(version).catch(() => {})}>{m.updater_full_notes()}</button>
+                  {/if}
                 {:else if $updater.phase === 'downloading'}
                   <span class="hint">{aboutPercent !== null ? m.updater_downloading_pct({ pct: aboutPercent }) : m.updater_downloading()}</span>
                   {#if aboutPercent !== null}
@@ -5674,6 +5679,10 @@
                   <span class="hint">{m.updater_installing()}</span>
                 {:else if $updater.phase === 'ready'}
                   <span class="feedback success">{m.updater_ready_body({ version: $updater.version ?? '' })}</span>
+                  {#if $updater.version}
+                    {@const version = $updater.version}
+                    <button type="button" class="about-notes-link" onclick={() => void openReleaseNotes(version).catch(() => {})}>{m.updater_full_notes()}</button>
+                  {/if}
                 {:else if $updater.phase === 'stalled'}
                   <span class="feedback error">
                     {$updater.installerReady
@@ -6909,6 +6918,21 @@
   .about-update-note {
     display: block;
     margin-top: 6px;
+  }
+
+  .about-notes-link {
+    margin-left: 10px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--accent);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .about-notes-link:hover {
+    text-decoration: underline;
   }
 
   .about-progress {
