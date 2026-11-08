@@ -8,7 +8,7 @@ has the two cheaper fixes from the same report: the updater goes through the
 system HTTP or HTTPS proxy (`system_proxy_for` in
 `src-tauri/src/commands/updater.rs`), and a connection failure says "Couldn't
 reach the update server" instead of "Secure update check failed" (see
-`docs/post-1.7.4.md`). This plan is for the users those do not help: no
+`docs/archived-plans/post-1.7.4.md`). This plan is for the users those do not help: no
 proxy at all, on a network where GitHub's download hosts are blocked.
 
 ## The problem

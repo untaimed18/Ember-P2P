@@ -9,12 +9,14 @@ the v3 frame changes, what moved it to v4 (see
 and every additive change since — each marked as additive, since that is the
 distinction an implementer needs.
 
-**This is the single plan for the overlay.** It replaces the separate
-`ember-dht-search-plan.md`, whose live content — the friend-browse filter design,
-the extension decision, and the standing "already better than KAD" list — is folded
-in below. Finished work is no longer narrated item by item; it is listed in
-[Closed](#closed), and the reasoning behind each closed item is in git history and
-in the specification.
+**This is the overlay's design record.** What is still to do, across the whole
+app, is listed in [future-plan.md](future-plan.md), section 7 for the overlay, with
+when to pick each item up; the design detail behind those items stays here. It
+replaces the separate `ember-dht-search-plan.md`, whose live content — the
+friend-browse filter design, the extension decision, and the standing "already
+better than KAD" list — is folded in below. Finished work is no longer narrated
+item by item; it is listed in [Closed](#closed), and the reasoning behind each
+closed item is in git history and in the specification.
 
 Status: **protocol slices complete** and the overlay is **always on**
 (`ember_native_enabled`; profiles that still had it off are turned on at load).
@@ -84,6 +86,9 @@ identity-to-IP map of every participant.
 ---
 
 ## Outstanding work
+
+The items below are tracked in [future-plan.md](future-plan.md); this section
+keeps their design.
 
 ### 1. Ember-native transfers are partly wired
 
@@ -810,8 +815,6 @@ settled.
   on the Ember page (listed / lookups / empty).
 - ~~Weight a gossip contact by whether the leads its introducer gave us turned
   out to be reachable.~~ Done — see the Sybil note under Hardening and ops.
-- Stronger observed-IP / STUN interplay under awkward NATs (needs soak
-  data).
 - Shard the rendezvous key space. The derivation is already versioned for
   this; it matters once one KAD bucket's 1000-entry cap is in sight.
 
@@ -829,7 +832,6 @@ settled.
   twenty nodes closest to the key fill at different rates and the first one to
   run out is what decides whether the advert still lands. Read 90 or above as
   due.
-- Table quality: tune announce versus bucket-refresh balance under load.
 
 ### Search and publish
 
@@ -1172,10 +1174,6 @@ against KAD.
   `IK_RESP` replaced. The cost is a round trip before the higher key's first
   message in an honest crossing, and before anything we start on a session a
   peer opened that has not yet sent us a frame.
-
-### Product / UX
-
-- Migration guidance when turning the DHT on alongside existing KAD/eD2K.
 
 ---
 

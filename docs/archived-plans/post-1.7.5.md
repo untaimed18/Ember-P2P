@@ -1,6 +1,6 @@
 # Beside the format freeze: shipped in 1.7.5, and planned for later
 
-1.7.5 freezes the Channels formats (`docs/post-1.7.4.md`, "Channels: the
+1.7.5 freezes the Channels formats (`docs/archived-plans/post-1.7.4.md`, "Channels: the
 format freeze"; `docs/channels-format.md`, "What freezes at the end of the
 beta"). This plan was written for what could come after the freeze, since
 none of it changes a frozen format. Items 2 to 4 (private messages between
@@ -1038,7 +1038,7 @@ list's source key had 14 nodes answer and none hold a record. A firewalled
 publisher with no buddy places no source record at all, while its head and
 listing still go out.
 
-**What 1.7.6 does** (`docs/feed-reachability-plan.md`; wire details in
+**What 1.7.6 does** (`docs/archived-plans/feed-reachability-plan.md`; wire details in
 `docs/channels-format.md`, "Reaching a publisher"):
 
 - Publishers register their 16 newest published feeds on the rendezvous
@@ -1103,7 +1103,7 @@ test: stop sending chat frames 15 and 19 and set `EXT_FLAG_DISPLAY` on kinds
 rotate every private room once as it does (`V1_CUT_OVER_ROTATES`, not built
 yet; v1 cannot be switched off until it is). Whether to renew every retained
 epoch's key records, not just the current one's, is also left to decide then.
-Detail in `docs/post-1.7.4.md` items 2 and 9.
+Detail in `docs/archived-plans/post-1.7.4.md` items 2 and 9.
 
 **Also in 1.8.0: relayed catch-up replies move the frontier.** A catch-up
 reply that reaches us through another member's hop arrives as an ordinary
@@ -1118,7 +1118,7 @@ anyway. To decide then: where the marker goes (the relay envelope is the
 natural place, since only relays forward a reply), whether it is signed by
 the neighbor that served the reply so a hop cannot forge progress for it, and
 how a 1.7.x member that does not send it is read (as today: not credited).
-Origin: `docs/post-1.7.4.md`, "Channels: smaller follow-ups".
+Origin: `docs/archived-plans/post-1.7.4.md`, "Channels: smaller follow-ups".
 
 **Also in 1.8.0: pad the owned-rooms list.** 1.7.5 can pad the identity's
 list (kind 7) to 8, 16, 32 or 48 entries with salts derived from the identity
@@ -1129,11 +1129,11 @@ off): a 1.7.4 device on the same identity reads every pad as a room it cannot
 find, carries it as unsettled, keeps looking every six hours and publishes the
 pads back in its own list, unpadded and in the order it holds them. 1.8.0
 switches it on, once a second device on 1.7.4 or older is no longer expected.
-Origin: `docs/post-1.7.4.md`, "Known limits" of owned-room recovery.
+Origin: `docs/archived-plans/post-1.7.4.md`, "Known limits" of owned-room recovery.
 
 ## Carried from the 1.7.5 plan
 
-What `docs/post-1.7.4.md` leaves open, apart from the item above, which this
+What `docs/archived-plans/post-1.7.4.md` leaves open, apart from the item above, which this
 plan now owns: under "Later", tuning Discover's spam thresholds from real use
 and the pop-out chat's own copy of the friends store; under "Channels:
 smaller follow-ups", the relayed catch-up frontier (1.8.0), the moderation

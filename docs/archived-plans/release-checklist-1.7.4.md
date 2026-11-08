@@ -2,9 +2,9 @@
 
 What automated checks cannot cover before tagging `v1.7.4`. Tick each box, and
 file anything that fails before tagging rather than after. Channels is still a
-beta: this is the cross-machine run `docs/post-1.7.3.md` asks 1.7.4 for, on
+beta: this is the cross-machine run `docs/archived-plans/post-1.7.3.md` asks 1.7.4 for, on
 today's formats, and its results are the baseline for the format freeze
-planned for 1.7.5 in `docs/post-1.7.4.md`.
+planned for 1.7.5 in `docs/archived-plans/post-1.7.4.md`.
 
 ## 0. Automated checks
 
@@ -91,7 +91,7 @@ not reachable from outside (no port forwarding, UPnP off). Call them A
       minutes after it turns Delivered.
 - [ ] Leave a friend chat idle for half an hour with one side on 1.7.4 and the
       other on 1.7.3. Note whether the session drops (it may, until both run
-      1.7.3 or later; see the known limits in `docs/post-1.7.4.md`).
+      1.7.3 or later; see the known limits in `docs/archived-plans/post-1.7.4.md`).
 
 ## 2a. Downloads with web mirrors
 

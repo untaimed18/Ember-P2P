@@ -3,13 +3,13 @@
 Written before 1.7.4 shipped, when its scope was settled: 1.7.4 is testing
 and small fixes with no Channels format change, so it can be judged on its
 own, and 1.7.5 is the release that freezes the Channels formats. Everything
-in `docs/post-1.7.3.md` outside 1.7.4's list is here. If 1.7.4 does not
+in `docs/archived-plans/post-1.7.3.md` outside 1.7.4's list is here. If 1.7.4 does not
 finish something on its list, move it here. Ordered by priority within each
 section.
 
-What 1.7.4 does is listed in `docs/post-1.7.3.md`. Two of its items feed this
+What 1.7.4 does is listed in `docs/archived-plans/post-1.7.3.md`. Two of its items feed this
 plan: the decision on item 1 below (a kind 8 record), and the cross-machine
-run in `docs/release-checklist-1.7.4.md`, which is the baseline item 5 is
+run in `docs/archived-plans/release-checklist-1.7.4.md`, which is the baseline item 5 is
 measured against.
 
 1.7.5 has done these so far, from user reports after 1.7.4 shipped:
@@ -77,7 +77,7 @@ measured against.
   (`PRESENCE_LANGUAGE_AT`); older builds read none and are read as before.
   Only the member's own presence record sets or clears the roster's
   `channel_members.language`, added at open outside the numbered chain.
-  Specified under [DHT channel records](channels-format.md#dht-channel-records).
+  Specified under [DHT channel records](../channels-format.md#dht-channel-records).
   Tests: `a_members_language_rides_every_presence_form` (`publish.rs`),
   `a_sealed_presence_language_is_invisible_to_older_readers` (`channel.rs`),
   `presence_reads_v2_first_and_falls_back_to_v1` (`channel_membership.rs`),
@@ -87,7 +87,7 @@ measured against.
   with no proxy at all. It needs a host reachable from those networks, the
   release workflow uploading to it, a second manifest signed with the same
   key, and the updater trying it after GitHub. Planned separately in
-  `docs/update-mirror-plan.md`, not scheduled.
+  `docs/archived-plans/update-mirror-plan.md`, not scheduled.
 
 ## Channels: the format freeze
 
@@ -132,7 +132,7 @@ commitment to the epoch announced, and again after a lookup given up on; they
 keep the newest copy. Either record arriving alone is applied on its own, and
 absence is never a reset. Its first field is item 7's key commitment, its
 second item 8's admission rule. Specified under
-[Room settings (kind 8)](channels-format.md#room-settings-kind-8).
+[Room settings (kind 8)](../channels-format.md#room-settings-kind-8).
 
 Tests: `the_newest_settings_record_is_held_and_absence_changes_nothing`,
 `settings_ride_every_third_moderation_pass_of_a_room_this_device_reads`,
@@ -172,7 +172,7 @@ without joiners at the same signed time, and otherwise the first stands and
 the second is not relayed. A v2 frame naming another author's line, or whose
 text sanitising would change, is dropped. Revisions pair the same way. Catch-up
 re-serves whichever forms are held. Specified under
-[Chat v2](channels-format.md#chat-v2-kinds-64-and-65).
+[Chat v2](../channels-format.md#chat-v2-kinds-64-and-65).
 
 Decided while building it:
 
@@ -266,11 +266,11 @@ left open and what 1.8.0 changes.
 
 ### 5. Test across real machines
 
-**Written in 1.7.5:** `docs/release-checklist-1.7.5.md`, from 1.7.4's, with
+**Written in 1.7.5:** `docs/archived-plans/release-checklist-1.7.5.md`, from 1.7.4's, with
 what this section changed; it is still to be run before tagging.
 
-1.7.4 runs `docs/release-checklist-1.7.4.md` section 1 on today's formats.
-For 1.7.5, write `docs/release-checklist-1.7.5.md` from it and run it on
+1.7.4 runs `docs/archived-plans/release-checklist-1.7.4.md` section 1 on today's formats.
+For 1.7.5, write `docs/archived-plans/release-checklist-1.7.5.md` from it and run it on
 three or more machines, at least one behind a firewall that is not
 reachable, adding what this section changes:
 
@@ -357,7 +357,7 @@ Built around that check:
   fetch stamp and redraws it, as an ingest does.
 
 Specified under
-[Room settings (kind 8)](channels-format.md#fields-in-version-1).
+[Room settings (kind 8)](../channels-format.md#fields-in-version-1).
 
 Tests: `an_invite_key_is_taken_for_a_held_room_only_against_the_owners_commitment`
 (`commands/channels.rs`);
@@ -413,7 +413,7 @@ other at all. Absent, 0, or no record held is the rule before 1.7.5; any value
 above 1 reads as 1, so a later build may only use one for a stricter rule.
 Every path that adds to a private room's roster, and what 1 does to each, is
 listed under
-[Admission](channels-format.md#admission-item-8).
+[Admission](../channels-format.md#admission-item-8).
 
 Tests: `the_held_settings_record_decides_whether_a_chat_line_admits`
 (`channel_membership.rs`);
@@ -469,7 +469,7 @@ the release that stops sending the old chat frames (item 2), stops publishing
 v1 (`PUBLISH_V1_MEMBERSHIP_RECORDS`) except the owner's own key copy, and
 rotates every private room once as it does (`V1_CUT_OVER_ROTATES`; not built
 yet, and v1 cannot be turned off until it is). Specified under
-[Private membership records, v2](channels-format.md#private-membership-records-v2-item-9).
+[Private membership records, v2](../channels-format.md#private-membership-records-v2-item-9).
 
 **Changed before the freeze, after an audit.** The first build blinded epoch
 `E`'s records with epoch `E - 1`'s join secret. A member whose copy of a
@@ -504,7 +504,7 @@ Known limits:
   stores or asks for which key, and so which pseudonym, room-blind key and
   blinded member id are theirs, though not which room those belong to. The
   fix is transport behaviour, not a format, and is planned in
-  `docs/post-1.7.5.md` item 1.
+  `docs/archived-plans/post-1.7.5.md` item 1.
 - v1 still leaks until 1.8.0: both forms are published, and a v1 record
   already stored lives out its TTL (45 minutes for presence, 30 days for a
   key epoch). A 1.7.4 member's records are v1 only for as long as they run
@@ -580,7 +580,7 @@ others beside them in `network/tests.rs`.
   nothing naming the neighbor asked, so the marker has to go into the relay
   envelope or the gossip frame, both frozen with this release. It costs a
   range asked for again, never a line. **Scheduled for 1.8.0:** see
-  `docs/post-1.7.5.md`, "Already scheduled for 1.8.0".
+  `docs/archived-plans/post-1.7.5.md`, "Already scheduled for 1.8.0".
 - **Room transfer key derivation. Done in 1.7.5:** an inbound transfer frame
   is checked under the key its transfer derived at setup
   (`xfer_frame_key`, from `xfer_recv`, `xfer_send` or `xfer_pending` when the
@@ -798,7 +798,7 @@ they matter.
   v2 records name neither the room nor the member, but every STORE and lookup
   that carries them is signed under the member's long-term DHT identity, so
   storers still learn the member (see item 9's known limits). Moved to
-  `docs/post-1.7.5.md` item 1, which plans it.
+  `docs/archived-plans/post-1.7.5.md` item 1, which plans it.
 - **An Away status.** An "Away" or "Not at PC" state, set by hand and by idle
   time, sent as a new friend-session extension frame (older builds ignore
   unknown ones), shown in the friends list and the chat header. **Done in
@@ -911,10 +911,10 @@ the release notes.
 - **The list shows how many rooms an identity owns. Built in 1.7.5, on in
   1.8.0:** the list can be padded to 8, 16, 32 or 48 salts with pads only the
   identity can tell apart, and sorted, and 1.7.5 drops its own pads from any
-  list it reads ([The owned-rooms list](channels-format.md#the-owned-rooms-list-kind-7)).
+  list it reads ([The owned-rooms list](../channels-format.md#the-owned-rooms-list-kind-7)).
   It does not publish them yet (`PAD_OWNED_ROOMS_LIST`): a 1.7.4 device on
   the same identity would take every pad for a room and publish it back. See
-  `docs/post-1.7.5.md`, "Already scheduled for 1.8.0".
+  `docs/archived-plans/post-1.7.5.md`, "Already scheduled for 1.8.0".
 - **Older builds don't store record kind 7.** Absence is only concluded after
   four nodes have answered (`MIN_RESPONDERS_FOR_ABSENCE`).
 - **Recovery has no end-to-end test. Done in 1.7.5:** the look runs over a

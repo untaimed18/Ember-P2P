@@ -2,10 +2,10 @@
 
 What automated checks cannot cover before tagging `v1.7.5`. Tick each box, and
 file anything that fails before tagging rather than after. 1.7.5 freezes the
-Channels formats (`docs/post-1.7.4.md`, "Channels: the format freeze";
+Channels formats (`docs/archived-plans/post-1.7.4.md`, "Channels: the format freeze";
 `docs/channels-format.md`, "What freezes at the end of the beta"), so this run
 is the last chance to find a format problem cheaply. It repeats 1.7.4's run
-(`docs/release-checklist-1.7.4.md`, the baseline) and adds what 1.7.5 changed.
+(`docs/archived-plans/release-checklist-1.7.4.md`, the baseline) and adds what 1.7.5 changed.
 
 ## 0. Automated checks
 

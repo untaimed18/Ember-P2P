@@ -1,7 +1,7 @@
 # Channels: wire and DHT formats
 
 The format spec for Channels, as frozen with 1.7.5
-([post-1.7.4 item 4](post-1.7.4.md#4-a-short-format-spec); what is frozen is
+([post-1.7.4 item 4](archived-plans/post-1.7.4.md#4-a-short-format-spec); what is frozen is
 listed at the end). It covers what goes over the gossip mesh, what is kept on
 the Ember DHT, and the friend-session sub-types frozen with them. Every number here is read
 from the code; identifiers are in backticks so they can be grepped. Where the
@@ -53,7 +53,7 @@ A room frame is three layers deep:
 `"ember-channel-gossip-v1\0" || channel_id || msg_id || sender_counter ||
 timestamp` (`gossip_aad`). Neither version byte nor `ttl` is under the AEAD:
 `ttl` has to change as the frame travels, which is why a relay can raise it
-(see [post-1.7.4 item 8](post-1.7.4.md#8-an-authenticated-marker-on-catch-up-re-serves)
+(see [post-1.7.4 item 8](archived-plans/post-1.7.4.md#8-an-authenticated-marker-on-catch-up-re-serves)
 and kind 8's [admission rule](#admission-item-8), which is how 1.7.5 answers it).
 `GOSSIP_ENVELOPE_OVERHEAD` (41) is the body version, nonce and tag.
 
@@ -244,7 +244,7 @@ older builds drop them like any number they do not know.
 ## Chat v2 (kinds 64 and 65)
 
 From 1.7.5. It fills in
-[post-1.7.4 item 2](post-1.7.4.md#2-a-second-version-of-the-chat-message).
+[post-1.7.4 item 2](archived-plans/post-1.7.4.md#2-a-second-version-of-the-chat-message).
 A chat line (15) and its revision (19) have fixed layouts, so replies were
 fitted inside the signed text as tag characters (`with_reply_trailer`) and
 any further field would have needed another frame number. The second version
@@ -715,7 +715,7 @@ The `extra` each kind carries:
 - **3, moderation.** The owner's whole governance snapshot (welcome, bans,
   moderators, `ModerationTail`). The storer does not check its shape; readers
   do. Worst case 1164 of 1165 bytes (see
-  [post-1.7.4 item 1](post-1.7.4.md#1-decide-the-future-of-the-room-settings-snapshot)).
+  [post-1.7.4 item 1](archived-plans/post-1.7.4.md#1-decide-the-future-of-the-room-settings-snapshot)).
   From 1.7.5 this record is frozen as it is, and new room settings go in
   kind 8.
 - **4, handoff.** `version(8) || successor_pubkey(32) || successor_id(16) ||
@@ -785,14 +785,14 @@ Recovery (`commands/channel_recovery.rs`) merges the salts of every copy the
 identity signed that comes back (`merged_lists`), and takes a lookup that
 finds nothing as "no list" only once `MIN_RESPONDERS_FOR_ABSENCE` (4) nodes
 have answered. Builds older than kind 7 do not store it. The known limits are
-under [Owned-room recovery](post-1.7.4.md#owned-room-recovery).
+under [Owned-room recovery](archived-plans/post-1.7.4.md#owned-room-recovery).
 
 ## Room settings (kind 8)
 
 From 1.7.5. It fills in
-[post-1.7.4 item 1](post-1.7.4.md#1-decide-the-future-of-the-room-settings-snapshot)
-and carries [item 7](post-1.7.4.md#7-a-way-back-in-for-a-member-behind-a-private-rooms-key)'s
-key commitment and [item 8](post-1.7.4.md#8-an-authenticated-marker-on-catch-up-re-serves)'s
+[post-1.7.4 item 1](archived-plans/post-1.7.4.md#1-decide-the-future-of-the-room-settings-snapshot)
+and carries [item 7](archived-plans/post-1.7.4.md#7-a-way-back-in-for-a-member-behind-a-private-rooms-key)'s
+key commitment and [item 8](archived-plans/post-1.7.4.md#8-an-authenticated-marker-on-catch-up-re-serves)'s
 admission rule. Code: `SignedRecord::channel_settings_at`,
 `parse_channel_settings`, `encode_settings_extra` and `settings_fields` in
 `publish.rs`; `settings_key`, `key_commitment` and `RosterAdmission` in
@@ -1134,7 +1134,7 @@ unaffected otherwise: nothing they rely on moves out of kind 3.
 ## Private membership records, v2 (item 9)
 
 From 1.7.5. It fills in
-[post-1.7.4 item 9](post-1.7.4.md#9-keep-private-room-membership-out-of-the-dht).
+[post-1.7.4 item 9](archived-plans/post-1.7.4.md#9-keep-private-room-membership-out-of-the-dht).
 In v1 a private room's presence record names the room (`file_hash`,
 `ember_file_hash`) and the member (`publisher_key`) in its header, so every
 storer learns the roster, and its seal binds the room but not the member, so
@@ -1345,7 +1345,7 @@ pseudonym, room-blind key and blinded member id that member uses. It still
 cannot tell from the records which room those belong to. Sending membership
 STOREs and lookups under a throwaway DHT identity, ideally through a relay,
 would close this; it is transport behaviour, not a record format, and is
-planned in [post-1.7.5 item 1](post-1.7.5.md#1-private-room-membership-traffic-under-a-throwaway-dht-identity).
+planned in [post-1.7.5 item 1](archived-plans/post-1.7.5.md#1-private-room-membership-traffic-under-a-throwaway-dht-identity).
 
 ## Feed heads (record type 0x04)
 
@@ -1353,7 +1353,7 @@ Not a room format, but a DHT record with the same header and trailer framing
 as channel records (`network/ember/feed.rs`, `SignedRecord::feed_head_record`).
 A feed is a signed, updatable list of files under a publisher's identity; the
 head points at the current list, which is an ordinary collection file
-fetched like any download. Design: [post-1.7.5 item 3](post-1.7.5.md#3-follow-a-publisher-feeds).
+fetched like any download. Design: [post-1.7.5 item 3](archived-plans/post-1.7.5.md#3-follow-a-publisher-feeds).
 
 **Privacy.** A feed is public to whoever has its link, and to nobody else
 unless it is listed (below). The 16-byte salt only the link holds is never
@@ -1963,7 +1963,7 @@ reads (see kind 2 above).
   transition: both forms published until 1.8.0, which stops publishing v1
   except the owner's own key copy and rotates every private room once.
   Sending membership traffic under a throwaway DHT identity is not part of
-  the format and can come later (`docs/post-1.7.5.md` item 1).
+  the format and can come later (`docs/archived-plans/post-1.7.5.md` item 1).
 - A member's languages in their presence record: the first in byte 67 of a
   public room's record and the nickname pad's last byte in a private room's
   seal, and, from 1.7.6, the second in byte 68 and the pad byte before the
@@ -1984,7 +1984,7 @@ reads (see kind 2 above).
 
 **Nothing is left open.** Every question the post-1.7.4 plan listed for the
 freeze was decided in 1.7.5; the decisions are above and in
-[post-1.7.4.md](post-1.7.4.md#channels-the-format-freeze). What changes next is
+[post-1.7.4.md](archived-plans/post-1.7.4.md#channels-the-format-freeze). What changes next is
 already scheduled: **1.8.0** stops sending chat frames 15 and 19 (and sets
 `EXT_FLAG_DISPLAY` on kinds 64 and 65), and stops publishing v1 private
 membership records, rotating every private room once as it does, so a room
@@ -1992,4 +1992,4 @@ has one cut-over to test. It also adds a marker that says a catch-up reply
 was relayed, so such a reply moves the asker's catch-up frontier; today a
 relayed reply cannot be told from the hop's own TTL-1 line, and the range is
 asked for again (see
-[post-1.7.5.md](post-1.7.5.md#already-scheduled-for-180)).
+[post-1.7.5.md](archived-plans/post-1.7.5.md#already-scheduled-for-180)).
