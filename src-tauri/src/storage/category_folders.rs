@@ -67,12 +67,30 @@ pub fn normalize_collection_entry_folder(value: &str) -> String {
 /// it is part of the name, not a level), then `entry_folder`'s levels. Empty
 /// when neither leaves anything.
 pub fn collection_segments(collection_name: &str, entry_folder: &str) -> Vec<String> {
-    clean_segment(collection_name)
-        .into_iter()
-        .chain(segments_of(entry_folder, MAX_COLLECTION_ENTRY_DEPTH))
-        .take(MAX_COLLECTION_DEPTH)
-        .collect()
+    // Without a level of its own, a nameless collection's folders would land
+    // straight among the category's, or in any other folder of Downloads
+    // that happens to share a name with one.
+    let own = clean_segment(collection_name).unwrap_or_else(|| UNNAMED_COLLECTION.to_string());
+    let mut length = own.chars().count();
+    let mut segments = vec![own];
+    for segment in segments_of(entry_folder, MAX_COLLECTION_ENTRY_DEPTH) {
+        length += 1 + segment.chars().count();
+        if length > MAX_COLLECTION_PATH_CHARS {
+            break;
+        }
+        segments.push(segment);
+    }
+    segments
 }
+
+/// The folder a collection with no usable name downloads into.
+const UNNAMED_COLLECTION: &str = "Collection";
+
+/// Longest the folders a collection adds may run, separators included. Each
+/// level is held to [`MAX_SEGMENT_CHARS`], but a collection comes from anyone,
+/// and five full levels below a category would take a file past the 260
+/// characters Explorer and most programs can open, though Ember can write it.
+pub const MAX_COLLECTION_PATH_CHARS: usize = 140;
 
 fn segments_of(value: &str, max: usize) -> Vec<String> {
     value
@@ -80,6 +98,25 @@ fn segments_of(value: &str, max: usize) -> Vec<String> {
         .filter_map(clean_segment)
         .take(max)
         .collect()
+}
+
+/// Characters that show as nothing, or as a blank, beyond the formatters the
+/// shared check catches: two folders differing only by one look the same, and
+/// a level made of fillers looks unnamed.
+fn is_invisible_in_a_name(c: char) -> bool {
+    matches!(c,
+        // Soft hyphen, combining grapheme joiner.
+        '\u{00AD}' | '\u{034F}'
+        // Hangul fillers.
+        | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}'
+        // Khmer inherent vowels, Mongolian free variation selectors.
+        | '\u{17B4}' | '\u{17B5}' | '\u{180B}'..='\u{180F}'
+        // Invisible operators and deprecated format characters past the
+        // shared check's range, interlinear annotation.
+        | '\u{2065}' | '\u{206A}'..='\u{206F}' | '\u{FFF9}'..='\u{FFFB}'
+        // Tags.
+        | '\u{E0000}'..='\u{E007F}'
+    )
 }
 
 /// One folder level made safe, or `None` when nothing usable is left.
@@ -100,7 +137,7 @@ fn clean_segment(segment: &str) -> Option<String> {
         .chars()
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() || crate::security::is_invisible_or_bidi_control_pub(c) => '_',
+            c if c.is_control() || crate::security::is_invisible_or_bidi_control_pub(c) || is_invisible_in_a_name(c) => '_',
             c => c,
         })
         .collect();
@@ -350,9 +387,25 @@ mod tests {
             vec!["Show_Name", "S1"],
             "the collection's name is one level"
         );
-        assert_eq!(collection_segments("..", "S1"), vec!["S1"]);
-        assert!(collection_segments("", "").is_empty());
+        assert_eq!(
+            collection_segments("..", "Video"),
+            vec![UNNAMED_COLLECTION, "Video"],
+            "a nameless collection keeps a level of its own, off the category folders beside it"
+        );
+        assert_eq!(collection_segments("", ""), vec![UNNAMED_COLLECTION]);
         assert_eq!(collection_segments("N", "a/b/c/d/e").len(), MAX_COLLECTION_DEPTH);
+
+        let long = "x".repeat(MAX_SEGMENT_CHARS);
+        let deep = collection_segments(&long, &[long.as_str(); 4].join("/"));
+        let length = deep.iter().map(|s| s.chars().count()).sum::<usize>() + deep.len() - 1;
+        assert!(length <= MAX_COLLECTION_PATH_CHARS, "{length} characters");
+        assert_eq!(deep.len(), 2, "the deeper levels give way");
+
+        assert_eq!(
+            normalize_collection_entry_folder("Season 1\u{00AD}/\u{3164}"),
+            "Season 1_/_",
+            "nothing that shows as nothing"
+        );
     }
 
     #[test]

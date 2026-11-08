@@ -104,6 +104,9 @@ pub struct ResolvedLimits {
 
 impl ResolvedLimits {
     /// The only constructor, so no source of limits can skip the ratio rule.
+    /// The daily upload quota lowers the upload limit after this, and on
+    /// purpose leaves the download limit as resolved here (see
+    /// [`super::quota`]).
     fn new(upload: u64, download: u64, active: Option<ActiveScheduleRule>) -> Self {
         let (max_download_speed, download_ratio_cap) = ratio::effective_download(upload, download);
         Self {

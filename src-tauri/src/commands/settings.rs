@@ -642,45 +642,66 @@ fn normalize_shared_folders(folders: Vec<String>) -> Result<Vec<String>, String>
         .collect())
 }
 
+/// What a save did to the release folder (`release_share`), for once it is
+/// written: the folder it was, and where its files go now.
+struct ReleaseFolderChange {
+    from: std::path::PathBuf,
+    /// `None` when both settings are off, or no download folder is left.
+    to: Option<std::path::PathBuf>,
+}
+
 /// Keep the release folder (`release_share`) in the shared folders exactly
-/// while one of its settings is on: added when one turns on, taken back when
-/// both are off or the download folder it was in has moved. Returns the folder
-/// to clear of release files once the save is written.
+/// while one of its settings is on, inside the download folder: added when
+/// one turns on, moved with the download folder, taken back when both are off.
 ///
-/// A new download folder is checked for provenance and writability further
-/// down this save, so nothing is created in one here: the release folder
-/// moves into it on the next save. One an existing shared folder already
-/// contains is shared through that one and is not listed again, since shared
-/// folders may not overlap.
-async fn sync_release_share_folder(
-    old: &AppSettings,
-    settings: &mut AppSettings,
-) -> Result<Option<std::path::PathBuf>, String> {
+/// Runs once a changed download folder has passed its provenance check, since
+/// following it means creating the folder there. A folder already listed is
+/// not touched on disk while it stays where it is, so a save goes through with
+/// the download folder offline (an unplugged drive, a share that is down), and
+/// one that cannot follow a move stays where it was until a later save can.
+/// One an existing shared folder already contains is shared through that one
+/// and is not listed again, since shared folders may not overlap.
+async fn sync_release_share_folder(settings: &mut AppSettings) -> Result<Option<ReleaseFolderChange>, String> {
+    use std::path::PathBuf;
     let listed = std::mem::take(&mut settings.ember_releases_folder);
-    let download_moved = normalized_path_components(std::path::Path::new(&settings.download_folder))
-        != normalized_path_components(std::path::Path::new(&old.download_folder));
-    let desired = match crate::release_share::folder_in(&settings.download_folder) {
-        Some(_) if !crate::release_share::wanted(settings) => None,
-        Some(_) if download_moved => (!listed.is_empty()).then(|| std::path::PathBuf::from(&listed)),
-        Some(folder) => Some(
-            tokio::task::spawn_blocking(move || -> std::io::Result<std::path::PathBuf> {
-                std::fs::create_dir_all(&folder)?;
-                folder.canonicalize()
-            })
-            .await
-            .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
-            .map_err(|e| coded_ctx("settings_release_folder_failed", "Could not create the Ember releases folder", e))?,
-        ),
+    let wanted_at = crate::release_share::wanted(settings)
+        .then(|| crate::release_share::folder_in(&settings.download_folder))
+        .flatten();
+    let desired = match wanted_at {
         None => None,
+        Some(at) if !listed.is_empty() && shared_folder_paths_equal(&at.to_string_lossy(), &listed) => {
+            Some(PathBuf::from(&listed))
+        }
+        Some(at) => {
+            let created = tokio::task::spawn_blocking(move || crate::release_share::create(&at))
+                .await
+                .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?;
+            match created {
+                Ok(folder) => Some(folder),
+                Err(error) if listed.is_empty() => {
+                    return Err(coded_ctx(
+                        "settings_release_folder_failed",
+                        "Could not create the Ember releases folder",
+                        error,
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "Release sharing: the Ember releases folder could not follow the download folder ({error}); it stays at {listed}"
+                    );
+                    Some(PathBuf::from(&listed))
+                }
+            }
+        }
     };
-    let mut clear = None;
+    let mut change = None;
     if !listed.is_empty()
         && !desired
             .as_ref()
             .is_some_and(|folder| shared_folder_paths_equal(&folder.to_string_lossy(), &listed))
     {
         settings.shared_folders.retain(|folder| !shared_folder_paths_equal(folder, &listed));
-        clear = Some(std::path::PathBuf::from(&listed));
+        change = Some(ReleaseFolderChange { from: PathBuf::from(&listed), to: desired.clone() });
     }
     if let Some(folder) = desired {
         let covered = settings
@@ -693,7 +714,13 @@ async fn sync_release_share_folder(
         }
         settings.ember_releases_folder = crate::commands::share_browser::display_fs_path(&folder);
     }
-    Ok(clear)
+    Ok(change)
+}
+
+/// Whether `path` is the release folder the settings keep shared, which only
+/// the release-sharing settings may add or take away.
+pub(crate) fn is_release_share_folder(settings: &AppSettings, path: &str) -> bool {
+    !settings.ember_releases_folder.is_empty() && shared_folder_paths_equal(path, &settings.ember_releases_folder)
 }
 
 fn shared_folder_paths_equal(a: &str, b: &str) -> bool {
@@ -1742,7 +1769,6 @@ pub async fn update_settings(
         tokio::task::spawn_blocking(move || normalize_shared_folders(shared_folders))
             .await
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
-    let release_folder_to_clear = sync_release_share_folder(&old_settings, &mut settings).await?;
     // Provenance before validation. `validate_settings` resolves the folder on
     // disk, and resolving `\\host\share` opens an SMB session that hands the
     // user's NTLM credentials to that host — so a changed folder the picker
@@ -1758,6 +1784,7 @@ pub async fn update_settings(
             "Choose the download folder with Browse before saving",
         ));
     }
+    let release_folder_change = sync_release_share_folder(&mut settings).await?;
     refuse_unoffered_choices(&settings, &old_settings)?;
     {
         let settings_for_validation = settings.clone();
@@ -2107,15 +2134,45 @@ pub async fn update_settings(
     crate::sharing::disk::set_hash_at_low_priority(settings.hash_low_priority);
     crate::release_share::configure(&settings);
     // Awaited, under the save lock: a save turning sharing back on straight
-    // after must not find this still deleting what it has just kept.
-    if let Some(folder) = release_folder_to_clear {
-        let _ = tokio::task::spawn_blocking(move || crate::release_share::clear(&folder)).await;
+    // after must not find this still deleting what it has just kept. Before
+    // the shared-folder changes below, so a moved folder is scanned with its
+    // files already in it.
+    if let Some(ReleaseFolderChange { from, to }) = release_folder_change {
+        let _ = tokio::task::spawn_blocking(move || match to {
+            Some(to) => {
+                let moved = crate::release_share::migrate(&from, &to);
+                tracing::info!("Release sharing: {moved} file(s) moved with the download folder");
+            }
+            None => crate::release_share::clear(&from),
+        })
+        .await;
+    } else if old_settings.seed_ember_releases
+        && !settings.seed_ember_releases
+        && !settings.ember_releases_folder.is_empty()
+    {
+        // Only the installer this install updated with is left to share.
+        let folder = std::path::PathBuf::from(&settings.ember_releases_folder);
+        let removed = tokio::task::spawn_blocking({
+            let folder = folder.clone();
+            move || crate::release_share::retain_installers(&folder, crate::release_share::own_installer_suffix())
+        })
+        .await
+        .unwrap_or(0);
+        if removed > 0 {
+            if let Some(watcher) = state.shared_folder_watcher.clone() {
+                watcher.queue_rescan_after(vec![folder], std::time::Duration::from_secs(2));
+            }
+        }
     }
     if settings.watch_shared_folders != old_settings.watch_shared_folders {
         if let Some(watcher) = state.shared_folder_watcher.clone() {
             let enabled = settings.watch_shared_folders;
-            // Adds or drops every OS watch, which can block on an offline share.
-            tokio::task::spawn_blocking(move || watcher.set_enabled(enabled));
+            // Taken here, under the save lock and so in save order; adding or
+            // dropping every OS watch can block on an offline share, so that
+            // runs apart and follows whatever the setting is by then.
+            if watcher.note_enabled(enabled) {
+                tokio::task::spawn_blocking(move || watcher.apply_enabled());
+            }
         }
     }
 
@@ -4100,18 +4157,17 @@ mod tests {
     }
 
     /// The release folder is listed while a release-sharing setting is on,
-    /// never alongside a shared folder that already holds it, never created
-    /// in a download folder this same save moves to, and taken back with its
-    /// files to clear once both settings are off.
+    /// never alongside a shared folder that already holds it, left alone on
+    /// disk while it stays put, moved with the download folder when it can
+    /// follow, and taken back with its files to clear once both are off.
     #[tokio::test]
     async fn the_release_folder_is_shared_exactly_while_release_sharing_is_on() {
+        use std::path::PathBuf;
+        type Change = Option<(PathBuf, Option<PathBuf>)>;
         // The folders as `update_settings` hands them on: normalized first.
-        async fn sync_release_share_folder(
-            old: &AppSettings,
-            settings: &mut AppSettings,
-        ) -> Result<Option<std::path::PathBuf>, String> {
+        async fn sync_release_share_folder(_old: &AppSettings, settings: &mut AppSettings) -> Result<Change, String> {
             settings.shared_folders = normalize_shared_folders(std::mem::take(&mut settings.shared_folders))?;
-            super::sync_release_share_folder(old, settings).await
+            Ok(super::sync_release_share_folder(settings).await?.map(|change| (change.from, change.to)))
         }
         let base = std::env::temp_dir().join(format!(
             "ember-release-folder-{}-{}",
@@ -4151,12 +4207,20 @@ mod tests {
         sync_release_share_folder(&again, &mut third).await.unwrap();
         assert_eq!(third.shared_folders, on.shared_folders, "still once");
 
+        // The download folder's drive unplugged: any save still goes through.
+        std::fs::remove_dir(&release_dir).unwrap();
+        let mut offline = again.clone();
+        assert_eq!(sync_release_share_folder(&again, &mut offline).await.unwrap(), None);
+        assert_eq!(offline.ember_releases_folder, listed);
+        assert!(!release_dir.exists(), "nothing touched on disk while it stays put");
+        std::fs::create_dir(&release_dir).unwrap();
+
         let mut turned_off = AppSettings {
             share_ember_installer: false,
             ..on.clone()
         };
         let clear = sync_release_share_folder(&on, &mut turned_off).await.unwrap();
-        assert_eq!(clear.as_deref(), Some(std::path::Path::new(&listed)));
+        assert_eq!(clear, Some((PathBuf::from(&listed), None)));
         assert!(turned_off.shared_folders.is_empty());
         assert!(turned_off.ember_releases_folder.is_empty());
 
@@ -4176,18 +4240,32 @@ mod tests {
         sync_release_share_folder(&covered, &mut uncovered).await.unwrap();
         assert_eq!(uncovered.shared_folders, vec![parent], "the user's own folder stays");
 
+        // A download folder that is not there (unplugged, or not writable):
+        // the release folder stays where it is rather than failing the save.
+        let unreachable = base.join("unplugged");
+        let mut stuck = AppSettings {
+            download_folder: unreachable.to_string_lossy().into_owned(),
+            ..on.clone()
+        };
+        assert_eq!(sync_release_share_folder(&on, &mut stuck).await.unwrap(), None);
+        assert_eq!(stuck.ember_releases_folder, listed);
+        assert!(!unreachable.exists(), "nothing made where the download folder is missing");
+
         let moved_to = base.join("elsewhere");
+        std::fs::create_dir_all(&moved_to).unwrap();
         let mut moved = AppSettings {
             download_folder: moved_to.to_string_lossy().into_owned(),
             ..on.clone()
         };
-        assert_eq!(sync_release_share_folder(&on, &mut moved).await.unwrap(), None);
-        assert!(!moved_to.exists(), "nothing created where the save is moving to");
-        assert_eq!(moved.ember_releases_folder, listed, "the folder follows on the next save");
-        let mut next = moved.clone();
-        let clear = sync_release_share_folder(&moved, &mut next).await.unwrap();
-        assert_eq!(clear.as_deref(), Some(std::path::Path::new(&listed)), "the old one is taken back");
-        assert!(moved_to.join(crate::release_share::FOLDER_NAME).is_dir());
+        let change = sync_release_share_folder(&on, &mut moved).await.unwrap();
+        let new_dir = moved_to.join(crate::release_share::FOLDER_NAME);
+        assert!(new_dir.is_dir(), "followed in the same save");
+        assert_eq!(change.as_ref().map(|(from, _)| from.clone()), Some(PathBuf::from(&listed)));
+        let to = change.and_then(|(_, to)| to).expect("the files go to the new folder");
+        assert!(shared_folder_paths_equal(&to.to_string_lossy(), &new_dir.canonicalize().unwrap().to_string_lossy()));
+        assert!(shared_folder_paths_equal(&moved.ember_releases_folder, &to.to_string_lossy()));
+        assert_eq!(moved.shared_folders.len(), 1);
+        assert!(shared_folder_paths_equal(&moved.shared_folders[0], &moved.ember_releases_folder));
 
         let _ = std::fs::remove_dir_all(&base);
     }

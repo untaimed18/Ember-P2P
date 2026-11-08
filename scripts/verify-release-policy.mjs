@@ -362,6 +362,63 @@ function releaseJobs(source) {
   );
 }
 
+/**
+ * The write permissions a job may hold, by workflow and job, exactly: every
+ * other job reads only. The release write is the signing job's; the website
+ * job commits docs/index.html to `main` and asks Pages to rebuild.
+ */
+const JOB_WRITE_PERMISSIONS = {
+  ".github/workflows/release.yml": { "sign-publish": ["contents: write"] },
+  ".github/workflows/website.yml": { downloads: ["contents: write", "pages: write"] },
+};
+
+/**
+ * The entries of the `permissions:` block starting at `indent` in `text`, or
+ * the inline value (`write-all`) as a single entry. `null` when there is none.
+ */
+function permissionEntries(text, indent) {
+  const lines = text.split(/\r?\n/);
+  const header = new RegExp(`^ {${indent}}permissions:[ \\t]*(.*?)[ \\t]*(?:#.*)?$`);
+  const at = lines.findIndex((line) => header.test(line));
+  if (at < 0) return null;
+  const inline = lines[at].match(header)[1];
+  if (inline) return [inline];
+  const entries = [];
+  for (const line of lines.slice(at + 1)) {
+    if (!line.trim()) continue;
+    const entry = line.match(new RegExp(`^ {${indent + 2}}(\\S[^#]*?)[ \\t]*(?:#.*)?$`));
+    if (!entry) break;
+    entries.push(entry[1].replace(/:\s+/, ": "));
+  }
+  return entries;
+}
+
+/**
+ * Lines of `run:` scripts that interpolate an expression. A `${{ }}` in a
+ * script is pasted into the shell before it runs, so a tag name, a release
+ * title or a dispatch input could carry commands; values go through `env:`.
+ */
+function runExpressions(source) {
+  const found = [];
+  const lines = source.split(/\r?\n/);
+  let block = -1;
+  lines.forEach((line, index) => {
+    const run = line.match(/^(\s*)(?:- )?run:[ \t]*(.*)$/);
+    if (run) {
+      if (run[2].includes("${{")) found.push(index + 1);
+      block = /^[|>]/.test(run[2]) ? run[1].length : -1;
+      return;
+    }
+    if (block < 0) return;
+    if (line.trim() && line.length - line.trimStart().length <= block) {
+      block = -1;
+    } else if (line.includes("${{")) {
+      found.push(index + 1);
+    }
+  });
+  return found;
+}
+
 export function verifyWorkflow({ root = scriptRoot } = {}) {
   const errors = [];
   let actions = 0;
@@ -399,11 +456,23 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
 
     const jobsIndex = source.indexOf("\njobs:");
     const topLevel = jobsIndex >= 0 ? source.slice(0, jobsIndex) : source;
-    if (!/permissions:\s*\r?\n\s{2}contents:\s*read\b/.test(topLevel)) {
-      errors.push(`${path}: top-level permissions must be contents: read`);
+    const topPermissions = permissionEntries(topLevel, 0);
+    if (topPermissions?.length !== 1 || topPermissions[0] !== "contents: read") {
+      errors.push(`${path}: top-level permissions must be contents: read, and only that`);
+    }
+    for (const line of runExpressions(source)) {
+      errors.push(`${path}:${line}: a run script must not interpolate \${{ }}; pass the value through env`);
     }
 
     for (const [name, body] of releaseJobs(source)) {
+      const entries = permissionEntries(body, 4) ?? [];
+      const writes = entries.filter((entry) => !/:\s*(read|none)$/.test(entry)).sort();
+      const allowed = [...(JOB_WRITE_PERMISSIONS[path]?.[name] ?? [])].sort();
+      if (writes.join() !== allowed.join()) {
+        errors.push(
+          `${path}: ${name} may request ${allowed.length ? allowed.join(" and ") : "read permissions only"}, not ${writes.join(", ") || "less"}`,
+        );
+      }
       if (
         body.includes("scripts/verify-release-policy.mjs") &&
         !/^\s*fetch-depth:\s*0\s*$/m.test(body)
