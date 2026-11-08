@@ -324,6 +324,9 @@ pub(super) fn place_ember_record_pending(
 /// Apply a storer's confirmation that `reference`'s record landed, advancing
 /// the file's republish schedule once none of its records remain unplaced.
 pub(super) fn confirm_ember_record_placed(state: &mut NetworkState, reference: EmberRecordRef) {
+    if !state.ember_batch_publish.record_still_outstanding(reference) {
+        state.ember_publish_refusals.remove(&reference);
+    }
     if place_ember_record_pending(state.publish_schedule(), reference, std::time::Instant::now()) {
         note_ember_file_published(state, reference.file_hash, reference.kind);
     }
@@ -3948,6 +3951,56 @@ pub(super) async fn send_ember_callback_req(
     sent
 }
 
+/// How often the per-keyword allowance is worked out again from the library,
+/// short of the publishable count changing, which redoes it at once. Renames are
+/// what this catches; at worst a renamed file waits this long for its new word.
+const EMBER_KEYWORD_CAP_REBUILD: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Our files allowed under each keyword that more of them carry than a storer
+/// will take from one publisher, keyed by keyword hash. A keyword absent from
+/// the map is under the cap and every file carrying it publishes there.
+///
+/// Every storer refuses a publisher's records past
+/// [`ember::dht::store::MAX_RECORDS_PER_PUBLISHER_PER_KEY`] under one key, so a
+/// library with more files than that under a common word sent the excess every
+/// round only to be refused everywhere, and which ones each storer kept was
+/// whichever arrived first. The files kept are the ones whose hash is closest to
+/// the key: a fixed choice, so the same files hold their slots round after
+/// round, and adding a file to the library moves at most one out.
+pub(super) fn ember_keyword_cap_from(
+    files: impl IntoIterator<Item = ([u8; 16], HashSet<[u8; 16]>)>,
+) -> HashMap<[u8; 16], HashSet<[u8; 16]>> {
+    let cap = ember::dht::store::MAX_RECORDS_PER_PUBLISHER_PER_KEY;
+    let mut by_key: HashMap<[u8; 16], Vec<[u8; 16]>> = HashMap::new();
+    for (file, keys) in files {
+        for key in keys {
+            by_key.entry(key).or_default().push(file);
+        }
+    }
+    by_key
+        .into_iter()
+        .filter_map(|(key, mut carriers)| {
+            carriers.sort_unstable();
+            carriers.dedup();
+            if carriers.len() <= cap {
+                return None;
+            }
+            carriers.sort_by_key(|file| ember::dht::EmberNodeId(*file).distance(&ember::dht::EmberNodeId(key)).0);
+            carriers.truncate(cap);
+            Some((key, carriers.into_iter().collect()))
+        })
+        .collect()
+}
+
+/// Whether `file` may publish under `key`. See [`ember_keyword_cap_from`].
+pub(super) fn ember_keyword_within_cap(
+    cap: &HashMap<[u8; 16], HashSet<[u8; 16]>>,
+    file: &[u8; 16],
+    key: &[u8; 16],
+) -> bool {
+    cap.get(key).is_none_or(|allowed| allowed.contains(file))
+}
+
 /// The words of a file to publish this round: those its pending partial retry
 /// is for, when it has one, or else all of them. A retry whose keys the name no
 /// longer yields (renamed meanwhile) sends the whole set, as a new name needs.
@@ -3993,6 +4046,7 @@ pub(super) async fn maybe_publish_ember_keywords(
         let restricted = collect_friends_only_hashes(&idx, known_files);
         let mut ranked: Vec<(u64, usize, [u8; 16])> = Vec::new();
         let mut seen: HashSet<[u8; 16]> = HashSet::new();
+        let mut publishable_files: Vec<(usize, [u8; 16])> = Vec::new();
         for (i, f) in files.iter().enumerate() {
             if !is_ember_publishable(f)
                 || !kad_may_advertise_partial(known_files, &restricted, &f.hash)
@@ -4008,6 +4062,7 @@ pub(super) async fn maybe_publish_ember_keywords(
             if !seen.insert(hash) {
                 continue;
             }
+            publishable_files.push((i, hash));
             let Some(staleness) = ember_publish_staleness(
                 &state.ember_publish_unplaced,
                 &state.ember_keyword_publish_at,
@@ -4024,6 +4079,28 @@ pub(super) async fn maybe_publish_ember_keywords(
         // inside the republish interval. A fixed budget silently stopped
         // republishing everything past the first few thousand files.
         let publishable = seen.len();
+        let signed_keys = |i: usize, hash: &[u8; 16]| -> Vec<[u8; 16]> {
+            let media = known_files.media_for(hash).and_then(|(_, media)| media);
+            let signed_name =
+                ember::dht::publish::keyword_record_signed_name(&files[i].name, media.as_ref());
+            ember::dht::search::ember_file_keywords(&signed_name)
+                .iter()
+                .map(|word| ember::dht::search::keyword_hash(word))
+                .collect()
+        };
+        if publishable != state.ember_keyword_cap_files
+            || state
+                .ember_keyword_cap_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= EMBER_KEYWORD_CAP_REBUILD)
+        {
+            state.ember_keyword_cap = ember_keyword_cap_from(
+                publishable_files
+                    .iter()
+                    .map(|&(i, hash)| (hash, signed_keys(i, &hash).into_iter().collect())),
+            );
+            state.ember_keyword_cap_at = Some(now);
+            state.ember_keyword_cap_files = publishable;
+        }
         ranked.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
         state.ember_publish_pass.due += ranked.len();
         state.ember_keyword_due_last = ranked.len();
@@ -4035,6 +4112,7 @@ pub(super) async fn maybe_publish_ember_keywords(
         // A file goes out only once every one of its keywords can; its keys are
         // those of the name as its record will sign it, or of a pending retry.
         let retry_keys = state.ember_keyword_retry_keys.clone();
+        let cap = std::mem::take(&mut state.ember_keyword_cap);
         let keys_of = |at: usize| -> Vec<[u8; 16]> {
             let (_, i, hash) = ranked[at];
             let media = known_files.media_for(&hash).and_then(|(_, media)| media);
@@ -4046,6 +4124,7 @@ pub(super) async fn maybe_publish_ember_keywords(
             )
             .iter()
             .map(|word| ember::dht::search::keyword_hash(word))
+            .filter(|key| ember_keyword_within_cap(&cap, &hash, key))
             .collect()
         };
         let pick = ember_publish_pick(
@@ -4082,6 +4161,7 @@ pub(super) async fn maybe_publish_ember_keywords(
                 )
             })
             .collect();
+        state.ember_keyword_cap = cap;
         (send, start_waits)
     };
     for key in start_waits {
@@ -4135,6 +4215,7 @@ pub(super) async fn maybe_publish_ember_keywords(
     }
 
     let mut files_with_no_keywords: Vec<[u8; 16]> = Vec::new();
+    let mut files_capped_out: Vec<[u8; 16]> = Vec::new();
     for (file_hash, file_size, file_name, ember_file_hash, _path) in due {
         // Whatever the probe above (or an earlier pass) found. Announced with the
         // record so an Ember-only search hit can fill the Length, Bitrate, Codec
@@ -4148,15 +4229,32 @@ pub(super) async fn maybe_publish_ember_keywords(
         // the record signs it, so a word cut off to fit is not a key the
         // record's own name cannot vouch for.
         let signed_name = ember::dht::publish::keyword_record_signed_name(&file_name, media.as_ref());
-        let keywords = ember_keywords_to_send(
+        let words = ember_keywords_to_send(
             ember::dht::search::ember_file_keywords(&signed_name),
             state.ember_keyword_retry_keys.get(&file_hash),
         );
-        if keywords.is_empty() {
+        if words.is_empty() {
             // Nothing to publish for this name, ever. Mark it done so it does
             // not get re-selected every tick and starve the rest of the
             // library.
             files_with_no_keywords.push(file_hash);
+            continue;
+        }
+        let keywords: Vec<String> = words
+            .into_iter()
+            .filter(|word| {
+                ember_keyword_within_cap(
+                    &state.ember_keyword_cap,
+                    &file_hash,
+                    &ember::dht::search::keyword_hash(word),
+                )
+            })
+            .collect();
+        if keywords.is_empty() {
+            // Every word it has is held by closer files. That changes only with
+            // the library, so it is looked at again when the allowance is next
+            // worked out rather than a whole republish interval from now.
+            files_capped_out.push(file_hash);
             continue;
         }
         let mut planned: Vec<(String, EmberRecordRef, Vec<ember::dht::EmberContact>)> = Vec::new();
@@ -4230,6 +4328,11 @@ pub(super) async fn maybe_publish_ember_keywords(
         state
             .publish_schedule()
             .stamp(hash, EmberPublishKind::Keyword, now);
+    }
+    for hash in files_capped_out {
+        state
+            .ember_keyword_publish_at
+            .insert(hash, now + EMBER_KEYWORD_CAP_REBUILD);
     }
 
     flush_ember_batch_publish(socket, state).await;

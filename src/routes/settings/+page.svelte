@@ -9,6 +9,7 @@
     pickPreviewPlayer as pickPreviewPlayerDialog,
     importWebServicesFile,
     getExampleWebService,
+    openReleaseNotes,
     SETTINGS_CHANGED_EVENT,
     type LaunchSettings,
     type UpdateSettingsResult,
@@ -93,6 +94,8 @@
   import {
     clampInputUtf8Bytes,
     formatDateTime,
+    formatDecimal,
+    formatNumber,
     formatSize,
     formatSpeed,
     NICKNAME_MAX_BYTES,
@@ -142,6 +145,10 @@
   import ConnectionDoctor from '$lib/components/ConnectionDoctor.svelte';
   import { highlightMatches } from '$lib/stores/highlight';
   import SpeedInput from '$lib/components/SpeedInput.svelte';
+
+  /** `types::MAX_UPLOAD_QUOTA_GB` and `types::MIN_UPLOAD_QUOTA_SPEED`. */
+  const UPLOAD_QUOTA_MAX_GB = 1000;
+  const UPLOAD_QUOTA_MIN_SPEED = 1024;
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import EmuleImport from '$lib/components/EmuleImport.svelte';
   import {
@@ -161,6 +168,15 @@
 
   // Silent updates. `supported` is the backend's answer for this install;
   // the status line describes what the saved setting is doing right now.
+  // Sharing every release starts with the next update check, which can be an
+  // hour away: run one as soon as the setting is saved on.
+  let seedingWasOn: boolean | null = null;
+  $effect(() => {
+    const on = $appSettings?.seed_ember_releases;
+    if (on === undefined) return;
+    if (seedingWasOn === false && on) void checkForUpdates({ silent: true });
+    seedingWasOn = on;
+  });
   const silentSupported = $derived($silentUpdate?.supported ?? false);
   const silentUnsupportedHint = $derived.by(() => {
     switch ($silentUpdate?.unsupportedReason) {
@@ -1413,6 +1429,7 @@
       'max_connections', 'max_connections_per_five_secs',
       'download_queue_wait_secs', 'multisource_retry_rounds',
       'max_download_file_size_gib', 'search_timeout_secs', 'max_friends', 'chat_attachment_auto_accept_mb',
+      'upload_quota_gb', 'upload_quota_speed',
     ] as const;
     const numericValues = s as unknown as Record<string, unknown>;
     for (const key of numericFields) {
@@ -1462,6 +1479,8 @@
     s.max_friends = ci(s.max_friends, 1, 500, 200);
     // 0 is "always ask", not an empty box; the ceiling is the attachment cap.
     s.chat_attachment_auto_accept_mb = cn(s.chat_attachment_auto_accept_mb, 2048, 25);
+    s.upload_quota_gb = ci(s.upload_quota_gb, 1, UPLOAD_QUOTA_MAX_GB, 50);
+    s.upload_quota_speed = ci(s.upload_quota_speed, UPLOAD_QUOTA_MIN_SPEED, MAX_CONFIGURED_SPEED_BPS, 20 * 1024);
     return { error: null, adjusted };
   }
 
@@ -1540,6 +1559,8 @@
     'max_download_speed',
     'alt_max_upload_speed',
     'alt_max_download_speed',
+    'upload_quota_gb',
+    'upload_quota_speed',
     'bandwidth_schedule',
     'tcp_port',
     'udp_port',
@@ -1565,6 +1586,8 @@
     max_download_speed: 'bandwidth',
     alt_max_upload_speed: 'bandwidth',
     alt_max_download_speed: 'bandwidth',
+    upload_quota_gb: 'bandwidth',
+    upload_quota_speed: 'bandwidth',
     bandwidth_schedule: 'bandwidth',
     chat_attachment_auto_accept_mb: 'friends',
     max_friends: 'friends',
@@ -3812,6 +3835,34 @@
             </div>
           </div>
 
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_scanning()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="watch-folders-label" for="watch-folders-switch">{m.settings_watch_shared_folders()}</label>
+                <span class="hint" id="watch-folders-hint">{m.settings_watch_shared_folders_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="watch-folders-switch"
+                bind:checked={settings.watch_shared_folders}
+                ariaLabelledby="watch-folders-label"
+                ariaDescribedby="watch-folders-hint"
+              />
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="hash-low-priority-label" for="hash-low-priority-switch">{m.settings_hash_low_priority()}</label>
+                <span class="hint" id="hash-low-priority-hint">{m.settings_hash_low_priority_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="hash-low-priority-switch"
+                bind:checked={settings.hash_low_priority}
+                ariaLabelledby="hash-low-priority-label"
+                ariaDescribedby="hash-low-priority-hint"
+              />
+            </div>
+          </div>
+
           <!-- Both automatic uses of the tag, under one explanation of what the
                tag is, so neither switch has to be understood on its own. -->
           <div class="settings-group">
@@ -4208,6 +4259,60 @@
               </div>
               {#if runtimeStatus?.alt_speed}
                 {@render downloadRatioCapNote()}
+              {/if}
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_upload_quota()}</h4>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="upload-quota-label" for="upload-quota-switch">{m.settings_upload_quota_label()}</label>
+                <span class="hint" id="upload-quota-hint">{m.settings_upload_quota_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="upload-quota-switch"
+                bind:checked={settings.upload_quota_enabled}
+                ariaLabelledby="upload-quota-label"
+                ariaDescribedby="upload-quota-hint"
+              />
+            </div>
+            <!-- Editable while off, like the alternative limits, so the amounts
+                 can be set before the quota is switched on. -->
+            <div class="field nested upload-quota-limits" class:is-inactive={!settings.upload_quota_enabled}>
+              <label for="upload-quota-gb">{m.settings_upload_quota_gb()}</label>
+              <div class="apply-input">
+                <input
+                  id="upload-quota-gb"
+                  class="compact-number"
+                  type="number"
+                  min="1"
+                  max={UPLOAD_QUOTA_MAX_GB}
+                  step="1"
+                  bind:value={settings.upload_quota_gb}
+                  onkeydown={(e) => applyOnEnter(e, ['upload_quota_gb'])}
+                />
+                {@render applyButton(['upload_quota_gb'], m.settings_upload_quota_gb())}
+              </div>
+              <div class="apply-input">
+                <div class="apply-grow">
+                  <SpeedInput label={m.settings_upload_quota_speed()} bind:value={settings.upload_quota_speed} onenter={() => void applyFields(['upload_quota_speed'])} onescape={() => revertTyped(['upload_quota_speed'])} />
+                </div>
+                {@render applyButton(['upload_quota_speed'], m.settings_upload_quota_speed())}
+              </div>
+              <span class="hint">{m.settings_upload_quota_speed_hint()}</span>
+              {#if runtimeStatus}
+                <span class="hint" role="status">
+                  {runtimeStatus.upload_quota_reached
+                    ? m.settings_upload_quota_reached({
+                        used: formatDecimal(runtimeStatus.uploaded_today / 1e9, 1),
+                        speed: formatSpeed(savedSettings?.upload_quota_speed ?? settings.upload_quota_speed),
+                      })
+                    : m.settings_upload_quota_today({
+                        used: formatDecimal(runtimeStatus.uploaded_today / 1e9, 1),
+                        quota: formatNumber(savedSettings?.upload_quota_gb ?? settings.upload_quota_gb),
+                      })}
+                </span>
               {/if}
             </div>
           </div>
@@ -5561,13 +5666,17 @@
               <div
                 class="about-update-status"
                 class:success={$updater.phase === 'uptodate' || $updater.phase === 'available' || $updater.phase === 'ready'}
-                class:error={$updater.phase === 'error' || $updater.phase === 'stalled' || $updater.signatureMissing}
+                class:error={$updater.phase === 'error' || $updater.phase === 'stalled' || $updater.signatureMissing || !!$updater.systemTooOld}
                 class:busy={$updater.phase === 'checking' || $updater.phase === 'downloading' || $updater.phase === 'installing'}
               >
                 {#if $updater.phase === 'uptodate'}
                   <span class="feedback success">{m.updater_uptodate()}</span>
                 {:else if $updater.phase === 'available'}
                   <span class="feedback success">{m.updater_available_status({ version: $updater.version ?? '' })}</span>
+                  {#if $updater.version}
+                    {@const version = $updater.version}
+                    <button type="button" class="about-notes-link" onclick={() => void openReleaseNotes(version).catch(() => {})}>{m.updater_full_notes()}</button>
+                  {/if}
                 {:else if $updater.phase === 'downloading'}
                   <span class="hint">{aboutPercent !== null ? m.updater_downloading_pct({ pct: aboutPercent }) : m.updater_downloading()}</span>
                   {#if aboutPercent !== null}
@@ -5579,6 +5688,10 @@
                   <span class="hint">{m.updater_installing()}</span>
                 {:else if $updater.phase === 'ready'}
                   <span class="feedback success">{m.updater_ready_body({ version: $updater.version ?? '' })}</span>
+                  {#if $updater.version}
+                    {@const version = $updater.version}
+                    <button type="button" class="about-notes-link" onclick={() => void openReleaseNotes(version).catch(() => {})}>{m.updater_full_notes()}</button>
+                  {/if}
                 {:else if $updater.phase === 'stalled'}
                   <span class="feedback error">
                     {$updater.installerReady
@@ -5596,6 +5709,8 @@
                   {/if}
                 {:else if $updater.phase === 'error' || $updater.signatureMissing}
                   <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })}</span>
+                {:else if $updater.systemTooOld}
+                  <span class="feedback error">{m.updater_system_too_old({ version: $updater.systemTooOld.version, glibc: $updater.systemTooOld.glibc })}</span>
                 {:else}
                   <span class="hint">{m.settings_about_check_hint()}</span>
                 {/if}
@@ -5630,6 +5745,32 @@
                 disabled={!silentSupported}
                 ariaLabelledby="silent-update-label"
                 ariaDescribedby="silent-update-hint silent-update-status"
+              />
+            </div>
+
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="share-installer-label" for="share-installer-switch">{m.settings_share_ember_installer()}</label>
+                <span class="hint" id="share-installer-hint">{m.settings_share_ember_installer_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="share-installer-switch"
+                bind:checked={settings.share_ember_installer}
+                ariaLabelledby="share-installer-label"
+                ariaDescribedby="share-installer-hint"
+              />
+            </div>
+
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="seed-releases-label" for="seed-releases-switch">{m.settings_seed_ember_releases()}</label>
+                <span class="hint" id="seed-releases-hint">{m.settings_seed_ember_releases_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="seed-releases-switch"
+                bind:checked={settings.seed_ember_releases}
+                ariaLabelledby="seed-releases-label"
+                ariaDescribedby="seed-releases-hint"
               />
             </div>
           </div>
@@ -6814,6 +6955,21 @@
     margin-top: 6px;
   }
 
+  .about-notes-link {
+    margin-left: 10px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--accent);
+    font-size: var(--font-size-sm);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .about-notes-link:hover {
+    text-decoration: underline;
+  }
+
   .about-progress {
     margin-top: 8px;
     height: 4px;
@@ -7349,6 +7505,7 @@
      saying what it said before: these rules are not in force. */
   .schedule-editor.is-inactive,
   .alt-speed-limits.is-inactive,
+  .upload-quota-limits.is-inactive,
   .manual-speed-limit.is-inactive {
     opacity: 0.62;
   }

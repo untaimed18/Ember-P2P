@@ -61,6 +61,14 @@ export interface UpdaterState {
   /** Manifest existed but `latest.json.sig` did not. Survives silent checks
    *  so Settings does not look current. */
   signatureMissing: boolean;
+  /** A newer release whose AppImage needs a newer glibc than this system has.
+   *  Not an error: this install cannot take it, and is told where to go. */
+  systemTooOld: SystemTooOld | null;
+}
+
+export interface SystemTooOld {
+  version: string;
+  glibc: string;
 }
 
 interface UpdateHandoffReport {
@@ -82,6 +90,7 @@ export interface SecureUpdateCheckResult {
   pendingRetained: boolean;
   error?: string | null;
   signatureMissing?: boolean;
+  systemTooOld?: SystemTooOld | null;
 }
 
 type SecureUpdateProgress =
@@ -102,6 +111,7 @@ const INITIAL: UpdaterState = {
   installerReady: false,
   fromHandoff: false,
   signatureMissing: false,
+  systemTooOld: null,
 };
 
 export const updater = writable<UpdaterState>({ ...INITIAL });
@@ -378,10 +388,19 @@ async function applyCheckResult(
       installerReady: false,
       fromHandoff: false,
       signatureMissing: false,
+      systemTooOld: null,
     });
     return true;
   }
   await disposePending();
+  if (result.systemTooOld) {
+    if (staged) {
+      restoreStaged(staged);
+      return false;
+    }
+    updater.set({ ...INITIAL, phase: 'idle', systemTooOld: result.systemTooOld });
+    return false;
+  }
   if (result.signatureMissing) {
     retryAction = 'check';
     if (staged) {

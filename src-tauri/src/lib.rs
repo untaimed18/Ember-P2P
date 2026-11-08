@@ -22,6 +22,8 @@
 #![allow(clippy::type_complexity)]
 
 mod app_state;
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+mod appimage_fonts;
 mod auto_update;
 mod background;
 mod bandwidth;
@@ -33,6 +35,7 @@ mod idle;
 mod ipfilter_update;
 mod network;
 mod power;
+mod release_share;
 mod search;
 pub mod security;
 mod session_end;
@@ -285,6 +288,9 @@ pub(crate) async fn run_graceful_shutdown(
     state
         .bw_shutdown
         .store(true, std::sync::atomic::Ordering::Release);
+    // The day's upload count, so the quota resumes where it stood rather than
+    // up to a minute behind.
+    background::save_upload_quota(app, &state).await;
 
     // Signal every in-flight hash worker to stop ASAP. The startup indexer
     // (and `reload_shared_files`) check these flags between files and mid-file
@@ -482,6 +488,11 @@ fn show_fatal_startup_dialog(message: &str) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // First: it sets environment variables, which only a process with one
+    // thread may do, and the runtime below starts several.
+    #[cfg(target_os = "linux")]
+    let appimage_fonts = appimage_fonts::prepare();
+
     // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
     //
     // Ember drives several very large async state machines — the multi-source
@@ -643,6 +654,8 @@ pub fn run() {
 
     #[cfg(target_os = "linux")]
     raise_open_file_limit();
+    #[cfg(target_os = "linux")]
+    appimage_fonts.log();
 
     // Multi-instance harness path: when `EMBER_DATA_DIR` is set, every
     // launched process is meant to be an *isolated* node (own config,
@@ -875,6 +888,10 @@ pub fn run() {
                 Ok(rows) => sharing::feed_downloads::load(rows),
                 Err(error) => tracing::error!("Could not read which downloads are from feeds: {error}"),
             }
+            match db.transfer_collection_folders() {
+                Ok(rows) => storage::category_folders::load_collection_folders(rows),
+                Err(error) => tracing::error!("Could not read which downloads came from collections: {error}"),
+            }
             // Best-effort, never fatal. A download folder on an unplugged USB
             // drive, an offline NAS or an unmapped share makes these fail, and
             // propagating that out of `setup` returns Err from `build()` — which
@@ -1088,9 +1105,12 @@ pub fn run() {
                 (Arc::new(RwLock::new(friends)), Arc::new(RwLock::new(mutual)))
             };
 
+            sharing::disk::set_hash_at_low_priority(settings.hash_low_priority);
+            release_share::configure(&settings);
             let shared_folder_watcher = sharing::watcher::SharedFoldersWatcher::start(
                 app_handle.clone(),
                 settings.shared_folders.clone(),
+                settings.watch_shared_folders,
             );
 
             // One-time AICH migration: invalidate multi-part AICH root hashes
@@ -1184,6 +1204,10 @@ pub fn run() {
                 )),
                 pending_deep_links: Arc::new(parking_lot::Mutex::new(pending_deep_links)),
                 runtime_status: Arc::new(parking_lot::RwLock::new(Default::default())),
+                upload_quota: Arc::new(parking_lot::Mutex::new(bandwidth::quota::UploadQuota::load(
+                    &bandwidth::quota::path_in(&storage::paths::resolve_data_dir_with_app(&app_handle)),
+                    &bandwidth::quota::local_today(),
+                ))),
             });
 
             // Seed the schedule/sleep snapshot and apply whatever bandwidth
@@ -2715,6 +2739,7 @@ pub fn run() {
             commands::settings::take_pending_restore_download_folder_notice,
             commands::settings::take_pending_known_met_notice,
             commands::settings::open_ember_link,
+            commands::settings::open_release_notes,
             commands::settings::open_support_page,
             commands::settings::get_ember_website_url,
             commands::settings::open_ember_share,

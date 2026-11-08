@@ -13,6 +13,10 @@ name: Release
 #      `releases/latest/download/latest.json` resolve, so installed apps only
 #      see the update once you've deliberately published. Editing the draft body
 #      afterwards does not change the notes already signed into latest.json.
+#   5. Nothing: publishing runs `website.yml`, which points the website's
+#      download table and new-release notice at the release, from the
+#      downloads list this workflow attached, and commits that to `main`. If it
+#      fails, it says why; run it again from the Actions tab with the tag.
 #
 # Required secrets on the protected `release-signing` environment:
 #   TAURI_SIGNING_PRIVATE_KEY           contents of ember-updater.key
@@ -177,6 +181,17 @@ jobs:
     # runner `check-linux` compiles on. An AppImage bundles everything except
     # glibc and glibc is only forwards compatible, so the distro this is built
     # on is the oldest one the result can run on.
+    #
+    # It also bundles WebKit but not FreeType, so the AppImage works around
+    # this distro's FreeType (2.11) on hosts with 2.13 or newer: see
+    # `src-tauri/src/appimage_fonts.rs`, whose `BUILT_AGAINST_FREETYPE` moves
+    # with this line. Moving the AppImage to a newer distro raises its glibc
+    # floor, and an AppImage rewrites itself in place, so an install on an
+    # older system must never be handed it: publish that build under
+    # `linux-x86_64-appimage-glibc` with its `min_glibc`, which only 1.7.7 and
+    # later read (`choose_appimage_target` in `commands/updater.rs`), and keep
+    # the plain `linux-x86_64-appimage` entry for a build that runs wherever
+    # this one does, or drop it.
     timeout-minutes: 90
     permissions:
       contents: read
@@ -268,6 +283,10 @@ jobs:
       # scripts that read the signatures back all have to agree.
       EMBER_WINDOWS_BUNDLE_DIR: src-tauri/target/windows-bundles
       EMBER_LINUX_BUNDLE_DIR: src-tauri/target/linux-bundles
+      # The eD2K collection, the notes it carries and the downloads list the
+      # website is refreshed from. Beside the bundles, not among them, so the
+      # signing pass does not take them for installers.
+      EMBER_ED2K_OUT_DIR: src-tauri/target/ed2k-out
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout
@@ -334,15 +353,48 @@ jobs:
               || { echo "failed to sign $bundle" >&2; exit 1; }
           done
 
+      # For everyone who cannot reach GitHub: an eD2K link for every installer,
+      # with its AICH hash and its GitHub download as a web source, an eMule
+      # collection of them and the notes, and each file's SHA-256. The script
+      # uses Node alone, so it runs nothing from the dependency tree beside the
+      # key; `scripts/ed2k-links.test.mjs` holds its hashes to Ember's own.
+      - name: Prepare the eD2K links and collection
+        id: ed2k
+        env:
+          EMBER_RELEASE_NOTES: ${{ steps.release_notes.outputs.body }}
+          EMBER_ED2K_SECTION: ${{ runner.temp }}/ed2k-section.md
+        run: node scripts/ed2k-links.mjs
+
+      # Ember's "Share every file of each new release" fetches these two and
+      # shares them only if they verify against these signatures, as the
+      # installers do against latest.json.
+      - name: Sign the eD2K collection and release notes
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          for file in "$EMBER_ED2K_OUT_DIR"/*.emulecollection "$EMBER_ED2K_OUT_DIR"/*_release-notes.md; do
+            npx --no-install tauri signer sign "$file" \
+              || { echo "failed to sign $file" >&2; exit 1; }
+          done
+
       # A re-run finds the draft the previous attempt created and reuses it; a
       # release that has already been published is never touched.
       - name: Create or update the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EMBER_RELEASE_NOTES: ${{ steps.release_notes.outputs.body }}
+          EMBER_ED2K_SECTION: ${{ steps.ed2k.outputs.section }}
         run: |
           notes="$RUNNER_TEMP/release-notes.md"
           printf '%s\n' "$EMBER_RELEASE_NOTES" > "$notes"
+          # The body only: the in-app updater shows the notes from latest.json,
+          # where links to files the user is already updating to do not belong.
+          if [ ! -s "$EMBER_ED2K_SECTION" ]; then
+            echo "the eD2K section for the release body is missing" >&2
+            exit 1
+          fi
+          cat "$EMBER_ED2K_SECTION" >> "$notes"
           if is_draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2>/dev/null); then
             if [ "$is_draft" != "true" ]; then
               echo "release $GITHUB_REF_NAME is already published; refusing to modify it" >&2
@@ -358,8 +410,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ ! -d "$EMBER_ED2K_OUT_DIR" ]; then
+            echo "$EMBER_ED2K_OUT_DIR is missing; run the eD2K step before attaching" >&2
+            exit 1
+          fi
           mapfile -d '' assets < <(find "$EMBER_WINDOWS_BUNDLE_DIR" "$EMBER_LINUX_BUNDLE_DIR" \
-            -type f -print0)
+            "$EMBER_ED2K_OUT_DIR" -type f -print0)
           gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
 
       # After the upload, so the manifest can never name an asset that is not

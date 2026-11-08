@@ -1156,6 +1156,42 @@ pub fn save_known2_met(
 mod tests {
     use super::*;
 
+    /// The release workflow hashes the installers with its own script
+    /// (`scripts/ed2k-links.mjs`), which may run nothing from this crate.
+    /// `scripts/ed2k-links.test.mjs` holds it to these same sizes and hashes,
+    /// so the two cannot drift apart: around a block, around a part, exact
+    /// multiples of a part (the trailing empty part hash), and enough parts
+    /// for an odd right subtree at the top of the AICH tree.
+    #[test]
+    fn the_release_script_hashes_installers_as_ember_does() {
+        const VECTORS: [(usize, &str, &str); 12] = [
+            (0, "31d6cfe0d16ae931b73c59d7e0c089c0", "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            (1, "a8deec165ed8ad822e82bc0563574d68", "5d1be7e9dda1ee8896be5b7e34a85ee16452a7b4"),
+            (184_319, "ee6d726c83d54b639b0d8c9eef68bffb", "5006ecc755ff60521b4313274e9963e6c9998f31"),
+            (184_320, "99ee334be8e5bede81e51d4db0416987", "ec5e0467fdf1e5d8ae0fed4507d582970f4888c6"),
+            (184_321, "f33c50dce3bdac4ed8aa22cdc836c15d", "96724d22a5433596242aead93ec72d2ad1ec2f93"),
+            (9_727_999, "aa6417ea31b5447f899aa39e739c7ee2", "c5b5843bb938b9ace5f45291fdb816dcd330e192"),
+            (9_728_000, "5ad70831b824ead053cf0a8ff867a417", "55904bdda3bca5080511a22be2345ec0198e62da"),
+            (9_728_001, "0c98fcd995b4b25efa6c00e93609b7e9", "103edd33024070ab962fd502c8af467a0fe9d82d"),
+            (19_456_000, "ec4e51f2c8fff914ca6de048386579e1", "dc300bdc843d9500194f1627dfbf38ee0bab9a8f"),
+            (19_640_327, "8444746ea9731f7c7109ea8b992bab71", "a11773b339c1e9b44a16ae29ecc73d5d53f1d900"),
+            (58_368_001, "bc82f08bb4f50a6fa073d0aa9811d21a", "73e8a34bed92a37bf781c2bd4afff1efa090bbda"),
+            (68_096_000, "fb71f4dbe698742cfad059fa7d1b3a98", "1a34277b7c945beae8be4591d25957241856007f"),
+        ];
+        // Byte `i` of each file is `(i * 31 + 7) % 251`.
+        let largest = VECTORS.iter().map(|(len, _, _)| *len).max().unwrap_or(0);
+        let data: Vec<u8> = (0..largest).map(|i| ((i * 31 + 7) % 251) as u8).collect();
+        for (len, ed2k, aich) in VECTORS {
+            let file = &data[..len];
+            assert_eq!(crate::network::ed2k::hash::ed2k_hash_bytes(file), ed2k, "ed2k, {len} bytes");
+            assert_eq!(
+                hex::encode(AICHRecoveryHashSet::build_from_data(file).root_hash),
+                aich,
+                "AICH, {len} bytes"
+            );
+        }
+    }
+
     #[test]
     fn test_aich_empty() {
         let hash = compute_aich_part(&[], 0, 1);

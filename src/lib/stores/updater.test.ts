@@ -106,6 +106,17 @@ describe('applyBackgroundCheckResult', () => {
     expect(s.error).toBeNull();
   });
 
+  it('says why a release this system cannot run is not offered, without calling it an error', async () => {
+    await applyBackgroundCheckResult({ ...NOTHING, systemTooOld: { version: '9.9.9', glibc: '2.39' } });
+    const s = get(updater);
+    expect(s.phase).toBe('idle');
+    expect(s.error).toBeNull();
+    expect(s.systemTooOld).toEqual({ version: '9.9.9', glibc: '2.39' });
+
+    await applyBackgroundCheckResult(found('9.9.10'));
+    expect(get(updater).systemTooOld).toBeNull();
+  });
+
   it('leaves an installed update waiting for its restart alone', async () => {
     updater.set({ ...IDLE, phase: 'ready', version: '9.9.8' });
     await applyBackgroundCheckResult(found('9.9.9'));

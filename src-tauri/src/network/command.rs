@@ -2680,6 +2680,12 @@ async fn handle_command_inner(
                 .min(u32::MAX as u64) as u32;
             diag.ember_dht_republish_backlog =
                 ember_republish_backlog(state).min(u32::MAX as usize) as u32;
+            state.ember_dht.refresh_selective_storer();
+            diag.ember_dht_replication_paused = ember_storer_republish_paused(state);
+            let (reach_open, reach_firewalled, reach_unknown) = state.ember_dht.reach_census();
+            diag.ember_dht_contacts_reach_open = reach_open.min(u32::MAX as usize) as u32;
+            diag.ember_dht_contacts_reach_firewalled = reach_firewalled.min(u32::MAX as usize) as u32;
+            diag.ember_dht_contacts_reach_unknown = reach_unknown.min(u32::MAX as usize) as u32;
             diag.ember_dht_seconds_since_inbound = state.ember_last_inbound.map(|at| {
                 chrono::Utc::now()
                     .timestamp()

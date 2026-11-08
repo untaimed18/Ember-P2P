@@ -1072,6 +1072,7 @@ fn build_list(publisher: &[u8; 32], salt: &FeedSalt, title: &str, author: &str, 
                 aich_hash: item.aich.clone(),
                 ember_file_hash: item.blake3.clone(),
                 note: item.note.clone(),
+                folder: String::new(),
             })
             .collect(),
     }

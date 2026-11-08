@@ -36,7 +36,138 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// Whether the library pass hashes at background priority (Settings >
+/// Library, "Hash shared files at low priority"). On by default.
+static HASH_AT_LOW_PRIORITY: AtomicBool = AtomicBool::new(true);
+
+/// Follow the setting. Read by every hash the library pass starts after this.
+pub fn set_hash_at_low_priority(low: bool) {
+    HASH_AT_LOW_PRIORITY.store(low, Ordering::Relaxed);
+}
+
+/// Run one file's library hash, at background priority unless the user turned
+/// that off.
+///
+/// The pass reads every byte of every shared file and spends CPU on three
+/// digests of each, so at normal priority a first scan of a large library is
+/// felt everywhere else on the machine: windows answer late and other programs'
+/// disk work queues behind it. Background priority hands the CPU and the disk to
+/// anything else that wants them and takes what is left, which on an idle
+/// machine is all of it. The cost is a slower pass while the machine is busy;
+/// the stall timeout counts from the last byte read, so a slow read is not
+/// mistaken for a wedged one.
+///
+/// - **Windows:** `THREAD_MODE_BACKGROUND_BEGIN` on the calling thread, which
+///   lowers its CPU, I/O and memory priority together, and `..._END` after,
+///   since the thread is the runtime's blocking pool's and goes on to other
+///   work.
+/// - **Linux and macOS:** a lowered thread cannot raise itself back up without
+///   privilege, so the hash runs on a thread of its own that ends with it:
+///   `nice` 10 and the lowest best-effort I/O level on Linux (not the idle
+///   class, which a busy disk can starve outright), the utility QoS class on
+///   macOS, which throttles disk access as well as CPU.
+pub fn hash_at_background_priority<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    if !HASH_AT_LOW_PRIORITY.load(Ordering::Relaxed) {
+        return work();
+    }
+    background::run(work)
+}
+
+#[cfg(windows)]
+mod background {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
+    };
+
+    /// Ends background mode when dropped, panics included, and only if this
+    /// guard began it: a thread already in background mode refuses `BEGIN`,
+    /// and ending what someone else began would undo their choice.
+    struct BackgroundMode(bool);
+
+    impl Drop for BackgroundMode {
+        fn drop(&mut self) {
+            if self.0 {
+                // SAFETY: the pseudo-handle names the calling thread, the one
+                // that began background mode in `run`.
+                unsafe {
+                    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+                }
+            }
+        }
+    }
+
+    pub(super) fn run<T>(work: impl FnOnce() -> T) -> T {
+        // SAFETY: as above; a failure leaves the thread as it was.
+        let began = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } != 0;
+        let _mode = BackgroundMode(began);
+        work()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod background {
+    pub(super) fn run<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+        let mut work = Some(work);
+        let done = std::thread::scope(|scope| {
+            let spawned = std::thread::Builder::new()
+                .name("ember-hash".into())
+                .spawn_scoped(scope, || {
+                    lower_this_thread();
+                    (work.take().expect("the hash runs once"))()
+                });
+            match spawned {
+                Ok(handle) => Some(handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))),
+                Err(error) => {
+                    tracing::debug!("No thread for a background hash ({error}); hashing at normal priority");
+                    None
+                }
+            }
+        });
+        // No thread to be had: hash here, at normal priority, rather than not
+        // at all.
+        done.unwrap_or_else(|| (work.take().expect("a failed spawn never ran the hash"))())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lower_this_thread() {
+        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+        const IOPRIO_CLASS_BE: libc::c_long = 2;
+        const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
+        const IOPRIO_LOWEST_LEVEL: libc::c_long = 7;
+        // SAFETY: plain syscalls on the calling thread's own id; a failure
+        // (an older kernel, a container's seccomp policy, a nice already
+        // above 10) leaves the thread as it was.
+        unsafe {
+            let tid = libc::syscall(libc::SYS_gettid);
+            libc::syscall(
+                libc::SYS_ioprio_set,
+                IOPRIO_WHO_PROCESS,
+                tid,
+                (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_LOWEST_LEVEL,
+            );
+            libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 10);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn lower_this_thread() {
+        // SAFETY: sets the calling thread's own QoS class; a failure leaves it
+        // as it was.
+        unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+mod background {
+    pub(super) fn run<T>(work: impl FnOnce() -> T) -> T {
+        work()
+    }
+}
 
 /// Concurrent file hashes to run against one device known not to seek.
 ///
@@ -405,6 +536,31 @@ fn query_device(_key: &str) -> Option<(String, Option<bool>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hash runs in background mode and the thread leaves it afterwards.
+    /// A thread already in background mode refuses `BEGIN` with
+    /// `ERROR_THREAD_MODE_ALREADY_BACKGROUND`, which is how the test can tell.
+    #[cfg(windows)]
+    #[test]
+    fn a_hash_runs_in_background_mode_and_the_thread_leaves_it_after() {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_THREAD_MODE_ALREADY_BACKGROUND};
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN, THREAD_MODE_BACKGROUND_END,
+        };
+
+        let refused_inside = background::run(|| {
+            // SAFETY: the calling thread's own pseudo-handle.
+            let began = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+            (began == 0).then(|| unsafe { GetLastError() })
+        });
+        assert_eq!(refused_inside, Some(ERROR_THREAD_MODE_ALREADY_BACKGROUND));
+
+        // SAFETY: as above, and ended again so the test thread is left as found.
+        unsafe {
+            assert_ne!(SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN), 0, "left after");
+            SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+        }
+    }
 
     /// The same rule, applied to the other direction. An external read on
     /// storage we could not identify used to be discarded outright, which made

@@ -240,6 +240,8 @@ pub(crate) struct EmberBatchAckOutcome {
     /// replica may still take them, so this is a failed *attempt*, not a lost
     /// record; it is charged the same way an unanswered batch is.
     pub(crate) refused: Vec<EmberRecordRef>,
+    /// Why, position for position with `refused`, when the storer said.
+    pub(crate) refusals: Vec<Option<ember::dht::messages::StoreRefusal>>,
 }
 
 /// Records the queue may hold before it starts refusing work, so a tick that
@@ -406,10 +408,14 @@ impl EmberBatchPublisher {
     /// resolve them, because only an ack *timeout* charged a failed round. An
     /// ack that accepted nothing took neither path, and the file was locked out
     /// of selection for the rest of the session.
-    pub(crate) fn note_ack(
+    ///
+    /// `reasons` are the per-record refusal codes the ack carried, if any, and
+    /// come back position for position in [`EmberBatchAckOutcome::refusals`].
+    pub(crate) fn note_ack_with_reasons(
         &mut self,
         request_id: u32,
         accepted: u64,
+        reasons: &[u8],
         from: ember::dht::EmberNodeId,
     ) -> EmberBatchAckOutcome {
         let Some(batch) = self.in_flight.get(&request_id) else {
@@ -427,13 +433,27 @@ impl EmberBatchPublisher {
                 outcome.placed.push(reference);
             } else {
                 outcome.refused.push(reference);
+                outcome
+                    .refusals
+                    .push(ember::dht::messages::store_refusal_at(reasons, i));
             }
         }
         outcome
     }
 
+    /// [`Self::note_ack_with_reasons`] for an ack that carried no reasons.
+    #[cfg(test)]
+    pub(crate) fn note_ack(
+        &mut self,
+        request_id: u32,
+        accepted: u64,
+        from: ember::dht::EmberNodeId,
+    ) -> EmberBatchAckOutcome {
+        self.note_ack_with_reasons(request_id, accepted, &[], from)
+    }
+
     /// Whether batch `request_id` went to `from` and is still waiting for its
-    /// ack — what [`Self::note_ack`] would honour.
+    /// ack — what [`Self::note_ack_with_reasons`] would honour.
     pub(crate) fn awaits_ack(&self, request_id: u32, from: ember::dht::EmberNodeId) -> bool {
         self.in_flight
             .get(&request_id)

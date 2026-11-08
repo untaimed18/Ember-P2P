@@ -1858,10 +1858,16 @@ mod tests {
 
         let mut send = SendState::new([0u8; 16], [0u8; 32], [3u8; 32], "f".into(), size, path.clone())
             .with_source_stamp(stamp);
-        std::fs::remove_file(&path).unwrap();
+        // Moved aside rather than deleted: ext4 and tmpfs hand a just-freed
+        // inode straight to the next file, and with no birth time and a
+        // modification time in the same clock tick the replacement would be
+        // indistinguishable from the original.
+        let original = path.with_extension("original");
+        std::fs::rename(&path, &original).unwrap();
         std::fs::write(&path, vec![2u8; size as usize]).unwrap();
         assert!(send.read_block(0, XFER_BLOCK_SIZE).is_err());
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&original);
     }
 
     #[test]

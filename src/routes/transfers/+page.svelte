@@ -9,7 +9,7 @@
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import { categoryDestinationLabel, categorySubdir } from '$lib/categoryFolders';
   import {
-    addUserCategory, countDownloadCategories, isCategoryTaken, removeUserCategory, setCategoryFolder,
+    addUserCategory, countDownloadCategories, countUncategorizedDownloads, isCategoryTaken, removeUserCategory, setCategoryFolder,
   } from '$lib/categorySettings';
   import { transfers, transfersLoaded, forgetTransfer, markDownloadRemoved, clearDownloadRemoved, holdDownloadRemoved, setLocalCategory, setLocalFileName, IDLE_STATUSES, effectiveUploadSpeed, resumableFailedDownloads } from '$lib/stores/transfers';
   import { removeToast, setToastMessage, toastsFor } from '$lib/stores/toast';
@@ -56,7 +56,7 @@
   import { mapSettledWithLimit } from '$lib/concurrency';
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
-  import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
+  import { BUILTIN_DOWNLOAD_CATEGORIES, UNCATEGORIZED_FILTER, downloadCategoryLabel, inCategoryFilter } from '$lib/downloadCategories';
   import {
     codedErrorOf,
     translateError,
@@ -2266,21 +2266,34 @@
   $effect(() => {
     try { localStorage.setItem(CATEGORY_FILTER_KEY, categoryFilter); } catch { /* ignore */ }
   });
+  let uncategorizedCount = $derived(countUncategorizedDownloads(allDownloads));
+  /** "Uncategorized", for sorting a long list into categories: shown once any
+   *  download has one, since before that it would list what All does. */
+  let showUncategorizedChip = $derived(Object.keys(categoryCounts).length > 0);
   /** The saved filter only applies while its chip exists, so a category that
    *  emptied out cannot leave the list blank with nothing to click. */
-  let activeCategory = $derived(categoryChips.includes(categoryFilter) ? categoryFilter : '');
+  let activeCategory = $derived(
+    categoryFilter === UNCATEGORIZED_FILTER
+      ? (showUncategorizedChip ? categoryFilter : '')
+      : (categoryChips.includes(categoryFilter) ? categoryFilter : ''),
+  );
   // And is forgotten once the chips are known, or a download filed under it
   // days later would narrow the list, and the bulk actions, by itself.
   // Not before: until the settings load and the backend has restored the last
   // session's unfinished downloads, a chip that is coming may be missing.
   $effect(() => {
     if (!$transfersLoaded || $appSettings === null) return;
-    if (categoryFilter && !categoryChips.includes(categoryFilter)) categoryFilter = '';
+    if (categoryFilter && !activeCategory) categoryFilter = '';
   });
   let downloadsNarrowed = $derived(Boolean(transferFilter.trim() || activeCategory));
   /** How the bulk actions and their prompts name the narrowed view. */
   let narrowLabel = $derived(
-    [activeCategory ? categoryLabel(activeCategory) : '', transferFilter.trim()].filter(Boolean).join(' · '),
+    [
+      activeCategory === UNCATEGORIZED_FILTER
+        ? m.transfers_category_filter_uncategorized()
+        : activeCategory ? categoryLabel(activeCategory) : '',
+      transferFilter.trim(),
+    ].filter(Boolean).join(' · '),
   );
   function clearDownloadFilters() {
     transferFilter = '';
@@ -2289,7 +2302,7 @@
 
   let filteredActiveDownloads = $derived.by(() => {
     const query = transferFilter.trim().toLowerCase();
-    const pool = activeCategory ? sortedActiveDownloads.filter((t) => t.category === activeCategory) : sortedActiveDownloads;
+    const pool = activeCategory ? sortedActiveDownloads.filter((t) => inCategoryFilter(t.category, activeCategory)) : sortedActiveDownloads;
     if (!query) return pool;
     return pool.filter((t) =>
       t.file_name.toLowerCase().includes(query)
@@ -2304,7 +2317,7 @@
   });
   let filteredCompletedDownloads = $derived.by(() => {
     const query = transferFilter.trim().toLowerCase();
-    const pool = activeCategory ? sortedCompletedDownloads.filter((t) => t.category === activeCategory) : sortedCompletedDownloads;
+    const pool = activeCategory ? sortedCompletedDownloads.filter((t) => inCategoryFilter(t.category, activeCategory)) : sortedCompletedDownloads;
     if (!query) return pool;
     return pool.filter((t) =>
       t.file_name.toLowerCase().includes(query)
@@ -5913,6 +5926,16 @@
         aria-pressed={!activeCategory}
         onclick={() => (categoryFilter = '')}
       >{m.transfers_category_filter_all()} <span class="category-chip-count">{formatNumber(allDownloads.length)}</span></button>
+      {#if showUncategorizedChip}
+        <button
+          type="button"
+          class="category-chip"
+          class:active={activeCategory === UNCATEGORIZED_FILTER}
+          aria-pressed={activeCategory === UNCATEGORIZED_FILTER}
+          title={m.transfers_category_filter_uncategorized_title()}
+          onclick={() => (categoryFilter = activeCategory === UNCATEGORIZED_FILTER ? '' : UNCATEGORIZED_FILTER)}
+        >{m.transfers_category_filter_uncategorized()} <span class="category-chip-count">{formatNumber(uncategorizedCount)}</span></button>
+      {/if}
       {#each categoryChips as cat (cat)}
         <button
           type="button"

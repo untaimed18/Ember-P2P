@@ -506,6 +506,18 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
       "sign-publish must add the Linux updater targets to latest.json",
     );
   }
+  // Where GitHub cannot be reached, these are the only way to the installers:
+  // a release without them silently strands those users on the old version.
+  if (
+    !signJob.includes("run: node scripts/ed2k-links.mjs") ||
+    !signJob.includes('cat "$EMBER_ED2K_SECTION" >> "$notes"') ||
+    !signJob.includes('"$EMBER_ED2K_OUT_DIR"/*.emulecollection "$EMBER_ED2K_OUT_DIR"/*_release-notes.md') ||
+    !signJob.includes('"$EMBER_ED2K_OUT_DIR" -type f')
+  ) {
+    errors.push(
+      "sign-publish must prepare the installers' eD2K links, sign the collection and notes, and attach them",
+    );
+  }
 
   const policyGate = signJob.indexOf("Re-verify release policy before secrets");
   const firstSecret = signJob.indexOf("secrets.");

@@ -89,6 +89,31 @@ fn is_missing_updater_resource(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<UpdaterResourceMissing>().is_some())
 }
 
+/// A newer release exists, but its AppImage needs a newer glibc than this
+/// system has. Not a failure: the check worked, and the answer is that this
+/// install cannot take it. Reported as [`SystemTooOld`], never as an error.
+#[derive(Debug)]
+struct UpdaterSystemTooOld(SystemTooOld);
+
+impl std::fmt::Display for UpdaterSystemTooOld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Ember {} needs glibc {} or newer to run as an AppImage",
+            self.0.version, self.0.glibc
+        )
+    }
+}
+
+impl std::error::Error for UpdaterSystemTooOld {}
+
+fn system_too_old(error: &anyhow::Error) -> Option<SystemTooOld> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<UpdaterSystemTooOld>())
+        .map(|too_old| too_old.0.clone())
+}
+
 /// Locks are taken in the order `operation`, `staging`, `pending`, and
 /// `pending` is only ever held briefly outside an install.
 #[derive(Default)]
@@ -161,6 +186,10 @@ struct SignedPlatform {
     signature: String,
     sha256: String,
     size: u64,
+    /// The oldest glibc the artifact runs on (`"2.39"`), for an AppImage built
+    /// on a newer distro than the last one. See [`choose_appimage_target`].
+    #[serde(default)]
+    min_glibc: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +212,18 @@ pub struct SecureUpdateCheckResult {
     error: Option<String>,
     #[serde(default)]
     signature_missing: bool,
+    /// The release this AppImage cannot run, when that is why nothing is
+    /// offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system_too_old: Option<SystemTooOld>,
+}
+
+/// A release whose AppImage needs a newer glibc than this system has.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemTooOld {
+    version: String,
+    glibc: String,
 }
 
 impl SecureUpdateCheckResult {
@@ -194,6 +235,7 @@ impl SecureUpdateCheckResult {
             pending_retained: false,
             error: Some(error),
             signature_missing: false,
+            system_too_old: None,
         }
     }
 
@@ -422,6 +464,16 @@ fn validate_manifest(
         }
         if platform.signature.len() > SIGNATURE_MAX_BYTES || platform.signature.trim().is_empty() {
             bail!("signed updater artifact signature is invalid");
+        }
+        if platform
+            .min_glibc
+            .as_deref()
+            .is_some_and(|min| parse_glibc(min).is_none())
+        {
+            bail!("signed updater glibc requirement is invalid");
+        }
+        if target.ends_with(GLIBC_GATED_APPIMAGE_SUFFIX) && platform.min_glibc.is_none() {
+            bail!("signed updater glibc-gated AppImage states no glibc requirement");
         }
         // Parse now so a malformed signed artifact signature is rejected at
         // check time, before the user downloads a potentially large bundle.
@@ -1405,6 +1457,86 @@ fn missing_updater_targets(error: &tauri_plugin_updater::Error) -> Option<String
     }
 }
 
+/// Suffix of the AppImage entry that states the glibc it needs
+/// (`linux-x86_64-appimage-glibc`).
+///
+/// The AppImage's glibc floor is the distro it is built on. Moving that build
+/// to a newer distro would hand every install on an older one an AppImage that
+/// cannot start, and since it rewrites itself in place, one it cannot update
+/// its way out of. So a build with a higher floor is published under this
+/// entry, with `min_glibc`, and the plain `linux-{arch}-appimage` entry keeps
+/// one that runs wherever earlier releases did, if it is published at all:
+/// releases before 1.7.7 read only the plain entry and check no glibc.
+const GLIBC_GATED_APPIMAGE_SUFFIX: &str = "-appimage-glibc";
+
+/// Which manifest entry an AppImage install takes its update from.
+#[derive(Debug, PartialEq, Eq)]
+enum AppImageTarget {
+    /// The plugin's own lookup: not an AppImage, or nothing here applies.
+    Default,
+    /// This entry, which runs on this system.
+    Use(String),
+    /// Every AppImage entry needs a newer glibc than this; the lowest of them.
+    TooOld(String),
+}
+
+/// The entry an AppImage on `arch` with `host_glibc` should update from: the
+/// glibc-gated one when this system meets it, else the plain one when it
+/// states nothing or this system meets what it states. A system whose glibc is
+/// unknown meets no stated requirement.
+fn choose_appimage_target(
+    platforms: &BTreeMap<String, SignedPlatform>,
+    arch: &str,
+    host_glibc: Option<(u32, u32)>,
+) -> AppImageTarget {
+    let mut lowest_unmet: Option<(u32, u32)> = None;
+    for target in [
+        format!("linux-{arch}{GLIBC_GATED_APPIMAGE_SUFFIX}"),
+        format!("linux-{arch}-appimage"),
+    ] {
+        let Some(platform) = platforms.get(&target) else {
+            continue;
+        };
+        match platform.min_glibc.as_deref().and_then(parse_glibc) {
+            None => return AppImageTarget::Use(target),
+            Some(min) if host_glibc.is_some_and(|host| host >= min) => {
+                return AppImageTarget::Use(target)
+            }
+            Some(min) => {
+                lowest_unmet = Some(lowest_unmet.map_or(min, |lowest| lowest.min(min)));
+            }
+        }
+    }
+    match lowest_unmet {
+        Some((major, minor)) => AppImageTarget::TooOld(format!("{major}.{minor}")),
+        None => AppImageTarget::Default,
+    }
+}
+
+/// `"2.39"` as `(2, 39)`: glibc names its releases by major and minor only.
+fn parse_glibc(version: &str) -> Option<(u32, u32)> {
+    let (major, minor) = version.split_once('.')?;
+    let number = |part: &str| {
+        (!part.is_empty() && part.len() <= 4 && part.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    Some((number(major)?, number(minor)?))
+}
+
+/// The glibc this process runs on.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn host_glibc() -> Option<(u32, u32)> {
+    // SAFETY: returns a pointer to a static NUL-terminated string.
+    let version = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) };
+    parse_glibc(version.to_str().ok()?)
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn host_glibc() -> Option<(u32, u32)> {
+    None
+}
+
 fn matching_platform(manifest: &SignedManifest, update: &Update) -> Result<SignedPlatform> {
     let matches: Vec<&SignedPlatform> = manifest
         .platforms
@@ -1519,6 +1651,43 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
         &manifest_version,
     )?;
 
+    // The signed release as it stands, whether or not this install takes it.
+    spawn_seed(app, &manifest, &config.public_key);
+
+    // An AppImage updates from the entry this system can run, and when no
+    // entry is one it can, the user is told so rather than offered nothing.
+    let appimage_target = if matches!(
+        tauri::utils::platform::bundle_type(),
+        Some(tauri::utils::config::BundleType::AppImage)
+    ) {
+        choose_appimage_target(&manifest.platforms, std::env::consts::ARCH, host_glibc())
+    } else {
+        AppImageTarget::Default
+    };
+    let appimage_target = match appimage_target {
+        AppImageTarget::Default => None,
+        AppImageTarget::Use(target) => Some(target),
+        AppImageTarget::TooOld(glibc) => {
+            if !should_offer_update(
+                CURRENT_SECURITY_EPOCH,
+                &current_version,
+                manifest.security_epoch,
+                &manifest_version,
+            ) {
+                return Ok(None);
+            }
+            tracing::info!(
+                "Ember {} is out, but its AppImage needs glibc {glibc} or newer; this system cannot run it",
+                manifest.version
+            );
+            return Err(UpdaterSystemTooOld(SystemTooOld {
+                version: manifest.version.clone(),
+                glibc,
+            })
+            .into());
+        }
+    };
+
     // The plugin is still responsible for constructing the platform-specific
     // Update and installing it. It fetches only the already-vetted final URL,
     // with redirects/proxies disabled. Exact raw_json equality binds that
@@ -1540,8 +1709,12 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     // `configure_client` rather than the plugin's own `proxy`, which logs the
     // proxy URL and with it any credentials the proxy carries.
     let final_proxy = system_proxy_for(&manifest_response.final_url)?;
-    let updater = app
-        .updater_builder()
+    let builder = app.updater_builder();
+    let builder = match appimage_target {
+        Some(target) => builder.target(target),
+        None => builder,
+    };
+    let updater = builder
         .endpoints(vec![manifest_response.final_url.clone()])
         .context("failed to set updater endpoint")?
         .no_proxy()
@@ -1649,6 +1822,263 @@ fn same_artifact(a: &SignedPlatform, b: &SignedPlatform) -> bool {
 /// install, or nothing for one prepared in the background.
 type ProgressSink<'a> = &'a (dyn Fn(UpdateProgress) + Sync);
 
+/// The largest collection or notes file a release carries beside its
+/// installers. Both are a few kilobytes.
+const RELEASE_EXTRA_MAX_BYTES: usize = 1024 * 1024;
+
+/// A release to share every file of, for [`seed_release`].
+struct SeedJob {
+    app: AppHandle,
+    manifest: SignedManifest,
+    public_key: String,
+    folder: PathBuf,
+}
+
+/// Whether a seeding task runs, and the release it is to seed next. One task
+/// at a time, and always the newest release a check saw: a check that lands
+/// while a run is under way replaces what comes next rather than being lost.
+fn seed_queue() -> &'static parking_lot::Mutex<(bool, Option<SeedJob>)> {
+    static QUEUE: std::sync::OnceLock<parking_lot::Mutex<(bool, Option<SeedJob>)>> = std::sync::OnceLock::new();
+    QUEUE.get_or_init(Default::default)
+}
+
+/// Share every file of the release `manifest` names, when the setting asks
+/// for it (`release_share::seed_folder`). In the background: the check it
+/// came from does not wait for some hundred megabytes.
+fn spawn_seed(app: &AppHandle, manifest: &SignedManifest, public_key: &str) {
+    let Some(folder) = crate::release_share::seed_folder() else {
+        return;
+    };
+    {
+        let mut queue = seed_queue().lock();
+        queue.1 = Some(SeedJob {
+            app: app.clone(),
+            manifest: manifest.clone(),
+            public_key: public_key.to_string(),
+            folder,
+        });
+        if queue.0 {
+            return;
+        }
+        queue.0 = true;
+    }
+    tauri::async_runtime::spawn(async {
+        // Only a panic reaches this with the task still marked running; an
+        // ordinary end clears it under the lock, together with the check that
+        // nothing is waiting, so no check can fall between the two.
+        struct Running;
+        impl Drop for Running {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    seed_queue().lock().0 = false;
+                }
+            }
+        }
+        let _running = Running;
+        loop {
+            let job = {
+                let mut queue = seed_queue().lock();
+                match queue.1.take() {
+                    Some(job) => job,
+                    None => {
+                        queue.0 = false;
+                        break;
+                    }
+                }
+            };
+            seed_release(&job).await;
+        }
+    });
+}
+
+/// Fetch every file of the release into its folder for sharing: each
+/// installer checked exactly as an update is, against its signed size, hash
+/// and signature, and the collection and notes against the signatures the
+/// release workflow made for them. A file already there is checked the same
+/// way, once a session, and fetched again if it fails. The previous release's
+/// files go only once every installer of this one is in. Stops as soon as the
+/// setting is turned off or points elsewhere.
+async fn seed_release(job: &SeedJob) {
+    let SeedJob { app, manifest, public_key, folder } = job;
+    let still_wanted = || crate::release_share::seed_folder().as_deref() == Some(folder.as_path());
+    let version = manifest.version.as_str();
+    let mut wrote = 0usize;
+    let mut complete = true;
+    let mut base: Option<Url> = None;
+    let mut seen = std::collections::HashSet::new();
+    for platform in manifest.platforms.values() {
+        if !seen.insert(platform.url.clone()) {
+            continue;
+        }
+        let Some(name) = crate::release_share::release_file_name(&platform.url, version) else {
+            continue;
+        };
+        base.get_or_insert_with(|| platform.url.clone());
+        let path = folder.join(&name);
+        if holds_signed_artifact(&path, platform).await {
+            continue;
+        }
+        if !still_wanted() {
+            return;
+        }
+        let bytes = match download_artifact(platform, public_key, &|_| {}).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!("Release sharing: could not fetch {name}: {error:#}");
+                complete = false;
+                continue;
+            }
+        };
+        if !still_wanted() {
+            return;
+        }
+        if keep_release_file(folder, &name, bytes, &platform.sha256).await {
+            wrote += 1;
+        } else {
+            complete = false;
+        }
+    }
+    if let Some(base) = base {
+        for name in [format!("Ember_{version}.emulecollection"), format!("Ember_{version}_release-notes.md")] {
+            let path = folder.join(&name);
+            if crate::release_share::checked_unchanged(&path, CHECKED_BY_RELEASE_SIGNATURE) {
+                continue;
+            }
+            if !still_wanted() {
+                return;
+            }
+            match fetch_signed_release_extra(&base, &name, public_key).await {
+                Ok(SignedExtra::Verified(bytes)) => {
+                    let unchanged = {
+                        let (path, expected) = (path.clone(), bytes.clone());
+                        tokio::task::spawn_blocking(move || std::fs::read(&path).is_ok_and(|held| held == expected))
+                            .await
+                            .unwrap_or(false)
+                    };
+                    if unchanged {
+                        crate::release_share::note_checked(&path, CHECKED_BY_RELEASE_SIGNATURE);
+                    } else if still_wanted()
+                        && keep_release_file(folder, &name, bytes, CHECKED_BY_RELEASE_SIGNATURE).await
+                    {
+                        wrote += 1;
+                    }
+                }
+                // A release from before the workflow signed these.
+                Ok(SignedExtra::Missing) => tracing::debug!("Release sharing: {version} has no signed {name}"),
+                // What the release offers does not verify, so nothing of it is
+                // shared from here, including a copy kept before.
+                Ok(SignedExtra::BadSignature) => {
+                    tracing::warn!("Release sharing: {name} does not match its release signature; not sharing it");
+                    let stale = path.clone();
+                    if tokio::task::spawn_blocking(move || std::fs::remove_file(stale).is_ok())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        wrote += 1;
+                    }
+                }
+                Err(error) => tracing::warn!("Release sharing: could not fetch {name}: {error:#}"),
+            }
+        }
+    }
+    if !still_wanted() {
+        return;
+    }
+    let pruned = if complete {
+        let (dir, keep) = (folder.clone(), version.to_string());
+        tokio::task::spawn_blocking(move || crate::release_share::prune(&dir, &keep))
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if wrote > 0 || pruned > 0 {
+        tracing::info!("Release sharing: {wrote} file(s) of Ember {version} kept to share, {pruned} older removed");
+        use tauri::Manager;
+        if let Some(watcher) = app.state::<crate::app_state::AppState>().shared_folder_watcher.clone() {
+            watcher.queue_rescan_after(vec![folder.clone()], Duration::from_secs(2));
+        }
+    }
+}
+
+/// Whether `path` holds the signed artifact `platform` names: checked against
+/// its size and SHA-256 once a session, and again whenever the file changes.
+async fn holds_signed_artifact(path: &Path, platform: &SignedPlatform) -> bool {
+    if crate::release_share::checked_unchanged(path, &platform.sha256) {
+        return true;
+    }
+    let (file, size, sha256) = (path.to_path_buf(), platform.size, platform.sha256.clone());
+    let holds = tokio::task::spawn_blocking(move || crate::release_share::holds(&file, size, &sha256))
+        .await
+        .unwrap_or(false);
+    if holds {
+        crate::release_share::note_checked(path, &platform.sha256);
+    }
+    holds
+}
+
+/// What a release's collection and notes are checked against: their
+/// signature, verified by fetching it again once a session.
+const CHECKED_BY_RELEASE_SIGNATURE: &str = "release signature";
+
+/// Keep verified release bytes, recording them as checked against `against`.
+/// Whether they were kept.
+async fn keep_release_file(folder: &Path, name: &str, bytes: Vec<u8>, against: &str) -> bool {
+    let (dir, file) = (folder.to_path_buf(), name.to_string());
+    match tokio::task::spawn_blocking(move || crate::release_share::keep(&dir, &file, &bytes)).await {
+        Ok(Ok(())) => {
+            crate::release_share::note_checked(&folder.join(name), against);
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("Release sharing: could not keep {name}: {error}");
+            false
+        }
+        Err(error) => {
+            tracing::warn!("Release sharing: could not keep {name}: {error}");
+            false
+        }
+    }
+}
+
+/// A file beside a release's installers, as [`fetch_signed_release_extra`]
+/// found it.
+enum SignedExtra {
+    /// The release has no such file, or no signature for it.
+    Missing,
+    /// The bytes, verified under the updater key.
+    Verified(Vec<u8>),
+    /// There, but not what its signature signs.
+    BadSignature,
+}
+
+/// `name`, beside the release's installers, checked against its `.sig` under
+/// the updater key. A failure to reach either is an error; a mismatch is not.
+async fn fetch_signed_release_extra(base: &Url, name: &str, public_key: &str) -> Result<SignedExtra> {
+    let url = base.join(name).context("release file URL is invalid")?;
+    let signature_url = base.join(&format!("{name}.sig")).context("release signature URL is invalid")?;
+    for url in [&url, &signature_url] {
+        validate_url(url, NetworkPolicy::PRODUCTION)?;
+    }
+    let fetch = |url: Url, cap: usize| async move {
+        fetch_capped(&url, cap, METADATA_DEADLINE, "application/octet-stream", NetworkPolicy::PRODUCTION).await
+    };
+    let file = match fetch(url, RELEASE_EXTRA_MAX_BYTES).await {
+        Ok(file) => file,
+        Err(error) if is_missing_updater_resource(&error) => return Ok(SignedExtra::Missing),
+        Err(error) => return Err(error),
+    };
+    let signature = match fetch(signature_url, SIGNATURE_MAX_BYTES).await {
+        Ok(signature) => signature,
+        Err(error) if is_missing_updater_resource(&error) => return Ok(SignedExtra::Missing),
+        Err(error) => return Err(error),
+    };
+    Ok(match verify_minisign(&file.bytes, &signature.bytes, public_key) {
+        Ok(()) => SignedExtra::Verified(file.bytes),
+        Err(_) => SignedExtra::BadSignature,
+    })
+}
+
 async fn download_artifact(
     platform: &SignedPlatform,
     public_key: &str,
@@ -1726,7 +2156,7 @@ enum PendingLook {
     /// It fell below the signed security floor and has been dropped.
     BelowFloor,
     Prepared { version: String },
-    Unprepared(PrepareTarget),
+    Unprepared(Box<PrepareTarget>),
 }
 
 async fn look_at_pending(app: &AppHandle, service: &UpdaterService) -> Result<PendingLook> {
@@ -1744,11 +2174,11 @@ async fn look_at_pending(app: &AppHandle, service: &UpdaterService) -> Result<Pe
         });
     }
     let path = pending_dir(app)?.join(staged_name(update));
-    Ok(PendingLook::Unprepared(PrepareTarget {
+    Ok(PendingLook::Unprepared(Box::new(PrepareTarget {
         platform: update.platform.clone(),
         version: update.info.version.clone(),
         path,
-    }))
+    })))
 }
 
 /// Download, verify and stage `target`, so that installing it later needs no
@@ -1964,6 +2394,13 @@ async fn install_locked(
             ))
         }
     };
+    // The bytes just checked against the signed manifest are the release's
+    // own installer, so with the setting on they are kept to share
+    // (`release_share`) before they are handed over.
+    if crate::release_share::installer_folder().is_some() {
+        let (url, version, bytes) = (update.platform.url.clone(), update.info.version.clone(), artifact.clone());
+        let _ = tokio::task::spawn_blocking(move || crate::release_share::keep_installer(&url, &version, &bytes)).await;
+    }
     // Record the attempt before handing the bytes over. `install` does not come
     // back on success, so this is the only chance to leave behind anything a
     // later launch could act on. Only with a staged copy, which is what the
@@ -2198,7 +2635,11 @@ async fn check_and_retain(
     app: &AppHandle,
     service: &UpdaterService,
 ) -> Result<SecureUpdateCheckResult, String> {
-    match secure_check(app).await {
+    let checked = secure_check(app).await;
+    // A release this system cannot run is "nothing to install", with the reason.
+    let too_old = checked.as_ref().err().and_then(system_too_old);
+    let checked = if too_old.is_some() { Ok(None) } else { checked };
+    match checked {
         Ok(Some((info, mut pending))) => {
             let mut slot = service.pending.lock().await;
             // The same signed artifact found again keeps what was prepared for
@@ -2216,6 +2657,7 @@ async fn check_and_retain(
                 pending_retained: true,
                 error: None,
                 signature_missing: false,
+                system_too_old: None,
             })
         }
         Ok(None) => {
@@ -2231,6 +2673,7 @@ async fn check_and_retain(
                 pending_retained: pending.is_some(),
                 error: None,
                 signature_missing: false,
+                system_too_old: too_old,
             })
         }
         Err(error) => {
@@ -2260,6 +2703,7 @@ async fn check_and_retain(
                 pending_retained: pending.is_some(),
                 error: Some(public_failure(UpdaterOperation::Check, error)),
                 signature_missing,
+                system_too_old: None,
             })
         }
     }
@@ -2304,7 +2748,7 @@ pub(crate) async fn prepare_pending_update(
     let target = match look_at_pending(app, service).await.map_err(fail)? {
         PendingLook::Nothing | PendingLook::BelowFloor => return Ok(None),
         PendingLook::Prepared { version } => return Ok(Some(version)),
-        PendingLook::Unprepared(target) => target,
+        PendingLook::Unprepared(target) => *target,
     };
     let config = embedded_updater_config().map_err(fail)?;
     let version = target.version.clone();
@@ -2353,7 +2797,7 @@ pub async fn secure_updater_install(
             ))
         }
         PendingLook::Prepared { .. } => None,
-        PendingLook::Unprepared(target) => Some(target),
+        PendingLook::Unprepared(target) => Some(*target),
     };
     let config = embedded_updater_config().map_err(fail)?;
     let report = |event: UpdateProgress| {
@@ -2766,7 +3210,121 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             signature: TEST_SIGNATURE.to_string(),
             sha256: hex::encode(Sha256::digest(b"test")),
             size: 4,
+            min_glibc: None,
         }
+    }
+
+    fn appimage_platforms(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, SignedPlatform> {
+        entries
+            .iter()
+            .map(|(target, min_glibc)| {
+                (
+                    target.to_string(),
+                    SignedPlatform {
+                        target: target.to_string(),
+                        min_glibc: min_glibc.map(str::to_string),
+                        ..platform_for_test_payload()
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_appimage_updates_only_from_an_entry_its_glibc_can_run() {
+        let legacy_only = appimage_platforms(&[("linux-x86_64-appimage", None)]);
+        assert_eq!(
+            choose_appimage_target(&legacy_only, "x86_64", Some((2, 35))),
+            AppImageTarget::Use("linux-x86_64-appimage".into()),
+            "today's manifests: the plain entry, as before"
+        );
+        assert_eq!(
+            choose_appimage_target(&legacy_only, "x86_64", None),
+            AppImageTarget::Use("linux-x86_64-appimage".into()),
+            "a plain entry states nothing, so an unknown glibc takes it"
+        );
+
+        let both = appimage_platforms(&[
+            ("linux-x86_64-appimage-glibc", Some("2.39")),
+            ("linux-x86_64-appimage", None),
+        ]);
+        assert_eq!(
+            choose_appimage_target(&both, "x86_64", Some((2, 41))),
+            AppImageTarget::Use("linux-x86_64-appimage-glibc".into()),
+            "a newer system takes the newer build"
+        );
+        assert_eq!(
+            choose_appimage_target(&both, "x86_64", Some((2, 35))),
+            AppImageTarget::Use("linux-x86_64-appimage".into()),
+            "an older one keeps the build it can run"
+        );
+
+        let gated_only = appimage_platforms(&[
+            ("linux-x86_64-appimage-glibc", Some("2.39")),
+            ("linux-x86_64-deb", None),
+        ]);
+        assert_eq!(
+            choose_appimage_target(&gated_only, "x86_64", Some((2, 39))),
+            AppImageTarget::Use("linux-x86_64-appimage-glibc".into())
+        );
+        assert_eq!(
+            choose_appimage_target(&gated_only, "x86_64", Some((2, 35))),
+            AppImageTarget::TooOld("2.39".into()),
+            "never handed a build that cannot start"
+        );
+        assert_eq!(
+            choose_appimage_target(&gated_only, "x86_64", None),
+            AppImageTarget::TooOld("2.39".into()),
+            "an unknown glibc meets no stated requirement"
+        );
+        assert_eq!(
+            choose_appimage_target(&gated_only, "aarch64", Some((2, 41))),
+            AppImageTarget::Default,
+            "another architecture's entries are not ours"
+        );
+        assert_eq!(
+            choose_appimage_target(&appimage_platforms(&[("linux-x86_64-deb", None)]), "x86_64", Some((2, 41))),
+            AppImageTarget::Default
+        );
+    }
+
+    #[test]
+    fn glibc_versions_are_major_and_minor_only() {
+        assert_eq!(parse_glibc("2.39"), Some((2, 39)));
+        assert_eq!(parse_glibc("2.4"), Some((2, 4)));
+        assert!(parse_glibc("2.4") < parse_glibc("2.39"), "compared as numbers");
+        for bad in ["", "2", "2.", ".39", "2.39.1", "2.x", "+2.39", "2. 39", "99999.1"] {
+            assert_eq!(parse_glibc(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_signed_glibc_requirement_must_be_well_formed_and_a_gated_entry_must_state_one() {
+        let manifest = |platform: serde_json::Value| {
+            serde_json::json!({
+                "version": "9.9.9",
+                "security_epoch": 1,
+                "platforms": { platform["target"].as_str().unwrap(): platform },
+            })
+        };
+        let entry = |target: &str, min_glibc: Option<&str>| {
+            let mut entry = serde_json::json!({
+                "target": target,
+                "url": "https://example.com/Ember_9.9.9_amd64.AppImage",
+                "signature": TEST_SIGNATURE,
+                "sha256": "0".repeat(64),
+                "size": 4,
+            });
+            if let Some(min) = min_glibc {
+                entry["min_glibc"] = min.into();
+            }
+            entry
+        };
+        let key = TEST_PUBLIC_KEY;
+        assert!(validate_manifest(manifest(entry("linux-x86_64-appimage-glibc", Some("2.39"))), key).is_ok());
+        assert!(validate_manifest(manifest(entry("linux-x86_64-appimage", None)), key).is_ok());
+        assert!(validate_manifest(manifest(entry("linux-x86_64-appimage-glibc", None)), key).is_err());
+        assert!(validate_manifest(manifest(entry("linux-x86_64-appimage", Some("latest"))), key).is_err());
     }
 
     #[test]
@@ -2934,6 +3492,7 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
             pending_retained: true,
             error: None,
             signature_missing: false,
+            system_too_old: None,
         };
         let still = found.clone().brought_up_to_date(Some(&info("1.8.0")));
         assert_eq!(still.update.map(|update| update.version).as_deref(), Some("1.8.0"));

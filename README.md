@@ -493,6 +493,7 @@ The production build writes platform packages under `src-tauri/target/release/bu
 | Friend Sessions | Noise IK + Ed25519 proof of possession |
 | Friend Chat Crypto | X25519 ECDH → HKDF → XChaCha20-Poly1305 (E2E) |
 | GeoIP | MaxMind DB (dbip-country-lite) |
+| AppImage emoji | Noto Color Emoji, bitmap (CBDT) build, SIL Open Font License 1.1 |
 
 ## License
 

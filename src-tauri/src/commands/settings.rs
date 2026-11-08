@@ -108,6 +108,7 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     // Written by `set_ignored_members` from wherever a member is ignored.
     "ignored_members",
     "shared_folders",
+    "ember_releases_folder",
     "previous_download_folders",
     "default_shared_folder_seeded",
     "folder_priorities",
@@ -628,6 +629,55 @@ fn normalize_shared_folders(folders: Vec<String>) -> Result<Vec<String>, String>
         .collect())
 }
 
+/// Keep the release folder (`release_share`) in the shared folders exactly
+/// while one of its settings is on: added when one turns on, taken back when
+/// both are off or the download folder it was in has moved. Returns the folder
+/// to clear of release files once the save is written.
+///
+/// A new download folder is checked for provenance and writability further
+/// down this save, so nothing is created in one here: the release folder
+/// moves into it on the next save. One an existing shared folder already
+/// contains is shared through that one and is not listed again, since shared
+/// folders may not overlap.
+async fn sync_release_share_folder(
+    old: &AppSettings,
+    settings: &mut AppSettings,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let listed = std::mem::take(&mut settings.ember_releases_folder);
+    let download_moved = normalized_path_components(std::path::Path::new(&settings.download_folder))
+        != normalized_path_components(std::path::Path::new(&old.download_folder));
+    let desired = match crate::release_share::folder_in(&settings.download_folder) {
+        Some(_) if !crate::release_share::wanted(settings) => None,
+        Some(_) if download_moved => (!listed.is_empty()).then(|| listed.clone()),
+        Some(folder) => Some(
+            tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+                std::fs::create_dir_all(&folder)?;
+                Ok(crate::commands::share_browser::display_fs_path(&folder.canonicalize()?))
+            })
+            .await
+            .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
+            .map_err(|e| coded_ctx("settings_release_folder_failed", "Could not create the Ember releases folder", e))?,
+        ),
+        None => None,
+    };
+    let mut clear = None;
+    if !listed.is_empty() && !desired.as_deref().is_some_and(|folder| shared_folder_paths_equal(folder, &listed)) {
+        settings.shared_folders.retain(|folder| !shared_folder_paths_equal(folder, &listed));
+        clear = Some(std::path::PathBuf::from(&listed));
+    }
+    if let Some(folder) = desired {
+        let covered = settings
+            .shared_folders
+            .iter()
+            .any(|shared| shared_paths_overlap(std::path::Path::new(shared), std::path::Path::new(&folder)));
+        if !covered {
+            settings.shared_folders.push(folder.clone());
+        }
+        settings.ember_releases_folder = folder;
+    }
+    Ok(clear)
+}
+
 fn shared_folder_paths_equal(a: &str, b: &str) -> bool {
     crate::search::index::normalize_path_key(a).trim_end_matches(['/', '\\'])
         == crate::search::index::normalize_path_key(b).trim_end_matches(['/', '\\'])
@@ -911,6 +961,12 @@ pub(crate) fn soft_repair_settings(settings: &mut AppSettings) -> bool {
     }
     changed |= clamp_assign(&mut settings.alt_max_upload_speed, 0, MAX_CONFIGURED_SPEED_BPS);
     changed |= clamp_assign(&mut settings.alt_max_download_speed, 0, MAX_CONFIGURED_SPEED_BPS);
+    changed |= clamp_assign(&mut settings.upload_quota_gb, 1, crate::types::MAX_UPLOAD_QUOTA_GB);
+    changed |= clamp_assign(
+        &mut settings.upload_quota_speed,
+        crate::types::MIN_UPLOAD_QUOTA_SPEED,
+        MAX_CONFIGURED_SPEED_BPS,
+    );
     // Soft-disable USS when upload is unlimited (validate rejects that combo).
     if settings.uss_enabled && settings.max_upload_speed == 0 {
         settings.uss_enabled = false;
@@ -1329,6 +1385,18 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             MAX_CONFIGURED_SPEED_BPS,
         ));
     }
+    if !(1..=crate::types::MAX_UPLOAD_QUOTA_GB).contains(&settings.upload_quota_gb) {
+        return Err(coded(
+            "settings_upload_quota_invalid",
+            "The daily upload quota must be between 1 and 1000 GB",
+        ));
+    }
+    if !(crate::types::MIN_UPLOAD_QUOTA_SPEED..=MAX_CONFIGURED_SPEED_BPS).contains(&settings.upload_quota_speed) {
+        return Err(coded(
+            "settings_upload_quota_speed_invalid",
+            "The upload speed after the quota must be at least 1 KB/s",
+        ));
+    }
     if !(60..=14400).contains(&settings.download_queue_wait_secs) {
         return Err(coded(
             "settings_download_queue_wait_invalid",
@@ -1656,6 +1724,7 @@ pub async fn update_settings(
         tokio::task::spawn_blocking(move || normalize_shared_folders(shared_folders))
             .await
             .map_err(|e| coded_ctx("settings_validation_task_failed", "Validation failed", e))??;
+    let release_folder_to_clear = sync_release_share_folder(&old_settings, &mut settings).await?;
     // Provenance before validation. `validate_settings` resolves the folder on
     // disk, and resolving `\\host\share` opens an SMB session that hands the
     // user's NTLM credentials to that host — so a changed folder the picker
@@ -2016,6 +2085,21 @@ pub async fn update_settings(
     // holding a read of the previous settings and then overwrite this target
     // with the stale one it resolved from them.
     crate::background::apply_effective_limits(&app, &state, &settings);
+
+    crate::sharing::disk::set_hash_at_low_priority(settings.hash_low_priority);
+    crate::release_share::configure(&settings);
+    // Awaited, under the save lock: a save turning sharing back on straight
+    // after must not find this still deleting what it has just kept.
+    if let Some(folder) = release_folder_to_clear {
+        let _ = tokio::task::spawn_blocking(move || crate::release_share::clear(&folder)).await;
+    }
+    if settings.watch_shared_folders != old_settings.watch_shared_folders {
+        if let Some(watcher) = state.shared_folder_watcher.clone() {
+            let enabled = settings.watch_shared_folders;
+            // Adds or drops every OS watch, which can block on an offline share.
+            tokio::task::spawn_blocking(move || watcher.set_enabled(enabled));
+        }
+    }
 
     // Apply the new concurrent-download cap and promote any queued downloads
     // that the higher cap now allows. Previously this only set the field, so
@@ -3072,6 +3156,9 @@ const EMBER_GITHUB_URL: &str = "https://github.com/untaimed18/Ember-P2P";
 /// The official subreddit.
 const EMBER_REDDIT_URL: &str = "https://www.reddit.com/r/EmberP2P/";
 
+/// The user guide on the website.
+const EMBER_GUIDE_URL: &str = "https://www.emberp2p.org/guide.html";
+
 /// The project's own pages, by name. The frontend names one of these rather
 /// than passing a URL: the addresses are hardcoded here so a compromised
 /// renderer cannot point the browser at an arbitrary destination.
@@ -3080,8 +3167,30 @@ fn ember_link_url(target: &str) -> Option<&'static str> {
         "website" => Some(EMBER_WEBSITE_URL),
         "github" => Some(EMBER_GITHUB_URL),
         "reddit" => Some(EMBER_REDDIT_URL),
+        "guide" => Some(EMBER_GUIDE_URL),
         _ => None,
     }
+}
+
+/// `version`'s notes in the website's release history (`#release-1-8-0`), or
+/// `None` for anything but a plain `major.minor.patch`: the version arrives
+/// from the renderer, and only the digits may reach the address.
+fn release_notes_url(version: &str) -> Option<String> {
+    let parts: Vec<&str> = version.split('.').collect();
+    let plain = parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.len() <= 5 && part.bytes().all(|byte| byte.is_ascii_digit()));
+    plain.then(|| format!("{EMBER_WEBSITE_URL}#release-{}", parts.join("-")))
+}
+
+/// Open a release's notes on the website in the default browser.
+#[tauri::command]
+pub async fn open_release_notes(version: String) -> Result<(), String> {
+    let url = release_notes_url(&version)
+        .ok_or_else(|| coded("settings_unknown_link", "Unknown link"))?;
+    crate::security::filesystem::open_url_with_default_app(&url)
+        .map_err(|e| coded_ctx("settings_open_link_failed", "Failed to open the link", e))
 }
 
 /// Open one of the project's pages (website, GitHub, Reddit) in the default
@@ -3963,13 +4072,106 @@ mod tests {
 
     #[test]
     fn ember_links_are_a_fixed_allowlist_of_https_pages() {
-        for target in ["website", "github", "reddit"] {
+        for target in ["website", "github", "reddit", "guide"] {
             let url = ember_link_url(target).expect(target);
             assert!(url.starts_with("https://"), "{target}: {url}");
         }
         assert_eq!(ember_link_url("website"), Some(EMBER_WEBSITE_URL));
         assert_eq!(ember_link_url("GitHub"), None, "names are lowercase");
         assert_eq!(ember_link_url("https://evil.example/"), None);
+    }
+
+    /// The release folder is listed while a release-sharing setting is on,
+    /// never alongside a shared folder that already holds it, never created
+    /// in a download folder this same save moves to, and taken back with its
+    /// files to clear once both settings are off.
+    #[tokio::test]
+    async fn the_release_folder_is_shared_exactly_while_release_sharing_is_on() {
+        let base = std::env::temp_dir().join(format!(
+            "ember-release-folder-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let downloads = base.join("dl");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let release_dir = downloads.join(crate::release_share::FOLDER_NAME);
+        let off = AppSettings {
+            download_folder: downloads.to_string_lossy().into_owned(),
+            shared_folders: Vec::new(),
+            ..Default::default()
+        };
+
+        let mut on = AppSettings {
+            share_ember_installer: true,
+            ..off.clone()
+        };
+        assert_eq!(sync_release_share_folder(&off, &mut on).await.unwrap(), None);
+        assert!(release_dir.is_dir(), "created");
+        let listed = on.ember_releases_folder.clone();
+        assert!(shared_folder_paths_equal(
+            &listed,
+            &crate::commands::share_browser::display_fs_path(&release_dir.canonicalize().unwrap())
+        ));
+        assert_eq!(on.shared_folders, vec![listed.clone()]);
+
+        let mut again = on.clone();
+        assert_eq!(sync_release_share_folder(&on, &mut again).await.unwrap(), None);
+        assert_eq!(again.shared_folders, vec![listed.clone()], "listed once");
+
+        let mut turned_off = AppSettings {
+            share_ember_installer: false,
+            ..on.clone()
+        };
+        let clear = sync_release_share_folder(&on, &mut turned_off).await.unwrap();
+        assert_eq!(clear.as_deref(), Some(std::path::Path::new(&listed)));
+        assert!(turned_off.shared_folders.is_empty());
+        assert!(turned_off.ember_releases_folder.is_empty());
+
+        let parent = crate::commands::share_browser::display_fs_path(&downloads.canonicalize().unwrap());
+        let mut covered = AppSettings {
+            seed_ember_releases: true,
+            shared_folders: vec![parent.clone()],
+            ..off.clone()
+        };
+        sync_release_share_folder(&off, &mut covered).await.unwrap();
+        assert_eq!(covered.shared_folders, vec![parent.clone()], "shared through the folder that holds it");
+        assert!(!covered.ember_releases_folder.is_empty());
+        let mut uncovered = AppSettings {
+            seed_ember_releases: false,
+            ..covered.clone()
+        };
+        sync_release_share_folder(&covered, &mut uncovered).await.unwrap();
+        assert_eq!(uncovered.shared_folders, vec![parent], "the user's own folder stays");
+
+        let moved_to = base.join("elsewhere");
+        let mut moved = AppSettings {
+            download_folder: moved_to.to_string_lossy().into_owned(),
+            ..on.clone()
+        };
+        assert_eq!(sync_release_share_folder(&on, &mut moved).await.unwrap(), None);
+        assert!(!moved_to.exists(), "nothing created where the save is moving to");
+        assert_eq!(moved.ember_releases_folder, listed, "the folder follows on the next save");
+        let mut next = moved.clone();
+        let clear = sync_release_share_folder(&moved, &mut next).await.unwrap();
+        assert_eq!(clear.as_deref(), Some(std::path::Path::new(&listed)), "the old one is taken back");
+        assert!(moved_to.join(crate::release_share::FOLDER_NAME).is_dir());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn release_notes_open_only_for_a_plain_version() {
+        assert_eq!(
+            release_notes_url("1.8.0").as_deref(),
+            Some("https://www.emberp2p.org/#release-1-8-0")
+        );
+        assert_eq!(
+            release_notes_url("10.20.300").as_deref(),
+            Some("https://www.emberp2p.org/#release-10-20-300")
+        );
+        for bad in ["", "1.8", "1.8.0.1", "1.8.0-beta", "1.8.x", "1..0", "1.8.0/../x", "1.8.0#a", " 1.8.0", "123456.0.0"] {
+            assert_eq!(release_notes_url(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

@@ -289,6 +289,20 @@
     field?.focus();
   }
 
+  /** The folder named after a category, as shown in the user's language, for
+   *  one that has none; `null` when it already has one or the name makes none. */
+  function suggestedFolder(category: string): string | null {
+    if (folders[category] || (drafts[category] ?? '').trim()) return null;
+    return normalizeCategoryFolder(labelFor(category));
+  }
+
+  async function useSuggestedFolder(category: string, folder: string, field: HTMLInputElement | null) {
+    drafts[category] = folder;
+    await saveFolder(category);
+    await tick();
+    field?.focus();
+  }
+
   function onFolderKeydown(e: KeyboardEvent, category: string) {
     if (e.key === 'Enter') {
       e.preventDefault();
@@ -529,6 +543,7 @@
 
 {#snippet details(category: string, builtin: boolean)}
   {@const count = counts[category] ?? 0}
+  {@const suggested = suggestedFolder(category)}
   <div class="cat-pane-head">
     {@render categoryIcon(category, builtin, 44)}
     <div class="cat-pane-title">
@@ -545,6 +560,20 @@
   <div class="cat-field">
     <span class="cat-field-label">{m.transfers_categories_folder_label()}</span>
     {@render folderField(category, `categories-folder-${instanceId}`)}
+    {#if suggested}
+      <button
+        type="button"
+        class="secondary cat-use-folder"
+        disabled={busy}
+        onclick={(e) => {
+          const field = e.currentTarget.parentElement?.querySelector('input') ?? null;
+          void useSuggestedFolder(category, suggested, field);
+        }}
+      >
+        {@render folderGlyph(13)}
+        <span>{m.transfers_categories_use_folder({ folder: folderPath(suggested) })}</span>
+      </button>
+    {/if}
   </div>
 
   <p class="cat-footnote">
@@ -697,6 +726,7 @@
                 <div class="cat-group-head">
                   <h4 id="categories-builtin-{instanceId}">{m.transfers_categories_builtin_title()}</h4>
                 </div>
+                <p class="cat-group-note">{m.transfers_categories_builtin_note()}</p>
                 <ul class="cat-items" aria-labelledby="categories-builtin-{instanceId}">
                   {#each shownBuiltins as category (category)}
                     {@render item(category, true)}
@@ -926,6 +956,21 @@
     font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
     color: var(--text-muted);
+  }
+  .cat-group-note {
+    margin: 0 8px 6px;
+    font-size: var(--font-size-xs);
+    line-height: 1.4;
+    color: var(--text-muted);
+  }
+  .cat-use-folder {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+    text-align: left;
   }
   .cat-side-empty {
     margin: 2px 6px 4px;

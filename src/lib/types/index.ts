@@ -422,6 +422,25 @@ export interface EmberDiagnostics {
    *  and have not been yet. Persistently high means replication is falling
    *  behind its per-cycle budget. */
   ember_dht_republish_backlog: number;
+  /** Storer replication is off because the overlay is no larger than one
+   *  replica set, so the backlog's zero means "not needed", not "caught up". */
+  ember_dht_replication_paused?: boolean;
+  /** Our records storers refused: over the 150-per-publisher cap under a key. */
+  ember_dht_our_refused_publisher_cap?: number;
+  /** Our records refused because the key or the storer's store was full. */
+  ember_dht_our_refused_full?: number;
+  /** Our records refused because the storer knows closer nodes to the key. */
+  ember_dht_our_refused_not_closest?: number;
+  /** Our records refused as invalid or out of date. */
+  ember_dht_our_refused_invalid?: number;
+  /** Our records refused with no reason given (older storers). */
+  ember_dht_our_refused_unexplained?: number;
+  /** Verified contacts that say unsolicited UDP reaches them. */
+  ember_dht_contacts_reach_open?: number;
+  /** Verified contacts that say their UDP port is filtered (kept out of our replies). */
+  ember_dht_contacts_reach_firewalled?: number;
+  /** Verified contacts that say nothing about their UDP port. */
+  ember_dht_contacts_reach_unknown?: number;
   /** Seconds since any Ember DHT frame arrived, or null if none ever has (0 is
    *  a frame this second). Separates "still joining" from "joined and quiet"
    *  from "stuck". */
@@ -672,6 +691,10 @@ export interface EmberDiagnostics {
   ember_dht_search_elapsed_ms_sum?: number;
   /** Sum of verified records gathered across those searches. */
   ember_dht_search_records_sum?: number;
+  /** Of those searches, the user's keyword searches. */
+  ember_dht_keyword_search_outcomes?: number;
+  /** Sum of keyword-search durations in milliseconds. */
+  ember_dht_keyword_search_elapsed_ms_sum?: number;
   /** Highest verified-contact count seen today (UTC). */
   ember_dht_verified_highwater_today?: number;
   /** Highest verified-contact count ever recorded on this node. */
@@ -1106,6 +1129,12 @@ export interface AppSettings {
    *  is away, after a one-minute warning. Update checks themselves always run
    *  (at launch and hourly) and have no setting. */
   silent_update_enabled: boolean;
+  /** Keep the installer each update was made with and share it over eD2K,
+   *  from `<download folder>/Ember releases`. */
+  share_ember_installer: boolean;
+  /** Fetch, verify and share every file of each new release (for a computer
+   *  that stays on). */
+  seed_ember_releases: boolean;
 
   /** Master switch for desktop notifications. Off silences every category
    *  below, and the backend re-checks it so a stale renderer cannot notify
@@ -1160,6 +1189,17 @@ export interface AppSettings {
   /** Bytes per second; 0 is unlimited. */
   alt_max_upload_speed: number;
   alt_max_download_speed: number;
+  /** Hold uploads to `upload_quota_speed` for the rest of the local day once
+   *  `upload_quota_gb` has been uploaded since midnight. */
+  upload_quota_enabled: boolean;
+  /** Gigabytes (10^9 bytes), 1–1000. */
+  upload_quota_gb: number;
+  /** Bytes per second once the quota is reached; at least 1024. */
+  upload_quota_speed: number;
+  /** Hash shared files at background CPU and disk priority. */
+  hash_low_priority: boolean;
+  /** Watch shared folders and index changes as they happen. */
+  watch_shared_folders: boolean;
   /** Start Ember when the user signs in. */
   launch_at_login: boolean;
   /** A launch at sign-in comes up in the tray rather than on the desktop. */
@@ -1235,4 +1275,8 @@ export interface RuntimeStatus {
    *  it rather than offering a dead switch. */
   sleep_inhibit_supported: boolean;
   sleep_inhibit_held: boolean;
+  /** Bytes uploaded since local midnight, in steps of 10 MB. */
+  uploaded_today: number;
+  /** The daily upload quota is reached and holds uploads to its speed. */
+  upload_quota_reached: boolean;
 }

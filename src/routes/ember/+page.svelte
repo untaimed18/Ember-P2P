@@ -322,7 +322,9 @@
           ? m.updater_ready_body({ version: $updater.version ?? '' })
           : $updater.phase === 'error' || $updater.signatureMissing
             ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
-            : '',
+            : $updater.systemTooOld
+              ? m.updater_system_too_old({ version: $updater.systemTooOld.version, glibc: $updater.systemTooOld.glibc })
+              : '',
   );
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
   let verifiedCount = $derived(diag?.ember_dht_verified_contacts ?? 0);
@@ -542,6 +544,7 @@
   // two of these strings colliding in one locale is a duplicate-key error.
   let metrics = $derived.by(() => {
     const outcomes = diag?.ember_dht_search_outcomes ?? 0;
+    const keywordOutcomes = diag?.ember_dht_keyword_search_outcomes ?? 0;
     return [
     { id: 'contacts', k: m.ember_stat_contacts(), v: formatNumber(peerCount) },
     { id: 'verified-contacts', k: m.ember_stat_verified_contacts(), v: formatNumber(diag?.ember_dht_verified_contacts ?? 0) },
@@ -549,9 +552,12 @@
     { id: 'verified-peak-all', k: m.ember_stat_verified_peak_alltime(), v: formatNumber(diag?.ember_dht_verified_highwater ?? 0) },
     { id: 'network-size', k: m.ember_stat_network_size(), v: estimatedNodes },
     { id: 'last-inbound', k: m.ember_stat_last_inbound(), v: lastInboundLabel },
-    { id: 'republish-backlog', k: m.ember_stat_republish_backlog(), v: formatNumber(diag?.ember_dht_republish_backlog ?? 0) },
+    { id: 'republish-backlog', k: m.ember_stat_republish_backlog(), v: diag?.ember_dht_replication_paused ? m.ember_stat_republish_paused() : formatNumber(diag?.ember_dht_republish_backlog ?? 0) },
     { id: 'cached-contacts', k: m.ember_stat_cached_contacts(), v: formatNumber(diag?.ember_dht_cached_contacts ?? 0) },
     { id: 'session-contacts', k: m.ember_stat_session_contacts(), v: formatNumber(diag?.ember_dht_session_contacts ?? 0) },
+    { id: 'contacts-reach-open', k: m.ember_stat_contacts_reach_open(), v: formatNumber(diag?.ember_dht_contacts_reach_open ?? 0) },
+    { id: 'contacts-reach-firewalled', k: m.ember_stat_contacts_reach_firewalled(), v: formatNumber(diag?.ember_dht_contacts_reach_firewalled ?? 0) },
+    { id: 'contacts-reach-unknown', k: m.ember_stat_contacts_reach_unknown(), v: formatNumber(diag?.ember_dht_contacts_reach_unknown ?? 0) },
     { id: 'contacts-evicted', k: m.ember_stat_contacts_evicted(), v: formatNumber(diag?.ember_dht_contacts_evicted ?? 0) },
     { id: 'contacts-demoted', k: m.ember_stat_contacts_demoted(), v: formatNumber(diag?.ember_dht_contacts_demoted ?? 0) },
     { id: 'peer-lists', k: m.ember_stat_peer_lists_received(), v: formatNumber(diag?.ember_dht_peer_lists_received ?? 0) },
@@ -578,6 +584,7 @@
     { id: 'search-misses', k: m.ember_stat_search_misses(), v: formatNumber(diag?.ember_dht_search_misses ?? 0) },
     { id: 'search-avg-nodes', k: m.ember_stat_search_avg_nodes(), v: searchAvg(diag?.ember_dht_search_nodes_answered, outcomes) },
     { id: 'search-avg-ms', k: m.ember_stat_search_avg_ms(), v: outcomes <= 0 ? '\u2014' : msFormat.format(Math.round((diag?.ember_dht_search_elapsed_ms_sum ?? 0) / outcomes)) },
+    { id: 'keyword-search-avg-ms', k: m.ember_stat_keyword_search_avg_ms(), v: keywordOutcomes <= 0 ? '\u2014' : msFormat.format(Math.round((diag?.ember_dht_keyword_search_elapsed_ms_sum ?? 0) / keywordOutcomes)) },
     { id: 'search-avg-records', k: m.ember_stat_search_avg_records(), v: searchAvg(diag?.ember_dht_search_records_sum, outcomes) },
     { id: 'store-acks', k: m.ember_stat_stores_acked(), v: formatNumber(diag?.ember_dht_stores_acked ?? 0) },
     { id: 'store-fails', k: m.ember_stat_stores_failed(), v: formatNumber(diag?.ember_dht_stores_failed ?? 0) },
@@ -619,6 +626,11 @@
     { id: 'reject-pub', k: m.ember_stat_store_reject_publisher_cap(), v: formatNumber(diag?.ember_dht_store_reject_publisher_cap ?? 0) },
     { id: 'reject-key', k: m.ember_stat_store_reject_per_key_cap(), v: formatNumber(diag?.ember_dht_store_reject_per_key_cap ?? 0) },
     { id: 'reject-prox', k: m.ember_stat_store_reject_proximity(), v: formatNumber(diag?.ember_dht_store_reject_proximity ?? 0) },
+    { id: 'our-refused-pub', k: m.ember_stat_our_refused_publisher_cap(), v: formatNumber(diag?.ember_dht_our_refused_publisher_cap ?? 0) },
+    { id: 'our-refused-full', k: m.ember_stat_our_refused_full(), v: formatNumber(diag?.ember_dht_our_refused_full ?? 0) },
+    { id: 'our-refused-prox', k: m.ember_stat_our_refused_not_closest(), v: formatNumber(diag?.ember_dht_our_refused_not_closest ?? 0) },
+    { id: 'our-refused-invalid', k: m.ember_stat_our_refused_invalid(), v: formatNumber(diag?.ember_dht_our_refused_invalid ?? 0) },
+    { id: 'our-refused-unexplained', k: m.ember_stat_our_refused_unexplained(), v: formatNumber(diag?.ember_dht_our_refused_unexplained ?? 0) },
     { id: 'keyword-key-off-name', k: m.ember_stat_keyword_key_off_name(), v: formatNumber(diag?.ember_dht_keyword_key_off_name ?? 0) },
     { id: 'unknown-record-types', k: m.ember_stat_unknown_record_types(), v: formatNumber(diag?.ember_dht_unknown_record_types ?? 0) },
     { id: 'version-advertisers', k: m.ember_stat_version_advertisers(), v: formatNumber(diag?.ember_dht_version_advertisers ?? 0) },

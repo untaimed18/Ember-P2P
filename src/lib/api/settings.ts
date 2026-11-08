@@ -239,10 +239,16 @@ export async function takePendingKnownMetNotice(): Promise<{ reset: boolean } | 
 
 /** The project's own pages. Named rather than passed as URLs: the addresses
  *  are fixed in the backend, so this renderer cannot point them elsewhere. */
-export type EmberLink = 'website' | 'github' | 'reddit';
+export type EmberLink = 'website' | 'github' | 'reddit' | 'guide';
 
 export async function openEmberLink(target: EmberLink): Promise<void> {
   return invoke('open_ember_link', { target });
+}
+
+/** Open `version`'s notes on the website. The backend builds the address from
+ *  the version's digits alone. */
+export async function openReleaseNotes(version: string): Promise<void> {
+  return invoke('open_release_notes', { version });
 }
 
 /** Open the project's Buy Me a Coffee page. The address is fixed in the backend. */
