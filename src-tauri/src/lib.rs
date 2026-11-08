@@ -290,7 +290,7 @@ pub(crate) async fn run_graceful_shutdown(
         .store(true, std::sync::atomic::Ordering::Release);
     // The day's upload count, so the quota resumes where it stood rather than
     // up to a minute behind.
-    background::save_upload_quota(app, &state).await;
+    background::save_upload_quota(app, &state, true).await;
 
     // Signal every in-flight hash worker to stop ASAP. The startup indexer
     // (and `reload_shared_files`) check these flags between files and mid-file

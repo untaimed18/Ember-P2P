@@ -183,6 +183,15 @@ impl Outcome {
 /// first thing in `run`, before the async runtime.
 #[cfg(target_os = "linux")]
 pub fn prepare() -> Outcome {
+    // `APPDIR` alone is not enough: an AppImage hands it on to whatever it
+    // starts, so a `.deb` Ember opened from one would take this path and find
+    // no bundled font under another program's mount.
+    if !matches!(
+        tauri::utils::platform::bundle_type(),
+        Some(tauri::utils::config::BundleType::AppImage)
+    ) {
+        return Outcome::NotAppImage;
+    }
     let Some(appdir) = std::env::var_os("APPDIR").map(PathBuf::from) else {
         return Outcome::NotAppImage;
     };

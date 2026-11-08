@@ -1480,6 +1480,11 @@
     // 0 is "always ask", not an empty box; the ceiling is the attachment cap.
     s.chat_attachment_auto_accept_mb = cn(s.chat_attachment_auto_accept_mb, 2048, 25);
     s.upload_quota_gb = ci(s.upload_quota_gb, 1, UPLOAD_QUOTA_MAX_GB, 50);
+    // An emptied box is no speed at all, not the slowest one.
+    if (s.upload_quota_speed === 0) {
+      s.upload_quota_speed = 20 * 1024;
+      adjusted = true;
+    }
     s.upload_quota_speed = ci(s.upload_quota_speed, UPLOAD_QUOTA_MIN_SPEED, MAX_CONFIGURED_SPEED_BPS, 20 * 1024);
     return { error: null, adjusted };
   }
@@ -4170,6 +4175,11 @@
                     : formatSpeed(runtimeStatus.effective_download_speed),
                 })}
               </span>
+              {#if runtimeStatus.upload_quota_reached}
+                <span class="schedule-active-limits">
+                  {m.upload_quota_holding_note({ speed: formatSpeed(runtimeStatus.effective_upload_speed) })}
+                </span>
+              {/if}
             </div>
           {:else if runtimeStatus?.alt_speed}
             <!-- Switched on from the tray or the status bar, the alternative
@@ -4188,6 +4198,11 @@
                     : formatSpeed(runtimeStatus.effective_download_speed),
                 })}
               </span>
+              {#if runtimeStatus.upload_quota_reached}
+                <span class="schedule-active-limits">
+                  {m.upload_quota_holding_note({ speed: formatSpeed(runtimeStatus.effective_upload_speed) })}
+                </span>
+              {/if}
             </div>
           {/if}
           <div class="settings-group">
@@ -4296,7 +4311,7 @@
               </div>
               <div class="apply-input">
                 <div class="apply-grow">
-                  <SpeedInput label={m.settings_upload_quota_speed()} bind:value={settings.upload_quota_speed} onenter={() => void applyFields(['upload_quota_speed'])} onescape={() => revertTyped(['upload_quota_speed'])} />
+                  <SpeedInput label={m.settings_upload_quota_speed()} bind:value={settings.upload_quota_speed} allowUnlimited={false} onenter={() => void applyFields(['upload_quota_speed'])} onescape={() => revertTyped(['upload_quota_speed'])} />
                 </div>
                 {@render applyButton(['upload_quota_speed'], m.settings_upload_quota_speed())}
               </div>
@@ -4306,7 +4321,7 @@
                   {runtimeStatus.upload_quota_reached
                     ? m.settings_upload_quota_reached({
                         used: formatDecimal(runtimeStatus.uploaded_today / 1e9, 1),
-                        speed: formatSpeed(savedSettings?.upload_quota_speed ?? settings.upload_quota_speed),
+                        speed: formatSpeed(runtimeStatus.effective_upload_speed),
                       })
                     : m.settings_upload_quota_today({
                         used: formatDecimal(runtimeStatus.uploaded_today / 1e9, 1),

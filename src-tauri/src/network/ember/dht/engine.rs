@@ -4960,8 +4960,9 @@ mod tests {
         let local = d.local_id();
         let seen = chrono::Utc::now().timestamp();
         let firewalled = contact_in_bucket(local, 3, seen);
-        let open = contact_in_bucket(local, 4, seen);
-        let silent = contact_in_bucket(local, 5, seen);
+        // Farther than the silent one, so only the claim can rank it first.
+        let open = contact_in_bucket(local, 5, seen);
+        let silent = contact_in_bucket(local, 4, seen);
         for c in [&firewalled, &open, &silent] {
             assert!(d.add_contact(c.clone()));
         }
@@ -4994,6 +4995,18 @@ mod tests {
         assert!(matches!(
             decoded.payload,
             DhtPayload::Ping {
+                reach: Some(UdpReach::Open),
+                ..
+            }
+        ));
+
+        let mut b = dht(8);
+        let (_rid, ping) = b.build_ping();
+        let on_a = a.handle_message(&ping, addr(8, 4672), b.local_noise_pub, 1000);
+        let pong = messages::decode_message(&on_a.responses[0], true, &a.local_noise_pub).unwrap();
+        assert!(matches!(
+            pong.payload,
+            DhtPayload::Pong {
                 reach: Some(UdpReach::Open),
                 ..
             }

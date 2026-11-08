@@ -238,7 +238,31 @@ pub(super) fn fail_ember_record_pending_with(
 /// Records whose failed attempts this round are all permanent refusals, held at
 /// most this many at once. Past it a failure is simply not recorded, which reads
 /// as an ordinary retryable failure — the behaviour before refusals had reasons.
-const EMBER_PUBLISH_REFUSALS_MAX: usize = super::ember_publish::EMBER_BATCH_QUEUE_MAX;
+pub(super) const EMBER_PUBLISH_REFUSALS_MAX: usize = super::ember_publish::EMBER_BATCH_QUEUE_MAX;
+
+/// Fold one storer's failure of `reference` into `refusals`: a record stays
+/// refused for good only while every storer that failed it refused it so.
+///
+/// Entries are taken back when the record's last copy fails, but a record
+/// retracted, re-addressed or dropped first leaves its own behind; at the cap,
+/// those whose record is no longer `outstanding` make room, rather than every
+/// later refusal reading as one worth retrying.
+pub(super) fn note_ember_refusal(
+    refusals: &mut HashMap<EmberRecordRef, bool>,
+    reference: EmberRecordRef,
+    permanent: bool,
+    outstanding: impl FnOnce() -> HashSet<EmberRecordRef>,
+) {
+    if !refusals.contains_key(&reference) && refusals.len() >= EMBER_PUBLISH_REFUSALS_MAX {
+        let outstanding = outstanding();
+        refusals.retain(|r, _| outstanding.contains(r));
+    }
+    if let Some(all_permanent) = refusals.get_mut(&reference) {
+        *all_permanent &= permanent;
+    } else if refusals.len() < EMBER_PUBLISH_REFUSALS_MAX {
+        refusals.insert(reference, permanent);
+    }
+}
 
 /// One storer did not place `reference`: it refused it, with the reason it
 /// gave if any, or its batch went unanswered (`refusal` is `None` for both of
@@ -251,12 +275,10 @@ pub(super) fn note_ember_store_attempt_failed(
 ) {
     let permanent = refusal.is_some_and(|r| r.is_permanent());
     if reference.kind != EmberPublishKind::Replication {
-        let refusals = &mut state.ember_publish_refusals;
-        if let Some(all_permanent) = refusals.get_mut(&reference) {
-            *all_permanent &= permanent;
-        } else if refusals.len() < EMBER_PUBLISH_REFUSALS_MAX {
-            refusals.insert(reference, permanent);
-        }
+        let batches = &state.ember_batch_publish;
+        note_ember_refusal(&mut state.ember_publish_refusals, reference, permanent, || {
+            batches.outstanding_records()
+        });
     }
     if state.ember_batch_publish.record_still_outstanding(reference) {
         return;
@@ -3287,7 +3309,11 @@ pub(super) async fn handle_ember_dht_message(
                     .ember_dht_stores_failed
                     .saturating_add(outcome.refused.len() as u32);
                 for (reference, refusal) in outcome.refused.into_iter().zip(outcome.refusals) {
-                    note_ember_refusal_reason(&mut state.ember_diagnostics, refusal);
+                    // "Our stores": a copy replicated for another publisher,
+                    // refused as stale or over that publisher's cap, is not.
+                    if reference.kind != EmberPublishKind::Replication {
+                        note_ember_refusal_reason(&mut state.ember_diagnostics, refusal);
+                    }
                     note_ember_store_attempt_failed(state, reference, refusal, now);
                 }
             }

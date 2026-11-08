@@ -11,6 +11,7 @@
   import { translateError } from '$lib/i18n';
   import { addToast } from '$lib/stores/toast';
   import type { AppSettings, RuntimeStatus } from '$lib/types';
+  import { formatSpeed } from '$lib/utils';
   import SpeedInput from './SpeedInput.svelte';
   import ToggleSwitch from './ToggleSwitch.svelte';
 
@@ -43,6 +44,8 @@
   let loaded = $state(false);
   let saving = $state(false);
   let scheduleLabel = $state<string | null>(null);
+  /** The speed the daily upload quota holds uploads to, once it is reached. */
+  let quotaSpeed = $state<number | null>(null);
   let placement = $state({ bottom: 0, right: 0 });
 
   const dirty = $derived(
@@ -77,6 +80,11 @@
     return status.schedule.label || m.schedule_unnamed_rule();
   }
 
+  function noteStatus(status: RuntimeStatus) {
+    scheduleLabel = scheduleText(status);
+    quotaSpeed = status.upload_quota_reached ? status.effective_upload_speed : null;
+  }
+
   async function load() {
     loaded = false;
     const cached = get(appSettings);
@@ -92,8 +100,11 @@
       }
     }
     getRuntimeStatus()
-      .then((status) => (scheduleLabel = scheduleText(status)))
-      .catch(() => (scheduleLabel = null));
+      .then(noteStatus)
+      .catch(() => {
+        scheduleLabel = null;
+        quotaSpeed = null;
+      });
   }
 
   async function save(patch: QuickLimitsPatch) {
@@ -204,9 +215,7 @@
     });
     let unlisten: (() => void) | null = null;
     let live = true;
-    listen<RuntimeStatus>('ember:runtime-status', (event) => {
-      scheduleLabel = scheduleText(event.payload);
-    })
+    listen<RuntimeStatus>('ember:runtime-status', (event) => noteStatus(event.payload))
       .then((fn) => { if (live) unlisten = fn; else fn(); })
       .catch(() => {});
 
@@ -265,6 +274,9 @@
 
       {#if scheduleLabel && !altOn}
         <p class="limits-note" role="status">{m.statusbar_limits_schedule_note({ rule: scheduleLabel })}</p>
+      {/if}
+      {#if quotaSpeed !== null}
+        <p class="limits-note" role="status">{m.upload_quota_holding_note({ speed: formatSpeed(quotaSpeed) })}</p>
       {/if}
 
       <div class="limits-actions">

@@ -14,11 +14,15 @@
   let {
     value = $bindable(0),
     label = '',
+    allowUnlimited = true,
     onenter,
     onescape,
   }: {
     value: number;
     label?: string;
+    /** Off for a rate that has to be a number: no ∞ button, and 0 shows as an
+     *  empty box rather than as Unlimited. */
+    allowUnlimited?: boolean;
     /** Called when Enter is pressed in the number box. */
     onenter?: () => void;
     /** Called when Escape is pressed in the number box. Returns true when it
@@ -34,7 +38,7 @@
   // edited. Otherwise clearing the input to retype a value (which momentarily
   // makes `value === 0`) would yank the input out from under the user and
   // replace it with the unlimited placeholder mid-keystroke.
-  let showUnlimited = $derived(value === 0 && !focused);
+  let showUnlimited = $derived(allowUnlimited && value === 0 && !focused);
   // `lastSyncedValue` alone decides whether a `value` change came from this
   // component or from outside. A separate "internal update" flag used to do
   // it, but `handleInput` set the flag before writing `value`, and several
@@ -191,9 +195,11 @@
       <option value="KB/s">{speedUnitLabel(1)}</option>
       <option value="MB/s">{speedUnitLabel(2)}</option>
     </select>
-    <button type="button" class="unlimited-btn" onclick={toggleUnlimited} title={m.speed_input_set_unlimited()} aria-label={m.speed_input_set_unlimited()}>
-      &infin;
-    </button>
+    {#if allowUnlimited}
+      <button type="button" class="unlimited-btn" onclick={toggleUnlimited} title={m.speed_input_set_unlimited()} aria-label={m.speed_input_set_unlimited()}>
+        &infin;
+      </button>
+    {/if}
   {/if}
 </div>
 
