@@ -1129,6 +1129,12 @@ export interface AppSettings {
    *  is away, after a one-minute warning. Update checks themselves always run
    *  (at launch and hourly) and have no setting. */
   silent_update_enabled: boolean;
+  /** Keep the installer each update was made with and share it over eD2K,
+   *  from `<download folder>/Ember releases`. */
+  share_ember_installer: boolean;
+  /** Fetch, verify and share every file of each new release (for a computer
+   *  that stays on). */
+  seed_ember_releases: boolean;
 
   /** Master switch for desktop notifications. Off silences every category
    *  below, and the backend re-checks it so a stale renderer cannot notify

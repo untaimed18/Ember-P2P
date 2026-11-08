@@ -697,13 +697,14 @@ test("every release carries its eD2K links and collection", () => {
   for (const [from, to] of [
     ["        run: node scripts/ed2k-links.mjs\n", "        run: true\n"],
     ['          cat "$EMBER_ED2K_SECTION" >> "$notes"', "          true"],
+    ['"$EMBER_ED2K_OUT_DIR"/*.emulecollection "$EMBER_ED2K_OUT_DIR"/*_release-notes.md', '"$EMBER_ED2K_OUT_DIR"/*.json'],
     ['            "$EMBER_ED2K_OUT_DIR" -type f -print0)', "            -type f -print0)"],
   ]) {
     const fixture = tamperedWorkflow(from, to);
     try {
       assert.throws(
         () => verifyWorkflow({ root: fixture }),
-        /sign-publish must prepare the installers' eD2K links and attach the collection/,
+        /sign-publish must prepare the installers' eD2K links, sign the collection and notes, and attach them/,
       );
     } finally {
       rmSync(fixture, { recursive: true, force: true });

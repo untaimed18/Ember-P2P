@@ -511,10 +511,11 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
   if (
     !signJob.includes("run: node scripts/ed2k-links.mjs") ||
     !signJob.includes('cat "$EMBER_ED2K_SECTION" >> "$notes"') ||
+    !signJob.includes('"$EMBER_ED2K_OUT_DIR"/*.emulecollection "$EMBER_ED2K_OUT_DIR"/*_release-notes.md') ||
     !signJob.includes('"$EMBER_ED2K_OUT_DIR" -type f')
   ) {
     errors.push(
-      "sign-publish must prepare the installers' eD2K links and attach the collection",
+      "sign-publish must prepare the installers' eD2K links, sign the collection and notes, and attach them",
     );
   }
 

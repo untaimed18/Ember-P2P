@@ -35,6 +35,7 @@ mod idle;
 mod ipfilter_update;
 mod network;
 mod power;
+mod release_share;
 mod search;
 pub mod security;
 mod session_end;
@@ -1105,6 +1106,7 @@ pub fn run() {
             };
 
             sharing::disk::set_hash_at_low_priority(settings.hash_low_priority);
+            release_share::configure(&settings);
             let shared_folder_watcher = sharing::watcher::SharedFoldersWatcher::start(
                 app_handle.clone(),
                 settings.shared_folders.clone(),

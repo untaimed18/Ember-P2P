@@ -1651,6 +1651,9 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
         &manifest_version,
     )?;
 
+    // The signed release as it stands, whether or not this install takes it.
+    spawn_seed(app, &manifest, &config.public_key);
+
     // An AppImage updates from the entry this system can run, and when no
     // entry is one it can, the user is told so rather than offered nothing.
     let appimage_target = if matches!(
@@ -1818,6 +1821,263 @@ fn same_artifact(a: &SignedPlatform, b: &SignedPlatform) -> bool {
 /// Progress sink for an artifact download: the frontend's channel for a manual
 /// install, or nothing for one prepared in the background.
 type ProgressSink<'a> = &'a (dyn Fn(UpdateProgress) + Sync);
+
+/// The largest collection or notes file a release carries beside its
+/// installers. Both are a few kilobytes.
+const RELEASE_EXTRA_MAX_BYTES: usize = 1024 * 1024;
+
+/// A release to share every file of, for [`seed_release`].
+struct SeedJob {
+    app: AppHandle,
+    manifest: SignedManifest,
+    public_key: String,
+    folder: PathBuf,
+}
+
+/// Whether a seeding task runs, and the release it is to seed next. One task
+/// at a time, and always the newest release a check saw: a check that lands
+/// while a run is under way replaces what comes next rather than being lost.
+fn seed_queue() -> &'static parking_lot::Mutex<(bool, Option<SeedJob>)> {
+    static QUEUE: std::sync::OnceLock<parking_lot::Mutex<(bool, Option<SeedJob>)>> = std::sync::OnceLock::new();
+    QUEUE.get_or_init(Default::default)
+}
+
+/// Share every file of the release `manifest` names, when the setting asks
+/// for it (`release_share::seed_folder`). In the background: the check it
+/// came from does not wait for some hundred megabytes.
+fn spawn_seed(app: &AppHandle, manifest: &SignedManifest, public_key: &str) {
+    let Some(folder) = crate::release_share::seed_folder() else {
+        return;
+    };
+    {
+        let mut queue = seed_queue().lock();
+        queue.1 = Some(SeedJob {
+            app: app.clone(),
+            manifest: manifest.clone(),
+            public_key: public_key.to_string(),
+            folder,
+        });
+        if queue.0 {
+            return;
+        }
+        queue.0 = true;
+    }
+    tauri::async_runtime::spawn(async {
+        // Only a panic reaches this with the task still marked running; an
+        // ordinary end clears it under the lock, together with the check that
+        // nothing is waiting, so no check can fall between the two.
+        struct Running;
+        impl Drop for Running {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    seed_queue().lock().0 = false;
+                }
+            }
+        }
+        let _running = Running;
+        loop {
+            let job = {
+                let mut queue = seed_queue().lock();
+                match queue.1.take() {
+                    Some(job) => job,
+                    None => {
+                        queue.0 = false;
+                        break;
+                    }
+                }
+            };
+            seed_release(&job).await;
+        }
+    });
+}
+
+/// Fetch every file of the release into its folder for sharing: each
+/// installer checked exactly as an update is, against its signed size, hash
+/// and signature, and the collection and notes against the signatures the
+/// release workflow made for them. A file already there is checked the same
+/// way, once a session, and fetched again if it fails. The previous release's
+/// files go only once every installer of this one is in. Stops as soon as the
+/// setting is turned off or points elsewhere.
+async fn seed_release(job: &SeedJob) {
+    let SeedJob { app, manifest, public_key, folder } = job;
+    let still_wanted = || crate::release_share::seed_folder().as_deref() == Some(folder.as_path());
+    let version = manifest.version.as_str();
+    let mut wrote = 0usize;
+    let mut complete = true;
+    let mut base: Option<Url> = None;
+    let mut seen = std::collections::HashSet::new();
+    for platform in manifest.platforms.values() {
+        if !seen.insert(platform.url.clone()) {
+            continue;
+        }
+        let Some(name) = crate::release_share::release_file_name(&platform.url, version) else {
+            continue;
+        };
+        base.get_or_insert_with(|| platform.url.clone());
+        let path = folder.join(&name);
+        if holds_signed_artifact(&path, platform).await {
+            continue;
+        }
+        if !still_wanted() {
+            return;
+        }
+        let bytes = match download_artifact(platform, public_key, &|_| {}).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!("Release sharing: could not fetch {name}: {error:#}");
+                complete = false;
+                continue;
+            }
+        };
+        if !still_wanted() {
+            return;
+        }
+        if keep_release_file(folder, &name, bytes, &platform.sha256).await {
+            wrote += 1;
+        } else {
+            complete = false;
+        }
+    }
+    if let Some(base) = base {
+        for name in [format!("Ember_{version}.emulecollection"), format!("Ember_{version}_release-notes.md")] {
+            let path = folder.join(&name);
+            if crate::release_share::checked_unchanged(&path, CHECKED_BY_RELEASE_SIGNATURE) {
+                continue;
+            }
+            if !still_wanted() {
+                return;
+            }
+            match fetch_signed_release_extra(&base, &name, public_key).await {
+                Ok(SignedExtra::Verified(bytes)) => {
+                    let unchanged = {
+                        let (path, expected) = (path.clone(), bytes.clone());
+                        tokio::task::spawn_blocking(move || std::fs::read(&path).is_ok_and(|held| held == expected))
+                            .await
+                            .unwrap_or(false)
+                    };
+                    if unchanged {
+                        crate::release_share::note_checked(&path, CHECKED_BY_RELEASE_SIGNATURE);
+                    } else if still_wanted()
+                        && keep_release_file(folder, &name, bytes, CHECKED_BY_RELEASE_SIGNATURE).await
+                    {
+                        wrote += 1;
+                    }
+                }
+                // A release from before the workflow signed these.
+                Ok(SignedExtra::Missing) => tracing::debug!("Release sharing: {version} has no signed {name}"),
+                // What the release offers does not verify, so nothing of it is
+                // shared from here, including a copy kept before.
+                Ok(SignedExtra::BadSignature) => {
+                    tracing::warn!("Release sharing: {name} does not match its release signature; not sharing it");
+                    let stale = path.clone();
+                    if tokio::task::spawn_blocking(move || std::fs::remove_file(stale).is_ok())
+                        .await
+                        .unwrap_or(false)
+                    {
+                        wrote += 1;
+                    }
+                }
+                Err(error) => tracing::warn!("Release sharing: could not fetch {name}: {error:#}"),
+            }
+        }
+    }
+    if !still_wanted() {
+        return;
+    }
+    let pruned = if complete {
+        let (dir, keep) = (folder.clone(), version.to_string());
+        tokio::task::spawn_blocking(move || crate::release_share::prune(&dir, &keep))
+            .await
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if wrote > 0 || pruned > 0 {
+        tracing::info!("Release sharing: {wrote} file(s) of Ember {version} kept to share, {pruned} older removed");
+        use tauri::Manager;
+        if let Some(watcher) = app.state::<crate::app_state::AppState>().shared_folder_watcher.clone() {
+            watcher.queue_rescan_after(vec![folder.clone()], Duration::from_secs(2));
+        }
+    }
+}
+
+/// Whether `path` holds the signed artifact `platform` names: checked against
+/// its size and SHA-256 once a session, and again whenever the file changes.
+async fn holds_signed_artifact(path: &Path, platform: &SignedPlatform) -> bool {
+    if crate::release_share::checked_unchanged(path, &platform.sha256) {
+        return true;
+    }
+    let (file, size, sha256) = (path.to_path_buf(), platform.size, platform.sha256.clone());
+    let holds = tokio::task::spawn_blocking(move || crate::release_share::holds(&file, size, &sha256))
+        .await
+        .unwrap_or(false);
+    if holds {
+        crate::release_share::note_checked(path, &platform.sha256);
+    }
+    holds
+}
+
+/// What a release's collection and notes are checked against: their
+/// signature, verified by fetching it again once a session.
+const CHECKED_BY_RELEASE_SIGNATURE: &str = "release signature";
+
+/// Keep verified release bytes, recording them as checked against `against`.
+/// Whether they were kept.
+async fn keep_release_file(folder: &Path, name: &str, bytes: Vec<u8>, against: &str) -> bool {
+    let (dir, file) = (folder.to_path_buf(), name.to_string());
+    match tokio::task::spawn_blocking(move || crate::release_share::keep(&dir, &file, &bytes)).await {
+        Ok(Ok(())) => {
+            crate::release_share::note_checked(&folder.join(name), against);
+            true
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("Release sharing: could not keep {name}: {error}");
+            false
+        }
+        Err(error) => {
+            tracing::warn!("Release sharing: could not keep {name}: {error}");
+            false
+        }
+    }
+}
+
+/// A file beside a release's installers, as [`fetch_signed_release_extra`]
+/// found it.
+enum SignedExtra {
+    /// The release has no such file, or no signature for it.
+    Missing,
+    /// The bytes, verified under the updater key.
+    Verified(Vec<u8>),
+    /// There, but not what its signature signs.
+    BadSignature,
+}
+
+/// `name`, beside the release's installers, checked against its `.sig` under
+/// the updater key. A failure to reach either is an error; a mismatch is not.
+async fn fetch_signed_release_extra(base: &Url, name: &str, public_key: &str) -> Result<SignedExtra> {
+    let url = base.join(name).context("release file URL is invalid")?;
+    let signature_url = base.join(&format!("{name}.sig")).context("release signature URL is invalid")?;
+    for url in [&url, &signature_url] {
+        validate_url(url, NetworkPolicy::PRODUCTION)?;
+    }
+    let fetch = |url: Url, cap: usize| async move {
+        fetch_capped(&url, cap, METADATA_DEADLINE, "application/octet-stream", NetworkPolicy::PRODUCTION).await
+    };
+    let file = match fetch(url, RELEASE_EXTRA_MAX_BYTES).await {
+        Ok(file) => file,
+        Err(error) if is_missing_updater_resource(&error) => return Ok(SignedExtra::Missing),
+        Err(error) => return Err(error),
+    };
+    let signature = match fetch(signature_url, SIGNATURE_MAX_BYTES).await {
+        Ok(signature) => signature,
+        Err(error) if is_missing_updater_resource(&error) => return Ok(SignedExtra::Missing),
+        Err(error) => return Err(error),
+    };
+    Ok(match verify_minisign(&file.bytes, &signature.bytes, public_key) {
+        Ok(()) => SignedExtra::Verified(file.bytes),
+        Err(_) => SignedExtra::BadSignature,
+    })
+}
 
 async fn download_artifact(
     platform: &SignedPlatform,
@@ -2134,6 +2394,13 @@ async fn install_locked(
             ))
         }
     };
+    // The bytes just checked against the signed manifest are the release's
+    // own installer, so with the setting on they are kept to share
+    // (`release_share`) before they are handed over.
+    if crate::release_share::installer_folder().is_some() {
+        let (url, version, bytes) = (update.platform.url.clone(), update.info.version.clone(), artifact.clone());
+        let _ = tokio::task::spawn_blocking(move || crate::release_share::keep_installer(&url, &version, &bytes)).await;
+    }
     // Record the attempt before handing the bytes over. `install` does not come
     // back on success, so this is the only chance to leave behind anything a
     // later launch could act on. Only with a staged copy, which is what the

@@ -168,6 +168,15 @@
 
   // Silent updates. `supported` is the backend's answer for this install;
   // the status line describes what the saved setting is doing right now.
+  // Sharing every release starts with the next update check, which can be an
+  // hour away: run one as soon as the setting is saved on.
+  let seedingWasOn: boolean | null = null;
+  $effect(() => {
+    const on = $appSettings?.seed_ember_releases;
+    if (on === undefined) return;
+    if (seedingWasOn === false && on) void checkForUpdates({ silent: true });
+    seedingWasOn = on;
+  });
   const silentSupported = $derived($silentUpdate?.supported ?? false);
   const silentUnsupportedHint = $derived.by(() => {
     switch ($silentUpdate?.unsupportedReason) {
@@ -5736,6 +5745,32 @@
                 disabled={!silentSupported}
                 ariaLabelledby="silent-update-label"
                 ariaDescribedby="silent-update-hint silent-update-status"
+              />
+            </div>
+
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="share-installer-label" for="share-installer-switch">{m.settings_share_ember_installer()}</label>
+                <span class="hint" id="share-installer-hint">{m.settings_share_ember_installer_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="share-installer-switch"
+                bind:checked={settings.share_ember_installer}
+                ariaLabelledby="share-installer-label"
+                ariaDescribedby="share-installer-hint"
+              />
+            </div>
+
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="seed-releases-label" for="seed-releases-switch">{m.settings_seed_ember_releases()}</label>
+                <span class="hint" id="seed-releases-hint">{m.settings_seed_ember_releases_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="seed-releases-switch"
+                bind:checked={settings.seed_ember_releases}
+                ariaLabelledby="seed-releases-label"
+                ariaDescribedby="seed-releases-hint"
               />
             </div>
           </div>

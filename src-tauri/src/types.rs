@@ -2050,6 +2050,22 @@ pub struct AppSettings {
     #[serde(default)]
     pub silent_update_enabled: bool,
 
+    /// Keep the installer each update was made with, and share it over eD2K
+    /// from `<download folder>/Ember releases`, for people who cannot reach
+    /// GitHub (`release_share`). Off by default: it shares a file.
+    #[serde(default)]
+    pub share_ember_installer: bool,
+    /// Fetch every file of each new Ember release, check it against the
+    /// release signature, and share it from the same folder: for a computer
+    /// that stays on, so a release's eD2K links have a source from the start.
+    #[serde(default)]
+    pub seed_ember_releases: bool,
+    /// The release folder Ember put in `shared_folders` for the two settings
+    /// above, so turning them off, or moving the download folder, takes back
+    /// exactly that one. Empty when none is. Backend-owned.
+    #[serde(default)]
+    pub ember_releases_folder: String,
+
     /// Master switch for desktop notifications. Off means Ember never asks the
     /// OS to show anything, whatever the per-event switches below say.
     ///
@@ -3235,6 +3251,9 @@ impl Default for AppSettings {
             minimize_to_tray: false,
             launch_maximized: false,
             silent_update_enabled: false,
+            share_ember_installer: false,
+            seed_ember_releases: false,
+            ember_releases_folder: String::new(),
             notifications_enabled: true,
             notifications_only_when_unfocused: true,
             notify_download_complete: true,

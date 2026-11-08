@@ -365,6 +365,19 @@ jobs:
           EMBER_ED2K_SECTION: ${{ runner.temp }}/ed2k-section.md
         run: node scripts/ed2k-links.mjs
 
+      # Ember's "Share every file of each new release" fetches these two and
+      # shares them only if they verify against these signatures, as the
+      # installers do against latest.json.
+      - name: Sign the eD2K collection and release notes
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          for file in "$EMBER_ED2K_OUT_DIR"/*.emulecollection "$EMBER_ED2K_OUT_DIR"/*_release-notes.md; do
+            npx --no-install tauri signer sign "$file" \
+              || { echo "failed to sign $file" >&2; exit 1; }
+          done
+
       # A re-run finds the draft the previous attempt created and reuses it; a
       # release that has already been published is never touched.
       - name: Create or update the draft release
