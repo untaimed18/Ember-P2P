@@ -45,6 +45,22 @@ export function releaseAnchor(version) {
   return `release-${version.replaceAll(".", "-")}`;
 }
 
+/**
+ * `link` as a page has to write it for a click to reach the eD2K client.
+ * Chrome and Edge 130+ and Firefox 122+ parse `ed2k://` links by the URL
+ * Standard, which forbids `|` after the `//`: a raw link is blocked
+ * (`about:blank#blocked`) and never leaves the browser. Written as `%7C` it
+ * parses, and Ember, eMule and aMule restore the pipes. The web source is
+ * encoded whole as well; left as it is, its `https:` reads as an empty port
+ * and the browser drops the colon. eMule decodes it with the rest of the link.
+ */
+export function clickableEd2kLink(link) {
+  const fields = link.replace(/^ed2k:\/\//, "").split("|");
+  return `ed2k://${fields
+    .map((field, index) => (index > 4 && field.startsWith("s=") ? `s=${encodeURIComponent(field.slice(2))}` : field))
+    .join("%7C")}`;
+}
+
 const DOWNLOAD_ICON =
   '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
 
@@ -55,9 +71,9 @@ function fileRow(label, file, { ed2kOnly = false } = {}) {
   return [
     "            <tr>",
     `              <th scope="row">${escapeHtml(label)}</th>`,
-    `              <td>${name}<code class="sha256" title="SHA-256">SHA-256 ${escapeHtml(file.sha256)}</code></td>`,
+    `              <td>${name}<code class="sha256" title="SHA-256">SHA-256 ${escapeHtml(file.sha256)}</code><details class="ed2k-text"><summary>eD2K link as text</summary><code>${escapeHtml(file.link)}</code></details></td>`,
     `              <td class="size">${formatSize(file.size)}</td>`,
-    `              <td><a href="${escapeHtml(file.link)}" class="ed2k">eD2K link</a></td>`,
+    `              <td><a href="${escapeHtml(clickableEd2kLink(file.link))}" class="ed2k">eD2K link</a></td>`,
     "            </tr>",
   ].join("\n");
 }
@@ -77,7 +93,7 @@ export function renderDownloads(downloads) {
     "      </div>",
     '      <div class="downloads">',
     "        <table>",
-    `          <caption>Every file in Ember ${escapeHtml(version)}. Cannot reach GitHub? An eD2K link opens in Ember, eMule or aMule and fetches the same file from the eD2K network. Check what you get against its SHA-256.</caption>`,
+    `          <caption>Every file in Ember ${escapeHtml(version)}. Cannot reach GitHub? An eD2K link opens in Ember, eMule or aMule and fetches the same file from the eD2K network; to paste one into the client instead, copy it from &ldquo;eD2K link as text&rdquo;. Check what you get against its SHA-256.</caption>`,
     '          <thead><tr><th scope="col">For</th><th scope="col">File</th><th scope="col">Size</th><th scope="col">eD2K</th></tr></thead>',
     "          <tbody>",
     ...rows,

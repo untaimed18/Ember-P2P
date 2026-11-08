@@ -532,9 +532,22 @@ pub async fn pick_preview_player(
 }
 
 pub(crate) fn normalized_path_components(path: &std::path::Path) -> Vec<String> {
+    use std::path::{Component, Prefix};
     path.components()
         .map(|component| {
-            let value = component.as_os_str().to_string_lossy().into_owned();
+            // `canonicalize` spells a drive `\\?\C:` and a share
+            // `\\?\UNC\host\share`, where a picker or a typed path says `C:`
+            // and `\\host\share`: one folder either way.
+            let value = match component {
+                Component::Prefix(prefix) => match prefix.kind() {
+                    Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => format!("{}:", drive as char),
+                    Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                        format!(r"\\{}\{}", server.to_string_lossy(), share.to_string_lossy())
+                    }
+                    _ => component.as_os_str().to_string_lossy().into_owned(),
+                },
+                _ => component.as_os_str().to_string_lossy().into_owned(),
+            };
             if cfg!(target_os = "windows") {
                 value.to_ascii_lowercase()
             } else {
@@ -648,11 +661,11 @@ async fn sync_release_share_folder(
         != normalized_path_components(std::path::Path::new(&old.download_folder));
     let desired = match crate::release_share::folder_in(&settings.download_folder) {
         Some(_) if !crate::release_share::wanted(settings) => None,
-        Some(_) if download_moved => (!listed.is_empty()).then(|| listed.clone()),
+        Some(_) if download_moved => (!listed.is_empty()).then(|| std::path::PathBuf::from(&listed)),
         Some(folder) => Some(
-            tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+            tokio::task::spawn_blocking(move || -> std::io::Result<std::path::PathBuf> {
                 std::fs::create_dir_all(&folder)?;
-                Ok(crate::commands::share_browser::display_fs_path(&folder.canonicalize()?))
+                folder.canonicalize()
             })
             .await
             .map_err(|e| coded_ctx("settings_transaction_task_failed", "Save failed", e))?
@@ -661,7 +674,11 @@ async fn sync_release_share_folder(
         None => None,
     };
     let mut clear = None;
-    if !listed.is_empty() && !desired.as_deref().is_some_and(|folder| shared_folder_paths_equal(folder, &listed)) {
+    if !listed.is_empty()
+        && !desired
+            .as_ref()
+            .is_some_and(|folder| shared_folder_paths_equal(&folder.to_string_lossy(), &listed))
+    {
         settings.shared_folders.retain(|folder| !shared_folder_paths_equal(folder, &listed));
         clear = Some(std::path::PathBuf::from(&listed));
     }
@@ -669,11 +686,12 @@ async fn sync_release_share_folder(
         let covered = settings
             .shared_folders
             .iter()
-            .any(|shared| shared_paths_overlap(std::path::Path::new(shared), std::path::Path::new(&folder)));
+            .any(|shared| shared_paths_overlap(std::path::Path::new(shared), &folder));
         if !covered {
-            settings.shared_folders.push(folder.clone());
+            // As `normalize_shared_folders` writes every other entry.
+            settings.shared_folders.push(folder.to_string_lossy().into_owned());
         }
-        settings.ember_releases_folder = folder;
+        settings.ember_releases_folder = crate::commands::share_browser::display_fs_path(&folder);
     }
     Ok(clear)
 }
@@ -4087,6 +4105,14 @@ mod tests {
     /// files to clear once both settings are off.
     #[tokio::test]
     async fn the_release_folder_is_shared_exactly_while_release_sharing_is_on() {
+        // The folders as `update_settings` hands them on: normalized first.
+        async fn sync_release_share_folder(
+            old: &AppSettings,
+            settings: &mut AppSettings,
+        ) -> Result<Option<std::path::PathBuf>, String> {
+            settings.shared_folders = normalize_shared_folders(std::mem::take(&mut settings.shared_folders))?;
+            super::sync_release_share_folder(old, settings).await
+        }
         let base = std::env::temp_dir().join(format!(
             "ember-release-folder-{}-{}",
             std::process::id(),
@@ -4112,11 +4138,18 @@ mod tests {
             &listed,
             &crate::commands::share_browser::display_fs_path(&release_dir.canonicalize().unwrap())
         ));
-        assert_eq!(on.shared_folders, vec![listed.clone()]);
+        assert_eq!(on.shared_folders.len(), 1);
+        assert!(shared_folder_paths_equal(&on.shared_folders[0], &listed));
 
-        let mut again = on.clone();
+        let mut again = AppSettings {
+            seed_ember_releases: true,
+            ..on.clone()
+        };
         assert_eq!(sync_release_share_folder(&on, &mut again).await.unwrap(), None);
-        assert_eq!(again.shared_folders, vec![listed.clone()], "listed once");
+        assert_eq!(again.shared_folders, on.shared_folders, "listed once");
+        let mut third = again.clone();
+        sync_release_share_folder(&again, &mut third).await.unwrap();
+        assert_eq!(third.shared_folders, on.shared_folders, "still once");
 
         let mut turned_off = AppSettings {
             share_ember_installer: false,
@@ -4127,7 +4160,7 @@ mod tests {
         assert!(turned_off.shared_folders.is_empty());
         assert!(turned_off.ember_releases_folder.is_empty());
 
-        let parent = crate::commands::share_browser::display_fs_path(&downloads.canonicalize().unwrap());
+        let parent = downloads.canonicalize().unwrap().to_string_lossy().into_owned();
         let mut covered = AppSettings {
             seed_ember_releases: true,
             shared_folders: vec![parent.clone()],
@@ -4675,6 +4708,28 @@ mod tests {
             std::path::Path::new("root/media"),
             std::path::Path::new("root/media-old"),
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_canonical_path_is_the_folder_it_names() {
+        use std::path::Path;
+        assert!(shared_paths_overlap(
+            Path::new(r"\\?\C:\Users\a\Ember releases"),
+            Path::new(r"c:\users\a\Ember releases"),
+        ));
+        assert_eq!(
+            normalized_path_components(Path::new(r"\\?\UNC\nas\media\tv")),
+            normalized_path_components(Path::new(r"\\NAS\Media\tv")),
+        );
+        assert!(!shared_paths_overlap(Path::new(r"\\?\C:\a"), Path::new(r"D:\a")));
+        let (deduped, changed) = dedupe_overlapping_shared_folders(vec![
+            r"\\?\C:\a\Downloads".into(),
+            r"\\?\C:\a\Ember releases".into(),
+            r"C:\a\Ember releases".into(),
+        ]);
+        assert!(changed, "a config saved with both spellings is repaired on load");
+        assert_eq!(deduped, vec![r"\\?\C:\a\Downloads".to_string(), r"\\?\C:\a\Ember releases".to_string()]);
     }
 
     #[test]
