@@ -13,43 +13,35 @@ what was decided along the way. The overlay's design record (decisions,
 known limits, closed work) stays in [`ember-dht.md`](ember-dht.md), and the
 Channels formats in [`channels-format.md`](channels-format.md).
 
-## 1. 1.8.0: the Channels format cut-over
+## 1. Before 1.8.0 ships: run the cut-over across real machines
 
-1.8.0 is the release that changes formats, so these were held for it. They go
-out together, so a room has one cut-over to test.
+1.8.0's Channels cut-over is built: the v2 chat frames go out alone with the
+display flag, private membership records go out in v2 alone but for the
+owner's own key copy, each owned private room is rotated once
+(`take_channel_cut_over_rotations`), the owned-rooms list is padded, and room
+transfers no longer hold a plain offer back (`HOLD_PLAIN_XFER_OFFERS`). The
+detail is in `channels-format.md`, "The cut-over in 1.8.0" and "The
+transition, and the cut-over in 1.8.0".
 
-- **Retire the old chat frames and the v1 membership records.** Stop sending
-  chat frames 15 and 19, and set `EXT_FLAG_DISPLAY` on kinds 64 and 65. Stop
-  publishing v1 private membership records (`PUBLISH_V1_MEMBERSHIP_RECORDS`),
-  except the owner's own key copy. Rotate every private room once as it does
-  (`V1_CUT_OVER_ROTATES`, not built yet; v1 cannot be switched off until it
-  is). Decide then whether to renew every retained epoch's key records, not
-  just the current one's. Detail: `archived-plans/post-1.7.4.md` items 2 and
-  9, and `channels-format.md`, "What freezes at the end of the beta".
-- **Relayed catch-up replies move the frontier.** A catch-up reply that
-  reaches us through another member's hop cannot be told from that hop's own
-  line, so only a neighbor whose reply came directly is credited
-  (`catch_up_progress` in `channel_gossip.rs`), and a neighbor whose replies
-  are relayed is asked the same range again each round. It costs bandwidth,
-  never a line. The fix is a marker saying a frame is a relayed catch-up reply
-  and for whom. To decide: where it goes (the relay envelope is the natural
-  place), whether the neighbor that served the reply signs it so a hop cannot
-  forge progress, and how a 1.7.x member that does not send it is read (as
-  today: not credited).
-- **Pad the owned-rooms list.** Switch on `PAD_OWNED_ROOMS_LIST`, so the list
-  says neither how many rooms an identity owns nor which were carried. Built
-  in 1.7.5 and left off only because a 1.7.4 device on the same identity reads
-  every pad as a room.
-- **Room transfers send only the sealed offer.** A sender still holds a plain
-  offer back for recipients on 1.6, and asks whether to send it when a sealed
-  one goes unanswered (`XFER_PLAIN_OFFER_FALLBACK_SECS`). After the cut-over a
-  1.6 member cannot read the room's chat anyway, so the plain offer, its
-  question and `sealed_offer_readers` can go in the same release. Detail:
-  `archived-plans/post-1.7.0.md` item 1.
-- **Run it across real machines** before tagging, with a 1.7.7 member in the
-  same room during the transition: chat, edits, private-room presence and key
-  records after the rotation, and catch-up. `archived-plans/release-checklist-1.7.5.md`
-  is the model for the checklist.
+- **Run it on three or more machines** before tagging, one behind a firewall
+  that is not reachable, with a 1.7.8 member and a 1.7.4 member in the same
+  rooms: chat and edits between 1.8.0 machines and from the 1.7.8 one (read
+  and paired here), the 1.7.4 member told a newer Ember is needed for a
+  1.8.0 member's line posted before the owner's rotation (after it, the room
+  just goes quiet for them), private rooms rotating once after the update,
+  only once the owner's table has contacts, and members on 1.7.5 or later
+  following the new key, a restored device getting its rooms and keys back
+  and rotating the private ones, and a file sent in a room with only the
+  sealed offer. `archived-plans/release-checklist-1.7.5.md` is the model for
+  the checklist.
+- **Then delete the 1.7 paths the cut-over switched off.** They are kept
+  behind their constants only so the cross-machine run can turn one back on:
+  sending the legacy chat frames (`SEND_LEGACY_CHAT_FRAMES`, the `frames.retain`
+  in `chat_gossip_frames`), publishing members' v1 records
+  (`PUBLISH_V1_MEMBERSHIP_RECORDS`), and holding plain transfer offers
+  (`HOLD_PLAIN_XFER_OFFERS`, `PlainOffer`, `SendChannelTransferPlainOffer`, the
+  `plain_offer_came_due` sweep, and the `sealed_offer_readers` cache and
+  table). Reading 15, 19, v1 records and plain offers stays.
 
 ## 2. Privacy
 
@@ -93,6 +85,23 @@ out together, so a room has one cut-over to test.
   ended) and put the prompt up again; accepting only stalls. An offer
   timestamp under the pairwise tag would let the recipient refuse one older
   than the offer window. Detail: `archived-plans/post-1.7.0.md` item 3.
+- **Decide whether owners renew every retained epoch's key records,** not
+  just the current one's, now that a member's copies go out in v2 alone: a
+  member far enough behind to need an older epoch finds it only while that
+  epoch's records have not lapsed.
+- **Rotate private rooms again once no member publishes v1.** The cut-over's
+  one rotation unlinks only members already on 1.8.0: one still on 1.7.5 to
+  1.7.8 publishes its new ids in both forms and is linked again. A second
+  one-time rotation under a new cut-over name, made once a presence walk in the
+  current epoch finds no v1 copy from anyone on the roster (or after a fixed
+  grace period), would cover them. See `channels-format.md`, "It protects only
+  members already on 1.8.0".
+- **Two owning devices rotating at once.** Each device's database records the
+  cut-over on its own, so an identity running 1.8.0 on two devices that both
+  own a room rotates it once per device, and both can mint the same next epoch
+  with different keys. Moderator-ban rotations already carry this hazard; the
+  cut-over makes it routine. Find out how members and the two owners resolve
+  it, and whether a second owning device should defer to the first.
 - **Tune Discover's spam folding from real use.** `LIKELY_SPAM_SCORE` and
   `DUPLICATE_NAME_FLOOD` stay as they are until reports of folded good rooms,
   or spam that gets through, say otherwise.
@@ -189,12 +198,6 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
 
 **Do next:**
 
-- **Bring the specification up to date.** The spec and its HTML source predate
-  1.7.7's additive changes: the reachability tag in the `PING`/`PONG` block
-  (`UDP_REACH_TAG` `0x02`), the refusal reasons trailing `STORE_BATCH_ACK`
-  (`STORE_ACK_REASONS_TAG` `0x01`, one code per record), and the publisher-side
-  rule of 150 records per keyword. Mark each additive and rebuild with
-  `scripts/build-ember-dht-spec.sh`.
 - **Validate firewalled publishing live.** The buddy `PROXY_STORE` chain has
   changed in three places none of which has been seen on a live network: an
   endorsement before the buddy proxies, no compatibility trailer, and the
@@ -295,21 +298,21 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   an explicit message boundary. It is a redesign rather than code motion, so it
   needs integration testing against live peers. `command.rs` is separable and
   `NetworkDeps` gives the entry point a real signature.
-- **Make clippy warnings fail CI.** `ci.yml` runs `cargo clippy --all-targets`
-  without `-D warnings`. The default lint levels were clean, but a newer
-  toolchain (Rust 1.98) reports 16 library warnings on Linux, mostly
-  `chunks_exact` with a constant size. Fix those, then add `-- -D warnings`.
-- **Remove the legacy friend authentication.** `LEGACY_FRIEND_AUTH_ENABLED` is
-  a `const false` and nothing turns it on, but `ed2k/ember_auth.rs` and its
-  branches in `multi_source.rs` and `upload.rs` still compile. Delete them, and
-  keep the arms that log and ignore `OP_EMBER_AUTH_CHALLENGE` and
-  `OP_EMBER_AUTH_RESPONSE`, which an old client may still send. Detail:
-  `archived-plans/post-1.7.1.md` item 3.
-- **Fold the `user_offline` flag.** It is set to `false` at startup and every
-  store to it stores `false`, so every branch it guards is dead. Remove it and
-  inline each check as `false`, keeping the KAD-disconnect exemption the
-  comment in `server.rs` explains. Detail: `archived-plans/post-1.7.1.md`
-  item 4.
+- **Fold the `Disconnected` network status.** Nothing sets
+  `NetworkStatus::Disconnected` after startup: the node opens in `Connecting`,
+  and the only command that moved it back, `kad_disconnect`, had no caller left
+  in the UI and was removed in 1.7.2. About 20 checks still test for it (the tick
+  gates, `PublishNote`, the bootstrap commands' "move off Disconnected", the
+  STUN-probe block in `network/mod.rs`, and the `'disconnected'` branch of the
+  status listener in `src/lib/stores/network.ts`), so each is dead. Inline
+  them as false, then look at what `KadConnect` still has to do when it can
+  only ever find the node Connecting or Connected.
+- **Decide what the Ember credit ledger is for.** The pubkey-keyed
+  `EmberCreditRecord` is written only for uploads on secure-v2 sessions and
+  persisted, but nothing reads it: the upload queue scores every peer from the
+  `user_hash` ledger, and since the legacy friend authentication went no
+  download is ever credited to it. Either give it a reader (the Known Ember
+  Peers tab, or scoring) or stop writing it and drop the table.
 - **Longer fuzz and property tests in CI,** and overnight soak runs.
 - **Find out why most known peers show verification as Needed.** SecureIdent is
   per session, which explains part of it. Run 30 to 60 minutes with
@@ -343,6 +346,15 @@ Taken off the plan, with why, so they are not added back without a new reason.
   (`post-1.7.0.md` item 9). For symmetry only: both already arrive on
   authenticated friend sessions and are matched against the attachment's
   friend.
+- **A marker that lets relayed catch-up replies move the frontier**
+  (`post-1.7.5.md`, "Already scheduled for 1.8.0"). A reply that reaches the
+  asker through another member's relay still moves no catch-up frontier, so
+  that range is asked for again: it costs bandwidth, never a line. Marking
+  such replies needs a field the relay envelope has no room for, and the
+  frozen formats send a new envelope version beside v1 until every build in
+  the room reads it, which would double relayed catch-up traffic for that
+  long. A signed note from the neighbor saying how far it served could carry
+  the frontier past lines lost on the way, which is worse than asking twice.
 - **Web mirrors in feed lists** (`post-1.7.5.md` item 6, step 3). It would let
   a publisher name a server it runs and learn who downloads and when, which it
   cannot learn today without being a source. Followers who opt in to share a

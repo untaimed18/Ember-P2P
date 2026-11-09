@@ -50,11 +50,11 @@ pub fn node_id_from_ed25519_bytes(bytes: &[u8; 32]) -> Option<[u8; 16]> {
 ///
 /// This check is NOT a proof of private-key possession. Anyone who has
 /// observed a peer's legitimate public key on the wire can replay it with
-/// a matching hash. The full anti-replay gate is
-/// `friend_connect::perform_ember_auth`, which runs an Ed25519 signature
-/// round-trip over a fresh nonce. Use this binding check as an always-on
-/// pre-filter and the challenge-response as the authoritative gate
-/// whenever you're granting friend-level trust.
+/// a matching hash. The authoritative gate is the secure-v2 handshake
+/// (`ed2k::secure_stream`), whose Noise IK static key must be the X25519
+/// form of this same identity key. Use this binding check as an always-on
+/// pre-filter and the secure-v2 session as the gate whenever you're
+/// granting friend-level trust.
 pub fn verify_ember_hash_binding(pubkey: &[u8; 32], advertised_hash: &[u8; 16]) -> bool {
     match VerifyingKey::from_bytes(pubkey) {
         Ok(vk) => node_id_from_public_key(&vk) == *advertised_hash,
@@ -142,13 +142,13 @@ pub fn blake3_hash_open_file(file: &mut std::fs::File) -> anyhow::Result<[u8; 32
 // Friend chat (`OP_EMBER_CHAT_MSG`) is encrypted with an AEAD key derived
 // from an X25519 Diffie-Hellman exchange between the two friends'
 // long-term Ed25519 identity keys — the same keys that already back
-// `ember_hash` and proof-of-possession, converted to their X25519
+// `ember_hash` and the secure-v2 handshake, converted to their X25519
 // (Montgomery) form via the standard birational map between the two
 // curve representations (the same technique libsodium's
 // `crypto_sign_ed25519_{sk,pk}_to_curve25519` use). We deliberately reuse
 // this identity key rather than minting a separate chat keypair: every
 // friend session already requires both sides to have proven possession
-// of it (`perform_ember_auth`), so there is no additional trust bootstrap
+// of it (the secure-v2 handshake), so there is no additional trust bootstrap
 // needed, and no extra key to advertise, persist, or rotate.
 //
 // This gives confidentiality and integrity against anyone relaying or
@@ -489,9 +489,8 @@ pub fn decrypt_chat_message(key: &[u8; 32], envelope: &[u8]) -> Option<Vec<u8>> 
 /// Convenience wrapper: derive the shared key for `peer_ed25519_pubkey`
 /// and encrypt `plaintext` in one call. Returns `None` only if key
 /// derivation fails (see [`derive_chat_key`]) — this should not happen in
-/// practice for any peer that has already passed `perform_ember_auth`,
-/// since that requires the same pubkey to be a valid, non-degenerate
-/// curve point.
+/// practice for any peer on a secure-v2 session, since its handshake
+/// requires the same pubkey to be a valid, non-degenerate curve point.
 pub fn encrypt_chat_for_peer(
     our_ed25519_seed: &[u8; 32],
     peer_ed25519_pubkey: &[u8; 32],
@@ -860,10 +859,7 @@ pub fn open_mailbox_payload(
             {
                 return None;
             }
-            let msg_ids = body
-                .chunks_exact(CHAT_MESSAGE_ID_LEN)
-                .map(|chunk| chunk.try_into().expect("chunks_exact yields full chunks"))
-                .collect();
+            let msg_ids = body.as_chunks::<CHAT_MESSAGE_ID_LEN>().0.to_vec();
             Some(MailboxPayload::Receipt { msg_ids })
         }
         _ => None,
@@ -909,8 +905,8 @@ pub fn decrypt_chat_id(
 /// decrypt as legacy plain UTF-8 text, reasoning that AEAD authentication
 /// makes a *legitimate* legacy message and *ciphertext* unambiguous. That
 /// reasoning covered the accidental-collision case but missed the actual
-/// threat: `perform_ember_auth`'s proof-of-possession authenticates a
-/// peer once, at session setup, not per-packet, so anyone on-path for the
+/// threat: the retired v1 proof of possession authenticated a peer once,
+/// at session setup, not per-packet, so anyone on-path for the
 /// remainder of an already-established session — a compromised
 /// rendezvous/relay hop (see `broker.rs`), or a TCP/Wi-Fi MITM on a
 /// direct connection — can inject an arbitrary `OP_EMBER_CHAT_MSG` packet
@@ -919,7 +915,7 @@ pub fn decrypt_chat_id(
 /// and its call sites), any payload that fails to decrypt here is never
 /// legitimate, and a fallback would let that attacker's arbitrary
 /// ASCII/UTF-8 bytes be silently displayed as a genuine message from the
-/// PoP-verified friend. Dropping instead closes that hole; the cost is
+/// verified friend. Dropping instead closes that hole; the cost is
 /// that a friend still running a pre-encryption build simply can't
 /// exchange chat with an upgraded one until they update too.
 pub fn decrypt_chat_payload(

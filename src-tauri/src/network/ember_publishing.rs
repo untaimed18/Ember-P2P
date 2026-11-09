@@ -1417,6 +1417,7 @@ pub(super) fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u
         None => return,
     };
 
+    super::channel_membership::note_owner_snapshot_finished(state, publish_id, result.stored_on);
     if let Some(tx) = state.ember_dht_pending_publishes.remove(&publish_id) {
         let _ = tx.send(result);
     }

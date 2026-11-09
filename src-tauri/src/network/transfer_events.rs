@@ -1049,10 +1049,7 @@ pub(super) async fn handle_download_event(
         | DownloadEvent::AichRecoveryFailed { .. }
         | DownloadEvent::PartFileReady { .. }
         | DownloadEvent::ProtocolViolation { .. }
-        | DownloadEvent::FriendSeen { .. }
-        | DownloadEvent::FriendTransferOnly { .. }
-        | DownloadEvent::EmberChatMessage { .. }
-        | DownloadEvent::EmberBrowseResponse { .. } => {
+        | DownloadEvent::FriendTransferOnly { .. } => {
             // Handled directly in the network event loop.
         }
     }

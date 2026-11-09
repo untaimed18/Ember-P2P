@@ -1203,7 +1203,9 @@ pub(super) fn note_sealed_offer_reader(
     channel_id: [u8; 16],
     member: &[u8; 32],
 ) {
-    if *member == state.local_ed25519_pubkey
+    // Nothing is held to ask about, so there is nothing to remember.
+    if !ember::xfer::HOLD_PLAIN_XFER_OFFERS
+        || *member == state.local_ed25519_pubkey
         || !channel_member_on_roster(state, db, channel_id, member)
     {
         return;

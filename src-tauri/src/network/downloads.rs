@@ -1020,20 +1020,6 @@ async fn start_pending_download_worker(
     epx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
     callback_stream_in_hand: bool,
 ) -> bool {
-    // The user asked activity to stop. Disconnect re-queues every active
-    // download as pending so it resumes on reconnect, but the Ember overlay
-    // keeps running and its source lookups call straight back into here — so
-    // without this gate a transfer the user just stopped could restart itself
-    // from an Ember source while the UI still read Disconnected. Checked here
-    // rather than at the five call sites so no future one can miss it.
-    if state
-        .user_offline
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        debug!("Not starting {transfer_id}: the user is offline");
-        return false;
-    }
-
     if let Some(pd) = state.pending_downloads.get(transfer_id) {
         if pd.control.is_paused() || pd.control.is_cancelled() {
             return false;

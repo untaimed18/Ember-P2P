@@ -111,12 +111,13 @@ jobs:
       - name: Check Rust
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml
 
-      # Clippy runs at its default lint levels: the correctness group is
-      # deny-by-default, so this still fails a genuine bug, while the warning
-      # backlog nobody has measured yet cannot block a merge. Tighten it to
-      # `-- -D warnings` once that backlog is at zero.
+      # Every warning fails the run, at clippy's default lint levels: the
+      # backlog is at zero on Windows and Linux alike. The toolchain is the
+      # current stable, so a new Rust release can bring a new lint; that turns
+      # CI red until it is fixed, and never blocks a release, which runs no
+      # clippy.
       - name: Lint Rust
-        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Test Rust
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
@@ -164,7 +165,7 @@ jobs:
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml
 
       - name: Lint Rust
-        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Test Rust
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
@@ -198,7 +199,7 @@ jobs:
         run: cargo check --locked --manifest-path rendezvous-server/Cargo.toml
 
       - name: Lint Rust
-        run: cargo clippy --locked --manifest-path rendezvous-server/Cargo.toml --all-targets
+        run: cargo clippy --locked --manifest-path rendezvous-server/Cargo.toml --all-targets -- -D warnings
 
       - name: Test Rust
         run: cargo test --locked --manifest-path rendezvous-server/Cargo.toml

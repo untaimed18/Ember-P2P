@@ -655,7 +655,9 @@ fn read_found_sources_block(buf: &[u8], pos: usize) -> Option<(FoundSourcesBlock
     let end = pos + 17 + count * 6;
     let sources = buf
         .get(pos + 17..end)?
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|s| {
             let id = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
             let port = u16::from_le_bytes([s[4], s[5]]);

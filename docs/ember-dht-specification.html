@@ -641,7 +641,8 @@ footer.doc-end {
     lists and <code>FOUND_VALUE</code>, and v4 bound a frame signature to the
     session it arrives on. Both are marked in place. Everything added since
     without a bump — query constraints, record media, the callback and
-    endorsement pair, channel records, and the advertised version range — is
+    endorsement pair, channel records, the advertised version range, and from
+    1.7.7 the UDP reachability claim and the store refusal reasons — is
     marked <span class="badge">additive</span>, meaning a peer that does not
     speak it parses the frame correctly and ignores the addition. Remaining
     work, including the dormant native transfer path, is called out where it
@@ -806,7 +807,7 @@ footer.doc-end {
   peer holds the private key. Anyone who observed a legitimate public key on
   the wire can replay the pair. Frame and record signatures are the
   proof-of-possession for DHT work. Friend-level privileges use a separate
-  challenge-response over a fresh nonce and are out of scope here.
+  Noise IK friend stream and are out of scope here.
 </div>
 
 <h3>3.3 Frame signature</h3>
@@ -1158,8 +1159,8 @@ footer.doc-end {
 <table class="data">
   <thead><tr><th>ID</th><th>Name</th><th>Direction</th><th>Payload</th></tr></thead>
   <tbody>
-    <tr><td>0x01</td><td>PING</td><td>→</td><td>optional advertised version range</td></tr>
-    <tr><td>0x02</td><td>PONG</td><td>←</td><td>optional observed SocketAddr, then optional advertised version range</td></tr>
+    <tr><td>0x01</td><td>PING</td><td>→</td><td>optional advertised version range and UDP reachability claim</td></tr>
+    <tr><td>0x02</td><td>PONG</td><td>←</td><td>optional observed SocketAddr, then optional advertised version range and UDP reachability claim</td></tr>
     <tr><td>0x03</td><td>FIND_NODE</td><td>→</td><td>target node ID (16)</td></tr>
     <tr><td>0x04</td><td>FOUND_NODE</td><td>←</td><td>contact list</td></tr>
     <tr><td>0x05</td><td>STORE_RECORD</td><td>→</td><td>key + record + record signature</td></tr>
@@ -1171,7 +1172,7 @@ footer.doc-end {
     <tr><td>0x0B</td><td>PROXY_STORE</td><td>→</td><td>same body as STORE_RECORD</td></tr>
     <tr><td>0x0C</td><td>PROXY_STORE_ACK</td><td>←</td><td>key (16) — buddy accepted, not a DHT STORE_ACK</td></tr>
     <tr><td>0x0D</td><td>STORE_BATCH</td><td>→</td><td>up to 64 records for one destination</td></tr>
-    <tr><td>0x0E</td><td>STORE_BATCH_ACK</td><td>←</td><td>u64 bitmap of accepted positions</td></tr>
+    <tr><td>0x0E</td><td>STORE_BATCH_ACK</td><td>←</td><td>u64 bitmap of accepted positions, then optional per-record refusal reasons</td></tr>
     <tr><td>0x0F</td><td>CALLBACK_REQ</td><td>→</td><td>publisher id (16) + file hash (16) + searcher TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Searcher → HighID buddy. The searcher's IP is the UDP source, not in the payload.</td></tr>
     <tr><td>0x10</td><td>CALLBACK</td><td>→</td><td>file hash (16) + searcher IPv4 (4) + TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Buddy → firewalled publisher: connect-and-serve this searcher.</td></tr>
     <tr><td>0x11</td><td>CHANNEL_MSG</td><td>→</td><td>AEAD channel gossip body for overlay rooms. <span class="badge">additive</span></td></tr>
@@ -1274,6 +1275,42 @@ footer.doc-end {
   leaves the routing table — it is worth what the session that proved it is
   worth, and one ping relearns it.
 </p>
+<p>
+  After the range, the same block may carry the sender’s claim about its own
+  UDP port: whether a datagram from a host it never contacted reaches it.
+  <span class="badge">additive</span>
+</p>
+<div class="wire">
+  <div class="cap">UDP reachability (trailing block, after the range)</div>
+  tag       u8     0x02 = UDP reachability<br>
+  len       u8     1<br>
+  value     u8     1 = open, 2 = firewalled
+</div>
+<p>
+  Only the node itself can answer this. A peer that answers <em>our</em>
+  queries has proved nothing to third parties: behind a NAT it answers through
+  a mapping its own traffic to us opened, so a contact list built on “answered
+  us” kept handing out NATed peers that every asker then probed in vain. The
+  claim comes from the node’s own evidence: open once its firewall check passed,
+  its NAT probe found no NAT, or a stranger’s ping reached it within the hour;
+  firewalled only when its
+  check concluded the port is filtered and nothing says otherwise. A node with
+  neither sends none, and a false “open” buys a liar nothing it could not get
+  by answering anyway.
+</p>
+<p>
+  The claim follows the range, so a build that knows only the range reads that
+  first and stops there. Absent, truncated, a length other than 1, or a value
+  other than 1 or 2 all read as no claim. Unlike the range,
+  an absent claim <em>replaces</em> a held one: every build that knows the
+  claim sends it on every frame while it has an answer, so a frame without it
+  means that answer has lapsed. A contact that claims firewalled is left out of
+  the contact lists this node hands out from its table (<code>FOUND_NODE</code>,
+  <code>PEER_LIST</code>, outbound <code>ANNOUNCE_PEER</code>, a friend’s
+  contact answer). A <code>FOUND_NODE</code> or <code>PEER_LIST</code> reply is
+  filled first with contacts that have answered us, then the rest; within each
+  group, those claiming open come before those that say nothing, nearest first.
+</p>
 
 <h3>6.6 FIND_NODE / FOUND_NODE</h3>
 <div class="wire">
@@ -1326,7 +1363,11 @@ footer.doc-end {
 </div>
 <div class="wire">
   <div class="cap">STORE_BATCH_ACK payload</div>
-  accepted  u64 LE   bit i set ⇒ record i was stored
+  accepted  u64 LE   bit i set ⇒ record i was stored<br>
+  <span class="c-muted">then, optionally:</span><br>
+  tag       u8     0x01 = refusal reasons<br>
+  len       u8     ≤ 64, one code per record of the batch<br>
+  codes     len B  code i is record i’s outcome
 </div>
 <p>
   Acceptance is per record: the storer re-evaluates proximity and capacity.
@@ -1334,6 +1375,41 @@ footer.doc-end {
   and retire files that were never stored. The datagram budget caps a real
   batch at roughly twenty minimum-size records; 64 is a decode-side bound
   matching the width of the ack bitmap.
+</p>
+<p>
+  <strong>Refusal reasons.</strong> <span class="badge">additive</span>
+  The bitmap says a record was refused but not why, so a publisher retried a
+  refusal as it would a lost datagram — several rounds an interval for one,
+  like “over your 150 under this word”, that every storer would repeat. The
+  trailing block names why each record was turned away.
+</p>
+<table class="data">
+  <thead><tr><th>Code</th><th>Meaning</th><th>Permanent</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>Stored</td><td>—</td></tr>
+    <tr><td>1</td><td>Invalid: parsing, signature, key binding or the source-address bind failed</td><td>Yes</td></tr>
+    <tr><td>2</td><td>Stale: creation time outside the window, or older than the copy held</td><td>Yes</td></tr>
+    <tr><td>3</td><td>Not responsible: the storer knows k nodes closer to the key</td><td>No — the publisher’s view of who is closest moves with its next lookup</td></tr>
+    <tr><td>4</td><td>Publisher full: this publisher already holds its share under the key (§7.5)</td><td>Yes</td></tr>
+    <tr><td>5</td><td>Key full</td><td>Yes</td></tr>
+    <tr><td>6</td><td>Store full: no room for another key</td><td>Yes</td></tr>
+    <tr><td>7</td><td>Other, and any code this build does not know</td><td>No</td></tr>
+  </tbody>
+</table>
+<p>
+  A record that every storer refused permanently gets no short retry. If a
+  round placed none of a file’s keys and every key it lost was refused that
+  way, the file waits out the full republish interval instead of its short
+  retries (§9.1). A key lost to a retryable refusal, or to a batch that went
+  unanswered, keeps the ordinary retry schedule.
+</p>
+<p>
+  Additive because the ack decoder has always read the bitmap and ignored what
+  follows, so a storer that sends the block costs an older publisher nothing,
+  and a publisher reading an older storer simply has no reasons and behaves as
+  it always has. The block is advisory: one that is absent, carries the wrong
+  tag, claims more than 64 codes or runs past the end of the payload is ignored
+  and the bitmap stands on its own.
 </p>
 
 <h3>6.9 FIND_VALUE / FOUND_VALUE</h3>
@@ -1690,6 +1766,19 @@ footer.doc-end {
   certain effect would have been more replication traffic.
   <code>MAX_STORE_BYTES</code> is unchanged, so per-key capacity tripled without
   raising what the process may hold resident.
+</p>
+<p>
+  <strong>Publishers hold themselves to the cap.</strong> Since every storer
+  refuses a publisher’s records past 150 under one key, a library with more
+  files than that under a common word used to send the excess every round only
+  to be refused everywhere, and which files each storer kept was whichever
+  arrived first. A publisher now publishes at most 150 files under any one
+  keyword: the 150 whose eD2K file hash is XOR-closest to the keyword hash. That is a
+  fixed choice, so the same files hold their slots round after round, and adding
+  a file to the library moves at most one out. The allowance is recomputed when
+  the publishable file count changes and every 30 minutes otherwise, which is
+  what catches a rename. This is publisher behaviour only; nothing on the wire
+  changes.
 </p>
 <p>
   <code>MAX_KEYS</code> is not a hard admission freeze. When the map is full,

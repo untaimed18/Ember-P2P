@@ -77,9 +77,10 @@ pub const BUDDY_ENDORSE_WIRE_LEN: usize = 4 + 2 + 32 + 8 + 64;
 /// Why a storer turned a record away, reported per record in the block trailing
 /// a `STORE_BATCH_ACK`.
 ///
-/// The bitmap alone could not tell "over your 150 under this word" from a lost
-/// datagram, so a publisher retried both alike — several rounds an interval for
-/// a refusal every storer would repeat. The block is additive: the ack decoder
+/// The bitmap said a record was refused but not why, so a publisher retried a
+/// refusal as it would a lost datagram — several rounds an interval for one,
+/// like "over your 150 under this word", that every storer would repeat. The
+/// block is additive: the ack decoder
 /// has always read the bitmap and ignored what follows, so a storer that sends
 /// it costs an older publisher nothing, and a publisher reading an older storer
 /// simply has no reasons and behaves as it always has.
@@ -457,19 +458,14 @@ fn decode_value_constraints(rest: &[u8]) -> (ValueConstraints, ResumeAnchors) {
                 // Across every entry, not per entry: the tag may repeat, and each
                 // repeat would otherwise buy another fifteen keys of intersection.
                 let room = MAX_FIND_VALUE_EXTRA_KEYS.saturating_sub(out.extra_keys.len());
-                for chunk in value.chunks_exact(16).take(room) {
-                    if let Ok(key) = <[u8; 16]>::try_from(chunk) {
-                        out.extra_keys.push(key);
-                    }
-                }
+                out.extra_keys
+                    .extend(value.as_chunks::<16>().0.iter().take(room).copied());
             }
             VALUE_EXT_TAG_RESUME_AFTER => {
                 // Held to the cap across repeats too, so a peer cannot buy a
                 // longer scan of the key by naming more anchors.
-                for chunk in value.chunks_exact(RESUME_ANCHOR_LEN) {
-                    if let Ok(anchor) = <[u8; RESUME_ANCHOR_LEN]>::try_from(chunk) {
-                        resume_after.push(anchor);
-                    }
+                for anchor in value.as_chunks::<RESUME_ANCHOR_LEN>().0 {
+                    resume_after.push(*anchor);
                 }
             }
             // An unknown tag is skipped by its own length, which is the point of
@@ -949,7 +945,7 @@ fn oversized_store_record(payload: &DhtPayload) -> Option<usize> {
 /// signer's own key at a fixed offset, which is an accident that any future
 /// field addition would quietly spend. Everything else in the tree that signs
 /// with this key is already separated (`BUDDY_ENDORSE_DOMAIN`, `RDV_DOMAIN`,
-/// `ember_auth`), so this brings frames in line.
+/// `KEY_LINK_DOMAIN`), so this brings frames in line.
 ///
 /// Appended rather than prepended, unlike those. They build a preimage from
 /// scratch; this one signs a buffer that is already the frame, and appending is

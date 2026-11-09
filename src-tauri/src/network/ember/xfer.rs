@@ -277,10 +277,17 @@ pub fn sealed_offer_reader_current(last_seen: Option<i64>, now: i64) -> bool {
 /// The largest offer v1.6.x reads. It drops a larger one without answering.
 pub const V1_6_XFER_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Whether to hold the plain offer for a `size`-byte file. Never for a member
-/// known to read sealed offers, and never for a file v1.6.x would drop: there
-/// the plain offer could only show its name and size to the members relaying
-/// it.
+/// Whether a sender holds back a plain offer, for a recipient that may be on
+/// 1.6, which reads no other. On from 1.7.1 to 1.7.8; off from 1.8.0, past
+/// whose cut-over a member on 1.6 cannot read the room's chat either, and the
+/// plain offer could only ever show the file's name and size to the members
+/// relaying it. Plain offers from older senders are still read.
+pub const HOLD_PLAIN_XFER_OFFERS: bool = false;
+
+/// Whether to hold the plain offer for a `size`-byte file, while
+/// [`HOLD_PLAIN_XFER_OFFERS`] holds. Never for a member known to read sealed
+/// offers, and never for a file v1.6.x would drop: there the plain offer could
+/// only show its name and size to the members relaying it.
 pub fn holds_plain_offer(size: u64, reads_sealed: bool) -> bool {
     !reads_sealed && size <= V1_6_XFER_MAX_BYTES
 }

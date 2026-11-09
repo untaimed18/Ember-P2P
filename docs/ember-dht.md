@@ -1271,13 +1271,14 @@ remains the single most pressing architectural risk in the codebase.** The
 groundwork is in place — `command.rs` is separable and `NetworkDeps` gives the entry
 point a real signature.
 
-**The clippy backlog is gone, which makes a CI change actionable.** That plan
-recorded 123 remaining library warnings, down from 415. `cargo clippy --all-targets`
-now reports **zero** at default lint levels. [`ci.yml`](../.github/workflows/ci.yml)
-says to tighten the lint step to `-- -D warnings` "once that backlog is at zero",
-and the condition is now met. The crate-level baseline in `lib.rs` still allows
-exactly four families, each with a written justification; anything outside those
-four is expected to stay at zero.
+**The clippy backlog is gone, and CI now holds it there.** That plan recorded 123
+remaining library warnings, down from 415. `cargo clippy --all-targets` reports
+**zero** at default lint levels on Windows and Linux, and since 1.8.0 every clippy
+step in [`ci.yml`](../.github/workflows/ci.yml) runs with `-- -D warnings`. CI
+tracks current stable, so a new Rust release can bring a new lint and turn CI red
+until it is fixed; releases run no clippy, so that never blocks one. The
+crate-level baseline in `lib.rs` still allows exactly four families, each with a
+written justification; anything outside those four is expected to stay at zero.
 
 ## Working notes for this tree
 

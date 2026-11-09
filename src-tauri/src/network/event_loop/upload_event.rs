@@ -780,7 +780,7 @@ pub(in crate::network) async fn on_upload_event(
             ip,
             port,
         }
-            // Gate on current membership: FriendSeen fires post-PoP for a
+            // Gate on current membership: FriendSeen fires on a secure-v2 session for a
             // peer that was a friend at emit time, but a concurrent
             // removal can still race it. Without this a just-removed
             // friend could be resurrected as "online" in the UI until the
@@ -789,9 +789,8 @@ pub(in crate::network) async fn on_upload_event(
                 let hash_hex = hex::encode(ember_hash);
                 let now = chrono::Utc::now().timestamp();
                 state.online_friends.insert(*ember_hash, now);
-                // Mirror the download-side FriendSeen handler: clear any
-                // reconnect backoff so a later disconnect can re-dial
-                // promptly instead of waiting out the cooldown.
+                // Clear any reconnect backoff so a later disconnect can
+                // re-dial promptly instead of waiting out the cooldown.
                 state.friend_reconnect_last.remove(ember_hash);
                 // A relayed session reports no address: it is online, but
                 // nothing about where to reach it is known.
@@ -1010,8 +1009,7 @@ pub(in crate::network) async fn on_upload_event(
         }
         if settings.chat_allowed_with(&chat_eh) {
             let hash_hex = hex::encode(chat_eh);
-            // L20: same ingress sanitisation as the
-            // download-event path above. Inbound chat
+            // L20: ingress sanitisation. Inbound chat
             // arrives via two upload-listener routes
             // (`upload.rs` direct, plus the
             // friend-session reader in
@@ -1019,14 +1017,12 @@ pub(in crate::network) async fn on_upload_event(
             // land here, so this single call covers
             // every inbound chat persistence point.
             let cleaned = crate::security::sanitize_chat_text(message);
-            // Dedup against the `DownloadEvent::EmberChatMessage`
-            // path above — see `recent_ember_chat`'s doc comment.
-            // The two upload-listener routes feeding *this* arm
-            // already can't double-deliver on their own (both
-            // honour `ember_sessions` slot ownership), but an
-            // ordinary download connection to the same friend
-            // deliberately doesn't participate in that ownership
-            // check, so this shared map is what catches it.
+            // Short-window dedup of an exact-text repeat — see
+            // `recent_ember_chat`'s doc comment. One send from the
+            // peer goes out on one connection, but simultaneous
+            // dials can leave two live ones that both accept chat,
+            // so this catches a retry or repeat arriving on the
+            // second.
             let now = chrono::Utc::now().timestamp();
             // A message with a mailbox id is told apart by that id alone: two
             // identical texts sent in a row are two messages, and dropping

@@ -1232,26 +1232,10 @@ pub(super) struct NetworkState {
     /// called by `OnAccept` shedding load), so a disconnected eMule keeps serving
     /// the peers that already hold a queue slot or know its address. Two earlier
     /// rules tried to raise this on disconnect and both stopped uploads that
-    /// should have kept running — see `NetworkCommand::KadDisconnect` and
-    /// `handle_server_disconnect`.
+    /// should have kept running — see `handle_server_disconnect`.
     ///
     /// Nothing clears it, because there is no path back from shutdown.
     pub(super) uploads_halted_for_shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /// The user asked activity to stop: set by an explicit `KadDisconnect`,
-    /// cleared by every path back off `Disconnected`.
-    ///
-    /// Deliberately not `uploads_halted_for_shutdown`, which answers a different
-    /// question — "are we still accepting inbound connections?" — and is raised
-    /// only by shutdown, which is not the user asking to go offline. This one is
-    /// only ever set by an explicit Disconnect, so it can
-    /// gate the outbound side: starting download workers, dialling friends, and
-    /// UDP server search, plus whether eD2K auto-reconnect may fire at all.
-    ///
-    /// Shared rather than a plain `bool` because friend dials outlive the
-    /// network task's borrow — one spawned before the click can still be
-    /// mid-handshake after it, and the session-insert path has to be able to
-    /// see that the answer changed underneath it.
-    pub(super) user_offline: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we have successfully registered with the rendezvous server
     pub(super) rendezvous_registered: bool,
     /// Last successful `/register` had intro *and* every pairwise presence
@@ -1319,11 +1303,11 @@ pub(super) struct NetworkState {
     /// has superseded the task.
     pub(super) nat_probe_generation: u64,
     /// Invalidates mapping keep-alive (STUN/TCP-hold) cycle results that
-    /// arrive after a disconnect has superseded them — a `NetworkState`
-    /// field (not a loop-local) specifically so `NetworkCommand::KadDisconnect`
-    /// can bump it and stop a stale in-flight result from re-populating
+    /// arrive after a reset has superseded them — a `NetworkState` field (not
+    /// a loop-local) specifically so `reset_stun_keepalive_session` can bump
+    /// it and stop a stale in-flight result from re-populating
     /// `external_udp_port` / `stun_sourced_udp_port` / advertise ports right
-    /// after `reset_stun_keepalive_session` just cleared them.
+    /// after clearing them.
     pub(super) mapping_ka_generation: u64,
     /// Live-updated mirror of `nat_info` (plus the QUIC endpoint once
     /// available) shared with spawned friend-dial tasks via
@@ -1679,6 +1663,9 @@ pub(super) struct NetworkState {
     pub(super) channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
     /// Last owner moderation STORE per channel.
     pub(super) channel_moderation_publish_at: HashMap<[u8; 16], i64>,
+    /// Owner moderation STOREs in flight, by publish id, so one that stores
+    /// nowhere is retried soon (`channel_membership::note_owner_snapshot_finished`).
+    pub(super) owner_snapshot_publishes: HashMap<u32, [u8; 16]>,
     /// Moderation lookups started per channel this session, which is what
     /// settings lookups ride: one on every third.
     pub(super) channel_moderation_passes: HashMap<[u8; 16], u64>,

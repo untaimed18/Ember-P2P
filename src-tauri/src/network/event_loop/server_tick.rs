@@ -1190,14 +1190,10 @@ pub(in crate::network) async fn on_server_tick(
         state.server_search_age = 0;
     }
 
-    // An explicit Disconnect has to outlast this tick. `preferred_ed2k_server`
-    // and `server_auto_reconnect` both survive going offline, so without this
-    // guard the disconnect the user just asked for was undone ~2s later by
-    // the drop-recovery path: the server came back on its own while
-    // `uploads_halted_for_shutdown` stayed raised, leaving a session that reads
-    // "server connected" in the UI and refuses every upload.
+    // An explicit Disconnect has to outlast this tick: `DisconnectServer`
+    // clears `server_auto_reconnect`, so the drop-recovery path below cannot
+    // bring the server back ~2s after the user dropped it.
     if state.server_auto_reconnect
-        && !state.user_offline.load(std::sync::atomic::Ordering::Relaxed)
         && !state.server_connected
         && state.pending_server_connect.is_none()
         && state.server_connection.is_none()

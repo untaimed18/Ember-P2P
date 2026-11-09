@@ -75,7 +75,7 @@ const MAX_ACTIVE_PUBLISHES: usize = 128;
 const PUBLISH_TIMEOUT_SECS: u64 = 30;
 
 /// Minimum number of nodes to store a record on.
-const MIN_STORE_NODES: usize = 5;
+pub const MIN_STORE_NODES: usize = 5;
 
 /// Record type constants.
 pub const RECORD_TYPE_KEYWORD: u8 = 0x01;
@@ -455,10 +455,7 @@ fn decode_owned_rooms_extra(extra: &[u8]) -> Option<Vec<channel::OwnedRoomSalt>>
         return None;
     }
     Some(
-        extra[2..salts_end]
-            .chunks_exact(16)
-            .map(|chunk| <[u8; 16]>::try_from(chunk).expect("16-byte chunk"))
-            .collect(),
+        extra[2..salts_end].as_chunks::<16>().0.to_vec(),
     )
 }
 
@@ -516,7 +513,7 @@ pub fn decode_key_commitments(value: &[u8]) -> Option<Vec<(i64, [u8; 32])>> {
         return None;
     }
     let mut out: Vec<(i64, [u8; 32])> = Vec::with_capacity(count);
-    for entry in entries.chunks_exact(KEY_COMMITMENT_ENTRY_LEN) {
+    for entry in entries.as_chunks::<KEY_COMMITMENT_ENTRY_LEN>().0 {
         let epoch = i64::from_le_bytes(entry[..8].try_into().ok()?);
         if epoch < 1 || out.last().is_some_and(|(newer, _)| epoch >= *newer) {
             return None;
@@ -1567,8 +1564,8 @@ impl SignedRecord {
     }
 
     /// Every form of our presence in a room this build publishes, live or
-    /// departed, all stamped `now`: v2 then v1 for a private room, v1 alone
-    /// once [`channel::PUBLISH_V1_MEMBERSHIP_RECORDS`] is off; v1 for a public
+    /// departed, all stamped `now`: v2 for a private room, and v1 after it
+    /// while [`channel::PUBLISH_V1_MEMBERSHIP_RECORDS`] holds; v1 for a public
     /// room, whose key anyone can derive, so blinding it would hide nothing.
     ///
     /// The two forms of a private record never share a store slot (publisher
@@ -3174,9 +3171,7 @@ impl ModerationTail {
         if rest.len() < pins_end {
             return None;
         }
-        for chunk in rest[1..pins_end].chunks_exact(CHANNEL_PIN_ID_LEN) {
-            let mut id = [0u8; CHANNEL_PIN_ID_LEN];
-            id.copy_from_slice(chunk);
+        for &id in rest[1..pins_end].as_chunks::<CHANNEL_PIN_ID_LEN>().0 {
             // A repeat is one pin, where it was first placed.
             if !tail.pinned_msg_ids.contains(&id) {
                 tail.pinned_msg_ids.push(id);
@@ -3674,11 +3669,7 @@ pub fn decode_moderation_extra(extra: &[u8]) -> Option<ModerationExtra> {
         return None;
     }
     let mut bans = Vec::with_capacity(ban_count);
-    for chunk in extra[ban_off + 2..bans_end].chunks_exact(32) {
-        let mut pk = [0u8; 32];
-        pk.copy_from_slice(chunk);
-        bans.push(pk);
-    }
+    bans.extend_from_slice(extra[ban_off + 2..bans_end].as_chunks::<32>().0);
     let rest = &extra[bans_end..];
     if rest.is_empty() {
         return Some((welcome, bans, Vec::new(), ModerationTail::default()));
@@ -3695,11 +3686,7 @@ pub fn decode_moderation_extra(extra: &[u8]) -> Option<ModerationExtra> {
         return None;
     }
     let mut mods = Vec::with_capacity(mod_count);
-    for chunk in rest[2..mods_end].chunks_exact(32) {
-        let mut pk = [0u8; 32];
-        pk.copy_from_slice(chunk);
-        mods.push(pk);
-    }
+    mods.extend_from_slice(rest[2..mods_end].as_chunks::<32>().0);
     let tail = ModerationTail::decode(&rest[mods_end..])?;
     Some((welcome, bans, mods, tail))
 }
@@ -4923,10 +4910,24 @@ mod tests {
         let join = [0x77u8; 32];
         let key = channel::content_key(&join);
         let blind = channel::presence_room_blind(&channel.channel_id, &join);
-        let private = SignedRecord::channel_presence_forms(
+        let mut private = SignedRecord::channel_presence_forms(
             "Ada", ja_en, channel.channel_id, channel.pubkey, &join, true, false, &[0x42; 32], &member, now,
         );
-        assert_eq!(private.len(), 2);
+        assert_eq!(private.len(), 1);
+        // The v1 copy as 1.7.5 to 1.7.8 still publish it beside v2.
+        private.push(SignedRecord::channel_presence_v1_at(
+            "Ada",
+            ja_en,
+            channel.channel_id,
+            channel.pubkey,
+            &join,
+            true,
+            channel::presence_epoch(now),
+            false,
+            &[0x42; 32],
+            &member,
+            now,
+        ));
         for record in &private {
             assert!(record.channel_store_ok());
             assert_eq!(channel_language_from_file_size(record.file_size), None, "kept out of the header");
@@ -4951,7 +4952,12 @@ mod tests {
                 "Ada", ja_en, channel.channel_id, channel.pubkey, &secret, private, true, &[0x42; 32], &member, now,
             );
             let last = left.last().unwrap();
-            let read = SignedRecord::parse_channel_presence_member(&blob_of(last), &channel.channel_id, Some(&key)).unwrap();
+            let read = if private {
+                SignedRecord::parse_channel_presence_member_v2(&blob_of(last), &channel.channel_id, &join, &blind)
+            } else {
+                SignedRecord::parse_channel_presence_member(&blob_of(last), &channel.channel_id, Some(&key))
+            }
+            .unwrap();
             assert!(read.departed);
             assert_eq!((read.language, read.language2), (None, None));
         }
@@ -4971,11 +4977,12 @@ mod tests {
         assert_eq!(ChannelLanguages::from_wire_ids(de, 255).secondary, None, "a later build's code reads as none");
     }
 
-    /// This build publishes both forms of a private room's presence and key
-    /// records, stamped alike, and only v1 where v2 would hide nothing.
+    /// Past the cut-over a private room's presence and key records go out in
+    /// v2 alone, but for the owner's own key copy, and v1 only where v2 would
+    /// hide nothing.
     #[test]
-    fn both_forms_of_private_membership_records_are_published() {
-        const { assert!(channel::PUBLISH_V1_MEMBERSHIP_RECORDS, "the transition keeps v1 until 1.8.0") };
+    fn private_membership_records_are_published_in_v2_past_the_cut_over() {
+        const { assert!(!channel::PUBLISH_V1_MEMBERSHIP_RECORDS, "1.8.0 stops publishing v1") };
         let channel = channel::ChannelIdentity::generate();
         let member = SigningKey::generate(&mut OsRng);
         let join = [0x77u8; 32];
@@ -4984,10 +4991,9 @@ mod tests {
             let forms = SignedRecord::channel_presence_forms(
                 "Ada", ChannelLanguages::default(), channel.channel_id, channel.pubkey, &join, true, departed, &[0x42; 32], &member, now,
             );
-            assert_eq!(forms.len(), 2);
-            assert_ne!(forms[0].file_hash, channel.channel_id, "v2 first");
-            assert_eq!(forms[1].file_hash, channel.channel_id);
-            assert_eq!(forms[0].keyword_hash, forms[1].keyword_hash);
+            assert_eq!(forms.len(), 1);
+            assert_ne!(forms[0].file_hash, channel.channel_id, "v2, which names neither the room nor the member");
+            assert_eq!(forms[0].keyword_hash, channel::presence_key(&channel.channel_id, &join, channel::presence_epoch(now)));
             assert!(forms.iter().all(|r| r.timestamp == now && r.channel_store_ok()));
             assert!(forms.iter().all(|r| r.channel.as_ref().unwrap().is_departed() == departed));
         }
@@ -5015,21 +5021,24 @@ mod tests {
             )
         };
         for epoch in [1, 2] {
-            let both = epoch_forms(false, epoch);
-            assert_eq!(both.len(), 2);
-            assert!(both[0].channel.as_ref().unwrap().flags & CHANNEL_FLAG_BLINDED != 0);
+            let members = epoch_forms(false, epoch);
+            assert_eq!(members.len(), 1, "a member's copy in v2 alone");
+            assert!(members[0].channel.as_ref().unwrap().flags & CHANNEL_FLAG_BLINDED != 0);
             assert_eq!(
-                both[0].keyword_hash,
+                members[0].keyword_hash,
                 channel::epoch_key_v2(&channel.channel_id, &channel::epoch_member_id(&blind, epoch), epoch)
             );
-            assert_eq!(both[1].keyword_hash, channel::epoch_key(&channel.channel_id, &member_pub, epoch));
-            assert!(both.iter().all(|r| r.timestamp == both[0].timestamp && r.channel_store_ok()));
-        }
+            assert!(members[0].channel_store_ok());
 
-        // Past the transition the owner's own copy still goes out in v1; a
-        // member's copy does not.
+            // The owner's own copy still goes out in v1 too: kind 3 names the
+            // owner already, and a restored device reads its keys back from it.
+            let own = epoch_forms(true, epoch);
+            assert_eq!(own.len(), 2);
+            assert_eq!(own[1].keyword_hash, channel::epoch_key(&channel.channel_id, &member_pub, epoch));
+            assert!(own.iter().all(|r| r.timestamp == own[0].timestamp && r.channel_store_ok()));
+        }
         assert!(channel::epoch_record_publishes_v1(true));
-        assert_eq!(channel::epoch_record_publishes_v1(false), channel::PUBLISH_V1_MEMBERSHIP_RECORDS);
+        assert!(!channel::epoch_record_publishes_v1(false));
     }
 
     /// A snapshot carries the stamp it was built at and the signature that

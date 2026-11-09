@@ -841,10 +841,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         dht_store,
         stats: NetworkStats {
             // KAD always bootstraps on startup, so the node opens in
-            // `Connecting` rather than waiting to be asked. `Disconnected` is
-            // still reachable — an explicit `KadDisconnect` from the KAD
-            // Network page puts us there for the rest of the session — so
-            // every gate that checks for it below still earns its place.
+            // `Connecting` rather than waiting to be asked. Nothing moves it
+            // to `Disconnected` afterwards.
             status: NetworkStatus::Connecting,
             bound_udp_port: udp_port,
             session_tcp_port: tcp_port,
@@ -1137,12 +1135,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // silently servable by any peer that remembered our IP:port from a
         // prior session while the UI still read "Disconnected". Now that KAD
         // always bootstraps there is no such session: startup is always a
-        // connect. `KadDisconnect` sets the flag, and `KadConnect` /
-        // `initiate_server_connect` clear it again.
+        // connect. Only shutdown raises it now.
         uploads_halted_for_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        // Starts false on purpose — see the field comment. "Has not connected
-        // yet" is not "was asked to go offline".
-        user_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rendezvous_registered: false,
         last_presence_blocked: false,
         rendezvous_register_generation: 0,
@@ -1252,6 +1246,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_channel_moderation: Vec::new(),
         channel_moderation_fetch_at: HashMap::new(),
         channel_moderation_publish_at: HashMap::new(),
+        owner_snapshot_publishes: HashMap::new(),
         channel_moderation_passes: HashMap::new(),
         channel_settings_fetch_owed: HashSet::new(),
         ember_channel_settings_searches: HashMap::new(),

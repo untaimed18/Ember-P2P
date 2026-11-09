@@ -45,9 +45,8 @@ const DISCARD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 /// Every start path aborts the previous worker before spawning a new one, but
 /// `abort()` only unwinds the *task*: the worker thread it owns keeps the file
 /// handle until it has drained its queue and run its trailing fsync, and most
-/// of those start paths do not wait for that at all (the KAD-disconnect path
-/// drains `download_handles` entirely, so the next start does not even see a
-/// handle to wait on). Two writer threads on one `.part` interleave seeks and
+/// of those start paths do not wait for that at all. Two writer threads on one
+/// `.part` interleave seeks and
 /// writes, so a block the old generation still had queued can land on top of
 /// one the new generation just wrote — a torn part that only surfaces later as
 /// an MD4/AICH mismatch and a re-download.
@@ -741,9 +740,8 @@ mod tests {
 
     /// Aborting a download task does not stop the writer thread it owns: the
     /// thread still drains its queue and fsyncs while holding the handle, and
-    /// most start paths spawn the replacement worker immediately (the
-    /// KAD-disconnect path drains `download_handles`, so the next start has no
-    /// handle to wait on at all). Opening a second writer in that window is
+    /// most start paths spawn the replacement worker immediately. Opening a
+    /// second writer in that window is
     /// what lets a stale queued block overwrite a fresh one.
     #[tokio::test]
     async fn a_second_writer_waits_for_the_previous_one_to_close() {

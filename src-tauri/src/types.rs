@@ -3031,9 +3031,9 @@ impl AppSettings {
 /// `(ember_id, ip, port, pubkey)` tuples that other Ember nodes
 /// can look up to find each other when KAD doesn't know the peer.
 /// It can NOT impersonate a friend on the data plane — every
-/// friend session does its own Ed25519 proof-of-possession before
-/// accepting chat, browse, or files (`friend_connect.rs`,
-/// `ember_auth.rs`). It can NOT silently rewrite a friend's
+/// friend session proves possession of the friend's key in its
+/// secure-v2 handshake before accepting chat, browse, or files
+/// (`friend_connect.rs`, `secure_stream.rs`). It can NOT silently rewrite a friend's
 /// address to attacker infrastructure either: after C4 the client
 /// signs the (id, port, ipv4, pubkey, ts) tuple with the node's
 /// Ed25519 secret, the server pins the pubkey to the id on first

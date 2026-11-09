@@ -16,8 +16,8 @@ pub(in crate::network) async fn on_udp_mapping_keepalive_result(
 ) {
     // Flags/sender are keyed by this cycle's local generation.
     // `mapping_ka_generation` can be bumped by
-    // `reset_stun_keepalive_session` (STUN toggle / KAD
-    // disconnect) without touching those locals; a matching
+    // `reset_stun_keepalive_session` (the STUN toggle)
+    // without touching those locals; a matching
     // local generation must still release them so the timer
     // is not stuck until the 90s watchdog. Payload is applied
     // only while the global generation still matches, so a

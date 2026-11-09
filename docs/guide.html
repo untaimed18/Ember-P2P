@@ -517,7 +517,7 @@ peer_count    (u16 LE)
     </div>
 
     <h3 id="friends-privacy">Privacy</h3>
-    <p>The rendezvous server stores presence as hashed capabilities derived from your Friend identity (never the raw Friend ID in the clear), paired with IP and port. Registration is pubkey-bound and signature-checked so entries cannot be spoofed with a stolen hash alone. Entries expire automatically after 5 minutes without a heartbeat. Between Ember peers, the Ember Hash is exchanged via the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake (with Ed25519 proof-of-possession on TCP) &mdash; not via the legacy EmuleInfo path used for ordinary eMule metadata.</p>
+    <p>The rendezvous server stores presence as hashed capabilities derived from your Friend identity (never the raw Friend ID in the clear), paired with IP and port. Registration is pubkey-bound and signature-checked so entries cannot be spoofed with a stolen hash alone. Entries expire automatically after 5 minutes without a heartbeat. Between Ember peers, the Ember Hash is exchanged via the private <code>OP_EMBER_HELLO</code> / <code>OP_EMBER_HELLOANSWER</code> handshake (with an Ed25519 public key that must bind to the hash; proof of possession comes from the Noise IK friend session, or for credit from the key-link proof) &mdash; not via the legacy EmuleInfo path used for ordinary eMule metadata.</p>
   </section>
 
   <hr>

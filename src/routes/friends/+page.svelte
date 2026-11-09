@@ -2854,11 +2854,11 @@
   }
 
   /* Verification badges on incoming friend requests. "Verified"
-     means the peer advertised an Ed25519 pubkey whose BLAKE3 prefix
-     matches their claimed ember_hash (offline identity binding).
-     "Unverified" means no pubkey was advertised or the binding
-     check failed; users should only accept from people they
-     recognise until the full challenge-response runs on accept. */
+     means the request arrived on a secure-v2 session, whose Noise IK
+     handshake proved the peer holds the key behind its ember_hash.
+     "Unverified" means it came in on a plain eD2K session, where
+     nothing proves that; users should only accept from people they
+     recognise. */
   .request-badge {
     display: inline-flex;
     align-items: center;

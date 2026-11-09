@@ -74,6 +74,9 @@ fn take_notify_token() -> bool {
     let ceiling = NOTIFY_BURST * 1_000;
 
     let mut spent = false;
+    // Rust 1.99 deprecates `fetch_update` for `try_update`, which is newer
+    // than this crate's `rust-version`.
+    #[allow(deprecated)]
     let _ = NOTIFY_TOKENS_MILLI.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         let available = current.saturating_add(refilled).min(ceiling);
         spent = available >= 1_000;

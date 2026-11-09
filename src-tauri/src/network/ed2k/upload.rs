@@ -48,11 +48,10 @@ pub struct EmberSessionHandle {
     session_id: u64,
     last_activity: Arc<std::sync::atomic::AtomicI64>,
     shutdown: tokio::sync::watch::Sender<bool>,
-    /// The peer's Ed25519 identity public key, as proven by the Ed25519
-    /// proof-of-possession challenge-response that gates creation of
-    /// every `EmberSessionHandle` (see the inbound `OP_EMBER_AUTH_RESPONSE`
-    /// handler and `friend_connect::run_friend_session_over_transport`,
-    /// the two call sites that construct one). Chat encryption
+    /// The peer's Ed25519 identity public key, as proven by the secure-v2
+    /// handshake that gates creation of every `EmberSessionHandle` (see the
+    /// inbound secure-v2 registration in the upload handler and
+    /// `friend_connect::run_friend_session_over_transport`). Chat encryption
     /// (`ember::crypto::{encrypt,decrypt}_chat_*`) derives its AEAD key
     /// from this — reusing the same identity key already bound to
     /// `ember_hash` rather than negotiating or persisting a separate one.
@@ -386,7 +385,7 @@ fn friend_privileges_allowed(secure_v2_authenticated: bool, live_friend_member: 
 /// identity already bound to this session. The first claimed hash and pubkey
 /// stick for the life of the socket, authenticated or not; later HELLOs may
 /// only repeat them (or fill in a pubkey that was never given).
-fn ember_hello_identity_changed(
+pub(super) fn ember_hello_identity_changed(
     bound_hash: Option<[u8; 16]>,
     bound_pubkey: Option<[u8; 32]>,
     claimed_hash: [u8; 16],
@@ -2805,14 +2804,13 @@ pub(crate) struct QueueEntry {
     /// can route verified Ember peers through the enhanced
     /// decayed-ratio + reliability + speed scoring path (Phase 3).
     pub(crate) ember_pubkey: Option<[u8; 32]>,
-    /// True iff the peer completed full Ed25519 proof-of-possession
-    /// on the session that produced this queue entry. A spoofer who
-    /// merely claims a pubkey on the wire lands here as `false` and
-    /// falls back to the legacy eMule credit-ratio scoring, so they
-    /// can't ride a friend's Ember reputation into the queue.
-    /// Snapshot of `ember_auth_state.is_verified()` at
-    /// insertion/update time — re-evaluated each time the peer
-    /// re-enters the queue (session-expired, queue-full rotation).
+    /// True iff the session that produced this queue entry is a secure-v2
+    /// session, whose Noise handshake proved the peer's Ember key. A spoofer
+    /// who merely claims a pubkey on the wire lands here as `false` and
+    /// falls back to the legacy eMule credit-ratio scoring, so they can't
+    /// ride a friend's Ember reputation into the queue. Snapshot at
+    /// insertion/update time — re-evaluated each time the peer re-enters
+    /// the queue (session-expired, queue-full rotation).
     pub(crate) ember_verified: bool,
     /// Peer's self-reported nickname from Hello (`CT_NAME`), empty when it
     /// advertised none.
@@ -3356,12 +3354,9 @@ pub enum UploadEventKind {
         tcp_port: u16,
         udp_port: u16,
     },
-    /// Incoming friend request from an Ember peer. `verified` carries
-    /// the same semantics as the download-side variant in
-    /// `super::transfer::DownloadEvent::EmberFriendRequest`: true iff
-    /// the peer advertised an Ed25519 pubkey that BLAKE3-binds to
-    /// their advertised `ember_hash`, plus (on friend-connect paths)
-    /// signature proof-of-possession.
+    /// Incoming friend request from an Ember peer. `verified` is true iff
+    /// the request arrived on a secure-v2 session, whose handshake proved
+    /// the peer's key (see `friends::process_inbound_friend_request`).
     EmberFriendRequest {
         ember_hash: [u8; 16],
         pubkey: Option<[u8; 32]>,
@@ -3797,16 +3792,13 @@ struct UploadHandler {
     ember_hash: [u8; 16],
     /// Our Ed25519 public key, advertised in `OP_EMBER_HELLO` so peers can
     /// verify our `ember_hash` is cryptographically bound to a key we
-    /// actually control (`verify_ember_hash_binding`) and use it as the
-    /// verifier in `perform_ember_auth`. Always the raw 32-byte little-
-    /// endian public-key encoding, derived deterministically from
-    /// `ed25519_secret_key` at identity-load time.
+    /// actually control (`verify_ember_hash_binding`). Always the raw
+    /// 32-byte little-endian public-key encoding, derived deterministically
+    /// from `ed25519_secret_key` at identity-load time.
     ed25519_public_key: [u8; 32],
-    /// Our Ed25519 secret key. Used by the reactive Ember auth
-    /// state machine (`super::ember_auth`) to sign the peer's
-    /// random nonce when they initiate a challenge-response from
-    /// the download side. Never serialized to the wire or to disk
-    /// from here.
+    /// Our Ed25519 secret key: the secure-v2 handshake, key-link proofs
+    /// (`super::key_link`) and friend chat encryption all use it. Never
+    /// serialized to the wire or to disk from here.
     ed25519_secret_key: [u8; 32],
     /// Live friend user-hash set for friend-slot priority boost
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
@@ -6483,11 +6475,10 @@ impl UploadHandler {
             // Re-entry after session end: refresh
             // the Ember verification snapshot. As
             // with `is_friend_slot` we only
-            // upgrade (NotStarted → Verified)
-            // here, never downgrade within the
-            // same session — once a peer has
-            // completed PoP on a session the
-            // queue entry keeps that fact through
+            // upgrade here, never downgrade within
+            // the same session — once a peer has
+            // proved its key on a secure-v2 session
+            // the queue entry keeps that fact through
             // re-admission (a session change
             // already reset it to `false` above).
             if secure_v2_authenticated {
@@ -7656,16 +7647,19 @@ impl UploadHandler {
         let peer_addr = SocketAddr::new(ip, entry.tcp_port);
 
         // Ticks run concurrently, so the place under the cap is reserved in
-        // one step rather than checked above and taken here.
-        if self
+        // one step rather than checked above and taken here. Rust 1.99
+        // deprecates `fetch_update` for `try_update`, which is newer than this
+        // crate's `rust-version`.
+        #[allow(deprecated)]
+        let reserved = self
             .push_grant_dials
             .fetch_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed,
                 |n| (n < MAX_PUSH_GRANT_DIALS).then_some(n + 1),
             )
-            .is_err()
-        {
+            .is_ok();
+        if !reserved {
             return;
         }
         // Owns the place just reserved from here on, so every way out of this
@@ -9431,10 +9425,9 @@ impl UploadHandler {
         // (`verify_ember_hash_binding`). This is the OFFLINE binding
         // check; on its own it does NOT imply proof of possession
         // (a peer who has merely observed the victim's pubkey on
-        // the wire could replay it). The reactive auth state
-        // machine below (`ember_auth_state`) provides the full PoP
-        // signal; we prefer that when available and fall back to
-        // this binding flag only if auth never completes.
+        // the wire could replay it). A secure-v2 session, whose Noise
+        // handshake proved the key, is the proof of possession, which is
+        // why it starts this flag set.
         let mut ember_hash_binding_verified = secure_v2_authenticated;
         // The Ember hash this session's binding check passed for, and whether
         // SecIdent verified this session: together they keep the binding for
@@ -9447,15 +9440,6 @@ impl UploadHandler {
         // (`super::key_link`). A verified proof ties the user hash to the
         // identity for Ember-stream credit (`key_link::link_proven_key`).
         let mut key_link = super::key_link::KeyLinkSession::default();
-        // Reactive Ember Ed25519 challenge-response state machine.
-        // Driven by inbound `OP_EMBER_AUTH_CHALLENGE` /
-        // `OP_EMBER_AUTH_RESPONSE` packets dispatched from the
-        // reader task; transitions to `Verified` only after we've
-        // seen a sig over our random nonce that decodes against the
-        // peer's advertised pubkey AND the pubkey BLAKE3-binds to
-        // their `ember_hash`. See `super::ember_auth` for the full
-        // state diagram and tests.
-        let mut ember_auth_state = super::ember_auth::EmberAuthState::default();
         let mut ul_sent_ember_hello = secure_v2_authenticated || handed_over;
         // Only to peers that speak the eMule extended protocol; see the
         // matching gate on the download side.
@@ -9614,10 +9598,8 @@ impl UploadHandler {
         // priority on its own — a spoofer who learned a friend's hash
         // on the wire can claim it. Privilege-granting sites below
         // (queue insertion, score_queue_entry) additionally gate on
-        // `ember_auth_state.is_verified()` via `is_verified_friend`,
-        // which only transitions to `true` after the peer completes
-        // the Ed25519 challenge-response on THIS TCP session (see
-        // `super::ember_auth`).
+        // `is_verified_friend` (`live_secure_friend_member`), which holds
+        // only on a secure-v2 session, whose handshake proved the key.
         //
         // Mutable because Ember identity is exchanged out-of-band
         // from the public Hello/EmuleInfo (in `OP_EMBER_HELLO`, kept
@@ -9649,18 +9631,18 @@ impl UploadHandler {
             _ => false,
         };
 
-        // FriendSeen is deliberately NOT emitted here. The dispatcher
-        // promotes FriendSeen to `update_friend_address` (overwriting
-        // the friend's last known IP in the DB) and an
-        // `ember:friend-online` UI event; both are user-facing facts
-        // about *that friend*, so they must require Ed25519 PoP on
-        // this session. Emission is moved to the OK arm of
-        // `OP_EMBER_AUTH_RESPONSE` below.
+        // FriendSeen is deliberately NOT emitted on the friend claim
+        // alone. The dispatcher promotes FriendSeen to
+        // `update_friend_address` (overwriting the friend's last known IP
+        // in the DB) and an `ember:friend-online` UI event; both are
+        // user-facing facts about *that friend* and need proof of the key
+        // on this session, so FriendSeen is sent only from the secure-v2
+        // registration below.
 
         // Tracks whether we've already shipped our outbound
-        // `OP_EMBER_FRIEND_REQ` on this session. Noise-authenticated
-        // sessions send immediately below; classic Ember file sockets
-        // send after HELLO (or when the user adds the peer mid-session).
+        // `OP_EMBER_FRIEND_REQ` on this session. Only a Noise-authenticated
+        // session sends one: immediately below, after a HELLO, or when the
+        // user adds the peer mid-session. A plain socket never does.
         let mut friend_request_sent = false;
         // Set once the friend sends `EMBER_EXT_BROWSE_SCOPE_AWARE`; until then
         // our browse answers on this session leave friends-only files out.
@@ -9677,21 +9659,17 @@ impl UploadHandler {
         // OP_EMBER_HELLO arm below re-evaluates this once peer
         // identity is known so the `is_ember_friend`-gated chat /
         // browse / keepalive arms and the `owns_ember_slot` claim
-        // in the AUTH_RESPONSE arm all see the up-to-date answer.
+        // all see the up-to-date answer.
         let mut is_ember_friend = is_friend && hello_caps.is_ember;
-        // Inbound `ember_sessions` slot reservation is deferred until the
-        // peer completes Ed25519 proof-of-possession on this TCP session
-        // (see `OP_EMBER_AUTH_RESPONSE` arm below). Reserving the slot
-        // earlier — based on the unauthenticated `is_friend &&
-        // hello_caps.is_ember` claim — let a spoofer who knew a friend's
-        // ember_hash grab the map entry that `SendChatMessage` /
-        // `BrowseFriend` look up by hash. Outbound chat/browse the local
-        // user composed for that friend would then be written to the
-        // spoofer's TCP socket. Keeping `owns_ember_slot = false` until
-        // the responder side of `ember_auth` flips to `Verified` closes
-        // that confidentiality gap; legitimate Ember friends always
-        // complete PoP, so the only sessions denied a slot are the ones
-        // we cannot prove are the friend.
+        // An inbound `ember_sessions` slot is reserved only for a secure-v2
+        // session, whose handshake proved the peer's key. Reserving it on
+        // the unauthenticated `is_friend && hello_caps.is_ember` claim would
+        // let a spoofer who knew a friend's ember_hash grab the map entry
+        // that `SendChatMessage` / `BrowseFriend` look up by hash, and
+        // outbound chat/browse the local user composed for that friend
+        // would then be written to the spoofer's TCP socket. A friend's own
+        // chat and browse connections are always secure-v2, so they still
+        // get the slot; a plain file socket from the same friend does not.
         let mut owns_ember_slot = false;
         // Set alongside `owns_ember_slot` when we claim the `ember_sessions`
         // slot below. Touched on *every* subsequent inbound packet (including
@@ -11537,14 +11515,13 @@ impl UploadHandler {
 
                     if !should_accept {
                         // Friend-slot priority requires proof-of-possession
-                        // on THIS TCP session (`ember_auth_state.is_verified()`).
-                        // Merely claiming a friend's hash (`is_friend`) is
-                        // not enough — otherwise a spoofer who observed
-                        // the hash on the wire could ride friend priority.
-                        // We evaluate this fresh at every queue-insertion /
-                        // scoring site because `ember_auth_state` can
-                        // advance mid-session as the peer's auth packets
-                        // arrive.
+                        // on THIS TCP session: a secure-v2 session, whose
+                        // handshake proved the key. Merely claiming a
+                        // friend's hash (`is_friend`) is not enough —
+                        // otherwise a spoofer who observed the hash on the
+                        // wire could ride friend priority. Evaluated fresh
+                        // at every queue-insertion / scoring site, since
+                        // friendship can change mid-session.
                         let is_verified_friend = live_secure_friend_member(
                             &self.friend_hashes,
                             peer_ember_hash,
@@ -11630,10 +11607,10 @@ impl UploadHandler {
                             // later handshake still names itself in the tab.
                             queue[pos].peer_name = hello_caps.peer_name.clone();
                             queue[pos].client_software = client_software_from_caps(&hello_caps);
-                            // If the peer has since completed PoP, upgrade
-                            // an existing queue entry's friend-slot flag
-                            // (it may have been added while auth was still
-                            // pending). Never downgrade within the same
+                            // If this session qualifies for friend priority,
+                            // upgrade an existing queue entry's friend-slot
+                            // flag (it may have been added before the peer
+                            // was a friend). Never downgrade within the same
                             // session: if the entry is already marked
                             // is_friend_slot from a prior verified state on
                             // the same session, leave it — but a session
@@ -14501,22 +14478,19 @@ impl UploadHandler {
                 // back so they learn our identity in the same round trip.
                 (OP_EMULEPROT, OP_EMBER_HELLO) | (OP_EMULEPROT, OP_EMBER_HELLOANSWER) => {
                     if let Some(ident) = parse_ember_hello(&payload) {
-                        // Identity lock: once PoP succeeds the peer's
-                        // `(ember_pubkey, ember_hash)` pair is fixed
-                        // for this TCP session. If they try to swap
-                        // identity in a follow-up Ember-Hello (the
-                        // pubkey or hash differs), refuse the change
-                        // and log it. Without this, an attacker who
-                        // PoPs as themselves could re-issue an
-                        // Ember-Hello carrying a victim's
-                        // (pubkey, hash) and then have credit
-                        // accounting / queue scoring attribute uploads
-                        // to the victim. Mod_version/nickname keep
-                        // updating because they're cosmetic.
-                        //
-                        // Plain sessions are locked to their first claim as
-                        // well: without that, one socket could cycle
-                        // candidate hashes through repeated HELLOs.
+                        // Identity lock: the peer's first claimed
+                        // `(ember_pubkey, ember_hash)` pair is fixed for
+                        // this TCP session. If they try to swap identity
+                        // in a follow-up Ember-Hello (the pubkey or hash
+                        // differs), refuse the change and log it. Without
+                        // this, a peer whose secure-v2 handshake proved
+                        // its own key could re-issue an Ember-Hello
+                        // carrying a victim's (pubkey, hash) and have
+                        // credit accounting / queue scoring attribute
+                        // uploads to the victim, and a plain socket could
+                        // cycle candidate hashes through repeated HELLOs.
+                        // Mod_version/nickname keep updating because
+                        // they're cosmetic.
                         let identity_changed = ember_hello_identity_changed(
                             hello_caps.ember_hash,
                             hello_caps.ember_pubkey,
@@ -14584,18 +14558,13 @@ impl UploadHandler {
                             }
                         }
 
-                        // Offline identity-binding verification. Since
-                        // the upload reader runs in a dedicated task
-                        // (not reachable from this dispatcher site),
-                        // we can't run the full challenge-response
-                        // here; we use the cheaper binding check
-                        // instead. Attackers who don't have the
-                        // victim's pubkey fail this check; attackers
-                        // who do (e.g. via passive wire-sniffing)
-                        // still get caught when the user accepts the
-                        // request and `friend_connect::open_friend_session`
-                        // runs a fresh challenge-response over a
-                        // dedicated TCP session.
+                        // Offline identity-binding verification.
+                        // Attackers who don't have the victim's pubkey
+                        // fail this check; attackers who do (e.g. via
+                        // passive wire-sniffing) still get caught when
+                        // the user accepts the request and the friend
+                        // session's secure-v2 handshake has to prove the
+                        // key.
                         if !ember_hash_binding_verified {
                             if let (Some(ref peer_pk), Some(ref peer_eh)) = (hello_caps.ember_pubkey, hello_caps.ember_hash) {
                                 if crate::network::ember::crypto::verify_ember_hash_binding(peer_pk, peer_eh) {
@@ -14897,9 +14866,9 @@ impl UploadHandler {
                         );
                     } else if let Some(eh) = peer_ember_hash {
                         let nick = crate::security::normalize_inbound_friend_nickname(&payload);
-                        // `verified` requires the strong PoP signal
-                        // from the reactive challenge-response state
-                        // machine. The earlier code also accepted
+                        // `verified` requires proof of the key on this
+                        // session, which only a secure-v2 handshake
+                        // gives. The earlier code also accepted
                         // `ember_hash_binding_verified` (the offline
                         // BLAKE3 hash check), but a peer can replay a
                         // friend's public (pubkey, ember_hash) pair
@@ -14911,8 +14880,8 @@ impl UploadHandler {
                         // log line below.
                         let verified = secure_v2_authenticated;
                         debug!(
-                            "Received friend request from {peer_addr} (nickname_chars={}, hash={}, verified={verified}, pop={}, binding={ember_hash_binding_verified})",
-                            nick.chars().count(), hex::encode(eh), verified,
+                            "Received friend request from {peer_addr} (nickname_chars={}, hash={}, verified={verified}, binding={ember_hash_binding_verified})",
+                            nick.chars().count(), hex::encode(eh),
                         );
                         let _ = self.upload_event_tx.send(UploadEvent {
                             transfer_id: String::new(),
@@ -14931,200 +14900,13 @@ impl UploadHandler {
                     }
                 }
 
-                // Ember Ed25519 challenge-response — responder side.
-                // The download peer drives a synchronous round-trip
-                // via `friend_connect::perform_ember_auth`; we react
-                // here from the dispatcher because our reader is
-                // owned by `reader_task` and we can't drive a
-                // synchronous read from this site. See
-                // `super::ember_auth` for the state-machine details.
-                //
-                // Both arms write outbound packets directly via
-                // `write_packet_async` rather than rerouting through
-                // the reader task, which is safe because the
-                // dispatcher is the sole writer on this session.
+                // The retired Ember v1 challenge-response. Older peers may
+                // still send it; both opcodes are logged and dropped.
                 (OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE) => {
                     // V1 signed attacker-selected nonces and was usable as a
-                    // live cross-session signing oracle.  Parsing remains for
-                    // wire compatibility, but no network path signs or
-                    // authorizes this opcode in secure-stream v2.
+                    // live cross-session signing oracle, so nothing signs or
+                    // authorizes on this opcode; secure-stream v2 replaced it.
                     debug!("Ignoring retired Ember v1 auth challenge from {peer_addr}");
-                }
-
-                (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE)
-                    if super::LEGACY_FRIEND_AUTH_ENABLED =>
-                {
-                    let outcome = match (hello_caps.ember_pubkey.as_ref(), peer_ember_hash.as_ref()) {
-                        (Some(pk), Some(eh)) => super::ember_auth::handle_response(
-                            &mut ember_auth_state,
-                            &payload,
-                            pk,
-                            eh,
-                        ),
-                        // Theoretical race: peer sent RESPONSE before
-                        // we finished parsing their OP_EMBER_HELLO.
-                        // TCP guarantees ordering of their writes so
-                        // this should not happen with a
-                        // well-behaved initiator (it always sends
-                        // OP_EMBER_HELLO before CHALLENGE before
-                        // RESPONSE) — but if it does, refuse to
-                        // verify rather than guess.
-                        _ => Err(super::ember_auth::AuthError::PeerPubkeyUnknown),
-                    };
-                    match outcome {
-                        Ok(()) => {
-                            info!("Ember auth (responder): peer {peer_addr} verified (proof of possession)");
-                            // Feed the mesh now that PoP has verified this
-                            // peer (see the gate comment above the
-                            // now-dead-at-connect-time `is_ember`-only
-                            // emit near the top of this function).
-                            if hello_caps.is_ember {
-                                if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
-                                    if hello_caps.tcp_port > 0
-                                        && !crate::security::is_bogus_v4(v4)
-                                    {
-                                        let _ = self
-                                            .upload_event_tx
-                                            .send(UploadEvent {
-                                                transfer_id: String::new(),
-                                                kind: UploadEventKind::EmberPeerDiscovered {
-                                                    ip: v4,
-                                                    tcp_port: hello_caps.tcp_port,
-                                                    udp_port: hello_caps.udp_port,
-                                                },
-                                            })
-                                            .await;
-                                        mesh_discovered_emitted = true;
-                                    }
-                                }
-                            }
-                            // First EPX push after binding — mirrors download
-                            // paths that only share sources once the peer's
-                            // advertised key binds to its Ember hash.
-                            if hello_caps.is_ember && !epx_sent_after_binding {
-                                let epx_data = self.ember_payload.read().await.clone();
-                                if !epx_data.is_empty() {
-                                    let gen = self
-                                        .ember_payload_generation
-                                        .load(std::sync::atomic::Ordering::Relaxed);
-                                    info!(
-                                        "Sending EPX to verified Ember peer {peer_addr} ({} bytes, gen {gen})",
-                                        epx_data.len()
-                                    );
-                                    self.bandwidth_limiter.charge_upload((6 + epx_data.len()) as u64);
-                                    if write_packet_async(
-                                            &mut writer,
-                                            OP_EMULEPROT,
-                                            OP_EMBER_SOURCEEXCHANGE,
-                                            &epx_data,
-                                        )
-                                        .await
-                                        .is_ok()
-                                    {
-                                        last_epx_generation = gen;
-                                        last_epx_resend = std::time::Instant::now();
-                                        epx_sent_after_binding = true;
-                                        self.epx_overhead
-                                            .record_upload((6 + epx_data.len()) as u64);
-                                    }
-                                } else {
-                                    epx_sent_after_binding = true;
-                                    info!("EPX payload empty, skipping EPX send to {peer_addr}");
-                                }
-                            }
-                            // PoP succeeded — claim the inbound friend
-                            // session slot now. We deliberately defer
-                            // this until verification completes so that
-                            // a peer who merely knows our friend's
-                            // public ember_hash cannot grab the slot
-                            // and intercept outbound chat/browse
-                            // routed via `ember_sessions` (see
-                            // session-open comment for the full
-                            // rationale).
-                            if !owns_ember_slot && is_ember_friend {
-                                // `hello_caps.ember_pubkey` is guaranteed
-                                // `Some` here: PoP just succeeded above,
-                                // which requires a pubkey to verify the
-                                // peer's signature against.
-                                if let (Some(eh), Some(pk)) =
-                                    (peer_ember_hash, hello_caps.ember_pubkey)
-                                {
-                                    let mut sessions = self.ember_sessions.write().await;
-                                    // A pre-existing entry might just be a
-                                    // stale leftover from a connection that
-                                    // died without a clean teardown (see
-                                    // `EmberSessionHandle`) — evict it so a
-                                    // fresh, actually-verified inbound
-                                    // session isn't blocked from claiming
-                                    // the slot.
-                                    if let Some(stale) =
-                                        sessions.get(&eh).filter(|handle| !handle.is_fresh())
-                                    {
-                                        stale.close();
-                                        sessions.remove(&eh);
-                                    }
-                                    if let std::collections::hash_map::Entry::Vacant(e) = sessions.entry(eh) {
-                                        let handle =
-                                            EmberSessionHandle::new(outbound_tx.clone(), pk);
-                                        ember_shutdown_rx = Some(handle.subscribe_shutdown());
-                                        ember_session_handle = Some(handle.clone());
-                                        e.insert(handle);
-                                        owns_ember_slot = true;
-                                    }
-                                }
-                            }
-                            // Emit FriendSeen only after PoP — the
-                            // dispatcher uses this to overwrite the
-                            // friend's last known IP and to mark them
-                            // online in the UI; an unverified peer
-                            // claiming the friend's `ember_hash` would
-                            // otherwise be able to poison both.
-                            if is_friend {
-                                if let Some(eh) = peer_ember_hash {
-                                    // See the comment on the other `FriendSeen`
-                                    // emission in this file for why we prefer the
-                                    // Hello listen port here.
-                                    let friend_port = if hello_caps.tcp_port > 0 {
-                                        hello_caps.tcp_port
-                                    } else {
-                                        peer_addr.port()
-                                    };
-                                    let _ = self.upload_event_tx.send(UploadEvent {
-                                        transfer_id: String::new(),
-                                        kind: UploadEventKind::FriendSeen {
-                                            ember_hash: eh,
-                                            ip: attach_addr.map(|a| a.ip()),
-                                            port: friend_port,
-                                        },
-                                    }).await;
-                                }
-                            }
-                            // Reciprocal friend request only after PoP —
-                            // same bar as FriendSeen / EPX / chat.
-                            if is_friend && hello_caps.is_ember && !friend_request_sent {
-                                info!(
-                                    "Sending friend request to verified Ember peer {peer_addr}"
-                                );
-                                let nickname = self.nickname_snapshot().await;
-                                let nick_bytes =
-                                    super::friend_connect::friend_request_payload(&nickname);
-                                if write_packet_async(
-                                    &mut writer,
-                                    OP_EMULEPROT,
-                                    OP_EMBER_FRIEND_REQ,
-                                    nick_bytes,
-                                )
-                                .await
-                                .is_ok()
-                                {
-                                    friend_request_sent = true;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Ember auth (responder): rejected RESPONSE from {peer_addr}: {e:?}");
-                        }
-                    }
                 }
 
                 (OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE) => {
@@ -17550,10 +17332,8 @@ mod ember_session_handle_tests {
 
     #[test]
     fn two_v1_sessions_or_nonmembers_never_gain_friend_privileges() {
-        // Even if two legacy sessions independently complete/replay their old
-        // PoP transcript, neither supplies the v2-authenticated bit consumed
-        // by authorization.
-        const _: () = assert!(!crate::network::ed2k::LEGACY_FRIEND_AUTH_ENABLED);
+        // A legacy session, even one replaying an old PoP transcript, never
+        // supplies the v2-authenticated bit consumed by authorization.
         assert!(!friend_privileges_allowed(false, true));
         assert!(!friend_privileges_allowed(true, false));
         // Canonical outbound-slot ownership is not part of chat/browse auth.
@@ -17772,7 +17552,7 @@ mod ember_session_handle_tests {
         std::fs::rename(&shared, &moved).unwrap();
 
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&base.join("private.bin"), &shared).unwrap();
+        std::os::unix::fs::symlink(base.join("private.bin"), &shared).unwrap();
         #[cfg(not(unix))]
         std::fs::write(&shared, b"attacker").unwrap();
 

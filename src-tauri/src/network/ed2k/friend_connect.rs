@@ -2,19 +2,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
-use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use super::ember_auth::{sign_auth_nonce, verify_auth_nonce};
 use super::messages::*;
 use super::secure_stream;
 use super::upload::{EmberSessionHandle, EmberSessionMap, UploadEvent, UploadEventKind};
-use crate::network::ember::crypto;
 use crate::network::ember::crypto::{
     decrypt_chat_payload, decrypt_chat_read, decrypt_chat_typing, MAX_CHAT_WIRE_LEN,
 };
@@ -56,12 +51,12 @@ const RETRACTION_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// to inbound (upload-side) friend packets.
 ///
 /// `expected_ember_hash` is the friend we intend to reach at `addr` (from a
-/// friend row, a rendezvous lookup, or a `FriendSeen` event). If the peer
+/// friend row or a rendezvous lookup). If the peer
 /// that actually answers identifies as a *different* Ember peer, the session
 /// is refused. A stale or reused address (or a misbehaving rendezvous) could
 /// otherwise land us in a session with friend B when the caller asked for
 /// friend A — delivering A's outbound chat to B and showing A online when
-/// only B is reachable. The Ed25519 PoP below proves the peer owns whatever
+/// only B is reachable. The secure-v2 handshake proves the peer owns whatever
 /// hash it claims, but only this equality check catches the *wrong friend*.
 ///
 /// The session automatically unregisters from `ember_sessions` on exit and
@@ -77,7 +72,6 @@ pub async fn open_and_run_friend_session(
     udp_port: u16,
     obfuscate: bool,
     ember_sessions: EmberSessionMap,
-    user_offline: Arc<std::sync::atomic::AtomicBool>,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ed25519_pubkey: Option<[u8; 32]>,
@@ -103,7 +97,6 @@ pub async fn open_and_run_friend_session(
         udp_port,
         obfuscate,
         ember_sessions,
-        user_offline,
         ul_event_tx,
         friend_hashes,
         ed25519_pubkey,
@@ -342,7 +335,7 @@ async fn send_friend_request_verdict(
 }
 
 /// Like [`open_and_run_friend_session`] but drives the full Ember
-/// handshake (EmuleInfo / `OP_EMBER_HELLO` / Ed25519 PoP / friend request)
+/// handshake (secure-v2 / EmuleInfo / `OP_EMBER_HELLO` / friend request)
 /// over an already-established bidirectional transport instead of dialing
 /// TCP itself. Used by [`connect_friend_with_fallback`] for the QUIC
 /// hole-punch and rendezvous-relay transports, which hand back boxed
@@ -369,7 +362,6 @@ pub async fn run_friend_session_over_transport(
     udp_port: u16,
     obfuscate: bool,
     ember_sessions: EmberSessionMap,
-    user_offline: Arc<std::sync::atomic::AtomicBool>,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ed25519_pubkey: Option<[u8; 32]>,
@@ -510,24 +502,6 @@ pub async fn run_friend_session_over_transport(
             drop(writer);
             anyhow::bail!(
                 "{} was removed while dialling",
-                crate::security::short_hash(&peer_ember_hash)
-            );
-        }
-        // The user may have gone offline while this dial was in flight.
-        // `KadDisconnect` closes and clears every session and reports every
-        // friend offline, so inserting here afterwards would put a live one
-        // back into a map the UI has already emptied: chat would send
-        // successfully to a friend shown as offline, and `FindFriendAndConnect`
-        // would then skip the reconnect because a fresh session exists. Read
-        // under the same lock as the insert, so a disconnect cannot land
-        // between the check and the claim.
-        if user_offline.load(std::sync::atomic::Ordering::Relaxed) {
-            ember_session_handle.close();
-            drop(sessions);
-            drop(reader);
-            drop(writer);
-            anyhow::bail!(
-                "went offline while dialling {}",
                 crate::security::short_hash(&peer_ember_hash)
             );
         }
@@ -1345,7 +1319,6 @@ pub async fn connect_friend_with_fallback(
     udp_port: u16,
     obfuscate: bool,
     ember_sessions: EmberSessionMap,
-    user_offline: Arc<std::sync::atomic::AtomicBool>,
     ul_event_tx: tokio::sync::mpsc::Sender<UploadEvent>,
     friend_hashes: Arc<RwLock<std::collections::HashSet<[u8; 16]>>>,
     ed25519_pubkey: Option<[u8; 32]>,
@@ -1364,7 +1337,6 @@ pub async fn connect_friend_with_fallback(
         udp_port,
         obfuscate,
         ember_sessions.clone(),
-        user_offline.clone(),
         ul_event_tx.clone(),
         friend_hashes.clone(),
         ed25519_pubkey,
@@ -1380,12 +1352,6 @@ pub async fn connect_friend_with_fallback(
         return Err(tcp_err);
     }
 
-    // The insert site refuses an offline dial on its own, but the NAT
-    // fallback below is a punch registration plus a relay ticket — minutes of
-    // rendezvous round-trips whose only possible outcome is that same refusal.
-    if user_offline.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(tcp_err);
-    }
     // Failures no transport can fix. Removal mid-dial would otherwise also
     // publish our address in a punch registration to someone we dropped.
     if ed25519_pubkey.is_none()
@@ -1457,7 +1423,6 @@ pub async fn connect_friend_with_fallback(
                 udp_port,
                 obfuscate,
                 ember_sessions,
-                user_offline,
                 ul_event_tx,
                 friend_hashes,
                 ed25519_pubkey,
@@ -1488,7 +1453,6 @@ pub async fn connect_friend_with_fallback(
                 udp_port,
                 obfuscate,
                 ember_sessions,
-                user_offline,
                 ul_event_tx,
                 friend_hashes,
                 ed25519_pubkey,
@@ -2363,73 +2327,6 @@ async fn read_packet_inner<R: AsyncReadExt + Unpin + ?Sized>(
     Ok((protocol, opcode, payload))
 }
 
-/// Maximum unrelated packets we'll skip while looking for a
-/// specific Ember auth opcode. Bounded to prevent a chatty peer
-/// from pinning us in this loop forever; in practice we expect
-/// 0–1 skips (just OP_SECIDENTSTATE).
-const AUTH_PACKET_MAX_SKIPS: usize = 3;
-/// Per-attempt timeout while waiting for the next packet during
-/// auth. L7: tightened from 10 s × 8 skips (~80 s worst case) to
-/// 5 s × 3 skips (~15 s worst case). The previous 80 s window let
-/// a chatty peer pin our auth path for over a minute by spraying
-/// unrelated frames, which made friend-connect look hung. In
-/// practice the only legitimate skip is a single OP_SECIDENTSTATE
-/// emitted by the upload side as part of its initial burst, so
-/// 3 skips is plenty of headroom while still bounding the total
-/// stall a misbehaving peer can inflict.
-const AUTH_PACKET_TIMEOUT_SECS: u64 = 5;
-
-/// Read the next packet matching `expected_opcode` (with
-/// `expected_payload_len`), skipping a bounded number of unrelated
-/// packets first.
-///
-/// `on_deferred` is invoked for each intervening non-AUTH packet so
-/// callers that care about those packets (e.g. the multi-source
-/// download loop, which must process `OP_SECIDENTSTATE` to keep
-/// SecIdent credit accounting correct) can capture them for later
-/// replay. Pass a no-op callback (`|_, _, _| {}`) to restore the
-/// original drop-on-the-floor behaviour used by friend-connect,
-/// which doesn't process SecIdent itself.
-///
-/// Returns the matched packet's payload. Errors if we hit the
-/// per-packet read timeout, hit `AUTH_PACKET_MAX_SKIPS` non-matching
-/// packets, or read a stream error.
-async fn read_specific_auth_packet<R, D>(
-    reader: &mut R,
-    expected_opcode: u8,
-    expected_payload_len: usize,
-    addr: SocketAddr,
-    label: &'static str,
-    mut on_deferred: D,
-) -> anyhow::Result<Vec<u8>>
-where
-    R: AsyncReadExt + Unpin + ?Sized,
-    D: FnMut(u8, u8, Vec<u8>),
-{
-    for _ in 0..=AUTH_PACKET_MAX_SKIPS {
-        let (proto, opcode, payload) = read_packet_with_timeout(reader, AUTH_PACKET_TIMEOUT_SECS)
-            .await
-            .map_err(|e| anyhow::anyhow!("Ember auth: failed to read {label} from {addr}: {e}"))?;
-        if proto == OP_EMULEPROT && opcode == expected_opcode {
-            if payload.len() != expected_payload_len {
-                anyhow::bail!(
-                    "Ember auth: {label} from {addr} has wrong payload length: got {}, expected {}",
-                    payload.len(),
-                    expected_payload_len,
-                );
-            }
-            return Ok(payload);
-        }
-        debug!(
-            "Ember auth: deferring intervening proto=0x{proto:02X} op=0x{opcode:02X} from {addr} while awaiting {label}"
-        );
-        on_deferred(proto, opcode, payload);
-    }
-    anyhow::bail!(
-        "Ember auth: never received {label} from {addr} after {AUTH_PACKET_MAX_SKIPS} unrelated packets"
-    );
-}
-
 async fn read_packet_with_timeout<R: AsyncReadExt + Unpin + ?Sized>(
     reader: &mut R,
     timeout_secs: u64,
@@ -2442,112 +2339,11 @@ async fn read_packet_with_timeout<R: AsyncReadExt + Unpin + ?Sized>(
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "read timed out"))?
 }
 
-/// Perform the Ember Ed25519 challenge-response authentication exchange.
-///
-/// Both sides send a 32-byte random nonce as `OP_EMBER_AUTH_CHALLENGE`, then
-/// sign the received nonce with their Ed25519 key and send the signature as
-/// `OP_EMBER_AUTH_RESPONSE` (32-byte pubkey + 64-byte signature).
-///
-/// Ember authentication for callers that must preserve intervening
-/// non-AUTH packets while waiting for the challenge and response.
-///
-/// Any packet read off the stream while waiting for `OP_EMBER_AUTH_CHALLENGE` /
-/// `OP_EMBER_AUTH_RESPONSE` is appended to `deferred_packets` so the
-/// caller can re-dispatch it through its main loop. This is what
-/// unblocks the multi-source download path: the uploader sends
-/// `OP_SECIDENTSTATE` (and sometimes EPX) in the same packet burst as
-/// its OP_EMBER_HELLO, and dropping those frames would break
-/// SecIdent credit accounting and silently lose source-exchange
-/// data for every Ember-to-Ember download.
-///
-/// On success (or cryptographic failure), `deferred_packets` holds the
-/// full sequence of non-AUTH frames observed during the auth round
-/// trip, in arrival order. On a timeout / read error the partial
-/// buffer is preserved so the caller can still drain it.
-pub(crate) async fn perform_ember_auth_buffered<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    our_pubkey: &[u8; 32],
-    our_secret_key: &[u8; 32],
-    peer_pubkey: &[u8; 32],
-    peer_ember_hash: Option<&[u8; 16]>,
-    addr: SocketAddr,
-    deferred_packets: &mut std::collections::VecDeque<(u8, u8, Vec<u8>)>,
-) -> anyhow::Result<()>
-where
-    R: AsyncReadExt + Unpin + ?Sized,
-    W: AsyncWriteExt + Unpin + ?Sized,
-{
-    // Same pubkey ↔ ember_hash check as the non-buffered path.
-    if let Some(expected_hash) = peer_ember_hash {
-        let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
-            .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
-        let derived_hash = crypto::node_id_from_public_key(&peer_vk);
-        if derived_hash != *expected_hash {
-            anyhow::bail!(
-                "Ember auth: peer pubkey does not match ember_hash (derived={}, advertised={})",
-                hex::encode(derived_hash),
-                hex::encode(expected_hash)
-            );
-        }
-    }
-
-    let mut our_nonce = [0u8; 32];
-    OsRng.fill_bytes(&mut our_nonce);
-    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_CHALLENGE, &our_nonce).await?;
-
-    let peer_nonce_payload = read_specific_auth_packet(
-        reader,
-        OP_EMBER_AUTH_CHALLENGE,
-        32,
-        addr,
-        "AUTH_CHALLENGE",
-        |p, o, pl| deferred_packets.push_back((p, o, pl)),
-    )
-    .await?;
-
-    let signing_key = SigningKey::from_bytes(our_secret_key);
-    let signature = sign_auth_nonce(&signing_key, &peer_nonce_payload);
-    let mut response = Vec::with_capacity(96);
-    response.extend_from_slice(our_pubkey);
-    response.extend_from_slice(&signature.to_bytes());
-    write_packet(writer, OP_EMULEPROT, OP_EMBER_AUTH_RESPONSE, &response).await?;
-
-    let peer_response = read_specific_auth_packet(
-        reader,
-        OP_EMBER_AUTH_RESPONSE,
-        96,
-        addr,
-        "AUTH_RESPONSE",
-        |p, o, pl| deferred_packets.push_back((p, o, pl)),
-    )
-    .await?;
-
-    let resp_pubkey: [u8; 32] = peer_response[..32].try_into().unwrap();
-    if resp_pubkey != *peer_pubkey {
-        anyhow::bail!("Ember auth: response pubkey doesn't match advertised pubkey from {addr}");
-    }
-
-    let peer_vk = VerifyingKey::from_bytes(peer_pubkey)
-        .map_err(|e| anyhow::anyhow!("invalid peer Ed25519 pubkey: {e}"))?;
-    let sig_bytes: [u8; 64] = peer_response[32..96].try_into().unwrap();
-    let peer_sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    if !verify_auth_nonce(&peer_vk, &our_nonce, &peer_sig) {
-        anyhow::bail!("Ember auth: signature verification failed for {addr}");
-    }
-
-    info!(
-        "Ember auth (buffered): verified peer {} at {} ({} deferred packet(s) captured)",
-        hex::encode(&peer_pubkey[..8]),
-        addr,
-        deferred_packets.len(),
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     /// With an empty `rendezvous_url`, `connect_friend_with_fallback` must
     /// behave exactly like the old TCP-only `open_and_run_friend_session`
@@ -2585,7 +2381,6 @@ mod tests {
                 4672,
                 false,
                 ember_sessions,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 ul_tx,
                 friend_hashes,
                 None,
@@ -2983,11 +2778,11 @@ mod tests {
 
     /// Regression guard for the "online_friends not updated on successful
     /// outbound rendezvous connect" gap: drives a full mock peer through
-    /// the real Hello / EmuleInfo / OP_EMBER_HELLO / Ed25519 PoP handshake
+    /// the real secure-v2 / Hello / EmuleInfo / OP_EMBER_HELLO handshake
     /// over an in-memory duplex pipe and asserts that a successful
     /// `run_friend_session_over_transport` call — the single choke point
-    /// every outbound dial (rendezvous lookup, chat/browse auto-connect,
-    /// proactive `FriendSeen` dial) funnels through — emits
+    /// every outbound dial (rendezvous lookup, chat/browse auto-connect)
+    /// funnels through — emits
     /// `UploadEventKind::EmberFriendConnected` so the network loop's
     /// `state.online_friends` bookkeeping (and therefore `GetOnlineFriends`)
     /// reflects the session immediately, not only after the peer happens to
@@ -3031,7 +2826,6 @@ mod tests {
             4672,
             false,
             ember_sessions,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ul_tx,
             friend_hashes,
             Some(our_pk_bytes),
@@ -3178,7 +2972,6 @@ mod tests {
             4672,
             false,
             ember_sessions,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ul_tx,
             friend_hashes,
             Some(our_pk_bytes),
@@ -3260,126 +3053,6 @@ mod tests {
         );
     }
 
-    /// A dial that was already in flight when the user hit Disconnect must not
-    /// hand back a live session afterwards. `KadDisconnect` closes and clears
-    /// every entry and reports every friend offline, so a late insert would
-    /// leave chat working against a friend the UI shows as offline — and would
-    /// block the reconnect, because `FindFriendAndConnect` skips a peer that
-    /// still has a fresh session.
-    #[tokio::test]
-    async fn a_dial_that_completes_after_going_offline_claims_no_session() {
-        let our_sk = SigningKey::generate(&mut OsRng);
-        let our_pk_bytes = our_sk.verifying_key().to_bytes();
-        let our_sk_bytes = our_sk.to_bytes();
-        let our_ember_hash =
-            crate::network::ember::crypto::node_id_from_public_key(&our_sk.verifying_key());
-
-        let peer_sk = SigningKey::generate(&mut OsRng);
-        let peer_pk_bytes = peer_sk.verifying_key().to_bytes();
-        let peer_ember_hash =
-            crate::network::ember::crypto::node_id_from_public_key(&peer_sk.verifying_key());
-
-        let (client, server) = tokio::io::duplex(8192);
-        let (client_r, client_w) = tokio::io::split(client);
-        let (mut server_r, server_w) = tokio::io::split(server);
-
-        let ember_sessions: EmberSessionMap =
-            Arc::new(RwLock::new(std::collections::HashMap::new()));
-        let (ul_tx, _ul_rx) = tokio::sync::mpsc::channel(16);
-        let friend_hashes = Arc::new(RwLock::new(std::collections::HashSet::from([
-            peer_ember_hash,
-        ])));
-        let addr: SocketAddr = "127.0.0.1:4662".parse().unwrap();
-
-        // Already offline by the time the handshake completes — the same state
-        // the dial would observe had Disconnect landed mid-flight.
-        let user_offline = Arc::new(std::sync::atomic::AtomicBool::new(true));
-
-        let session_task = tokio::spawn(run_friend_session_over_transport(
-            Box::new(client_r),
-            Box::new(client_w),
-            addr,
-            false,
-            peer_ember_hash,
-            [0x11; 16],
-            our_ember_hash,
-            "tester".to_string(),
-            0,
-            4662,
-            4672,
-            false,
-            ember_sessions.clone(),
-            user_offline,
-            ul_tx,
-            friend_hashes,
-            Some(our_pk_bytes),
-            Some(our_sk_bytes),
-        ));
-
-        // The peer plays the handshake through to the point where the dial
-        // would claim its slot, so the refusal is proven to happen at the
-        // claim and not earlier by accident.
-        let mock_peer = async {
-            let first = server_r.read_u8().await.unwrap();
-            let secure = super::secure_stream::accept_after_first(
-                Box::new(server_r),
-                Box::new(server_w),
-                first,
-                peer_ember_hash,
-                peer_pk_bytes,
-                peer_sk.to_bytes(),
-            )
-            .await
-            .unwrap();
-            let mut server_r = secure.reader;
-            let mut server_w = secure.writer;
-            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
-            assert_eq!((proto, opcode), (OP_EDONKEYHEADER, OP_HELLO));
-            let hello_answer = build_hello_answer_with_buddy_opts(
-                &[0x99; 16],
-                0,
-                4662,
-                "peer",
-                None,
-                &HelloOptions::default_for_udp_port(4672),
-            );
-            write_packet(
-                &mut server_w,
-                OP_EDONKEYHEADER,
-                OP_HELLOANSWER,
-                &hello_answer,
-            )
-            .await
-            .unwrap();
-
-            let (proto, opcode, _) = read_packet_inner(&mut server_r).await.unwrap();
-            assert_eq!((proto, opcode), (OP_EMULEPROT, OP_EMULEINFO));
-            let info_answer = build_emule_info(4672, false, None, None);
-            write_packet(
-                &mut server_w,
-                OP_EMULEPROT,
-                OP_EMULEINFOANSWER,
-                &info_answer,
-            )
-            .await
-            .unwrap();
-        };
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), mock_peer).await;
-
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), session_task)
-            .await
-            .expect("session task must not hang")
-            .expect("session task must not panic");
-        assert!(
-            result.is_err(),
-            "a dial completing while offline must not report a live session"
-        );
-        assert!(
-            ember_sessions.read().await.is_empty(),
-            "an offline dial must leave the session map as Disconnect left it"
-        );
-    }
-
     #[test]
     fn reusable_secure_session_requires_fresh_secure_matching_pubkey() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
@@ -3449,7 +3122,6 @@ mod tests {
             4672,
             false,
             ember_sessions,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
             ul_tx,
             friend_hashes,
             Some(our_pk_bytes),

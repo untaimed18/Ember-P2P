@@ -533,9 +533,6 @@ async fn handle_command_inner(
                 method,
                 has_keyword_query,
                 !keywords.is_empty() && !server_directive_query,
-                state
-                    .user_offline
-                    .load(std::sync::atomic::Ordering::Relaxed),
             );
             // A filter-only expression matches every file that passes it; the
             // connected server caps its answer, but the global sweep would ask
@@ -1047,8 +1044,7 @@ async fn handle_command_inner(
                 // join here stalled UDP receive, all 41 timers and every IPC
                 // snapshot for up to 5 s *per row*, and batch cancel enqueues
                 // one command per selected row. Bounding the wait did not fix
-                // that; a bounded freeze is still a freeze. This mirrors what
-                // `KadDisconnect` already does with its own aborts.
+                // that; a bounded freeze is still a freeze.
                 //
                 // The ack moves into the spawned task rather than staying at
                 // the tail of this handler because `cancel_transfers_batch`
@@ -1174,7 +1170,7 @@ async fn handle_command_inner(
             // eMule PauseFile: tear down active network state but keep source
             // knowledge so the download can be resumed quickly.
             // Cancel the shared control BEFORE aborting the worker so detached
-            // per-source tasks observe teardown cooperatively (N1 / KadDisconnect).
+            // per-source tasks observe teardown cooperatively (N1).
             {
                 let mgr = transfer_manager.read().await;
                 if let Some(control) = mgr.get_control(&transfer_id) {
@@ -3631,8 +3627,9 @@ async fn handle_command_inner(
             };
             // Sealed only, so the members it is forwarded through cannot read
             // the file's name and size. A recipient on v1.6.x cannot read it
-            // either, so unless this one is known to, the plain offer is kept
-            // and the user is asked about it if the recipient stays silent.
+            // either; while `HOLD_PLAIN_XFER_OFFERS` held, the plain offer was
+            // kept for one not known to read sealed offers, and the user asked
+            // about it if that recipient stayed silent.
             // The file as it stands now, which the block path checks before it
             // serves a byte. Off this task: an open can stall on a scanner.
             let stamp_path = path.clone();
@@ -3653,7 +3650,9 @@ async fn handle_command_inner(
             let mut send =
                 ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone())
                     .with_source_stamp(stamp);
-            if ember::xfer::holds_plain_offer(size, member_reads_sealed_offers(state, db, &peer)) {
+            if ember::xfer::HOLD_PLAIN_XFER_OFFERS
+                && ember::xfer::holds_plain_offer(size, member_reads_sealed_offers(state, db, &peer))
+            {
                 send.hold_plain_offer(
                     ember::channel::encode_xfer_offer(&key, &offer),
                     std::time::Instant::now()
@@ -4621,14 +4620,8 @@ async fn handle_command_inner(
 
         NetworkCommand::KadConnect => {
             info!("KAD connect requested");
-            // Nothing to un-gate for uploads: the listener is not taken down by
-            // going offline, only by shutdown, which does not come back.
-            //
-            // Lift the outbound stop: downloads, friend dials and server
-            // search are suspended for exactly as long as the user is offline.
-            state
-                .user_offline
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // Nothing to un-gate for uploads: the listener is taken down only
+            // by shutdown, which does not come back.
             state.stats.status = NetworkStatus::Connecting;
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
@@ -4748,13 +4741,6 @@ async fn handle_command_inner(
                                 info!("Sent bootstrap request to {addr}");
                                 if state.stats.status == NetworkStatus::Disconnected {
                                     state.stats.status = NetworkStatus::Connecting;
-                                    // Same rule as `KadConnect`: this is the
-                                    // one path that actually moves us off
-                                    // Disconnected, so the outbound stop must
-                                    // be lifted at this moment.
-                                    state
-                                        .user_offline
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 Ok(format!(
                                     "Bootstrap request sent to {addr} — contacts will appear as they respond"
@@ -4837,11 +4823,6 @@ async fn handle_command_inner(
             info!("Sent bootstrap requests to {actually_sent}/{send_count} connected contacts");
             if state.stats.status == NetworkStatus::Disconnected && actually_sent > 0 {
                 state.stats.status = NetworkStatus::Connecting;
-                // See `KadBootstrapIp`: keep the outbound stop in sync with
-                // every path off Disconnected.
-                state
-                    .user_offline
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             let _ = tx.send(if actually_sent > 0 {
                 Ok(actually_sent)
@@ -6327,7 +6308,7 @@ async fn handle_command_inner(
                 };
                 if let Some(sender) = sender {
                     // Every friend session's `EmberSessionHandle` carries
-                    // the peer's PoP-verified Ed25519 pubkey (see its doc
+                    // the peer's verified Ed25519 pubkey (see its doc
                     // comment), so encryption is always possible for a
                     // live session — there is no plaintext-fallback path.
                     let peer_pubkey = sender.peer_ember_pubkey();
@@ -6337,9 +6318,9 @@ async fn handle_command_inner(
                         message.as_bytes(),
                     ) {
                         None => {
-                            // Can only happen if the peer's already-PoP-verified
+                            // Can only happen if the peer's already-verified
                             // pubkey somehow isn't a valid curve point, which
-                            // `perform_ember_auth` should have ruled out —
+                            // the secure-v2 handshake should have ruled out —
                             // treat as an internal error rather than ever
                             // silently sending plaintext.
                             let _ = tx.send(Err("ChatEncryptFailed".into()));
@@ -6540,7 +6521,6 @@ async fn handle_command_inner(
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
-                                let offline_clone = state.user_offline.clone();
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
                                 let db3 = db.clone();
@@ -6567,7 +6547,6 @@ async fn handle_command_inner(
                                         udp,
                                         obfs,
                                         sessions_clone.clone(),
-                                        offline_clone,
                                         ul_tx,
                                         fh.clone(),
                                         Some(ed25519_pubkey),
@@ -6665,7 +6644,6 @@ async fn handle_command_inner(
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
-                            let offline = state.user_offline.clone();
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
                             let ultx2 = ul_event_tx.clone();
@@ -6701,7 +6679,6 @@ async fn handle_command_inner(
                                             udp,
                                             obfs,
                                             sess,
-                                            offline,
                                             ultx,
                                             fh.clone(),
                                             Some(ed25519_pubkey),
@@ -6908,7 +6885,6 @@ async fn handle_command_inner(
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
-                                let offline_clone = state.user_offline.clone();
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
                                 let browse_event_tx = ul_event_tx.clone();
@@ -6933,7 +6909,6 @@ async fn handle_command_inner(
                                         udp,
                                         obfs,
                                         sessions_clone.clone(),
-                                        offline_clone,
                                         ul_tx,
                                         fh,
                                         Some(ed25519_pubkey),
@@ -7022,7 +6997,6 @@ async fn handle_command_inner(
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
-                            let offline = state.user_offline.clone();
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
                             let app2 = app_handle.clone();
@@ -7060,7 +7034,6 @@ async fn handle_command_inner(
                                             udp,
                                             obfs,
                                             sess,
-                                            offline,
                                             ultx,
                                             fh,
                                             Some(ed25519_pubkey),

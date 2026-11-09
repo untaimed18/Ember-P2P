@@ -216,16 +216,7 @@ pub(crate) fn parse_browse_scope(body: &[u8]) -> Option<Vec<[u8; 16]>> {
     {
         return None;
     }
-    Some(
-        hashes
-            .chunks_exact(16)
-            .map(|chunk| {
-                let mut hash = [0u8; 16];
-                hash.copy_from_slice(chunk);
-                hash
-            })
-            .collect(),
-    )
+    Some(hashes.as_chunks::<16>().0.to_vec())
 }
 
 /// Per friend, the hashes that friend last told us are friends-only on their

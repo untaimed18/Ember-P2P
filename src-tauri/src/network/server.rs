@@ -274,14 +274,14 @@ pub(super) async fn handle_server_disconnect(
     // decided the fate of eD2K uploads, so a server-only session lost every
     // upload on the first transient drop — the 120 s activity watchdog, a
     // server-side disconnect, a failed reconnect — and nothing cleared it again,
-    // because only `initiate_server_connect` and `KadConnect` do. Keying off
-    // `user_offline` then quietly undid the KAD-disconnect exemption instead:
-    // `KadDisconnect` sets that flag and then calls this function to drop the
-    // server itself, so the gate came straight back up and uploads stopped
-    // anyway.
+    // because only `initiate_server_connect` and `KadConnect` did. Keying off
+    // the user's offline flag then quietly undid the KAD-disconnect exemption
+    // instead: the KAD Disconnect command raised that flag and then called
+    // this function to drop the server itself, so the gate came straight back
+    // up and uploads stopped anyway.
     //
-    // eMule raises no such gate on any disconnect — see the note in
-    // `NetworkCommand::KadDisconnect`. The upload listener now comes down for
+    // eMule raises no such gate on any disconnect: `CemuleDlg::CloseConnection`
+    // never touches its listen socket. The upload listener comes down for
     // shutdown alone.
 }
 
@@ -589,14 +589,9 @@ pub(super) async fn initiate_server_connect(
     state.server_last_attempt_failed = false;
     state.server_last_connect_attempt = Some(std::time::Instant::now());
     state.preferred_ed2k_server = Some((ip.clone(), port));
-    // Joining a server is a deliberate "come back online", so it lifts the
-    // outbound stop the same way `KadConnect` does. The upload listener needs
-    // nothing here — it was never taken down. It used to be, which is what made
-    // joining a server after disconnecting KAD reject the server's own HighID
-    // TCP port-test and stick the node on LowID.
-    state
-        .user_offline
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // The upload listener needs nothing here — it was never taken down. It
+    // used to be, which is what made joining a server after disconnecting KAD
+    // reject the server's own HighID TCP port-test and stick the node on LowID.
     // Explicit Connect should be allowed to retry a server that recently
     // failed auto-reconnect — keep fail counts for sort preference.
     state.server_list.clear_connect_cooldowns();

@@ -31,25 +31,16 @@ export interface FriendRequestInfo {
   sender_nickname: string;
   received_at: number;
   /**
-   * True iff the peer's identity passed cryptographic
-   * verification on the session this request arrived on. The
-   * exact strength depends on the originating session type:
+   * True iff the request arrived on a secure-v2 session, whose
+   * Noise IK handshake proved the peer holds the Ember key
+   * behind `sender_hash`.
    *
-   *  - Friend-connect dial-back (the path that fires when the
-   *    user accepts a request and the app dials the peer for
-   *    a dedicated friend session): full Ed25519 proof of
-   *    possession via `friend_connect::perform_ember_auth`.
-   *  - Regular upload / multi-source download session: offline
-   *    BLAKE3 identity-binding check — the peer's advertised
-   *    pubkey matches their advertised hash, but we did not
-   *    challenge them to sign a fresh nonce on this session.
-   *
-   * False means the peer didn't advertise an Ed25519 pubkey
-   * (older Ember release, or the single-source transfer.rs
-   * download path), the binding check failed, or the
-   * challenge-response failed. Either way the Friends page
-   * shows an "Unverified" badge and users should only accept
-   * if they recognise the requester.
+   * False for a request that came in on a plain eD2K upload or
+   * download session: the advertised pubkey may bind to the
+   * hash, but that pair is public and can be replayed, so it
+   * proves nothing. The Friends page then shows an "Unverified"
+   * badge and users should only accept if they recognise the
+   * requester.
    */
   verified: boolean;
 }

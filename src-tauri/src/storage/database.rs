@@ -2326,9 +2326,9 @@ impl Database {
             // Sits alongside the existing eMule `credits` table rather
             // than replacing it — wire-compatible eMule peers continue
             // using the `credits` table via user_hash, and Ember peers
-            // that completed PoP get a second higher-fidelity record
-            // here that feeds decayed-ratio + reliability + speed
-            // scoring.
+            // that proved their key on a secure-v2 session get a second
+            // higher-fidelity record here (see `EmberCreditRecord`; the
+            // upload queue does not score from it).
             //
             // The pubkey column is `BLOB` (32 bytes) and acts as the
             // identity anchor — unlike user_hash it's cryptographically
@@ -10871,6 +10871,18 @@ impl Database {
                 )?;
             }
         }
+        // The device the room is recovered from published its v1 membership
+        // records, and a cut-over already taken here marked only the rooms
+        // this database held then.
+        if matches!(outcome, RecoveredChannel::Adopted | RecoveredChannel::Inserted) {
+            Self::ensure_channel_cut_overs_locked(&tx)?;
+            tx.execute(
+                "UPDATE channels SET rotate_pending = 1
+                 WHERE channel_id = ?1 AND visibility = 'private'
+                   AND EXISTS(SELECT 1 FROM channel_cut_overs WHERE name = ?2)",
+                params![channel_id, crate::network::ember::channel::V1_CUT_OVER],
+            )?;
+        }
         tx.commit()?;
         drop(conn);
         if matches!(outcome, RecoveredChannel::Adopted | RecoveredChannel::Inserted) {
@@ -14735,6 +14747,51 @@ impl Database {
             params![channel_id],
         )?;
         Ok(())
+    }
+
+    /// Created on first use rather than by a numbered migration, like
+    /// `sealed_offer_readers`: a numbered one would stop 1.7.x from opening the
+    /// database after a downgrade.
+    fn ensure_channel_cut_overs_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_cut_overs (
+                name TEXT PRIMARY KEY,
+                at INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// The first time `cut_over` is taken, owe a key rotation to every private
+    /// room this identity owns, and never again: how many rooms that marked,
+    /// 0 once taken. The marks and the record of having made them are one
+    /// transaction, so a crash between them cannot rotate a room twice or not
+    /// at all. A room created later needs none: it never had a record the
+    /// cut-over retires. One taken over is owed its rotation by the takeover,
+    /// and one recovered onto this device by `adopt_recovered_owned_channel`.
+    pub fn take_channel_cut_over_rotations(&self, cut_over: &str, now: i64) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock();
+        Self::ensure_channel_cut_overs_locked(&conn)?;
+        let tx = conn.transaction()?;
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channel_cut_overs WHERE name = ?1)",
+            params![cut_over],
+            |row| row.get(0),
+        )?;
+        if taken {
+            return Ok(0);
+        }
+        let marked = tx.execute(
+            "UPDATE channels SET rotate_pending = 1
+             WHERE is_owner = 1 AND visibility = 'private' AND deleted = 0",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO channel_cut_overs (name, at) VALUES (?1, ?2)",
+            params![cut_over, now],
+        )?;
+        tx.commit()?;
+        Ok(marked)
     }
 
     /// Clear it, once the snapshot announcing the new epoch is on its way.
@@ -22945,7 +23002,7 @@ mod tests {
         id
     }
 
-    /// A member who sends both forms of each line, as 1.7.5 does.
+    /// A member who sends both forms of each line, as 1.7.5 to 1.7.8 do.
     struct V2Author {
         key: ed25519_dalek::SigningKey,
         hex: String,
@@ -22970,7 +23027,7 @@ mod tests {
             let line_id = ch::new_chat_msg_id(&channel, &self.key.verifying_key().to_bytes(), sent);
             let legacy = crate::security::sanitize_outgoing_message_text(typed).unwrap();
             let v2 = ch::chat_v2_outgoing_text(typed, &legacy, None);
-            let chat = ch::outgoing_chat_line(&self.key, &channel, &line_id, sent, &legacy, &v2, None).unwrap();
+            let chat = ch::outgoing_chat_line_1_7(&self.key, &channel, &line_id, sent, &legacy, &v2, None).unwrap();
             (hex::encode(line_id), legacy, chat)
         }
 
@@ -22988,7 +23045,7 @@ mod tests {
             let legacy = crate::security::sanitize_outgoing_message_text(typed).unwrap();
             let v2 = ch::chat_v2_outgoing_text(typed, &legacy, None);
             let chat =
-                ch::outgoing_chat_edit(&self.key, &channel, &target, sent, edited_at, &legacy, &v2, None).unwrap();
+                ch::outgoing_chat_edit_1_7(&self.key, &channel, &target, sent, edited_at, &legacy, &v2, None).unwrap();
             (legacy, chat)
         }
     }
@@ -25792,6 +25849,92 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The cut-over owes each private room we own one rotation, the first
+    /// time it is taken, and no room we only belong to, that is public or that
+    /// we deleted. A private room recovered onto the device afterwards is owed
+    /// its own.
+    #[test]
+    fn the_cut_over_owes_each_owned_private_room_one_rotation() {
+        use crate::network::ember::channel::{ChannelIdentity, V1_CUT_OVER};
+
+        let (db, path) = handoff_test_db("cut-over");
+        let owned_private = ChannelIdentity::generate();
+        let owned_public = ChannelIdentity::generate();
+        let joined_private = ChannelIdentity::generate();
+        let deleted_private = ChannelIdentity::generate();
+        for (room, visibility, owner) in [
+            (&owned_private, "private", true),
+            (&owned_public, "public", true),
+            (&joined_private, "private", false),
+            (&deleted_private, "private", true),
+        ] {
+            let seed = room.seed();
+            db.insert_channel(
+                &hex::encode(room.channel_id),
+                &hex::encode(room.pubkey),
+                "Room",
+                visibility,
+                owner,
+                owner.then_some(&seed),
+                Some(&[0x31; 32]),
+            )
+            .unwrap();
+        }
+        db.tombstone_channel(&hex::encode(deleted_private.channel_id)).unwrap();
+
+        // A room recovered before the cut-over is taken is marked by the take.
+        let early = ChannelIdentity::generate();
+        let early_id = hex::encode(early.channel_id);
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&early_id, &hex::encode(early.pubkey), "Early", "private", &early.seed(), None, &[0x41; 16])
+                .unwrap(),
+            RecoveredChannel::Inserted
+        );
+        assert!(!db.channel_rotate_is_pending(&early_id).unwrap(), "not owed before the take");
+
+        assert_eq!(db.take_channel_cut_over_rotations(V1_CUT_OVER, 100).unwrap(), 2);
+        assert!(db.channel_rotate_is_pending(&hex::encode(owned_private.channel_id)).unwrap());
+        assert!(db.channel_rotate_is_pending(&early_id).unwrap());
+        assert!(!db.channel_rotate_is_pending(&hex::encode(owned_public.channel_id)).unwrap());
+        assert!(!db.channel_rotate_is_pending(&hex::encode(joined_private.channel_id)).unwrap());
+        assert!(!db.channel_rotate_is_pending(&hex::encode(deleted_private.channel_id)).unwrap());
+
+        // Rotated, then started again: it is owed nothing more.
+        db.clear_channel_rotate_pending(&hex::encode(owned_private.channel_id)).unwrap();
+        db.clear_channel_rotate_pending(&early_id).unwrap();
+        assert_eq!(db.take_channel_cut_over_rotations(V1_CUT_OVER, 200).unwrap(), 0);
+        assert!(!db.channel_rotate_is_pending(&hex::encode(owned_private.channel_id)).unwrap());
+
+        // Recovered after the take: private rooms are owed their rotation,
+        // public ones nothing, and one already held with its seed nothing more.
+        let late_private = ChannelIdentity::generate();
+        let late_public = ChannelIdentity::generate();
+        for (room, visibility) in [(&late_private, "private"), (&late_public, "public")] {
+            assert_eq!(
+                db.adopt_recovered_owned_channel(
+                    &hex::encode(room.channel_id),
+                    &hex::encode(room.pubkey),
+                    "Late",
+                    visibility,
+                    &room.seed(),
+                    None,
+                    &[0x42; 16],
+                )
+                .unwrap(),
+                RecoveredChannel::Inserted
+            );
+        }
+        assert!(db.channel_rotate_is_pending(&hex::encode(late_private.channel_id)).unwrap());
+        assert!(!db.channel_rotate_is_pending(&hex::encode(late_public.channel_id)).unwrap());
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&early_id, &hex::encode(early.pubkey), "Early", "private", &early.seed(), None, &[0x41; 16])
+                .unwrap(),
+            RecoveredChannel::AlreadyOwned
+        );
+        assert!(!db.channel_rotate_is_pending(&early_id).unwrap());
+        drop_handoff_test_db(db, path);
     }
 
     /// Each member builds the successor's key from whichever epoch of the old

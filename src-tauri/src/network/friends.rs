@@ -680,8 +680,8 @@ static NEW_FRIEND_REQUEST_RATE: std::sync::LazyLock<parking_lot::Mutex<NewFriend
 /// policy can't drift between the two ingress paths (it previously lived as two
 /// hand-maintained copies, which is how earlier divergences crept in).
 ///
-/// `verified` is Ed25519 proof-of-possession on the emitting session
-/// (`ember_auth_verified` / `secure_v2_authenticated`), including the
+/// `verified` is Ed25519 proof-of-possession on the emitting session: true
+/// only on a secure-v2 session (`secure_v2_authenticated`), so never from the
 /// multi-source download path. Binding the advertised pubkey to ember_hash is
 /// logged separately and is not enough: that check is replayable from a public
 /// (pubkey, ember_hash) pair.
@@ -1230,7 +1230,6 @@ pub(super) fn spawn_rendezvous_friend_lookup(
     let app_fc = app_handle.clone();
     let fh_fc = friend_hashes.clone();
     let sess_fc = state.ember_sessions.clone();
-    let offline_fc = state.user_offline.clone();
     let ultx_fc = ul_event_tx.clone();
     // Ember NAT-fallback context for `connect_friend_with_fallback`: a
     // plain `TcpStream::connect` alone can't reach a friend whose NAT
@@ -1352,7 +1351,6 @@ pub(super) fn spawn_rendezvous_friend_lookup(
                         udp,
                         obfuscate,
                         sess_fc,
-                        offline_fc,
                         ultx_fc.clone(),
                         fh_fc,
                         Some(ed25519_pubkey),

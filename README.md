@@ -203,7 +203,7 @@ Between Ember peers, the Ember Hash and its public key are exchanged over the pr
 
 ### Sessions
 
-Once a friend is located, Ember opens a direct TCP connection and negotiates a **`Noise_IK_25519_ChaChaPoly_BLAKE2s`** secure stream ([`ed2k/secure_stream.rs`](src-tauri/src/network/ed2k/secure_stream.rs)) with Ed25519 proof of possession — a signature round trip over a fresh nonce (`friend_connect::perform_ember_auth`), not just the offline hash↔pubkey binding check. The X25519 static key that IK authenticates is checked against the standard Ed25519→X25519 conversion of the advertised identity key, so the session and the Friend ID cannot disagree. Chat, browse, offers, friends-only shares and verified requests unlock only on that authenticated session; when ordinary HighID or callback routes are unavailable, friend file transfers can also run over it.
+Once a friend is located, Ember opens a direct TCP connection and negotiates a **`Noise_IK_25519_ChaChaPoly_BLAKE2s`** secure stream ([`ed2k/secure_stream.rs`](src-tauri/src/network/ed2k/secure_stream.rs)). The handshake is the proof of possession, not just the offline hash↔pubkey binding check: the X25519 static key that IK authenticates is checked against the standard Ed25519→X25519 conversion of the advertised identity key, so only the holder of that key can complete it, and the session and the Friend ID cannot disagree. Chat, browse, offers, friends-only shares and verified requests unlock only on that authenticated session; when ordinary HighID or callback routes are unavailable, friend file transfers can also run over it.
 
 ### Chat encryption
 

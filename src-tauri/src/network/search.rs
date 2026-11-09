@@ -224,21 +224,15 @@ pub(super) fn search_legs(
     method: SearchMethod,
     has_keyword_query: bool,
     has_keywords: bool,
-    user_offline: bool,
 ) -> SearchLegs {
     SearchLegs {
         server: matches!(method, SearchMethod::Global | SearchMethod::Server),
-        // Global's UDP leg does not need a server *session*, so it kept
-        // spraying `OP_GLOBSEARCH` at the whole server list after the user had
-        // gone offline. Ember still answers a Global query, which is the
-        // documented offline fallback; talking to eD2K servers is not.
-        //
         // `has_keyword_query` is what stops a co-share-only related search
         // here: the search expression is empty in that case, and this leg
         // would queue a keywordless `OP_GLOBSEARCH` to every server in the
         // list. Only the one connected server can answer a co-share request,
         // and it is asked over TCP.
-        udp: has_keyword_query && matches!(method, SearchMethod::Global) && !user_offline,
+        udp: has_keyword_query && matches!(method, SearchMethod::Global),
         kad: has_keywords && matches!(method, SearchMethod::Global | SearchMethod::Kad),
         // Gated on `has_keywords` for the same reason Kad is: the Ember DHT
         // walks to a keyword hash, so with no lookupable term there is no walk
@@ -260,7 +254,7 @@ mod search_legs_tests {
     #[test]
     fn server_asks_the_server_and_nothing_else() {
         assert_eq!(
-            search_legs(SearchMethod::Server, true, true, false),
+            search_legs(SearchMethod::Server, true, true),
             SearchLegs {
                 server: true,
                 udp: false,
@@ -273,7 +267,7 @@ mod search_legs_tests {
     #[test]
     fn global_asks_every_leg_it_can() {
         assert_eq!(
-            search_legs(SearchMethod::Global, true, true, false),
+            search_legs(SearchMethod::Global, true, true),
             SearchLegs {
                 server: true,
                 udp: true,
@@ -286,7 +280,7 @@ mod search_legs_tests {
     #[test]
     fn kad_and_ember_methods_stay_on_their_own_network() {
         assert_eq!(
-            search_legs(SearchMethod::Kad, true, true, false),
+            search_legs(SearchMethod::Kad, true, true),
             SearchLegs {
                 server: false,
                 udp: false,
@@ -295,7 +289,7 @@ mod search_legs_tests {
             },
         );
         assert_eq!(
-            search_legs(SearchMethod::Ember, true, true, false),
+            search_legs(SearchMethod::Ember, true, true),
             SearchLegs {
                 server: false,
                 udp: false,
@@ -305,19 +299,12 @@ mod search_legs_tests {
         );
     }
 
-    #[test]
-    fn going_offline_stops_the_ed2k_udp_spray_and_leaves_ember() {
-        let legs = search_legs(SearchMethod::Global, true, true, true);
-        assert!(!legs.udp, "no OP_GLOBSEARCH at the server list while offline");
-        assert!(legs.ember, "Ember is the documented offline fallback");
-    }
-
     /// A co-share-only related search: the seed's name yielded no searchable
     /// word, so there is nothing to put on a keyword leg and the hashes go to
     /// the server on their own.
     #[test]
     fn a_search_with_no_keywords_asks_no_keyword_leg() {
-        let legs = search_legs(SearchMethod::Global, false, false, false);
+        let legs = search_legs(SearchMethod::Global, false, false);
         assert!(!legs.udp, "a keywordless OP_GLOBSEARCH is not a search");
         assert!(!legs.kad);
         assert!(!legs.ember, "the Ember DHT walk needs a keyword hash");
@@ -330,7 +317,7 @@ mod search_legs_tests {
     /// was never published.
     #[test]
     fn a_server_directive_query_asks_no_dht_leg() {
-        let legs = search_legs(SearchMethod::Global, true, false, false);
+        let legs = search_legs(SearchMethod::Global, true, false);
         assert!(legs.server, "the directive goes to the connected server");
         assert!(legs.udp, "the rest of the server list can resolve it too");
         assert!(
@@ -1048,9 +1035,7 @@ pub(super) fn unasked_udp_search_packets(
     state: &NetworkState,
     request: &ActiveSearchRequest,
 ) -> Vec<(Vec<u8>, std::net::SocketAddr)> {
-    if request.udp_search_expr.is_empty()
-        || state.user_offline.load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if request.udp_search_expr.is_empty() {
         return Vec::new();
     }
     let uses_64bit_search = kad::messages::search_expression_uses_64bit(&request.udp_search_expr);

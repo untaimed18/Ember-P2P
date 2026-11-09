@@ -360,11 +360,9 @@ pub struct CreditRecord {
 /// Identity is anchored on the peer's 32-byte Ed25519 public key rather
 /// than the wire `user_hash` so a peer can't farm credit by cycling
 /// user_hash bytes — the credit row is bound to a keypair they must
-/// prove possession of via the PoP state machine in `ember_auth.rs`.
-/// `ident_verified == true` implies the peer completed full Ed25519
-/// proof-of-possession on at least one session; binding-only peers
-/// (older Ember releases that don't ship the AUTH opcodes) still get a
-/// record so their activity is tracked.
+/// prove possession of. Only a secure-v2 session, whose handshake proves
+/// the key, writes to it, so `ident_verified == true` means the peer did
+/// that on at least one session.
 ///
 /// The upload queue does not score from this record: every peer is
 /// ranked by eMule's formula over the `user_hash` ledger, which every
@@ -522,8 +520,8 @@ impl CreditRecord {
 /// What keeps the weak parameters above tolerable is that **no Ember-side
 /// grant reads a [`CreditRecord`]**. Upload queue position does, for every
 /// peer alike, because it is eMule's rule and an eD2K grant; friend-level
-/// access is gated on `friend_connect::perform_ember_auth`, a signature
-/// round-trip over a fresh nonce. Forging a 384-bit RSA identity buys eD2K
+/// access is gated on a secure-v2 session (`super::secure_stream`), whose
+/// Noise IK handshake proves the Ember key. Forging a 384-bit RSA identity buys eD2K
 /// queue priority and nothing on the overlay.
 ///
 /// The one place the two identity spaces meet is the `user_hash ↔ ember_hash`
@@ -546,8 +544,8 @@ pub struct CreditManager {
     /// because the key material is different (32-byte pubkey vs.
     /// 16-byte user_hash) and the scoring formula is different
     /// (decay + reliability + speed factors, not just bytes).
-    /// Only populated for peers that have either passed binding
-    /// verification or full PoP on at least one session.
+    /// Written only for peers that proved their key on a secure-v2
+    /// session; rows loaded from older builds may predate that rule.
     #[zeroize(skip)]
     ember_credits: HashMap<[u8; 32], EmberCreditRecord>,
     #[zeroize(skip)]
@@ -2122,12 +2120,12 @@ impl CreditManager {
         self.ember_credits.values().collect()
     }
 
-    /// Credit peer `pub_key` for `bytes` they uploaded to us. `verified`
-    /// must be `true` (full PoP completed on this session) for bytes to
-    /// land on the record — without PoP a spoofer who claimed the
-    /// pubkey could farm credit for a genuine peer. Binding-only
-    /// peers still get their bytes tracked via the legacy `CreditRecord`
-    /// upstream; this method only governs the Ember-specific ledger.
+    /// Record `bytes` we uploaded to peer `pub_key`. `verified` must be
+    /// `true` (a secure-v2 session, whose handshake proved the key) for
+    /// bytes to land on the record — otherwise a spoofer who claimed the
+    /// pubkey could write to a genuine peer's record. Other peers still
+    /// get their bytes tracked via the `CreditRecord` upstream; this
+    /// method only governs the Ember-specific ledger.
     ///
     /// Returns `true` when the write landed, `false` when it was
     /// rejected so callers can emit a metric/log.
@@ -2139,18 +2137,6 @@ impl CreditManager {
         let record = self.get_or_create_ember(pub_key);
         record.uploaded = record.uploaded.saturating_add(bytes);
         record.last_upload_time = now;
-        record.ident_verified = true;
-        true
-    }
-
-    pub fn add_ember_downloaded(&mut self, pub_key: [u8; 32], bytes: u64, verified: bool) -> bool {
-        if !verified {
-            return false;
-        }
-        let now = chrono::Utc::now().timestamp();
-        let record = self.get_or_create_ember(pub_key);
-        record.downloaded = record.downloaded.saturating_add(bytes);
-        record.last_download_time = now;
         record.ident_verified = true;
         true
     }
@@ -2564,12 +2550,10 @@ fn read_anchor_section(data: &[u8], offset: usize) -> Option<HashSet<[u8; 16]>> 
     let body_end = count.checked_mul(16)?.checked_add(body_start)?;
     let body = data.get(body_start..body_end)?;
     Some(
-        body.chunks_exact(16)
-            .map(|chunk| {
-                let mut user_hash = [0u8; 16];
-                user_hash.copy_from_slice(chunk);
-                user_hash
-            })
+        body.as_chunks::<16>()
+            .0
+            .iter()
+            .copied()
             .collect(),
     )
 }
@@ -4727,9 +4711,8 @@ mod tests {
 
     // ---- Ember credit tests ----
 
-    /// Unverified peers cannot farm Ember credit — the `add_ember_uploaded`
-    /// and `add_ember_downloaded` helpers must reject writes when
-    /// `verified == false`. Without this check a hash-spoofer could
+    /// Unverified peers cannot farm Ember credit — `add_ember_uploaded`
+    /// must reject writes when `verified == false`. Without this check a hash-spoofer could
     /// claim a verified friend's pubkey on the wire and burn
     /// their real reputation by uploading garbage in their name.
     #[test]
@@ -4742,19 +4725,13 @@ mod tests {
             "unverified upload must be rejected"
         );
         assert!(
-            !cm.add_ember_downloaded(pk, 4096, false),
-            "unverified download must be rejected"
-        );
-        assert!(
             cm.get_ember_record(&pk).is_none(),
             "rejected writes must not create a record"
         );
 
         assert!(cm.add_ember_uploaded(pk, 4096, true));
-        assert!(cm.add_ember_downloaded(pk, 2048, true));
         let r = cm.get_ember_record(&pk).expect("verified writes must land");
         assert_eq!(r.uploaded, 4096);
-        assert_eq!(r.downloaded, 2048);
         assert!(r.ident_verified, "verified writes must set ident_verified");
     }
 

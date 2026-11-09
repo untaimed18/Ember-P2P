@@ -278,8 +278,10 @@ pub(in crate::network) async fn on_ember_search_tick(
     }
 
     for op in state.ember_publish.cleanup_expired() {
+        let result = ember_publish_result(&op);
+        crate::network::channel_membership::note_owner_snapshot_finished(state, op.id, result.stored_on);
         if let Some(tx) = state.ember_dht_pending_publishes.remove(&op.id) {
-            let _ = tx.send(ember_publish_result(&op));
+            let _ = tx.send(result);
         }
         state
             .ember_dht_publish_requests

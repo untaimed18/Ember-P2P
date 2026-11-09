@@ -467,11 +467,28 @@ mod membership_record_v2_tests {
     /// The owner's copy of `epoch` for `member`, every form it publishes,
     /// as blobs: what a rotation, a renewal and an unban's re-seal all send.
     fn owner_publishes(room: &ChannelIdentity, member: &[u8; 32], epoch: i64, key: &[u8; 32]) -> Vec<SignedRecord> {
+        owner_publishes_forms(room, member, epoch, key, false)
+    }
+
+    /// Both forms of a member's key record, as an owner on 1.7.5 to 1.7.8
+    /// publishes them: the v1 copy goes out beside v2 there, as it still does
+    /// here for an owner's own copy.
+    fn owner_publishes_1_7(room: &ChannelIdentity, member: &[u8; 32], epoch: i64, key: &[u8; 32]) -> Vec<SignedRecord> {
+        owner_publishes_forms(room, member, epoch, key, true)
+    }
+
+    fn owner_publishes_forms(
+        room: &ChannelIdentity,
+        member: &[u8; 32],
+        epoch: i64,
+        key: &[u8; 32],
+        with_v1: bool,
+    ) -> Vec<SignedRecord> {
         let wrap = channel::derive_channel_epoch_secret(&OWNER_SEED, member, &room.channel_id, epoch).unwrap();
         let blind = channel::epoch_blind(&OWNER_SEED, member, &room.channel_id).unwrap();
         let sealed = channel::seal_channel_key_epoch(&wrap, &room.channel_id, epoch, key);
         SignedRecord::channel_key_epoch_forms(
-            room.channel_id, room.pubkey, member, false, epoch, &blind, &sealed, &room.signing_key,
+            room.channel_id, room.pubkey, member, with_v1, epoch, &blind, &sealed, &room.signing_key,
         )
     }
 
@@ -498,9 +515,14 @@ mod membership_record_v2_tests {
         };
 
         let published = owner_publishes(&room, &ada.ed25519_public_key, 4, &SECRETS[4]);
+        assert_eq!(published.len(), 1, "a 1.8.0 owner publishes a member's copy in v2 alone");
         let (target, keys) = lookup(&db).expect("epoch 4 is missing");
         assert_eq!(target, 4);
-        assert_eq!(keys, published.iter().map(|r| r.keyword_hash).collect::<Vec<_>>(), "v2 key, then v1");
+        assert_eq!(
+            keys,
+            vec![published[0].keyword_hash, channel::epoch_key(&room.channel_id, &ada.ed25519_public_key, 4)],
+            "v2 key, then v1, which an owner on 1.7.x may still publish"
+        );
         assert_eq!(
             ingest_channel_epoch_records(&db, &ada, room.channel_id, 4, &v2_only(&published)),
             ChannelEpochIngest::Rekeyed
@@ -510,7 +532,7 @@ mod membership_record_v2_tests {
         // The epochs in between, newest first, each under its own key.
         let (target, keys) = lookup(&db).unwrap();
         assert_eq!(target, 3);
-        let three = owner_publishes(&room, &ada.ed25519_public_key, 3, &SECRETS[3]);
+        let three = owner_publishes_1_7(&room, &ada.ed25519_public_key, 3, &SECRETS[3]);
         assert_eq!(keys[0], three[0].keyword_hash);
         // v1 alone, as a 1.7.4 owner or storer leaves it, is still read.
         assert_eq!(
@@ -915,6 +937,49 @@ mod channel_settings_schedule_tests {
         )
         .expect("insert owned channel");
         ident
+    }
+
+    /// Two devices of one identity that own a room, making the same rotation
+    /// from the same epoch, mint the same key: random keys would split the
+    /// room between them.
+    #[test]
+    fn two_owning_devices_mint_the_same_rotated_key() {
+        let (path_a, a) = temp_db("rotate-a");
+        let (path_b, b) = temp_db("rotate-b");
+        let room = ChannelIdentity::generate();
+        let id = hex::encode(room.channel_id);
+        let seed = room.seed();
+        for db in [&a, &b] {
+            db.insert_channel(&id, &hex::encode(room.pubkey), "Ours", "private", true, Some(&seed), Some(&[7u8; 32]))
+                .expect("insert owned channel");
+        }
+        assert_eq!(super::rotate_owned_channel_key(&a, &id, &seed, 0), Some(1));
+        assert_eq!(super::rotate_owned_channel_key(&b, &id, &seed, 0), Some(1));
+        let minted = |db: &Database| {
+            db.load_channel_key_epochs(&id)
+                .unwrap()
+                .into_iter()
+                .find(|(epoch, _)| *epoch == 1)
+                .map(|(_, key)| key)
+        };
+        assert_eq!(minted(&a), minted(&b));
+        assert!(minted(&a).is_some());
+        drop((a, b));
+        remove(&path_a);
+        remove(&path_b);
+    }
+
+    /// An owner's snapshot that no storer took is published again within
+    /// minutes, not at the next six-hourly republish.
+    #[test]
+    fn an_owner_snapshot_that_stored_nowhere_is_due_again_in_minutes() {
+        use crate::network::ember::channel::schedule_due;
+        let now = 1_000_000;
+        let stamp = super::owner_snapshot_retry_stamp(now);
+        let retry = super::OWNER_SNAPSHOT_RETRY_SECS;
+        assert!(!schedule_due(stamp, now, MODERATION_REPUBLISH_SECS));
+        assert!(!schedule_due(stamp, now + retry - 1, MODERATION_REPUBLISH_SECS));
+        assert!(schedule_due(stamp, now + retry, MODERATION_REPUBLISH_SECS));
     }
 
     fn held(commitments: &[(i64, [u8; 32])]) -> HeldChannelSettings {
@@ -4510,6 +4575,66 @@ pub(crate) fn ingest_channel_moderation_records(
     applied
 }
 
+/// Owe the cut-over's one rotation to each private room this identity owns
+/// ([`ember::channel::V1_CUT_OVER_ROTATES`]), once per database: the pass
+/// below makes it, with the snapshot naming the new epoch, as it makes the
+/// rotation a moderator's ban is owed. Asked once a run, and again after a
+/// failed attempt.
+fn take_v1_cut_over_rotations(db: &Database, now: i64) {
+    static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ember::channel::V1_CUT_OVER_ROTATES || TAKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    match db.take_channel_cut_over_rotations(ember::channel::V1_CUT_OVER, now) {
+        Ok(rooms) => {
+            TAKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            if rooms > 0 {
+                info!("Ember: rotating the key of {rooms} private room(s) we own once, as v1 membership records stop");
+            }
+        }
+        Err(e) => warn!("Ember: could not owe the cut-over's key rotations yet: {e}"),
+    }
+}
+
+/// Whether a rotation made now would reach the room. Members learn a new epoch
+/// only from the snapshot this pass publishes, and the next one is
+/// `MODERATION_REPUBLISH_SECS` away, so a rotation announced to a table that has
+/// not yet heard from enough contacts to store it would leave them on the old
+/// key for hours while the owner seals under the new one. At startup the pass
+/// can run on the saved address book alone, none of it heard from yet.
+fn rotation_can_be_announced(state: &NetworkState) -> bool {
+    state.ember_dht.routing().verified_len() >= ember::dht::publish::MIN_STORE_NODES
+}
+
+/// How soon an owner's moderation snapshot goes out again when it stored
+/// nowhere. Members learn a new epoch from it alone, so one announcing a
+/// rotation, or republished after a restart cut the first short, would leave
+/// them on the old key for hours if it waited out `MODERATION_REPUBLISH_SECS`.
+const OWNER_SNAPSHOT_RETRY_SECS: i64 = 5 * 60;
+
+/// One of our publishes ended: if it was a room's moderation snapshot and no
+/// storer took it, bring the room's next owner pass forward to
+/// [`OWNER_SNAPSHOT_RETRY_SECS`] from now. An epoch it named stays minted; the
+/// pass republishes the snapshot that names it.
+pub(super) fn note_owner_snapshot_finished(state: &mut NetworkState, publish_id: u32, stored_on: usize) {
+    let Some(channel_id) = state.owner_snapshot_publishes.remove(&publish_id) else {
+        return;
+    };
+    if stored_on == 0 {
+        let now = chrono::Utc::now().timestamp();
+        state
+            .channel_moderation_publish_at
+            .insert(channel_id, owner_snapshot_retry_stamp(now));
+    }
+}
+
+/// The publish stamp that makes a room's owner pass due again
+/// [`OWNER_SNAPSHOT_RETRY_SECS`] after `now`.
+fn owner_snapshot_retry_stamp(now: i64) -> i64 {
+    now.saturating_sub(ember::channel::MODERATION_REPUBLISH_SECS)
+        .saturating_add(OWNER_SNAPSHOT_RETRY_SECS)
+}
+
 /// Owners re-STORE the records only they can sign, so their DHT TTL cannot age
 /// them out while the owner is about: the moderation record, plus the
 /// public-index listing for public rooms. Remaining life is derived from the
@@ -4533,6 +4658,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
         return;
     }
     let now = chrono::Utc::now().timestamp();
+    take_v1_cut_over_rotations(db, now);
     let Some(channels) = channels_lite_cached(state, db) else {
         return;
     };
@@ -4623,8 +4749,11 @@ pub(super) async fn maybe_publish_owned_channel_records(
         // Borrowed from the shared roster until a rotation forces a re-read,
         // so the common path does not copy the row.
         let mut ch = std::borrow::Cow::Borrowed(ch);
-        let rotated = if private && db.channel_rotate_is_pending(&ch.channel_id).unwrap_or(false) {
-            let minted = rotate_owned_channel_key(db, &ch.channel_id, ch.key_epoch);
+        let rotated = if private
+            && rotation_can_be_announced(state)
+            && db.channel_rotate_is_pending(&ch.channel_id).unwrap_or(false)
+        {
+            let minted = rotate_owned_channel_key(db, &ch.channel_id, &seed, ch.key_epoch);
             if minted.is_some() {
                 // Re-read: the snapshot's tail and the re-seal both take the
                 // epoch from this row.
@@ -4747,6 +4876,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
         };
         {
             state.channel_moderation_publish_at.insert(channel_id, now);
+            state.owner_snapshot_publishes.insert(publish_id, channel_id);
             // The ban is now an eviction: the snapshot naming the new epoch is
             // on its way, and the re-seal at the end of this pass reaches
             // everyone still entitled to it.
@@ -5658,18 +5788,26 @@ pub(super) fn undo_owned_rotation(db: &Database, channel_id_hex: &str, rotated: 
 /// Returns the new epoch number. The caller has to announce it in the moderation
 /// snapshot and roll it back if that snapshot does not go out: members only ever
 /// fetch an epoch a snapshot has named, so a rotation nobody was told about
-/// leaves the owner sealing traffic under a key the room cannot find.
-pub(super) fn rotate_owned_channel_key(db: &Database, channel_id_hex: &str, from_epoch: i64) -> Option<i64> {
+/// leaves the owner sealing traffic under a key the room cannot find. The key
+/// is [`ember::channel::derive_owned_epoch_secret`]'s, so another device of
+/// this identity making the same rotation mints the same one.
+pub(super) fn rotate_owned_channel_key(
+    db: &Database,
+    channel_id_hex: &str,
+    owner_seed: &[u8; 32],
+    from_epoch: i64,
+) -> Option<i64> {
     let next = from_epoch.saturating_add(1);
-    let mut secret = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
-    match db.insert_channel_key_epoch(channel_id_hex, next, &secret) {
+    let mut secret = ember::channel::derive_owned_epoch_secret(owner_seed, next);
+    let minted = db.insert_channel_key_epoch(channel_id_hex, next, &secret);
+    zeroize::Zeroize::zeroize(&mut secret);
+    match minted {
         Ok(()) => Some(next),
         Err(error) => {
             tracing::warn!(
                 channel_id = %channel_id_hex,
                 %error,
-                "could not mint a rotated content key for a moderator's ban"
+                "could not mint a rotated content key"
             );
             None
         }

@@ -3009,40 +3009,36 @@ async fn load_owned_channel_as(
 /// across the DHT publish too, which is bounded by that call's own timeout.
 static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-/// The longest line, in UTF-8 bytes of its text, whose sealed legacy frame
-/// fits [`channel::RELAYABLE_GOSSIP_MAX_BYTES`]: past it, [`chat_gossip_frames`]
-/// refuses the line. A reply's trailer ([`channel::REPLY_TRAILER_BYTES`]) comes
-/// out of the same room.
+/// The longest line, in UTF-8 bytes of its text, whose sealed v2 frame fits
+/// [`channel::RELAYABLE_GOSSIP_MAX_BYTES`]: past it, [`chat_gossip_frames`]
+/// refuses the line. A reply's reference ([`channel::CHAT_V2_REPLY_BYTES`])
+/// comes out of the same room.
 ///
-/// The frame adds the same overhead whatever the text says, but the text it
-/// carries is what was typed with emoji joiners and the other characters the
-/// outgoing sanitiser drops taken out, so a line typed with those can run a
-/// little longer. Measured on what was typed, this is the most that always goes
-/// out. The send path measures the frame itself; this is the number the
-/// frontend holds (`CHANNEL_LINE_MAX_TEXT_BYTES` in `src/lib/api/channels.ts`).
-/// Once [`channel::SEND_LEGACY_CHAT_FRAMES`] is off the v2 frame sets the
-/// limit instead, and this changes.
+/// The frame adds the same overhead whatever the text says, and it keeps the
+/// text's emoji joiners, so this is measured on the text as typed. The send
+/// path measures the frame itself; this is the number the frontend holds
+/// (`CHANNEL_LINE_MAX_TEXT_BYTES` in `src/lib/api/channels.ts`). It was the
+/// legacy frame's, 3728, while [`channel::SEND_LEGACY_CHAT_FRAMES`] held.
 #[cfg(test)]
-const CHANNEL_LINE_MAX_TEXT_BYTES: usize = 3728;
-/// [`CHANNEL_LINE_MAX_TEXT_BYTES`] for a revision, whose legacy frame also
-/// carries the line's id and both its times. A revised reply keeps its
-/// trailer, so it too leaves [`channel::REPLY_TRAILER_BYTES`] less.
+const CHANNEL_LINE_MAX_TEXT_BYTES: usize = 3704;
+/// [`CHANNEL_LINE_MAX_TEXT_BYTES`] for a revision, whose frame also carries
+/// the line's original time. A revised reply keeps its reference, so it too
+/// leaves [`channel::CHAT_V2_REPLY_BYTES`] less.
 #[cfg(test)]
-const CHANNEL_EDIT_MAX_TEXT_BYTES: usize = 3696;
+const CHANNEL_EDIT_MAX_TEXT_BYTES: usize = 3693;
 
-/// The sealed frames of one outgoing line or revision, the legacy one first so
-/// that a build reading only it meets it ahead of the frame it cannot read.
+/// The sealed frames of one outgoing line or revision: the v2 frame alone, or
+/// while [`channel::SEND_LEGACY_CHAT_FRAMES`] held, the legacy one first so
+/// that a build reading only it met it ahead of the frame it could not read.
 /// `legacy_envelope` and `at` are the legacy frame's envelope id and time; the
 /// v2 frame carries its own.
 ///
 /// A sealed frame has to fit one datagram inside the overlay relay envelope a
 /// firewalled member's copy goes in ([`channel::RELAYABLE_GOSSIP_MAX_BYTES`]),
-/// which a text near the 4096-byte cap does not. Unless the line is a reply,
-/// whose legacy trailer outweighs the v2 frame's reference, the v2 frame is the
-/// larger of the two, so a line whose legacy frame fits and v2 frame does not
-/// goes out in the legacy form alone, which every build reads; one whose first
-/// frame does not fit is refused, before the callers store anything, rather
-/// than kept here and delivered nowhere.
+/// which a text near the 4096-byte cap does not. A line whose first frame does
+/// not fit is refused, before the callers store anything, rather than kept
+/// here and delivered nowhere. With both frames, one whose v2 frame alone did
+/// not fit went out in the legacy form, which every build reads.
 fn chat_gossip_frames(
     channel_id: [u8; 16],
     key: &[u8; 32],
@@ -7080,12 +7076,12 @@ mod tests {
     }
 
     /// Every frame handed to the gossip layer fits a datagram, wrapped for an
-    /// overlay relay hop too, which is how a firewalled member gets it. Near
-    /// the cap a line goes out in the legacy form alone; past what the legacy
-    /// frame can carry it is refused, so it is neither stored nor lost on the
-    /// way.
+    /// overlay relay hop too, which is how a firewalled member gets it. Past
+    /// what the first frame can carry a line is refused, so it is neither
+    /// stored nor lost on the way. While both frames went out, a line near the
+    /// cap went in the legacy form alone.
     #[test]
-    fn a_line_too_long_for_a_datagram_is_refused_and_its_oversized_twin_dropped() {
+    fn a_line_too_long_for_a_relayed_datagram_is_refused() {
         let key = crypto::signing_key_from_bytes(&[0x31; 32]);
         let sender = key.verifying_key().to_bytes();
         let room = [0x5a; 16];
@@ -7174,7 +7170,7 @@ mod tests {
             assert!((1..=longest).step_by(97).all(fits), "every shorter line fits too");
             longest
         };
-        let reply = channel::REPLY_TRAILER_BYTES;
+        let reply = channel::CHAT_V2_REPLY_BYTES;
         let cases = [
             (None, false, CHANNEL_LINE_MAX_TEXT_BYTES),
             (Some(&parent), false, CHANNEL_LINE_MAX_TEXT_BYTES - reply),
@@ -7192,14 +7188,13 @@ mod tests {
             assert!(frames_for(&at_edge, parent, edit).is_ok(), "{what}: multi-byte text at the edge");
             assert!(frames_for(&format!("{at_edge}a"), parent, edit).is_err(), "{what}: one byte past it");
 
-            // Each family emoji is 18 bytes typed and 12 once its joiners are
-            // gone, and the edge is measured on the 12.
+            // The v2 frame carries a line's emoji joiners, so they count: the
+            // edge is on the text as typed, which is what the frontend measures.
             let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".repeat(10);
-            let legacy_len = crate::security::without_message_text_joiners(&family).len();
-            let joined = format!("{family}{}", "a".repeat(limit - legacy_len));
-            assert_eq!(joined.len(), limit + 60);
-            assert!(frames_for(&joined, parent, edit).is_ok(), "{what}: joiners do not count");
-            assert!(frames_for(&format!("{joined}a"), parent, edit).is_err(), "{what}: past the edge without them");
+            let joined = format!("{family}{}", "a".repeat(limit - family.len()));
+            assert_eq!(joined.len(), limit);
+            assert!(frames_for(&joined, parent, edit).is_ok(), "{what}: joiners and all at the edge");
+            assert!(frames_for(&format!("{joined}a"), parent, edit).is_err(), "{what}: one byte past it");
         }
     }
 

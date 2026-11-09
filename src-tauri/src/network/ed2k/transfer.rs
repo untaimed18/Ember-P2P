@@ -954,23 +954,6 @@ pub enum DownloadEvent {
         peer_port: u16,
         verified: bool,
     },
-    /// An Ember friend was seen on a download connection (EmuleInfo exchange completed).
-    FriendSeen {
-        ember_hash: [u8; 16],
-        ip: std::net::IpAddr,
-        port: u16,
-    },
-    /// Legacy parser-only chat event. Generic download chat is dropped.
-    #[allow(dead_code)]
-    EmberChatMessage {
-        ember_hash: [u8; 16],
-        message: String,
-    },
-    /// Incoming Ember browse response from a friend on a download connection.
-    EmberBrowseResponse {
-        ember_hash: [u8; 16],
-        entries: Vec<(String, u64, String, Option<String>, Option<String>)>,
-    },
     /// The .part file has been created on disk, signalling the network loop to
     /// offer this partial to the server and publish to KAD so other peers can
     /// discover us as a source.

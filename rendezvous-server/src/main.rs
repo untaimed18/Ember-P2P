@@ -1491,6 +1491,9 @@ struct RelayQueueReceiver {
 impl RelayQueueSender {
     async fn send(&self, frame: Vec<u8>) -> Result<(), ()> {
         let len = frame.len();
+        // Rust 1.99 deprecates `fetch_update` for `try_update`, which is newer
+        // than this crate's `rust-version`.
+        #[allow(deprecated)]
         let reserved = self
             .queued_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
@@ -3968,6 +3971,8 @@ async fn protocol_v4() -> Json<serde_json::Value> {
 /// pre-body gate reads, whether or not it is probed. The hourly probe budget
 /// is charged only for a probe, and its 429 says `"reason": "hourly"` so the
 /// client can tell it from the general one, which passes within a minute.
+// The error is the HTTP response itself, built once and handed to axum.
+#[allow(clippy::result_large_err)]
 async fn reachability_v4(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,

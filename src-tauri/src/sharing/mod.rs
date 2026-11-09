@@ -277,7 +277,9 @@ pub(crate) fn volume_key(path: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(windows)]
+    use std::path::PathBuf;
 
     #[test]
     fn the_home_folder_is_found_whatever_its_spelling() {
