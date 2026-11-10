@@ -26,26 +26,15 @@ from the room's seed so two devices owning a room stay on one key. The detail
 is in `channels-format.md`, "The cut-over in 1.8.0", "The transition, and the
 cut-over in 1.8.0" and "Two devices owning a room".
 
-- **Run it on three or more machines** before tagging, one behind a firewall
-  that is not reachable, with a 1.7.8 member and a 1.7.4 member in the same
-  rooms: chat and edits between 1.8.0 machines and from the 1.7.8 one (read
-  and paired here), the 1.7.4 member told a newer Ember is needed for a
-  1.8.0 member's line posted before the owner's rotation (after it, the room
-  just goes quiet for them), private rooms rotating once after the update,
-  only once the owner's table has contacts, and members on 1.7.5 or later
-  following the new key, a restored device getting its rooms and keys back
-  and rotating the private ones, and a file sent in a room with only the
-  sealed offer. Then the follow-ups: the room with the 1.7.8 member rotating a
-  second time once the owner, online and in the room, has gone a week without
-  a v1 copy after that member updates (`V1_RELINK_QUIET_SECS` can be shortened
-  for the run), a member who joined after a rotation finding the older epoch
-  once the owner renews it, and one identity owning a room on two machines:
-  each banning someone while the other is closed, the second rotating past
-  the first's epoch and the room ending on one key with both bans standing;
-  both open and rotating from the same epoch, minting the same key; a rename
-  on one reaching the other and staying; and an edit on a machine just opened
-  held back until it has read the room (`channels_owner_reading`), then kept.
-  `archived-plans/release-checklist-1.7.5.md` is the model for the checklist.
+- **Run it on three or more machines** before tagging, with a 1.7.8 member
+  and a 1.7.4 member in the same rooms, by
+  [`release-checklist-1.8.0.md`](release-checklist-1.8.0.md): the cut-over
+  between 1.8.0 machines, its rotation and a restored device's, the second
+  rotation for rooms with a 1.7.x member, the renewal of older epochs, one
+  identity owning a room on two devices, mixed versions, and what the
+  cleanups touched. It says how to run a second device on one PC and how to
+  shorten the week-long and twelve-hour waits. Move it to `archived-plans/`
+  once 1.8.0 ships.
 - **Then delete the 1.7 paths the cut-over switched off.** They are kept
   behind their constants only so the cross-machine run can turn one back on:
   sending the legacy chat frames (`SEND_LEGACY_CHAT_FRAMES`, the `frames.retain`
