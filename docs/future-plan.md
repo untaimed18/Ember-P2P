@@ -18,10 +18,13 @@ Channels formats in [`channels-format.md`](channels-format.md).
 1.8.0's Channels cut-over is built: the v2 chat frames go out alone with the
 display flag, private membership records go out in v2 alone but for the
 owner's own key copy, each owned private room is rotated once
-(`take_channel_cut_over_rotations`), the owned-rooms list is padded, and room
-transfers no longer hold a plain offer back (`HOLD_PLAIN_XFER_OFFERS`). The
-detail is in `channels-format.md`, "The cut-over in 1.8.0" and "The
-transition, and the cut-over in 1.8.0".
+(`take_channel_cut_over_rotations`) and once more where members were still on
+1.7.x (`take_channel_relink_rotation`), the owned-rooms list is padded, and
+room transfers no longer hold a plain offer back (`HOLD_PLAIN_XFER_OFFERS`).
+Owners also renew the older epochs a room keeps, and derive every rotated key
+from the room's seed so two devices owning a room stay on one key. The detail
+is in `channels-format.md`, "The cut-over in 1.8.0", "The transition, and the
+cut-over in 1.8.0" and "Two devices owning a room".
 
 - **Run it on three or more machines** before tagging, one behind a firewall
   that is not reachable, with a 1.7.8 member and a 1.7.4 member in the same
@@ -32,8 +35,17 @@ transition, and the cut-over in 1.8.0".
   only once the owner's table has contacts, and members on 1.7.5 or later
   following the new key, a restored device getting its rooms and keys back
   and rotating the private ones, and a file sent in a room with only the
-  sealed offer. `archived-plans/release-checklist-1.7.5.md` is the model for
-  the checklist.
+  sealed offer. Then the follow-ups: the room with the 1.7.8 member rotating a
+  second time once the owner, online and in the room, has gone a week without
+  a v1 copy after that member updates (`V1_RELINK_QUIET_SECS` can be shortened
+  for the run), a member who joined after a rotation finding the older epoch
+  once the owner renews it, and one identity owning a room on two machines:
+  each banning someone while the other is closed, the second rotating past
+  the first's epoch and the room ending on one key with both bans standing;
+  both open and rotating from the same epoch, minting the same key; a rename
+  on one reaching the other and staying; and an edit on a machine just opened
+  held back until it has read the room (`channels_owner_reading`), then kept.
+  `archived-plans/release-checklist-1.7.5.md` is the model for the checklist.
 - **Then delete the 1.7 paths the cut-over switched off.** They are kept
   behind their constants only so the cross-machine run can turn one back on:
   sending the legacy chat frames (`SEND_LEGACY_CHAT_FRAMES`, the `frames.retain`
@@ -85,23 +97,6 @@ transition, and the cut-over in 1.8.0".
   ended) and put the prompt up again; accepting only stalls. An offer
   timestamp under the pairwise tag would let the recipient refuse one older
   than the offer window. Detail: `archived-plans/post-1.7.0.md` item 3.
-- **Decide whether owners renew every retained epoch's key records,** not
-  just the current one's, now that a member's copies go out in v2 alone: a
-  member far enough behind to need an older epoch finds it only while that
-  epoch's records have not lapsed.
-- **Rotate private rooms again once no member publishes v1.** The cut-over's
-  one rotation unlinks only members already on 1.8.0: one still on 1.7.5 to
-  1.7.8 publishes its new ids in both forms and is linked again. A second
-  one-time rotation under a new cut-over name, made once a presence walk in the
-  current epoch finds no v1 copy from anyone on the roster (or after a fixed
-  grace period), would cover them. See `channels-format.md`, "It protects only
-  members already on 1.8.0".
-- **Two owning devices rotating at once.** Each device's database records the
-  cut-over on its own, so an identity running 1.8.0 on two devices that both
-  own a room rotates it once per device, and both can mint the same next epoch
-  with different keys. Moderator-ban rotations already carry this hazard; the
-  cut-over makes it routine. Find out how members and the two owners resolve
-  it, and whether a second owning device should defer to the first.
 - **Tune Discover's spam folding from real use.** `LIKELY_SPAM_SCORE` and
   `DUPLICATE_NAME_FLOOD` stay as they are until reports of folded good rooms,
   or spam that gets through, say otherwise.

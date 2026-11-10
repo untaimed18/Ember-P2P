@@ -69,7 +69,7 @@ fn clamp_name_to_record_budget(file_name: &str, contact_bytes: usize) -> std::bo
 }
 
 /// Maximum concurrent publish operations.
-const MAX_ACTIVE_PUBLISHES: usize = 128;
+pub const MAX_ACTIVE_PUBLISHES: usize = 128;
 
 /// How long to wait for a STORE_ACK before timing out.
 const PUBLISH_TIMEOUT_SECS: u64 = 30;

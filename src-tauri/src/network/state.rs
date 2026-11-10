@@ -1623,6 +1623,12 @@ pub(super) struct NetworkState {
     /// batches land in the order their lookups finished.
     pub(super) ember_channel_ingest:
         Option<tokio::task::JoinHandle<super::channel_membership::ChannelIngestResults>>,
+    /// The rooms whose moderation lookups `ember_channel_ingest` is writing,
+    /// and whether one of them counts as a read
+    /// (`channel_membership::moderation_look_answered`).
+    pub(super) ember_channel_ingest_moderation: HashMap<[u8; 16], bool>,
+    /// The same for lookups that have ended and wait for the next ingest.
+    pub(super) channel_moderation_look_read: HashMap<[u8; 16], bool>,
     /// Last presence FIND_VALUE start per channel.
     pub(super) channel_presence_fetch_at: HashMap<[u8; 16], i64>,
     /// The one room the user currently has open, if any.
@@ -1663,6 +1669,24 @@ pub(super) struct NetworkState {
     pub(super) channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
     /// Last owner moderation STORE per channel.
     pub(super) channel_moderation_publish_at: HashMap<[u8; 16], i64>,
+    /// When the newest moderation lookup some peer answered began, per
+    /// channel: how fresh this device's view of the network's snapshot is.
+    pub(super) channel_moderation_looked_at: HashMap<[u8; 16], i64>,
+    /// When a due owner republish first asked for, or began waiting on, a
+    /// fresh look at the network's snapshot
+    /// (`channel_membership::owner_republish_read_gate`).
+    pub(super) channel_republish_read_asked: HashMap<[u8; 16], i64>,
+    /// How long a due owner republish has been putting itself off for want of
+    /// an answered look, and when it last did; cleared once it signs.
+    pub(super) channel_republish_deferred: HashMap<[u8; 16], (i64, i64)>,
+    /// The older epoch whose key records are being renewed, if any, and when
+    /// the rooms we own were last looked over for one
+    /// (`channel_membership::maybe_renew_retained_channel_epochs`).
+    pub(super) channel_retained_renewal: Option<super::channel_membership::RetainedEpochRenewal>,
+    pub(super) channel_retained_scan_at: i64,
+    /// The epoch the owner pass last re-sealed for each room we own, and when
+    /// (`channel_membership::maybe_publish_owned_channel_records`).
+    pub(super) channel_epoch_resealed: HashMap<[u8; 16], (i64, i64)>,
     /// Owner moderation STOREs in flight, by publish id, so one that stores
     /// nowhere is retried soon (`channel_membership::note_owner_snapshot_finished`).
     pub(super) owner_snapshot_publishes: HashMap<u32, [u8; 16]>,
@@ -1831,11 +1855,14 @@ pub(super) struct NetworkState {
     /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
     /// channel + epoch).
     pub(super) ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,
-    /// Epoch blobs accumulated for a room and epoch while a FIND_VALUE for it
-    /// is still in flight: one walk for the v2 key, one for the v1 key.
-    pub(super) ember_channel_epoch_buffer: HashMap<([u8; 16], i64), Vec<Vec<u8>>>,
-    /// Epoch blobs waiting to be opened and stored (async drain).
-    pub(super) ember_pending_channel_epoch: Vec<([u8; 16], i64, Vec<Vec<u8>>)>,
+    /// What the lookups of a room's epoch have gathered while one is still in
+    /// flight: one walk for the v2 key, one for the v1 key.
+    pub(super) ember_channel_epoch_buffer:
+        HashMap<([u8; 16], i64), super::channel_membership::EpochLookupHeld>,
+    /// Epoch blobs waiting to be opened and stored (async drain), and how the
+    /// lookups that found them ended.
+    pub(super) ember_pending_channel_epoch:
+        Vec<([u8; 16], i64, Vec<Vec<u8>>, super::channel_membership::EpochLookupEnd)>,
     /// Last epoch FIND_VALUE start per channel.
     ///
     /// Per channel rather than per (channel, epoch): we only ever chase the one
@@ -1843,6 +1870,12 @@ pub(super) struct NetworkState {
     /// a long-lived client accumulated an entry for every rotation a room had
     /// ever had, with nothing to remove them.
     pub(super) channel_epoch_fetch_at: HashMap<[u8; 16], i64>,
+    /// When an answered lookup of `(room, epoch)`, an epoch older than the one
+    /// the room had announced by then, last found nothing; it is passed over
+    /// until `channel_membership::CHANNEL_EPOCH_MISS_RETRY_SECS` after that.
+    /// Pruned past that on every lookup pass, so it holds at most the
+    /// retention window's epochs for each private room.
+    pub(super) channel_epoch_missed: HashMap<([u8; 16], i64), i64>,
     /// In-flight FIND_VALUE of a succession claim (`search_id` → channel).
     pub(super) ember_channel_claim_searches: HashMap<u32, [u8; 16]>,
     /// Claim blobs waiting to be verified against the owner's nomination.

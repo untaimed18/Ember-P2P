@@ -871,9 +871,12 @@ little-endian, at least 1, strictly decreasing along the list; a list that
 breaks that, or whose length is not exactly `1 + 40 × count`, is malformed
 (`decode_key_commitments`). The commitment (`key_commitment`) is
 `blake3::derive_key("ember channel key commitment v1", channel_id ||
-epoch || content_key(join_secret))`. It reveals no key: the join secret is 32
-random bytes. Nor does it reveal anything kind 3 does not already, since
-`key_epoch` there says how many epochs there have been. A public room
+epoch || content_key(join_secret))`. It reveals no key: each epoch's secret
+is 32 bytes that only the room's owner can compute, derived from the room's
+seed (`derive_owned_join_secret`, `derive_owned_epoch_secret`), or drawn at
+random for epochs minted before 1.8.0. Nor does it reveal anything kind 3
+does not already, since `key_epoch` there says how many epochs there have
+been. A public room
 writes no tag 1: its content key derives from a secret everyone holds. Nor
 does epoch 0, the secret a private room was created with, which no rotation
 made and which invites minted before any rotation carry.
@@ -1063,7 +1066,8 @@ once after a rotation committed from a command,
 the commitment list differs from the one it last published, both read from
 the room's epochs when signed, so every key rotation and every rotation taken
 back goes out, including one taken back and minted again under the same epoch
-with another key; then once more within 30 minutes
+(with the same key from 1.8.0, whose owner rotations derive it, and another
+before); then once more within 30 minutes
 (`CHANNEL_SETTINGS_CONFIRM_SECS`), and otherwise on kind 3's republish cadence
 (`MODERATION_REPUBLISH_SECS`, 6 hours) and once each launch. The first of a
 launch is confirmed within 30 minutes too when its commitments differ from
@@ -1261,7 +1265,44 @@ pool), so history under the epochs in between comes after the current key. A
 key stored clears the room's fetch stamp, so the next missing epoch is looked
 up on the next maintenance tick (`EMBER_MAINT_INTERVAL`, a minute) rather than
 possibly the one after, the fetch interval (`CHANNEL_EPOCH_FETCH_SECS`) being a
-minute too. A room with nothing to look up is stamped like one looked up.
+minute too. A room with nothing to look up is stamped like one looked up. The
+window runs back from the newer of the announced epoch and the newest held,
+as the retention keeps it, and a fetched key the retention drops on arrival
+counts as nothing found. An older epoch a lookup did not find is passed over
+for six hours (`CHANNEL_EPOCH_MISS_RETRY_SECS`) when every walk of the lookup
+finished, enough peers answered one for finding nothing to mean the record is
+not there (`MIN_RESPONDERS_FOR_ABSENCE`, four, as recovery reads absence), and
+the epoch was already older than the one the room announced when the lookup
+began (`EpochLookupEnd::miss_counts`), and not while chat is locked. The announced one never is, nor is anything
+after a lookup nobody answered. Otherwise a member who joined after a
+rotation, to whom the epoch before it was never sealed, would ask for it
+every minute for as long as it stayed in the window.
+
+**Owners renew the retained epochs too.** The owner pass renews the current
+epoch's records when the epoch has moved or six hours have passed since it
+last got them all out, and about once a week (`RETAINED_EPOCH_RENEW_SECS`) each
+older epoch the room still keeps is renewed as well, sealed the same way to
+every unbanned member on the roster (`maybe_renew_retained_channel_epochs`).
+When each epoch's records last all went out is kept in the database
+(`channel_epoch_renewals`), the current epoch's included, so the week holds
+across restarts and an epoch's first week as an older one counts from its
+last renewal as the current one. One older epoch at a time across all the
+rooms the device owns, the longest unrenewed first: its records are sealed
+together, members in an order drawn afresh (`seal_epoch_records`, as an
+owner's own ban seals them too), and started as the publish table has room
+beside a margin of 16 slots, since a large room's epoch can hold more records
+than the table and starting them all at once would push out the next room's
+snapshot. Each batch leaves out members banned since the records were
+sealed, and a room deleted or handed over meanwhile is dropped. The epoch
+counts as renewed once every record has started; a batch held up for longer
+than a republish interval is sealed again. A key-epoch record lives 30 days from
+its last renewal, so without this an older epoch would lapse a month after
+it was superseded, and one minted before a member joined would never be
+sealed to them. Either way the member could not read what a peer still on
+that epoch re-served, or an attachment sealed under it. Sealing an older
+epoch to a member who joined after it, or to one unbanned since it was
+minted while they were banned, gives them nothing a catch-up would not:
+replies are sealed under the responder's current key.
 
 ### Storer rules on 1.7.5
 
@@ -1290,9 +1331,8 @@ both differ), so neither replaces the other. A republish or a leave counts as
 landed when either form stored (`any_publish_stored`), since a reader takes
 either. A key-epoch record always goes out as v2 (every rotated epoch is at
 least 1), and as v1 as `epoch_record_publishes_v1` says. Rotation, the
-owner's renewal of the current epoch (`republish_channel_key_epoch`, whose
-key read, DH and seals run on the blocking pool,
-`seal_current_epoch_records`) and an unban's re-seal
+owner's renewal (`republish_channel_key_epoch`, whose key read, DH and seals
+run on the blocking pool, `seal_epoch_records`) and an unban's re-seal
 (`reseal_current_epoch_to_member`) publish the same forms.
 
 **What the transition gives away.** A key-epoch record's v2 and v1 copies go
@@ -1347,13 +1387,141 @@ published its v1 records. Key-epoch records do not need it, since their ids
 change with every epoch, but the same rotation is what gives them their first
 epoch past the transition.
 
-**It protects only members already on 1.8.0.** A member still on 1.7.5 to
-1.7.8 when the owner rotates takes the new key and goes on publishing v1 and
-v2 presence side by side under it, so storers link that member's new ids at
-once, and they stay linked after the member updates until the room rotates
-again for some other reason (a ban). The same holds for a device that
-downgrades to 1.7.x and comes back: the cut-over is recorded, so it does not
-rotate a second time.
+**Rooms with members still on 1.7.x rotate once more.** A member still on
+1.7.5 to 1.7.8 when the owner rotates takes the new key and goes on
+publishing v1 and v2 presence side by side under it, so storers link that
+member's new ids at once, and they stay linked after the member updates. The
+owner reads those copies in its own presence walks: a v1 copy opened under
+the current key from a key on the roster (`merge_channel_presence_blobs`'s
+third set) is noted with the epoch it was seen in (`note_channel_v1_walk`, in
+`channel_v1_sightings`), counted only once the cut-over's rotation is made
+and only in the room's current epoch. Each walk after that which finds
+records but no such copy adds the time since the previous walk to a quiet
+span, at most `PRESENCE_FRESH_SECS` (20 minutes, what one walk speaks for),
+and a sighting starts the span over. A walk that found nothing at all counts
+for nothing; one only this node's own store answered still counts, for at
+most the 45 minutes a presence record lives there, which is nothing against
+a week. So time the walks did not watch counts for little, and an owner who
+was offline, or not in its own room (which it then does not walk), does not
+take the silence for an update. A rotation in between, a ban's say, carries
+the sightings into its epoch with the span started over and the first
+sighting kept: a member seen on 1.7.x took that key too, and may have
+published v1 under it before updating. Once the span reaches a week
+(`V1_RELINK_QUIET_SECS`), or 30 days after the first sighting
+(`V1_RELINK_GRACE_SECS`) if they keep coming, or if the owner has since
+stopped walking the room, the room is owed a second rotation
+(`take_channel_relink_rotation`), recorded in
+`channel_relink_rotations` so it is made once. That unlinks everyone who
+updated meanwhile. A member away longer than the quiet week and still on
+1.7.x, or one who never updates, is linked again by this rotation as by any
+other. A room never seen with such a copy is owed nothing, the first
+rotation having been enough. Both tables are per database: a second device
+owning the room keeps its own, and may make the second rotation once more
+itself, which costs only that rotation. A device that downgrades to 1.7.x
+and comes back is not rotated again for the cut-over, which is recorded.
+
+**Two devices owning a room.** An identity can own a room on two devices, and
+each makes the room's rotations on its own. Every owner rotation, the owner
+pass's and an owner's own ban alike, mints the key the room's seed derives for
+the new epoch (`derive_owned_epoch_secret`) rather than drawing one, so two
+devices rotating from the same epoch mint the same key instead of splitting
+the room between two. The same epoch therefore always gets the same key, which
+sets three rules:
+
+- A rotation starts past the newest epoch the room has announced
+  (`key_epoch_wanted`), not just the newest held here
+  (`next_rotation_epoch`, and the owner pass likewise): the other device's key
+  for an epoch it already sealed must not be minted again under a ban it did
+  not make. A device learns of such an epoch from every copy of the snapshot
+  a lookup brings back, those it does not apply included
+  (`note_owned_snapshot_seen`). A device behind the room's announcement looks
+  up its own copy of the newer key as a member would
+  (`channel_epoch_lookup`), whether or not it is in the room (never for a
+  room deleted here), and then the epochs in between, which the other device
+  sealed to this identity too; the newest key fetched so brings its next
+  owner pass forward, which re-seals it to the members this device knows. Until
+  then it sends, and re-seals, under the newest epoch it holds, which members
+  still read. An owner not behind checks for such a gap every six hours.
+  Meanwhile its snapshots announce the room's newest epoch, not the one it
+  holds, so a member whose newest snapshot is this device's is not told to
+  stop at an older epoch. One whose lookups, each answered by enough peers,
+  have gone on finding nothing for twelve hours (`OWNER_BEHIND_ROTATE_SECS`,
+  counted in the
+  database across restarts, each gap between lookups adding ten minutes at
+  most, so time offline counts for little) rotates past the epoch it never
+  found (`note_owner_epoch_missed`): the other device announced it and left
+  before its records were stored, and the members told of it cannot read or
+  send until a newer key reaches them.
+- A rotation claims its epoch: it mints only if neither that epoch nor a later
+  one is held or has been announced (`mint_channel_key_epoch`), the check and
+  the mint in one transaction. An owner's ban that loses that race is refused
+  with `channels_owner_reading` and can be made again on the room as it now
+  is: whichever rotation took the epoch sealed it before this ban was
+  committed, so the member being banned has that key too. A pass that loses
+  it, or cannot announce a rotation yet, tries again a few minutes on
+  (`OWNER_SNAPSHOT_RETRY_SECS`) rather than at its next republish; a pass
+  brought forward so re-seals the current epoch only when it has moved or its
+  six hours are up.
+- A key taken back, by a rotation whose snapshot did not commit, must not
+  have gone out, since the next rotation from that epoch mints it again.
+
+A device that takes in the other's newer snapshot (`ingest_channel_moderation`)
+banning someone it had not banned, while it already holds the epoch the
+snapshot names or a later one, may have sealed that key to them before it
+knew: it owes the room a rotation past it (`owe_rotation_for_unseen_bans_locked`),
+made on its next owner pass, which is brought forward. So does a copy it does
+not take that names the epoch this device is on, while that is the newest the
+room has announced, and leaves out someone this device's own snapshots ban
+(the newest the record carries, never the owner's key) who was banned before
+that copy was signed: whoever signed it did not know of the ban and may have
+sealed this very key to them, as when both devices ban someone in the same
+minute and the room keeps one of the two snapshots
+(`note_owned_snapshot_not_taken_locked`). This device's own snapshots carry
+every such ban, so they owe nothing. The name the other
+device renamed the room to is taken with the snapshot (`apply_own_room_name`),
+unless this device renamed the room since that snapshot was signed; otherwise
+this device's next republish and registry renewal would name the room back.
+The once-a-day rule stays the registry's, which refuses a rename too soon
+after the other device's. Two snapshots the
+devices signed in the same second are settled as members settle them, by
+signature: each device keeps the signature of its newest
+(`note_owner_snapshot_signed`) and takes the other's only if it orders after
+(`owner_takes_fetched_locked`), so neither republishes over the one the room
+kept.
+
+And because a snapshot is a whole state whose newer stamp wins, an edit
+signed from what a device held before the other device's edit undoes that
+edit everywhere. A look counts when it found the snapshot on another node,
+not just in this one's own store, or when enough peers answered it for
+finding nothing to mean something (`moderation_look_answered`). A routine republish signs only after such a
+look, begun within the last 30 seconds or since the republish first asked,
+and written to the database (`owner_republish_read_gate`); that leaves about
+a minute between the look and the signature. Waiting two minutes for one in
+vain, it puts itself off five minutes rather than sign, since a stamp taken
+from a stale view would outrank every snapshot the other device signed
+meanwhile, which this one would then refuse and undo; only once it has been
+putting itself off for a republish interval (`OWNER_REPUBLISH_DEFER_MAX_SECS`,
+six hours, each gap between tries counting ten minutes at most, so a sleep
+does not count) does it sign regardless, so the room's renewal, and its
+registry name with it, cannot hang on a network that answers nobody. Every
+other commit of an owner snapshot, the UI's edits among them, waits for such
+a look written within the last ten minutes (`owner_edit_waits_for_first_read`,
+`OWNER_EDIT_READ_FRESH_SECS`), and is refused with `channels_owner_reading`
+until then; one that finds a snapshot already fetched and still being written
+waits the moments that takes instead (`wait_for_unwritten_read`). The refusal asks the moderation poll to look the room up at once,
+whether or not the device is in it. Two minutes after the first edit refused
+(`OWNER_EDIT_READ_WAIT_SECS`) edits go ahead regardless for ten minutes, and
+the wait starts over after that, so an unreachable network, or Ember's
+network being off, cannot keep the owner from editing, and a device woken
+from a sleep still reads first. A recovered room's re-key, which has no one
+to ask to try again, waits for the read itself (`wait_for_owner_read`), as
+does a rename once the registry has granted the name, so the name it now
+holds is not left without its snapshot. A
+room created on the device, or taken over by its claim, counts as just read.
+In a room the device is in, the regular lookup every five minutes
+(`MODERATION_FETCH_SECS`) keeps the view fresh, so edits there are not held
+back once it has been read. An edit on each device within those few minutes
+still has the later one win, as two people editing one document would.
 
 **What it costs a member still on 1.7.4 or older.** They read neither the v2
 chat frames nor the v2 key records. Lines from members on 1.8.0 are lost to
@@ -1993,7 +2161,9 @@ reads (see kind 2 above).
   `CHANNEL_FLAG_BLINDED` (`0x04`) on kind 5; both storer rules; and the
   transition: both forms published from 1.7.5 to 1.7.8, then from 1.8.0 v2
   alone but for the owner's own key copy, each owned private room rotated
-  once at the cut-over.
+  once at the cut-over, and once more where a member's v1 copies were seen
+  after it, once a week of the owner's walks sees none or 30 days after the
+  first.
   Sending membership traffic under a throwaway DHT identity is not part of
   the format and can come later (`docs/archived-plans/post-1.7.5.md` item 1).
 - A member's languages in their presence record: the first in byte 67 of a

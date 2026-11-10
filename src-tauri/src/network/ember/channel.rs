@@ -868,21 +868,28 @@ pub fn owned_rooms_key(identity_pubkey: &[u8; 32]) -> [u8; 16] {
 }
 
 /// The first content key of a private room whose seed is `owner_seed`, so the
-/// owner can rebuild it from the seed. Later keys come back from the owner's
-/// own sealed copy instead: an owner's own ban draws its key at random, and the
-/// owner's rotation pass derives one ([`derive_owned_epoch_secret`]).
+/// owner can rebuild it from the seed. Later keys are
+/// [`derive_owned_epoch_secret`]'s from 1.8.0 on, and were drawn at random
+/// before; either way a restored device reads them back from the owner's own
+/// sealed copy.
 pub fn derive_owned_join_secret(owner_seed: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key(OWNED_JOIN_SECRET_CONTEXT, owner_seed)
 }
 
-/// The content key the owner's rotation pass mints for `epoch` of the private
-/// room whose seed is `owner_seed`.
+/// The content key an owner's rotation mints for `epoch` of the private room
+/// whose seed is `owner_seed`, from the owner pass or the owner's own ban.
 ///
 /// Derived rather than drawn so that an identity owning the room on two
 /// devices, each making the same rotation from the same epoch (the cut-over's,
 /// or one a moderator's ban is owed), mints the same key on both. Random keys
 /// would split the room between them, each member holding whichever reached
 /// it first and refusing the other. Only the room's owners hold the seed.
+///
+/// The same epoch always gets the same key, so a rotation that is undone must
+/// not have let its key out, and a device that rotates from behind must not
+/// mint an epoch another device already sealed: each rotation starts past the
+/// newest epoch the room has announced, and a ban made on one device that the
+/// other's current key may have reached rotates again there.
 pub fn derive_owned_epoch_secret(owner_seed: &[u8; 32], epoch: i64) -> [u8; 32] {
     let mut material = [0u8; 32 + 8];
     material[..32].copy_from_slice(owner_seed);
@@ -978,12 +985,36 @@ pub const PUBLISH_V1_MEMBERSHIP_RECORDS: bool = false;
 /// after the cut-over would carry the ids the transition already linked.
 /// Each owned private room is owed the rotation once
 /// (`Database::take_channel_cut_over_rotations`, under [`V1_CUT_OVER`]), and
-/// the owner loop makes it as it makes a moderator ban's.
+/// the owner loop makes it as it makes a moderator ban's. It also turns on
+/// the owner's watch for members still on 1.7.x and the second rotation that
+/// follows ([`V1_RELINK_QUIET_SECS`]).
 pub const V1_CUT_OVER_ROTATES: bool = !PUBLISH_V1_MEMBERSHIP_RECORDS;
 
 /// The name the v1 membership cut-over is recorded under, so each owned room
 /// is rotated for it once however often Ember starts.
 pub const V1_CUT_OVER: &str = "v1-membership-records";
+
+/// How long an owner's presence walks must have watched a private room's
+/// current epoch without a v1 copy from a roster member, after one was seen
+/// there, before it rotates the room once more.
+///
+/// The cut-over's rotation unlinks only members already past 1.7.8: one still
+/// on 1.7.5 to 1.7.8 takes the new key and goes on publishing both forms under
+/// it, so storers link its new ids at once, and they stay linked after it
+/// updates. The owner reads those copies in its own presence walks
+/// (`Database::note_channel_v1_walk`), and once they stop the room rotates a
+/// second and last time (`Database::take_channel_relink_rotation`). Only time
+/// the walks covered counts, so an owner who was offline or out of the room
+/// does not take the silence for an update; [`V1_RELINK_GRACE_SECS`] bounds
+/// the wait. A rotation in between carries the sightings into its epoch. A week covers a member who is online now and then; one away
+/// longer and still on 1.7.x is linked again however long this waits.
+pub const V1_RELINK_QUIET_SECS: i64 = 7 * 24 * 3600;
+
+/// How long after a private room's first v1 sighting it rotates the second
+/// time even while v1 copies keep coming: the members who updated meanwhile
+/// are unlinked by it, and those who never do would be linked again by any
+/// rotation.
+pub const V1_RELINK_GRACE_SECS: i64 = 30 * 24 * 3600;
 
 /// The key a member signs its v2 presence records in one room with, while the
 /// room seals under `join_secret`.

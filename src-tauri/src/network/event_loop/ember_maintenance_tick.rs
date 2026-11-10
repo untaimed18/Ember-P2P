@@ -80,6 +80,7 @@ pub(in crate::network) async fn on_ember_maintenance_tick(
             identity,
         )
         .await;
+        maybe_renew_retained_channel_epochs(udp_socket, state, db, settings, identity).await;
         maybe_publish_channel_settings(udp_socket, state, db, settings).await;
         maybe_publish_owned_rooms_list(udp_socket, state, db, identity).await;
     }

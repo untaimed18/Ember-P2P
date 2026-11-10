@@ -308,6 +308,7 @@ mod membership_record_v2_tests {
     use crate::storage::database::Database;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+    use std::collections::HashSet;
 
     fn blob(record: &SignedRecord) -> Vec<u8> {
         let mut blob = record.data.clone();
@@ -352,7 +353,13 @@ mod membership_record_v2_tests {
             vec![blob(&ada_v2), blob(&ada_v1), blob(&bob_v1), blob(&cy_v2), blob(&lifted)],
             vec![blob(&ada_v1), blob(&ada_v2), blob(&lifted), blob(&cy_v2), blob(&bob_v1)],
         ] {
-            let (latest, admits) = merge_channel_presence_blobs(&blobs, &room.channel_id, &secrets, true, now);
+            let (latest, admits, v1_current) =
+                merge_channel_presence_blobs(&blobs, &room.channel_id, &secrets, true, now);
+            assert_eq!(
+                v1_current,
+                HashSet::from([pk(&ada), pk(&bob)]),
+                "who still publishes v1 under the current secret, whatever else they publish"
+            );
             assert_eq!(latest.len(), 3, "the lifted seal names nobody");
             assert_eq!(latest[&pk(&ada)].nickname, "ada");
             assert_eq!(latest[&pk(&ada)].noise_pub, [2; 32]);
@@ -379,12 +386,14 @@ mod membership_record_v2_tests {
         lifted_v1.publisher_key = pk(&storer);
         lifted_v1.data[73..105].copy_from_slice(&lifted_v1.publisher_key);
         lifted_v1.signature = crate::network::ember::crypto::sign(&storer, &lifted_v1.data);
-        let (latest, admits) =
+        let (latest, admits, _) =
             merge_channel_presence_blobs(&[blob(&lifted_v1)], &room.channel_id, &secrets, true, now);
         assert!(latest.contains_key(&pk(&storer)), "the copied seal still opens");
         assert!(!admits.contains(&pk(&storer)), "but proves nothing about its signer");
-        let (_, admits) = merge_channel_presence_blobs(&[blob(&bob_v1)], &room.channel_id, &secrets, false, now);
+        let (_, admits, v1_current) =
+            merge_channel_presence_blobs(&[blob(&bob_v1)], &room.channel_id, &secrets, false, now);
         assert!(admits.contains(&pk(&bob)), "a public room's v1 record still admits");
+        assert!(v1_current.is_empty(), "and links nothing a rotation could undo");
 
         // A v1 record that is neither flagged private nor sealed — a bare
         // 32-byte extra, which anyone who knows the room's id and pubkey can
@@ -394,17 +403,18 @@ mod membership_record_v2_tests {
         let forged = SignedRecord::channel_presence_v1_at(
             "mallory", L::default(), room.channel_id, room.pubkey, &current, false, channel::presence_epoch(now), false, &[9; 32], &mallory, now,
         );
-        let (latest, admits) = merge_channel_presence_blobs(&[blob(&forged)], &room.channel_id, &secrets, true, now);
+        let (latest, admits, _) =
+            merge_channel_presence_blobs(&[blob(&forged)], &room.channel_id, &secrets, true, now);
         assert!(latest.is_empty(), "not read in a private room");
         assert!(!admits.contains(&pk(&mallory)), "and never as holding the current key");
-        let (latest, _) = merge_channel_presence_blobs(&[blob(&forged)], &room.channel_id, &secrets, false, now);
+        let (latest, _, _) = merge_channel_presence_blobs(&[blob(&forged)], &room.channel_id, &secrets, false, now);
         assert!(latest.contains_key(&pk(&mallory)), "the public shape, in a public room");
 
         // A newer v1 leave beats an older v2 announce: the merge is by member.
         let ada_left = SignedRecord::channel_presence_v1_at(
             "ada", L::default(), room.channel_id, room.pubkey, &current, true, channel::presence_epoch(now), true, &[1; 32], &ada, now + 5,
         );
-        let (latest, _) =
+        let (latest, _, _) =
             merge_channel_presence_blobs(&[blob(&ada_v2), blob(&ada_left)], &room.channel_id, &secrets, true, now + 5);
         assert!(latest[&pk(&ada)].departed);
     }
@@ -509,10 +519,11 @@ mod membership_record_v2_tests {
         let id_hex = hex::encode(room.channel_id);
         let ada = identity([0x0Bu8; 32]);
         let (path, db) = member_device("behind", &room, &[]);
-        let lookup = |db: &Database| {
+        let lookup_skipping = |db: &Database, skip: &[i64]| {
             let ch = db.get_channel(&id_hex).unwrap().unwrap();
-            channel_epoch_lookup(db, &ada.ed25519_secret_key, &ada.ed25519_public_key, &ch, &room.channel_id)
+            channel_epoch_lookup(db, &ada.ed25519_secret_key, &ada.ed25519_public_key, &ch, &room.channel_id, skip)
         };
+        let lookup = |db: &Database| lookup_skipping(db, &[]);
 
         let published = owner_publishes(&room, &ada.ed25519_public_key, 4, &SECRETS[4]);
         assert_eq!(published.len(), 1, "a 1.8.0 owner publishes a member's copy in v2 alone");
@@ -529,9 +540,12 @@ mod membership_record_v2_tests {
         );
         assert_eq!(db.load_channel_key_epochs(&id_hex).unwrap()[0], (4, SECRETS[4]));
 
-        // The epochs in between, newest first, each under its own key.
+        // The epochs in between, newest first, each under its own key, and
+        // one not found lately is passed over for the next.
         let (target, keys) = lookup(&db).unwrap();
         assert_eq!(target, 3);
+        assert_eq!(lookup_skipping(&db, &[3]).unwrap().0, 2);
+        assert_eq!(lookup_skipping(&db, &[3, 2, 1]), None, "nothing to ask for until they are due again");
         let three = owner_publishes_1_7(&room, &ada.ed25519_public_key, 3, &SECRETS[3]);
         assert_eq!(keys[0], three[0].keyword_hash);
         // v1 alone, as a 1.7.4 owner or storer leaves it, is still read.
@@ -551,6 +565,255 @@ mod membership_record_v2_tests {
 
         drop(db);
         remove(&path);
+    }
+
+    /// The owner's renewal of an older retained epoch reaches a member who
+    /// joined after it was superseded, and leaves out a banned one.
+    #[test]
+    fn an_owners_renewal_of_an_older_epoch_reaches_a_later_member() {
+        let room = ChannelIdentity::generate();
+        let id_hex = hex::encode(room.channel_id);
+        let owner_pub = SigningKey::from_bytes(&OWNER_SEED).verifying_key().to_bytes();
+        let (owner_path, owner_db) = temp_db("renew-owner");
+        owner_db
+            .insert_channel(&id_hex, &hex::encode(room.pubkey), "Den", "private", true, Some(&room.seed()), Some(&SECRETS[0]))
+            .unwrap();
+        for epoch in 1..=4 {
+            owner_db.insert_channel_key_epoch(&id_hex, epoch, &SECRETS[epoch as usize]).unwrap();
+        }
+        let late = identity([0x0Eu8; 32]);
+        let banned = identity([0x0Fu8; 32]);
+        for member in [&late, &banned] {
+            owner_db
+                .upsert_channel_member(&id_hex, &hex::encode(member.ed25519_public_key), "Them", 100, None)
+                .unwrap();
+        }
+        owner_db
+            .apply_channel_moderation(
+                &id_hex, "", "", 2_000, &[banned.ed25519_public_key], &[], Some(&owner_pub), None, None, Some(4), None, None,
+            )
+            .unwrap();
+
+        let records = super::seal_epoch_records(&owner_db, &id_hex, 2, &room, &OWNER_SEED, owner_pub);
+        assert!(!records.is_empty());
+        let (late_path, late_db) = member_device("renew-late", &room, &[4]);
+        assert_eq!(
+            ingest_channel_epoch_records(&late_db, &late, room.channel_id, 2, &records.iter().map(blob).collect::<Vec<_>>()),
+            ChannelEpochIngest::Rekeyed
+        );
+        let (banned_path, banned_db) = member_device("renew-banned", &room, &[1]);
+        assert_eq!(
+            ingest_channel_epoch_records(&banned_db, &banned, room.channel_id, 2, &records.iter().map(blob).collect::<Vec<_>>()),
+            ChannelEpochIngest::Nothing,
+            "nothing sealed to a banned member"
+        );
+        drop((owner_db, late_db, banned_db));
+        for path in [owner_path, late_path, banned_path] {
+            remove(&path);
+        }
+    }
+
+    /// An owning device that another device of the same identity rotated past
+    /// looks up its own copy of the room's newest epoch, then the one in
+    /// between, and opens both; holding every epoch, it looks up nothing.
+    #[test]
+    fn an_owning_device_behind_another_fetches_the_newer_keys_back() {
+        let room = ChannelIdentity::generate();
+        let id_hex = hex::encode(room.channel_id);
+        let owner = identity(OWNER_SEED);
+        let owner_pub = owner.ed25519_public_key;
+        let (path, db) = temp_db("owner-behind");
+        db.insert_channel(&id_hex, &hex::encode(room.pubkey), "Den", "private", true, Some(&room.seed()), Some(&SECRETS[0]))
+            .unwrap();
+        for epoch in 1..=2 {
+            db.insert_channel_key_epoch(&id_hex, epoch, &SECRETS[epoch as usize]).unwrap();
+        }
+        let lookup = |db: &Database| {
+            let ch = db.get_channel(&id_hex).unwrap().unwrap();
+            channel_epoch_lookup(db, &owner.ed25519_secret_key, &owner_pub, &ch, &room.channel_id, &[])
+        };
+        let own_copy = |epoch: i64| {
+            owner_publishes_forms(&room, &owner_pub, epoch, &SECRETS[epoch as usize], true)
+                .iter()
+                .map(blob)
+                .collect::<Vec<_>>()
+        };
+        db.apply_channel_moderation(&id_hex, "", "", 900, &[], &[], Some(&owner_pub), None, None, Some(2), None, None)
+            .unwrap();
+        assert_eq!(lookup(&db), None, "an owner holding every epoch it minted");
+
+        // The other device's snapshot names epoch 4.
+        db.apply_channel_moderation(&id_hex, "", "", 1_000, &[], &[], Some(&owner_pub), None, None, Some(4), None, None)
+            .unwrap();
+        let (target, keys) = lookup(&db).expect("the room's newest epoch");
+        assert_eq!(target, 4);
+        let v2 = owner_publishes_forms(&room, &owner_pub, 4, &SECRETS[4], true);
+        assert_eq!(keys[0], v2[0].keyword_hash, "its own v2 slot, as the other device sealed it");
+        assert_eq!(
+            ingest_channel_epoch_records(&db, &owner, room.channel_id, 4, &own_copy(4)),
+            ChannelEpochIngest::Rekeyed
+        );
+        assert_eq!(db.get_channel(&id_hex).unwrap().unwrap().key_epoch, 4);
+        assert_eq!(lookup(&db).expect("the epoch in between").0, 3);
+        assert_eq!(
+            ingest_channel_epoch_records(&db, &owner, room.channel_id, 3, &own_copy(3)),
+            ChannelEpochIngest::Rekeyed
+        );
+        assert_eq!(lookup(&db), None, "caught up");
+        assert_eq!(
+            db.load_channel_key_epochs(&id_hex).unwrap().iter().map(|(epoch, _)| *epoch).collect::<Vec<_>>(),
+            vec![4, 3, 2, 1]
+        );
+
+        // Its own pass then rotates twice, which moves nothing it has been
+        // told: the window follows the epochs it holds, so the one the
+        // retention dropped is not looked up, nor kept if it arrives.
+        for epoch in [5, 6] {
+            assert!(db.mint_channel_key_epoch(&id_hex, epoch, &[epoch as u8; 32]).unwrap());
+        }
+        let row = db.get_channel(&id_hex).unwrap().unwrap();
+        assert_eq!((row.key_epoch, row.key_epoch_wanted), (6, 4));
+        assert_eq!(lookup(&db), None, "epoch 2 is past the window of 3 to 6");
+        assert_eq!(
+            ingest_channel_epoch_records(&db, &owner, room.channel_id, 2, &own_copy(2)),
+            ChannelEpochIngest::Nothing,
+            "dropped on arrival, so nothing to look up again on its account"
+        );
+
+        // Deleted here: a lookup begun before brings none of its keys back.
+        assert!(db.tombstone_channel(&id_hex).unwrap());
+        assert_eq!(
+            ingest_channel_epoch_records(&db, &owner, room.channel_id, 4, &own_copy(4)),
+            ChannelEpochIngest::Nothing
+        );
+        assert!(db.load_channel_key_epochs(&id_hex).unwrap().is_empty());
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// An empty epoch lookup is passed over for a while only when every walk
+    /// finished, a peer answered one, and the epoch was already older than
+    /// the room's announced one when they began; a lookup that found the key
+    /// is never a miss.
+    #[test]
+    fn only_an_answered_finished_miss_of_an_older_epoch_is_passed_over() {
+        let held = |answered: bool, incomplete: bool, older: bool| super::EpochLookupHeld {
+            records: Vec::new(),
+            answered,
+            incomplete,
+            older,
+        };
+        assert!(held(true, false, true).end().miss_counts());
+        assert!(!held(false, false, true).end().miss_counts(), "nobody answered");
+        assert!(!held(true, true, true).end().miss_counts(), "a walk was cut short");
+        assert!(!held(true, false, false).end().miss_counts(), "the room's announced epoch then");
+
+        let room = ChannelIdentity::generate();
+        let ada = identity([0x0Bu8; 32]);
+        let (path, db) = member_device("miss", &room, &[]);
+        let older = super::EpochLookupEnd { answered: true, older: true };
+        let missed = |epoch: i64, records: Vec<Vec<u8>>, end: super::EpochLookupEnd| {
+            super::run_channel_ingest(
+                &db,
+                &ada,
+                &ada.ed25519_public_key,
+                super::ChannelIngestBatch {
+                    epoch: vec![(room.channel_id, epoch, records, end)],
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(missed(3, Vec::new(), older).epoch_missed, vec![(room.channel_id, 3)]);
+        assert!(missed(3, Vec::new(), super::EpochLookupEnd::default()).epoch_missed.is_empty());
+        let announced = missed(4, Vec::new(), super::EpochLookupEnd { answered: true, older: false });
+        assert!(announced.epoch_missed.is_empty() && announced.rotation_owed.is_empty(), "a member's room owes nothing");
+        let found = owner_publishes(&room, &ada.ed25519_public_key, 2, &SECRETS[2]);
+        assert!(missed(2, found.iter().map(blob).collect(), older).epoch_missed.is_empty(), "found and stored");
+
+        drop(db);
+        remove(&path);
+    }
+
+    /// The renewal takes the older epoch whose week is up that went longest
+    /// without one, an epoch never on record first and of those the oldest,
+    /// and never the current one.
+    #[test]
+    fn a_retained_renewal_takes_the_longest_unrenewed_older_epoch() {
+        use super::{retained_epoch_to_renew, RETAINED_EPOCH_RENEW_SECS as WEEK};
+
+        let now = 10 * WEEK;
+        let fresh = Some(now - 60);
+        assert_eq!(retained_epoch_to_renew(&[(1, None), (2, None), (3, None), (4, None)], 4, now), Some(1));
+        assert_eq!(
+            retained_epoch_to_renew(&[(1, fresh), (2, Some(now - 2 * WEEK)), (3, Some(now - WEEK)), (4, None)], 4, now),
+            Some(2),
+            "the longest unrenewed"
+        );
+        assert_eq!(
+            retained_epoch_to_renew(&[(2, Some(now - WEEK + 1)), (3, fresh), (4, None)], 4, now),
+            None,
+            "none before its week is up, and never the current epoch"
+        );
+        assert_eq!(retained_epoch_to_renew(&[(1, None), (2, None)], 1, now), None, "nothing older than epoch 1");
+        assert_eq!(retained_epoch_to_renew(&[], 3, now), None);
+    }
+
+    /// An owner edit waits for an answered look at the room made within its
+    /// freshness span, asking for one, and a room made here counts as looked
+    /// at. A look nobody answered changes nothing; an edit is held back two
+    /// minutes at most from the first refused.
+    #[test]
+    fn an_owner_edit_waits_for_a_fresh_answered_look_at_the_room() {
+        use super::{
+            note_channel_moderation_read, owner_edit_waits_for_first_read, OWNER_EDIT_READ_FRESH_SECS,
+            OWNER_EDIT_READ_WAIT_SECS,
+        };
+
+        let now = 1_800_000_000;
+        let wanted = |room: &ChannelIdentity| super::moderation_reads().wanted.contains(&room.channel_id);
+        let room = ChannelIdentity::generate();
+        let id_hex = hex::encode(room.channel_id);
+        assert!(owner_edit_waits_for_first_read(&id_hex, now));
+        assert!(wanted(&room), "the poll looks it up at once");
+        note_channel_moderation_read(room.channel_id, false, now + 5);
+        assert!(owner_edit_waits_for_first_read(&id_hex, now + 10), "nobody answered");
+        note_channel_moderation_read(room.channel_id, true, now + 20);
+        assert!(!owner_edit_waits_for_first_read(&id_hex, now + 21));
+        assert!(!wanted(&room));
+        let stale = now + 20 + OWNER_EDIT_READ_FRESH_SECS;
+        assert!(owner_edit_waits_for_first_read(&id_hex, stale), "read too long ago");
+        assert!(wanted(&room));
+
+        // A snapshot fetched and not yet written holds edits back too.
+        note_channel_moderation_read(room.channel_id, true, stale);
+        super::note_channel_moderation_unwritten(room.channel_id);
+        assert!(owner_edit_waits_for_first_read(&id_hex, stale + 1), "an answer in hand");
+        note_channel_moderation_read(room.channel_id, false, stale + 2);
+        note_channel_moderation_read(room.channel_id, true, stale + 3);
+        assert!(!owner_edit_waits_for_first_read(&id_hex, stale + 4));
+
+        // Nobody answers: the first refused edit starts the two minutes, and a
+        // look nobody answered does not. Once through, edits go ahead for the
+        // freshness span, and after it the wait starts over.
+        let offline = ChannelIdentity::generate();
+        let offline_hex = hex::encode(offline.channel_id);
+        note_channel_moderation_read(offline.channel_id, false, now);
+        let first = now + 600;
+        assert!(owner_edit_waits_for_first_read(&offline_hex, first));
+        assert!(owner_edit_waits_for_first_read(&offline_hex, first + OWNER_EDIT_READ_WAIT_SECS - 1));
+        let through = first + OWNER_EDIT_READ_WAIT_SECS;
+        assert!(!owner_edit_waits_for_first_read(&offline_hex, through), "two minutes at most");
+        assert!(!owner_edit_waits_for_first_read(&offline_hex, through + 30), "the same action checks again");
+        assert!(
+            owner_edit_waits_for_first_read(&offline_hex, through + OWNER_EDIT_READ_FRESH_SECS),
+            "a new wait after the span, as after a sleep"
+        );
+
+        let made = ChannelIdentity::generate();
+        note_channel_moderation_read(made.channel_id, true, now);
+        assert!(!owner_edit_waits_for_first_read(&hex::encode(made.channel_id), now));
+        assert!(!owner_edit_waits_for_first_read("not a room", now), "nothing to wait for");
     }
 
     /// A member whose copy of a rotation was never published opens the
@@ -576,6 +839,7 @@ mod membership_record_v2_tests {
                 &member.ed25519_public_key,
                 &ch,
                 &room.channel_id,
+                &[],
             )
             .unwrap();
             assert_eq!(target, 4);
@@ -967,6 +1231,49 @@ mod channel_settings_schedule_tests {
         drop((a, b));
         remove(&path_a);
         remove(&path_b);
+    }
+
+    /// An owner's republish signs only after a fresh look at the network's
+    /// snapshot has been written, asks for one when it has none, and puts
+    /// itself off a few minutes when none is answered in time, signing
+    /// regardless only once it has been put off for a republish interval;
+    /// never over an answer in hand that is not written yet.
+    #[test]
+    fn an_owner_republish_signs_after_a_fresh_look() {
+        use super::{owner_republish_read_gate as gate, OwnerRepublishRead as Read};
+        let now = 1_000_000;
+        let fresh = super::OWNER_REPUBLISH_READ_FRESH_SECS;
+        let wait = super::OWNER_REPUBLISH_READ_WAIT_SECS;
+        let defer_max = super::OWNER_REPUBLISH_DEFER_MAX_SECS;
+        assert_eq!(gate(Some(now - fresh), None, 0, false, false, now), Read::Ready);
+        assert_eq!(gate(Some(now - fresh - 1), None, 0, false, false, now), Read::Ask, "too old");
+        assert_eq!(gate(None, None, 0, false, false, now), Read::Ask, "never looked");
+        assert_eq!(gate(Some(now), None, 0, false, true, now), Read::Wait, "the look is not written yet");
+        assert_eq!(gate(Some(now + 600), None, 0, false, false, now), Read::Ask, "begun before the clock was set back");
+        // Asked: a look begun since counts, one running is waited for, and one
+        // that ended without an answer is asked for again.
+        let asked = now - 60;
+        assert_eq!(gate(Some(asked), Some(asked), 0, false, false, now), Read::Ready);
+        assert_eq!(gate(Some(asked - 1), Some(asked), 0, true, false, now), Read::Wait);
+        assert_eq!(gate(Some(asked - 1), Some(asked), 0, false, false, now), Read::Ask);
+        // Nothing answered in time: put off, not signed, until it has been put
+        // off for a republish interval; an answer in hand is written first.
+        assert_eq!(gate(None, Some(now - wait), 0, true, false, now), Read::Defer);
+        assert_eq!(gate(None, Some(now - wait), defer_max - 1, false, false, now), Read::Defer);
+        assert_eq!(gate(None, Some(now - wait), defer_max, false, false, now), Read::Ready);
+        assert_eq!(gate(None, Some(now - wait), defer_max, true, true, now), Read::Wait);
+        assert_eq!(gate(Some(now - wait), Some(now - wait), 0, false, false, now), Read::Ready, "answered since");
+    }
+
+    /// A look an owner can sign after found the snapshot, or enough peers
+    /// answered it for finding nothing to mean the snapshot is not there.
+    #[test]
+    fn a_look_counts_once_it_found_the_snapshot_or_enough_peers_answered() {
+        use crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE as ENOUGH;
+        assert!(super::moderation_look_answered(1, 1));
+        assert!(!super::moderation_look_answered(ENOUGH - 1, 0));
+        assert!(super::moderation_look_answered(ENOUGH, 0));
+        assert!(!super::moderation_look_answered(0, 0));
     }
 
     /// An owner's snapshot that no storer took is published again within
@@ -3756,6 +4063,24 @@ pub(super) async fn maybe_refresh_channel_moderation(
         return;
     };
     let mut started = 0usize;
+    // Rooms an owner edit is waiting to see read go first, whatever their
+    // schedule and whether or not we are in them.
+    let mut wanted: Vec<[u8; 16]> = take_owner_reads_wanted().into_iter().collect();
+    while let Some(channel_id) = wanted.pop() {
+        let id_hex = hex::encode(channel_id);
+        let Some(ch) = channels.iter().find(|ch| ch.channel_id == id_hex) else {
+            continue;
+        };
+        match start_channel_moderation_fetch(socket, state, ch, channel_id, now).await {
+            None => {
+                wanted.push(channel_id);
+                return_owner_reads_wanted(wanted);
+                return;
+            }
+            Some(false) => {}
+            Some(true) => started += 1,
+        }
+    }
     for ch in channels.iter() {
         if !ch.in_room_now() {
             continue;
@@ -3812,8 +4137,10 @@ async fn start_channel_moderation_fetch(
     state
         .ember_channel_moderation_searches
         .insert(search_id, channel_id);
-    drive_ember_search(socket, state, search_id).await;
+    // Before the drive, which can finish the search: its end reads this as
+    // when it began (`channel_moderation_looked_at`).
     state.channel_moderation_fetch_at.insert(channel_id, now);
+    drive_ember_search(socket, state, search_id).await;
     let pass = state.channel_moderation_passes.entry(channel_id).or_insert(0);
     if settings_fetch_rides_pass(*pass, ch) {
         state.channel_settings_fetch_owed.insert(channel_id);
@@ -4510,6 +4837,7 @@ pub(crate) fn ingest_channel_moderation_records(
         return false;
     };
     let mut best: Option<ember::dht::publish::ChannelModeration> = None;
+    let mut passed_over = Vec::new();
     for blob in records {
         let Some(parsed) =
             ember::dht::publish::SignedRecord::parse_channel_moderation(blob, &channel_id)
@@ -4527,7 +4855,9 @@ pub(crate) fn ingest_channel_moderation_records(
                 Some(&cur.signature),
             )
         }) {
-            best = Some(parsed);
+            passed_over.extend(best.replace(parsed));
+        } else {
+            passed_over.push(parsed);
         }
     }
     let Some(moderation) = best else {
@@ -4552,14 +4882,47 @@ pub(crate) fn ingest_channel_moderation_records(
             &moderation.signature,
         )
         .unwrap_or(false);
+    // On a room we own, every copy the lookup brought back is this identity's
+    // word, the older ones included: what they say about epochs and bans is
+    // noted, against the room as the newest has just left it.
+    if ch.is_owner {
+        for older in &passed_over {
+            let noted = db.note_owned_snapshot_seen(
+                &channel_id_hex,
+                &crate::storage::database::ModerationSnapshot {
+                    topic: &older.topic,
+                    welcome: &older.welcome,
+                    banned_pubkeys: &older.banned_pubkeys,
+                    moderator_pubkeys: &older.moderator_pubkeys,
+                    owner_pubkey: older.tail.owner_pubkey.as_ref(),
+                    successor_nominee: older.tail.successor_nominee.as_ref(),
+                    claim_after_days: older.tail.claim_after_days,
+                    key_epoch: older.tail.key_epoch,
+                    invites_owner_only: older.tail.invites_owner_only,
+                    slow_mode_secs: older.tail.slow_mode_secs,
+                },
+                older.timestamp,
+            );
+            if let Err(e) = noted {
+                debug!("Ember channel {channel_id_hex}: could not note an older snapshot: {e}");
+            }
+        }
+    }
     // Only from a snapshot just accepted as the owner's newest, so an older
-    // record replayed from a slow storer cannot rename the room back. Never on
-    // the owner's own device: its name is the one it renamed the room to, and
-    // a snapshot of its own signed before the rename would quietly undo it here
-    // while the registry and every member moved on.
+    // record replayed from a slow storer cannot rename the room back. On a
+    // room we own that is one another device of ours signed after any of this
+    // device's (`ingest_channel_moderation` refuses the rest, this device's
+    // own older ones included), so the name is the one it renamed the room to;
+    // left alone, this device's next republish and registry renewal would
+    // name the room back. Not over a rename made here since it was signed.
     if applied {
-        if let Some(name) = moderation.tail.room_name.as_deref().filter(|_| !ch.is_owner) {
-            if let Err(e) = db.apply_owner_room_name(&channel_id_hex, name) {
+        if let Some(name) = moderation.tail.room_name.as_deref() {
+            let taken = if ch.is_owner {
+                db.apply_own_room_name(&channel_id_hex, name, moderation.timestamp)
+            } else {
+                db.apply_owner_room_name(&channel_id_hex, name)
+            };
+            if let Err(e) = taken {
                 tracing::warn!("Channel {channel_id_hex}: could not apply the owner's room name: {e}");
             }
         }
@@ -4596,6 +4959,26 @@ fn take_v1_cut_over_rotations(db: &Database, now: i64) {
     }
 }
 
+/// Owe a private room we own its second rotation once its members' v1 copies
+/// have stopped ([`ember::channel::V1_RELINK_QUIET_SECS`]).
+fn take_v1_relink_rotation(db: &Database, channel_id_hex: &str, now: i64) {
+    if !ember::channel::V1_CUT_OVER_ROTATES {
+        return;
+    }
+    match db.take_channel_relink_rotation(
+        channel_id_hex,
+        now,
+        ember::channel::V1_RELINK_QUIET_SECS,
+        ember::channel::V1_RELINK_GRACE_SECS,
+    ) {
+        Ok(true) => info!(
+            "Ember channel {channel_id_hex}: rotating once more, as members' v1 presence copies have stopped"
+        ),
+        Ok(false) => {}
+        Err(e) => warn!("Ember channel {channel_id_hex}: could not owe the second rotation: {e}"),
+    }
+}
+
 /// Whether a rotation made now would reach the room. Members learn a new epoch
 /// only from the snapshot this pass publishes, and the next one is
 /// `MODERATION_REPUBLISH_SECS` away, so a rotation announced to a table that has
@@ -4604,6 +4987,259 @@ fn take_v1_cut_over_rotations(db: &Database, now: i64) {
 /// can run on the saved address book alone, none of it heard from yet.
 fn rotation_can_be_announced(state: &NetworkState) -> bool {
     state.ember_dht.routing().verified_len() >= ember::dht::publish::MIN_STORE_NODES
+}
+
+/// How often an owner renews the key records of each older epoch a room still
+/// keeps; the current epoch's go out on every owner pass.
+///
+/// A key-epoch record lives 30 days from its last renewal, so renewing only the
+/// current epoch would let an older one lapse a month after it was superseded,
+/// and one minted before a member joined would never be sealed to them. Such a
+/// member could not read what a peer still on that epoch re-served, or an
+/// attachment sealed under it. A week keeps each well inside its 30 days. When
+/// each epoch was last renewed is kept in the database
+/// (`Database::channel_epoch_renewals`), the current one's included, so the
+/// week holds across restarts and starts from an epoch's last renewal as the
+/// current one ([`maybe_renew_retained_channel_epochs`]).
+const RETAINED_EPOCH_RENEW_SECS: i64 = 7 * 24 * 3600;
+
+/// Publish slots a retained renewal leaves free for everything else: records
+/// still going out, and the next room's snapshot.
+const RETAINED_EPOCH_SLOT_MARGIN: usize = 16;
+
+/// How often the rooms we own are looked over for an older epoch due for
+/// renewal, while none is.
+const RETAINED_EPOCH_SCAN_SECS: i64 = 15 * 60;
+
+/// An older epoch's records being renewed: sealed at once, and started a few
+/// at a time as the publish table has room ([`maybe_renew_retained_channel_epochs`]).
+pub(super) struct RetainedEpochRenewal {
+    channel_id_hex: String,
+    epoch: i64,
+    sealed_at: i64,
+    /// Each record still to start, with the member it is sealed to.
+    records: Vec<([u8; 32], ember::dht::publish::SignedRecord)>,
+}
+
+/// Of a room's epochs with when each was last renewed (`None` for never on
+/// record), the older one to renew now: due a week after its last renewal,
+/// longest unrenewed first, and of those never on record the oldest, which was
+/// superseded first and so lapses first.
+fn retained_epoch_to_renew(renewals: &[(i64, Option<i64>)], current: i64, now: i64) -> Option<i64> {
+    renewals
+        .iter()
+        .filter(|(epoch, _)| (1..current).contains(epoch))
+        .filter(|(_, at)| ember::channel::schedule_due(at.unwrap_or(0), now, RETAINED_EPOCH_RENEW_SECS))
+        .min_by_key(|(epoch, at)| (at.unwrap_or(0), *epoch))
+        .map(|(epoch, _)| *epoch)
+}
+
+/// Renew the key records of one older epoch a room we own still keeps, sealed
+/// the same way as the current epoch's to every unbanned member and to us.
+///
+/// One epoch at a time across all our rooms, the longest unrenewed first, its
+/// records sealed together, in an order drawn afresh ([`seal_epoch_records`]),
+/// and started as the publish table has room beside
+/// [`RETAINED_EPOCH_SLOT_MARGIN`]: a large room's epoch can hold more records
+/// than the table, and starting them all at once, beside the current epoch's,
+/// would push out the next room's snapshot. Each batch leaves out members
+/// banned since the records were sealed, and a room deleted or handed over
+/// meanwhile is dropped. The epoch counts as renewed once every record has
+/// started; a batch left over from before a restart, or held up for longer
+/// than a republish interval, is sealed again.
+pub(super) async fn maybe_renew_retained_channel_epochs(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    settings: &AppSettings,
+    identity: &crate::storage::identity::NodeIdentity,
+) {
+    if !settings.ember_native_enabled || db.chat_locked() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let Some(channels) = channels_lite_cached(state, db) else {
+        return;
+    };
+    let renewable = |ch: &crate::storage::database::StoredChannel| {
+        ch.is_owner
+            && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
+            && !ch.deleted
+            && ch.successor_id.is_empty()
+            && ch.key_epoch > 1
+    };
+    if state.channel_retained_renewal.as_ref().is_some_and(|renewal| {
+        !(0..ember::channel::MODERATION_REPUBLISH_SECS).contains(&now.saturating_sub(renewal.sealed_at))
+            || !channels
+                .iter()
+                .any(|ch| ch.channel_id == renewal.channel_id_hex && renewable(ch))
+    }) {
+        state.channel_retained_renewal = None;
+    }
+    if state.channel_retained_renewal.is_none() {
+        if !ember::channel::schedule_due(state.channel_retained_scan_at, now, RETAINED_EPOCH_SCAN_SECS) {
+            return;
+        }
+        state.channel_retained_scan_at = now;
+        let rooms: Vec<String> = channels
+            .iter()
+            .filter(|ch| renewable(ch))
+            .map(|ch| ch.channel_id.clone())
+            .collect();
+        if rooms.is_empty() {
+            return;
+        }
+        let picked = {
+            let db = db.clone();
+            let our_seed = zeroize::Zeroizing::new(identity.ed25519_secret_key);
+            let our_pk = identity.ed25519_public_key;
+            tokio::task::spawn_blocking(move || {
+                let mut due: Vec<(String, i64, i64)> = rooms
+                    .into_iter()
+                    .filter_map(|channel_id_hex| {
+                        let ch = db.get_channel_lite(&channel_id_hex).ok().flatten()?;
+                        let renewals = db.channel_epoch_renewals(&channel_id_hex).ok()?;
+                        let epoch = retained_epoch_to_renew(&renewals, ch.key_epoch, now)?;
+                        let at = renewals
+                            .iter()
+                            .find(|(held, _)| *held == epoch)
+                            .and_then(|(_, at)| *at)
+                            .unwrap_or(0);
+                        Some((channel_id_hex, epoch, at))
+                    })
+                    .collect();
+                due.sort_by_key(|(_, epoch, at)| (*at, *epoch));
+                // The first that seals: one whose key or seed cannot be read
+                // must not hold up every other room.
+                due.into_iter().find_map(|(channel_id_hex, epoch, _)| {
+                    let seed = db.load_channel_owner_seed(&channel_id_hex).ok().flatten()?;
+                    let ident = ember::channel::ChannelIdentity::from_seed(&seed);
+                    let records = seal_epoch_records_to(&db, &channel_id_hex, epoch, &ident, &our_seed, our_pk);
+                    (!records.is_empty()).then_some(RetainedEpochRenewal {
+                        channel_id_hex,
+                        epoch,
+                        sealed_at: now,
+                        records,
+                    })
+                })
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        let Some(renewal) = picked else {
+            return;
+        };
+        // Another epoch may be due as well: look again once this one is out.
+        state.channel_retained_scan_at = 0;
+        state.channel_retained_renewal = Some(renewal);
+    }
+    let Some(mut renewal) = state.channel_retained_renewal.take() else {
+        return;
+    };
+    let our_pk = identity.ed25519_public_key;
+    // Held, not sent unchecked, while the ban list cannot be read.
+    let Ok(banned) = db.list_banned_channel_pubkeys(&renewal.channel_id_hex) else {
+        state.channel_retained_renewal = Some(renewal);
+        return;
+    };
+    let banned: HashSet<[u8; 32]> = banned.into_iter().filter(|pk| *pk != our_pk).collect();
+    renewal.records.retain(|(member_pk, _)| !banned.contains(member_pk));
+    let room = ember::dht::publish::MAX_ACTIVE_PUBLISHES
+        .saturating_sub(state.ember_publish.active_count())
+        .saturating_sub(RETAINED_EPOCH_SLOT_MARGIN);
+    let batch: Vec<_> = renewal.records.drain(..room.min(renewal.records.len())).collect();
+    for (member_pk, record) in batch {
+        match start_own_channel_renewal(state, record.clone()) {
+            Some(publish_id) => drive_ember_publish(socket, state, publish_id).await,
+            None => renewal.records.push((member_pk, record)),
+        }
+    }
+    if !renewal.records.is_empty() {
+        state.channel_retained_renewal = Some(renewal);
+        return;
+    }
+    if let Err(e) = db.note_channel_epoch_renewed(&renewal.channel_id_hex, renewal.epoch, now) {
+        // Not looked over again at once, or the same epoch would go out on
+        // every tick.
+        state.channel_retained_scan_at = now;
+        debug!("Ember channel {}: could not note epoch {} renewed: {e}", renewal.channel_id_hex, renewal.epoch);
+    }
+}
+
+/// How recent a look at the network's snapshot an owner's republish counts as
+/// fresh without asking for another.
+const OWNER_REPUBLISH_READ_FRESH_SECS: i64 = 30;
+/// How long a due republish waits for the look it asked for before it puts
+/// itself off a few minutes ([`OwnerRepublishRead::Defer`]).
+const OWNER_REPUBLISH_READ_WAIT_SECS: i64 = 120;
+/// How long a republish puts itself off for want of an answered look before it
+/// signs regardless: one republish interval, well inside the life of the copy
+/// the network holds. Past it the room's renewal, its registry name and its
+/// directory entry with it, cannot wait on a network that answers nobody.
+const OWNER_REPUBLISH_DEFER_MAX_SECS: i64 = ember::channel::MODERATION_REPUBLISH_SECS;
+
+/// What an owner's due republish does about its view of the snapshot the
+/// network holds ([`owner_republish_read_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerRepublishRead {
+    /// Sign now.
+    Ready,
+    /// A look is running or its answer is not written yet.
+    Wait,
+    /// Start a look, then wait for it.
+    Ask,
+    /// No look was answered in time: try again a few minutes on rather than
+    /// sign. A stamp taken now would outrank every snapshot the other device
+    /// signed while this one was away, which it would then refuse and undo.
+    Defer,
+}
+
+/// Whether an owner's due republish may sign yet.
+///
+/// A snapshot is a whole state, and the newer stamp wins, so a device that
+/// republishes what it held before this identity's other device edited the
+/// room — a ban, a moderator, the topic — stamps that older state later and
+/// undoes the edit everywhere, the other device included. Signing only after
+/// a look the network answered, begun within the last
+/// [`OWNER_REPUBLISH_READ_FRESH_SECS`] or since this republish first asked,
+/// and written to the database (nothing `unwritten`), narrows that to the time
+/// between the look and the signature, about a minute: the pass after the one
+/// that asked. `looked_at` is when the newest answered look began, `asked_at`
+/// when this republish first asked or waited, `deferred_for` how long it has
+/// been putting itself off, `in_flight` whether a look is running.
+fn owner_republish_read_gate(
+    looked_at: Option<i64>,
+    asked_at: Option<i64>,
+    deferred_for: i64,
+    in_flight: bool,
+    unwritten: bool,
+    now: i64,
+) -> OwnerRepublishRead {
+    // An answer already in hand is written first, however long the wait.
+    if unwritten {
+        return OwnerRepublishRead::Wait;
+    }
+    // A look dated ahead of the clock was begun before it was set back, so it
+    // says nothing about how recent it is.
+    let fresh = looked_at.filter(|at| *at <= now).is_some_and(|at| {
+        at >= now.saturating_sub(OWNER_REPUBLISH_READ_FRESH_SECS) || asked_at.is_some_and(|asked| at >= asked)
+    });
+    if fresh {
+        return OwnerRepublishRead::Ready;
+    }
+    if asked_at.is_some_and(|asked| now.saturating_sub(asked) >= OWNER_REPUBLISH_READ_WAIT_SECS) {
+        return if deferred_for >= OWNER_REPUBLISH_DEFER_MAX_SECS {
+            OwnerRepublishRead::Ready
+        } else {
+            OwnerRepublishRead::Defer
+        };
+    }
+    if in_flight {
+        OwnerRepublishRead::Wait
+    } else {
+        OwnerRepublishRead::Ask
+    }
 }
 
 /// How soon an owner's moderation snapshot goes out again when it stored
@@ -4663,6 +5299,9 @@ pub(super) async fn maybe_publish_owned_channel_records(
         return;
     };
     let mut started = 0usize;
+    // Lookups the read gate starts this pass, held to the moderation poll's
+    // own budget: at startup every owned room is due at once.
+    let mut asked_reads = 0usize;
     for ch in channels.iter() {
         if ch.deleted {
             continue;
@@ -4730,6 +5369,8 @@ pub(super) async fn maybe_publish_owned_channel_records(
             // Nothing pending: whatever stamp ended the silence, its hold is over.
             state.channel_return_held_since.remove(&channel_id);
         }
+        // Before the read gate, so a room that cannot sign does not cost a
+        // lookup every pass.
         let Ok(Some(seed)) = db.load_channel_owner_seed(&ch.channel_id) else {
             continue;
         };
@@ -4737,7 +5378,73 @@ pub(super) async fn maybe_publish_owned_channel_records(
         if ident.channel_id != channel_id {
             continue;
         }
+        // An ask older than twice the wait belongs to a pass that went no
+        // further (held, or past this tick's publishes), so it starts over, as
+        // does one dated ahead of a clock that has since been set back.
+        let asked_at = state
+            .channel_republish_read_asked
+            .get(&channel_id)
+            .copied()
+            .filter(|asked| (0..2 * OWNER_REPUBLISH_READ_WAIT_SECS).contains(&now.saturating_sub(*asked)));
+        let read = owner_republish_read_gate(
+            state.channel_moderation_looked_at.get(&channel_id).copied(),
+            asked_at,
+            state
+                .channel_republish_deferred
+                .get(&channel_id)
+                .map_or(0, |(deferred_for, _)| *deferred_for),
+            state
+                .ember_channel_moderation_searches
+                .values()
+                .any(|id| *id == channel_id),
+            state.ember_channel_ingest_moderation.contains_key(&channel_id)
+                || state
+                    .ember_pending_channel_moderation
+                    .iter()
+                    .any(|(id, _, _)| *id == channel_id),
+            now,
+        );
+        match read {
+            OwnerRepublishRead::Ready => {
+                state.channel_republish_read_asked.remove(&channel_id);
+                state.channel_republish_deferred.remove(&channel_id);
+            }
+            OwnerRepublishRead::Defer => {
+                state.channel_republish_read_asked.remove(&channel_id);
+                // Each gap counts at most two retries, so a sleep or a clock
+                // set back is not taken for hours of trying.
+                let (deferred_for, last) = state.channel_republish_deferred.entry(channel_id).or_insert((0, now));
+                *deferred_for += now.saturating_sub(*last).clamp(0, 2 * OWNER_SNAPSHOT_RETRY_SECS);
+                *last = now;
+                state.channel_moderation_publish_at.insert(channel_id, owner_snapshot_retry_stamp(now));
+                continue;
+            }
+            OwnerRepublishRead::Wait => {
+                // Waiting starts the cap too, or a look that never comes would
+                // hold the room forever.
+                if asked_at.is_none() {
+                    state.channel_republish_read_asked.insert(channel_id, now);
+                }
+                continue;
+            }
+            OwnerRepublishRead::Ask => {
+                // The wait starts even when this tick has no lookup to spare,
+                // or rooms behind the budget would never reach the deferral.
+                if asked_at.is_none() {
+                    state.channel_republish_read_asked.insert(channel_id, now);
+                }
+                if asked_reads >= CHANNEL_MODERATION_FETCH_PER_TICK {
+                    continue;
+                }
+                asked_reads += 1;
+                let _ = start_channel_moderation_fetch(socket, state, ch, channel_id, now).await;
+                continue;
+            }
+        }
         let private = ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE;
+        if private {
+            take_v1_relink_rotation(db, &ch.channel_id, now);
+        }
         // A delegated moderator's ban has to become an eviction, and only this
         // device can make it one: an epoch record is signed by the room
         // identity, whose seed is ours alone. Done here rather than where the
@@ -4749,11 +5456,14 @@ pub(super) async fn maybe_publish_owned_channel_records(
         // Borrowed from the shared roster until a rotation forces a re-read,
         // so the common path does not copy the row.
         let mut ch = std::borrow::Cow::Borrowed(ch);
-        let rotated = if private
-            && rotation_can_be_announced(state)
-            && db.channel_rotate_is_pending(&ch.channel_id).unwrap_or(false)
-        {
-            let minted = rotate_owned_channel_key(db, &ch.channel_id, &seed, ch.key_epoch);
+        let rotation_owed = private && db.channel_rotate_is_pending(&ch.channel_id).unwrap_or(false);
+        let rotated = if rotation_owed && rotation_can_be_announced(state) {
+            // Past the newest epoch the room has announced, not just the one
+            // held here: another device of ours may have rotated, and its key
+            // for that epoch, which this one would derive again, already went
+            // to everyone it was sealed to.
+            let from = ch.key_epoch.max(ch.key_epoch_wanted);
+            let minted = rotate_owned_channel_key(db, &ch.channel_id, &seed, from);
             if minted.is_some() {
                 // Re-read: the snapshot's tail and the re-seal both take the
                 // epoch from this row.
@@ -4768,9 +5478,11 @@ pub(super) async fn maybe_publish_owned_channel_records(
         // Stamped before the state is read, and read from the table rather
         // than the cached roster: an owner edit committed after this stamp
         // carries a later one, and one committed before it is what gets read,
-        // so this republish can never undo an edit for the room.
+        // so this republish never undoes an edit made on this device. One
+        // made on another is what the read gate above is for.
         let Ok(Some(stamp)) = db.stamp_owner_snapshot(&ch.channel_id, now) else {
             undo_owned_rotation(db, &ch.channel_id, rotated);
+            state.channel_moderation_publish_at.insert(channel_id, owner_snapshot_retry_stamp(now));
             continue;
         };
         state.channel_return_held_since.remove(&channel_id);
@@ -4781,6 +5493,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
         // above may have stored its epoch in what was just read.
         if room_rotating(&ch.channel_id) {
             undo_owned_rotation(db, &ch.channel_id, rotated);
+            state.channel_moderation_publish_at.insert(channel_id, owner_snapshot_retry_stamp(now));
             continue;
         }
         let mut bans = db
@@ -4801,10 +5514,12 @@ pub(super) async fn maybe_publish_owned_channel_records(
             &mods,
             // We own this room, so our own identity is the owner identity every
             // member needs in order to refuse a ban aimed at us, and our epoch
-            // is how they tell they are behind.
+            // is how they tell they are behind. The room's newest, if another
+            // device of ours rotated past this one: this one fetches its key,
+            // and must not tell members of a later stamp to stop at an older one.
             &ember::dht::publish::ModerationTail {
                 owner_pubkey: Some(our_pk),
-                key_epoch: Some(ch.key_epoch.max(0) as u64),
+                key_epoch: Some(ch.key_epoch.max(ch.key_epoch_wanted).max(0) as u64),
                 // Zeros rather than absent when unset, so withdrawing a
                 // nomination actually reaches members.
                 successor_nominee: Some(
@@ -4868,14 +5583,31 @@ pub(super) async fn maybe_publish_owned_channel_records(
                 hex::encode(channel_id)
             );
             undo_owned_rotation(db, &ch.channel_id, rotated);
+            // Until the next refresh: shortening the lists is an edit, which
+            // publishes on its own.
+            state.channel_moderation_publish_at.insert(channel_id, now);
             continue;
         };
+        // So a snapshot another device of ours signs in the same second is
+        // ordered against this one as members order the two.
+        if let Err(e) = db.note_owner_snapshot_signed(&ch.channel_id, stamp, &record.signature) {
+            debug!("Ember channel {}: could not note its snapshot's signature: {e}", ch.channel_id);
+        }
         let Some(publish_id) = start_own_channel_publish(state, record) else {
             undo_owned_rotation(db, &ch.channel_id, rotated);
+            state.channel_moderation_publish_at.insert(channel_id, owner_snapshot_retry_stamp(now));
             continue;
         };
         {
-            state.channel_moderation_publish_at.insert(channel_id, now);
+            // A rotation owed and not made (too few contacts to announce it,
+            // or its epoch taken meanwhile) is tried again in minutes, not at
+            // the next republish hours away.
+            let next = if rotation_owed && rotated.is_none() {
+                owner_snapshot_retry_stamp(now)
+            } else {
+                now
+            };
+            state.channel_moderation_publish_at.insert(channel_id, next);
             state.owner_snapshot_publishes.insert(publish_id, channel_id);
             // The ban is now an eviction: the snapshot naming the new epoch is
             // on its way, and the re-seal at the end of this pass reaches
@@ -5006,8 +5738,26 @@ pub(super) async fn maybe_publish_owned_channel_records(
             // member is locked out of a room they are still entitled to read,
             // with nothing to re-ask of. This is the recovery path, and it is
             // cheap: republishing an epoch a member already holds is a no-op.
-            if private && ch.key_epoch > 0 {
-                republish_channel_key_epoch(socket, state, db, &ch, &ident, identity, our_pk).await;
+            // Once per republish interval, or when the epoch has moved: a pass
+            // brought forward to retry a rotation or a snapshot that stored
+            // nowhere has no new key to hand out. Noted when every record
+            // started, so the epoch's weeks as an older one count from here
+            // ([`RETAINED_EPOCH_RENEW_SECS`]).
+            let reseal_due = state.channel_epoch_resealed.get(&channel_id).is_none_or(|(epoch, at)| {
+                *epoch != ch.key_epoch
+                    || ember::channel::schedule_due(*at, now, ember::channel::MODERATION_REPUBLISH_SECS)
+            });
+            if private && ch.key_epoch > 0 && reseal_due {
+                let (started, total) =
+                    republish_channel_key_epoch(socket, state, db, &ch, &ident, identity, our_pk).await;
+                // One the publish table could not take whole goes again on
+                // the next pass, however soon.
+                if total > 0 && started == total {
+                    state.channel_epoch_resealed.insert(channel_id, (ch.key_epoch, now));
+                    if let Err(e) = db.note_channel_epoch_renewed(&ch.channel_id, ch.key_epoch, now) {
+                        debug!("Ember channel {}: could not note its epoch renewed: {e}", ch.channel_id);
+                    }
+                }
             }
         }
     }
@@ -5228,6 +5978,153 @@ impl Drop for RestoringRoom {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.0);
+    }
+}
+
+/// How recent an answered look at a room's snapshot an owner edit counts as
+/// current: two of the moderation poll's intervals, so a room the device is
+/// in never waits once read.
+const OWNER_EDIT_READ_FRESH_SECS: i64 = 2 * ember::channel::MODERATION_FETCH_SECS;
+
+/// How long an owner edit is held back from the first one refused before it
+/// goes ahead regardless, so a network that answers nobody, or Ember's
+/// network being off, cannot keep the owner from editing.
+pub(crate) const OWNER_EDIT_READ_WAIT_SECS: i64 = 120;
+
+/// Where this run stands on reading one room's snapshot, for an owner edit
+/// ([`owner_edit_waits_for_first_read`]).
+#[derive(Debug, Clone, Copy)]
+enum ModerationRead {
+    /// Since then edits go ahead, for [`OWNER_EDIT_READ_FRESH_SECS`]: a look
+    /// some peer answered was written, the room was made here, or an edit
+    /// waited [`OWNER_EDIT_READ_WAIT_SECS`] for one in vain.
+    Current(i64),
+    /// An edit was first refused then, waiting for one.
+    Waiting(i64),
+}
+
+/// Each room's [`ModerationRead`], the rooms an edit is waiting on, which the
+/// moderation poll looks up at once, and the rooms whose fetched snapshot is
+/// not written yet. Process-wide so a command can ask.
+#[derive(Default)]
+struct ModerationReads {
+    rooms: HashMap<[u8; 16], ModerationRead>,
+    wanted: HashSet<[u8; 16]>,
+    unwritten: HashSet<[u8; 16]>,
+}
+
+fn moderation_reads() -> std::sync::MutexGuard<'static, ModerationReads> {
+    static READS: std::sync::OnceLock<std::sync::Mutex<ModerationReads>> = std::sync::OnceLock::new();
+    READS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// A lookup of the room's snapshot has come back and waits to be written.
+pub(super) fn note_channel_moderation_unwritten(channel_id: [u8; 16]) {
+    moderation_reads().unwritten.insert(channel_id);
+}
+
+/// A lookup of the room's snapshot has been written, which some peer
+/// `answered` or not, or the room was made here and so this device holds all
+/// of it (`answered`). One nobody answered says nothing about the room.
+pub(crate) fn note_channel_moderation_read(channel_id: [u8; 16], answered: bool, now: i64) {
+    let mut reads = moderation_reads();
+    reads.unwritten.remove(&channel_id);
+    if answered {
+        reads.rooms.insert(channel_id, ModerationRead::Current(now));
+        reads.wanted.remove(&channel_id);
+    }
+}
+
+/// Whether a lookup of a room's snapshot that `responded` peers answered and
+/// that brought back `found` records from other nodes is one an owner can
+/// sign after: it found the snapshot, or enough peers answered for its absence
+/// to mean something, as recovery reads it.
+pub(super) fn moderation_look_answered(responded: usize, found: usize) -> bool {
+    (responded > 0 && found > 0) || responded >= crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE
+}
+
+/// The rooms an owner edit is waiting to see read, taken.
+pub(super) fn take_owner_reads_wanted() -> HashSet<[u8; 16]> {
+    std::mem::take(&mut moderation_reads().wanted)
+}
+
+/// Rooms taken by [`take_owner_reads_wanted`] that could not be looked up yet.
+pub(super) fn return_owner_reads_wanted(rooms: impl IntoIterator<Item = [u8; 16]>) {
+    moderation_reads().wanted.extend(rooms);
+}
+
+/// Whether an owner edit of a room of ours waits for an answered look at the
+/// snapshot the network holds, written within [`OWNER_EDIT_READ_FRESH_SECS`],
+/// asking for one if so. A snapshot is a whole state and the newer stamp wins,
+/// so an edit signed from what this device held before it saw another
+/// device's edit would undo that edit everywhere: a device just opened or
+/// woken, and a room the moderation poll does not cover (one we are not in),
+/// are where that happens. One whose fetched snapshot is still being written
+/// waits for that too. Held back at most [`OWNER_EDIT_READ_WAIT_SECS`] from
+/// the first edit refused, after which edits go ahead as if it had been read.
+/// The owner pass reads afresh on its own before it republishes
+/// ([`owner_republish_read_gate`]).
+pub(crate) fn owner_edit_waits_for_first_read(channel_id: &str, now: i64) -> bool {
+    let Some(id) = hex::decode(channel_id)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+    else {
+        return false;
+    };
+    let mut reads = moderation_reads();
+    let unwritten = reads.unwritten.contains(&id);
+    let since = match reads.rooms.get(&id).copied() {
+        Some(ModerationRead::Current(at))
+            if !unwritten && (0..OWNER_EDIT_READ_FRESH_SECS).contains(&now.saturating_sub(at)) =>
+        {
+            return false;
+        }
+        Some(ModerationRead::Waiting(since)) if since <= now => since,
+        _ => {
+            reads.rooms.insert(id, ModerationRead::Waiting(now));
+            now
+        }
+    };
+    if now.saturating_sub(since) >= OWNER_EDIT_READ_WAIT_SECS {
+        reads.rooms.insert(id, ModerationRead::Current(now));
+        return false;
+    }
+    if !unwritten {
+        reads.wanted.insert(id);
+    }
+    true
+}
+
+/// Wait, a few seconds at most, for a snapshot of the room already fetched to
+/// be written: an edit that finds one in hand waits for it rather than being
+/// refused, since the write takes moments.
+pub(crate) async fn wait_for_unwritten_read(channel_id: &str) {
+    let Some(id) = hex::decode(channel_id)
+        .ok()
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+    else {
+        return;
+    };
+    for _ in 0..20 {
+        if !moderation_reads().unwritten.contains(&id) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Wait, at most [`OWNER_EDIT_READ_WAIT_SECS`] and a little over, until an
+/// owner edit of the room no longer waits for a read
+/// ([`owner_edit_waits_for_first_read`]), asking for one meanwhile. For
+/// commits made in the background, which have no one to tell to try again.
+pub(crate) async fn wait_for_owner_read(channel_id: &str) {
+    let started = std::time::Instant::now();
+    let limit = std::time::Duration::from_secs(OWNER_EDIT_READ_WAIT_SECS as u64 + 5);
+    while owner_edit_waits_for_first_read(channel_id, chrono::Utc::now().timestamp()) && started.elapsed() < limit {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
@@ -5791,6 +6688,12 @@ pub(super) fn undo_owned_rotation(db: &Database, channel_id_hex: &str, rotated: 
 /// leaves the owner sealing traffic under a key the room cannot find. The key
 /// is [`ember::channel::derive_owned_epoch_secret`]'s, so another device of
 /// this identity making the same rotation mints the same one.
+///
+/// `None` as well when the epoch is already held or announced since
+/// `from_epoch` was read: by another rotation on this device, or by another
+/// device of this identity whose snapshot or key arrived meanwhile. The
+/// pending rotation is then tried again a few minutes on
+/// (`OWNER_SNAPSHOT_RETRY_SECS`), from the room as it then is.
 pub(super) fn rotate_owned_channel_key(
     db: &Database,
     channel_id_hex: &str,
@@ -5799,10 +6702,11 @@ pub(super) fn rotate_owned_channel_key(
 ) -> Option<i64> {
     let next = from_epoch.saturating_add(1);
     let mut secret = ember::channel::derive_owned_epoch_secret(owner_seed, next);
-    let minted = db.insert_channel_key_epoch(channel_id_hex, next, &secret);
+    let minted = db.mint_channel_key_epoch(channel_id_hex, next, &secret);
     zeroize::Zeroize::zeroize(&mut secret);
     match minted {
-        Ok(()) => Some(next),
+        Ok(true) => Some(next),
+        Ok(false) => None,
         Err(error) => {
             tracing::warn!(
                 channel_id = %channel_id_hex,
@@ -5814,11 +6718,12 @@ pub(super) fn rotate_owned_channel_key(
     }
 }
 
-/// Re-seal the room's current content key to every member still entitled to it.
+/// Re-seal the room's current content key to every member still entitled to it,
+/// and to ourselves ([`seal_epoch_records`]).
 ///
-/// Skips banned members and ourselves, exactly as the rotation did. Reads the
-/// `banned` flag from the database, which is safe here because any ban that
-/// triggered a rotation was committed long before this timer runs.
+/// Skips banned members, exactly as the rotation did. Reads the `banned` flag
+/// from the database, which is safe here because any ban that triggered a
+/// rotation was committed long before this timer runs.
 ///
 /// Every unbanned row is taken as entitled, which holds only because a new row
 /// needs evidence that its *author* held the current key — not merely that
@@ -5842,6 +6747,9 @@ pub(super) fn rotate_owned_channel_key(
 /// is in the room. What this does not cover is a member who holds the current
 /// key and chooses to vouch for someone: they could as easily hand that
 /// someone the key.
+///
+/// Returns how many of its records started, of how many. The older epochs the
+/// room keeps are renewed apart ([`maybe_renew_retained_channel_epochs`]).
 pub(super) async fn republish_channel_key_epoch(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -5850,31 +6758,35 @@ pub(super) async fn republish_channel_key_epoch(
     ident: &ember::channel::ChannelIdentity,
     identity: &crate::storage::identity::NodeIdentity,
     our_pk: [u8; 32],
-) {
+) -> (usize, usize) {
     let records = {
         let db = db.clone();
         let channel_id_hex = ch.channel_id.clone();
-        let epoch = ch.key_epoch;
+        let current = ch.key_epoch;
         let ident = ident.clone();
         let our_seed = zeroize::Zeroizing::new(identity.ed25519_secret_key);
         tokio::task::spawn_blocking(move || {
-            seal_current_epoch_records(&db, &channel_id_hex, epoch, &ident, &our_seed, our_pk)
+            seal_epoch_records(&db, &channel_id_hex, current, &ident, &our_seed, our_pk)
         })
         .await
         .unwrap_or_default()
     };
+    let total = records.len();
+    let mut started = 0;
     for record in records {
         if let Some(publish_id) = start_own_channel_renewal(state, record) {
             drive_ember_publish(socket, state, publish_id).await;
+            started += 1;
         }
     }
+    (started, total)
 }
 
-/// The records [`republish_channel_key_epoch`] publishes: every form of the
-/// room's `epoch` key sealed to us and to each unbanned member. Empty when
-/// that key is not held. Blocking: it reads the key and the roster, and runs a
-/// DH and a seal per member.
-fn seal_current_epoch_records(
+/// The records [`republish_channel_key_epoch`] publishes for one epoch: every
+/// form of the room's `epoch` key sealed to us and to each unbanned member.
+/// Empty when that key is not held. Blocking: it reads the key and the roster,
+/// and runs a DH and a seal per member.
+fn seal_epoch_records(
     db: &Database,
     channel_id_hex: &str,
     epoch: i64,
@@ -5882,6 +6794,21 @@ fn seal_current_epoch_records(
     our_seed: &[u8; 32],
     our_pk: [u8; 32],
 ) -> Vec<ember::dht::publish::SignedRecord> {
+    seal_epoch_records_to(db, channel_id_hex, epoch, ident, our_seed, our_pk)
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect()
+}
+
+/// [`seal_epoch_records`], each record with the member it is sealed to.
+fn seal_epoch_records_to(
+    db: &Database,
+    channel_id_hex: &str,
+    epoch: i64,
+    ident: &ember::channel::ChannelIdentity,
+    our_seed: &[u8; 32],
+    our_pk: [u8; 32],
+) -> Vec<([u8; 32], ember::dht::publish::SignedRecord)> {
     let Some(secret) = db
         .load_channel_key_epochs(channel_id_hex)
         .unwrap_or_default()
@@ -5895,15 +6822,22 @@ fn seal_current_epoch_records(
     // restored from a backup taken before this epoch reads the key back from.
     // A member's slot, so the record is the one every member's is.
     let members = db.list_channel_members(channel_id_hex).unwrap_or_default();
-    let recipients = std::iter::once(our_pk).chain(members.iter().filter_map(|member| {
-        if member.banned {
-            return None;
-        }
-        let member_pk = hex::decode(&member.member_pubkey)
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())?;
-        (member_pk != our_pk).then_some(member_pk)
-    }));
+    let mut others: Vec<[u8; 32]> = members
+        .iter()
+        .filter_map(|member| {
+            if member.banned {
+                return None;
+            }
+            let member_pk = hex::decode(&member.member_pubkey)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())?;
+            (member_pk != our_pk).then_some(member_pk)
+        })
+        .collect();
+    // In an order drawn afresh, so a storer watching one epoch's records and
+    // another's go out cannot pair the members' ids by their place in line.
+    rand::seq::SliceRandom::shuffle(others.as_mut_slice(), &mut rand::thread_rng());
+    let recipients = std::iter::once(our_pk).chain(others);
     let mut records = Vec::new();
     for member_pk in recipients {
         let (Some(wrap), Some(blind)) = (
@@ -5914,16 +6848,20 @@ fn seal_current_epoch_records(
         };
         let sealed =
             ember::channel::seal_channel_key_epoch(&wrap, &ident.channel_id, epoch, &secret);
-        records.extend(ember::dht::publish::SignedRecord::channel_key_epoch_forms(
-            ident.channel_id,
-            ident.pubkey,
-            &member_pk,
-            member_pk == our_pk,
-            epoch,
-            &blind,
-            &sealed,
-            &ident.signing_key,
-        ));
+        records.extend(
+            ember::dht::publish::SignedRecord::channel_key_epoch_forms(
+                ident.channel_id,
+                ident.pubkey,
+                &member_pk,
+                member_pk == our_pk,
+                epoch,
+                &blind,
+                &sealed,
+                &ident.signing_key,
+            )
+            .into_iter()
+            .map(|record| (member_pk, record)),
+        );
     }
     records
 }
@@ -5932,13 +6870,39 @@ pub(super) const CHANNEL_EPOCH_FETCH_PER_TICK: usize = 2;
 /// Re-ask for an epoch record we could not find yet. Short, because until it
 /// lands the member cannot read anything new in the room.
 pub(super) const CHANNEL_EPOCH_FETCH_SECS: i64 = 60;
+/// How long an older epoch a lookup did not find is passed over. Unlike the
+/// current one, it is needed only for what is still sealed under it, and its
+/// record may never have been sealed to this member (one who joined later) or
+/// may have lapsed, so at a minute's interval it would be asked for every
+/// minute for as long as it stayed in the retention window. Its owner renews
+/// it weekly (`RETAINED_EPOCH_RENEW_SECS`), so asking a few times a day finds
+/// it soon after. Also how often a room we own, and are not behind on, is
+/// looked over for epochs this device lacks ([`maybe_refresh_channel_key_epoch`]).
+pub(super) const CHANNEL_EPOCH_MISS_RETRY_SECS: i64 = 6 * 3600;
+
+/// How long answered lookups by a device behind another device of this
+/// identity must have gone on finding nothing for the newer key before it
+/// rotates past it (`Database::note_owner_epoch_missed`): two of the other
+/// device's republishes, each of which renews its records. The other device
+/// announced an epoch whose records it never stored, and left, and the
+/// members told of it cannot read or send until someone seals a newer one to
+/// them; the rotation mints past it (`next_rotation_epoch`).
+const OWNER_BEHIND_ROTATE_SECS: i64 = 2 * ember::channel::MODERATION_REPUBLISH_SECS;
+/// The most one gap between such lookups adds to that count, so time this
+/// device was off or offline counts for little. Lookups of the announced
+/// epoch come every minute (`CHANNEL_EPOCH_FETCH_SECS`); the rest is room for
+/// the per-tick budget.
+const OWNER_BEHIND_MISS_GAP_SECS: i64 = 10 * 60;
 
 /// FIND_VALUE our own copy of a rotated content key.
 ///
-/// Only for private rooms we do not own: the owner mints epochs, and a public
-/// room's key is derivable by anyone so rotating one would evict nobody. Driven
-/// by `key_epoch_wanted` running ahead of `key_epoch`, both of which come from
-/// the owner's signed moderation record.
+/// For private rooms: a public room's key is derivable by anyone, so rotating
+/// one would evict nobody. Driven by `key_epoch_wanted` running ahead of
+/// `key_epoch`, both of which come from the owner's signed moderation record,
+/// and by epochs missing from the retention window. A room we own is looked at
+/// every few hours rather than every minute while it is not behind, since the
+/// owner mints its epochs; it finds something only once another device of ours
+/// minted some, or as a recovered room.
 ///
 /// What to look up is read on the blocking pool, for every due room at once
 /// ([`channel_epoch_lookup`]). A room with nothing to look up is stamped, so it
@@ -5960,33 +6924,58 @@ pub(super) async fn maybe_refresh_channel_key_epoch(
     let due: Vec<([u8; 16], crate::storage::database::StoredChannel)> = channels
         .iter()
         .filter(|ch| {
-            // An owner mints its keys and needs none fetched — unless it is a
-            // recovered owner, which fetches the current one back from the
-            // copy it sealed to itself ([`channel_epoch_lookup`] asks).
-            ch.in_room_now()
+            // A room we own whether or not we are in it: its owner pass and
+            // settings pass run either way, and sign from the keys held here.
+            // Never one deleted here, whose keys the delete purged.
+            (ch.in_room_now() || ch.is_owner)
+                && !ch.deleted
                 && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
                 && ch.key_epoch_wanted > 0
                 && ch.successor_id.is_empty()
-                && (!ch.is_owner || ch.key_epoch_wanted > ch.key_epoch)
         })
         .filter_map(|ch| {
             let channel_id = <[u8; 16]>::try_from(hex::decode(&ch.channel_id).ok()?).ok()?;
             let last = state.channel_epoch_fetch_at.get(&channel_id).copied().unwrap_or(0);
-            ember::channel::schedule_due(last, now, CHANNEL_EPOCH_FETCH_SECS)
-                .then(|| (channel_id, ch.clone()))
+            // An owner mints its keys, so it is looked at rarely — unless
+            // another device of this identity rotated past it, and it fetches
+            // the key back from the copy sealed to this identity, then the
+            // epochs in between ([`channel_epoch_lookup`] asks). A stored key
+            // clears the stamp, so those follow at once.
+            let interval = if ch.is_owner && ch.key_epoch_wanted <= ch.key_epoch {
+                CHANNEL_EPOCH_MISS_RETRY_SECS
+            } else {
+                CHANNEL_EPOCH_FETCH_SECS
+            };
+            ember::channel::schedule_due(last, now, interval).then(|| (channel_id, ch.clone()))
         })
         .collect();
+    state
+        .channel_epoch_missed
+        .retain(|_, at| now.saturating_sub(*at) < CHANNEL_EPOCH_MISS_RETRY_SECS);
     if due.is_empty() {
         return;
     }
+    let due: Vec<_> = due
+        .into_iter()
+        .map(|(channel_id, ch)| {
+            let skip: Vec<i64> = state
+                .channel_epoch_missed
+                .keys()
+                .filter(|(room, _)| *room == channel_id)
+                .map(|(_, epoch)| *epoch)
+                .collect();
+            (channel_id, ch, skip)
+        })
+        .collect();
     let lookups = {
         let db = db.clone();
         let our_seed = identity.ed25519_secret_key;
         let our_pk = identity.ed25519_public_key;
         tokio::task::spawn_blocking(move || {
             due.into_iter()
-                .map(|(channel_id, ch)| {
-                    (channel_id, channel_epoch_lookup(&db, &our_seed, &our_pk, &ch, &channel_id))
+                .map(|(channel_id, ch, skip)| {
+                    let lookup = channel_epoch_lookup(&db, &our_seed, &our_pk, &ch, &channel_id, &skip);
+                    (channel_id, ch.key_epoch_wanted, lookup)
                 })
                 .collect::<Vec<_>>()
         })
@@ -5994,7 +6983,7 @@ pub(super) async fn maybe_refresh_channel_key_epoch(
         .unwrap_or_default()
     };
     let mut started = 0usize;
-    for (channel_id, lookup) in lookups {
+    for (channel_id, wanted, lookup) in lookups {
         let Some((target, keys)) = lookup else {
             state.channel_epoch_fetch_at.insert(channel_id, now);
             continue;
@@ -6017,12 +7006,25 @@ pub(super) async fn maybe_refresh_channel_key_epoch(
                 Vec::new(),
                 state.ember_dht.routing(),
             ) else {
+                // One form went unasked, so finding nothing proves nothing.
+                if any {
+                    if let Some(held) = state.ember_channel_epoch_buffer.get_mut(&(channel_id, target)) {
+                        held.incomplete = true;
+                    }
+                }
                 break;
             };
             seed_ember_local_records(state, search_id, &key, &[]);
             state
                 .ember_channel_epoch_searches
                 .insert(search_id, (channel_id, target));
+            // Judged now: a snapshot landing before the lookups end must not
+            // make the epoch they were sent for look like an older one.
+            state
+                .ember_channel_epoch_buffer
+                .entry((channel_id, target))
+                .or_default()
+                .older = target < wanted;
             drive_ember_search(socket, state, search_id).await;
             any = true;
         }
@@ -6035,9 +7037,8 @@ pub(super) async fn maybe_refresh_channel_key_epoch(
 }
 
 /// The epoch to look our own copy of a private room's content key up for, and
-/// the keys to look under: v2 first, then v1. `None` when the room has nothing
-/// to look up: no epoch in the retention window missing, or a room we own that
-/// is not a recovered one waiting on its key.
+/// the keys to look under: v2 first, then v1. `None` when no epoch in the
+/// retention window is missing, `skip` aside.
 ///
 /// The newest epoch we are *missing*, which is not the same as the one the
 /// owner advertises. Sleeping through two rotations used to leave the
@@ -6051,25 +7052,37 @@ pub(super) async fn maybe_refresh_channel_key_epoch(
 /// v2 needs only the owner's key, which the moderation poll brings, so it is
 /// found for any epoch whatever this device missed. v1 is the only form a
 /// 1.7.4 owner publishes and a 1.7.4 storer keeps.
+///
+/// `skip` holds older epochs a lookup did not find lately
+/// ([`CHANNEL_EPOCH_MISS_RETRY_SECS`]); the current one is asked for whatever.
 pub(crate) fn channel_epoch_lookup(
     db: &Database,
     our_seed: &[u8; 32],
     our_pk: &[u8; 32],
     ch: &crate::storage::database::StoredChannel,
     channel_id: &[u8; 16],
+    skip: &[i64],
 ) -> Option<(i64, Vec<[u8; 16]>)> {
-    if ch.is_owner && db.channel_owner_key_pending(&ch.channel_id).ok().flatten().is_none() {
-        return None;
-    }
-    let floor = (ch.key_epoch_wanted - Database::CHANNEL_KEY_EPOCHS_KEPT as i64 + 1).max(1);
+    // The window is counted from the newest epoch held as well as the one
+    // announced: an owner's own rotations run ahead of what it has been told,
+    // and what the retention keeps is the newest few held. An owner that
+    // minted every epoch in it holds them all, so this finds nothing for it;
+    // one finds a gap when it is a recovered owner waiting on its key, or when
+    // another device of this identity rotated, which sealed its copy of each
+    // epoch to this identity as well.
+    let top = ch.key_epoch.max(ch.key_epoch_wanted);
+    let floor = (top - Database::CHANNEL_KEY_EPOCHS_KEPT as i64 + 1).max(1);
     let target = db
-        .newest_missing_channel_key_epoch(&ch.channel_id, floor, ch.key_epoch_wanted)
+        .newest_missing_channel_key_epoch(&ch.channel_id, floor, ch.key_epoch_wanted, skip)
         .ok()
         .flatten()?;
     let mut keys = Vec::with_capacity(2);
+    // As `ingest_channel_epoch_records` reads it: a room of ours is owned by
+    // this identity whether or not a snapshot has named it yet.
     let blind = hex::decode(&ch.owner_pubkey)
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .or_else(|| ch.is_owner.then_some(*our_pk))
         .and_then(|owner| ember::channel::epoch_blind(our_seed, &owner, channel_id));
     if let Some(blind) = blind {
         let member_id = ember::channel::epoch_member_id(&blind, target);
@@ -6079,20 +7092,73 @@ pub(crate) fn channel_epoch_lookup(
     Some((target, keys))
 }
 
+/// What the lookups of one room's epoch have gathered while they run.
+#[derive(Default)]
+pub(super) struct EpochLookupHeld {
+    records: Vec<Vec<u8>>,
+    /// Some peer answered one of them.
+    answered: bool,
+    /// One of them ended without finishing its walk.
+    incomplete: bool,
+    /// The epoch was older than the one the room had announced when they began.
+    older: bool,
+}
+
+impl EpochLookupHeld {
+    fn end(&self) -> EpochLookupEnd {
+        EpochLookupEnd {
+            answered: self.answered && !self.incomplete,
+            older: self.older,
+        }
+    }
+}
+
+/// How the lookups of one room's epoch ended, for what finding nothing in
+/// them means.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct EpochLookupEnd {
+    /// Every walk finished and some peer answered one.
+    pub(super) answered: bool,
+    /// The epoch was older than the one the room had announced when they began.
+    pub(super) older: bool,
+}
+
+impl EpochLookupEnd {
+    /// Whether finding nothing passes the epoch over for a while
+    /// ([`CHANNEL_EPOCH_MISS_RETRY_SECS`]): only an older epoch, which may
+    /// never have been sealed to us, and only after an answered lookup. The
+    /// announced epoch is asked for at the usual interval until it lands.
+    fn miss_counts(self) -> bool {
+        self.answered && self.older
+    }
+}
+
 /// Hold epoch blobs until every FIND_VALUE for this room and epoch has
 /// finished, v2 key and v1 key alike, then queue one ingest, so it reads the
-/// two forms together.
+/// two forms together. `answered`: whether any peer answered this one.
 pub(super) fn buffer_channel_epoch_records(
     state: &mut NetworkState,
     channel_id: [u8; 16],
     epoch: i64,
     records: Vec<Vec<u8>>,
+    answered: bool,
 ) {
+    let held = state
+        .ember_channel_epoch_buffer
+        .entry((channel_id, epoch))
+        .or_default();
+    held.records.extend(records);
+    held.answered |= answered;
+    flush_channel_epoch_if_idle(state, channel_id, epoch);
+}
+
+/// A lookup of this room's epoch ended without finishing its walk.
+pub(super) fn abandon_channel_epoch_lookup(state: &mut NetworkState, channel_id: [u8; 16], epoch: i64) {
     state
         .ember_channel_epoch_buffer
         .entry((channel_id, epoch))
         .or_default()
-        .extend(records);
+        .incomplete = true;
     flush_channel_epoch_if_idle(state, channel_id, epoch);
 }
 
@@ -6104,10 +7170,11 @@ pub(super) fn flush_channel_epoch_if_idle(state: &mut NetworkState, channel_id: 
     {
         return;
     }
-    if let Some(records) = state.ember_channel_epoch_buffer.remove(&(channel_id, epoch)) {
+    if let Some(held) = state.ember_channel_epoch_buffer.remove(&(channel_id, epoch)) {
+        let end = held.end();
         state
             .ember_pending_channel_epoch
-            .push((channel_id, epoch, records));
+            .push((channel_id, epoch, held.records, end));
     }
 }
 
@@ -6146,12 +7213,20 @@ pub(crate) fn ingest_channel_epoch_records(
         return ChannelEpochIngest::Nothing;
     }
     let channel_id_hex = hex::encode(channel_id);
+    // Nor for a room deleted here, whose keys the delete purged: a lookup
+    // begun before it must not bring them back.
     let Ok(Some(ch)) = db.get_channel(&channel_id_hex) else {
         return ChannelEpochIngest::Nothing;
     };
+    if ch.deleted {
+        return ChannelEpochIngest::Nothing;
+    }
+    // A room of ours is owned by this identity whether or not a snapshot has
+    // named it yet.
     let Some(owner_pk) = hex::decode(&ch.owner_pubkey)
         .ok()
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .or_else(|| ch.is_owner.then_some(identity.ed25519_public_key))
     else {
         // We have not learned who owns the room, so there is nobody to derive
         // the wrapping key against yet. The moderation poll fixes that.
@@ -6207,8 +7282,11 @@ pub(crate) fn ingest_channel_epoch_records(
             continue;
         };
         opened_one = true;
-        match db.insert_channel_key_epoch(&channel_id_hex, epoch, &secret) {
-            Ok(()) => return ChannelEpochIngest::Rekeyed,
+        match db.store_fetched_channel_key_epoch(&channel_id_hex, epoch, &secret) {
+            Ok(true) => return ChannelEpochIngest::Rekeyed,
+            // Older than every epoch the room keeps: nothing changed, so
+            // nothing is looked up again on its account.
+            Ok(false) => return ChannelEpochIngest::Nothing,
             Err(e) => {
                 debug!("Ember channel epoch {epoch} for {channel_id_hex} not stored: {e}");
             }
@@ -6736,6 +7814,11 @@ impl ChannelPresenceIngest {
 /// member, so they merge as one; v2 goes in last, so of two copies signed the
 /// same second the v2 one is what stands. A v2 record whose binding does not
 /// verify is dropped, never read as v1.
+///
+/// The third set is who published a v1 copy under the current secret in a
+/// private room: a member on 1.7.5 to 1.7.8 whose ids storers can link
+/// ([`ember::channel::V1_RELINK_QUIET_SECS`]). A storer can sign a lifted v1
+/// seal under its own key, so it counts only for a key the roster holds.
 pub(super) fn merge_channel_presence_blobs(
     records: &[Vec<u8>],
     channel_id: &[u8; 16],
@@ -6744,6 +7827,7 @@ pub(super) fn merge_channel_presence_blobs(
     now: i64,
 ) -> (
     HashMap<[u8; 32], ember::dht::publish::ChannelPresenceMember>,
+    HashSet<[u8; 32]>,
     HashSet<[u8; 32]>,
 ) {
     use ember::dht::publish::SignedRecord;
@@ -6797,6 +7881,14 @@ pub(super) fn merge_channel_presence_blobs(
             }
         }
     }
+    let v1_current: HashSet<[u8; 32]> = if private {
+        v1.iter()
+            .filter(|(_, opened)| *opened == ember::channel::OpenedUnder::Current)
+            .map(|(member, _)| member.publisher_key)
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut latest = HashMap::new();
     let mut current = HashSet::new();
     let v1 = v1.into_iter().map(|(member, opened)| (member, opened, !private));
@@ -6812,7 +7904,36 @@ pub(super) fn merge_channel_presence_blobs(
         member.timestamp = ts;
         ember::dht::publish::keep_latest_presence_member(&mut latest, member);
     }
-    (latest, current)
+    (latest, current, v1_current)
+}
+
+/// A presence walk of a private room we own, which found v1 copies under its
+/// current key from `publishers`: a sighting when one of them is on the roster
+/// and not us, and otherwise time watched without one
+/// (`Database::note_channel_v1_walk`).
+fn note_v1_walk(
+    db: &Database,
+    ch: &crate::storage::database::StoredChannel,
+    our_pubkey: &[u8; 32],
+    publishers: &HashSet<[u8; 32]>,
+    now: i64,
+) {
+    let saw_v1 = publishers.iter().any(|pk| {
+        pk != our_pubkey
+            && db
+                .channel_member_unbanned(&ch.channel_id, &hex::encode(pk))
+                .unwrap_or(false)
+    });
+    if let Err(e) = db.note_channel_v1_walk(
+        &ch.channel_id,
+        ember::channel::V1_CUT_OVER,
+        ch.key_epoch,
+        saw_v1,
+        now,
+        ember::channel::PRESENCE_FRESH_SECS,
+    ) {
+        debug!("Ember channel {}: could not note a presence walk: {e}", ch.channel_id);
+    }
 }
 
 pub(super) fn ingest_channel_presence_records(
@@ -6842,13 +7963,22 @@ pub(super) fn ingest_channel_presence_records(
     // the one they published with.
     let join_secrets = channel_join_secrets(db, &ch);
     let now = chrono::Utc::now().timestamp();
-    let (latest, current) = merge_channel_presence_blobs(
+    let (latest, current, v1_current) = merge_channel_presence_blobs(
         records,
         &channel_id,
         &join_secrets,
         ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE,
         now,
     );
+    // A walk that found nothing at all, not even our own record, is one no
+    // storer answered, which says nothing about who is still on 1.7.x.
+    if ch.is_owner
+        && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
+        && ember::channel::V1_CUT_OVER_ROTATES
+        && !records.is_empty()
+    {
+        note_v1_walk(db, &ch, our_pubkey, &v1_current, now);
+    }
     let our_hex = hex::encode(our_pubkey);
     for member in latest.into_values() {
         let pk_hex = hex::encode(member.publisher_key);
@@ -6944,7 +8074,8 @@ pub(super) struct ChannelIngestBatch {
     pub(super) moderation: Vec<([u8; 16], Vec<Vec<u8>>, usize)>,
     pub(super) settings: Vec<([u8; 16], Vec<Vec<u8>>)>,
     pub(super) claim: Vec<([u8; 16], Vec<Vec<u8>>)>,
-    pub(super) epoch: Vec<([u8; 16], i64, Vec<Vec<u8>>)>,
+    /// Per lookup: room, epoch, what it found, and how it ended.
+    pub(super) epoch: Vec<([u8; 16], i64, Vec<Vec<u8>>, EpochLookupEnd)>,
     pub(super) handoff: Vec<([u8; 16], Vec<Vec<u8>>)>,
 }
 
@@ -6993,6 +8124,46 @@ pub(super) struct ChannelIngestResults {
     pub(super) adopted: Vec<([u8; 16], [u8; 16])>,
     /// Rooms we own whose handoff fetch found no record of ours.
     pub(super) handoff_absent: Vec<[u8; 16]>,
+    /// Rooms we own that owe a rotation once a snapshot from this identity's
+    /// other device has been applied, whether that snapshot left it owing one
+    /// (`owe_rotation_for_unseen_bans_locked`) or it already did, or once the
+    /// epoch that device announced has gone unfound long enough
+    /// ([`OWNER_BEHIND_ROTATE_SECS`]).
+    pub(super) rotation_owed: Vec<[u8; 16]>,
+    /// `(room, epoch)` for each epoch lookup that found nothing to store and
+    /// counts as a miss ([`EpochLookupEnd::miss_counts`]).
+    pub(super) epoch_missed: Vec<([u8; 16], i64)>,
+    /// Rooms we own that fetched back their newest key, another device of
+    /// ours having minted it: theirs to re-seal to the members this one knows.
+    pub(super) owner_caught_up: Vec<[u8; 16]>,
+}
+
+/// An answered lookup of the epoch a room has announced found nothing: for a
+/// room we own, that is another device of ours whose records never stored.
+/// Whether that has gone on long enough that the room now owes a rotation past
+/// it ([`OWNER_BEHIND_ROTATE_SECS`]).
+fn owner_epoch_never_found(db: &Database, channel_id: [u8; 16], epoch: i64) -> bool {
+    let channel_id_hex = hex::encode(channel_id);
+    if !db
+        .get_channel_lite(&channel_id_hex)
+        .ok()
+        .flatten()
+        .is_some_and(|ch| ch.is_owner)
+    {
+        return false;
+    }
+    let now = chrono::Utc::now().timestamp();
+    match db.note_owner_epoch_missed(&channel_id_hex, epoch, now, OWNER_BEHIND_MISS_GAP_SECS, OWNER_BEHIND_ROTATE_SECS) {
+        Ok(true) => {
+            info!("Ember channel {channel_id_hex}: epoch {epoch} was never found; rotating past it");
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            debug!("Ember channel {channel_id_hex}: could not note a missed epoch: {e}");
+            false
+        }
+    }
 }
 
 /// Apply a batch to the database. Blocking: every step takes the database lock.
@@ -7026,9 +8197,21 @@ pub(super) fn run_channel_ingest(
             let _ = db.touch_channel_moderation_checked(&channel_id_hex, checked_at);
         }
         let before = db.get_channel_lite(&channel_id_hex).ok().flatten();
+        let owned_private = before
+            .as_ref()
+            .is_some_and(|ch| ch.is_owner && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE);
+        let owed_before = owned_private && db.channel_rotate_is_pending(&channel_id_hex).unwrap_or(true);
         let applied = ingest_channel_moderation_records(db, channel_id, &records);
         if applied {
             results.moderated.push(channel_id);
+        }
+        // Owed after a snapshot applied, or newly owed for one that was not
+        // (`note_owned_snapshot_not_taken_locked`).
+        if owned_private
+            && (applied || !owed_before)
+            && db.channel_rotate_is_pending(&channel_id_hex).unwrap_or(false)
+        {
+            results.rotation_owed.push(channel_id);
         }
         let mut check_held = false;
         if let Ok(Some(row)) = db.get_channel_lite(&channel_id_hex) {
@@ -7071,10 +8254,28 @@ pub(super) fn run_channel_ingest(
             results.claimed.push((channel_id, successor));
         }
     }
-    for (channel_id, epoch, records) in batch.epoch {
+    for (channel_id, epoch, records, end) in batch.epoch {
         match ingest_channel_epoch_records(db, identity, channel_id, epoch, &records) {
-            ChannelEpochIngest::Nothing => {}
-            ChannelEpochIngest::Rekeyed => results.rekeyed.push(channel_id),
+            // Not while chat is locked, when nothing is opened at all.
+            ChannelEpochIngest::Nothing if db.chat_locked() => {}
+            ChannelEpochIngest::Nothing => {
+                if end.miss_counts() {
+                    results.epoch_missed.push((channel_id, epoch));
+                } else if end.answered && owner_epoch_never_found(db, channel_id, epoch) {
+                    results.rotation_owed.push(channel_id);
+                }
+            }
+            ChannelEpochIngest::Rekeyed => {
+                results.rekeyed.push(channel_id);
+                let current = db
+                    .get_channel_lite(&hex::encode(channel_id))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|ch| ch.is_owner && ch.key_epoch == epoch);
+                if current {
+                    results.owner_caught_up.push(channel_id);
+                }
+            }
             ChannelEpochIngest::NeedsNewer => results.needs_newer.push(channel_id),
         }
     }

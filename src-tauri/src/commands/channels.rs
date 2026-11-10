@@ -956,6 +956,12 @@ pub async fn create_channel(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_create_failed", "Failed to create channel", e))?;
+    // Made here, so there is nothing elsewhere to read before editing it.
+    crate::network::channel_membership::note_channel_moderation_read(
+        ident.channel_id,
+        true,
+        chrono::Utc::now().timestamp(),
+    );
 
     // Bounded and fatal, unlike the username re-claim above: this call is what
     // makes the name ours, so proceeding without an answer would publish a room
@@ -3169,14 +3175,16 @@ async fn owner_moderation_tail(state: &AppState, owned: &OwnedChannel) -> Modera
         let pins = owned.row.pinned_msg_ids.clone();
         // Held back if it cannot be read: a stand-in name signed into the
         // snapshot would rename the room for every member.
-        let fallback = (owned.row.key_epoch, Vec::new(), true);
+        let fallback = (owned.row.key_epoch.max(owned.row.key_epoch_wanted), Vec::new(), true);
         tokio::task::spawn_blocking(move || {
             let row = db.get_channel_lite(&id).ok().flatten()?;
             // A pin this device has removed is pruned here, which is the
             // owner's next commit of any kind.
             let removed = db.channel_messages_removed(&id, &pins).unwrap_or_default();
             let unconfirmed = db.channel_name_unconfirmed(&id).unwrap_or(true);
-            Some((row.key_epoch, removed, unconfirmed))
+            // The room's newest epoch, as the owner pass announces it: another
+            // device of ours may have rotated past the one held here.
+            Some((row.key_epoch.max(row.key_epoch_wanted), removed, unconfirmed))
         })
         .await
         .ok()
@@ -3279,7 +3287,10 @@ fn owner_pins_fit(
 }
 
 /// Refuse an owner edit while the room waits for a claim lookup
-/// ([`crate::network::channel_membership::owner_edit_waits_for_claims`]).
+/// ([`crate::network::channel_membership::owner_edit_waits_for_claims`]), or
+/// for a recent answered look at its snapshot
+/// ([`crate::network::channel_membership::owner_edit_waits_for_first_read`]).
+/// Every commit of an owner snapshot comes through here, not only the UI's.
 async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str) -> Result<(), String> {
     let db = state.db.clone();
     let id = channel_id.to_string();
@@ -3297,6 +3308,16 @@ async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str) -> 
             "channels_owner_return_pending",
             "Ember is checking whether this room was taken over while you were away. \
              Try again in a few minutes.",
+        ));
+    }
+    crate::network::channel_membership::wait_for_unwritten_read(channel_id).await;
+    if crate::network::channel_membership::owner_edit_waits_for_first_read(
+        channel_id,
+        chrono::Utc::now().timestamp(),
+    ) {
+        return Err(coded(
+            "channels_owner_reading",
+            "Ember is still loading this room's latest state from the network. Try again in a moment.",
         ));
     }
     Ok(())
@@ -3397,6 +3418,14 @@ async fn commit_channel_moderation_with(
     ) else {
         return Ok(());
     };
+    // So a snapshot another device of ours signs in the same second is ordered
+    // against this one as members order the two.
+    {
+        let db = state.db.clone();
+        let id = owned.row.channel_id.clone();
+        let signature = record.signature;
+        let _ = tokio::task::spawn_blocking(move || db.note_owner_snapshot_signed(&id, stamp, &signature)).await;
+    }
     // Queued, not awaited. The rows above are already committed and the owner's
     // periodic republish (`maybe_republish_channel_moderation`) rebuilds this
     // record from them, so the STORE result was never acted on — only logged.
@@ -3761,35 +3790,50 @@ async fn rotate_channel_key(
     if owned.row.visibility != CHANNEL_KIND_PRIVATE {
         return Ok(None);
     }
-    let next_epoch = owned.row.key_epoch.saturating_add(1);
-    let mut secret = [0u8; 32];
-    OsRng.fill_bytes(&mut secret);
+    let next_epoch = next_rotation_epoch(&owned.row);
+    // The seed's key for this epoch, as the owner pass mints, so another device
+    // owning the room that rotates from the same epoch mints the same one.
+    let secret = zeroize::Zeroizing::new(channel::derive_owned_epoch_secret(&owned.ident.seed(), next_epoch));
 
     // Members before the key: a failure after the key is stored would leave an
     // epoch no snapshot announces and no caller rolls back.
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
-    let members = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
+    let mut members = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
+    // Sealed in an order drawn afresh, as the owner pass seals, so a storer
+    // cannot pair the members' ids across epochs by their place in line.
+    rand::seq::SliceRandom::shuffle(members.as_mut_slice(), &mut rand::thread_rng());
 
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
-    let stored_secret = secret;
-    tokio::task::spawn_blocking(move || {
-        db.insert_channel_key_epoch(&id, next_epoch, &stored_secret)
+    let stored_secret = secret.clone();
+    let minted = tokio::task::spawn_blocking(move || {
+        db.mint_channel_key_epoch(&id, next_epoch, &stored_secret)
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_moderation_failed", "Could not rotate the room key", e))?;
+    // Another rotation took this epoch meanwhile: the owner pass's, or one of
+    // this identity's other device that this one has since fetched or been
+    // told of. This ban never committed, so that key went to the member being
+    // banned too; refused, the ban can be made again on the room as it now is.
+    if !minted {
+        return Err(coded(
+            "channels_owner_reading",
+            "Ember is still loading this room's latest state from the network. Try again in a moment.",
+        ));
+    }
 
     let our_seed = state.identity.ed25519_secret_key;
     let our_hex = hex::encode(state.identity.ed25519_public_key);
     let mut records = Vec::new();
-    // Sealed to ourselves as well, in a member's slot: the key is random, so
-    // this copy is the only way a device restored from an older backup gets
-    // the room's current key back.
+    // Sealed to ourselves as well, in a member's slot: a device restored from
+    // a backup (`catch_up_own_epochs`, which derives only the first key) and
+    // this identity's other owning device (`channel_epoch_lookup`) get the key
+    // back from this copy.
     if let (Some(wrap), Some(blind)) = (
         channel::derive_channel_epoch_secret(
             &our_seed,
@@ -3851,6 +3895,14 @@ async fn rotate_channel_key(
     }))
 }
 
+/// The epoch a rotation of `row` mints: past the newest the room has announced,
+/// not just the one held here. Another device of this identity may have rotated
+/// past this one, and its key for that epoch, which this device would derive
+/// again, already went to everyone it was sealed to.
+fn next_rotation_epoch(row: &crate::storage::database::StoredChannel) -> i64 {
+    row.key_epoch.max(row.key_epoch_wanted).saturating_add(1)
+}
+
 /// A content key [`rotate_channel_key`] stored, and the records sealing it to
 /// us and to each member still entitled to it.
 struct RotatedKey {
@@ -3866,9 +3918,9 @@ struct RotatedKey {
 /// nobody will ever go looking for.
 ///
 /// The sealed key goes out only once the snapshot has committed. A key taken
-/// back must not reach anyone: a member who fetched it would store it for its
-/// epoch, and the key minted next under the same number would be refused
-/// there until the owner's commitments showed the first one wrong. Nor its
+/// back must not reach anyone: the next rotation from the same epoch mints the
+/// very same key ([`channel::derive_owned_epoch_secret`]), and that rotation
+/// may be one that leaves out a member this one sealed it to. Nor its
 /// commitment: the settings pass signs nothing for the room until the commit
 /// or the undo is done ([`RotatingRoom`]).
 async fn rotate_and_commit(
@@ -3884,7 +3936,7 @@ async fn rotate_and_commit(
         // The snapshot the commit will sign, naming the epoch about to be
         // minted, refused for size before the key is stored rather than after.
         let mut tail = owner_moderation_tail(state, owned).await;
-        tail.key_epoch = Some(owned.row.key_epoch.saturating_add(1).max(0) as u64);
+        tail.key_epoch = Some(next_rotation_epoch(&owned.row).max(0) as u64);
         let tail = crate::network::ember::dht::publish::fit_moderation_pins(
             &owned.row.topic,
             &owned.row.welcome,
@@ -4079,6 +4131,9 @@ pub(crate) async fn rekey_recovered_room(
     channel_id: &str,
     pending: i64,
 ) -> Result<i64, String> {
+    // Read the room first, as every owner commit must, and before the lock
+    // every owner edit shares: nobody is there to try this again in a moment.
+    crate::network::channel_membership::wait_for_owner_read(channel_id).await;
     let _snapshot = moderation_lock().lock().await;
     let mut owned = load_owned_channel_as(state, channel_id, true).await?;
     if owned.row.visibility != CHANNEL_KIND_PRIVATE {
@@ -4792,6 +4847,9 @@ pub async fn rename_channel(
         .await
     };
     granted.map_err(|e| registry_fail(e, "channels_name_taken"))?;
+    // The name is ours now, so its snapshot must not be refused for a read
+    // that lapsed or landed during the round trip: waited for, not refused.
+    crate::network::channel_membership::wait_for_owner_read(&channel_id).await;
 
     // Retaken for the write and the commit, read afresh: other owner edits may
     // have landed while the registry was being asked, and the snapshot below
@@ -5472,6 +5530,12 @@ pub async fn claim_channel_ownership(
             "This room does not need claiming",
         ));
     }
+    // Made here, as a created room is: its first snapshot is the one below.
+    crate::network::channel_membership::note_channel_moderation_read(
+        successor.channel_id,
+        true,
+        chrono::Utc::now().timestamp(),
+    );
     // Everything that needed serialising is now in the database, and the room
     // reads as claimed, so a second attempt is refused by the guard above
     // rather than by this lock. Released before the network work because

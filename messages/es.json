@@ -4474,6 +4474,7 @@
   "error_channels_rename_unsupported": "Cambiar el nombre de las salas aún no está disponible en este servidor.",
   "error_channels_rename_pins_no_room": "El nuevo nombre no cabe junto a los mensajes fijados de esta sala. Elige un nombre más corto o desfija un mensaje.",
   "error_channels_owner_return_pending": "Ember está comprobando si alguien tomó el control de esta sala mientras no estabas. Vuelve a intentarlo en unos minutos.",
+  "error_channels_owner_reading": "Ember todavía está cargando el estado más reciente de esta sala desde la red. Vuelve a intentarlo en un momento.",
   "error_channels_name_taken": "Ese nombre de sala ya está en uso",
   "error_channels_registry_unavailable": "El registro de nombres no está disponible; inténtalo de nuevo cuando haya conexión",
   "error_channels_deleted": "Esta sala ha sido eliminada",

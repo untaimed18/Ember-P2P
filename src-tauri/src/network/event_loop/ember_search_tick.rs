@@ -981,17 +981,39 @@ pub(in crate::network) async fn on_ember_search_tick(
         .is_some_and(|job| job.is_finished())
     {
         if let Some(job) = state.ember_channel_ingest.take() {
+            let read = std::mem::take(&mut state.ember_channel_ingest_moderation);
             match job.await {
                 Ok(results) => {
+                    let now = chrono::Utc::now().timestamp();
+                    for (channel_id, answered) in read {
+                        crate::network::channel_membership::note_channel_moderation_read(channel_id, answered, now);
+                    }
+                    // A newer look at one of them, queued meanwhile, is still
+                    // to be written.
+                    for (channel_id, _, _) in &state.ember_pending_channel_moderation {
+                        crate::network::channel_membership::note_channel_moderation_unwritten(*channel_id);
+                    }
                     apply_channel_ingest_results(udp_socket, state, db, app_handle, results)
                         .await
                 }
-                Err(e) => tracing::warn!("channel lookup ingest failed: {e}"),
+                Err(e) => {
+                    // Nothing it read was written, so no look stands for it.
+                    let now = chrono::Utc::now().timestamp();
+                    for channel_id in read.keys() {
+                        state.channel_moderation_looked_at.remove(channel_id);
+                        crate::network::channel_membership::note_channel_moderation_read(*channel_id, false, now);
+                    }
+                    tracing::warn!("channel lookup ingest failed: {e}");
+                }
             }
         }
     }
     if state.ember_channel_ingest.is_none() {
         if let Some(batch) = ChannelIngestBatch::take(state) {
+            for (channel_id, _, _) in &batch.moderation {
+                let read = state.channel_moderation_look_read.remove(channel_id).unwrap_or(false);
+                *state.ember_channel_ingest_moderation.entry(*channel_id).or_default() |= read;
+            }
             let db = db.clone();
             let identity = identity.clone();
             state.ember_channel_ingest = Some(tokio::task::spawn_blocking(move || {
@@ -1054,6 +1076,19 @@ async fn apply_channel_ingest_results(
         );
     }
     state.channel_settings_fetch_owed.extend(results.settings_owed);
+    // The key this device holds may have reached a member the other device
+    // banned, so the owner pass makes the rotation it owes now, not at its
+    // next republish hours away. One that fetched back the newest key another
+    // device of ours minted re-seals it on that pass to the members it knows.
+    for channel_id in results.rotation_owed.into_iter().chain(results.owner_caught_up) {
+        state.channel_moderation_publish_at.remove(&channel_id);
+    }
+    // An older epoch is passed over for a while after this; the current one
+    // is asked for again at the usual interval.
+    let missed_at = chrono::Utc::now().timestamp();
+    for missed in results.epoch_missed {
+        state.channel_epoch_missed.insert(missed, missed_at);
+    }
     for (channel_id, successor_id) in results.claimed {
         let _ = app_handle.emit(
             "ember:channel-handoff",

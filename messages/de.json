@@ -4424,6 +4424,7 @@
   "error_channels_rename_unsupported": "Das Umbenennen von Räumen ist auf diesem Server noch nicht verfügbar.",
   "error_channels_rename_pins_no_room": "Der neue Name passt nicht neben die angehefteten Nachrichten dieses Raums. Wählen Sie einen kürzeren Namen oder lösen Sie eine Nachricht.",
   "error_channels_owner_return_pending": "Ember prüft gerade, ob dieser Raum während Ihrer Abwesenheit übernommen wurde. Versuchen Sie es in ein paar Minuten erneut.",
+  "error_channels_owner_reading": "Ember lädt noch den aktuellen Stand dieses Raums aus dem Netzwerk. Versuchen Sie es gleich noch einmal.",
   "error_channels_name_taken": "Dieser Raumname ist bereits vergeben",
   "error_channels_registry_unavailable": "Das Namensverzeichnis ist nicht erreichbar; versuchen Sie es später erneut",
   "error_channels_deleted": "Dieser Raum wurde gelöscht",

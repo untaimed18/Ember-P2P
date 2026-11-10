@@ -4474,6 +4474,7 @@
   "error_channels_rename_unsupported": "Le renommage des salons n’est pas encore disponible sur ce serveur.",
   "error_channels_rename_pins_no_room": "Le nouveau nom ne tient pas avec les messages épinglés de ce salon. Choisissez un nom plus court ou désépinglez un message.",
   "error_channels_owner_return_pending": "Ember vérifie si ce salon a été repris pendant votre absence. Réessayez dans quelques minutes.",
+  "error_channels_owner_reading": "Ember charge encore l’état le plus récent de ce salon depuis le réseau. Réessayez dans un instant.",
   "error_channels_name_taken": "Ce nom de salon est déjà pris",
   "error_channels_registry_unavailable": "Le registre des noms est injoignable ; réessayez une fois en ligne",
   "error_channels_deleted": "Ce salon a été supprimé",

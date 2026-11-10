@@ -4474,6 +4474,7 @@
   "error_channels_rename_unsupported": "此伺服器尚不支援重新命名房間。",
   "error_channels_rename_pins_no_room": "此房間的釘選訊息已佔用空間，放不下新名稱。請選擇較短的名稱或取消釘選一則訊息。",
   "error_channels_owner_return_pending": "Ember 正在檢查你離開期間此房間是否已被他人接管。請幾分鐘後再試。",
+  "error_channels_owner_reading": "Ember 仍在從網路載入此房間的最新狀態。請稍後再試。",
   "error_channels_name_taken": "該房間名已被占用",
   "error_channels_registry_unavailable": "名稱登記處無法使用；請在連線後再試",
   "error_channels_deleted": "此房間已被刪除",

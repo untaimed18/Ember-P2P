@@ -2180,7 +2180,7 @@ pub(super) fn release_ember_search_state(
     );
     state.ember_channel_handoff_searches.remove(&search_id);
     if let Some((channel_id, epoch)) = state.ember_channel_epoch_searches.remove(&search_id) {
-        flush_channel_epoch_if_idle(state, channel_id, epoch);
+        abandon_channel_epoch_lookup(state, channel_id, epoch);
     }
     state.ember_channel_claim_searches.remove(&search_id);
     // A publish-target lookup can end here rather than through

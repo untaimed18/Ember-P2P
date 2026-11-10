@@ -4474,6 +4474,7 @@
   "error_channels_rename_unsupported": "La rinomina delle stanze non è ancora disponibile su questo server.",
   "error_channels_rename_pins_no_room": "Il nuovo nome non ci sta insieme ai messaggi fissati di questa stanza. Scegli un nome più corto o togli un messaggio dai fissati.",
   "error_channels_owner_return_pending": "Ember sta verificando se qualcuno ha preso il controllo di questa stanza mentre eri via. Riprova tra qualche minuto.",
+  "error_channels_owner_reading": "Ember sta ancora caricando lo stato più recente di questa stanza dalla rete. Riprova tra un momento.",
   "error_channels_name_taken": "Quel nome della stanza è già in uso",
   "error_channels_registry_unavailable": "Il registro dei nomi non è raggiungibile; riprova quando sei online",
   "error_channels_deleted": "Questa stanza è stata eliminata",

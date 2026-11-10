@@ -4424,6 +4424,7 @@
   "error_channels_rename_unsupported": "Renaming rooms isn't available on this server yet.",
   "error_channels_rename_pins_no_room": "The new name doesn't fit alongside this room's pins. Choose a shorter name or unpin a message.",
   "error_channels_owner_return_pending": "Ember is checking whether this room was taken over while you were away. Try again in a few minutes.",
+  "error_channels_owner_reading": "Ember is still loading this room's latest state from the network. Try again in a moment.",
   "error_channels_name_taken": "That room name is already taken",
   "error_channels_registry_unavailable": "The name registry is unreachable; try again when online",
   "error_channels_deleted": "This room has been deleted",

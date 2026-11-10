@@ -4474,6 +4474,7 @@
   "error_channels_rename_unsupported": "Renomear salas ainda não está disponível neste servidor.",
   "error_channels_rename_pins_no_room": "O novo nome não cabe junto com as mensagens fixadas desta sala. Escolha um nome mais curto ou desafixe uma mensagem.",
   "error_channels_owner_return_pending": "O Ember está verificando se alguém assumiu esta sala enquanto você estava fora. Tente novamente em alguns minutos.",
+  "error_channels_owner_reading": "O Ember ainda está carregando o estado mais recente desta sala da rede. Tente novamente em instantes.",
   "error_channels_name_taken": "Esse nome de sala já está em uso",
   "error_channels_registry_unavailable": "O registro de nomes está inacessível; tente de novo quando estiver online",
   "error_channels_deleted": "Esta sala foi excluída",

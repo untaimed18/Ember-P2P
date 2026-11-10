@@ -4424,6 +4424,7 @@
   "error_channels_rename_unsupported": "Zmiana nazwy pokoi nie jest jeszcze dostępna na tym serwerze.",
   "error_channels_rename_pins_no_room": "Nowa nazwa nie mieści się razem z przypiętymi wiadomościami tego pokoju. Wybierz krótszą nazwę lub odepnij wiadomość.",
   "error_channels_owner_return_pending": "Ember sprawdza, czy ktoś nie przejął tego pokoju podczas twojej nieobecności. Spróbuj ponownie za kilka minut.",
+  "error_channels_owner_reading": "Ember wciąż wczytuje najnowszy stan tego pokoju z sieci. Spróbuj ponownie za chwilę.",
   "error_channels_name_taken": "Ta nazwa pokoju jest już zajęta",
   "error_channels_registry_unavailable": "Rejestr nazw jest nieosiągalny; spróbuj ponownie, gdy będziesz online",
   "error_channels_deleted": "Ten pokój został usunięty",

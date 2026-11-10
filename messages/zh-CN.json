@@ -4474,6 +4474,7 @@
   "error_channels_rename_unsupported": "此服务器暂不支持重命名房间。",
   "error_channels_rename_pins_no_room": "此房间的置顶消息已占用空间，放不下新名称。请选择更短的名称或取消置顶一条消息。",
   "error_channels_owner_return_pending": "Ember 正在检查你离开期间此房间是否已被他人接管。请几分钟后再试。",
+  "error_channels_owner_reading": "Ember 仍在从网络加载此房间的最新状态。请稍后再试。",
   "error_channels_name_taken": "该房间名已被占用",
   "error_channels_registry_unavailable": "名称登记处不可用；请在联网后再试",
   "error_channels_deleted": "此房间已被删除",

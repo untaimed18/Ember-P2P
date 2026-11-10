@@ -889,7 +889,12 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             } else if let Some((channel_id, epoch)) =
                 state.ember_channel_epoch_searches.remove(&search_id)
             {
-                buffer_channel_epoch_records(state, channel_id, epoch, into_blobs(held));
+                // Finding nothing counts against the epoch only from a walk
+                // enough peers answered, as recovery reads absence.
+                let answered = search.as_ref().is_some_and(|s| {
+                    s.responded_count() >= crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE
+                });
+                buffer_channel_epoch_records(state, channel_id, epoch, into_blobs(held), answered);
             } else if let Some(channel_id) =
                 state.ember_channel_moderation_searches.remove(&search_id)
             {
@@ -898,9 +903,22 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                 // we could not reach the network — and succession must not read
                 // the two the same way.
                 let answered = search.as_ref().map_or(0, |s| s.responded_count());
+                // A look an owner's republish or edit can sign after: one that
+                // found the snapshot on another node, not just in our own
+                // store, or that enough peers answered for its absence to mean
+                // something, as recovery reads it.
+                let found = held.iter().filter(|record| !record.from_local_store).count();
+                let read = moderation_look_answered(answered, found);
+                let blobs = into_blobs(held);
+                if read {
+                    let began = state.channel_moderation_fetch_at.get(&channel_id).copied().unwrap_or(0);
+                    state.channel_moderation_looked_at.insert(channel_id, began);
+                }
+                *state.channel_moderation_look_read.entry(channel_id).or_default() |= read;
+                super::channel_membership::note_channel_moderation_unwritten(channel_id);
                 state
                     .ember_pending_channel_moderation
-                    .push((channel_id, into_blobs(held), answered));
+                    .push((channel_id, blobs, answered));
             } else if let Some(channel_id) =
                 state.ember_channel_settings_searches.remove(&search_id)
             {
