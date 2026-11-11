@@ -41,9 +41,8 @@ pub(in crate::network) async fn on_cleanup_tick(
     // Deliberately not gated on KAD status. This sweep is the only
     // bound on `pending_udp_reasks` and `server_udp_source_reask_at`,
     // both of which are filled by server-driven source discovery
-    // that needs no KAD at all — so in an eD2K-only session (which
-    // never leaves `Disconnected`) they grew for the whole session.
-    // Every step below is a no-op on empty KAD state.
+    // that needs no KAD at all. Every step below is a no-op on empty
+    // KAD state.
     let rendezvous_target = rendezvous_search_target(state);
     let (removed_sids, released_in_use) = state.search_manager.cleanup(120);
     finalize_removed_searches(

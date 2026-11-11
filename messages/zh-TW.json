@@ -4086,6 +4086,7 @@
   "channels_dm_peer_declined": "{name} 不接受你的私訊。",
   "channels_dm_you_declined": "你已拒絕 {name} 的私訊。",
   "channels_dm_no_shared_room": "你們已不在同一個房間，訊息無法送達。加對方為好友即可繼續聊天。",
+  "channels_dm_friend_listed": "{name} 已在你的好友列表中：請在好友聊天中傳訊息。",
   "channels_dm_status_sending": "正在傳送…",
   "channels_dm_status_delivered": "已送達",
   "channels_dm_status_failed": "未送達：對方可能不在線上，或使用的是舊版 Ember",

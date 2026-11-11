@@ -6649,10 +6649,13 @@ pub async fn channel_member_friend_code(
     member_pubkey: String,
 ) -> Result<String, String> {
     let pk = parse_member_pubkey(&member_pubkey)?;
-    let hash = crypto::node_id_from_ed25519_bytes(&pk).ok_or_else(|| {
-        coded("channels_member_invalid", "Invalid member key")
-    })?;
-    Ok(format!("ember2:{}:{}", hex::encode(hash), hex::encode(pk)))
+    member_friend_code(&pk).ok_or_else(|| coded("channels_member_invalid", "Invalid member key"))
+}
+
+/// [`channel_member_friend_code`] for a key already parsed.
+pub(crate) fn member_friend_code(member: &[u8; 32]) -> Option<String> {
+    let hash = crypto::node_id_from_ed25519_bytes(member)?;
+    Some(format!("ember2:{}:{}", hex::encode(hash), hex::encode(member)))
 }
 
 /// Rooms one friend request is sent across when it goes through rooms.

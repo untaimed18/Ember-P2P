@@ -12,9 +12,8 @@ pub(in crate::network) async fn on_broker_tick(
     kad_callback_tx: &mpsc::Sender<upload_server::KadCallbackParts>,
 ) {
     // Not gated on KAD status: the broker serves friend connections
-    // over rendezvous, which has nothing to do with Kademlia, and
-    // an eD2K-only session never leaves `Disconnected`. Both halves
-    // below are already no-ops when no broker exists.
+    // over rendezvous, which has nothing to do with Kademlia. Both
+    // halves below are already no-ops when no broker exists.
     if let Some(ref mut broker) = state.connection_broker {
         broker.tick().await;
     }

@@ -39,7 +39,6 @@ pub(in crate::network) async fn on_uss_ping_tick(
     udp_socket: &Arc<UdpSocket>,
     state: &mut NetworkState,
 ) {
-    if state.stats.status == NetworkStatus::Disconnected { return; }
     if !state.uss_enabled_flag.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some((addr, _)) = state.uss_host.take() {
             state.uss_prev_host = Some(addr);

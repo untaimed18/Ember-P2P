@@ -2259,10 +2259,6 @@ async fn handle_command_inner(
             comment,
             tx,
         } => {
-            if state.stats.status == NetworkStatus::Disconnected {
-                let _ = tx.send(Err("KAD is disconnected".to_string()));
-                return;
-            }
             let closest = state
                 .routing_table
                 .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
@@ -4565,6 +4561,13 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::KadConnect => {
+            // The node opens `Connecting` and moves only between that and
+            // `Connected`, so this finds it on its way or there. A connected
+            // node keeps its session; one still connecting bootstraps again.
+            if state.stats.status == NetworkStatus::Connected {
+                debug!("KAD connect requested while connected; nothing to do");
+                return;
+            }
             info!("KAD connect requested");
             // Nothing to un-gate for uploads: the listener is taken down only
             // by shutdown, which does not come back.
@@ -4685,9 +4688,6 @@ async fn handle_command_inner(
                         match socket.send_to(&packet, addr).await {
                             Ok(_) => {
                                 info!("Sent bootstrap request to {addr}");
-                                if state.stats.status == NetworkStatus::Disconnected {
-                                    state.stats.status = NetworkStatus::Connecting;
-                                }
                                 Ok(format!(
                                     "Bootstrap request sent to {addr} — contacts will appear as they respond"
                                 ))
@@ -4730,9 +4730,6 @@ async fn handle_command_inner(
                     let _ = socket.send_to(&packet, addr).await;
                 }
             }
-            if state.stats.status == NetworkStatus::Disconnected {
-                state.stats.status = NetworkStatus::Connecting;
-            }
             info!("Loaded {count} contacts from URL, bootstrapping");
             let _ = tx.send(Ok(format!("Loaded {count} contacts from nodes.dat")));
         }
@@ -4767,9 +4764,6 @@ async fn handle_command_inner(
                 }
             }
             info!("Sent bootstrap requests to {actually_sent}/{send_count} connected contacts");
-            if state.stats.status == NetworkStatus::Disconnected && actually_sent > 0 {
-                state.stats.status = NetworkStatus::Connecting;
-            }
             let _ = tx.send(if actually_sent > 0 {
                 Ok(actually_sent)
             } else {

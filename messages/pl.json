@@ -4107,6 +4107,7 @@
   "channels_dm_peer_declined": "{name} nie przyjmuje od ciebie wiadomości prywatnych.",
   "channels_dm_you_declined": "Odrzucono wiadomości prywatne od {name}.",
   "channels_dm_no_shared_room": "Nie jesteście już razem w żadnym pokoju, więc wiadomości nie mogą dotrzeć. Dodaj tę osobę do znajomych, aby dalej rozmawiać.",
+  "channels_dm_friend_listed": "{name} jest na twojej liście znajomych: napisz do tej osoby w czacie ze znajomymi.",
   "channels_dm_status_sending": "Wysyłanie…",
   "channels_dm_status_delivered": "Dostarczono",
   "channels_dm_status_failed": "Nie dostarczono: odbiorca może być offline lub używać starszej wersji Ember",

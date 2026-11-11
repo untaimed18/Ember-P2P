@@ -20,6 +20,7 @@ import {
   type ChatTabOp,
 } from '$lib/stores/chatTabs';
 import { activeChatHash } from '$lib/stores/friends';
+import { isAcceptedFriendInput } from '$lib/friendCode';
 import { loadAppSettings } from '$lib/stores/settings';
 import { initTheme } from '$lib/stores/theme';
 import { toastError } from '$lib/stores/toast';
@@ -229,11 +230,17 @@ export async function initChatPopoutMain(): Promise<() => void> {
         pendingDrafts = parseDrafts(e.payload?.drafts);
         pendingActiveHash = validHash(e.payload?.activeHash) ?? pendingActiveHash;
       }),
-      await listen<{ path?: unknown }>(NAVIGATE_EVENT, (e) => {
+      await listen<{ path?: unknown; add?: unknown; name?: unknown }>(NAVIGATE_EVENT, (e) => {
         const path = e.payload?.path;
-        if (typeof path === 'string' && NAVIGABLE.has(path)) {
-          void goto(path).catch((err) => console.warn('chat window: navigation failed', err));
-        }
+        if (typeof path !== 'string' || !NAVIGABLE.has(path)) return;
+        // Only fills the Add form: adding stays a click in this window.
+        const add = e.payload?.add;
+        const name = typeof e.payload?.name === 'string' ? e.payload.name : '';
+        const target =
+          path === '/friends' && typeof add === 'string' && isAcceptedFriendInput(add)
+            ? friendsAddPath(add, name)
+            : path;
+        void goto(target).catch((err) => console.warn('chat window: navigation failed', err));
       }),
     );
   } catch (e) {
@@ -288,6 +295,20 @@ export async function dockBack(): Promise<void> {
 export function showInMainWindow(path: string) {
   void emit(NAVIGATE_EVENT, { path }).catch(() => {});
   void focusMainWindow().catch(() => {});
+}
+
+/** Show the main window's Friends page with `code` and the name they go by
+ *  in its Add form, from the chat window, which cannot add friends itself. */
+export function addFriendInMainWindow(code: string, name: string) {
+  void emit(NAVIGATE_EVENT, { path: '/friends', add: code, name }).catch(() => {});
+  void focusMainWindow().catch(() => {});
+}
+
+/** The Friends page with its Add form filled: `code`, and `name` when there
+ *  is one. */
+export function friendsAddPath(code: string, name: string): string {
+  const shown = name.trim().slice(0, 256);
+  return `/friends?add=${encodeURIComponent(code.trim())}${shown ? `&name=${encodeURIComponent(shown)}` : ''}`;
 }
 
 /**

@@ -51,6 +51,7 @@ function thread(overrides: Partial<RoomDmThread> = {}): RoomDmThread {
     last_at: 1,
     can_send: true,
     is_friend: false,
+    friend_code: '',
     ...overrides,
   };
 }

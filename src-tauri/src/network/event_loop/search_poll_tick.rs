@@ -92,7 +92,6 @@ pub(in crate::network) async fn on_search_poll_tick(
     if let Some(request_id) = udp_finished_request {
         maybe_finish_active_search(state, app_handle, request_id);
     }
-    if state.stats.status == NetworkStatus::Disconnected { return; }
     let new_in_use = state.search_manager.drain_pending_in_use();
     if !new_in_use.is_empty() {
         state.routing_table.mark_contacts_in_use(&new_in_use);

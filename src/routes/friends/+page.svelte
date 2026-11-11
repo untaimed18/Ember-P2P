@@ -100,6 +100,9 @@
   let showAddForm = $state(false);
   let newHash = $state('');
   let newNickname = $state('');
+  /** The name a link filled in, which is the one they go by: added as it
+   *  stands, it is kept as theirs, not as the user's own label. */
+  let linkedName: string | null = null;
   let addError: string | null = $state(null);
 
   let confirmRemoveOpen = $state(false);
@@ -425,15 +428,22 @@
   $effect(() => {
     const addParam = $page.url.searchParams.get('add');
     if (!addParam) return;
+    const nameParam = [...($page.url.searchParams.get('name') ?? '').trim()]
+      .slice(0, FRIEND_NAME_MAX_CHARS)
+      .join('')
+      .trim();
     showAddForm = true;
     untrack(() => {
-      if (newHash.trim() !== addParam.trim()) newNickname = '';
+      if (nameParam) newNickname = nameParam;
+      else if (newHash.trim() !== addParam.trim()) newNickname = '';
     });
+    linkedName = nameParam || null;
     newHash = addParam;
     addError = null;
     untrack(() => {
       const next = new URL($page.url);
       next.searchParams.delete('add');
+      next.searchParams.delete('name');
       void goto(`${next.pathname}${next.search}${next.hash}`, {
         replaceState: true,
         keepFocus: true,
@@ -725,7 +735,8 @@
       const before = new Set(friends.map((f) => f.user_hash.toLowerCase()));
       // For a public key, re-adding an existing friend is an upsert rather than
       // an error, so the only way to tell it apart is whether a row appeared.
-      await addFriend(hash, nick || undefined);
+      await addFriend(hash, nick || undefined, nick !== '' && nick === linkedName);
+      linkedName = null;
       if (updatedFriend) {
         failedSearchToastsShown.delete(updatedFriend.user_hash.toLowerCase());
         flash(m.friends_code_updated({

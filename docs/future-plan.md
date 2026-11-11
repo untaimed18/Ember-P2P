@@ -50,8 +50,6 @@ owning a room stay on one key. The 1.7 sending paths are gone; reading 15,
 
 ## 3. Rooms and private messages
 
-- **"Add friend" from a private conversation with no shared room.** The text
-  already says to; the button is not there.
 - **Offline delivery of room private messages** through the chat mailbox
   (`derive_chat_mailbox_box` already works for any two identities). Today a
   message reaches only a recipient online within the 10-minute relay window,
@@ -141,22 +139,16 @@ owning a room stay on one key. The 1.7 sending paths are gone; reading 15,
   `|s=<url>|`, which eMule reads too. Deleting the file drops them. A switch
   leaves them out of copied links, since a mirror URL can name the user's own
   server. Detail: `archived-plans/post-1.7.5.md` item 6, step 2.
-- **Give up on an upload waiter whose slot dial fails.** A disconnected HighID
-  waiter at the top of the queue is dialled for its slot, and a failed dial
-  only backs off 30 seconds (`PUSH_GRANT_BACKOFF_SECS`) for the rest of its
-  hour, so a few peers that went offline can keep all three dials busy above a
-  reachable waiter. eMule drops a waiter whose slot connection fails. It needs
-  `connect_and_serve` to tell a failed connect from a soft end, then drop the
-  row or back off longer after each failure. A waiter for a friends-only file
-  is better left to its own re-ask, since push-grant sessions are plain eD2K.
-  Detail: `archived-plans/post-1.7.0.md`, "Upload queue".
-- **Unshare a folder inside a listed folder entry.** "Unshare folder" on
-  `F:\Music\Live`, while a partial share of `F:\` lists `F:\Music`, unshares
-  what is there now, but the list still offers `Live`, so files added to it
-  later are shared. Either a per-folder exclusion that discovery,
-  `allowlist_permits` and the withheld tidy-up all honour, or expanding the
-  `F:\Music` entry into its contents minus `Live`, which changes what new files
-  in `F:\Music` get.
+- **Grant a friend's slot for a friends-only file over a secure dial.** A
+  disconnected HighID waiter is dialled for its slot over plain eD2K, which
+  is never served a friends-only file, so a friend waiting for one loses its
+  row when its turn comes and queues again from the back. Skipping the dial
+  does not help: the friend's re-asks arrive by UDP and are answered with a
+  rank, and only an unanswered UDP re-ask makes it reconnect over TCP. The fix
+  is to dial such a waiter with `secure_friend_ember_hash` set from its proven
+  Ember key, so the session is authenticated and the file is served. Needs a
+  run between two machines, since nothing else exercises that dial for an
+  upload grant.
 - **eMule import: offer eMule's one-folder sharing.** eMule shares exactly the
   folders listed; Ember shares a folder with its subfolders. The import warns
   and lets each folder be unticked, but cannot import a folder the eMule way.
@@ -269,21 +261,6 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   an explicit message boundary. It is a redesign rather than code motion, so it
   needs integration testing against live peers. `command.rs` is separable and
   `NetworkDeps` gives the entry point a real signature.
-- **Fold the `Disconnected` network status.** Nothing sets
-  `NetworkStatus::Disconnected` after startup: the node opens in `Connecting`,
-  and the only command that moved it back, `kad_disconnect`, had no caller left
-  in the UI and was removed in 1.7.2. About 20 checks still test for it (the tick
-  gates, `PublishNote`, the bootstrap commands' "move off Disconnected", the
-  STUN-probe block in `network/mod.rs`, and the `'disconnected'` branch of the
-  status listener in `src/lib/stores/network.ts`), so each is dead. Inline
-  them as false, then look at what `KadConnect` still has to do when it can
-  only ever find the node Connecting or Connected.
-- **Decide what the Ember credit ledger is for.** The pubkey-keyed
-  `EmberCreditRecord` is written only for uploads on secure-v2 sessions and
-  persisted, but nothing reads it: the upload queue scores every peer from the
-  `user_hash` ledger, and since the legacy friend authentication went no
-  download is ever credited to it. Either give it a reader (the Known Ember
-  Peers tab, or scoring) or stop writing it and drop the table.
 - **Longer fuzz and property tests in CI,** and overnight soak runs.
 - **Find out why most known peers show verification as Needed.** SecureIdent is
   per session, which explains part of it. Run 30 to 60 minutes with
@@ -340,3 +317,6 @@ Taken off the plan, with why, so they are not added back without a new reason.
   a contested digest is not pinned), and keeping withheld lists in a store of
   their own (`post-1.7.0.md`; 1.7.2 made the list name folders instead, see
   `post-1.7.1.md` item 2).
+- **Already done, found since:** unsharing a folder inside a listed folder
+  entry (`withhold_under` gives it an empty list of its own, so files added
+  later stay unshared).

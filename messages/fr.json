@@ -4086,6 +4086,7 @@
   "channels_dm_peer_declined": "{name} n’accepte pas vos messages privés.",
   "channels_dm_you_declined": "Vous avez refusé les messages privés de {name}.",
   "channels_dm_no_shared_room": "Vous n’êtes plus dans un salon ensemble, les messages ne peuvent donc plus lui parvenir. Ajoutez cette personne en ami pour continuer à discuter.",
+  "channels_dm_friend_listed": "{name} est dans votre liste d’amis : écrivez-lui dans le chat entre amis.",
   "channels_dm_status_sending": "Envoi…",
   "channels_dm_status_delivered": "Remis",
   "channels_dm_status_failed": "Non remis : la personne est peut-être hors ligne ou utilise un Ember plus ancien",

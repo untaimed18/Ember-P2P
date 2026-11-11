@@ -2448,6 +2448,55 @@ fn push_grant_dialable(
         && !is_banned(&e.user_hash, &SocketAddr::new(ip, e.tcp_port))
 }
 
+/// A push-grant dial that never reached the peer: its address is refused by
+/// the IP filter, or the TCP connect failed or timed out. Kept apart from
+/// every later failure, since only this says the waiter is not there.
+#[derive(Debug)]
+struct PeerNotReached(String);
+
+impl std::fmt::Display for PeerNotReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PeerNotReached {}
+
+/// A connect error that is about our side — no network, no route out, no
+/// local address or buffer to dial from — and so says nothing about the peer.
+fn local_connect_failure(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    #[cfg(windows)]
+    const NO_BUFFERS: i32 = 10055; // WSAENOBUFS
+    #[cfg(target_os = "macos")]
+    const NO_BUFFERS: i32 = 55;
+    #[cfg(not(any(windows, target_os = "macos")))]
+    const NO_BUFFERS: i32 = 105;
+    matches!(
+        e.kind(),
+        ErrorKind::NetworkDown
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::AddrNotAvailable
+            | ErrorKind::AddrInUse
+    ) || e.raw_os_error() == Some(NO_BUFFERS)
+}
+
+/// Whether a dial's outcome was [`PeerNotReached`].
+fn peer_not_reached(result: &anyhow::Result<()>) -> bool {
+    result.as_ref().is_err_and(|e| e.downcast_ref::<PeerNotReached>().is_some())
+}
+
+/// Whether `e` is the waiter a push-grant dial started at `dialed_at` could
+/// not reach, which eMule drops: still unbound, and not re-asked since. One
+/// that re-asked meanwhile reached us another way and keeps its place.
+fn dropped_after_unreached_dial(
+    e: &QueueEntry,
+    identity: &QueueIdentity,
+    dialed_at: std::time::Instant,
+) -> bool {
+    e.identity == *identity && e.current_addr.is_none() && e.last_request <= dialed_at
+}
+
 /// The best-scoring queue row `competes` admits, the earlier join breaking a
 /// tie to agree with [`compute_queue_rank`].
 ///
@@ -3839,9 +3888,8 @@ struct UploadHandler {
     slot_order: Arc<SlotOrder>,
     /// Active Ember friend sessions: ember_hash -> outbound packet sender
     ember_sessions: EmberSessionMap,
-    /// Set to true when the network is disconnected; upload handlers check
-    /// this to reject new file requests and terminate active sessions (eMule
-    /// behavior: all upload activity stops on disconnect).
+    /// Set to true at shutdown; upload handlers check this to reject new file
+    /// requests and terminate active sessions.
     halted_for_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// Lock-free counter the per-connection upload tasks bump on every
     /// inbound `OP_REQUESTSOURCES` and outbound `OP_ANSWERSOURCES`
@@ -7728,26 +7776,41 @@ impl UploadHandler {
         let _admission_guard =
             ConnectionAdmissionGuard::new(conn_permit, self.ip_connection_counts.clone(), ip);
 
+        let dialed_at = std::time::Instant::now();
         let result = self.connect_and_serve(req).await;
         grant_accepted.release_dial();
-        drop(in_flight_entry);
 
         // A grant's waiting row was dropped by `run_session` when it accepted.
         // `connect_and_serve` returns only once the whole session is over, so
         // any row of this identity now is a later one, such as the re-queue
         // after a slot rotation, and must stay.
         if !grant_accepted.accepted() {
-            // No grant, whether the dial failed or the session ended softly.
-            // Back off either way: the row is still the top scorer, so without
-            // this the 1 s slot tick redials it and starves everyone below.
-            // The row keeps its seniority; sessions that refuse the peer
-            // outright (ban / AntiLeech) have already removed it.
+            // A peer the dial never reached goes, as eMule drops a waiter whose
+            // slot connection fails: one that went offline would otherwise be
+            // redialled for the rest of its hour, and a few such rows above a
+            // reachable waiter kept every dial busy. One still there queues
+            // again when it next asks.
+            let unreached = peer_not_reached(&result);
             match result {
                 Err(e) => debug!("AddUpNextClient dial to {peer_addr} failed before grant: {e}"),
                 Ok(()) => debug!("AddUpNextClient dial to {peer_addr} ended without a grant"),
             }
+            if unreached {
+                self.upload_queue
+                    .lock()
+                    .await
+                    .retain(|e| !dropped_after_unreached_dial(e, &identity, dialed_at));
+            }
+            // Otherwise the session ended softly and the row keeps its
+            // seniority; sessions that refuse the peer outright (ban /
+            // AntiLeech) have already removed it. Back off either way: a row
+            // that is still the top scorer would be redialled on every 1 s slot
+            // tick and starve everyone below it.
             back_off(identity).await;
         }
+        // Released only now, so a tick between the end of the dial and its
+        // back-off cannot dial the same row again.
+        drop(in_flight_entry);
     }
 
     /// Dial `peer_addr` and serve it as an upload peer — the LowID callback
@@ -7781,12 +7844,18 @@ impl UploadHandler {
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
             if let std::net::IpAddr::V4(v4) = peer_addr.ip() {
-                let blocked = self
-                    .shared_ip_filter
-                    .read()
-                    .map_or(true, |snap| snap.is_blocked(v4));
+                // A poisoned lock still refuses, but says nothing about the
+                // peer, so it is not a reason to drop the waiter.
+                let Ok(snap) = self.shared_ip_filter.read() else {
+                    anyhow::bail!("connect_and_serve {peer_addr}: the IP filter cannot be read");
+                };
+                let blocked = snap.is_blocked(v4);
+                drop(snap);
                 if blocked {
-                    anyhow::bail!("connect_and_serve {peer_addr}: blocked by the IP filter");
+                    return Err(PeerNotReached(format!(
+                        "connect_and_serve {peer_addr}: blocked by the IP filter"
+                    ))
+                    .into());
                 }
             }
         }
@@ -7827,6 +7896,14 @@ impl UploadHandler {
             .await
             {
                 Ok(Ok(s)) => s,
+                // The plain retry after a failed obfuscation reached the peer
+                // once already, so only a first connect says it is not there.
+                Ok(Err(e)) if !fallback_used && !local_connect_failure(&e) => {
+                    return Err(PeerNotReached(format!("connect_and_serve {peer_addr}: tcp connect: {e}")).into())
+                }
+                Err(_) if !fallback_used => {
+                    return Err(PeerNotReached(format!("connect_and_serve {peer_addr}: tcp connect timeout")).into())
+                }
                 Ok(Err(e)) => anyhow::bail!("connect_and_serve {peer_addr}: tcp connect: {e}"),
                 Err(_) => anyhow::bail!("connect_and_serve {peer_addr}: tcp connect timeout"),
             };
@@ -12013,18 +12090,6 @@ impl UploadHandler {
                                 h,
                             );
                         }
-                        if let Some(pk) = hello_caps.ember_pubkey {
-                            let session_secs =
-                                session_start.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-                            let mut cm = self.credit_manager.write().await;
-                            cm.record_ember_session(
-                                pk,
-                                slot_payload,
-                                session_secs,
-                                slot_payload > 0,
-                                secure_v2_authenticated,
-                            );
-                        }
                         session_start = None;
                         write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_OUTOFPARTREQS, &[])
                             .await?;
@@ -12986,21 +13051,6 @@ impl UploadHandler {
                                 credit_peer_ip,
                                 batch_credited_bytes,
                             );
-                            // Ember credit ledger: mirrors the eMule
-                            // credit write for peers that have
-                            // advertised an Ed25519 pubkey AND
-                            // completed PoP on THIS session. Without
-                            // PoP the write is rejected inside
-                            // `add_ember_uploaded` — a spoofer
-                            // riding a friend's hash cannot farm
-                            // real reputation here. The helper also
-                            // bumps `last_upload_time` so decay
-                            // starts from the last real upload, not
-                            // from the last handshake.
-                            if let Some(pk) = hello_caps.ember_pubkey {
-                                let verified = secure_v2_authenticated;
-                                cm.add_ember_uploaded(pk, batch_credited_bytes, verified);
-                            }
                         }
                         self.slot_rates
                             .lock()
@@ -13092,9 +13142,7 @@ impl UploadHandler {
                                 .await;
                         }
                         // Cleared so the shared teardown below does not emit a
-                        // second terminal event for this transfer. The Ember
-                        // session record still fires there (session_start is
-                        // left intact) with completed = true.
+                        // second terminal event for this transfer.
                         transfer_id = None;
                         break;
                     }
@@ -13209,16 +13257,6 @@ impl UploadHandler {
                              sending OP_OUTOFPARTREQS",
                             rate_tracker.smoothed_rate(),
                         );
-                        // Record the Ember session history. Reaching the
-                        // session limit is a clean completion: we served
-                        // them the most allowed per session.
-                        if let Some(pk) = hello_caps.ember_pubkey {
-                            let verified = secure_v2_authenticated;
-                            let mut cm = self.credit_manager.write().await;
-                            cm.record_ember_session(pk, slot_payload, session_secs, true, verified);
-                        }
-                        // Cleared before the write: if it fails, the teardown
-                        // must not record this session a second time.
                         session_start = None;
                         write_packet_async(
                             &mut writer,
@@ -13329,22 +13367,6 @@ impl UploadHandler {
                         last_part_request.elapsed().as_secs(),
                         session_open_at.elapsed().as_secs(),
                     );
-                    // Same reliability rule as the session-expired
-                    // branch: "completed" iff the peer actually
-                    // received at least one byte from this session.
-                    // A peer that cancels a freshly-granted slot
-                    // without any data transferred is counted as an
-                    // aborted session so the reliability multiplier
-                    // reflects the churn.
-                    if let Some(pk) = hello_caps.ember_pubkey {
-                        let verified = secure_v2_authenticated;
-                        let session_secs = session_start
-                            .map(|t| t.elapsed().as_secs())
-                            .unwrap_or(0);
-                        let completed = slot_payload > 0;
-                        let mut cm = self.credit_manager.write().await;
-                        cm.record_ember_session(pk, slot_payload, session_secs, completed, verified);
-                    }
                     if let Some(tid) = &transfer_id {
                         // Mirror the connection-exit cleanup at the bottom of
                         // this function: only report a session as Completed
@@ -15496,29 +15518,9 @@ impl UploadHandler {
                 credit_peer_ip,
                 unflushed_credit_bytes,
             );
-            if let Some(pk) = hello_caps.ember_pubkey {
-                cm.add_ember_uploaded(pk, unflushed_credit_bytes, secure_v2_authenticated);
-            }
         }
 
         // slot_guard Drop handles upload slot release automatically
-
-        // Ember session reliability/speed bookkeeping for the
-        // disconnect path: `session_start.is_some()` iff we were
-        // mid-session when the connection dropped. Same "completed
-        // iff bytes flowed" rule as the explicit cancel branch.
-        // Doing this before the transfer-event emit keeps the
-        // credit-manager write adjacent to the other end-of-session
-        // work, and guarantees the record lands even if the event
-        // channel is full (the send after this point drops on
-        // `let _`).
-        if let (Some(pk), Some(start)) = (hello_caps.ember_pubkey, session_start) {
-            let verified = secure_v2_authenticated;
-            let session_secs = start.elapsed().as_secs();
-            let completed = slot_payload > 0;
-            let mut cm = self.credit_manager.write().await;
-            cm.record_ember_session(pk, slot_payload, session_secs, completed, verified);
-        }
 
         // Emit completion/failure for any tracked upload. This is the
         // single bottleneck through which every upload session
@@ -16449,7 +16451,6 @@ mod scoring_tests {
     use super::*;
     use crate::network::ed2k::credits::{CreditManager, IdentState};
     use crate::search::index::LocalIndex;
-    use chrono::Utc;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn addr() -> Option<SocketAddr> {
@@ -16583,31 +16584,16 @@ mod scoring_tests {
         record.ident_ip = 0x0A00_0001;
     }
 
-    /// The best history the Ember ledger can carry: fully reliable and fast.
-    fn seed_ember_credits(cm: &mut CreditManager, pubkey: [u8; 32]) {
-        let now = Utc::now().timestamp();
-        let record = cm.get_or_create_ember(pubkey);
-        record.uploaded = 1_000_000;
-        record.downloaded = 50_000_000;
-        record.last_download_time = now;
-        record.last_upload_time = now;
-        record.total_sessions = 10;
-        record.completed_sessions = 10;
-        record.avg_upload_speed = 10 * 1024 * 1024;
-        record.ident_verified = true;
-    }
-
     /// eMule's `GetScore` is wait × credit ratio × file priority, with no
     /// multiplier for a peer we download from and nothing read from any
-    /// other ledger — so an Ember peer with a glowing Ember record scores
-    /// exactly what an eMule peer with the same `user_hash` history does.
+    /// other ledger — so an Ember peer scores exactly what an eMule peer with
+    /// the same `user_hash` history does.
     #[test]
     fn every_peer_is_scored_by_emules_formula_alone() {
         let mut cm = CreditManager::new();
         let idx = LocalIndex::new();
         let user_hash = [0xEEu8; 16];
         seed_emule_credits(&mut cm, user_hash);
-        seed_ember_credits(&mut cm, [0xEBu8; 32]);
 
         let score = score_queue_entry(
             &cm,
@@ -18570,6 +18556,50 @@ mod abuse_and_seniority_tests {
         let mut connected = e.clone();
         connected.current_addr = Some(addr("81.2.69.7"));
         assert!(!push_grant_dialable(&connected, &none, &no_backoff, never));
+    }
+
+    /// Only a dial that never reached the peer drops its waiter, and only the
+    /// row it dialled, still unbound and not re-asked since the dial began.
+    #[test]
+    fn an_unreached_push_grant_dial_drops_only_the_silent_waiter() {
+        let reached: anyhow::Result<()> = Err(anyhow::anyhow!("push-grant session: no free upload slot"));
+        let unreached: anyhow::Result<()> = Err(PeerNotReached("tcp connect timeout".into()).into());
+        assert!(!peer_not_reached(&Ok(())));
+        assert!(!peer_not_reached(&reached));
+        assert!(peer_not_reached(&unreached));
+        assert!(peer_not_reached(&unreached.map_err(|e| e.context("dialing"))));
+
+        let dialed_at = std::time::Instant::now();
+        let mut silent = waiter("81.2.69.7", 4672);
+        silent.last_request = dialed_at
+            .checked_sub(std::time::Duration::from_secs(60))
+            .expect("clock far enough along");
+        assert!(dropped_after_unreached_dial(&silent, &silent.identity, dialed_at));
+
+        let mut asked_again = silent.clone();
+        asked_again.last_request = dialed_at + std::time::Duration::from_secs(1);
+        assert!(!dropped_after_unreached_dial(&asked_again, &silent.identity, dialed_at));
+
+        let mut connected = silent.clone();
+        connected.current_addr = Some(addr("81.2.69.7"));
+        assert!(!dropped_after_unreached_dial(&connected, &silent.identity, dialed_at));
+
+        let mut someone_else = silent.clone();
+        someone_else.identity = QueueIdentity::UserHash([0x42; 16]);
+        assert!(!dropped_after_unreached_dial(&someone_else, &silent.identity, dialed_at));
+    }
+
+    /// A connect that fails on our side, with no network or nothing to dial
+    /// from, says nothing about the waiter; one the peer's side refused does.
+    #[test]
+    fn only_a_peer_side_connect_failure_counts_as_not_reached() {
+        use std::io::{Error, ErrorKind};
+        for ours in [ErrorKind::NetworkDown, ErrorKind::NetworkUnreachable, ErrorKind::AddrNotAvailable] {
+            assert!(local_connect_failure(&Error::from(ours)), "{ours:?}");
+        }
+        for theirs in [ErrorKind::ConnectionRefused, ErrorKind::HostUnreachable, ErrorKind::TimedOut] {
+            assert!(!local_connect_failure(&Error::from(theirs)), "{theirs:?}");
+        }
     }
 
     #[test]

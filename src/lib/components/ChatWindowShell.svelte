@@ -70,7 +70,12 @@
         else fn();
       })
       .catch((e) => console.error('Failed to register settings-changed listener:', e));
-    const onFocus = () => void loadAppSettings();
+    // The friend list likewise: a friend added in the main window, from this
+    // window's Add friend among others, announces nothing here.
+    const onFocus = () => {
+      void loadAppSettings();
+      void refreshFriendsList();
+    };
     window.addEventListener('focus', onFocus);
 
     void (async () => {

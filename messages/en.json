@@ -4107,6 +4107,7 @@
   "channels_dm_peer_declined": "{name} does not take private messages from you.",
   "channels_dm_you_declined": "You declined {name}'s private messages.",
   "channels_dm_no_shared_room": "You are no longer in a room together, so messages cannot reach them. Add them as a friend to keep talking.",
+  "channels_dm_friend_listed": "{name} is on your friends list: write to them in friend chat.",
   "channels_dm_status_sending": "Sending…",
   "channels_dm_status_delivered": "Delivered",
   "channels_dm_status_failed": "Not delivered: they may be offline or on an older Ember",

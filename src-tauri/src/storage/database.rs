@@ -460,9 +460,6 @@ pub type CreditRowRef<'a> = (
 /// proof named, and the SecIdent key the user hash was proven under then.
 pub type CreditKeyLink = ([u8; 16], [u8; 16], Vec<u8>);
 
-/// Borrowed `ember_credits` row, in `load_ember_credits` column order.
-pub type EmberCreditRowRef<'a> = (&'a [u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool);
-
 /// One public room remembered from an earlier Discover walk.
 ///
 /// A hint for what to draw while the DHT is being asked again, never an
@@ -1258,6 +1255,14 @@ impl Database {
             // to be reused. Only tidying, so a failure leaves it for next time.
             if let Err(e) = conn.execute_batch("DROP TABLE IF EXISTS sealed_offer_readers;") {
                 warn!("Could not drop the retired sealed_offer_readers table: {e}");
+            }
+            // The Ember credit ledger, retired in 1.8.0: nothing read it. The
+            // table stays, since 1.7.x saves its credits through it, but its
+            // rows (peers' keys and what we uploaded to each) go.
+            if let Err(e) = conn.execute_batch(
+                "DELETE FROM ember_credits WHERE EXISTS (SELECT 1 FROM ember_credits);",
+            ) {
+                warn!("Could not empty the retired ember_credits table: {e}");
             }
         }
 
@@ -2333,9 +2338,9 @@ impl Database {
             // Sits alongside the existing eMule `credits` table rather
             // than replacing it — wire-compatible eMule peers continue
             // using the `credits` table via user_hash, and Ember peers
-            // that proved their key on a secure-v2 session get a second
-            // higher-fidelity record here (see `EmberCreditRecord`; the
-            // upload queue does not score from it).
+            // that proved their key on a secure-v2 session got a second
+            // record here. Retired in 1.8.0, which empties it on open; the
+            // table stays because 1.7.x saves its credits through it.
             //
             // The pubkey column is `BLOB` (32 bytes) and acts as the
             // identity anchor — unlike user_hash it's cryptographically
@@ -3265,7 +3270,7 @@ impl Database {
             //
             // Columns on `credits` rather than a side table: they are keyed by
             // the same `user_hash`, they are written and pruned on exactly the
-            // same schedule, and `save_all_credits_with_ember` replaces the table
+            // same schedule, and `save_all_credits` replaces the table
             // wholesale, so a separate table would only add a second thing to
             // keep in step with that replacement.
             let tx = conn.unchecked_transaction()?;
@@ -5954,8 +5959,7 @@ impl Database {
         let records = stmt
             .query_map([], |row| {
                 let hash_blob: Vec<u8> = row.get(0)?;
-                // Exactly 16, not "at least 16", for the reason `load_ember_credits`
-                // spells out for its 32-byte key: a longer blob silently truncated
+                // Exactly 16, not "at least 16": a longer blob silently truncated
                 // to the first 16 bytes would alias two distinct user hashes onto a
                 // single credit account. Short blobs were already refused; long ones
                 // are now refused too, so the row is skipped rather than merged into
@@ -6360,84 +6364,12 @@ impl Database {
         Ok(())
     }
 
-    /// Load persisted Ember credit records. Returns raw field tuples so
-    /// the caller can rehydrate `EmberCreditRecord` without this layer
-    /// depending on the credit types — same pattern as
-    /// `load_credits`.
-    ///
-    /// Field order matches the v15 schema and the
-    /// `save_all_credits_with_ember` INSERT statement: pubkey, uploaded,
-    /// downloaded, last_upload_time, last_download_time,
-    /// completed_sessions, total_sessions, avg_upload_speed, last_seen,
-    /// ident_verified.
-    #[allow(clippy::type_complexity)]
-    pub fn load_ember_credits(
-        &self,
-    ) -> anyhow::Result<Vec<([u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT pub_key, uploaded, downloaded, last_upload_time, last_download_time, \
-                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified \
-             FROM ember_credits",
-        )?;
-        let records = stmt
-            .query_map([], |row| {
-                let pk_blob: Vec<u8> = row.get(0)?;
-                // M10: strict 32-byte pub_key. Previously a row with
-                // a >32 byte blob silently truncated to the first 32
-                // bytes, which would alias two distinct Ed25519 keys
-                // onto a single credit account if any non-conformant
-                // row ever appeared. We now reject anything that
-                // isn't exactly 32 bytes; the row is logged + skipped
-                // by the `filter_map` below rather than being merged
-                // into the wrong account.
-                if pk_blob.len() != 32 {
-                    return Err(rusqlite::Error::InvalidColumnType(
-                        0,
-                        format!("pub_key must be 32 bytes, got {}", pk_blob.len()),
-                        rusqlite::types::Type::Blob,
-                    ));
-                }
-                let mut pk = [0u8; 32];
-                pk.copy_from_slice(&pk_blob);
-                Ok((
-                    pk,
-                    row.get::<_, i64>(1)?.max(0) as u64,
-                    row.get::<_, i64>(2)?.max(0) as u64,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?.clamp(0, i64::from(u32::MAX)) as u32,
-                    row.get::<_, i64>(6)?.clamp(0, i64::from(u32::MAX)) as u32,
-                    row.get::<_, i64>(7)?.max(0) as u64,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)? != 0,
-                ))
-            })?
-            .filter_map(|r| match r {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!("Skipping malformed ember_credits row: {e}");
-                    None
-                }
-            })
-            .collect();
-        Ok(records)
-    }
-
-    /// Full-replacement save of BOTH credit tables inside a SINGLE
-    /// transaction, so the `credits` and `ember_credits` tables can never
-    /// diverge across a crash or a partial failure: both DELETE+INSERT pairs
-    /// share one `tx`.
+    /// Full-replacement save of the credit table in one transaction.
     ///
     /// A replacement rather than per-row `INSERT OR REPLACE`, so rows pruned
     /// in memory by `CreditManager::cleanup_stale` do not survive on disk and
     /// get resurrected by the loader on the next launch.
-    #[allow(clippy::type_complexity)]
-    pub fn save_all_credits_with_ember(
-        &self,
-        credits: &[CreditRowRef<'_>],
-        ember_credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
-    ) -> anyhow::Result<()> {
+    pub fn save_all_credits(&self, credits: &[CreditRowRef<'_>]) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM credits", [])?;
@@ -6476,41 +6408,6 @@ impl Database {
                 ])?;
             }
         }
-        tx.execute("DELETE FROM ember_credits", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO ember_credits (\
-                    pub_key, uploaded, downloaded, last_upload_time, last_download_time, \
-                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
-            for (
-                pk,
-                up,
-                down,
-                last_up,
-                last_down,
-                completed,
-                total,
-                avg_speed,
-                last_seen,
-                verified,
-            ) in ember_credits
-            {
-                stmt.execute(params![
-                    &pk[..],
-                    i64::try_from(*up).unwrap_or(i64::MAX),
-                    i64::try_from(*down).unwrap_or(i64::MAX),
-                    *last_up,
-                    *last_down,
-                    i64::from(*completed),
-                    i64::from(*total),
-                    i64::try_from(*avg_speed).unwrap_or(i64::MAX),
-                    *last_seen,
-                    i64::from(*verified),
-                ])?;
-            }
-        }
         tx.commit()?;
         Ok(())
     }
@@ -6526,18 +6423,6 @@ impl Database {
          ident_state = excluded.ident_state, ember_hash = excluded.ember_hash, \
          crypto_verified_once = excluded.crypto_verified_once, peer_name = excluded.peer_name, \
          client_software = excluded.client_software, seen_ip = excluded.seen_ip";
-    const EMBER_CREDIT_COLUMNS: &'static str = "pub_key, uploaded, downloaded, last_upload_time, \
-         last_download_time, completed_sessions, total_sessions, avg_upload_speed, last_seen, \
-         ident_verified";
-    const EMBER_CREDIT_UPSERT_SQL: &'static str = "INSERT INTO ember_credits (pub_key, uploaded, \
-         downloaded, last_upload_time, last_download_time, completed_sessions, total_sessions, \
-         avg_upload_speed, last_seen, ident_verified) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-         ON CONFLICT(pub_key) DO UPDATE SET uploaded = excluded.uploaded, \
-         downloaded = excluded.downloaded, last_upload_time = excluded.last_upload_time, \
-         last_download_time = excluded.last_download_time, \
-         completed_sessions = excluded.completed_sessions, total_sessions = excluded.total_sessions, \
-         avg_upload_speed = excluded.avg_upload_speed, last_seen = excluded.last_seen, \
-         ident_verified = excluded.ident_verified";
 
     /// Column values exactly as the credit saves store them, in
     /// `CREDIT_COLUMNS` order, so a stored row can be compared for equality.
@@ -6573,51 +6458,22 @@ impl Database {
         ]
     }
 
-    fn ember_credit_row_values(row: &EmberCreditRowRef<'_>) -> [rusqlite::types::Value; 10] {
-        use rusqlite::types::Value;
-        let (pk, up, down, last_up, last_down, completed, total, avg_speed, last_seen, verified) =
-            *row;
-        [
-            Value::Blob(pk.to_vec()),
-            Value::Integer(i64::try_from(up).unwrap_or(i64::MAX)),
-            Value::Integer(i64::try_from(down).unwrap_or(i64::MAX)),
-            Value::Integer(last_up),
-            Value::Integer(last_down),
-            Value::Integer(i64::from(completed)),
-            Value::Integer(i64::from(total)),
-            Value::Integer(i64::try_from(avg_speed).unwrap_or(i64::MAX)),
-            Value::Integer(last_seen),
-            Value::Integer(i64::from(verified)),
-        ]
-    }
-
     fn credit_row_key<'r>(row: &'r CreditRowRef<'_>) -> &'r [u8] {
         &row.0[..]
     }
 
-    fn ember_credit_row_key<'r>(row: &'r EmberCreditRowRef<'_>) -> &'r [u8] {
-        &row.0[..]
-    }
-
     /// Persist only the credit rows a flush found changed: an upsert for each
-    /// live record and a delete for each evicted key, both tables in one
-    /// transaction.
+    /// live record and a delete for each evicted key, in one transaction.
     ///
-    /// The full-replacement saves rewrite every row, and with `secure_delete`
-    /// and `synchronous=FULL` that pushed the whole ledger (up to 50k rows per
-    /// table) through the WAL under the connection mutex every minute.
+    /// The full-replacement save rewrites every row, and with `secure_delete`
+    /// and `synchronous=FULL` that pushed the whole ledger (up to 50k rows)
+    /// through the WAL under the connection mutex every minute.
     pub fn save_credit_changes(
         &self,
         credits: &[CreditRowRef<'_>],
         removed_credits: &[[u8; 16]],
-        ember_credits: &[EmberCreditRowRef<'_>],
-        removed_ember_credits: &[[u8; 32]],
     ) -> anyhow::Result<()> {
-        if credits.is_empty()
-            && removed_credits.is_empty()
-            && ember_credits.is_empty()
-            && removed_ember_credits.is_empty()
-        {
+        if credits.is_empty() && removed_credits.is_empty() {
             return Ok(());
         }
         let conn = self.conn.lock();
@@ -6632,33 +6488,19 @@ impl Database {
                 delete.execute(params![&hash[..]])?;
             }
         }
-        {
-            let mut upsert = tx.prepare(Self::EMBER_CREDIT_UPSERT_SQL)?;
-            for row in ember_credits {
-                upsert.execute(rusqlite::params_from_iter(Self::ember_credit_row_values(row)))?;
-            }
-            let mut delete = tx.prepare("DELETE FROM ember_credits WHERE pub_key = ?1")?;
-            for pk in removed_ember_credits {
-                delete.execute(params![&pk[..]])?;
-            }
-        }
         tx.commit()?;
         Ok(())
     }
 
-    /// Make both credit tables equal a full snapshot while writing only the
+    /// Make the credit table equal a full snapshot while writing only the
     /// rows that differ, in one transaction. Same end state as
-    /// [`Self::save_all_credits_with_ember`], including dropping rows the
-    /// snapshot lacks or that `load_credits` would skip as malformed.
+    /// [`Self::save_all_credits`], including dropping rows the snapshot lacks
+    /// or that `load_credits` would skip as malformed.
     ///
     /// For a session's first flush: startup loads every record through the
     /// mutating accessor, so all of them are marked even though nearly all
     /// already match disk. Reading the table is far cheaper than rewriting it.
-    pub fn sync_all_credits_with_ember(
-        &self,
-        credits: &[CreditRowRef<'_>],
-        ember_credits: &[EmberCreditRowRef<'_>],
-    ) -> anyhow::Result<()> {
+    pub fn sync_all_credits(&self, credits: &[CreditRowRef<'_>]) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         Self::reconcile_rows(
@@ -6669,15 +6511,6 @@ impl Database {
             credits,
             Self::credit_row_key,
             Self::credit_row_values,
-        )?;
-        Self::reconcile_rows(
-            &tx,
-            "ember_credits",
-            Self::EMBER_CREDIT_COLUMNS,
-            Self::EMBER_CREDIT_UPSERT_SQL,
-            ember_credits,
-            Self::ember_credit_row_key,
-            Self::ember_credit_row_values,
         )?;
         tx.commit()?;
         Ok(())
@@ -17331,34 +17164,6 @@ mod tests {
         }
     }
 
-    /// Minimal schema for testing the defensive SQLite-to-memory conversion
-    /// used by `load_ember_credits`.
-    fn ember_credits_only_db() -> Database {
-        let conn = Connection::open_in_memory().expect("open in-memory");
-        conn.execute_batch(
-            "CREATE TABLE ember_credits (
-                pub_key BLOB PRIMARY KEY,
-                uploaded INTEGER NOT NULL DEFAULT 0,
-                downloaded INTEGER NOT NULL DEFAULT 0,
-                last_upload_time INTEGER NOT NULL DEFAULT 0,
-                last_download_time INTEGER NOT NULL DEFAULT 0,
-                completed_sessions INTEGER NOT NULL DEFAULT 0,
-                total_sessions INTEGER NOT NULL DEFAULT 0,
-                avg_upload_speed INTEGER NOT NULL DEFAULT 0,
-                last_seen INTEGER NOT NULL DEFAULT 0,
-                ident_verified INTEGER NOT NULL DEFAULT 0
-            );",
-        )
-        .expect("create schema");
-        Database {
-            conn: Mutex::new(conn),
-            path: std::path::PathBuf::from(":memory:"),
-            chat_key: Some(Zeroizing::new([0xA5; 32])),
-            corrupt_backup: None,
-            feeds_ready: Default::default(),
-        }
-    }
-
     /// Build a `Database` with just the friends-related tables, enough to
     /// exercise blocking without a `tauri::AppHandle`.
     fn friends_only_db() -> Database {
@@ -17454,26 +17259,6 @@ mod tests {
             .lock()
             .query_row(sql, [], |r| r.get(0))
             .expect("count")
-    }
-
-    #[test]
-    fn load_ember_credits_clamps_corrupt_session_counters() {
-        let db = ember_credits_only_db();
-        db.conn
-            .lock()
-            .execute(
-                "INSERT INTO ember_credits (
-                    pub_key, uploaded, downloaded, last_upload_time, last_download_time,
-                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified
-                ) VALUES (?1, 0, 0, 0, 0, ?2, ?3, 0, 0, 0)",
-                params![vec![0xA5u8; 32], 5_000_000_000i64, -1i64],
-            )
-            .expect("insert corrupt counters");
-
-        let records = db.load_ember_credits().expect("load credits");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].5, u32::MAX);
-        assert_eq!(records[0].6, 0);
     }
 
     /// The point of a block is that it outlives the friendship it ended.
@@ -18877,7 +18662,7 @@ mod tests {
         assert_eq!(blocked[0].1, "Mallory");
     }
 
-    /// Regression: `save_all_credits_with_ember` MUST act as a full
+    /// Regression: `save_all_credits` MUST act as a full
     /// replacement so records pruned in memory by
     /// `CreditManager::cleanup_stale` are also dropped from the persisted
     /// table. Before this was a bare `INSERT OR REPLACE`, the database
@@ -18893,14 +18678,11 @@ mod tests {
         let pk: &[u8] = &[0xAA; 4];
 
         // Seed three records.
-        db.save_all_credits_with_ember(
-            &[
-                (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false, "", "", 0),
-                (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true, "", "", 0),
-                (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false, "", "", 0),
-            ],
-            &[],
-        )
+        db.save_all_credits(&[
+            (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false, "", "", 0),
+            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true, "", "", 0),
+            (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false, "", "", 0),
+        ])
         .expect("seed");
         let loaded = db.load_credits().expect("reload after seed");
         assert_eq!(loaded.len(), 3, "seed must persist three records");
@@ -18908,10 +18690,20 @@ mod tests {
         // Re-save with only one of the three. The other two represent
         // stale records the in-memory pruner has just dropped — they
         // must NOT survive in the database.
-        db.save_all_credits_with_ember(
-            &[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None, true, "Nia", "eMule 0.60a", 0x0506_0708)],
-            &[],
-        )
+        db.save_all_credits(&[(
+            &h2,
+            999,
+            888,
+            1_700_000_999,
+            pk,
+            0x0102_0304,
+            1,
+            None,
+            true,
+            "Nia",
+            "eMule 0.60a",
+            0x0506_0708,
+        )])
         .expect("replace");
         let after = db.load_credits().expect("reload after replace");
         assert_eq!(after.len(), 1, "stale records must not persist");
@@ -18944,11 +18736,11 @@ mod tests {
     fn save_all_credits_with_empty_input_clears_table() {
         let (db, path) = migrated_credits_db("empty");
         let h1 = [0x01u8; 16];
-        db.save_all_credits_with_ember(&[(&h1, 1, 1, 0, &[], 0, 0, None, false, "", "", 0)], &[])
+        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0, None, false, "", "", 0)])
             .expect("seed");
         assert_eq!(db.load_credits().expect("reload").len(), 1);
 
-        db.save_all_credits_with_ember(&[], &[]).expect("empty save");
+        db.save_all_credits(&[]).expect("empty save");
         assert!(db.load_credits().expect("reload empty").is_empty());
         remove_db_files(db, &path);
     }
@@ -18975,18 +18767,11 @@ mod tests {
     fn save_credit_changes_upserts_touched_rows_and_deletes_evicted_ones() {
         let (db, path) = migrated_credits_db("changes");
         let (h1, h2, h3) = ([0x01u8; 16], [0x02u8; 16], [0x03u8; 16]);
-        let (pk1, pk2) = ([0x11u8; 32], [0x12u8; 32]);
         let key: &[u8] = &[0xAA; 4];
-        db.save_all_credits_with_ember(
-            &[
-                (&h1, 1, 1, 100, key, 0, 0, None, false, "", "", 0),
-                (&h2, 2, 2, 200, key, 0, 0, None, false, "", "", 0),
-            ],
-            &[
-                (&pk1, 1, 1, 0, 0, 0, 0, 0, 100, false),
-                (&pk2, 2, 2, 0, 0, 0, 0, 0, 200, false),
-            ],
-        )
+        db.save_all_credits(&[
+            (&h1, 1, 1, 100, key, 0, 0, None, false, "", "", 0),
+            (&h2, 2, 2, 200, key, 0, 0, None, false, "", "", 0),
+        ])
         .expect("seed");
 
         db.save_credit_changes(
@@ -18995,8 +18780,6 @@ mod tests {
                 (&h3, 3, 3, 300, &[], 0, 0, None, false, "", "", 0),
             ],
             &[h2],
-            &[(&pk1, 5, 6, 7, 8, 1, 2, 3, 300, true)],
-            &[pk2],
         )
         .expect("incremental save");
 
@@ -19009,10 +18792,6 @@ mod tests {
             "an existing row must take every new column value"
         );
         assert_eq!(credits[1].0, h3, "a new record must be inserted");
-        assert_eq!(
-            db.load_ember_credits().expect("reload ember"),
-            vec![(pk1, 5, 6, 7, 8, 1, 2, 3, 300, true)]
-        );
         remove_db_files(db, &path);
     }
 
@@ -19022,18 +18801,11 @@ mod tests {
     fn sync_all_credits_writes_only_differences_and_drops_unknown_rows() {
         let (db, path) = migrated_credits_db("sync");
         let (h1, h2, h3) = ([0x01u8; 16], [0x02u8; 16], [0x03u8; 16]);
-        let (pk1, pk2) = ([0x11u8; 32], [0x12u8; 32]);
         let key: &[u8] = &[0xAA; 4];
-        db.save_all_credits_with_ember(
-            &[
-                (&h1, 1, 1, 100, key, 0, 0, None, false, "a", "b", 0),
-                (&h2, 2, 2, 200, key, 0, 0, None, false, "", "", 0),
-            ],
-            &[
-                (&pk1, 1, 1, 0, 0, 0, 0, 0, 100, false),
-                (&pk2, 2, 2, 0, 0, 0, 0, 0, 200, false),
-            ],
-        )
+        db.save_all_credits(&[
+            (&h1, 1, 1, 100, key, 0, 0, None, false, "a", "b", 0),
+            (&h2, 2, 2, 200, key, 0, 0, None, false, "", "", 0),
+        ])
         .expect("seed");
         db.conn
             .lock()
@@ -19047,9 +18819,7 @@ mod tests {
             (&h1, 1, 1, 100, key, 0, 0, None, false, "a", "b", 0),
             (&h3, 3, 3, 300, key, 0, 0, None, false, "", "", 0),
         ];
-        let ember_snapshot: [EmberCreditRowRef<'_>; 1] = [(&pk1, 9, 9, 0, 0, 0, 0, 0, 100, true)];
-        db.sync_all_credits_with_ember(&snapshot, &ember_snapshot)
-            .expect("sync");
+        db.sync_all_credits(&snapshot).expect("sync");
 
         let raw_rows: i64 = db
             .conn
@@ -19060,10 +18830,6 @@ mod tests {
         let mut credits = db.load_credits().expect("reload");
         credits.sort_by_key(|row| row.0);
         assert_eq!(credits.iter().map(|r| r.0).collect::<Vec<_>>(), vec![h1, h3]);
-        assert_eq!(
-            db.load_ember_credits().expect("reload ember"),
-            vec![(pk1, 9, 9, 0, 0, 0, 0, 0, 100, true)]
-        );
 
         db.conn
             .lock()
@@ -19071,14 +18837,10 @@ mod tests {
                 "CREATE TEMP TABLE credit_writes (n INTEGER);
                  CREATE TEMP TRIGGER cw_ins AFTER INSERT ON main.credits BEGIN INSERT INTO credit_writes VALUES (1); END;
                  CREATE TEMP TRIGGER cw_upd AFTER UPDATE ON main.credits BEGIN INSERT INTO credit_writes VALUES (1); END;
-                 CREATE TEMP TRIGGER cw_del AFTER DELETE ON main.credits BEGIN INSERT INTO credit_writes VALUES (1); END;
-                 CREATE TEMP TRIGGER ew_ins AFTER INSERT ON main.ember_credits BEGIN INSERT INTO credit_writes VALUES (1); END;
-                 CREATE TEMP TRIGGER ew_upd AFTER UPDATE ON main.ember_credits BEGIN INSERT INTO credit_writes VALUES (1); END;
-                 CREATE TEMP TRIGGER ew_del AFTER DELETE ON main.ember_credits BEGIN INSERT INTO credit_writes VALUES (1); END;",
+                 CREATE TEMP TRIGGER cw_del AFTER DELETE ON main.credits BEGIN INSERT INTO credit_writes VALUES (1); END;",
             )
             .expect("write counters");
-        db.sync_all_credits_with_ember(&snapshot, &ember_snapshot)
-            .expect("second sync");
+        db.sync_all_credits(&snapshot).expect("second sync");
         let writes: i64 = db
             .conn
             .lock()
@@ -19147,15 +18909,12 @@ mod tests {
         let fresh = [0x22u8; 16];
         let pk: &[u8] = &[0xAA; 4];
 
-        db.save_all_credits_with_ember(
-            &[
-                (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true, "", "", 0),
-                // Persisted `Failed` (2) with no anchor: exactly the state a
-                // stranger can force by failing one challenge under this hash.
-                (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false, "", "", 0),
-            ],
-            &[],
-        )
+        db.save_all_credits(&[
+            (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true, "", "", 0),
+            // Persisted `Failed` (2) with no anchor: exactly the state a
+            // stranger can force by failing one challenge under this hash.
+            (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false, "", "", 0),
+        ])
         .expect("seed");
 
         let loaded = db.load_credits().expect("reload");
@@ -19213,11 +18972,8 @@ mod tests {
         let (db, path) = migrated_credits_db("banned-list");
         let named = [0x0Au8; 16];
         let unnamed = [0x0Bu8; 16];
-        db.save_all_credits_with_ember(
-            &[(&named, 1, 1, 0, &[], 0, 0, None, false, "Nia", "eMule 0.60a", 0)],
-            &[],
-        )
-        .expect("seed credits");
+        db.save_all_credits(&[(&named, 1, 1, 0, &[], 0, 0, None, false, "Nia", "eMule 0.60a", 0)])
+            .expect("seed credits");
         db.ban_peer(&hex::encode(named)).expect("ban named");
         db.ban_peer(&hex::encode(unnamed)).expect("ban unnamed");
 
@@ -23326,6 +23082,32 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The Ember credit ledger 1.7.x wrote is emptied on open, and its table
+    /// kept for a 1.7.x that saves its credits through it after a downgrade.
+    #[test]
+    fn a_1_7_ember_credit_ledger_is_emptied_on_open() {
+        let path = temp_db_path("ember-credits");
+        {
+            let db = Database::open_at(&path).expect("open db");
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO ember_credits (pub_key, uploaded, last_seen) VALUES (?1, 5, 100)",
+                    params![vec![0xA5u8; 32]],
+                )
+                .expect("1.7.x row");
+        }
+        let db = Database::open_at(&path).expect("reopen db");
+        let rows: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ember_credits", [], |row| row.get(0))
+            .expect("the table is still there");
+        assert_eq!(rows, 0);
+        drop(db);
+        remove_temp_db(&path);
     }
 
     /// The list 1.7.x kept of members that read sealed offers is dropped on

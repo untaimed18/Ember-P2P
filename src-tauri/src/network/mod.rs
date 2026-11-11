@@ -1793,39 +1793,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
             Err(e) => warn!("Could not load Ember key links: {e}"),
         }
-        // Ember credit records live in a separate v15 table, loaded the
-        // same way as the eMule table above.
-        if let Ok(records) = db.load_ember_credits() {
-            let loaded_count = records.len();
-            for (
-                pk,
-                up,
-                down,
-                last_up,
-                last_down,
-                completed,
-                total,
-                avg_speed,
-                last_seen,
-                verified,
-            ) in records
-            {
-                let mut record = ed2k::credits::EmberCreditRecord::new(pk);
-                record.uploaded = up;
-                record.downloaded = down;
-                record.last_upload_time = last_up;
-                record.last_download_time = last_down;
-                record.completed_sessions = completed;
-                record.total_sessions = total;
-                record.avg_upload_speed = avg_speed;
-                record.last_seen = last_seen;
-                record.ident_verified = verified;
-                cm.insert_loaded_ember_credit(record);
-            }
-            if loaded_count > 0 {
-                info!("Loaded {loaded_count} Ember credit records from database");
-            }
-        }
         let clients_met = data_dir.join("clients.met");
         crate::security::recover_interrupted_replace(&clients_met);
         if clients_met.exists() && cm.all_records().is_empty() {
@@ -2967,52 +2934,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
         }
 
-        if state.stats.status == NetworkStatus::Disconnected {
-            // Ember-only nodes remain KAD-Disconnected permanently. Do not
-            // cancel an in-flight STUN probe that discovers `external_ip` for
-            // slice-9 source publish — clearing here every loop iteration
-            // would respawn forever and ignore every STUN reply as stale.
-            //
-            // Also don't stomp a probe that just started: this runs on EVERY
-            // loop iteration while disconnected (not just once on the
-            // disconnect transition), and STUN keepalive's own external-IP
-            // discovery can satisfy the NAT-probe trigger conditions before
-            // `KadConnect` ever flips status away from `Disconnected` (often
-            // within the same second at startup). Without this guard, each
-            // iteration here would reset `nat_probe_in_flight = false`,
-            // letting the catch-all trigger below immediately spawn a NEW
-            // probe and orphan the previous one's reply-routing channel —
-            // observed in practice as 3 probes spawned within ~40ms and a
-            // "STUN reply channel closed" error on the abandoned ones.
-            let probe_is_fresh = nat_probe_in_flight
-                && nat_probe_started_at
-                    .map(|t| t.elapsed() < NAT_PROBE_WATCHDOG)
-                    .unwrap_or(false);
-            if !settings.ember_native_enabled && !probe_is_fresh {
-                nat_probe_in_flight = false;
-                nat_probe_started_at = None;
-                nat_probe_packet_tx = None;
-            }
-            // Same trap as the NAT probe above, and for the same reason: once
-            // the user disconnects KAD the node is `Disconnected` for the rest
-            // of the session, so clearing unconditionally left the in-flight guard
-            // permanently false. The bootstrap timer then respawned
-            // registration every tick, each spawn bumped
-            // `rendezvous_register_generation`, and the result handler dropped
-            // every reply as stale — `rendezvous_registered` and
-            // `friend_presence_initial_done` could never latch and friends
-            // never saw us. Only give up on an attempt the watchdog would have
-            // abandoned anyway.
-            let register_is_fresh = rendezvous_register_in_flight
-                && rendezvous_register_started_at
-                    .map(|t| t.elapsed() < RENDEZVOUS_REGISTER_WATCHDOG)
-                    .unwrap_or(false);
-            if !register_is_fresh {
-                rendezvous_register_in_flight = false;
-                rendezvous_register_started_at = None;
-            }
-        }
-
         // Probe NAT when we already know an external IP (refine type), or when
         // Ember is on and we still lack one (STUN discovers the mapped address
         // so KAD-less HighID source publish can advertise a real IP).
@@ -3190,17 +3111,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             ).await;
                         }
                     } else {
-                        // Always dispatch: this handler owns eD2K peer UDP as
-                        // well as KAD, and it gates the KAD half on connection
-                        // state itself. Only the KAD accounting is conditional.
-                        if state.stats.status != NetworkStatus::Disconnected {
-                            last_kad_activity_at = monotonic_secs();
-                            stats_manager.add_overhead(
-                                crate::storage::statistics::OverheadCategory::Kad,
-                                crate::storage::statistics::OverheadDirection::Download,
-                                len as u64,
-                            );
-                        }
+                        // This handler owns eD2K peer UDP as well as KAD.
+                        last_kad_activity_at = monotonic_secs();
+                        stats_manager.add_overhead(
+                            crate::storage::statistics::OverheadCategory::Kad,
+                            crate::storage::statistics::OverheadDirection::Download,
+                            len as u64,
+                        );
                         handle_udp_packet(
                             &udp_socket,
                             data,
@@ -3618,7 +3535,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // sent — not 60s later.
             _ = publish_health_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let cur = PublishHealthSnapshot {
                     confirmed: state.publish_confirmed,
                     pending: state.publish_pending.len(),
@@ -3756,7 +3672,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // eMule Consolidate: merge sparse sibling leaf zones every 45 minutes
             _ = consolidate_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let merged = state.routing_table.consolidate();
                 if merged > 0 {
                     debug!("Consolidated {merged} zone pairs");

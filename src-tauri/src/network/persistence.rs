@@ -107,7 +107,6 @@ pub(super) async fn flush_credit_state(
         cm.dirty_generation()
     };
 
-    type EmberCreditRow = ([u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool);
     fn credit_row(r: &ed2k::credits::CreditRecord) -> crate::storage::database::CreditRow {
         (
             r.user_hash,
@@ -124,35 +123,18 @@ pub(super) async fn flush_credit_state(
             r.seen_ip,
         )
     }
-    fn ember_credit_row(r: &ed2k::credits::EmberCreditRecord) -> EmberCreditRow {
-        (
-            r.pub_key,
-            r.uploaded,
-            r.downloaded,
-            r.last_upload_time,
-            r.last_download_time,
-            r.completed_sessions,
-            r.total_sessions,
-            r.avg_upload_speed,
-            r.last_seen,
-            r.ident_verified,
-        )
-    }
-
     // Only the rows touched since the last successful flush are written: a
     // key still in the map is upserted, one that is gone is deleted. The
     // keys are taken under the write lock, which is then downgraded so the
     // row copies and the `clients.met` serialization see exactly that state
     // while readers (the upload dispatcher) keep running.
-    let (serialized_bytes, flush_keys, owned, removed, ember_owned, ember_removed, links, key_links) = {
+    let (serialized_bytes, flush_keys, owned, removed, links, key_links) = {
         let mut cm_w = credit_manager.write().await;
         let flush_keys = cm_w.begin_flush();
         let cm = cm_w.downgrade();
         let bytes = cm.serialize();
         let mut records: Vec<crate::storage::database::CreditRow> = Vec::new();
         let mut removed: Vec<[u8; 16]> = Vec::new();
-        let mut ember_records: Vec<EmberCreditRow> = Vec::new();
-        let mut ember_removed: Vec<[u8; 32]> = Vec::new();
         // `proven_ember_hash` of each row written, which lives in its own table.
         let mut links: Vec<([u8; 16], Option<[u8; 16]>)> = Vec::new();
         // And its key link, which lives in another.
@@ -170,11 +152,6 @@ pub(super) async fn flush_credit_state(
                     key_links.push((r.user_hash, Some(link)));
                 }
             }
-            ember_records = cm
-                .all_ember_records()
-                .into_iter()
-                .map(ember_credit_row)
-                .collect();
         } else {
             for key in &flush_keys.credit_keys {
                 match cm.get_record(key) {
@@ -186,14 +163,8 @@ pub(super) async fn flush_credit_state(
                     None => removed.push(*key),
                 }
             }
-            for key in &flush_keys.ember_keys {
-                match cm.get_ember_record(key) {
-                    Some(r) => ember_records.push(ember_credit_row(r)),
-                    None => ember_removed.push(*key),
-                }
-            }
         }
-        (bytes, flush_keys, records, removed, ember_records, ember_removed, links, key_links)
+        (bytes, flush_keys, records, removed, links, key_links)
     };
     let full_sync = flush_keys.full_sync;
     // Own the save slot through the blocking DB/cache write itself. If the
@@ -224,18 +195,12 @@ pub(super) async fn flush_credit_state(
                 )
             })
             .collect();
-        // Persist both credit tables in ONE SQLite transaction so they can
-        // never diverge across a crash or partial failure.
-        let ember_refs: Vec<crate::storage::database::EmberCreditRowRef<'_>> = ember_owned
-            .iter()
-            .map(|(pk, u, d, lu, ld, c, t, s, ls, v)| (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v))
-            .collect();
         // Persist SQLite first: it is authoritative on load. Only refresh the
         // clients.met cache after that transaction succeeds.
         let result = if full_sync {
-            db_ref.sync_all_credits_with_ember(&refs, &ember_refs)
+            db_ref.sync_all_credits(&refs)
         } else {
-            db_ref.save_credit_changes(&refs, &removed, &ember_refs, &ember_removed)
+            db_ref.save_credit_changes(&refs, &removed)
         };
         // Display-only, so a failure here is logged rather than holding the
         // credits back: the next touch of the row writes it again.
@@ -249,7 +214,7 @@ pub(super) async fn flush_credit_state(
                 debug!("Failed to save Ember key links: {e}");
             }
         }
-        if result.is_ok() && (full_sync || !removed.is_empty() || !ember_removed.is_empty()) {
+        if result.is_ok() && (full_sync || !removed.is_empty()) {
             db_ref.incremental_vacuum();
         }
         let mut cache_written = false;

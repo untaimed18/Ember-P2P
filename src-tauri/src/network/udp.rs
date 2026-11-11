@@ -982,17 +982,7 @@ pub(super) async fn handle_udp_packet_inner(
 
     // Everything above serves eD2K *peer* UDP — port test, queue reasks and
     // their acks, buddy reask relay — none of which involves KAD. Everything
-    // below is KAD's, and an unsolicited KAD packet must not be parsed or folded
-    // into the routing table while KAD is disconnected, so the gate belongs here
-    // rather than around the whole handler. It used to sit at the call site,
-    // which meant a session with KAD disconnected — eD2K-only, but still
-    // transferring — discarded every inbound peer datagram while still sending
-    // reasks, so queue ranks never updated, peers queued on us never got an
-    // ack, and the UDP port test always failed.
-    if state.stats.status == NetworkStatus::Disconnected {
-        debug!("Dropping KAD UDP packet from {from}: KAD is not connected");
-        return;
-    }
+    // below is KAD's.
 
     // Canonicalize IPv6-mapped-IPv4 addresses so all downstream handlers see IpAddr::V4
     let from = match from.ip() {

@@ -47,16 +47,11 @@ pub(in crate::network) async fn on_bootstrap_tick(
     maybe_probe_from_outside(state, settings);
     keep_named_buddy_reachable(udp_socket, state).await;
 
-    // Only the KAD bootstrap below depends on KAD being up. The
-    // friend-presence and friend-search work after this block must
-    // not: `stats.status` is only ever advanced by KAD code paths,
-    // so a session where the user disconnected KAD sits at
-    // `Disconnected` until they reconnect. Returning here left the
-    // connection broker unbuilt, no QUIC listener, and the node
-    // never registered with rendezvous — friends could not find it
-    // at all, with no event emitted to say so.
-    'kad_bootstrap: {
-    if state.stats.status == NetworkStatus::Disconnected { break 'kad_bootstrap; }
+    // The KAD bootstrap. The friend-presence and friend-search work after
+    // it must never wait on KAD: returning early here once left the
+    // connection broker unbuilt, no QUIC listener, and the node never
+    // registered with rendezvous.
+    {
     let table_size = state.routing_table.len();
 
     if table_size == 0 {
@@ -561,7 +556,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
             }
     }
     state.stats.connected_peers = count;
-    } // 'kad_bootstrap
+    } // KAD bootstrap
 
     // Register with the rendezvous server as soon as we have a
     // confirmed external IP so other Ember clients can find us.

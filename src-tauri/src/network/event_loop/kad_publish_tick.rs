@@ -14,7 +14,7 @@ pub(in crate::network) async fn on_kad_publish_tick(
     const KADEMLIA_TOTAL_STORE_NOTES: usize = 1;
     const REPUBLISH_NOTE_SECS: i64 = 24 * 3600;
 
-    if state.stats.status == NetworkStatus::Disconnected || state.routing_table.is_empty() {
+    if state.routing_table.is_empty() {
         return;
     }
 

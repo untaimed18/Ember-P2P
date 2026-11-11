@@ -114,12 +114,9 @@ pub(in crate::network) async fn on_publish_tick(
     }
 
     // KAD publish diagnostics only. Presence heartbeat lives on
-    // `bootstrap_timer` so an eD2K-only session (status stays
-    // `Disconnected`) still refreshes rendezvous.
-    if state.stats.status == NetworkStatus::Disconnected
-        || state.routing_table.is_empty()
-    {
-        debug!("Skipping publish cycle: KAD is not connected or its routing table is empty");
+    // `bootstrap_timer`.
+    if state.routing_table.is_empty() {
+        debug!("Skipping publish cycle: the KAD routing table is empty");
     } else {
     let total_files = state.publish_manager.file_count();
     let needing_source = state.publish_manager.files_needing_source_publish().len();

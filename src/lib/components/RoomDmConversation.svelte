@@ -12,6 +12,7 @@
    */
   import { onMount, tick, untrack } from 'svelte';
   import { get } from 'svelte/store';
+  import { goto } from '$app/navigation';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
     answerRoomDmRequest,
@@ -35,8 +36,11 @@
     refreshDmThreads,
     viewingDm,
   } from '$lib/stores/roomDm';
-  import { activeChatHash } from '$lib/stores/friends';
+  import { activeChatHash, friendRequests, friendsList } from '$lib/stores/friends';
   import { clearDraft, getDraft, registerDraftFlusher, setDraft } from '$lib/stores/chatTabs';
+  import { addFriendInMainWindow, friendsAddPath, showInMainWindow } from '$lib/chatPopout';
+  import { friendHashFromCode } from '$lib/friendCode';
+  import { isChatWindow } from '$lib/windowRole';
   import { appSettings } from '$lib/stores/settings';
   import { toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
@@ -89,18 +93,53 @@
    *  another window: answered as far as this view goes. */
   let heldAnswer = $derived(thread?.state === 'request' ? ($dmAnswersHeld.get(who) ?? null) : null);
 
-  /** Why nothing can be written here, or null when something can. */
-  let blocked = $derived.by((): string | null => {
-    if (heldAnswer === 'decline') return m.channels_dm_you_declined({ name: shownName });
-    if (heldAnswer === 'ignore') return m.channels_dm_ignoring_toast({ name: shownName });
+  /** Where they stand as a friend, for a conversation no room carries: only
+   *  friend chat can take it on. */
+  let friendHash = $derived(thread?.friend_code ? friendHashFromCode(thread.friend_code) : null);
+  let friendRelation = $derived.by((): 'mutual' | 'listed' | 'incoming' | 'none' => {
+    if (!friendHash) return 'none';
+    const row = $friendsList.find((f) => f.user_hash.toLowerCase() === friendHash);
+    if (row) return row.mutual ? 'mutual' : 'listed';
+    if ($friendRequests.some((r) => r.sender_hash.toLowerCase() === friendHash)) return 'incoming';
+    return 'none';
+  });
+
+  /** Why nothing can be written here, or null when something can, and what
+   *  it offers instead. */
+  let blockedBy = $derived.by((): { text: string; offers?: 'befriend' | 'friends_page' } | null => {
+    const say = (text: string) => ({ text });
+    if (heldAnswer === 'decline') return say(m.channels_dm_you_declined({ name: shownName }));
+    if (heldAnswer === 'ignore') return say(m.channels_dm_ignoring_toast({ name: shownName }));
     if (thread?.state === 'request') return null;
-    if (justDeclined) return m.channels_dm_you_declined({ name: shownName });
-    if (thread?.is_friend) return m.channels_dm_is_friend();
-    if (policyOff) return m.channels_dm_policy_off();
-    if (thread?.peer_state === 'declined') return m.channels_dm_peer_declined({ name: shownName });
-    if (thread && !thread.can_send) return m.channels_dm_no_shared_room();
+    if (justDeclined) return say(m.channels_dm_you_declined({ name: shownName }));
+    if (thread?.is_friend || friendRelation === 'mutual') return say(m.channels_dm_is_friend());
+    if (policyOff) return say(m.channels_dm_policy_off());
+    if (thread?.peer_state === 'declined') return say(m.channels_dm_peer_declined({ name: shownName }));
+    if (thread && !thread.can_send) {
+      if (friendRelation === 'listed') return say(m.channels_dm_friend_listed({ name: shownName }));
+      if (friendRelation === 'incoming') {
+        return { text: m.channels_friend_they_asked({ name: shownName }), offers: 'friends_page' };
+      }
+      return { text: m.channels_dm_no_shared_room(), offers: thread.friend_code ? 'befriend' : undefined };
+    }
     return null;
   });
+  let blocked = $derived(blockedBy?.text ?? null);
+
+  /** The Friends page with their code in its Add form; the add is the user's
+   *  click there, in the main window. */
+  function addAsFriend() {
+    const code = thread?.friend_code;
+    if (!code) return;
+    const theirName = name.trim() || thread?.name || '';
+    if (isChatWindow()) addFriendInMainWindow(code, theirName);
+    else void goto(friendsAddPath(code, theirName)).catch((e) => console.warn('Failed to open Friends page:', e));
+  }
+
+  function openFriendsPage() {
+    if (isChatWindow()) showInMainWindow('/friends');
+    else void goto('/friends').catch((e) => console.warn('Failed to open Friends page:', e));
+  }
 
   function rowKey(row: RoomDmMessage): string {
     return `${row.direction}:${row.message_id}`;
@@ -445,6 +484,15 @@
 
   {#if blocked}
     <p class="dm-blocked" role="status">{blocked}</p>
+    {#if blockedBy?.offers === 'befriend'}
+      <div class="dm-blocked-actions">
+        <button type="button" class="primary" onclick={addAsFriend}>{m.channels_add_friend()}</button>
+      </div>
+    {:else if blockedBy?.offers === 'friends_page'}
+      <div class="dm-blocked-actions">
+        <button type="button" class="secondary" onclick={openFriendsPage}>{m.chat_dock_empty_cta()}</button>
+      </div>
+    {/if}
   {:else if thread?.state !== 'request'}
     <div class="dm-compose">
       <textarea
@@ -631,6 +679,12 @@
     margin: 8px 12px 0;
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
+  }
+
+  .dm-blocked-actions {
+    display: flex;
+    gap: 8px;
+    margin: 8px 12px 0;
   }
 
   .dm-privacy {

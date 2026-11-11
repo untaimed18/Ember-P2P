@@ -307,18 +307,13 @@ fn apply_credits(pending: &Path, db: &Database) -> anyhow::Result<u64> {
             }
         }
     }
-    let ember = db.load_ember_credits()?;
     let refs: Vec<crate::storage::database::CreditRowRef<'_>> = rows
         .iter()
         .map(|(h, u, d, l, p, ip, st, eh, cv, name, software, seen)| {
             (h, *u, *d, *l, p.as_slice(), *ip, *st, eh.as_ref(), *cv, name.as_str(), software.as_str(), *seen)
         })
         .collect();
-    let ember_refs: Vec<(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> = ember
-        .iter()
-        .map(|(pk, u, d, lu, ld, c, t, s, ls, v)| (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v))
-        .collect();
-    db.save_all_credits_with_ember(&refs, &ember_refs)?;
+    db.save_all_credits(&refs)?;
     Ok(imported.len() as u64)
 }
 

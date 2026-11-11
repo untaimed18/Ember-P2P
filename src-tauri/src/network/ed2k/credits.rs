@@ -112,32 +112,6 @@ impl<K: Ord + Copy + std::hash::Hash> LastSeenIndex<K> {
     }
 }
 
-// --- Ember credit scoring constants ---
-//
-// The Ember credit system layers three multiplicative factors on top of the
-// baseline eMule credit-ratio formula: time-decayed ratio, session
-// reliability, and upload-speed fairness. Each factor is clamped to a
-// narrow band so no single signal can dominate scoring; the plan target is
-// "slightly more nuanced than eMule", not "completely rewrite priority".
-//
-// Exposed at module level so the unit tests can reference the same
-// constants the runtime uses — avoids the "tests pass but drift from
-// code" trap.
-
-/// EWMA smoothing weight for new session speed samples. The new sample
-/// contributes `EMBER_SPEED_EWMA_ALPHA` and the prior average
-/// contributes `1 - EMBER_SPEED_EWMA_ALPHA`. 0.3 gives the series a
-/// visible memory (prior ~3 sessions still show through) while still
-/// tracking persistent speed changes over ~10 sessions.
-pub(crate) const EMBER_SPEED_EWMA_ALPHA: f64 = 0.3;
-
-/// Minimum session duration (seconds) that's allowed to update the EWMA
-/// speed estimate. Sub-second sessions are dominated by handshake
-/// overhead and produce wildly noisy "speeds"; ignoring them keeps the
-/// EWMA honest for the real data-transfer sessions it's trying to
-/// characterise.
-pub(crate) const EMBER_MIN_SESSION_SECS_FOR_SPEED: u64 = 5;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentState {
     Unknown,
@@ -355,75 +329,6 @@ pub struct CreditRecord {
     key_proven: bool,
 }
 
-/// Credit record for verified Ember peers.
-///
-/// Identity is anchored on the peer's 32-byte Ed25519 public key rather
-/// than the wire `user_hash` so a peer can't farm credit by cycling
-/// user_hash bytes — the credit row is bound to a keypair they must
-/// prove possession of. Only a secure-v2 session, whose handshake proves
-/// the key, writes to it, so `ident_verified == true` means the peer did
-/// that on at least one session.
-///
-/// The upload queue does not score from this record: every peer is
-/// ranked by eMule's formula over the `user_hash` ledger, which every
-/// transfer writes as well, so an eMule user is never ranked below an
-/// Ember one for the same history. The session counts and the
-/// `avg_upload_speed` EWMA are kept as history only.
-#[derive(Debug, Clone)]
-pub struct EmberCreditRecord {
-    pub pub_key: [u8; 32],
-    pub uploaded: u64,
-    pub downloaded: u64,
-    pub last_upload_time: i64,
-    pub last_download_time: i64,
-    pub completed_sessions: u32,
-    pub total_sessions: u32,
-    pub avg_upload_speed: u64,
-    pub last_seen: i64,
-    pub ident_verified: bool,
-}
-
-impl EmberCreditRecord {
-    pub fn new(pub_key: [u8; 32]) -> Self {
-        Self {
-            pub_key,
-            uploaded: 0,
-            downloaded: 0,
-            last_upload_time: 0,
-            last_download_time: 0,
-            completed_sessions: 0,
-            total_sessions: 0,
-            avg_upload_speed: 0,
-            last_seen: chrono::Utc::now().timestamp(),
-            ident_verified: false,
-        }
-    }
-
-    /// Apply a new session-observation to the EWMA. Ignores sessions
-    /// too short to produce a useful speed sample (handshake noise
-    /// dominates). The first real sample seeds the EWMA rather than
-    /// being smoothed with the 0 default — that way a fresh record
-    /// reflects what we actually measured rather than half-mixing
-    /// with a zero.
-    pub fn record_session(&mut self, bytes_transferred: u64, duration_secs: u64, completed: bool) {
-        self.total_sessions = self.total_sessions.saturating_add(1);
-        if completed {
-            self.completed_sessions = self.completed_sessions.saturating_add(1);
-        }
-        if duration_secs >= EMBER_MIN_SESSION_SECS_FOR_SPEED && bytes_transferred > 0 {
-            let sample = (bytes_transferred as f64) / (duration_secs as f64);
-            let new_avg = if self.avg_upload_speed == 0 {
-                sample
-            } else {
-                EMBER_SPEED_EWMA_ALPHA * sample
-                    + (1.0 - EMBER_SPEED_EWMA_ALPHA) * (self.avg_upload_speed as f64)
-            };
-            self.avg_upload_speed = new_avg.round().max(0.0) as u64;
-        }
-        self.last_seen = chrono::Utc::now().timestamp();
-    }
-}
-
 impl CreditRecord {
     pub fn new(user_hash: [u8; 16]) -> Self {
         Self {
@@ -531,23 +436,14 @@ impl CreditRecord {
 /// connect like any other. The binding steers our outbound behaviour; it never
 /// grants an inbound peer anything.
 ///
-/// Keep it that way. If a future Ember decision needs a reputation input, take
-/// it from [`EmberCreditRecord`] — reaching across to the eD2K ledger would
-/// put overlay trust behind a 384-bit key, which is the one thing this
-/// threat model does not cover.
+/// Keep it that way. If a future Ember decision needs a reputation input, key
+/// it on the Ember identity a secure-v2 session proves — reaching across to
+/// the eD2K ledger would put overlay trust behind a 384-bit key, which is the
+/// one thing this threat model does not cover.
 #[derive(ZeroizeOnDrop)]
 pub struct CreditManager {
     #[zeroize(skip)]
     credits: HashMap<[u8; 16], CreditRecord>,
-    /// Enhanced credit records for Ember peers, keyed on Ed25519
-    /// public key. Parallel to `credits` rather than sharing storage
-    /// because the key material is different (32-byte pubkey vs.
-    /// 16-byte user_hash) and the scoring formula is different
-    /// (decay + reliability + speed factors, not just bytes).
-    /// Written only for peers that proved their key on a secure-v2
-    /// session; rows loaded from older builds may predate that rule.
-    #[zeroize(skip)]
-    ember_credits: HashMap<[u8; 32], EmberCreditRecord>,
     #[zeroize(skip)]
     credit_seen: LastSeenIndex<[u8; 16]>,
     /// The subset of `credit_seen` that may still be
@@ -558,8 +454,6 @@ pub struct CreditManager {
     /// moved on.
     #[zeroize(skip)]
     disposable_seen: LastSeenIndex<[u8; 16]>,
-    #[zeroize(skip)]
-    ember_seen: LastSeenIndex<[u8; 32]>,
     /// eD2K user hash → Ember hash learned from an offline binding check on a
     /// session that was not Noise-authenticated, with the IPv4 that session
     /// came from. Anyone can mint a keypair that passes binding and pair it
@@ -597,15 +491,11 @@ pub struct CreditManager {
     /// map at flush time is a row to delete.
     #[zeroize(skip)]
     unsaved_credit_keys: HashSet<[u8; 16]>,
-    #[zeroize(skip)]
-    unsaved_ember_keys: HashSet<[u8; 32]>,
     /// Keys handed to a flush that has not confirmed success. They stay here
     /// until [`Self::finish_flush`], so a failed, panicked or aborted flush is
     /// retried by the next one instead of dropping the rows.
     #[zeroize(skip)]
     in_flight_credit_keys: HashSet<[u8; 16]>,
-    #[zeroize(skip)]
-    in_flight_ember_keys: HashSet<[u8; 32]>,
     /// Until one flush has succeeded, which rows on disk match memory is
     /// unknown: startup may have loaded from SQLite or fallen back to
     /// `clients.met`. The first flush reconciles the whole table against
@@ -627,14 +517,13 @@ pub struct CreditManager {
 pub struct CreditFlushKeys {
     pub full_sync: bool,
     pub credit_keys: Vec<[u8; 16]>,
-    pub ember_keys: Vec<[u8; 32]>,
     epoch: u64,
 }
 
 impl CreditFlushKeys {
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        !self.full_sync && self.credit_keys.is_empty() && self.ember_keys.is_empty()
+        !self.full_sync && self.credit_keys.is_empty()
     }
 }
 
@@ -642,10 +531,8 @@ impl CreditManager {
     pub fn new() -> Self {
         Self {
             credits: HashMap::new(),
-            ember_credits: HashMap::new(),
             credit_seen: LastSeenIndex::default(),
             disposable_seen: LastSeenIndex::default(),
-            ember_seen: LastSeenIndex::default(),
             bound_ember_hashes: HashMap::new(),
             our_public_key: Vec::new(),
             our_private_key: Vec::new(),
@@ -654,9 +541,7 @@ impl CreditManager {
             dirty: false,
             dirty_generation: 0,
             unsaved_credit_keys: HashSet::new(),
-            unsaved_ember_keys: HashSet::new(),
             in_flight_credit_keys: HashSet::new(),
-            in_flight_ember_keys: HashSet::new(),
             needs_full_sync: true,
             flush_epoch: 0,
         }
@@ -664,11 +549,11 @@ impl CreditManager {
 
     /// Mark the in-memory credit state as needing a flush.
     ///
-    /// Reached (through `mark_credit_unsaved` / `mark_ember_unsaved`, which
-    /// also record the key) from `get_or_create` / `get_or_create_ember` — the
-    /// only two methods that hand out `&mut` to a record, and therefore the choke point
-    /// every mutating operation (`add_uploaded`, `set_public_key`,
-    /// `set_ident_state`, `record_ember_session`, …) already routes through.
+    /// Reached (through `mark_credit_unsaved`, which also records the key)
+    /// from `get_or_create` — the only method that hands out `&mut` to a
+    /// record, and therefore the choke point every mutating operation
+    /// (`add_uploaded`, `set_public_key`, `set_ident_state`, …) already
+    /// routes through.
     /// Deliberately over-approximates: a caller that takes `&mut` and changes
     /// nothing still marks dirty. An extra flush is cheap; a missed one loses
     /// the user's accumulated upload credit.
@@ -702,19 +587,12 @@ impl CreditManager {
         self.touch_dirty();
     }
 
-    fn mark_ember_unsaved(&mut self, pub_key: [u8; 32]) {
-        self.unsaved_ember_keys.insert(pub_key);
-        self.touch_dirty();
-    }
-
     /// Hand the rows the next flush must write to the caller, which snapshots
     /// them under the same lock. Keys from an earlier flush that never
     /// reported success are included again.
     pub fn begin_flush(&mut self) -> CreditFlushKeys {
         self.in_flight_credit_keys
             .extend(self.unsaved_credit_keys.drain());
-        self.in_flight_ember_keys
-            .extend(self.unsaved_ember_keys.drain());
         self.flush_epoch = self.flush_epoch.wrapping_add(1);
         if self.needs_full_sync {
             return CreditFlushKeys {
@@ -726,7 +604,6 @@ impl CreditManager {
         CreditFlushKeys {
             full_sync: false,
             credit_keys: self.in_flight_credit_keys.iter().copied().collect(),
-            ember_keys: self.in_flight_ember_keys.iter().copied().collect(),
             epoch: self.flush_epoch,
         }
     }
@@ -742,7 +619,6 @@ impl CreditManager {
             return;
         }
         self.in_flight_credit_keys.clear();
-        self.in_flight_ember_keys.clear();
         if keys.full_sync {
             self.needs_full_sync = false;
         }
@@ -1116,39 +992,6 @@ impl CreditManager {
             self.disposable_seen.set(user_hash, record.last_seen);
         }
         self.credits.insert(user_hash, record);
-    }
-
-    /// Ember counterpart of [`Self::insert_loaded_credit`], including its
-    /// clamp of a future `last_seen`.
-    pub fn insert_loaded_ember_credit(&mut self, mut record: EmberCreditRecord) {
-        let now = chrono::Utc::now().timestamp();
-        if record.last_seen > now {
-            record.last_seen = now;
-            self.touch_dirty();
-        }
-        let pub_key = record.pub_key;
-        if let Some(existing) = self.ember_credits.get_mut(&pub_key) {
-            self.ember_seen.set(pub_key, record.last_seen);
-            *existing = record;
-            return;
-        }
-        if self.ember_credits.len() >= MAX_CREDIT_RECORDS {
-            if let Some(oldest) = self.ember_seen.oldest(&self.ember_credits, |r| r.last_seen) {
-                let oldest_seen = self
-                    .ember_credits
-                    .get(&oldest)
-                    .map_or(i64::MAX, |r| r.last_seen);
-                if record.last_seen <= oldest_seen {
-                    self.mark_ember_unsaved(pub_key);
-                    return;
-                }
-                self.ember_credits.remove(&oldest);
-                self.ember_seen.remove(&oldest);
-                self.mark_ember_unsaved(oldest);
-            }
-        }
-        self.ember_seen.set(pub_key, record.last_seen);
-        self.ember_credits.insert(pub_key, record);
     }
 
     /// Remember what a peer calls itself and what it runs.
@@ -2026,7 +1869,7 @@ impl CreditManager {
     pub fn cleanup_stale(&mut self, max_age_days: i64) {
         let now = chrono::Utc::now().timestamp();
         let cutoff = now - (max_age_days * 86400);
-        let before = self.credits.len() + self.ember_credits.len();
+        let before = self.credits.len();
         let mut clamped = false;
         let unsaved_credit_keys = &mut self.unsaved_credit_keys;
         let credit_seen = &mut self.credit_seen;
@@ -2052,118 +1895,12 @@ impl CreditManager {
             }
             keep
         });
-        // Same cutoff for Ember records so the two tables age in
-        // lockstep. `last_seen` on EmberCreditRecord is bumped by
-        // every credit-granting or session-recording operation, so
-        // active peers stay regardless of their public-key format.
-        let unsaved_ember_keys = &mut self.unsaved_ember_keys;
-        let ember_seen = &mut self.ember_seen;
-        self.ember_credits.retain(|k, r| {
-            if r.last_seen > now {
-                r.last_seen = now;
-                unsaved_ember_keys.insert(*k);
-                clamped = true;
-            }
-            let keep = r.last_seen > cutoff;
-            if keep {
-                ember_seen.set(*k, r.last_seen);
-            } else {
-                ember_seen.remove(k);
-                unsaved_ember_keys.insert(*k);
-            }
-            keep
-        });
         // Only dirty when the sweep actually changed something. This runs on
         // the same 60s tick as the flush, so bumping unconditionally would
         // re-dirty the state every tick and defeat the gate entirely.
-        if clamped || self.credits.len() + self.ember_credits.len() != before {
+        if clamped || self.credits.len() != before {
             self.touch_dirty();
         }
-    }
-
-    // ---- Ember credit helpers ----
-
-    /// Look up or create an Ember credit record for this pubkey.
-    /// Mirrors `get_or_create` on the eMule side: bumps `last_seen`
-    /// so evictions track contact freshness. Non-mutating queries
-    /// (`get_ember_record`) route through `ember_credits.get` and
-    /// deliberately do NOT bump the timestamp.
-    pub fn get_or_create_ember(&mut self, pub_key: [u8; 32]) -> &mut EmberCreditRecord {
-        let now = chrono::Utc::now().timestamp();
-        // Same backstop as `get_or_create` (see MAX_CREDIT_RECORDS): evict the
-        // least-recently-seen Ember record when inserting a new one at capacity.
-        if !self.ember_credits.contains_key(&pub_key)
-            && self.ember_credits.len() >= MAX_CREDIT_RECORDS
-        {
-            if let Some(oldest) = self.ember_seen.oldest(&self.ember_credits, |r| r.last_seen) {
-                self.ember_credits.remove(&oldest);
-                self.ember_seen.remove(&oldest);
-                self.mark_ember_unsaved(oldest);
-            }
-        }
-        // Same reason as `get_or_create`: flag before the borrow escapes.
-        self.mark_ember_unsaved(pub_key);
-        self.ember_seen.set(pub_key, now);
-        let record = self
-            .ember_credits
-            .entry(pub_key)
-            .or_insert_with(|| EmberCreditRecord::new(pub_key));
-        record.last_seen = now;
-        record
-    }
-
-    pub fn get_ember_record(&self, pub_key: &[u8; 32]) -> Option<&EmberCreditRecord> {
-        self.ember_credits.get(pub_key)
-    }
-
-    pub fn all_ember_records(&self) -> Vec<&EmberCreditRecord> {
-        self.ember_credits.values().collect()
-    }
-
-    /// Record `bytes` we uploaded to peer `pub_key`. `verified` must be
-    /// `true` (a secure-v2 session, whose handshake proved the key) for
-    /// bytes to land on the record — otherwise a spoofer who claimed the
-    /// pubkey could write to a genuine peer's record. Other peers still
-    /// get their bytes tracked via the `CreditRecord` upstream; this
-    /// method only governs the Ember-specific ledger.
-    ///
-    /// Returns `true` when the write landed, `false` when it was
-    /// rejected so callers can emit a metric/log.
-    pub fn add_ember_uploaded(&mut self, pub_key: [u8; 32], bytes: u64, verified: bool) -> bool {
-        if !verified {
-            return false;
-        }
-        let now = chrono::Utc::now().timestamp();
-        let record = self.get_or_create_ember(pub_key);
-        record.uploaded = record.uploaded.saturating_add(bytes);
-        record.last_upload_time = now;
-        record.ident_verified = true;
-        true
-    }
-
-    /// Record a completed/aborted upload session for the peer so the
-    /// session counts and speed EWMA stay up to date. Called from
-    /// `upload.rs` once per session (normal completion OR mid-session
-    /// failure) — NOT once per chunk.
-    ///
-    /// `completed == true` iff the session ended in the "healthy"
-    /// state (out-of-parts, session-limit expired, queue rotation).
-    /// `false` for aborted sessions (connection closed mid-transfer,
-    /// queue-full reissues, etc.).
-    pub fn record_ember_session(
-        &mut self,
-        pub_key: [u8; 32],
-        bytes_transferred: u64,
-        duration_secs: u64,
-        completed: bool,
-        verified: bool,
-    ) {
-        if !verified {
-            return;
-        }
-        let record = self.get_or_create_ember(pub_key);
-        record.record_session(bytes_transferred, duration_secs, completed);
-        record.ident_verified = true;
     }
 
     /// Serialize credits to the versioned `clients.met` cache format. Adds
@@ -3761,13 +3498,10 @@ mod tests {
 
         let a = [0x11u8; 16];
         let b = [0x12u8; 16];
-        let pk = [0x21u8; 32];
         cm.add_uploaded(a, 0, 10);
-        cm.add_ember_uploaded(pk, 10, true);
         let failed = cm.begin_flush();
         assert!(!failed.full_sync);
         assert_eq!(failed.credit_keys, vec![a]);
-        assert_eq!(failed.ember_keys, vec![pk]);
 
         // That flush failed (no `finish_flush`); a later edit joins the retry.
         cm.add_uploaded(b, 0, 10);
@@ -3775,19 +3509,16 @@ mod tests {
         let mut keys = retry.credit_keys.clone();
         keys.sort();
         assert_eq!(keys, vec![a, b], "a failed flush must not drop its rows");
-        assert_eq!(retry.ember_keys, vec![pk]);
         cm.finish_flush(&retry);
         assert!(cm.begin_flush().is_empty());
 
         cm.get_or_create(a).last_seen = chrono::Utc::now().timestamp() - 100 * 86400;
-        cm.get_or_create_ember(pk).last_seen = chrono::Utc::now().timestamp() - 100 * 86400;
         let edited = cm.begin_flush();
         cm.finish_flush(&edited);
         cm.cleanup_stale(90);
         let evicted = cm.begin_flush();
         assert_eq!(evicted.credit_keys, vec![a], "an evicted row must be deleted on disk");
-        assert_eq!(evicted.ember_keys, vec![pk]);
-        assert!(cm.get_record(&a).is_none() && cm.get_ember_record(&pk).is_none());
+        assert!(cm.get_record(&a).is_none());
     }
 
     /// A flush that finishes after a newer one has begun must not settle the
@@ -3913,19 +3644,6 @@ mod tests {
 
         let flush = cm.begin_flush();
         assert!(flush.full_sync, "the first flush still reconciles the whole table");
-        let mut ember_cm = CreditManager::new();
-        for i in 0..10u64 {
-            let mut pk = [0u8; 32];
-            pk[..8].copy_from_slice(&i.to_le_bytes());
-            let mut record = EmberCreditRecord::new(pk);
-            record.last_seen = now - i as i64;
-            ember_cm.insert_loaded_ember_credit(record);
-        }
-        assert!(
-            !ember_cm.is_dirty(),
-            "rows that fit and match disk are not queued for a rewrite"
-        );
-        assert_eq!(ember_cm.get_ember_record(&[0u8; 32]).map(|r| r.last_seen), Some(now));
     }
 
     #[test]
@@ -4063,10 +3781,6 @@ mod tests {
         record.last_seen = future;
         cm.insert_loaded_credit(record);
         assert!(cm.get_record(&loaded).unwrap().last_seen <= chrono::Utc::now().timestamp());
-        let mut ember = EmberCreditRecord::new([0x16u8; 32]);
-        ember.last_seen = future;
-        cm.insert_loaded_ember_credit(ember);
-        assert!(cm.get_ember_record(&[0x16u8; 32]).unwrap().last_seen <= chrono::Utc::now().timestamp());
 
         let stamped = [0x17u8; 16];
         cm.get_or_create(stamped).last_seen = future;
@@ -4707,116 +4421,6 @@ mod tests {
         assert!(cm.add_downloaded(giver, 0, 20 << 20));
         assert!((cm.get_score_ratio(&giver, 0) - cm.standing_with(&peer)).abs() < 1e-9);
         assert_eq!(cm.standing_with(&giver), MIN_CREDIT_RATIO);
-    }
-
-    // ---- Ember credit tests ----
-
-    /// Unverified peers cannot farm Ember credit — `add_ember_uploaded`
-    /// must reject writes when `verified == false`. Without this check a hash-spoofer could
-    /// claim a verified friend's pubkey on the wire and burn
-    /// their real reputation by uploading garbage in their name.
-    #[test]
-    fn ember_credit_writes_require_verification() {
-        let mut cm = CreditManager::new();
-        let pk = [0xEBu8; 32];
-
-        assert!(
-            !cm.add_ember_uploaded(pk, 4096, false),
-            "unverified upload must be rejected"
-        );
-        assert!(
-            cm.get_ember_record(&pk).is_none(),
-            "rejected writes must not create a record"
-        );
-
-        assert!(cm.add_ember_uploaded(pk, 4096, true));
-        let r = cm.get_ember_record(&pk).expect("verified writes must land");
-        assert_eq!(r.uploaded, 4096);
-        assert!(r.ident_verified, "verified writes must set ident_verified");
-    }
-
-    /// `record_ember_session` tracks completion + speed EWMA. A first
-    /// session seeds the EWMA directly (no smoothing with the zero
-    /// default) so the ratio is honest on cold start.
-    #[test]
-    fn record_ember_session_seeds_ewma_on_first_sample() {
-        let mut cm = CreditManager::new();
-        let pk = [0xC0u8; 32];
-
-        // Short/fast session — 1 MiB over 10s = ~104857 bytes/sec.
-        // Below the 5s floor this would be dropped; above it the
-        // first real sample should seed the EWMA directly.
-        cm.record_ember_session(pk, 1_048_576, 10, true, true);
-        let r = cm.get_ember_record(&pk).unwrap();
-        assert_eq!(r.total_sessions, 1);
-        assert_eq!(r.completed_sessions, 1);
-        let expected = (1_048_576_f64 / 10.0).round() as u64;
-        assert_eq!(
-            r.avg_upload_speed, expected,
-            "first sample must seed EWMA without prior-zero mixing"
-        );
-    }
-
-    /// Subsequent sessions smooth with `EMBER_SPEED_EWMA_ALPHA` so a
-    /// single outlier can't yank the long-run estimate. A fast
-    /// session after a slow one should move the average but not
-    /// all the way to the new value.
-    #[test]
-    fn record_ember_session_ewma_smooths_subsequent_samples() {
-        let mut cm = CreditManager::new();
-        let pk = [0xA1u8; 32];
-
-        cm.record_ember_session(pk, 100 * 1024, 10, true, true);
-        let base = cm.get_ember_record(&pk).unwrap().avg_upload_speed;
-
-        // Now a 10× faster session. The EWMA should move upward but
-        // well short of the full 10× — with α = 0.3, expect roughly
-        // 0.3 × fast + 0.7 × base.
-        cm.record_ember_session(pk, 1000 * 1024, 10, true, true);
-        let after = cm.get_ember_record(&pk).unwrap().avg_upload_speed;
-        assert!(after > base, "fast session should pull average up");
-        let new_sample = 1000u64 * 1024 / 10;
-        assert!(
-            after < new_sample,
-            "α=0.3 smoothing must NOT fully adopt the new sample (got {after}, new {new_sample})",
-        );
-    }
-
-    /// Too-short sessions skip the EWMA update (noise dominates) but
-    /// still count toward total_sessions / completed_sessions so
-    /// reliability doesn't get hidden for rapid disconnects.
-    #[test]
-    fn record_ember_session_skips_ewma_for_tiny_sessions() {
-        let mut cm = CreditManager::new();
-        let pk = [0x07u8; 32];
-
-        cm.record_ember_session(pk, 99_999, 1, false, true);
-        let r = cm.get_ember_record(&pk).unwrap();
-        assert_eq!(r.total_sessions, 1);
-        assert_eq!(
-            r.completed_sessions, 0,
-            "aborted session must NOT count completed"
-        );
-        assert_eq!(
-            r.avg_upload_speed, 0,
-            "sub-threshold sessions must NOT touch EWMA"
-        );
-    }
-
-    /// `cleanup_stale` prunes the Ember table in lockstep with the
-    /// eMule table so one doesn't silently outlast the other.
-    #[test]
-    fn cleanup_stale_also_prunes_ember_records() {
-        let mut cm = CreditManager::new();
-        let fresh = [0xF0u8; 32];
-        let stale = [0x5Au8; 32];
-        let now = chrono::Utc::now().timestamp();
-        cm.get_or_create_ember(fresh).last_seen = now;
-        cm.get_or_create_ember(stale).last_seen = now - (CREDIT_EXPIRY_DAYS + 10) * 86400;
-
-        cm.cleanup_stale(CREDIT_EXPIRY_DAYS);
-        assert!(cm.get_ember_record(&fresh).is_some());
-        assert!(cm.get_ember_record(&stale).is_none());
     }
 
     /// Regression for the "Known Clients IP + country flag disappear after

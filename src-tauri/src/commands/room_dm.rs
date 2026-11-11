@@ -42,6 +42,9 @@ pub struct DmThreadInfo {
     pub can_send: bool,
     /// They are a friend: friend chat is the place to talk.
     pub is_friend: bool,
+    /// Their `ember2:` friend code, for the Add friend a conversation no room
+    /// carries offers. Empty for a key that has none.
+    pub friend_code: String,
 }
 
 fn member_key(member: &str) -> Result<[u8; 32], String> {
@@ -173,6 +176,10 @@ pub async fn list_room_dm_threads(state: tauri::State<'_, AppState>) -> Result<V
                     DmThreadInfo {
                         can_send: shared_room(&db, &thread.member_pubkey, &ours, &thread.channel_id).is_some(),
                         is_friend: is_friend(&db, &key),
+                        friend_code: member_key(&thread.member_pubkey)
+                            .ok()
+                            .and_then(|key| crate::commands::channels::member_friend_code(&key))
+                            .unwrap_or_default(),
                         thread,
                     }
                 })

@@ -9,8 +9,6 @@ pub(in crate::network) async fn on_small_tick(
     settings: &AppSettings,
     app_handle: &tauri::AppHandle,
 ) {
-    if state.stats.status == NetworkStatus::Disconnected { return; }
-
     // eMule KADEMLIADISCONNECTDELAY: if no valid KAD contact for 20 minutes,
     // transition back to Connecting so bootstrap re-engages. Do NOT tear
     // down eD2K here — temporary KAD quiet must not yank a working server

@@ -19,6 +19,9 @@ export interface RoomDmThread {
   can_send: boolean;
   /** They are a friend: friend chat is the place to talk. */
   is_friend: boolean;
+  /** Their `ember2:` friend code, for Add friend once no room carries the
+   *  conversation; empty if their key has none. */
+  friend_code: string;
 }
 
 export interface RoomDmMessage {

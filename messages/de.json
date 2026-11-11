@@ -4107,6 +4107,7 @@
   "channels_dm_peer_declined": "{name} nimmt keine privaten Nachrichten von Ihnen an.",
   "channels_dm_you_declined": "Sie haben die privaten Nachrichten von {name} abgelehnt.",
   "channels_dm_no_shared_room": "Sie sind in keinem gemeinsamen Raum mehr, daher erreichen Nachrichten die Person nicht. Fügen Sie sie als Freund hinzu, um weiterzuschreiben.",
+  "channels_dm_friend_listed": "{name} steht auf Ihrer Freundesliste: Schreiben Sie im Freundes-Chat.",
   "channels_dm_status_sending": "Wird gesendet…",
   "channels_dm_status_delivered": "Zugestellt",
   "channels_dm_status_failed": "Nicht zugestellt: Die Person ist vielleicht offline oder nutzt ein älteres Ember",
