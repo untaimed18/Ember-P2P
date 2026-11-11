@@ -2168,7 +2168,6 @@ pub async fn edit_channel_message(
         &msg_id_bytes,
         target.timestamp,
         edited_at,
-        &wire_text,
         &v2_text,
         reply_parent.as_ref(),
     )
@@ -2178,14 +2177,10 @@ pub async fn edit_channel_message(
             "Message must be between 1 and 4096 bytes",
         )
     })?;
-    let mut envelope_id = [0u8; 16];
-    OsRng.fill_bytes(&mut envelope_id);
-    let frames = chat_gossip_frames(
+    let frame = chat_gossip_frame(
         channel_id_bytes,
         &channel::content_key(&join_secret),
         &sender_pk,
-        envelope_id,
-        edited_at,
         &revision,
     )?;
 
@@ -2204,7 +2199,6 @@ pub async fn edit_channel_message(
     let msg_id_for_edit = target.msg_id.clone();
     let sender_for_edit = sender.clone();
     let text_for_edit = revision.stored_text.clone();
-    let sig_hex = revision.legacy.as_ref().map(|(_, sig)| hex::encode(sig)).unwrap_or_default();
     let v2_frame = revision.v2.clone();
     let original_ts = target.timestamp;
     let outcome = tokio::task::spawn_blocking(move || {
@@ -2215,7 +2209,8 @@ pub async fn edit_channel_message(
             original_ts,
             edited_at,
             &text_for_edit,
-            &sig_hex,
+            // No legacy frame (19), so no signature of one.
+            "",
             edited_at,
             Some(&v2_frame),
         )
@@ -2264,9 +2259,9 @@ pub async fn edit_channel_message(
     }
 
     // Spends the slot claimed before the write. Nothing between the two can
-    // refuse it, so the revision on disk and the frames on the mesh are one
+    // refuse it, so the revision on disk and the frame on the mesh are one
     // outcome rather than two.
-    permit.send(NetworkCommand::FanoutChannelChat { bodies: frames });
+    permit.send(NetworkCommand::FanoutChannelChat { bodies: vec![frame] });
     let _ = app.emit(
         "ember:channel-message-edited",
         serde_json::json!({
@@ -2624,8 +2619,9 @@ pub async fn send_channel_message(
         }
     };
     let wire_text = channel::with_reply_trailer(&cleaned, reply_parent.as_ref());
-    // The cap is on what goes on the wire, which a reply's trailer is part of:
-    // every receiver, old builds included, refuses a line over 4096 bytes.
+    // The cap is on the stored text, which a reply's trailer is part of: every
+    // receiver refuses a line over 4096 bytes. The v2 text falls back to this
+    // one when its own would be longer, so this is the check that holds it.
     if cleaned.is_empty() || wire_text.len() > MAX_CHANNEL_MESSAGE {
         return Err(coded(
             "channels_message_size_invalid",
@@ -2751,7 +2747,6 @@ pub async fn send_channel_message(
         &channel_id_bytes,
         &msg_id,
         sent_at,
-        &wire_text,
         &v2_text,
         reply_parent.as_ref(),
     ) else {
@@ -2762,8 +2757,8 @@ pub async fn send_channel_message(
         ));
     };
     let key = channel::content_key(&join_secret);
-    let frames = match chat_gossip_frames(channel_id_bytes, &key, &sender_pk, msg_id, sent_at, &line) {
-        Ok(frames) => frames,
+    let frame = match chat_gossip_frame(channel_id_bytes, &key, &sender_pk, &line) {
+        Ok(frame) => frame,
         Err(e) => {
             refund_local_send(&channel_id);
             return Err(e);
@@ -2779,10 +2774,10 @@ pub async fn send_channel_message(
     let id = channel_id.clone();
     let sender2 = sender.clone();
     // Stored as signed, trailer and all, so a catch-up re-serves the same
-    // bytes: the v2 text, and beside it both frames' signatures.
+    // bytes: the v2 text, and beside it the frame and its signature. There is
+    // no legacy frame (15), so no signature of one.
     let text = line.stored_text.clone();
     let msg_id_hex = hex::encode(msg_id);
-    let author_sig_hex = line.legacy.as_ref().map(|(_, sig)| hex::encode(sig)).unwrap_or_default();
     let v2_frame = line.v2.clone();
     let row_id = tokio::task::spawn_blocking(move || {
         let row_id = db.insert_channel_message_with(
@@ -2792,7 +2787,7 @@ pub async fn send_channel_message(
             &text,
             &msg_id_hex,
             sent_at,
-            &author_sig_hex,
+            "",
             true,
             Some(&v2_frame),
         )?;
@@ -2819,7 +2814,7 @@ pub async fn send_channel_message(
 
     if let Err(e) = state
         .network_tx
-        .try_send(NetworkCommand::FanoutChannelChat { bodies: frames })
+        .try_send(NetworkCommand::FanoutChannelChat { bodies: vec![frame] })
     {
         // Take the row back out. A line nobody was sent is not history, and
         // leaving it would show the sender a transcript the room does not have —
@@ -3016,7 +3011,7 @@ async fn load_owned_channel_as(
 static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 /// The longest line, in UTF-8 bytes of its text, whose sealed v2 frame fits
-/// [`channel::RELAYABLE_GOSSIP_MAX_BYTES`]: past it, [`chat_gossip_frames`]
+/// [`channel::RELAYABLE_GOSSIP_MAX_BYTES`]: past it, [`chat_gossip_frame`]
 /// refuses the line. A reply's reference ([`channel::CHAT_V2_REPLY_BYTES`])
 /// comes out of the same room.
 ///
@@ -3024,7 +3019,7 @@ static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync:
 /// text's emoji joiners, so this is measured on the text as typed. The send
 /// path measures the frame itself; this is the number the frontend holds
 /// (`CHANNEL_LINE_MAX_TEXT_BYTES` in `src/lib/api/channels.ts`). It was the
-/// legacy frame's, 3728, while [`channel::SEND_LEGACY_CHAT_FRAMES`] held.
+/// legacy frame's, 3728, while 1.7.5 to 1.7.8 sent that frame first.
 #[cfg(test)]
 const CHANNEL_LINE_MAX_TEXT_BYTES: usize = 3704;
 /// [`CHANNEL_LINE_MAX_TEXT_BYTES`] for a revision, whose frame also carries
@@ -3033,52 +3028,38 @@ const CHANNEL_LINE_MAX_TEXT_BYTES: usize = 3704;
 #[cfg(test)]
 const CHANNEL_EDIT_MAX_TEXT_BYTES: usize = 3693;
 
-/// The sealed frames of one outgoing line or revision: the v2 frame alone, or
-/// while [`channel::SEND_LEGACY_CHAT_FRAMES`] held, the legacy one first so
-/// that a build reading only it met it ahead of the frame it could not read.
-/// `legacy_envelope` and `at` are the legacy frame's envelope id and time; the
-/// v2 frame carries its own.
+/// The sealed frame of one outgoing line or revision, its v2 frame, under the
+/// envelope id and time it was signed with.
 ///
 /// A sealed frame has to fit one datagram inside the overlay relay envelope a
 /// firewalled member's copy goes in ([`channel::RELAYABLE_GOSSIP_MAX_BYTES`]),
-/// which a text near the 4096-byte cap does not. A line whose first frame does
-/// not fit is refused, before the callers store anything, rather than kept
-/// here and delivered nowhere. With both frames, one whose v2 frame alone did
-/// not fit went out in the legacy form, which every build reads.
-fn chat_gossip_frames(
+/// which a text near the 4096-byte cap does not. A line whose frame does not
+/// fit is refused, before the callers store anything, rather than kept here
+/// and delivered nowhere.
+fn chat_gossip_frame(
     channel_id: [u8; 16],
     key: &[u8; 32],
     sender: &[u8; 32],
-    legacy_envelope: [u8; 16],
-    at: i64,
     chat: &channel::OutgoingChat,
-) -> Result<Vec<Vec<u8>>, String> {
-    let seal = |envelope_id: [u8; 16], at: i64, plain: &[u8]| {
-        channel::ChannelGossip::sealed(
-            channel_id,
-            envelope_id,
-            key,
-            at.max(0) as u64,
-            plain,
-            channel::CHANNEL_MSG_TTL_DEFAULT,
-            at,
-        )
-        .encode()
-    };
-    let fits = |frame: &Vec<u8>| frame.len() <= channel::RELAYABLE_GOSSIP_MAX_BYTES;
-    let mut frames = Vec::with_capacity(2);
-    if let Some((plain, _)) = &chat.legacy {
-        frames.push(seal(legacy_envelope, at, plain));
-    }
-    frames.push(seal(chat.v2.frame_id, chat.v2.signed_at, &chat.v2.plain(sender)));
-    if !fits(&frames[0]) {
+) -> Result<Vec<u8>, String> {
+    let at = chat.v2.signed_at;
+    let frame = channel::ChannelGossip::sealed(
+        channel_id,
+        chat.v2.frame_id,
+        key,
+        at.max(0) as u64,
+        &chat.v2.plain(sender),
+        channel::CHANNEL_MSG_TTL_DEFAULT,
+        at,
+    )
+    .encode();
+    if frame.len() > channel::RELAYABLE_GOSSIP_MAX_BYTES {
         return Err(coded(
             "channels_message_too_long_to_send",
             "This message is too long to send to a room. Shorten it and try again.",
         ));
     }
-    frames.retain(fits);
-    Ok(frames)
+    Ok(frame)
 }
 
 /// Our own outbound chat times, per room, for [`LOCAL_SEND_PER_MINUTE`].
@@ -7038,25 +7019,6 @@ pub async fn cancel_channel_transfer(
     Ok(())
 }
 
-/// Send the standard offer for a file you offered whose recipient has not
-/// answered the private one. Every member it is forwarded through can read the
-/// file's name and size, so this only runs when the user asks for it.
-#[tauri::command]
-pub async fn send_channel_transfer_standard_offer(
-    state: tauri::State<'_, AppState>,
-    xfer_id: String,
-) -> Result<(), String> {
-    require_ember(&state).await?;
-    let xfer_id = parse_xfer_id(&xfer_id)?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::SendChannelTransferPlainOffer { xfer_id, tx })
-        .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
-    await_reply(rx, "channels_xfer_failed", "No response from network").await??;
-    Ok(())
-}
-
 /// Open the Channel Files folder, creating it if nothing has landed there yet.
 #[tauri::command]
 pub async fn open_channel_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
@@ -7141,68 +7103,56 @@ mod tests {
 
     /// Every frame handed to the gossip layer fits a datagram, wrapped for an
     /// overlay relay hop too, which is how a firewalled member gets it. Past
-    /// what the first frame can carry a line is refused, so it is neither
-    /// stored nor lost on the way. While both frames went out, a line near the
-    /// cap went in the legacy form alone.
+    /// what the frame can carry a line is refused, so it is neither stored nor
+    /// lost on the way.
     #[test]
     fn a_line_too_long_for_a_relayed_datagram_is_refused() {
         let key = crypto::signing_key_from_bytes(&[0x31; 32]);
         let sender = key.verifying_key().to_bytes();
         let room = [0x5a; 16];
         let content_key = [0x77; 32];
-        let frames_for = |len: usize| {
+        let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
+        let line_of = |len: usize| {
             let text = "a".repeat(len);
-            let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
-            let line = channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, &text, None)
-                .expect("under the text cap");
-            chat_gossip_frames(room, &content_key, &sender, line_id, 1_700_000_000, &line)
+            channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, None).expect("under the text cap")
         };
+        let frame_for = |len: usize| chat_gossip_frame(room, &content_key, &sender, &line_of(len));
         let max = crate::network::ember::dht::messages::MAX_DELIVERABLE_PAYLOAD;
-        let both = if channel::SEND_LEGACY_CHAT_FRAMES { 2 } else { 1 };
 
-        assert_eq!(frames_for(200).unwrap().len(), both);
-        assert!(frames_for(MAX_CHANNEL_MESSAGE).is_err());
+        assert!(frame_for(200).is_ok());
+        assert!(frame_for(MAX_CHANNEL_MESSAGE).is_err());
         let longest = (1..=MAX_CHANNEL_MESSAGE)
             .rev()
-            .find(|len| frames_for(*len).is_ok())
+            .find(|len| frame_for(*len).is_ok())
             .expect("some line fits");
         assert!(longest > 3_500, "a long line still goes out: {longest}");
         let relayed = |frame: &Vec<u8>| channel::encode_channel_relay_envelope(&room, &[0x42; 16], frame).len();
         for len in longest.saturating_sub(64)..=longest {
-            let frames = frames_for(len).expect("every shorter line fits too");
-            assert!(
-                frames.iter().all(|frame| relayed(frame) <= max),
-                "a {len}-byte line's frame fits a relay hop's datagram"
-            );
-        }
-        let frames = frames_for(longest).unwrap();
-        if channel::SEND_LEGACY_CHAT_FRAMES {
-            assert_eq!(frames.len(), 1, "only the legacy frame fits at the edge");
+            let frame = frame_for(len).expect("every shorter line fits too");
+            assert!(relayed(&frame) <= max, "a {len}-byte line's frame fits a relay hop's datagram");
         }
         // The first length refused is one whose frame would still fit a direct
         // datagram, and only a relay hop's would not.
-        let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
-        let text = "a".repeat(longest + 1);
-        let line = channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, &text, None).unwrap();
+        let line = line_of(longest + 1);
         let first = channel::ChannelGossip::sealed(
             room,
             line_id,
             &content_key,
             1_700_000_000,
-            &line.legacy.as_ref().map_or_else(|| line.v2.plain(&sender), |(plain, _)| plain.clone()),
+            &line.v2.plain(&sender),
             channel::CHANNEL_MSG_TTL_DEFAULT,
             1_700_000_000,
         )
         .encode();
         assert!(first.len() <= max && relayed(&first) > max, "{}", first.len());
-        assert!(frames_for(longest + 1).is_err());
+        assert!(frame_for(longest + 1).is_err());
     }
 
     /// The limits the frontend holds are exactly where the send path starts
     /// refusing: for a line and a revision, each with and without a reply,
     /// built as `send_channel_message` and `edit_channel_message` build them.
-    /// Multi-byte text meets the same edge, and text whose joiners the legacy
-    /// frame drops only ever gets further.
+    /// Multi-byte text meets the same edge, and so does text with emoji
+    /// joiners, which the frame keeps.
     #[test]
     fn the_frontends_line_limits_are_where_the_frames_stop_fitting() {
         let key = crypto::signing_key_from_bytes(&[0x31; 32]);
@@ -7215,18 +7165,13 @@ mod tests {
         let frames_for = |typed: &str, parent: Option<&[u8; 16]>, edit: bool| {
             let sanitized = crate::security::sanitize_outgoing_message_text(typed).expect("under the character cap");
             let cleaned = channel::strip_reply_trailers(&sanitized).to_string();
-            let wire_text = channel::with_reply_trailer(&cleaned, parent);
             let v2_text = channel::chat_v2_outgoing_text(typed, &cleaned, parent);
-            if edit {
-                let revision =
-                    channel::outgoing_chat_edit(&key, &room, &line_id, sent, sent + 60, &wire_text, &v2_text, parent)
-                        .expect("under the text cap");
-                chat_gossip_frames(room, &content_key, &sender, [0x42; 16], sent + 60, &revision)
+            let chat = if edit {
+                channel::outgoing_chat_edit(&key, &room, &line_id, sent, sent + 60, &v2_text, parent)
             } else {
-                let line = channel::outgoing_chat_line(&key, &room, &line_id, sent, &wire_text, &v2_text, parent)
-                    .expect("under the text cap");
-                chat_gossip_frames(room, &content_key, &sender, line_id, sent, &line)
-            }
+                channel::outgoing_chat_line(&key, &room, &line_id, sent, &v2_text, parent)
+            };
+            chat_gossip_frame(room, &content_key, &sender, &chat.expect("under the text cap"))
         };
         let longest = |parent: Option<&[u8; 16]>, edit: bool| {
             let fits = |len: usize| frames_for(&"a".repeat(len), parent, edit).is_ok();

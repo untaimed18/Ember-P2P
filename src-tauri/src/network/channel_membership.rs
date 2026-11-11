@@ -4939,13 +4939,13 @@ pub(crate) fn ingest_channel_moderation_records(
 }
 
 /// Owe the cut-over's one rotation to each private room this identity owns
-/// ([`ember::channel::V1_CUT_OVER_ROTATES`]), once per database: the pass
-/// below makes it, with the snapshot naming the new epoch, as it makes the
-/// rotation a moderator's ban is owed. Asked once a run, and again after a
-/// failed attempt.
+/// ([`ember::channel::V1_CUT_OVER`]), once per database: the pass below makes
+/// it, with the snapshot naming the new epoch, as it makes the rotation a
+/// moderator's ban is owed. Asked once a run, and again after a failed
+/// attempt.
 fn take_v1_cut_over_rotations(db: &Database, now: i64) {
     static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !ember::channel::V1_CUT_OVER_ROTATES || TAKEN.load(std::sync::atomic::Ordering::Relaxed) {
+    if TAKEN.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     match db.take_channel_cut_over_rotations(ember::channel::V1_CUT_OVER, now) {
@@ -4962,9 +4962,6 @@ fn take_v1_cut_over_rotations(db: &Database, now: i64) {
 /// Owe a private room we own its second rotation once its members' v1 copies
 /// have stopped ([`ember::channel::V1_RELINK_QUIET_SECS`]).
 fn take_v1_relink_rotation(db: &Database, channel_id_hex: &str, now: i64) {
-    if !ember::channel::V1_CUT_OVER_ROTATES {
-        return;
-    }
     match db.take_channel_relink_rotation(
         channel_id_hex,
         now,
@@ -7972,11 +7969,7 @@ pub(super) fn ingest_channel_presence_records(
     );
     // A walk that found nothing at all, not even our own record, is one no
     // storer answered, which says nothing about who is still on 1.7.x.
-    if ch.is_owner
-        && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE
-        && ember::channel::V1_CUT_OVER_ROTATES
-        && !records.is_empty()
-    {
+    if ch.is_owner && ch.visibility == ember::channel::CHANNEL_KIND_PRIVATE && !records.is_empty() {
         note_v1_walk(db, &ch, our_pubkey, &v1_current, now);
     }
     let our_hex = hex::encode(our_pubkey);

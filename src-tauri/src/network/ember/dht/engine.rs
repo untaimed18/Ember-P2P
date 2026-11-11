@@ -2555,10 +2555,9 @@ impl EmberDht {
     ///
     /// Empty, the frame `prepare_outgoing` declines to send, for a body too
     /// large for one datagram. A room line near the 4096-byte text cap seals to
-    /// one, and its v2 form is 24 bytes larger than the legacy one; such a body
-    /// is not a bug in the encoder's callers but a line nobody can be sent, so
-    /// it is refused here rather than tripping the encoder's assertion. The
-    /// send paths say so to the user (`chat_gossip_frames`).
+    /// one; such a body is not a bug in the encoder's callers but a line nobody
+    /// can be sent, so it is refused here rather than tripping the encoder's
+    /// assertion. The send paths say so to the user (`chat_gossip_frame`).
     pub fn build_channel_msg(&mut self, body: Vec<u8>) -> (u32, Vec<u8>) {
         let request_id = self.next_request_id();
         if body.len() > messages::MAX_DELIVERABLE_PAYLOAD {

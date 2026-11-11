@@ -13,36 +13,23 @@ what was decided along the way. The overlay's design record (decisions,
 known limits, closed work) stays in [`ember-dht.md`](ember-dht.md), and the
 Channels formats in [`channels-format.md`](channels-format.md).
 
-## 1. Before 1.8.0 ships: run the cut-over across real machines
+## 1. Before 1.8.0 ships
 
 1.8.0's Channels cut-over is built: the v2 chat frames go out alone with the
 display flag, private membership records go out in v2 alone but for the
 owner's own key copy, each owned private room is rotated once
 (`take_channel_cut_over_rotations`) and once more where members were still on
 1.7.x (`take_channel_relink_rotation`), the owned-rooms list is padded, and
-room transfers no longer hold a plain offer back (`HOLD_PLAIN_XFER_OFFERS`).
-Owners also renew the older epochs a room keeps, and derive every rotated key
-from the room's seed so two devices owning a room stay on one key. The detail
-is in `channels-format.md`, "The cut-over in 1.8.0", "The transition, and the
-cut-over in 1.8.0" and "Two devices owning a room".
+room transfers send sealed offers only. Owners also renew the older epochs a
+room keeps, and derive every rotated key from the room's seed so two devices
+owning a room stay on one key. The 1.7 sending paths are gone; reading 15,
+19, v1 records and plain offers stays. The detail is in `channels-format.md`,
+"The cut-over in 1.8.0", "The transition, and the cut-over in 1.8.0" and
+"Two devices owning a room".
 
-- **Run it on three or more machines** before tagging, with a 1.7.8 member
-  and a 1.7.4 member in the same rooms, by
-  [`release-checklist-1.8.0.md`](release-checklist-1.8.0.md): the cut-over
-  between 1.8.0 machines, its rotation and a restored device's, the second
-  rotation for rooms with a 1.7.x member, the renewal of older epochs, one
-  identity owning a room on two devices, mixed versions, and what the
-  cleanups touched. It says how to run a second device on one PC and how to
-  shorten the week-long and twelve-hour waits. Move it to `archived-plans/`
-  once 1.8.0 ships.
-- **Then delete the 1.7 paths the cut-over switched off.** They are kept
-  behind their constants only so the cross-machine run can turn one back on:
-  sending the legacy chat frames (`SEND_LEGACY_CHAT_FRAMES`, the `frames.retain`
-  in `chat_gossip_frames`), publishing members' v1 records
-  (`PUBLISH_V1_MEMBERSHIP_RECORDS`), and holding plain transfer offers
-  (`HOLD_PLAIN_XFER_OFFERS`, `PlainOffer`, `SendChannelTransferPlainOffer`, the
-  `plain_offer_came_due` sweep, and the `sealed_offer_readers` cache and
-  table). Reading 15, 19, v1 records and plain offers stays.
+- **Write the 1.8.0 release notes** in `docs/index.html` before tagging. A
+  cross-machine checklist for the cut-over was written and not run;
+  `git log --all -- docs/release-checklist-1.8.0.md` finds it if it is wanted.
 
 ## 2. Privacy
 

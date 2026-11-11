@@ -529,7 +529,7 @@ peer_count    (u16 LE)
 
     <p>Friends are for people you know one-to-one. Channels are for a group &mdash; a room you can hand an invite to, hand off to someone else, or leave running after you have gone.</p>
 
-    <p>Channels left beta in 1.7.6. The room formats have been fixed since 1.7.5, so rooms keep working across updates. Read <a href="#channels-limits">What to expect</a> before you rely on a room for anything that matters.</p>
+    <p>Channels left beta in 1.7.6. The room formats have been fixed since 1.7.5, so rooms keep working across updates from there. From 1.8.0 rooms use those formats alone: a member still on 1.7.4 or earlier does not see what is written on 1.8.0, and cannot read a private room once its owner has updated, because the owner changes the room&rsquo;s key then. Read <a href="#channels-limits">What to expect</a> before you rely on a room for anything that matters.</p>
 
     <h3 id="channels-start">Getting started</h3>
     <ol class="steps-list">
@@ -582,14 +582,14 @@ peer_count    (u16 LE)
     <h3 id="channels-messages">Messages</h3>
     <ul>
       <li><strong>Edit your own message</strong> for 15 minutes after sending it. Every receiver checks the author&rsquo;s signature and both clocks itself, so &ldquo;only the author may edit&rdquo; is not something the sending client is trusted about. Members who were away are handed the corrected line rather than the original followed by a revision.</li>
-      <li><strong>Reply to a message</strong> and your line quotes the one it answers. A member on 1.6.x sees the reply as an ordinary line.</li>
+      <li><strong>Reply to a message</strong> and your line quotes the one it answers.</li>
       <li><strong>React</strong> with one of 20 reactions. One reaction per person per message, and changing yours replaces it. The original thumb up, thumb down and heart work with 1.6.1 and newer; the others need 1.7.0.</li>
       <li><strong>Format</strong> with <code>**bold**</code>, <code>*italic*</code>, <code>~~strike~~</code> and <code>`code`</code>. Formatting is only how the line is shown; an older Ember shows the marks as typed.</li>
       <li><strong>See who is typing,</strong> on 1.7.0.</li>
       <li><strong>Remove a message from this device.</strong> Local only &mdash; the protocol has no way to unsend, so every other member keeps their copy. What it does guarantee is that the line stays gone here, including when another member replays it later.</li>
       <li><strong>Mention a member</strong> by typing <code>@</code>, which completes handles from the room&rsquo;s member list.</li>
     </ul>
-    <p>Edits and reactions need both sides on 1.6.1 or newer. An older client does not recognise them and drops them rather than passing them on, so in a mixed room they reach only the members who have updated.</p>
+    <p>Reactions need both sides on 1.6.1 or newer. An older client does not recognise them and drops them rather than passing them on, so in a mixed room they reach only the members who have updated. Edits, like the lines themselves, reach members on 1.7.5 or newer.</p>
 
     <h3 id="channels-private">Private messages</h3>
     <p>Two members of a room can write to each other privately without becoming friends. Choose <em>Message privately</em> from a member&rsquo;s menu. The message travels through a room you share, as chat does, but is encrypted to the recipient: members passing it on can see that you sent a private message, not to whom or what it says, and moderators cannot read it. Conversations open in the chat dock as a tab marked (private) and work in the popped-out chat window too; one whose tab you closed is listed under Private conversations in the dock&rsquo;s switcher.</p>
@@ -602,7 +602,7 @@ peer_count    (u16 LE)
 
     <h3 id="channels-files">Sending files</h3>
     <p>You can send a file to one member of a room at a time, up to <strong>2 GB</strong>, and only after they accept the offer. An offer that goes unanswered lapses after 5 minutes, and up to 4 transfers can run at once. Files go directly between the two of you, not to the whole room, and the payload is encrypted to that member rather than to the room. Transfers count against your upload speed limit like any other upload, and appear in a drawer under the member list with their speed and time left.</p>
-    <p>Between two members on 1.7.0 the file moves over a direct QUIC stream, or an encrypted stream on the sender&rsquo;s TCP upload port when their UDP port cannot be reached, and each piece is checked against the offer as it lands. If neither can be opened &mdash; a member on 1.6.x, or two firewalled members who can only meet through a relay &mdash; the transfer falls back to the older block protocol, which is much slower, keeps what was already verified, and is limited to 100&nbsp;MB for a 1.6.x member. Received files are saved to a <strong>Channel Files</strong> folder, which is not shared, and programs, scripts and disguised files carry a warning.</p>
+    <p>Between two members on 1.7.0 the file moves over a direct QUIC stream, or an encrypted stream on the sender&rsquo;s TCP upload port when their UDP port cannot be reached, and each piece is checked against the offer as it lands. If neither can be opened, as for two firewalled members who can only meet through a relay, the transfer falls back to the older block protocol, which is much slower and keeps what was already verified. A member on 1.6.x cannot read the offers this version sends, so cannot be sent a file. Received files are saved to a <strong>Channel Files</strong> folder, which is not shared, and programs, scripts and disguised files carry a warning.</p>
 
     <h3 id="channels-limits">What to expect</h3>
     <div class="callout-warn callout">

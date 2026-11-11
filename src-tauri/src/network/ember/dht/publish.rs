@@ -1564,12 +1564,10 @@ impl SignedRecord {
     }
 
     /// Every form of our presence in a room this build publishes, live or
-    /// departed, all stamped `now`: v2 for a private room, and v1 after it
-    /// while [`channel::PUBLISH_V1_MEMBERSHIP_RECORDS`] holds; v1 for a public
+    /// departed, stamped `now`: v2 for a private room, and v1 for a public
     /// room, whose key anyone can derive, so blinding it would hide nothing.
-    ///
-    /// The two forms of a private record never share a store slot (publisher
-    /// and `file_hash` both differ), so neither replaces the other.
+    /// From 1.7.5 to 1.7.8 a private room's went out in v1 too
+    /// ([`channel::V1_CUT_OVER`]).
     ///
     /// A leave notice carries no `languages`: it removes the row they would label.
     #[allow(clippy::too_many_arguments)]
@@ -1586,14 +1584,10 @@ impl SignedRecord {
         now: i64,
     ) -> Vec<Self> {
         let languages = if departed { ChannelLanguages::default() } else { languages };
-        let mut forms = Vec::with_capacity(2);
-        if private {
-            forms.push(Self::channel_presence_v2_at(
-                nickname, languages, channel_id, join_secret, departed, noise_pub, member, now,
-            ));
-        }
-        if !private || channel::PUBLISH_V1_MEMBERSHIP_RECORDS {
-            forms.push(Self::channel_presence_v1_at(
+        let form = if private {
+            Self::channel_presence_v2_at(nickname, languages, channel_id, join_secret, departed, noise_pub, member, now)
+        } else {
+            Self::channel_presence_v1_at(
                 nickname,
                 languages,
                 channel_id,
@@ -1605,9 +1599,9 @@ impl SignedRecord {
                 noise_pub,
                 member,
                 now,
-            ));
-        }
-        forms
+            )
+        };
+        vec![form]
     }
 
     /// Leave tombstone under the same presence key as a live announcement.
@@ -1799,12 +1793,13 @@ impl SignedRecord {
 
     /// Every form of one member's copy of one epoch this build publishes, all
     /// stamped now: v2 under `blind`, the member's [`channel::epoch_blind`],
-    /// then v1 as [`channel::epoch_record_publishes_v1`] says. `own_copy` is
-    /// the owner's copy sealed to itself.
-    ///
-    /// The two forms share their stamp and envelope and the v1 one names the
-    /// member, so while both go out a storer holding both links the v2 one to
-    /// the member; v2's unlinkability starts with the cut-over.
+    /// and v1 too for `own_copy`, the owner's copy sealed to itself. The
+    /// owner's key is already public in the room's moderation snapshot, so v1
+    /// hides nothing there, and it is the form a device restored from a backup
+    /// reads its keys back from (`catch_up_own_epochs`). A member's copy went
+    /// out in v1 too from 1.7.5 to 1.7.8 ([`channel::V1_CUT_OVER`]), stamped
+    /// and sealed alike and naming the member, so a storer holding both could
+    /// link the v2 one to the member until the cut-over.
     #[allow(clippy::too_many_arguments)]
     pub fn channel_key_epoch_forms(
         channel_id: [u8; 16],
@@ -1831,7 +1826,7 @@ impl SignedRecord {
                 now,
             ));
         }
-        if channel::epoch_record_publishes_v1(own_copy) {
+        if own_copy {
             forms.push(Self::channel_key_epoch_at(
                 channel_id,
                 channel_pubkey,
@@ -4982,7 +4977,6 @@ mod tests {
     /// hide nothing.
     #[test]
     fn private_membership_records_are_published_in_v2_past_the_cut_over() {
-        const { assert!(!channel::PUBLISH_V1_MEMBERSHIP_RECORDS, "1.8.0 stops publishing v1") };
         let channel = channel::ChannelIdentity::generate();
         let member = SigningKey::generate(&mut OsRng);
         let join = [0x77u8; 32];
@@ -5037,8 +5031,6 @@ mod tests {
             assert_eq!(own[1].keyword_hash, channel::epoch_key(&channel.channel_id, &member_pub, epoch));
             assert!(own.iter().all(|r| r.timestamp == own[0].timestamp && r.channel_store_ok()));
         }
-        assert!(channel::epoch_record_publishes_v1(true));
-        assert!(!channel::epoch_record_publishes_v1(false));
     }
 
     /// A snapshot carries the stamp it was built at and the signature that

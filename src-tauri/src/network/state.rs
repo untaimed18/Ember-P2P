@@ -1753,8 +1753,6 @@ pub(super) struct NetworkState {
     pub(super) local_ed25519_seed: [u8; 32],
     /// Ember Transfer: files we have offered or are sending, by transfer id.
     pub(super) xfer_send: HashMap<[u8; 16], ember::xfer::SendState>,
-    /// See [`super::channel_xfer::note_sealed_offer_reader`].
-    pub(super) sealed_offer_readers: super::channel_xfer::SealedOfferReaders,
     /// Ember Transfer: files we accepted and are pulling in.
     pub(super) xfer_recv: HashMap<[u8; 16], ember::xfer::RecvState>,
     /// Where [`finish_xfer_recv`] posts a verified transfer back to the event

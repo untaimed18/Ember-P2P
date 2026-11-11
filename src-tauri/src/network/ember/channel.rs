@@ -207,9 +207,9 @@ pub const CHANNEL_MSG_TTL_DEFAULT: u8 = 8;
 pub const CHANNEL_GOSSIP_SEEN_CAP: usize = 8192;
 /// `CHANNEL_MSG` frames we will relay for the mesh per second.
 ///
-/// Counted in frames, not lines: while [`SEND_LEGACY_CHAT_FRAMES`] holds, a
-/// chat line or revision is two frames, so this and the per-hop allowances
-/// derived from it carry half as many lines.
+/// Counted in frames, not lines: a member on 1.7.5 to 1.7.8 sends each chat
+/// line or revision as two frames, so this and the per-hop allowances derived
+/// from it carry half as many of their lines.
 pub const CHANNEL_GOSSIP_OUT_PER_SEC: usize = 16;
 /// `CHANNEL_MSG` frames this user may originate per second.
 ///
@@ -963,35 +963,27 @@ pub fn presence_key(channel_id: &[u8; 16], join_secret: &[u8; 32], epoch: i64) -
     key
 }
 
-/// Whether this build still publishes the v1 forms of a private room's
-/// membership records: the presence record that names the room and the member
-/// in its header, and the key-epoch record filed under [`epoch_key`].
+/// The name the v1 membership cut-over is recorded under, so each owned room
+/// is rotated for it once however often Ember starts.
 ///
-/// On from 1.7.5 to 1.7.8 for the transition, so members and storers on 1.7.4,
-/// which keep neither v2 form, still found them. Off from 1.8.0, the release
-/// that stops sending the old chat frames, so a room has one cut-over. Readers
-/// keep reading v1, which members still on 1.7.4 publish. See
-/// [`epoch_record_publishes_v1`] for the epoch records that stay v1 past it,
-/// and [`V1_CUT_OVER_ROTATES`] for what ships with turning it off.
-pub const PUBLISH_V1_MEMBERSHIP_RECORDS: bool = false;
-
-/// The cut-over also rotates: an owner that stops publishing v1 membership
-/// records rotates every private room it owns once.
+/// From 1.7.5 to 1.7.8 a private room's membership records went out in their
+/// v1 forms too (the presence record that names the room and the member in
+/// its header, and the key-epoch record filed under [`epoch_key`]), so that
+/// members and storers on 1.7.4, which keep neither v2 form, still found them.
+/// 1.8.0 publishes the v2 forms alone, but for the owner's own key-epoch copy
+/// (`SignedRecord::channel_key_epoch_forms`), and still reads v1, which
+/// members on 1.7.4 publish.
 ///
 /// During the transition a member's v1 and v2 presence copies sat under one
 /// presence key with the same stamp and flags, so a storer keeping a table
 /// links the pseudonym and room-blind key to the member and the room. Both
 /// change only with the join secret, so without a rotation the v2 records
-/// after the cut-over would carry the ids the transition already linked.
-/// Each owned private room is owed the rotation once
-/// (`Database::take_channel_cut_over_rotations`, under [`V1_CUT_OVER`]), and
-/// the owner loop makes it as it makes a moderator ban's. It also turns on
-/// the owner's watch for members still on 1.7.x and the second rotation that
-/// follows ([`V1_RELINK_QUIET_SECS`]).
-pub const V1_CUT_OVER_ROTATES: bool = !PUBLISH_V1_MEMBERSHIP_RECORDS;
-
-/// The name the v1 membership cut-over is recorded under, so each owned room
-/// is rotated for it once however often Ember starts.
+/// after the cut-over would carry the ids the transition already linked. Each
+/// owned private room is owed the rotation once
+/// (`Database::take_channel_cut_over_rotations`, under this name), and the
+/// owner loop makes it as it makes a moderator ban's. The owner then watches
+/// for members still on 1.7.x, and rotates once more when they stop
+/// ([`V1_RELINK_QUIET_SECS`]).
 pub const V1_CUT_OVER: &str = "v1-membership-records";
 
 /// How long an owner's presence walks must have watched a private room's
@@ -1140,9 +1132,9 @@ pub fn epoch_key(channel_id: &[u8; 16], member_pubkey: &[u8; 32], epoch: i64) ->
 /// member its own seed and the owner's. [`epoch_key`] is built from public
 /// values, so anyone who knew the room id could test whether a key was a
 /// member; this one needs the member's pairwise secret, which no other member,
-/// former ones included, holds. Only once v1 copies stop going out
-/// ([`PUBLISH_V1_MEMBERSHIP_RECORDS`]): until then each record is published
-/// beside a v1 copy of it, and that copy's key can still be tested.
+/// former ones included, holds. From 1.7.5 to 1.7.8 each record went out
+/// beside a v1 copy of it, whose key could still be tested; from 1.8.0 a
+/// member's copy goes out in v2 alone ([`V1_CUT_OVER`]).
 pub fn epoch_blind(
     our_ed25519_seed: &[u8; 32],
     peer_ed25519_pubkey: &[u8; 32],
@@ -1163,12 +1155,12 @@ pub fn epoch_blind(
 ///
 /// A different one in every epoch, so the records one member is sealed across
 /// rotations cannot be told apart from different members' by a storer that
-/// keeps them all, once v1 copies stop going out: until then each v2 record
-/// goes out beside a v1 copy stamped the same second with the same envelope,
-/// which names the member, so a storer holding both can link them. The ids
-/// being per epoch, the next rotation after the cut-over starts unlinked
-/// without one of its own. The storer needs no more than the record gives it:
-/// the id and the epoch are both in the extra it recomputes the key from.
+/// keeps them all. From 1.7.5 to 1.7.8 each v2 record went out beside a v1
+/// copy stamped the same second with the same envelope, which names the
+/// member, so a storer holding both could link them; the ids being per epoch,
+/// the first rotation after the cut-over ([`V1_CUT_OVER`]) starts unlinked.
+/// The storer needs no more than the record gives it: the id and the epoch are
+/// both in the extra it recomputes the key from.
 pub fn epoch_member_id(blind: &[u8; 32], epoch: i64) -> [u8; 32] {
     let mut input = [0u8; 32 + 8];
     input[..32].copy_from_slice(blind);
@@ -1192,16 +1184,6 @@ pub fn epoch_key_v2(channel_id: &[u8; 16], member_id: &[u8; 32], epoch: i64) -> 
     let mut key = [0u8; 16];
     key.copy_from_slice(&hash.as_bytes()[..16]);
     key
-}
-
-/// Whether a key-epoch record goes out in v1 as well as v2.
-///
-/// Past the transition ([`PUBLISH_V1_MEMBERSHIP_RECORDS`] off) the owner's own
-/// copy still does: the owner's key is already public in the room's moderation
-/// snapshot, so v1 hides nothing there, and it is the form a device restored
-/// from a backup reads its keys back from (`catch_up_own_epochs`).
-pub fn epoch_record_publishes_v1(own_copy: bool) -> bool {
-    PUBLISH_V1_MEMBERSHIP_RECORDS || own_copy
 }
 
 /// Whether a room's owner-silence is something we have observed rather than
@@ -2043,8 +2025,8 @@ const TYPING_PLAIN_VERSION: u8 = 23;
 /// protocol, and never dials.
 const XFER_STREAM_SEALED_VERSION: u8 = 25;
 /// An offer encrypted to the recipient alone. v1.6.x drops the number like the
-/// two above, so a sender that hears nothing back asks its user whether to send
-/// the plain offer too; see [`XFER_SEEN_PLAIN_VERSION`].
+/// two above; senders from 1.7.1 to 1.7.8 that heard nothing back asked their
+/// user whether to send the plain offer too ([`XFER_SEEN_PLAIN_VERSION`]).
 const XFER_OFFER_SEALED_VERSION: u8 = 26;
 /// A friend request from one member to another, for a recipient the friend
 /// rendezvous cannot find: a current build publishes presence only to its
@@ -2056,20 +2038,14 @@ const XFER_OFFER_SEALED_VERSION: u8 = 26;
 /// relays it.
 const ROOM_FRIEND_REQUEST_PLAIN_VERSION: u8 = 27;
 /// "Your sealed offer arrived and I can read it", sent the moment one does —
-/// apart from Accept and Deny, which wait on a person. A sender that has not
-/// heard it (or anything else about the transfer) within
-/// [`XFER_PLAIN_OFFER_FALLBACK_SECS`] asks its user whether to send the plain
-/// offer, which is all v1.6.x reads and which every member it is forwarded
-/// through can read too; the first offer under a transfer id wins, so a
-/// recipient that read both sees one prompt. v1.6.x and 1.7.0 drop the number.
-///
-/// A forwarder can drop this frame but cannot make one, so it can bring the
-/// question up and nothing more. See [`xfer_frame_proves_sealed_reader`] for
-/// the members no question is asked about.
+/// apart from Accept and Deny, which wait on a person. Still sent for senders
+/// on 1.7.1 to 1.7.8: one that had not heard it (or anything else about the
+/// transfer) within ten seconds asks its user whether to send the plain offer,
+/// which is all v1.6.x reads and which every member it is forwarded through
+/// can read too. 1.8.0 sends no plain offer, so it reads this and does nothing
+/// with it; the first offer under a transfer id wins, so a recipient that read
+/// both sees one prompt. v1.6.x and 1.7.0 drop the number.
 const XFER_SEEN_PLAIN_VERSION: u8 = 28;
-/// How long a sender waits to hear that its sealed offer was read before it
-/// asks whether to send the plain one as well.
-pub const XFER_PLAIN_OFFER_FALLBACK_SECS: u64 = 10;
 
 /// Lowest leading byte of an extension frame. Every kind from here up is laid
 /// out as [`ChannelExtFrame`]: `kind || flags || sender || signature || body`.
@@ -2108,8 +2084,8 @@ impl ChannelExtFrame {
 }
 
 /// A chat line, version 2: an extension frame whose body is a tagged field
-/// list ([`decode_chat_v2_body`]). Sent beside [`CHAT_PLAIN_VERSION`] until
-/// [`SEND_LEGACY_CHAT_FRAMES`] is turned off.
+/// list ([`decode_chat_v2_body`]). Sent alone from 1.8.0, and beside
+/// [`CHAT_PLAIN_VERSION`] from 1.7.5 to 1.7.8.
 pub const EXT_KIND_CHAT_LINE: u8 = 64;
 /// A revision of a line, version 2, beside [`CHAT_EDIT_PLAIN_VERSION`].
 pub const EXT_KIND_CHAT_EDIT: u8 = 65;
@@ -2182,8 +2158,7 @@ pub fn encode_channel_ext_frame(
 }
 
 /// The author's signature over an extension frame, made apart from the frame
-/// so it can be kept with the stored copy and replayed on a catch-up, as
-/// [`chat_author_signature`] is.
+/// so it can be kept with the stored copy and replayed on a catch-up.
 pub fn ext_author_signature(
     signing_key: &SigningKey,
     channel_id: &[u8; 16],
@@ -2254,24 +2229,20 @@ pub fn decode_channel_ext_frame(
     })
 }
 
-/// Whether this build still sends every line as a chat line
-/// ([`CHAT_PLAIN_VERSION`], 15) and every revision as an edit
-/// ([`CHAT_EDIT_PLAIN_VERSION`], 19) beside its v2 frame. On from 1.7.5 to
-/// 1.7.8; off from 1.8.0, which sends the v2 frames alone, sets
-/// [`EXT_FLAG_DISPLAY`] on them ([`chat_v2_flags`]) and lets a line's frame
-/// take the line's own id ([`outgoing_chat_line`]). 15 and 19 are still read
-/// from members on older builds.
-pub const SEND_LEGACY_CHAT_FRAMES: bool = false;
-
-/// Flags on every v2 chat frame this build sends, as tests pin them.
-#[cfg(test)]
-pub const CHAT_V2_FLAGS: u8 = chat_v2_flags(SEND_LEGACY_CHAT_FRAMES);
+/// Flags on every v2 chat frame this build sends. Displayable, since the frame
+/// goes out alone: builds from 1.7.2 to 1.7.4, which cannot read the kind,
+/// count it as a line needing a newer Ember. 1.7.5 to 1.7.8 sent it unflagged,
+/// beside a chat line ([`CHAT_PLAIN_VERSION`], 15) or edit
+/// ([`CHAT_EDIT_PLAIN_VERSION`], 19) that showed it there; 15 and 19 are still
+/// read from members on those builds.
+pub const CHAT_V2_FLAGS: u8 = EXT_FLAG_DISPLAY;
 
 /// Version of a v2 chat body. A later version keeps the framing, so a reader
 /// that knows only this one reads its fields the same way.
 pub const CHAT_V2_BODY_VERSION: u8 = 1;
-/// The line's id: for a line, the `msg_id` its legacy twin travels under; for
-/// a revision, the line revised. 16 bytes.
+/// The line's id: for a line, its `msg_id`, which a legacy twin travels under
+/// and, from 1.8.0, the frame itself; for a revision, the line revised. 16
+/// bytes.
 const CHAT_V2_TAG_LINE: u8 = 1;
 /// The text, UTF-8, without any reply trailer. Emoji joiners are kept.
 const CHAT_V2_TAG_TEXT: u8 = 2;
@@ -2340,8 +2311,8 @@ pub struct ChatV2Body {
 }
 
 impl ChatV2Body {
-    /// The text as a line is stored and as its legacy twin is signed: the
-    /// body, then the reply trailer when there is a parent.
+    /// The text as a line is stored and as a legacy twin is signed: the body,
+    /// then the reply trailer when there is a parent.
     pub fn stored_text(&self) -> String {
         with_reply_trailer(&self.text, self.reply_to.as_ref())
     }
@@ -2425,7 +2396,7 @@ impl ChatV2Frame {
 
 /// The text a legacy twin (15 or 19) carries for a line stored as `stored`
 /// from a v2 frame: the same body and trailer with the emoji joiners taken out,
-/// which is what senders on this build sign the legacy frame over.
+/// which is what 1.7.5 to 1.7.8 senders signed theirs over.
 ///
 /// Receivers hold the pair to it, whichever arrives first: a v2 frame replaces
 /// the stored text of its legacy twin only when this gives back the twin's
@@ -2463,14 +2434,15 @@ pub fn chat_v2_text_reads_alike(text: &str, reply_to: Option<&[u8; 16]>) -> bool
 /// The body a line or revision goes out as in its v2 frame: what was typed,
 /// sanitised as a receiver would ([`crate::security::sanitize_message_text`],
 /// which keeps emoji joiners) with any pasted trailer dropped. `legacy_body`
-/// is the body the legacy frame carries, from
+/// is the body a legacy frame would carry, from
 /// [`crate::security::sanitize_outgoing_message_text`].
 ///
 /// `legacy_body` itself when the kept text would not pair with it
 /// ([`chat_legacy_text`]), would not read alike in both forms
-/// ([`chat_v2_text_reads_alike`]) or would not fit [`CHAT_TEXT_MAX_BYTES`], so
-/// the two frames always agree; that costs only the joiners. `legacy_body` is
-/// what the callers send as the legacy body: not empty, joiner-free and with
+/// ([`chat_v2_text_reads_alike`]) or would not fit [`CHAT_TEXT_MAX_BYTES`];
+/// that costs only the joiners. Every v2 reader drops a frame that does not
+/// read alike, and pairing keeps the row this build stores like one a 1.7.x
+/// author sent in both forms. `legacy_body` is not empty, joiner-free and has
 /// its trailers stripped, so it reads alike itself.
 pub fn chat_v2_outgoing_text(typed: &str, legacy_body: &str, parent: Option<&[u8; 16]>) -> String {
     let legacy = with_reply_trailer(legacy_body, parent);
@@ -2485,45 +2457,120 @@ pub fn chat_v2_outgoing_text(typed: &str, legacy_body: &str, parent: Option<&[u8
         .unwrap_or_else(|| legacy_body.to_string())
 }
 
-/// One line or revision as this device sends and stores it.
+/// One line or revision as this device sends and stores it: its v2 frame.
 #[derive(Debug, Clone)]
 pub struct OutgoingChat {
-    /// The legacy frame's plaintext and the author's signature in it, while
-    /// [`SEND_LEGACY_CHAT_FRAMES`] holds.
-    pub legacy: Option<(Vec<u8>, [u8; 64])>,
     pub v2: ChatV2Frame,
     /// The text to store: the v2 body with its reply trailer.
     pub stored_text: String,
 }
 
-/// The frames of a line the local user sends: the v2 frame, and the legacy
-/// one while [`SEND_LEGACY_CHAT_FRAMES`] holds.
+/// The v2 frame of a line the local user sends, under the line's own id, so a
+/// line's delivery is settled by the one frame that carries it.
 ///
-/// The v2 frame travels under an envelope id of its own while the legacy
-/// frame goes out too. Every build drops a frame whose `msg_id` it has seen,
-/// so a build before this one that met a v2 frame under the line's id first
-/// would drop the legacy line as a duplicate and never show it; the line's id
-/// rides inside the signed body instead. With no legacy frame to shadow
-/// (1.8.0), the frame takes the line's id, so a line's delivery is still
-/// settled by the one frame that carries it.
-///
-/// `legacy_text` is the legacy frame's text, trailer included; `v2_text` the
-/// body from [`chat_v2_outgoing_text`]. `None` for a text too long for the
-/// body's length field, which the callers' own cap rules out.
+/// `v2_text` is the body from [`chat_v2_outgoing_text`]. `None` for a text too
+/// long for the body's length field, which the callers' own cap rules out.
 pub fn outgoing_chat_line(
     signing_key: &SigningKey,
     channel_id: &[u8; 16],
     line_id: &[u8; 16],
     timestamp: i64,
-    legacy_text: &str,
     v2_text: &str,
     parent: Option<&[u8; 16]>,
 ) -> Option<OutgoingChat> {
-    outgoing_chat_line_as(SEND_LEGACY_CHAT_FRAMES, signing_key, channel_id, line_id, timestamp, legacy_text, v2_text, parent)
+    sign_chat_v2_frame(
+        signing_key,
+        channel_id,
+        *line_id,
+        timestamp,
+        CHAT_V2_FLAGS,
+        ChatV2Body {
+            line_id: *line_id,
+            text: v2_text.to_string(),
+            reply_to: parent.copied(),
+            original_timestamp: None,
+        },
+    )
 }
 
-/// A line as 1.7.5 to 1.7.8 send it, both forms: what a member on one of
-/// them still sends, for tests of reading it.
+/// The v2 frame of a revision the local user makes of `target`, sent at
+/// `original_timestamp`, under an envelope id of its own: a revision has no
+/// id of its own to share.
+pub fn outgoing_chat_edit(
+    signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    target: &[u8; 16],
+    original_timestamp: i64,
+    edited_at: i64,
+    v2_text: &str,
+    parent: Option<&[u8; 16]>,
+) -> Option<OutgoingChat> {
+    let mut frame_id = [0u8; 16];
+    OsRng.fill_bytes(&mut frame_id);
+    sign_chat_v2_frame(
+        signing_key,
+        channel_id,
+        frame_id,
+        edited_at,
+        CHAT_V2_FLAGS,
+        ChatV2Body {
+            line_id: *target,
+            text: v2_text.to_string(),
+            reply_to: parent.copied(),
+            original_timestamp: Some(original_timestamp),
+        },
+    )
+}
+
+/// `body` as a v2 frame of its kind (a line, or a revision when it carries an
+/// original time), signed under `frame_id` at `signed_at`.
+fn sign_chat_v2_frame(
+    signing_key: &SigningKey,
+    channel_id: &[u8; 16],
+    frame_id: [u8; 16],
+    signed_at: i64,
+    flags: u8,
+    body: ChatV2Body,
+) -> Option<OutgoingChat> {
+    let kind = if body.original_timestamp.is_some() {
+        EXT_KIND_CHAT_EDIT
+    } else {
+        EXT_KIND_CHAT_LINE
+    };
+    let stored_text = body.stored_text();
+    let body = encode_chat_v2_body(&body)?;
+    let signature = ext_author_signature(signing_key, channel_id, &frame_id, signed_at, kind, flags, &body);
+    Some(OutgoingChat {
+        v2: ChatV2Frame {
+            kind,
+            flags,
+            frame_id,
+            signed_at,
+            signature,
+            body,
+        },
+        stored_text,
+    })
+}
+
+/// A line or revision as 1.7.5 to 1.7.8 send it, for tests of reading what a
+/// member on one of them still sends: the legacy frame (15 or 19), its
+/// plaintext with the author's signature in it, and beside it the v2 frame,
+/// unflagged so builds from 1.7.2 to 1.7.4 did not count a line their legacy
+/// twin already showed, and under an envelope id of its own. Every build drops
+/// a frame whose `msg_id` it has seen, so a build before 1.7.5 that met a v2
+/// frame under the line's id first would have dropped the legacy line as a
+/// duplicate; the line's id rides inside the signed body instead.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct OutgoingChat17 {
+    pub legacy: (Vec<u8>, [u8; 64]),
+    pub v2: ChatV2Frame,
+    pub stored_text: String,
+}
+
+/// A line as 1.7.5 to 1.7.8 send it ([`OutgoingChat17`]). `legacy_text` is
+/// the legacy frame's text, trailer included.
 #[cfg(test)]
 pub fn outgoing_chat_line_1_7(
     signing_key: &SigningKey,
@@ -2533,103 +2580,32 @@ pub fn outgoing_chat_line_1_7(
     legacy_text: &str,
     v2_text: &str,
     parent: Option<&[u8; 16]>,
-) -> Option<OutgoingChat> {
-    outgoing_chat_line_as(true, signing_key, channel_id, line_id, timestamp, legacy_text, v2_text, parent)
-}
-
-/// The flags on a v2 chat frame sent with the legacy one beside it or not.
-/// Unset beside it: builds from 1.7.2 to 1.7.4 count a displayable frame of a
-/// kind they cannot read as a line needing a newer Ember, and with the flag
-/// set every line would have raised that banner there although its legacy
-/// twin showed it. Set without it, so those builds say so.
-const fn chat_v2_flags(with_legacy: bool) -> u8 {
-    if with_legacy { 0 } else { EXT_FLAG_DISPLAY }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn outgoing_chat_line_as(
-    with_legacy: bool,
-    signing_key: &SigningKey,
-    channel_id: &[u8; 16],
-    line_id: &[u8; 16],
-    timestamp: i64,
-    legacy_text: &str,
-    v2_text: &str,
-    parent: Option<&[u8; 16]>,
-) -> Option<OutgoingChat> {
+) -> Option<OutgoingChat17> {
     let sender = signing_key.verifying_key().to_bytes();
-    let flags = chat_v2_flags(with_legacy);
-    let legacy = with_legacy.then(|| {
-        let sig = chat_author_signature(signing_key, &sender, channel_id, line_id, timestamp, legacy_text);
-        (encode_channel_chat_plain_presigned(&sender, &sig, legacy_text), sig)
-    });
-    let frame_id = if with_legacy {
-        let mut id = [0u8; 16];
-        OsRng.fill_bytes(&mut id);
-        id
-    } else {
-        *line_id
-    };
-    let body = ChatV2Body {
-        line_id: *line_id,
-        text: v2_text.to_string(),
-        reply_to: parent.copied(),
-        original_timestamp: None,
-    };
-    let stored_text = body.stored_text();
-    let body = encode_chat_v2_body(&body)?;
-    let signature = ext_author_signature(
+    let sig = chat_author_signature(signing_key, &sender, channel_id, line_id, timestamp, legacy_text);
+    let mut frame_id = [0u8; 16];
+    OsRng.fill_bytes(&mut frame_id);
+    let chat = sign_chat_v2_frame(
         signing_key,
         channel_id,
-        &frame_id,
+        frame_id,
         timestamp,
-        EXT_KIND_CHAT_LINE,
-        flags,
-        &body,
-    );
-    Some(OutgoingChat {
-        legacy,
-        v2: ChatV2Frame {
-            kind: EXT_KIND_CHAT_LINE,
-            flags,
-            frame_id,
-            signed_at: timestamp,
-            signature,
-            body,
+        0,
+        ChatV2Body {
+            line_id: *line_id,
+            text: v2_text.to_string(),
+            reply_to: parent.copied(),
+            original_timestamp: None,
         },
-        stored_text,
+    )?;
+    Some(OutgoingChat17 {
+        legacy: (encode_channel_chat_plain_presigned(&sender, &sig, legacy_text), sig),
+        v2: chat.v2,
+        stored_text: chat.stored_text,
     })
 }
 
-/// Both frames of a revision the local user makes of `target`, sent at
-/// `original_timestamp`. The v2 frame's envelope id is always its own: a
-/// revision has no id of its own to share.
-#[allow(clippy::too_many_arguments)]
-pub fn outgoing_chat_edit(
-    signing_key: &SigningKey,
-    channel_id: &[u8; 16],
-    target: &[u8; 16],
-    original_timestamp: i64,
-    edited_at: i64,
-    legacy_text: &str,
-    v2_text: &str,
-    parent: Option<&[u8; 16]>,
-) -> Option<OutgoingChat> {
-    outgoing_chat_edit_as(
-        SEND_LEGACY_CHAT_FRAMES,
-        signing_key,
-        channel_id,
-        target,
-        original_timestamp,
-        edited_at,
-        legacy_text,
-        v2_text,
-        parent,
-    )
-}
-
-/// A revision as 1.7.5 to 1.7.8 send it, both forms; see
-/// [`outgoing_chat_line_1_7`].
+/// A revision as 1.7.5 to 1.7.8 send it; see [`outgoing_chat_line_1_7`].
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn outgoing_chat_edit_1_7(
@@ -2641,76 +2617,39 @@ pub fn outgoing_chat_edit_1_7(
     legacy_text: &str,
     v2_text: &str,
     parent: Option<&[u8; 16]>,
-) -> Option<OutgoingChat> {
-    outgoing_chat_edit_as(true, signing_key, channel_id, target, original_timestamp, edited_at, legacy_text, v2_text, parent)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn outgoing_chat_edit_as(
-    with_legacy: bool,
-    signing_key: &SigningKey,
-    channel_id: &[u8; 16],
-    target: &[u8; 16],
-    original_timestamp: i64,
-    edited_at: i64,
-    legacy_text: &str,
-    v2_text: &str,
-    parent: Option<&[u8; 16]>,
-) -> Option<OutgoingChat> {
+) -> Option<OutgoingChat17> {
     let sender = signing_key.verifying_key().to_bytes();
-    let flags = chat_v2_flags(with_legacy);
-    let legacy = with_legacy.then(|| {
-        let sig = edit_author_signature(
-            signing_key,
-            &sender,
-            channel_id,
-            target,
-            original_timestamp,
-            edited_at,
-            legacy_text,
-        );
-        (
-            encode_channel_chat_edit_presigned(
-                &sender,
-                target,
-                original_timestamp,
-                edited_at,
-                &sig,
-                legacy_text,
-            ),
-            sig,
-        )
-    });
+    let sig = edit_author_signature(
+        signing_key,
+        &sender,
+        channel_id,
+        target,
+        original_timestamp,
+        edited_at,
+        legacy_text,
+    );
     let mut frame_id = [0u8; 16];
     OsRng.fill_bytes(&mut frame_id);
-    let body = ChatV2Body {
-        line_id: *target,
-        text: v2_text.to_string(),
-        reply_to: parent.copied(),
-        original_timestamp: Some(original_timestamp),
-    };
-    let stored_text = body.stored_text();
-    let body = encode_chat_v2_body(&body)?;
-    let signature = ext_author_signature(
+    let chat = sign_chat_v2_frame(
         signing_key,
         channel_id,
-        &frame_id,
+        frame_id,
         edited_at,
-        EXT_KIND_CHAT_EDIT,
-        flags,
-        &body,
-    );
-    Some(OutgoingChat {
-        legacy,
-        v2: ChatV2Frame {
-            kind: EXT_KIND_CHAT_EDIT,
-            flags,
-            frame_id,
-            signed_at: edited_at,
-            signature,
-            body,
+        0,
+        ChatV2Body {
+            line_id: *target,
+            text: v2_text.to_string(),
+            reply_to: parent.copied(),
+            original_timestamp: Some(original_timestamp),
         },
-        stored_text,
+    )?;
+    Some(OutgoingChat17 {
+        legacy: (
+            encode_channel_chat_edit_presigned(&sender, target, original_timestamp, edited_at, &sig, legacy_text),
+            sig,
+        ),
+        v2: chat.v2,
+        stored_text: chat.stored_text,
     })
 }
 
@@ -2895,9 +2834,10 @@ fn chat_sig_preimage(
 /// affordable here for the reason they were not on a transfer block: a chat
 /// line is nowhere near the unfragmented datagram budget.
 ///
-/// Produced separately from the frame so a sender can keep it with its stored
-/// copy of the message and put byte-identical bytes on the wire, which is what
-/// lets the row be re-served on a catch-up later.
+/// Produced separately from the frame so a 1.7.x sender could keep it with its
+/// stored copy of the message, which is what lets the row be re-served on a
+/// catch-up. This build sends no legacy frame, so only tests sign one.
+#[cfg(test)]
 pub fn chat_author_signature(
     signing_key: &SigningKey,
     sender_pubkey: &[u8; 32],
@@ -3657,7 +3597,8 @@ fn edit_sig_preimage(
 ///
 /// Kept beside the stored row for the same reason [`chat_author_signature`] is:
 /// a catch-up has to put byte-identical bytes back on the wire, and only the
-/// author could have produced them.
+/// author could have produced them. Signed only by tests, likewise.
+#[cfg(test)]
 pub fn edit_author_signature(
     signing_key: &SigningKey,
     sender_pubkey: &[u8; 32],
@@ -4626,17 +4567,6 @@ pub fn xfer_frame_peek(bytes: &[u8]) -> Option<([u8; 32], [u8; 32], [u8; 16])> {
     Some((sender, target, xfer_id))
 }
 
-/// Whether a transfer frame that [`xfer_verify`] accepted shows its sender
-/// reads sealed offers: only 1.7.0 and later send these numbers, and the
-/// pairwise authenticator names the sender, so nobody forwarding it can have
-/// made it.
-pub fn xfer_frame_proves_sealed_reader(bytes: &[u8]) -> bool {
-    matches!(
-        bytes.first(),
-        Some(&(XFER_STREAM_SEALED_VERSION | XFER_OFFER_SEALED_VERSION | XFER_SEEN_PLAIN_VERSION))
-    )
-}
-
 /// Check the authenticator and hand back the frame body without it.
 pub fn xfer_verify<'a>(key: &[u8; 32], bytes: &'a [u8]) -> Option<&'a [u8]> {
     if bytes.len() < XFER_HEADER_LEN + XFER_MAC_LEN {
@@ -4690,7 +4620,11 @@ pub struct XferOffer {
     pub name: String,
 }
 
-/// `hdr || size(8) || root(32) || name || tag(16)`.
+/// `hdr || size(8) || root(32) || name || tag(16)`: the plain offer, all 1.6.x
+/// reads, which senders from 1.7.1 to 1.7.8 still sent on their user's say for
+/// a recipient that had not answered the sealed one. Read still; this build
+/// sends only [`encode_xfer_offer_sealed`].
+#[cfg(test)]
 pub fn encode_xfer_offer(key: &[u8; 32], offer: &XferOffer) -> Vec<u8> {
     let name = truncate_utf8_owned(&offer.name, XFER_NAME_MAX);
     let mut out = Vec::with_capacity(XFER_HEADER_LEN + 8 + 32 + name.len() + XFER_MAC_LEN);
@@ -4717,8 +4651,7 @@ pub fn decode_xfer_offer(bytes: &[u8]) -> Option<XferOffer> {
 ///
 /// The plain offer's body, encrypted to the recipient alone, so a member the
 /// offer is forwarded through learns neither the file's name nor its size.
-/// Sent first; the plain offer follows only for a recipient that has not
-/// answered it with [`encode_xfer_seen`], and only if the user agrees.
+/// The only offer this build sends.
 ///
 /// The name is padded with NULs to [`XFER_NAME_MAX`] so every sealed offer is
 /// the same length and a forwarder cannot tell how long the name is. 1.7.0
@@ -8796,33 +8729,6 @@ mod tests {
         );
     }
 
-    /// Only frames 1.6.x never sends mark a member as reading sealed offers.
-    #[test]
-    fn only_frames_newer_than_v1_6_mark_a_sealed_offer_reader() {
-        let offer = sample_offer();
-        let (s, t, id) = (offer.sender, offer.target, offer.xfer_id);
-        let proving = [
-            encode_xfer_offer_sealed(&K, &offer),
-            encode_xfer_seen(&K, &s, &t, &id),
-            encode_xfer_stream(&K, &s, &t, &id, XferStreamRole::Serve, quic_only(4662)),
-        ];
-        for frame in &proving {
-            assert!(xfer_frame_proves_sealed_reader(frame), "version {}", frame[0]);
-        }
-        let older = [
-            encode_xfer_offer(&K, &offer),
-            encode_xfer_reply(&K, &s, &t, &id, XferReply::Accept),
-            encode_xfer_block_request(&K, &s, &t, &id, 0, 1),
-            encode_xfer_block_data(&K, &s, &t, &id, 0, b"x").expect("one byte fits"),
-            encode_xfer_cancel(&K, &s, &t, &id, XferCancel::User),
-            encode_xfer_done(&K, &s, &t, &id),
-        ];
-        for frame in &older {
-            assert!(!xfer_frame_proves_sealed_reader(frame), "version {}", frame[0]);
-        }
-        assert!(!xfer_frame_proves_sealed_reader(&[]));
-    }
-
     #[test]
     fn xfer_offer_round_trip_and_bounds() {
         let offer = sample_offer();
@@ -10145,10 +10051,7 @@ mod tests {
         let alice = SigningKey::generate(&mut OsRng);
         let alice_pk = alice.verifying_key().to_bytes();
         let line_id = new_chat_msg_id(&CHAT_CHANNEL, &alice_pk, CHAT_TS);
-        const { assert!(!SEND_LEGACY_CHAT_FRAMES, "1.8.0 sends the v2 frames alone") };
-        const { assert!(CHAT_V2_FLAGS & EXT_FLAG_DISPLAY != 0) };
-        let line = outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, "hi", "hi", None).unwrap();
-        assert!(line.legacy.is_none());
+        let line = outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, "hi", None).unwrap();
         assert_eq!(line.v2.frame_id, line_id);
         let ext = decode_channel_ext_frame(&line.v2.plain(&alice_pk), &CHAT_CHANNEL, &line_id, CHAT_TS)
             .expect("signed under the line's id");
@@ -10157,9 +10060,7 @@ mod tests {
 
         let mut frame_ids = HashSet::new();
         for _ in 0..8 {
-            let edit = outgoing_chat_edit(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, CHAT_TS + 9, "ho", "ho", None)
-                .unwrap();
-            assert!(edit.legacy.is_none());
+            let edit = outgoing_chat_edit(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, CHAT_TS + 9, "ho", None).unwrap();
             assert_ne!(edit.v2.frame_id, line_id, "a revision has no id of its own to share");
             assert!(frame_ids.insert(edit.v2.frame_id), "a fresh id every time");
             assert_ne!(edit.v2.flags & EXT_FLAG_DISPLAY, 0);
@@ -10175,7 +10076,7 @@ mod tests {
         let alice = SigningKey::generate(&mut OsRng);
         let alice_pk = alice.verifying_key().to_bytes();
         let line_id = new_chat_msg_id(&CHAT_CHANNEL, &alice_pk, CHAT_TS);
-        let line = outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, "hello", "hello", None).unwrap();
+        let line = outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, "hello", None).unwrap();
         let v2_plain = line.v2.plain(&alice_pk);
         assert_eq!(v1_6_7_branch(&v2_plain), V167Branch::DroppedWithDebugLog);
         let ext = decode_channel_ext_frame(&v2_plain, &CHAT_CHANNEL, &line_id, CHAT_TS).unwrap();
@@ -10189,9 +10090,8 @@ mod tests {
         let alice_pk = alice.verifying_key().to_bytes();
         let line_id = new_chat_msg_id(&CHAT_CHANNEL, &alice_pk, CHAT_TS);
         for chat in [
-            outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, "hi", "hi", Some(&V2_PARENT)).unwrap(),
-            outgoing_chat_edit(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, CHAT_TS + 5, "ho", "ho", Some(&V2_PARENT))
-                .unwrap(),
+            outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, "hi", Some(&V2_PARENT)).unwrap(),
+            outgoing_chat_edit(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, CHAT_TS + 5, "ho", Some(&V2_PARENT)).unwrap(),
         ] {
             let frame = chat.v2.plain(&alice_pk);
             let (id, at) = (chat.v2.frame_id, chat.v2.signed_at);
@@ -10405,8 +10305,7 @@ mod tests {
             for parent in [None, Some(&V2_PARENT)] {
                 let v2_text = chat_v2_outgoing_text(typed, &legacy_body, parent);
                 let legacy = with_reply_trailer(&legacy_body, parent);
-                let chat = outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, &legacy, &v2_text, parent)
-                    .unwrap();
+                let chat = outgoing_chat_line(&alice, &CHAT_CHANNEL, &line_id, CHAT_TS, &v2_text, parent).unwrap();
                 let body = decode_chat_v2_body(EXT_KIND_CHAT_LINE, &chat.v2.body)
                     .unwrap_or_else(|| panic!("{typed:?} with {parent:?}"));
                 assert_eq!(chat_legacy_text(&body.stored_text()), legacy);

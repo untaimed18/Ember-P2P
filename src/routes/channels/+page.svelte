@@ -92,7 +92,6 @@
     pickAndOfferChannelTransfer,
     removeChannelModerator,
     respondChannelTransfer,
-    sendChannelTransferStandardOffer,
     rotateChannelRoomKey,
     setChannelInvitePolicy,
     setChannelSlowMode,
@@ -159,7 +158,6 @@
     unreadBadgeTone,
     channelTransfers,
     mergeChannelTransfers,
-    xferNeedsConsent,
     type ChannelNotifyLevel,
   } from '$lib/stores/channels';
   import {
@@ -2913,21 +2911,10 @@
     }
   }
 
-  async function handleSendStandardOffer(xferId: string) {
-    if (respondingTo.includes(xferId)) return;
-    respondingTo = [...respondingTo, xferId];
-    try {
-      await sendChannelTransferStandardOffer(xferId);
-    } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
-    } finally {
-      respondingTo = respondingTo.filter((id) => id !== xferId);
-    }
-  }
-
   /** Transfers belonging to the room on screen. A transfer is between two
-   *  people in one room, so showing another room's would be noise. */
-  /** Offers waiting on an answer come first — they are the only rows that
+   *  people in one room, so showing another room's would be noise.
+   *
+   *  Offers waiting on an answer come first — they are the only rows that
    *  need the user to do something, and they expire. Everything else keeps a
    *  stable order so a progress bar does not jump around as it fills. */
   let roomTransfers = $derived(
@@ -2942,17 +2929,13 @@
       }),
   );
 
-  const LEGACY_XFER_MAX_BYTES = 100 * 1024 * 1024;
-
   function transferLabel(t: ChannelTransferInfo): string {
     const who = memberNames[t.peer_pubkey] || shortId(t.peer_pubkey);
     switch (t.status) {
       case 'awaiting':
         return m.channels_xfer_awaiting({ name: who });
       case 'offered':
-        return xferNeedsConsent(t)
-          ? m.channels_xfer_no_reply({ name: who })
-          : m.channels_xfer_offered({ name: who });
+        return m.channels_xfer_offered({ name: who });
       case 'accepted':
       case 'active':
         return t.direction === 'send'
@@ -2973,11 +2956,7 @@
       case 'not_allowed':
         return m.channels_xfer_peer_refuses({ name: who });
       case 'expired':
-        // Builds before 1.7.0 drop an offer over 100 MB without answering, so
-        // for a file that size silence is as likely to be that as absence.
-        return t.direction === 'send' && t.size > LEGACY_XFER_MAX_BYTES
-          ? m.channels_xfer_expired_large()
-          : m.channels_xfer_expired();
+        return m.channels_xfer_expired();
       case 'stalled':
         return m.channels_xfer_stalled();
       case 'source_gone':
@@ -3035,11 +3014,8 @@
     return () => clearInterval(timer);
   });
 
-  /** Offers waiting on this user: one to answer, or their own one asking
-   *  whether to send the standard offer. */
-  let roomOffersWaiting = $derived(
-    roomTransfers.filter((t) => t.status === 'awaiting' || xferNeedsConsent(t)).length,
-  );
+  /** Offers waiting on this user to answer them. */
+  let roomOffersWaiting = $derived(roomTransfers.filter((t) => t.status === 'awaiting').length);
   /** How long `ember:channel-newer` events are gathered into one list re-read. */
   const NEWER_REFRESH_MS = 2_000;
   /** The same for members, moderation and handoff events, kept short because
@@ -3131,16 +3107,6 @@
     const fresh = roomTransfers.filter((t) => t.status === 'awaiting' && !offersSeen.has(t.xfer_id));
     if (fresh.length === 0) return;
     for (const t of fresh) offersSeen.add(t.xfer_id);
-    untrack(bringOutXferDrawer);
-  });
-
-  /** The question about a standard offer is brought out the same way, since
-   *  its button is in the drawer too. */
-  const consentAsked = new Set<string>();
-  $effect(() => {
-    const fresh = roomTransfers.filter((t) => xferNeedsConsent(t) && !consentAsked.has(t.xfer_id));
-    if (fresh.length === 0) return;
-    for (const t of fresh) consentAsked.add(t.xfer_id);
     untrack(bringOutXferDrawer);
   });
 </script>
@@ -4748,9 +4714,6 @@
                           </p>
                         {/if}
                         <p class="xfer-status">{transferLabel(t)}</p>
-                        {#if xferNeedsConsent(t)}
-                          <p class="xfer-note">{m.channels_xfer_standard_offer_hint()}</p>
-                        {/if}
                         {#if t.status === 'accepted' || t.status === 'active'}
                           <div
                             class="xfer-progress"
@@ -4800,25 +4763,6 @@
                               onclick={() => handleRespondTransfer(t.xfer_id, false)}
                             >
                               {m.channels_xfer_decline()}
-                            </button>
-                          </div>
-                        {:else if xferNeedsConsent(t)}
-                          <div class="xfer-actions two">
-                            <button
-                              type="button"
-                              class="secondary"
-                              disabled={busy}
-                              onclick={() => handleSendStandardOffer(t.xfer_id)}
-                            >
-                              {m.channels_xfer_send_standard_offer()}
-                            </button>
-                            <button
-                              type="button"
-                              class="ghost xfer-cancel"
-                              disabled={busy}
-                              onclick={() => handleCancelTransfer(t.xfer_id)}
-                            >
-                              {m.common_cancel()}
                             </button>
                           </div>
                         {:else if tone === 'moving'}
@@ -6982,14 +6926,6 @@
 
   .xfer-card.tone-done .xfer-status { color: var(--success); }
   .xfer-card.tone-failed .xfer-status { color: var(--danger); }
-
-  .xfer-note {
-    margin: 0;
-    font-size: var(--font-size-xs);
-    line-height: 1.4;
-    color: var(--text-muted);
-    overflow-wrap: anywhere;
-  }
 
   .xfer-progress {
     position: relative;

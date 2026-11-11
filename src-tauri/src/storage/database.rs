@@ -1252,6 +1252,13 @@ impl Database {
             }
             Self::shape_channel_settings_locked(&conn)?;
             Self::shape_channel_messages_v2_locked(&conn)?;
+            // Members 1.7.x saw read sealed offers, kept only to decide whether
+            // to hold a plain one. Not a numbered migration: 1.7.x makes the
+            // table again on first use after a downgrade, so the name is never
+            // to be reused. Only tidying, so a failure leaves it for next time.
+            if let Err(e) = conn.execute_batch("DROP TABLE IF EXISTS sealed_offer_readers;") {
+                warn!("Could not drop the retired sealed_offer_readers table: {e}");
+            }
         }
 
         info!("Database initialized");
@@ -13244,10 +13251,6 @@ impl Database {
         Self::delete_channel_handoff_commit_locked(&conn, channel_id)
     }
 
-    /// The download folder each download's `.part` was last recorded in, kept
-    /// beside `transfers` rather than as a column of it for the same reason as
-    /// [`Self::ensure_sealed_offer_readers_locked`]: a numbered migration would
-    /// stop 1.7.0 from opening the database after a downgrade.
     /// Web sources (`s=` URLs) of downloads, by file hash, in a table of its
     /// own for the reason [`Self::ensure_transfer_part_folders_locked`] gives.
     fn ensure_transfer_web_sources_locked(conn: &Connection) -> anyhow::Result<()> {
@@ -13362,6 +13365,9 @@ impl Database {
         Ok(())
     }
 
+    /// The download folder each download's `.part` was last recorded in, kept
+    /// beside `transfers` rather than as a column of it: a numbered migration
+    /// would stop 1.7.0 from opening the database after a downgrade.
     fn ensure_transfer_part_folders_locked(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS transfer_part_folders (
@@ -13419,91 +13425,6 @@ impl Database {
             );",
         )?;
         Ok(())
-    }
-
-    /// Created on first use rather than by a numbered migration, like
-    /// `channel_handoff_commits`: nothing refers to it, and a numbered one
-    /// would stop 1.7.0 from opening the database after a downgrade.
-    fn ensure_sealed_offer_readers_locked(conn: &Connection) -> anyhow::Result<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sealed_offer_readers (
-                member_pubkey TEXT PRIMARY KEY,
-                last_seen INTEGER NOT NULL
-            );",
-        )?;
-        Ok(())
-    }
-
-    /// Record that the room member with Ed25519 key `member_pubkey` (hex)
-    /// proved at `now` that it reads sealed transfer offers. Forget every
-    /// member last proven before `forget_before` or too far after `now` (a
-    /// proof written while our clock was wrong), and all but the
-    /// `keep_at_most` most recently proven.
-    #[cfg(test)]
-    pub fn note_sealed_offer_reader(
-        &self,
-        member_pubkey: &str,
-        now: i64,
-        forget_before: i64,
-        keep_at_most: usize,
-    ) -> anyhow::Result<()> {
-        self.note_sealed_offer_readers(&[(member_pubkey, now)], now, forget_before, keep_at_most)
-    }
-
-    /// [`Self::note_sealed_offer_reader`] for several members in one
-    /// transaction, each proven at its own time; `now` bounds them all.
-    pub fn note_sealed_offer_readers(
-        &self,
-        proofs: &[(&str, i64)],
-        now: i64,
-        forget_before: i64,
-        keep_at_most: usize,
-    ) -> anyhow::Result<()> {
-        let future_after = now.saturating_add(
-            crate::network::ember::xfer::SEALED_OFFER_READER_MAX_FUTURE_SECS,
-        );
-        let conn = self.conn.lock();
-        Self::ensure_sealed_offer_readers_locked(&conn)?;
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut upsert = tx.prepare(
-                "INSERT INTO sealed_offer_readers (member_pubkey, last_seen) VALUES (?1, ?2)
-                 ON CONFLICT(member_pubkey) DO UPDATE SET last_seen =
-                    CASE WHEN last_seen > ?3 THEN excluded.last_seen
-                         ELSE MAX(last_seen, excluded.last_seen) END",
-            )?;
-            for (member_pubkey, seen_at) in proofs {
-                upsert.execute(params![member_pubkey.to_ascii_lowercase(), seen_at, future_after])?;
-            }
-        }
-        tx.execute(
-            "DELETE FROM sealed_offer_readers WHERE last_seen < ?1 OR last_seen > ?2",
-            params![forget_before, future_after],
-        )?;
-        tx.execute(
-            "DELETE FROM sealed_offer_readers WHERE member_pubkey IN (
-                SELECT member_pubkey FROM sealed_offer_readers
-                 ORDER BY last_seen DESC, member_pubkey ASC
-                 LIMIT -1 OFFSET ?1
-             )",
-            params![keep_at_most as i64],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// When the member with Ed25519 key `member_pubkey` (hex) last proved it
-    /// reads sealed transfer offers, if it ever did.
-    pub fn sealed_offer_reader_seen_at(&self, member_pubkey: &str) -> anyhow::Result<Option<i64>> {
-        let conn = self.conn.lock();
-        Self::ensure_sealed_offer_readers_locked(&conn)?;
-        Ok(conn
-            .query_row(
-                "SELECT last_seen FROM sealed_offer_readers WHERE member_pubkey = ?1",
-                params![member_pubkey.to_ascii_lowercase()],
-                |row| row.get(0),
-            )
-            .optional()?)
     }
 
     /// Hand a room we own to its confirmed successor, if that is still the
@@ -15189,8 +15110,8 @@ impl Database {
     }
 
     /// Created on first use rather than by a numbered migration, like
-    /// `sealed_offer_readers`: a numbered one would stop 1.7.x from opening the
-    /// database after a downgrade.
+    /// `transfer_part_folders`: a numbered one would stop 1.7.x from opening
+    /// the database after a downgrade.
     fn ensure_channel_cut_overs_locked(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS channel_cut_overs (
@@ -16710,8 +16631,8 @@ impl Database {
     }
 
     /// `apply_channel_message_edit`, above, for either form of a revision, or
-    /// both at once as this device sends them: `edit_sig` is the edit frame's
-    /// (19) signature or empty, and `v2` the revision's v2 frame (65). With a
+    /// both at once as 1.7.5 to 1.7.8 send them: `edit_sig` is the edit
+    /// frame's (19) signature or empty, and `v2` the revision's v2 frame (65). With a
     /// v2 frame `text` is its body and trailer, and `edit_sig` covers its
     /// legacy text.
     ///
@@ -23407,97 +23328,37 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
-    /// A member proven to read sealed offers is remembered across a restart
-    /// under its newest proof, and forgotten once that proof is too old.
+    /// The list 1.7.x kept of members that read sealed offers is dropped on
+    /// open, whatever it held, and the schema stays where 1.7.x can open it.
     #[test]
-    fn sealed_offer_readers_survive_a_restart_and_age_out() {
+    fn a_1_7_list_of_sealed_offer_readers_is_dropped_on_open() {
         let path = temp_db_path("sealed-readers");
-        let (alice, bob) = ("A1".repeat(32), "b0".repeat(32));
-        {
+        let version = {
             let db = Database::open_at(&path).expect("open db");
-            assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), None);
-            db.note_sealed_offer_reader(&alice, 1_000, 0, 16).unwrap();
-            db.note_sealed_offer_reader(&alice, 900, 0, 16).unwrap();
-            db.note_sealed_offer_reader(&bob, 500, 0, 16).unwrap();
-            assert_eq!(
-                db.sealed_offer_reader_seen_at(&alice.to_ascii_lowercase()).unwrap(),
-                Some(1_000),
-                "an older proof does not move it back, and case does not matter"
-            );
-        }
+            let version = db.schema_version();
+            let conn = db.conn.lock();
+            conn.execute_batch(
+                "CREATE TABLE sealed_offer_readers (
+                    member_pubkey TEXT PRIMARY KEY,
+                    last_seen INTEGER NOT NULL
+                 );
+                 INSERT INTO sealed_offer_readers VALUES ('a1', 1000);",
+            )
+            .expect("1.7.x table");
+            version
+        };
         let db = Database::open_at(&path).expect("reopen db");
-        assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(1_000));
-        assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), Some(500));
-        db.note_sealed_offer_reader(&alice, 2_000, 600, 16).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), None, "aged out");
-        assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(2_000));
-        drop(db);
-        remove_temp_db(&path);
-    }
-
-    /// A proof written while the clock ran far ahead gives way to the next
-    /// proof, and one nobody renews is forgotten, rather than either counting
-    /// until that date plus the keep time. A little ahead still wins.
-    #[test]
-    fn a_sealed_offer_reader_proven_under_a_fast_clock_is_not_kept() {
-        use crate::network::ember::xfer::SEALED_OFFER_READER_MAX_FUTURE_SECS as AHEAD;
-        let path = temp_db_path("sealed-readers-future");
-        let db = Database::open_at(&path).expect("open db");
-        let (alice, bob, carol) = ("a1".repeat(32), "b0".repeat(32), "c2".repeat(32));
-        let now = 1_000_000;
-        db.note_sealed_offer_reader(&alice, now + AHEAD + 1, 0, 16).unwrap();
-        db.note_sealed_offer_reader(&bob, now + AHEAD + 1, 0, 16).unwrap();
-        db.note_sealed_offer_reader(&carol, now + 60, 0, 16).unwrap();
-
-        db.note_sealed_offer_reader(&alice, now, 0, 16).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(now), "overwritten");
-        assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), None, "forgotten");
-        db.note_sealed_offer_reader(&carol, now, 0, 16).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&carol).unwrap(), Some(now + 60));
-        drop(db);
-        remove_temp_db(&path);
-    }
-
-    /// However many identities prove themselves, only the most recently
-    /// proven are kept.
-    #[test]
-    fn sealed_offer_readers_are_capped_newest_first() {
-        let path = temp_db_path("sealed-readers-cap");
-        let db = Database::open_at(&path).expect("open db");
-        let member = |i: u8| format!("{i:02x}").repeat(32);
-        for i in 0..6u8 {
-            db.note_sealed_offer_reader(&member(i), 1_000 + i as i64, 0, 4).unwrap();
-        }
-        for i in 0..2u8 {
-            assert_eq!(db.sealed_offer_reader_seen_at(&member(i)).unwrap(), None, "oldest {i} made way");
-        }
-        for i in 2..6u8 {
-            assert_eq!(db.sealed_offer_reader_seen_at(&member(i)).unwrap(), Some(1_000 + i as i64));
-        }
-        db.note_sealed_offer_reader(&member(2), 2_000, 0, 4).unwrap();
-        db.note_sealed_offer_reader(&member(9), 2_001, 0, 4).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&member(2)).unwrap(), Some(2_000), "renewed, so kept");
-        assert_eq!(db.sealed_offer_reader_seen_at(&member(3)).unwrap(), None);
-        drop(db);
-        remove_temp_db(&path);
-    }
-
-    /// A batch keeps each member's own proof time and is capped and aged as a
-    /// whole, the same as writing its members one at a time.
-    #[test]
-    fn a_batch_of_sealed_offer_readers_is_written_as_one() {
-        let path = temp_db_path("sealed-readers-batch");
-        let db = Database::open_at(&path).expect("open db");
-        let member = |i: u8| format!("{i:02x}").repeat(32);
-        db.note_sealed_offer_reader(&member(0), 500, 0, 4).unwrap();
-        let proofs: Vec<(String, i64)> = (1..6u8).map(|i| (member(i), 1_000 + i as i64)).collect();
-        let proofs: Vec<(&str, i64)> = proofs.iter().map(|(m, at)| (m.as_str(), *at)).collect();
-        db.note_sealed_offer_readers(&proofs, 1_010, 600, 4).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&member(0)).unwrap(), None, "aged out");
-        assert_eq!(db.sealed_offer_reader_seen_at(&member(1)).unwrap(), None, "the oldest made way");
-        for i in 2..6u8 {
-            assert_eq!(db.sealed_offer_reader_seen_at(&member(i)).unwrap(), Some(1_000 + i as i64));
-        }
+        assert_eq!(db.schema_version(), version);
+        let tables: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sealed_offer_readers'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
         drop(db);
         remove_temp_db(&path);
     }
@@ -23802,7 +23663,7 @@ mod tests {
             channel_id: &str,
             sent: i64,
             typed: &str,
-        ) -> (String, String, crate::network::ember::channel::OutgoingChat) {
+        ) -> (String, String, crate::network::ember::channel::OutgoingChat17) {
             use crate::network::ember::channel as ch;
             let channel: [u8; 16] = hex::decode(channel_id).unwrap().try_into().unwrap();
             let line_id = ch::new_chat_msg_id(&channel, &self.key.verifying_key().to_bytes(), sent);
@@ -23819,7 +23680,7 @@ mod tests {
             sent: i64,
             edited_at: i64,
             typed: &str,
-        ) -> (String, crate::network::ember::channel::OutgoingChat) {
+        ) -> (String, crate::network::ember::channel::OutgoingChat17) {
             use crate::network::ember::channel as ch;
             let channel: [u8; 16] = hex::decode(channel_id).unwrap().try_into().unwrap();
             let target: [u8; 16] = hex::decode(line_id).unwrap().try_into().unwrap();
@@ -23831,8 +23692,8 @@ mod tests {
         }
     }
 
-    fn legacy_sig(chat: &crate::network::ember::channel::OutgoingChat) -> String {
-        hex::encode(chat.legacy.as_ref().unwrap().1)
+    fn legacy_sig(chat: &crate::network::ember::channel::OutgoingChat17) -> String {
+        hex::encode(chat.legacy.1)
     }
 
     const JOINED: &str = "\u{2764}\u{FE0F} see you \u{1F468}\u{200D}\u{1F469}";

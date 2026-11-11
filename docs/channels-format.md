@@ -156,7 +156,7 @@ rather than a longer old one.
 | 4, 5, 8 | — | retired | The withdrawn broadcast-attachment path; builds still running it are on the network |
 | 6 | `HANDOFF_OFFER_PLAIN_VERSION` | in use | Handoff offer, signed by the channel key; 137 bytes |
 | 7 | — | retired | Unsigned handoff-ready |
-| 9 | `XFER_OFFER_PLAIN_VERSION` | in use | Transfer offer, readable by every member it passes |
+| 9 | `XFER_OFFER_PLAIN_VERSION` | read only | Transfer offer, readable by every member it passes; sent by 1.7.0 and earlier, and by 1.7.1 to 1.7.8 only on their user's say |
 | 10 | `XFER_REPLY_PLAIN_VERSION` | in use | Accept or deny |
 | 11 | `XFER_BLOCK_REQUEST_PLAIN_VERSION` | in use | Receiver asks for blocks |
 | 12 | — | retired | Block with its payload sealed only by the room key |
@@ -175,7 +175,7 @@ rather than a longer old one.
 | 25 | `XFER_STREAM_SEALED_VERSION` | in use | Transfer QUIC port, encrypted to the other end |
 | 26 | `XFER_OFFER_SEALED_VERSION` | in use | Offer encrypted to the recipient |
 | 27 | `ROOM_FRIEND_REQUEST_PLAIN_VERSION` | in use | Friend request addressed by a pairwise tag |
-| 28 | `XFER_SEEN_PLAIN_VERSION` | in use | "Your sealed offer arrived and I can read it" |
+| 28 | `XFER_SEEN_PLAIN_VERSION` | in use | "Your sealed offer arrived and I can read it"; still sent to every sealed offer's sender for the sake of 1.7.1 to 1.7.8 ones, and ignored on arrival from 1.8.0 |
 | 29 | `HANDOFF_READY_PROVEN_PLAIN_VERSION` | in use | Handoff-ready plus the successor key's signature; 201 bytes |
 | 30–63 | — | unassigned | The code says they "stay unassigned" |
 | 64–255 | `EXT_KIND_MIN` and up | extension | See below |
@@ -184,8 +184,10 @@ rather than a longer old one.
 The transfer frames (9, 10, 11, 13, 14, 21, 25, 26, 28) share a header,
 `version(1) || sender(32) || target(32) || xfer_id(16)` (`XFER_HEADER_LEN`, 81),
 and end in a 16-byte pairwise authenticator (`XFER_MAC_LEN`) under
-`derive_xfer_key`. 25, 26 and 28 are only sent by 1.7.0 and later, which is
-what `xfer_frame_proves_sealed_reader` relies on.
+`derive_xfer_key`. 25, 26 and 28 are only sent by 1.7.0 and later, so from
+1.7.1 to 1.7.8 a sender took any of them from the recipient as proof that it
+read sealed offers, and held no plain offer for it. 1.8.0 sends sealed offers
+only and keeps no such record.
 
 Retired numbers have no constant left in the code; the table is built from
 the comments beside the live constants and from the test that the retired
@@ -284,7 +286,7 @@ kinds; a later build that needs another layout takes a new tag.
 
 | Tag | Field | Value | Kind 64 | Kind 65 |
 | --- | --- | --- | --- | --- |
-| 1 | line id | 16 bytes: for 64, the line's own id, which is its legacy twin's `msg_id`; for 65, the line revised | required | required |
+| 1 | line id | 16 bytes: for 64, the line's own id, which a legacy twin travels under and, from 1.8.0, the frame itself; for 65, the line revised | required | required |
 | 2 | text | UTF-8, not empty, without a reply trailer; emoji joiners kept | required | required |
 | 3 | reply parent | 16 bytes, the id of the line this one answers; absent for a line that is not a reply | optional | optional |
 | 4 | original time | `i64`, the revised line's send time | ignored | required |
@@ -348,12 +350,14 @@ the editor.
 
 ### Pairing with the legacy frames
 
-During the transition every line goes out twice: as chat line 15 under the
-line's id, and as kind 64 under a **`msg_id` of its own** (random), naming the
-line in tag 1. Every build drops a frame whose `msg_id` it has seen; had the
-two shared one, a 1.7.4 build that met the v2 frame first would drop the
-legacy line as a duplicate and never show it. Revisions go out as 19 and 65,
-each under its own random envelope id, as 19 already did.
+During the transition (1.7.5 to 1.7.8) every line went out twice: as chat
+line 15 under the line's id, and as kind 64 under a **`msg_id` of its own**
+(random), naming the line in tag 1. Every build drops a frame whose `msg_id`
+it has seen; had the two shared one, a 1.7.4 build that met the v2 frame
+first would drop the legacy line as a duplicate and never show it. Revisions
+went out as 19 and 65, each under its own random envelope id, as 19 already
+did. 1.8.0 sends kind 64 alone, under the line's id
+([below](#the-cut-over-in-180)).
 
 Receivers on 1.7.5 keep one row per line, under the line's id; whichever form
 arrives first makes it:
@@ -412,15 +416,15 @@ which is the legacy envelope's and the v2 frame's, or the revision's
 `edited_at`. A line leaves or spends one only when its id binds its author at
 that time (`chat_msg_id_binds`), as every id minted beside a v2 frame does; a
 legacy line under any other id is charged on its own. A credit lasts
-`CHAT_TWIN_CREDIT_TTL` (5 seconds): a sender hands both frames to the network
+`CHAT_TWIN_CREDIT_TTL` (5 seconds): a 1.7.5 to 1.7.8 sender hands both frames to the network
 together and every hop passes them on in that order, so honest twins arrive
 back to back, and one form sent alone cannot bank a free frame for a burst
 later. At most `CHAT_TWIN_CREDITS_CAP` (4096) are held. A third frame for the
 same line is charged, so an author cannot turn one line into a stream of v2
-frames under fresh envelope ids. The sender counts the pair as one message for
-its own per-room limit (`LOCAL_SEND_PER_MINUTE`) and for slow mode, and hands
-both frames to the network task as one command (`FanoutChannelChat`), legacy
-first.
+frames under fresh envelope ids. A 1.7.5 to 1.7.8 sender counted the pair as
+one message for its own per-room limit (`LOCAL_SEND_PER_MINUTE`) and for slow
+mode, and handed both frames to the network task as one command
+(`FanoutChannelChat`), legacy first.
 
 **Budgets count frames.** The relay allowance (`CHANNEL_GOSSIP_OUT_PER_SEC`,
 16 a second), the per-hop inbound allowance derived from it, and a catch-up
@@ -432,16 +436,19 @@ a 1.7.x author sent in both forms is still re-served as two. A twin whose credit
 them: the relay allowance is this node's own bound on what it forwards, and
 it is spent per frame sent.
 
-**Sending.** The legacy frame carries the text as before, joiners stripped
-(`sanitize_outgoing_message_text`). The v2 frame carries what was typed under
-the receive-side rules (`sanitize_message_text`, joiners kept), unless that
-would not pair with the legacy text or would take the stored text past 4096
-bytes (`CHAT_TEXT_MAX_BYTES`), in which case it carries the legacy body
-(`chat_v2_outgoing_text`). The local row holds the v2 text and both frames'
-signatures.
+**Sending.** From 1.7.5 to 1.7.8 the legacy frame carried the text as before,
+joiners stripped (`sanitize_outgoing_message_text`). The v2 frame carries what
+was typed under the receive-side rules (`sanitize_message_text`, joiners
+kept), unless that would not pair with the legacy text or would take the
+stored text past 4096 bytes (`CHAT_TEXT_MAX_BYTES`), in which case it carries
+the legacy body (`chat_v2_outgoing_text`). 1.8.0 sends the v2 frame alone
+under the same rule, so its text still reads alike with the legacy text
+derived from it (`chat_legacy_text`), as on a row from a 1.7.5 to 1.7.8
+author. Such a row holds the v2 text and both frames' signatures; a 1.8.0
+row holds no legacy signature.
 
-**Display flag.** While the legacy frames go out, kinds 64 and 65 are sent
-**without** `EXT_FLAG_DISPLAY` (`chat_v2_flags`). Builds 1.7.2–1.7.4 count
+**Display flag.** From 1.7.5 to 1.7.8, beside the legacy frames, kinds 64
+and 65 were sent **without** `EXT_FLAG_DISPLAY`. Builds 1.7.2–1.7.4 count
 a displayable frame of a kind they cannot read as a line needing a newer
 Ember, and with the flag set every line would raise that banner there even
 though its legacy twin shows it. Builds before 1.7.2 drop the frame as an
@@ -482,9 +489,9 @@ that downgraded; only re-serving them is lost.
 
 1.8.0 stops sending 15 and 19 and sets `EXT_FLAG_DISPLAY` on 64 and 65, so a
 build that cannot read them says so: 1.7.2 to 1.7.4 count each line as one
-needing a newer Ember, and builds before 1.7.2 drop it. It is one constant,
-`SEND_LEGACY_CHAT_FRAMES`, off from 1.8.0, which also decides the frames'
-flags (`chat_v2_flags`). With no legacy frame to shadow, a kind 64 frame takes the
+needing a newer Ember, and builds before 1.7.2 drop it. The flag is
+`CHAT_V2_FLAGS`, and `outgoing_chat_line` and `outgoing_chat_edit` build the
+one frame. With no legacy frame to shadow, a kind 64 frame takes the
 line's id as its own envelope id, so the line's delivery is settled by the
 frame that carries it; receivers already accepted that. A revision's frame
 keeps an id of its own. 1.8.0 still reads 15 and 19 from members on older
@@ -1151,8 +1158,8 @@ record is filed under `epoch_key(channel_id, member, epoch)`, all public
 values, with the member's key in the clear, so anyone who knows the room id
 can test whether a key is a member. Both kinds gain a second form. Code:
 `presence_pseudonym`, `presence_room_blind`, `encode_presence_extra_v2`,
-`decode_presence_extra_v2`, `epoch_blind`, `epoch_member_id`, `epoch_key_v2`,
-`PUBLISH_V1_MEMBERSHIP_RECORDS` and `V1_CUT_OVER_ROTATES` in `channel.rs`;
+`decode_presence_extra_v2`, `epoch_blind`, `epoch_member_id`, `epoch_key_v2`
+and `V1_CUT_OVER` in `channel.rs`;
 `SignedRecord::channel_presence_v2_at`, `parse_channel_presence_member_v2`,
 `channel_key_epoch_at` and the two `*_forms` builders in `publish.rs`;
 `merge_channel_presence_blobs`, `ingest_channel_epoch_records`,
@@ -1323,22 +1330,23 @@ record's extra and finds it filed elsewhere. Like kinds 7 and 8, v2 lives on
 
 ### The transition, and the cut-over in 1.8.0
 
-**Publishing.** From 1.7.5 to 1.7.8 builds publish both forms
-(`SignedRecord::channel_presence_forms`, `channel_key_epoch_forms`), stamped
-alike; what 1.8.0 still publishes is below. A private presence record goes out as v2 and v1, under the same
-presence key; the two never share a store slot (publisher and `file_hash`
-both differ), so neither replaces the other. A republish or a leave counts as
-landed when either form stored (`any_publish_stored`), since a reader takes
-either. A key-epoch record always goes out as v2 (every rotated epoch is at
-least 1), and as v1 as `epoch_record_publishes_v1` says. Rotation, the
-owner's renewal (`republish_channel_key_epoch`, whose key read, DH and seals
-run on the blocking pool, `seal_epoch_records`) and an unban's re-seal
-(`reseal_current_epoch_to_member`) publish the same forms.
+**Publishing.** From 1.7.5 to 1.7.8 builds published both forms, stamped
+alike; what 1.8.0 still publishes is below. A private presence record went
+out as v2 and v1, under the same presence key; the two never share a store
+slot (publisher and `file_hash` both differ), so neither replaces the other.
+A republish or a leave counts as landed when any form it sent stored
+(`any_publish_stored`), since a reader takes either. A key-epoch record
+always goes out as v2 (every rotated epoch is at least 1), and from 1.7.5 to
+1.7.8 went out as v1 too. `SignedRecord::channel_presence_forms` and `channel_key_epoch_forms`
+build the forms; rotation, the owner's renewal
+(`republish_channel_key_epoch`, whose key read, DH and seals run on the
+blocking pool, `seal_epoch_records`) and an unban's re-seal
+(`reseal_current_epoch_to_member`) publish the same ones.
 
-**What the transition gives away.** A key-epoch record's v2 and v1 copies go
-out together, stamped the same second and carrying the same envelope, and the
-v1 copy names the member. A storer that holds both links the v2 copy's
-`member_id` to that member, so until 1.8.0 one member's key records can be
+**What the transition gives away.** A key-epoch record's v2 and v1 copies
+went out together, stamped the same second and carrying the same envelope,
+and the v1 copy named the member. A storer that holds both links the v2 copy's
+`member_id` to that member, so until 1.8.0 one member's key records could be
 linked across rotations after all, and each v1 copy's key stays testable from
 public values (above). The v2 ids are per epoch, so this needs no cut-over
 rotation of its own: the first epoch minted after v1 stops has ids nothing
@@ -1354,9 +1362,9 @@ two lookups are held until both end and read together
 signed the same second.
 
 **1.8.0 stops publishing v1,** the same release that stops sending the old
-chat frames (item 2), so a room has one cut-over. The switch is one
-constant, `PUBLISH_V1_MEMBERSHIP_RECORDS`. The owner's own key-epoch copy
-stays v1 past it (`epoch_record_publishes_v1`): kind 3 already names the
+chat frames (item 2), so a room has one cut-over. A private room's presence
+record goes out as v2 alone, and a public room's as v1 alone, as before. The
+owner's own key-epoch copy stays v1 as well as v2: kind 3 already names the
 owner, so v1 hides nothing there, and it is the form a device restored from a
 backup reads its keys back from (`catch_up_own_epochs`). 1.8.0 still reads
 v1, which is what members on 1.7.4 publish; stopping that, and with it
@@ -1370,10 +1378,10 @@ and `R` change only when the join secret does, so without a rotation the v2
 records after the cut-over would carry ids the transition already linked.
 Owners therefore rotate each private room they own once when they stop
 publishing v1, and the v2 ids after it are unlinkable to the transition's
-(as far as the records go; see below). `V1_CUT_OVER_ROTATES` stands next to
-the switch. The first time 1.8.0 runs, every private room the identity owns
-is marked as owed a rotation (`take_channel_cut_over_rotations`, recorded in
-`channel_cut_overs` under `V1_CUT_OVER` so it is done once), and the owner
+(as far as the records go; see below). The first time 1.8.0 runs, every
+private room the identity owns is marked as owed a rotation
+(`take_channel_cut_over_rotations`, recorded in `channel_cut_overs` under
+`V1_CUT_OVER` so it is done once), and the owner
 loop makes it with the snapshot naming the new epoch, as it makes the one a
 moderator's ban is owed, once the routing table has heard from enough
 contacts (`MIN_STORE_NODES`) to store that snapshot: members learn the epoch
