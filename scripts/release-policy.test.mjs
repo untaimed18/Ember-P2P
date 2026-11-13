@@ -521,23 +521,49 @@ test("the Linux updater targets are composed from the signed bundles", () => {
     addLinuxPlatforms({
       manifest,
       bundles: collectLinuxBundles({ directory: bundleDir }),
+      appimageMinGlibc: "2.39",
     });
 
-    assert.deepEqual(manifest.platforms["linux-x86_64-appimage"], {
+    assert.deepEqual(manifest.platforms["linux-x86_64-appimage-glibc"], {
       url: `${releaseBase}/Ember_1.2.3_amd64.AppImage`,
       signature: "signature for Ember_1.2.3_amd64.AppImage",
+      min_glibc: "2.39",
     });
     assert.deepEqual(manifest.platforms["linux-x86_64-deb"], {
       url: `${releaseBase}/Ember_1.2.3_amd64.deb`,
       signature: "signature for Ember_1.2.3_amd64.deb",
     });
 
-    // The absence of the bare key is the point, so it is asserted rather than
-    // left to the two checks above. It is what an install whose format the
-    // bundler marker does not identify falls back to, and no artifact is right
-    // for those: a `.deb` install reaching it would hand an AppImage to `dpkg`,
-    // and an RPM install would hand one to `rpm`.
+    // The absence of these keys is the point, so it is asserted rather than
+    // left to the checks above. The bare key is what an install whose format
+    // the bundler marker does not identify falls back to, and no artifact is
+    // right for those: a `.deb` install reaching it would hand an AppImage to
+    // `dpkg`, and an RPM install would hand one to `rpm`. The plain AppImage
+    // key is what releases before 1.7.7 read without checking their glibc, so
+    // it would hand an AppImage built for a newer one to a system that cannot
+    // start it.
     assert.equal(manifest.platforms["linux-x86_64"], undefined);
+    assert.equal(manifest.platforms["linux-x86_64-appimage"], undefined);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("the AppImage entry cannot be published without the glibc it needs", () => {
+  // The updater refuses a whole manifest whose gated entry states no glibc, or
+  // one it cannot read, so a release with either would stop every install's
+  // update check rather than only the AppImage's.
+  const { fixture, bundleDir, manifestPath } = linuxReleaseFixture();
+  try {
+    const bundles = collectLinuxBundles({ directory: bundleDir });
+    for (const appimageMinGlibc of [undefined, "", "2", "2.39.1", "v2.39", "latest", "2.39\n"]) {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      assert.throws(
+        () => addLinuxPlatforms({ manifest, bundles, appimageMinGlibc }),
+        /the AppImage's min_glibc must be a glibc release/,
+        JSON.stringify(appimageMinGlibc),
+      );
+    }
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
@@ -555,6 +581,7 @@ test("composed Linux targets are hashed and size-bound like the Windows ones", (
     addLinuxPlatforms({
       manifest,
       bundles: collectLinuxBundles({ directory: bundleDir }),
+      appimageMinGlibc: "2.39",
     });
     writeFileSync(manifestPath, JSON.stringify(manifest));
 
@@ -563,9 +590,14 @@ test("composed Linux targets are hashed and size-bound like the Windows ones", (
       artifactPaths: artifacts,
       securityEpoch: 1,
     });
+    assert.equal(
+      hardened.platforms["linux-x86_64-appimage-glibc"].min_glibc,
+      "2.39",
+      "hardening keeps the glibc the updater checks",
+    );
 
     for (const [target, name] of [
-      ["linux-x86_64-appimage", "Ember_1.2.3_amd64.AppImage"],
+      ["linux-x86_64-appimage-glibc", "Ember_1.2.3_amd64.AppImage"],
       ["linux-x86_64-deb", "Ember_1.2.3_amd64.deb"],
       ["windows-x86_64", "Ember_1.2.3_x64-setup.exe"],
     ]) {
@@ -596,24 +628,26 @@ test("a re-run of the signing job rewrites the Linux targets rather than failing
   try {
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
     const bundles = collectLinuxBundles({ directory: bundleDir });
-    addLinuxPlatforms({ manifest, bundles });
+    addLinuxPlatforms({ manifest, bundles, appimageMinGlibc: "2.39" });
 
     Object.assign(manifest.platforms["linux-x86_64-deb"], {
       signature: "a signature from the attempt that failed",
       sha256: "a".repeat(64),
       size: 999,
     });
-    // And the bare key, which nothing writes today but which has to be cleared
-    // rather than left behind if anything ever does.
+    // And the keys nothing writes today, which have to be cleared rather than
+    // left behind if anything ever does.
     manifest.platforms["linux-x86_64"] = { url: "https://example.invalid/x", signature: "stale" };
+    manifest.platforms["linux-x86_64-appimage"] = { url: "https://example.invalid/y", signature: "stale" };
 
-    addLinuxPlatforms({ manifest, bundles });
+    addLinuxPlatforms({ manifest, bundles, appimageMinGlibc: "2.39" });
 
     assert.deepEqual(manifest.platforms["linux-x86_64-deb"], {
       url: `${releaseBase}/Ember_1.2.3_amd64.deb`,
       signature: "signature for Ember_1.2.3_amd64.deb",
     });
     assert.equal(manifest.platforms["linux-x86_64"], undefined);
+    assert.equal(manifest.platforms["linux-x86_64-appimage"], undefined);
     assert.ok(manifest.platforms["windows-x86_64"], "the Windows half must survive");
   } finally {
     rmSync(fixture, { recursive: true, force: true });
@@ -672,14 +706,14 @@ test("the signing key and release write stay in the one protected job", () => {
   // the change that made the difference observable.
   for (const [from, to, expected] of [
     [
-      "    name: Build Linux packages\n",
-      "    name: Build Linux packages\n    environment: release-signing\n",
-      /only sign-publish may enter the release-signing environment, not build-linux/,
+      "    name: Build the Linux .deb\n",
+      "    name: Build the Linux .deb\n    environment: release-signing\n",
+      /only sign-publish may enter the release-signing environment, not build-linux-deb/,
     ],
     [
       "          APPIMAGE_EXTRACT_AND_RUN: 1",
       "          APPIMAGE_EXTRACT_AND_RUN: 1\n          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}",
-      /build-linux must not reference a secret/,
+      /build-linux-appimage must not reference a secret/,
     ],
   ]) {
     const fixture = tamperedWorkflow(from, to);
@@ -718,16 +752,68 @@ test("a release cannot be signed without the Linux packages it publishes", () =>
   // Windows built. It is the Linux half that disappears, from a release that
   // otherwise looks complete.
   const fixture = tamperedWorkflow(
-    "    needs: [verify, build, build-windows, build-linux]",
+    "    needs: [verify, build, build-windows, build-linux-deb, build-linux-appimage]",
     "    needs: [verify, build, build-windows]",
   );
   try {
     assert.throws(
       () => verifyWorkflow({ root: fixture }),
-      /sign-publish must depend on every build job; it is missing build-linux/,
+      /sign-publish must depend on every build job; it is missing build-linux-deb, build-linux-appimage/,
     );
   } finally {
     rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("each Linux format is built on its own runner, and the AppImage's glibc reaches the manifest", () => {
+  for (const [from, to, expected] of [
+    [
+      // A 22.04 AppImage beside the 24.04 one: two AppImages, and the one a
+      // newer system should get could be either.
+      "          npm run tauri build -- --bundles deb \\",
+      "          npm run tauri build -- --bundles appimage,deb \\",
+      /build-linux-deb must build the \.deb, and only the \.deb/,
+    ],
+    [
+      "          npm run tauri build -- --bundles appimage \\",
+      "          npm run tauri build -- --bundles appimage,deb \\",
+      /build-linux-appimage must build the AppImage, and only the AppImage/,
+    ],
+    [
+      `          npm run tauri build -- --bundles appimage \\\n            --config '{"bundle":{"createUpdaterArtifacts":false}}'`,
+      "          npm run tauri build -- --bundles appimage \\\n            --verbose",
+      /build-linux-appimage holds no signing key, so it must disable createUpdaterArtifacts/,
+    ],
+    [
+      // Nothing gates the .deb by glibc: built here, it installs on 22.04 and
+      // does not start there.
+      "    name: Build the Linux .deb\n    needs: verify\n    runs-on: ubuntu-22.04\n",
+      "    name: Build the Linux .deb\n    needs: verify\n    runs-on: ubuntu-24.04\n",
+      /build-linux-deb must stay on ubuntu-22\.04/,
+    ],
+    [
+      // The manifest would follow the runner; the published notes would not.
+      "    name: Build the Linux AppImage\n    needs: verify\n    runs-on: ubuntu-24.04\n",
+      "    name: Build the Linux AppImage\n    needs: verify\n    runs-on: ubuntu-22.04\n",
+      /build-linux-appimage must run on ubuntu-24\.04/,
+    ],
+    [
+      "          EMBER_APPIMAGE_MIN_GLIBC: ${{ needs.build-linux-appimage.outputs.min-glibc }}\n",
+      "",
+      /sign-publish must state, as the AppImage's min_glibc, the glibc build-linux-appimage was built against/,
+    ],
+    [
+      "      min-glibc: ${{ steps.glibc.outputs.version }}\n",
+      "",
+      /sign-publish must state, as the AppImage's min_glibc, the glibc build-linux-appimage was built against/,
+    ],
+  ]) {
+    const fixture = tamperedWorkflow(from, to);
+    try {
+      assert.throws(() => verifyWorkflow({ root: fixture }), expected);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   }
 });
 
@@ -774,8 +860,8 @@ test("the Windows installers are built without the key and signed afterwards", (
       /only sign-publish may enter the release-signing environment, not build-windows/,
     ],
     [
-      "    needs: [verify, build, build-windows, build-linux]",
-      "    needs: [verify, build, build-linux]",
+      "    needs: [verify, build, build-windows, build-linux-deb, build-linux-appimage]",
+      "    needs: [verify, build, build-linux-deb, build-linux-appimage]",
       /it is missing build-windows/,
     ],
     [
@@ -820,8 +906,8 @@ test("no workflow gets more than it needs, nor pastes values into a script", () 
       /release\.yml: top-level permissions must be contents: read, and only that/,
     ],
     [
-      tamperedWorkflow("    name: Build Linux packages\n", "    name: Build Linux packages\n    permissions: write-all\n"),
-      /build-linux may request read permissions only, not write-all/,
+      tamperedWorkflow("    name: Build the Linux .deb\n", "    name: Build the Linux .deb\n    permissions: write-all\n"),
+      /build-linux-deb may request read permissions only, not write-all/,
     ],
     [
       websiteFixture("    permissions:\n      contents: write\n      pages: write\n", "    permissions: write-all\n"),

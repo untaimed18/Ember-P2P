@@ -26,7 +26,7 @@
   import { plural } from '$lib/plural';
   import { EMBER_DIAG_FAILURE_THRESHOLD } from '$lib/emberJoin';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
-  import { checkForUpdates, installUpdate, restartToUpdate, updater } from '$lib/stores/updater';
+  import { checkForUpdates, installUpdate, restartToUpdate, systemTooOldMessage, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
   import PortTest from '$lib/components/PortTest.svelte';
   import { appSettings } from '$lib/stores/settings';
@@ -323,7 +323,7 @@
           : $updater.phase === 'error' || $updater.signatureMissing
             ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
             : $updater.systemTooOld
-              ? m.updater_system_too_old({ version: $updater.systemTooOld.version, glibc: $updater.systemTooOld.glibc })
+              ? systemTooOldMessage($updater.systemTooOld)
               : '',
   );
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);

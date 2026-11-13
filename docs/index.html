@@ -204,6 +204,7 @@
                   <li><strong>Files offered in a room are always sealed to the recipient,</strong> and the <em>Send standard offer</em> button is gone, so a member on 1.6 cannot receive a file from 1.8.0</li>
                   <li><strong>Disappearing private messages and room mail work between members on 1.8.0.</strong> A member on an older release keeps what you send for good, and is never left mail</li>
                   <li><strong>Searching all of a friend&rsquo;s files, and the secure slot grant below, need your friend on 1.8.0 too;</strong> an older friend&rsquo;s files are listed and filtered as before</li>
+                  <li><strong>The Linux AppImage now needs glibc 2.39 or newer</strong> (Ubuntu 24.04, Debian 13, Fedora 40, Linux Mint 22 and later), because it is built on Ubuntu 24.04. On an older system, an AppImage of 1.7.7 or later says so when it finds the update and keeps the version it has; the <code>.deb</code> still installs on Ubuntu 22.04 and Debian 12. An AppImage of 1.7.6 or earlier is not offered 1.8.0, so download it by hand</li>
                 </ul>
 
                 <h4>What&rsquo;s New</h4>
@@ -238,6 +239,12 @@
                 <h5>Ember network</h5>
                 <ul>
                   <li><strong>The log shows what the store holds for others</strong> once a minute, beside the publish line: records held, accepted and refused by reason, lookups answered and records republished. At debug level, each peer a rendezvous lookup lists gets a line saying whether it can be dialled and how its ping ended</li>
+                </ul>
+
+                <h5>Linux</h5>
+                <ul>
+                  <li><strong>The AppImage is built on Ubuntu 24.04.</strong> On Fedora, Debian 13, Arch and other distributions with a recent FreeType, it now draws emoji with the system&rsquo;s own font, as the <code>.deb</code> does, rather than the copy it carries</li>
+                  <li><strong>A <code>.deb</code> update checks that the system can run the new package before installing it,</strong> as the AppImage has since 1.7.7, and says so when it cannot</li>
                 </ul>
 
                 <h4>What&rsquo;s Fixed</h4>

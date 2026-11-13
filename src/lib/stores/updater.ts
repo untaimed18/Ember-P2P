@@ -61,14 +61,24 @@ export interface UpdaterState {
   /** Manifest existed but `latest.json.sig` did not. Survives silent checks
    *  so Settings does not look current. */
   signatureMissing: boolean;
-  /** A newer release whose AppImage needs a newer glibc than this system has.
-   *  Not an error: this install cannot take it, and is told where to go. */
+  /** A newer release whose package for this install needs a newer glibc than
+   *  this system has. Not an error: this install cannot take it, and is told
+   *  where to go. */
   systemTooOld: SystemTooOld | null;
 }
 
 export interface SystemTooOld {
   version: string;
   glibc: string;
+  package: 'appimage' | 'deb';
+}
+
+/** What to tell a user whose system cannot run the new release's package. An
+ *  AppImage can be swapped for the `.deb`, which runs on an older glibc; a
+ *  `.deb` has nowhere older to go. */
+export function systemTooOldMessage(tooOld: SystemTooOld): string {
+  const params = { version: tooOld.version, glibc: tooOld.glibc };
+  return tooOld.package === 'deb' ? m.updater_system_too_old_deb(params) : m.updater_system_too_old(params);
 }
 
 interface UpdateHandoffReport {

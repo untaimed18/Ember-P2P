@@ -406,7 +406,7 @@ eMule users and eD2K servers see your nickname followed by `[https://emberp2p.or
 Ember ships for **Windows 10 and Windows 11**, and for **x86-64 Linux** as a `.deb` and an AppImage. No external runtimes are required — no Java, no .NET, no separate browser engine download.
 
 1. Download the latest release from the [Releases page](https://github.com/untaimed18/Ember-P2P/releases).
-2. Run the installer (`.exe` on Windows). On Linux, install the `.deb` with your package manager, or mark the AppImage executable and run it. Both update themselves in place from inside Ember, using the format you installed; the AppImage needs FUSE 2 to start at all — `libfuse2` on Ubuntu 22.04, `libfuse2t64` on Ubuntu 24.04 and Debian 13 — so on those prefer the `.deb`.
+2. Run the installer (`.exe` on Windows). On Linux, install the `.deb` with your package manager, or mark the AppImage executable and run it. Both update themselves in place from inside Ember, using the format you installed. The `.deb` needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), the AppImage glibc 2.39 or newer (Ubuntu 24.04, Debian 13, Fedora 40 and later); the AppImage also needs FUSE 2 to start at all — `libfuse2t64` on Ubuntu 24.04 and Debian 13 — so on those prefer the `.deb`.
 3. On first launch, the **Setup Wizard** walks you through essential settings — nickname, download folder, ports, speed limits, and theme.
 4. **KAD connects on its own** every launch, so there is nothing to press. eD2K servers are separate: connect from the eD2K Servers page, or turn on **Auto-connect to server** in Settings > Network so Ember rejoins your last one on launch. A community `server.met` list can be downloaded from emule-security.org on first run.
 5. The [Ember Network](#ember-network) needs no connect step either — it is on by default and joins on its own, finding its first peers *through* KAD.
@@ -455,7 +455,7 @@ sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
   xdg-utils desktop-file-utils
 ```
 
-A Linux build from this tree produces the same `.deb` and AppImage the release publishes, built on Ubuntu 22.04 for its glibc baseline — an AppImage bundles everything except glibc, so it runs on that release or newer and nothing older. The AppImage needs FUSE 2 (`libfuse2` on Ubuntu 22.04, `libfuse2t64` on Ubuntu 24.04 and Debian 13); if it fails to start, run it with `APPIMAGE_EXTRACT_AND_RUN=1`. A large shared library can exceed the kernel's inotify watch limit, which turns off live tracking for that folder until it is raised (`sudo sysctl fs.inotify.max_user_watches=524288`). Ctrl++ / Ctrl+- zoom the UI if the compositor's display scale is not applied.
+A Linux build from this tree produces the same `.deb` and AppImage the release publishes, which builds the `.deb` on Ubuntu 22.04 and the AppImage on Ubuntu 24.04. Neither carries glibc, so each runs on the distro it was built on or newer and nothing older, and a local build does the same for the distro it is built on. The AppImage needs FUSE 2 (`libfuse2t64` on Ubuntu 24.04 and Debian 13, `libfuse2` on older releases); if it fails to start, run it with `APPIMAGE_EXTRACT_AND_RUN=1`. A large shared library can exceed the kernel's inotify watch limit, which turns off live tracking for that folder until it is raised (`sudo sysctl fs.inotify.max_user_watches=524288`). Ctrl++ / Ctrl+- zoom the UI if the compositor's display scale is not applied.
 
 #### Development
 

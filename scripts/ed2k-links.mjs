@@ -475,8 +475,8 @@ export function prepareRelease({ version, tag, repository, bundleDirectories, ou
   const notesFor = {
     "windows-installer": "Windows 10 and 11, 64-bit. The installer most people want.",
     "windows-msi": "Windows 10 and 11, 64-bit. For managed installs.",
-    "linux-deb": "Linux x86-64. Install with your package manager.",
-    "linux-appimage": "Linux x86-64. Mark it executable and run it; needs FUSE 2.",
+    "linux-deb": "Linux x86-64, glibc 2.35 or newer. Install with your package manager.",
+    "linux-appimage": "Linux x86-64, glibc 2.39 or newer. Mark it executable and run it; needs FUSE 2.",
     "release-notes": `What is new in Ember ${version}.`,
   };
   writeFileSync(

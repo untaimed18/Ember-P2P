@@ -10,7 +10,7 @@ and every additive change since — each marked as additive, since that is the
 distinction an implementer needs.
 
 **This is the overlay's design record.** What is still to do, across the whole
-app, is listed in [future-plan.md](future-plan.md), section 7 for the overlay, with
+app, is listed in [future-plan.md](future-plan.md), section 5 for the overlay, with
 when to pick each item up; the design detail behind those items stays here. It
 replaces the separate `ember-dht-search-plan.md`, whose live content — the
 friend-browse filter design, the extension decision, and the standing "already

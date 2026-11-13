@@ -45,6 +45,16 @@ unless it says otherwise:
   1,000 files is searched whole, and one on 1.7.8 is listed and filtered as
   before.
 
+What only the tagged release can show is the AppImage built on Ubuntu 24.04:
+`latest.json` carries `linux-x86_64-appimage-glibc` with a `min_glibc` of
+2.39 and no plain `linux-x86_64-appimage`; a 1.7.8 AppImage on Ubuntu 24.04
+or Fedora takes the update and starts; one on Ubuntu 22.04 says the update
+needs glibc 2.39 and keeps its version; and on Fedora the 1.8.0 AppImage
+draws emoji with the system's font, its debug log saying the host FreeType
+matches the bundled WebKit.
+`linux-test-build.yml` builds the same AppImage on demand for the last of
+these.
+
 ## 2. Privacy
 
 - **Membership traffic and feed lookups through a one-hop relay.** Private-room
@@ -62,39 +72,8 @@ unless it says otherwise:
   friends behind a symmetric NAT, which friend meets skip. Detail:
   `archived-plans/post-1.7.5.md` item 1.
 
-## 3. Rooms and private messages
+## 3. Feeds
 
-- **Room mail for a stranger's first message.** From 1.8.0 a member collects
-  room mail only from the conversations it has, so a first message still needs
-  its recipient online. Collecting from every member of every room would be
-  hundreds of boxes a round; a member could instead name, in its presence,
-  that it takes first messages by mail, which needs a field the frozen
-  presence record does not have.
-- **A test of private messages through two network loops,** for the routing.
-  The wire and storage path between two members, room mail included, is
-  covered by `a_private_message_goes_end_to_end_between_two_members`, and the
-  pacing by `dm_pacing_invariants_hold`. Routing needs two `NetworkState`s a
-  test can build, and today only `start_network` builds one, from live
-  sockets and managers; and an `AppHandle` for the receiver's events, which
-  Tauri's `test` feature provides. Building the state for tests is most of
-  the work of the `NetworkState` split in section 9.
-- **Room transfers: check block-protocol data as it arrives.** The direct
-  stream verifies every 256 KiB chunk before writing it; the block protocol
-  (the fallback) hashes only the finished file, so an accepted sender can waste
-  bandwidth up to the offered size. Send the chunk-hash list first and verify
-  each 256 KiB run as it completes, re-requesting only a bad run. Needs a new
-  frame and a version bump on both ends, so it suits a release that changes
-  formats. Detail: `archived-plans/post-1.7.0.md` item 2.
-- **Tune Discover's spam folding from real use.** `LIKELY_SPAM_SCORE` and
-  `DUPLICATE_NAME_FLOOD` stay as they are until reports of folded good rooms,
-  or spam that gets through, say otherwise.
-
-## 4. Feeds
-
-- **Carry a feed to another device of the same identity.** The format allows
-  several devices to publish one feed (the clock-based `sequence` makes the
-  latest publish win), but nothing carries a feed's salt and items to a second
-  device, so an identity restored elsewhere does not bring its feeds.
 - **Followers who help share a feed's files (opt-in per feed).** A feed's
   files cost its publisher every byte, to every follower, because feed
   downloads stay private. A per-feed switch, "Share files from this feed", off
@@ -107,9 +86,9 @@ unless it says otherwise:
   ties the follower to the feed for anyone looking up an item's hash. Detail:
   `archived-plans/post-1.7.5.md` item 5. A swarm among a link-only feed's
   followers alone is the later, bigger step, and waits on Ember downloading
-  from several Ember peers at once (section 7, "Ember-native transfers").
+  from several Ember peers at once (section 5, "Ember-native transfers").
 
-## 5. Friends
+## 4. Friends
 
 - **Check friend meets on real restricted NATs.** 1.7.6 resends the first
   handshake message and carries the Noise key in the meet. Tests replay the
@@ -118,14 +97,7 @@ unless it says otherwise:
   Diagnostics; conversions should be close to meets for friends not behind a
   symmetric NAT.
 
-## 6. Downloads, uploads and sharing
-
-- **Share any folder without its subfolders, not only from the eMule
-  import.** 1.8.0 has the share itself (a flat entry in the folder's
-  allowlist, `flat_entry` in `sharing/indexer.rs`), but only the import makes
-  one. The folder picker would need the choice, and the Library a mark for it.
-
-## 7. The Ember network
+## 5. The Ember network
 
 Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
 5 and 7, "Future improvements", and the 2026-08-18 audit notes.
@@ -197,13 +169,13 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   move bytes over eD2K. Ember Transfer moves files between room members over
   the room session, in 1008-byte blocks. Moving it onto QUIC would lift the
   throughput ceiling, and downloading from several Ember peers at once is what
-  a feed's follower swarm (section 4) needs. Reach is the other limit: an
+  a feed's follower swarm (section 3) needs. Reach is the other limit: an
   arbitrary room member holding a file may not be dialable.
 - **Retire the legacy QUIC listener.** It stays on the TCP port number for
   relays that dial a KAD-only source there. It can go once those sources have
   a relay target of their own.
 
-## 8. Updates and releases
+## 6. Updates and releases
 
 - **A second place to fetch updates from,** for users who cannot reach
   GitHub's download hosts and have no proxy (mainland China). The updater
@@ -215,23 +187,49 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   workflow that uploads on publish with credentials of its own, and an updater
   that tries the mirror only when GitHub is unreachable, sharing the one
   downgrade floor. Detail: `archived-plans/update-mirror-plan.md`.
-- **Build the AppImage on a newer distribution.** It is built on Ubuntu 22.04
-  so it runs on glibc 2.35. Moving it raises the glibc floor, and an AppImage
-  replaces itself in place, so the newer build goes out under
-  `linux-x86_64-appimage-glibc` with its `min_glibc`, which 1.7.7 and later
-  read (`choose_appimage_target`), while the plain entry keeps a build that
-  runs wherever today's does, or is dropped. `BUILT_AGAINST_FREETYPE` in
-  `appimage_fonts.rs` moves with the build. See the comment on the
-  `build-linux` job in `release.yml`.
+- **Build the `.deb` on a newer distribution.** From 1.8.0 the AppImage is
+  built on Ubuntu 24.04 and published under `linux-x86_64-appimage-glibc`
+  alone, with its `min_glibc`. The `.deb` stays on 22.04 (glibc 2.35): a
+  `.deb` before 1.8.0 asks for `linux-x86_64-deb` and checks no glibc, so a
+  build from a newer distro would install on an older one and then not
+  start. 1.8.0's `.deb` prefers `linux-x86_64-deb-glibc` when its system
+  meets that entry's `min_glibc`, and says so when it cannot
+  (`choose_glibc_target`). Once enough `.deb` installs are on 1.8.0 or later,
+  a release can build the `.deb` on 24.04 and publish it there, with
+  `add-linux-platforms.mjs` and the release policy following. Whether a 22.04
+  build keeps the plain entry beside it, for `.deb` installs before 1.8.0 and
+  systems older than 24.04, is the choice then; the two files would need
+  different names, since both are `Ember_<version>_amd64.deb` today. It has
+  to happen before GitHub retires its Ubuntu 22.04 runners, and until then
+  the release policy holds `build-linux-deb` to `ubuntu-22.04`.
+- **Flatpak and Snap packages.** Both bring their own runtime (Flatpak a
+  GNOME runtime with WebKitGTK, Snap `core24` with its `gnome` extension), so
+  one build would run on any distribution with Flatpak or snapd whatever its
+  glibc or FreeType, and neither the glibc floors above nor the AppImage's
+  emoji workaround would apply. The costs: updates come from Flathub or the
+  Snap Store rather than Ember's signed manifest, so the updater has to stand
+  aside for them (a build without a bundle marker already finds no entry and
+  reports no update); Flathub builds from source on its own infrastructure,
+  so what its users run is not the release's signed artifact; and the
+  sandbox needs permissions for the download and shared folders, which Ember
+  lets the user put anywhere, and for the tray and the `ed2k:` link handler.
+  Pick it up when users ask for one, or if the `.deb` cannot leave 22.04 in
+  time.
 
-## 9. Code health
+## 7. Code health
 
 - **Split `NetworkState` per stack.** One struct on one task is the model that
   produced the original starvation bug, and it is still the most pressing
   architectural risk in the codebase. Each stack would get its own task with
   an explicit message boundary. It is a redesign rather than code motion, so it
   needs integration testing against live peers. `command.rs` is separable and
-  `NetworkDeps` gives the entry point a real signature.
+  `NetworkDeps` gives the entry point a real signature. Today only
+  `start_network` builds a `NetworkState`, from live sockets and managers; a
+  state tests can build comes with the split, and with it a test of private
+  messages through two network loops for their routing (the wire, storage and
+  pacing are covered: `a_private_message_goes_end_to_end_between_two_members`,
+  `dm_pacing_invariants_hold`). The receiver's events need an `AppHandle`,
+  which Tauri's `test` feature provides.
 - **Overnight runs of Ember itself, and property tests for more of it.** The
   fuzz loops and the `*_invariants_hold` property tests (the Ember routing
   table, the batch publisher, private-message pacing) run 200 times longer
@@ -245,7 +243,7 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   download-side peers never get a challenge, send one when their session
   starts. Detail: `archived-plans/post-1.7.1.md` item 5.
 
-## 10. Translations
+## 8. Translations
 
 - **A native speaker's read of the 1.8.0 Russian and Polish plurals.** The
   source-exchange tooltip and the cancel-and-remove confirmation now carry a
@@ -281,12 +279,39 @@ Taken off the plan, with why, so they are not added back without a new reason.
 - **Web mirrors in feed lists** (`post-1.7.5.md` item 6, step 3). It would let
   a publisher name a server it runs and learn who downloads and when, which it
   cannot learn today without being a source. Followers who opt in to share a
-  feed's files (section 4) relieve the publisher without that.
+  feed's files (section 3) relieve the publisher without that.
 - **Stronger observed-IP and STUN interplay, and tuning announce against bucket
   refresh** (`ember-dht.md`, "Future improvements"). Neither had a problem or a
   design behind it. Reopen with soak data that shows one.
 - **Migration guidance for turning the DHT on beside KAD and eD2K**
   (`ember-dht.md`, "Product / UX"). The overlay is always on, with no switch.
+- **Room mail for a stranger's first message.** A first message from someone
+  with no conversation is a request the user answers; left in a mailbox, it
+  would let anyone in a shared room fill one's box on the server while one is
+  away. A first contact waiting for both to be online is the right gate, and
+  the alternative needs a field the frozen presence record does not have.
+- **Checking block-protocol room transfers chunk by chunk**
+  (`post-1.7.0.md` item 2). The block protocol is the fallback for members
+  who can only meet through a relay, and the finished file is still checked
+  against the offer, so nothing bad is kept. What a bad sender can waste is
+  bandwidth, up to the size of a file the user chose to accept from it: not
+  worth a new frame on both ends.
+- **Tuning Discover's spam folding as a plan item.** There is nothing to
+  build; `LIKELY_SPAM_SCORE` and `DUPLICATE_NAME_FLOOD` are revisited when a
+  report of a folded good room, or of spam getting through, comes in.
+- **Carrying a feed to another device of the same identity.** A backup holds
+  `ember.db`, a user's own feeds and their items included (`feeds_own`,
+  `feeds_own_items`), so an identity restored from one brings its feeds.
+  Keeping two running devices' feeds in step would be a sync feature Ember
+  has nowhere else.
+- **Sharing any folder without its subfolders from the folder picker.** Ember
+  shares a folder with what is under it by design, and the share browser
+  already unshares a subfolder, files added to it later included; only a
+  subfolder made later is shared. The eMule import makes flat shares itself
+  for users who expect eMule's way.
+- **A test of private messages through two network loops, on its own.** It
+  needs a `NetworkState` that tests can build, which is the split's work, so
+  it is part of that item (section 7).
 - **Already done, found while gathering this plan:** digest corroboration
   across colluding storers (`post-1.7.0.md`; responders are counted per /24 and
   a contested digest is not pinned), and keeping withheld lists in a store of

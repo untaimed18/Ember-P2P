@@ -314,7 +314,8 @@ const REQUIRED_JOBS = [
   "verify",
   "build",
   "build-windows",
-  "build-linux",
+  "build-linux-deb",
+  "build-linux-appimage",
   "sign-publish",
 ];
 
@@ -556,23 +557,57 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
     errors.push("sign-publish must compose the Windows updater targets into latest.json");
   }
 
-  // A Linux release is three things that have to stay together: both formats
-  // built, neither of them asking a keyless runner to produce updater
-  // signatures, and both reaching the manifest. Dropping any one of them still
-  // produces a green release — one that silently stops offering Linux users an
-  // update, or offers them an artifact with no signature to verify.
-  const linuxJob = jobs.get("build-linux") ?? "";
-  if (!/--bundles\s+appimage,deb\b/.test(linuxJob)) {
-    errors.push("build-linux must build both the AppImage and the .deb");
+  // A Linux release is several things that have to stay together: both formats
+  // built, each on its own runner, neither of them asking a keyless runner to
+  // produce updater signatures, and both reaching the manifest. Dropping any
+  // one of them still produces a green release — one that silently stops
+  // offering Linux users an update, or offers them an artifact with no
+  // signature to verify.
+  const debJob = jobs.get("build-linux-deb") ?? "";
+  const appImageJob = jobs.get("build-linux-appimage") ?? "";
+  if (!/--bundles\s+deb\s/.test(debJob)) {
+    errors.push("build-linux-deb must build the .deb, and only the .deb");
   }
-  if (!/"createUpdaterArtifacts"\s*:\s*false/.test(linuxJob)) {
-    errors.push(
-      "build-linux holds no signing key, so it must disable createUpdaterArtifacts",
-    );
+  if (!/--bundles\s+appimage\s/.test(appImageJob)) {
+    errors.push("build-linux-appimage must build the AppImage, and only the AppImage");
+  }
+  for (const [name, body] of [["build-linux-deb", debJob], ["build-linux-appimage", appImageJob]]) {
+    if (!/"createUpdaterArtifacts"\s*:\s*false/.test(body)) {
+      errors.push(
+        `${name} holds no signing key, so it must disable createUpdaterArtifacts`,
+      );
+    }
   }
   if (!signJob.includes("scripts/add-linux-platforms.mjs")) {
     errors.push(
       "sign-publish must add the Linux updater targets to latest.json",
+    );
+  }
+  // A `.deb` before 1.8.0 checks no glibc before it takes an update, so a
+  // `.deb` built on a newer distro installs on an older one and then cannot
+  // start. Until a newer build goes out under the gated entry 1.8.0 reads, the
+  // plain one stays on the distro every earlier `.deb` was built on.
+  if (!/^\s{4}runs-on:\s*ubuntu-22\.04\s*$/m.test(debJob)) {
+    errors.push(
+      "build-linux-deb must stay on ubuntu-22.04: nothing stops a .deb built against a newer glibc reaching an older system",
+    );
+  }
+  // The manifest states the glibc the AppImage's runner measured, but the
+  // eD2K notes, the website's download line and the guide say 2.39 in words.
+  if (!/^\s{4}runs-on:\s*ubuntu-24\.04\s*$/m.test(appImageJob)) {
+    errors.push(
+      "build-linux-appimage must run on ubuntu-24.04: the eD2K notes, the website and the guide give its glibc as 2.39, so they move with it",
+    );
+  }
+  // The AppImage's entry is the one that may name a newer glibc, and the
+  // updater refuses a manifest whose gated entry states none, so the value the
+  // AppImage's runner measured has to reach the step that writes the entry.
+  if (
+    !/^\s{6}min-glibc:\s*\$\{\{\s*steps\.glibc\.outputs\.version\s*\}\}\s*$/m.test(appImageJob) ||
+    !/^\s+EMBER_APPIMAGE_MIN_GLIBC:\s*\$\{\{\s*needs\.build-linux-appimage\.outputs\.min-glibc\s*\}\}\s*$/m.test(signJob)
+  ) {
+    errors.push(
+      "sign-publish must state, as the AppImage's min_glibc, the glibc build-linux-appimage was built against",
     );
   }
   // Where GitHub cannot be reached, these are the only way to the installers:

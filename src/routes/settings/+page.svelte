@@ -158,6 +158,7 @@
     installUpdate,
     restartToUpdate,
     runStagedInstaller,
+    systemTooOldMessage,
   } from '$lib/stores/updater';
   import { silentUpdate, silentUpdateResume } from '$lib/stores/silentUpdate';
   import { toastError } from '$lib/stores/toast';
@@ -5766,7 +5767,7 @@
                 {:else if $updater.phase === 'error' || $updater.signatureMissing}
                   <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })}</span>
                 {:else if $updater.systemTooOld}
-                  <span class="feedback error">{m.updater_system_too_old({ version: $updater.systemTooOld.version, glibc: $updater.systemTooOld.glibc })}</span>
+                  <span class="feedback error">{systemTooOldMessage($updater.systemTooOld)}</span>
                 {:else}
                   <span class="hint">{m.settings_about_check_hint()}</span>
                 {/if}

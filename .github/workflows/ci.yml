@@ -126,7 +126,8 @@ jobs:
     name: Check desktop Rust on Linux
     runs-on: ubuntu-22.04
     # Same compile/clippy/lib-test gates as `check`, on the glibc baseline
-    # Tauri recommends for shipping `.deb` / AppImage (Ubuntu 22.04). This is
+    # Tauri recommends for shipping and the release builds the `.deb` on
+    # (Ubuntu 22.04). This is
     # not a Linux release job: it does not sign, bundle, or publish. It exists
     # so Linux-only filesystem paths and unix tests cannot rot behind the
     # Windows-only desktop CI.
