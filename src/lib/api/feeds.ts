@@ -64,6 +64,9 @@ export interface FollowedFeed {
   followed_at: number;
   checked_at: number;
   auto_download: boolean;
+  /** "Share files from this feed": its downloads are offered to others as
+   *  any shared file is. Off by default. */
+  share_files: boolean;
   auto_max_item_mib: number;
   auto_max_day_mib: number;
   /** When auto-download was last turned on; it takes files first seen since. */
@@ -251,6 +254,10 @@ export const setFeedAutoDownload = (
   maxDayMib: number,
 ): Promise<FollowedFeed> =>
   invoke('set_feed_auto_download', { publisher, salt, enabled, maxItemMib, maxDayMib });
+/** Share a followed feed's files, partial and finished, from its folder, or
+ *  keep them private again. */
+export const setFeedShareFiles = (publisher: string, salt: string, share: boolean): Promise<FollowedFeed> =>
+  invoke('set_feed_share_files', { publisher, salt, share });
 export const downloadFeedItems = (publisher: string, salt: string, ed2ks: string[]): Promise<number> =>
   invoke('download_feed_items', { publisher, salt, ed2ks });
 /** Cancel the feed's download of a file: what has arrived is deleted. */

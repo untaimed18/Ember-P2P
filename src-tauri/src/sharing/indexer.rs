@@ -802,10 +802,21 @@ impl FileIndexer {
         if metadata.is_dir() {
             let private = path
                 .file_name()
-                .is_some_and(|name| crate::sharing::is_private_receive_dir_name(&name.to_string_lossy()))
-                || crate::sharing::feed_downloads::is_feeds_dir(path);
+                .is_some_and(|name| crate::sharing::is_private_receive_dir_name(&name.to_string_lossy()));
             if private || scope.is_some_and(|scope| !scope.admits_dir(&key)) {
                 return ScopedDiscovery::Removed;
+            }
+            // A download folder's `Feeds` holds nothing shared but the
+            // folders of feeds that share their files.
+            if crate::sharing::feed_downloads::is_feeds_dir(path) {
+                let mut partial = false;
+                let mut files = Vec::new();
+                for dir in crate::sharing::feed_downloads::sharing_dirs_in(path) {
+                    let result = Self::discover_directory_page_in(&dir.to_string_lossy(), None, scope);
+                    partial |= result.partial || !result.unreadable.is_empty();
+                    files.extend(result.files);
+                }
+                return ScopedDiscovery::Found { partial, files };
             }
             let result = Self::discover_directory_page_in(&path.to_string_lossy(), None, scope);
             return ScopedDiscovery::Found {
@@ -970,28 +981,36 @@ impl FileIndexer {
                     let dir_name = entry.file_name().to_string_lossy().into_owned();
                     if crate::sharing::is_index_skip_dir_name(&dir_name)
                         || crate::sharing::is_private_receive_dir_name(&dir_name)
-                        || crate::sharing::feed_downloads::is_feeds_dir(&entry_path)
                     {
                         continue;
                     }
-                    let mut key = normalize_path_key(&entry_path.to_string_lossy());
-                    if scope.is_some_and(|scope| !scope.admits_dir(&key)) {
-                        continue;
-                    }
-                    if let Ok(canonical) = entry_path.canonicalize() {
-                        if canonical == data_canon || canonical.starts_with(&data_canon) {
+                    // A download folder's `Feeds` is entered for the folders of
+                    // feeds that share their files, and no further.
+                    let dirs = if crate::sharing::feed_downloads::is_feeds_dir(&entry_path) {
+                        crate::sharing::feed_downloads::sharing_dirs_in(&entry_path)
+                    } else {
+                        vec![entry_path]
+                    };
+                    for entry_path in dirs {
+                        let mut key = normalize_path_key(&entry_path.to_string_lossy());
+                        if scope.is_some_and(|scope| !scope.admits_dir(&key)) {
                             continue;
                         }
+                        if let Ok(canonical) = entry_path.canonicalize() {
+                            if canonical == data_canon || canonical.starts_with(&data_canon) {
+                                continue;
+                            }
+                        }
+                        key.push(std::path::MAIN_SEPARATOR);
+                        // Skipped here rather than when popped: queued, entries
+                        // before the cursor took frontier room on every resumed
+                        // page, crowding out the ones the page resumed for.
+                        if cursor.is_some_and(|value| subtree_sorts_before_cursor(&key, value)) {
+                            *saw_before_cursor = true;
+                            continue;
+                        }
+                        insert_bounded(pending, dropped_floor, key, entry_path, true);
                     }
-                    key.push(std::path::MAIN_SEPARATOR);
-                    // Skipped here rather than when popped: queued, entries
-                    // before the cursor took frontier room on every resumed
-                    // page, crowding out the ones the page resumed for.
-                    if cursor.is_some_and(|value| subtree_sorts_before_cursor(&key, value)) {
-                        *saw_before_cursor = true;
-                        continue;
-                    }
-                    insert_bounded(pending, dropped_floor, key, entry_path, true);
                 } else if file_type.is_file() {
                     let key = normalize_path_key(&entry_path.to_string_lossy());
                     if scope.is_some_and(|scope| !scope.admits_file(&key)) {
@@ -1210,16 +1229,22 @@ impl FileIndexer {
                     let dir_name = entry.file_name().to_string_lossy().into_owned();
                     if crate::sharing::is_index_skip_dir_name(&dir_name)
                         || crate::sharing::is_private_receive_dir_name(&dir_name)
-                        || crate::sharing::feed_downloads::is_feeds_dir(&entry_path)
                     {
                         continue;
                     }
-                    if let Ok(canonical) = entry_path.canonicalize() {
-                        if canonical == data_canon || canonical.starts_with(data_canon) {
-                            continue;
+                    let dirs = if crate::sharing::feed_downloads::is_feeds_dir(&entry_path) {
+                        crate::sharing::feed_downloads::sharing_dirs_in(&entry_path)
+                    } else {
+                        vec![entry_path]
+                    };
+                    for entry_path in dirs {
+                        if let Ok(canonical) = entry_path.canonicalize() {
+                            if canonical == data_canon || canonical.starts_with(data_canon) {
+                                continue;
+                            }
                         }
+                        stack.push(entry_path);
                     }
-                    stack.push(entry_path);
                 } else if file_type.is_file() {
                     if is_excluded_share_file_name(&entry_path)
                         || metadata.as_ref().is_some_and(|metadata| !shareable_size(metadata.len()))
@@ -2038,6 +2063,54 @@ mod tests {
             other => panic!("a rescan of the shared folder walks it, got {other:?}"),
         }
         assert!(!under_private_receive_dir(&shared_on_purpose, &chat.join("a.jpg")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A share holding a download folder walks into its `Feeds` for the folder
+    /// of a feed that shares its files, and for nothing else there.
+    #[test]
+    fn a_share_holding_feeds_reaches_only_a_sharing_feeds_folder() {
+        use crate::sharing::feed_downloads as feeds;
+        let _sharing = feeds::sharing_test_lock();
+        let root = scratch_tree("feeds-share");
+        let roots = vec![root.to_string_lossy().to_string()];
+        let no_lists = DiscoveryScopes::default();
+        let shared = format!("Shared {}", uuid::Uuid::new_v4());
+        let dir = feeds::feeds_dir(&root);
+        for folder in [shared.as_str(), "Private"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+            std::fs::write(dir.join(folder).join("a.mp3"), b"x").unwrap();
+        }
+        feeds::mark_feeds_dir(&dir);
+        let names = |files: &[crate::types::FileInfo]| {
+            let mut paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+            paths.sort();
+            paths
+        };
+
+        let page = FileIndexer::discover_directory_page_in(&roots[0], None, None);
+        assert!(page.files.is_empty(), "{:?}", page.files);
+
+        feeds::set_sharing([shared.clone()]);
+        let wanted = vec![dir.join(&shared).join("a.mp3").to_string_lossy().to_string()];
+        let page = FileIndexer::discover_directory_page_in(&roots[0], None, None);
+        assert_eq!(names(&page.files), wanted);
+        match FileIndexer::discover_scoped_path(&roots, &no_lists, &dir) {
+            ScopedDiscovery::Found { files, .. } => assert_eq!(names(&files), wanted),
+            other => panic!("a rescan of Feeds finds the sharing feed's files, got {other:?}"),
+        }
+        assert!(!under_private_receive_dir(&roots, &dir.join(&shared).join("a.mp3")));
+        assert!(under_private_receive_dir(&roots, &dir.join("Private").join("a.mp3")));
+        assert!(matches!(
+            FileIndexer::discover_scoped_path(&roots, &no_lists, &dir.join("Private").join("a.mp3")),
+            ScopedDiscovery::Removed
+        ));
+
+        feeds::set_sharing([]);
+        match FileIndexer::discover_scoped_path(&roots, &no_lists, &dir) {
+            ScopedDiscovery::Found { files, .. } => assert!(files.is_empty(), "{files:?}"),
+            other => panic!("a rescan of Feeds finds nothing once it stops sharing, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

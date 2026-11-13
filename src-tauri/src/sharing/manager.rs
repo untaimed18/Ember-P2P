@@ -2688,7 +2688,7 @@ impl TransferManager {
             .chain(self.completed.iter())
             .filter(|t| {
                 !crate::sharing::feed_files::is_internal_fetch(&t.id)
-                    && !crate::sharing::feed_downloads::is_private(&t.id)
+                    && !crate::sharing::feed_downloads::is_feed_download(&t.id)
             })
             .map(|t| {
                 let preview_ready = self

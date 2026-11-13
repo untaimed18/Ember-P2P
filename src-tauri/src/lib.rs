@@ -890,6 +890,10 @@ pub fn run() {
                 Ok(rows) => sharing::feed_downloads::load(rows),
                 Err(error) => tracing::error!("Could not read which downloads are from feeds: {error}"),
             }
+            match db.feed_sharing_folders() {
+                Ok(folders) => sharing::feed_downloads::set_sharing(folders),
+                Err(error) => tracing::error!("Could not read which feeds share their files: {error}"),
+            }
             match db.transfer_collection_folders() {
                 Ok(rows) => storage::category_folders::load_collection_folders(rows),
                 Err(error) => tracing::error!("Could not read which downloads came from collections: {error}"),
@@ -1234,6 +1238,16 @@ pub fn run() {
             // tell the user (their settings were reset to defaults; the original
             // is preserved). Delay the emit so the webview has registered its
             // listeners — the file is already safely backed up regardless.
+            // The folders of feeds that share their files, once the startup
+            // scan has begun: one a crash left unshared, or a download folder
+            // moved since, is set right.
+            if !sharing::feed_downloads::sharing_folders().is_empty() {
+                let handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    sharing::feed_shares::reconcile(&handle, &[]).await;
+                });
+            }
             if let Some(bak) = corrupt_backup {
                 let emit_handle = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
@@ -2678,6 +2692,7 @@ pub fn run() {
             commands::feeds::get_feed_items,
             commands::feeds::mark_feed_read,
             commands::feeds::set_feed_auto_download,
+            commands::feeds::set_feed_share_files,
             commands::feeds::download_feed_items,
             commands::feeds::cancel_feed_download,
             commands::feeds::unfollow_feed,

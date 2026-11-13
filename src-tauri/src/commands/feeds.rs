@@ -2286,6 +2286,46 @@ pub async fn set_feed_auto_download(
     Ok(followed_info(feed))
 }
 
+/// "Share files from this feed", off by default: its downloads, partial and
+/// finished, are advertised and served as any download is, and its folder is
+/// shared (`sharing::feed_shares`). Off again, they are private once more and
+/// a folder Ember shared for it is taken back; one the user shared stays.
+/// Returns the feed as saved.
+#[tauri::command]
+pub async fn set_feed_share_files(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    publisher: String,
+    salt: String,
+    share: bool,
+) -> Result<FollowedFeedInfo, String> {
+    let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
+    let db = state.db.clone();
+    let (key_pub, key_salt) = (publisher.clone(), salt.clone());
+    let (feed, sharing) = blocking(
+        move || {
+            if !db.feed_set_share_files(&key_pub, &key_salt, share)? {
+                return Ok(None);
+            }
+            // Its folder now, if no download has given it one, so the folder
+            // is shared from before its first file.
+            if let Some(feed) = db.feed_followed(&key_pub, &key_salt)?.filter(|feed| share && feed.folder.is_empty()) {
+                db.feed_followed_folder(&key_pub, &key_salt, &feed.title)?;
+            }
+            let sharing = db.feed_sharing_folders()?;
+            Ok(db.feed_followed(&key_pub, &key_salt)?.map(|feed| (feed, sharing)))
+        },
+        "feeds_failed",
+        "Could not save the feed",
+    )
+    .await?
+    .ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
+    crate::sharing::feed_downloads::set_sharing(sharing);
+    crate::sharing::feed_shares::reconcile(&app, std::slice::from_ref(&feed.folder)).await;
+    let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": publisher, "salt": salt }));
+    Ok(followed_info(feed))
+}
+
 /// Every transfer that has not finished: running, queued, or failed and
 /// still listed with its partial file, which only the feed's page shows.
 fn unfinished_downloads(manager: &crate::sharing::manager::TransferManager) -> impl Iterator<Item = &Transfer> {
@@ -2821,19 +2861,21 @@ pub async fn unfollow_feed(
     let dir = feeds_dir(&app);
     let db = state.db.clone();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
-    let (released, folder) = blocking(
+    let (released, folder, shared, sharing) = blocking(
         move || {
             let mut released = None;
             let mut folder = String::new();
+            let mut shared = false;
             if let Some(feed) = db.feed_followed(&key_pub, &key_salt)? {
                 if let Ok(hash) = hex_to16(&feed.held_ed2k) {
                     released = release_list(&hash, &followed_owner(&key_pub, &key_salt));
                 }
                 folder = feed.folder;
+                shared = feed.share_files;
             }
             remove_followed_files(&dir, &key_pub, &key_salt, None);
             db.feed_unfollow(&key_pub, &key_salt)?;
-            Ok((released, folder))
+            Ok((released, folder, shared, db.feed_sharing_folders()?))
         },
         "feeds_failed",
         "Could not unfollow the feed",
@@ -2841,6 +2883,11 @@ pub async fn unfollow_feed(
     .await?;
     drop(followed);
     withdraw_lists(&state, released).await;
+    // Its files stop being shared with it, but where the user shares them too.
+    if shared {
+        crate::sharing::feed_downloads::set_sharing(sharing);
+        crate::sharing::feed_shares::reconcile(&app, std::slice::from_ref(&folder)).await;
+    }
     // Its unfinished downloads go with it: they are shown nowhere but the
     // feed's page, so left running they could be neither seen nor stopped.
     // What finished stays in its folder.
@@ -5058,6 +5105,7 @@ mod tests {
             auto_since: 0,
             seen_at: 0,
             deleted: false,
+            share_files: false,
         }
     }
 

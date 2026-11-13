@@ -109,6 +109,7 @@ const BACKEND_OWNED_SETTINGS_FIELDS: &[&str] = &[
     "ignored_members",
     "shared_folders",
     "ember_releases_folder",
+    "feed_share_folders",
     "previous_download_folders",
     "default_shared_folder_seeded",
     "folder_priorities",
@@ -721,6 +722,15 @@ async fn sync_release_share_folder(settings: &mut AppSettings) -> Result<Option<
 /// the release-sharing settings may add or take away.
 pub(crate) fn is_release_share_folder(settings: &AppSettings, path: &str) -> bool {
     !settings.ember_releases_folder.is_empty() && shared_folder_paths_equal(path, &settings.ember_releases_folder)
+}
+
+/// Whether `path` is a feed folder Ember shares for a feed whose files are
+/// shared, which only that feed's switch may add or take away.
+pub(crate) fn is_feed_share_folder(settings: &AppSettings, path: &str) -> bool {
+    settings
+        .feed_share_folders
+        .iter()
+        .any(|folder| shared_folder_paths_equal(path, folder))
 }
 
 fn shared_folder_paths_equal(a: &str, b: &str) -> bool {
@@ -2133,6 +2143,15 @@ pub async fn update_settings(
 
     crate::sharing::disk::set_hash_at_low_priority(settings.hash_low_priority);
     crate::release_share::configure(&settings);
+    // The folders of feeds that share their files follow the download folder.
+    if settings.download_folder != old_settings.download_folder
+        && !crate::sharing::feed_downloads::sharing_folders().is_empty()
+    {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::sharing::feed_shares::reconcile(&app, &[]).await;
+        });
+    }
     // Awaited, under the save lock: a save turning sharing back on straight
     // after must not find this still deleting what it has just kept. Before
     // the shared-folder changes below, so a moved folder is scanned with its

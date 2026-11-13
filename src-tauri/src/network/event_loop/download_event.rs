@@ -581,8 +581,9 @@ pub(in crate::network) async fn on_download_event(
                 .unwrap_or(now)
             };
 
-            // A feed's download is private: it goes in no index, known.met,
-            // KAD or server list (see `sharing::feed_downloads`).
+            // A feed's download is private, unless its feed shares its files:
+            // it goes in no index, known.met, KAD or server list (see
+            // `sharing::feed_downloads`).
             let private = crate::sharing::feed_downloads::is_private(transfer_id);
             if private {
                 info!("Completed download {transfer_id} is from a feed: kept private, out of the library");
@@ -1193,7 +1194,7 @@ pub(in crate::network) async fn on_download_event(
                 &mut state.ember_content_hashes,
                 &mut *transfer_manager.write().await,
                 transfer_id,
-                crate::sharing::feed_downloads::is_private(transfer_id)
+                crate::sharing::feed_downloads::is_feed_download(transfer_id)
                     || crate::sharing::feed_files::is_internal_fetch(transfer_id),
             );
         if remote_pin_dropped {

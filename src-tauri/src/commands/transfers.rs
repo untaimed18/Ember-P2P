@@ -570,7 +570,7 @@ async fn revive_failed_download(
         transfer_id_short(transfer_id)
     );
     persist_transfer_status(state, transfer_id, &row.status).await;
-    if !crate::sharing::feed_downloads::is_private(transfer_id) {
+    if !crate::sharing::feed_downloads::is_feed_download(transfer_id) {
         let _ = app.emit("transfer-started", &row);
     }
     let Some(link) = link else {
@@ -1991,7 +1991,7 @@ pub(crate) async fn start_download_to(
                     friend_ember_hash,
                     add_paused,
                 };
-                let was_feed_download = crate::sharing::feed_downloads::is_private(&failed_id);
+                let was_feed_download = crate::sharing::feed_downloads::is_feed_download(&failed_id);
                 if let Some(folder) = &feed_folder {
                     mark_feed_download(&state, &failed_id, folder).await?;
                 }
@@ -2059,7 +2059,7 @@ pub(crate) async fn start_download_to(
     let (active_now, existing_id) = queued?;
     if let Some(existing_id) = existing_id {
         attach_link_web_sources(&state, &file_hash, web_sources).await;
-        let in_feed = crate::sharing::feed_downloads::is_private(&existing_id);
+        let in_feed = crate::sharing::feed_downloads::is_feed_download(&existing_id);
         return Ok(StartDownloadResponse {
             transfer_id: existing_id,
             already_queued: true,
@@ -3370,7 +3370,7 @@ pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Tran
         .into_iter()
         .filter(|t| {
             !crate::sharing::feed_files::is_internal_fetch(&t.id)
-                && !crate::sharing::feed_downloads::is_private(&t.id)
+                && !crate::sharing::feed_downloads::is_feed_download(&t.id)
         })
         .collect())
 }
@@ -3673,7 +3673,7 @@ pub async fn set_transfers_category(
             manager.set_category(id, &category);
             // A feed's file stays in its feed folder: a category folder is in
             // `Downloads`, which may be shared.
-            if !move_finished.unwrap_or(true) || crate::sharing::feed_downloads::is_private(id) {
+            if !move_finished.unwrap_or(true) || crate::sharing::feed_downloads::is_feed_download(id) {
                 continue;
             }
             let Some(t) = manager.get_transfer(id).filter(|t| {

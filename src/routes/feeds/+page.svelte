@@ -33,6 +33,7 @@
     refreshFeed,
     setDiscoveredFeedHidden,
     setFeedAutoDownload,
+    setFeedShareFiles,
     setFeedDetails,
     setFeedItems,
     setFeedListed,
@@ -286,6 +287,7 @@
   let refreshing = $derived(selectedKey !== null && refreshingFor.has(selectedKey));
   let downloading = $derived(selectedKey !== null && downloadingFor.has(selectedKey));
   let autoEnabled = $state(false);
+  let shareEnabled = $state(false);
   let autoItemMib = $state(0);
   let autoDayMib = $state(0);
   let autoOpen = $state(false);
@@ -600,6 +602,7 @@
     if (shownSettingsFor !== key) {
       shownSettingsFor = key;
       autoEnabled = feed.auto_download;
+      shareEnabled = feed.share_files;
       autoItemMib = feed.auto_max_item_mib;
       autoDayMib = feed.auto_max_day_mib;
       autoOpen = false;
@@ -663,6 +666,26 @@
       return;
     }
     if (on && selectedKey === key) autoOpen = true;
+  }
+
+  let shareQueue: Promise<unknown> = Promise.resolve();
+
+  /** Saves at once, one change at a time, as the auto-download switch does. */
+  function toggleShare(on: boolean) {
+    const feed = selected;
+    if (!feed) return;
+    const key = keyOf(feed);
+    shareEnabled = on;
+    shareQueue = shareQueue.then(async () => {
+      try {
+        await setFeedShareFiles(feed.publisher, feed.salt, on);
+        await refreshFollowedFeeds();
+        toastSuccess(aboutFeed(feed, on ? m.feeds_share_on_saved() : m.feeds_share_off_saved()));
+      } catch (e) {
+        toastError(aboutFeed(feed, translateError(e, m.error_operation_failed())));
+        if (selectedKey === key && shareEnabled === on) shareEnabled = !on;
+      }
+    });
   }
 
   /** A limit saves once its field is left, as the switch does when flipped. */
@@ -2255,7 +2278,7 @@
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <rect x="3.5" y="7" width="9" height="6.5" rx="1"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/>
                     </svg>
-                    <span>{m.feeds_private_note()}</span>
+                    <span>{selected.share_files ? m.feeds_shared_note() : m.feeds_private_note()}</span>
                   </p>
 
                   {#if selected.deleted}
@@ -2341,6 +2364,33 @@
                           </div>
                         </div>
                       {/if}
+                    </div>
+                  {/if}
+
+                  <!-- Its files stay where they are, so a deleted feed's can still be shared. -->
+                  {#if selected.folder !== '' || !selected.deleted}
+                    <div class="auto-card" class:on={shareEnabled}>
+                      <div class="auto-head">
+                        <span class="auto-icon" aria-hidden="true">
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="4" cy="8" r="1.75"/><circle cx="12" cy="4" r="1.75"/><circle cx="12" cy="12" r="1.75"/><path d="M5.6 7.2 10.4 4.8M5.6 8.8l4.8 2.4"/>
+                          </svg>
+                        </span>
+                        <div class="auto-title static">
+                          <span class="auto-text">
+                            <span class="auto-line">
+                              <span class="auto-name">{m.feeds_share_title()}</span>
+                              <span class="auto-state">{shareEnabled ? m.feeds_auto_on() : m.feeds_auto_off()}</span>
+                            </span>
+                            <span class="auto-desc">{m.feeds_share_desc()}</span>
+                          </span>
+                        </div>
+                        <ToggleSwitch
+                          checked={shareEnabled}
+                          ariaLabel={m.feeds_share_title()}
+                          onchange={(on) => toggleShare(on)}
+                        />
+                      </div>
                     </div>
                   {/if}
 
@@ -3937,6 +3987,10 @@
 
   .auto-title:hover {
     background: none;
+  }
+
+  .auto-title.static {
+    cursor: default;
   }
 
   .auto-text {

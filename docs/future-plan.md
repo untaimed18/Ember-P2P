@@ -44,6 +44,10 @@ unless it says otherwise:
 - **Searching all of a friend's files** (`EBR2`): a friend sharing more than
   1,000 files is searched whole, and one on 1.7.8 is listed and filtered as
   before.
+- **Share files from this feed:** with the publisher offline, a follower who
+  shares gives a second follower the file, partial and finished; off again,
+  the file is no longer found from them; and on a machine sharing its whole
+  download folder, the feed's folder is shared through that share alone.
 
 What only the tagged release can show is the AppImage built on Ubuntu 24.04:
 `latest.json` carries `linux-x86_64-appimage-glibc` with a `min_glibc` of
@@ -63,32 +67,19 @@ these.
   static key, from its own address, so storers learn who is in private rooms
   (not which room, nor anything said in it), and feed lookups say who follows
   what. A throwaway key alone hides nothing: the Noise key and the address tie
-  it back. The version worth building sends these through a one-hop relay (a
-  HighID peer or the rendezvous relay) under a throwaway identity and Noise key,
-  so the storer sees the relay's address and a key it has never seen. Settle
-  first: how long a throwaway identity lives, that its STOREs are accepted and
-  its lookups answered as readily, and that it neither trips nor slips past
-  the per-publisher and per-address budgets. The same relay path would reach
-  friends behind a symmetric NAT, which friend meets skip. Detail:
-  `archived-plans/post-1.7.5.md` item 1.
+  it back. The version worth building sends these through a one-hop relay, a
+  reachable Ember peer (not the rendezvous server, whose one address would
+  trip every storer's per-address limits), under a throwaway identity and
+  Noise key, so the storer sees the relay's address and a key it has never
+  seen. Designed in [membership-relay.md](membership-relay.md): leases on a
+  port of the relay's own, the lookups still driven by the member, one
+  throwaway identity per room or feed per lease of up to an hour, at most 4
+  leases a relay and 8 identities a lease to stay inside older storers'
+  limits, and direct sending, counted, where no relay is there. Its numbers
+  want a relay's counters from a test run first. The same lease would reach
+  friends behind a symmetric NAT, which friend meets skip.
 
-## 3. Feeds
-
-- **Followers who help share a feed's files (opt-in per feed).** A feed's
-  files cost its publisher every byte, to every follower, because feed
-  downloads stay private. A per-feed switch, "Share files from this feed", off
-  by default, would share finished files from where they are, like any public
-  file, and unshare them when switched off or on Unfollow. Settle first:
-  whether partials are shared too, whether co-seeders' source records should
-  end the 45-second publisher-first hold early, whether a publisher may ask
-  followers to share (a field in the head, shown, never applied silently), and
-  what upload priority co-seeded files take. The help text has to say that it
-  ties the follower to the feed for anyone looking up an item's hash. Detail:
-  `archived-plans/post-1.7.5.md` item 5. A swarm among a link-only feed's
-  followers alone is the later, bigger step, and waits on Ember downloading
-  from several Ember peers at once (section 5, "Ember-native transfers").
-
-## 4. Friends
+## 3. Friends
 
 - **Check friend meets on real restricted NATs.** 1.7.6 resends the first
   handshake message and carries the Noise key in the meet. Tests replay the
@@ -97,7 +88,7 @@ these.
   Diagnostics; conversions should be close to meets for friends not behind a
   symmetric NAT.
 
-## 5. The Ember network
+## 4. The Ember network
 
 Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
 5 and 7, "Future improvements", and the 2026-08-18 audit notes.
@@ -169,13 +160,16 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   move bytes over eD2K. Ember Transfer moves files between room members over
   the room session, in 1008-byte blocks. Moving it onto QUIC would lift the
   throughput ceiling, and downloading from several Ember peers at once is what
-  a feed's follower swarm (section 3) needs. Reach is the other limit: an
-  arbitrary room member holding a file may not be dialable.
+  a swarm among a link-only feed's followers needs: found under a key derived
+  from the feed, so nobody without its link can find it, and served over
+  Ember's streams rather than eD2K, beyond what 1.8.0's "Share files from this
+  feed" does over the public networks. Reach is the other limit: an arbitrary
+  room member holding a file may not be dialable.
 - **Retire the legacy QUIC listener.** It stays on the TCP port number for
   relays that dial a KAD-only source there. It can go once those sources have
   a relay target of their own.
 
-## 6. Updates and releases
+## 5. Updates and releases
 
 - **A second place to fetch updates from,** for users who cannot reach
   GitHub's download hosts and have no proxy (mainland China). The updater
@@ -216,7 +210,7 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   Pick it up when users ask for one, or if the `.deb` cannot leave 22.04 in
   time.
 
-## 7. Code health
+## 6. Code health
 
 - **Split `NetworkState` per stack.** One struct on one task is the model that
   produced the original starvation bug, and it is still the most pressing
@@ -243,7 +237,7 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   download-side peers never get a challenge, send one when their session
   starts. Detail: `archived-plans/post-1.7.1.md` item 5.
 
-## 8. Translations
+## 7. Translations
 
 - **A native speaker's read of the 1.8.0 Russian and Polish plurals.** The
   source-exchange tooltip and the cancel-and-remove confirmation now carry a
@@ -279,7 +273,7 @@ Taken off the plan, with why, so they are not added back without a new reason.
 - **Web mirrors in feed lists** (`post-1.7.5.md` item 6, step 3). It would let
   a publisher name a server it runs and learn who downloads and when, which it
   cannot learn today without being a source. Followers who opt in to share a
-  feed's files (section 3) relieve the publisher without that.
+  feed's files (from 1.8.0) relieve the publisher without that.
 - **Stronger observed-IP and STUN interplay, and tuning announce against bucket
   refresh** (`ember-dht.md`, "Future improvements"). Neither had a problem or a
   design behind it. Reopen with soak data that shows one.
@@ -311,7 +305,7 @@ Taken off the plan, with why, so they are not added back without a new reason.
   for users who expect eMule's way.
 - **A test of private messages through two network loops, on its own.** It
   needs a `NetworkState` that tests can build, which is the split's work, so
-  it is part of that item (section 7).
+  it is part of that item (section 6).
 - **Already done, found while gathering this plan:** digest corroboration
   across colluding storers (`post-1.7.0.md`; responders are counted per /24 and
   a contested digest is not pinned), and keeping withheld lists in a store of

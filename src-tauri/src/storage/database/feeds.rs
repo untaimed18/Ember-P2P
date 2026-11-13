@@ -191,6 +191,9 @@ pub struct FollowedFeed {
     /// and files stay; no list is fetched for it and nothing more is
     /// auto-downloaded, as nothing newer will come.
     pub deleted: bool,
+    /// "Share files from this feed": its downloads are advertised and served
+    /// as any download is, and its folder is shared. Off by default.
+    pub share_files: bool,
 }
 
 /// An item of a followed feed's list, with what this side knows of it.
@@ -430,6 +433,8 @@ impl Database {
             ("feeds_followed", "total_size", "INTEGER NOT NULL DEFAULT 0"),
             // The newest head taken up was its publisher's tombstone.
             ("feeds_followed", "deleted", "INTEGER NOT NULL DEFAULT 0"),
+            // The follower shares the feed's files; off for every feed before.
+            ("feeds_followed", "share_files", "INTEGER NOT NULL DEFAULT 0"),
             ("feeds_discovered", "total_size", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let present: bool = conn.query_row(
@@ -952,7 +957,7 @@ impl Database {
         let select = "SELECT publisher, salt, title, description, sequence, list_ed2k, list_blake3, list_size,
                     item_count, state, list_sequence, unread, followed_at, checked_at, auto_download,
                     auto_max_item_mib, auto_max_day_mib, held_ed2k, held_blake3, held_size, folder,
-                    auto_since, seen_at, total_size, deleted
+                    auto_since, seen_at, total_size, deleted, share_files
              FROM feeds_followed";
         let map = |row: &rusqlite::Row<'_>| {
             Ok(FollowedFeed {
@@ -981,6 +986,7 @@ impl Database {
                 seen_at: row.get(22)?,
                 total_size: row.get(23)?,
                 deleted: row.get::<_, i64>(24)? != 0,
+                share_files: row.get::<_, i64>(25)? != 0,
             })
         };
         let rows = match key {
@@ -1386,6 +1392,27 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Set whether a followed feed's files are shared. False when it is not
+    /// followed.
+    pub fn feed_set_share_files(&self, publisher: &str, salt: &str, share: bool) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        self.ensure_feeds_locked(&conn)?;
+        Ok(conn.execute(
+            "UPDATE feeds_followed SET share_files = ?3 WHERE publisher = ?1 AND salt = ?2",
+            params![publisher, salt, share],
+        )? > 0)
+    }
+
+    /// The folders of the followed feeds whose files are shared, for those
+    /// given one by a download.
+    pub fn feed_sharing_folders(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        self.ensure_feeds_locked(&conn)?;
+        let mut stmt = conn.prepare("SELECT folder FROM feeds_followed WHERE share_files != 0 AND folder != ''")?;
+        let rows = stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Stop following a feed and forget its items. Files downloaded from it
@@ -1931,6 +1958,29 @@ mod tests {
             "another feed of that name"
         );
         assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().folder, "Mixes");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_feeds_files_are_shared_only_once_its_follower_says_so() {
+        let (db, path) = db("share-files");
+        db.feed_follow(PUB, SALT, 1).unwrap();
+        db.feed_follow(PUB, "no-folder", 1).unwrap();
+        assert!(!db.feed_followed(PUB, SALT).unwrap().unwrap().share_files, "off for a new follow");
+        db.feed_followed_folder(PUB, SALT, "Mixes").unwrap();
+        assert!(db.feed_sharing_folders().unwrap().is_empty());
+
+        assert!(db.feed_set_share_files(PUB, SALT, true).unwrap());
+        assert!(db.feed_set_share_files(PUB, "no-folder", true).unwrap());
+        assert!(db.feed_followed(PUB, SALT).unwrap().unwrap().share_files);
+        assert_eq!(db.feed_sharing_folders().unwrap(), vec!["Mixes".to_string()], "only a feed with a folder");
+
+        assert!(db.feed_set_share_files(PUB, SALT, false).unwrap());
+        assert!(db.feed_sharing_folders().unwrap().is_empty());
+        assert!(!db.feed_set_share_files(PUB, "nope", true).unwrap(), "not followed");
+        db.feed_set_share_files(PUB, SALT, true).unwrap();
+        db.feed_unfollow(PUB, SALT).unwrap();
+        assert!(db.feed_sharing_folders().unwrap().is_empty(), "gone with the follow");
         drop_db(db, path);
     }
 

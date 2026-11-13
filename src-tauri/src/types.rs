@@ -2075,6 +2075,11 @@ pub struct AppSettings {
     /// exactly that one. Empty when none is. Backend-owned.
     #[serde(default)]
     pub ember_releases_folder: String,
+    /// The feed folders Ember put in `shared_folders` for feeds whose files
+    /// are shared (`sharing::feed_shares`), so turning a feed's sharing off
+    /// takes back exactly those and never one the user shared. Backend-owned.
+    #[serde(default)]
+    pub feed_share_folders: Vec<String>,
 
     /// Master switch for desktop notifications. Off means Ember never asks the
     /// OS to show anything, whatever the per-event switches below say.
@@ -3266,6 +3271,7 @@ impl Default for AppSettings {
             share_ember_installer: false,
             seed_ember_releases: false,
             ember_releases_folder: String::new(),
+            feed_share_folders: Vec::new(),
             notifications_enabled: true,
             notifications_only_when_unfocused: true,
             notify_download_complete: true,

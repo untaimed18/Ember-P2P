@@ -228,6 +228,7 @@ pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "set_feed_details",
     "set_feed_items",
     "set_feed_listed",
+    "set_feed_share_files",
     "set_files_friends_only",
     "set_finish_action",
     "set_ip_filter_auto_update",

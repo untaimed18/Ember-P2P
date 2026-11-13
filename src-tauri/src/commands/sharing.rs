@@ -5392,6 +5392,12 @@ pub(crate) async fn add_shared_folder_approved(
                         "The Ember releases folder is shared by release sharing; turn that off in Settings > About",
                     ));
                 }
+                if crate::commands::settings::is_feed_share_folder(&config.settings, existing) {
+                    return Err(coded(
+                        "sharing_feed_folder_managed",
+                        "This feed's folder is shared because sharing is on for the feed; turn it off on the Feeds page",
+                    ));
+                }
                 return Err(coded_ctx(
                     "sharing_folder_overlap",
                     "Shared folders must not overlap",
@@ -6733,6 +6739,26 @@ pub async fn remove_shared_folder(
     state: tauri::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    remove_shared_folder_as(app, state, path, FolderRemoval::User).await
+}
+
+/// Who takes a folder off the shared list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FolderRemoval {
+    /// The user, from the folder list: a folder a setting keeps shared is
+    /// refused, since that setting's next change would share it again.
+    User,
+    /// A feed's sharing being turned off (`sharing::feed_shares`), for a
+    /// folder it added.
+    FeedShare,
+}
+
+pub(crate) async fn remove_shared_folder_as(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+    by: FolderRemoval,
+) -> Result<(), String> {
     if path.len() > MAX_PATH_LEN {
         return Err(coded_ctx(
             "sharing_folder_path_too_long",
@@ -6810,6 +6836,14 @@ pub async fn remove_shared_folder(
             "The Ember releases folder is shared by release sharing; turn that off in Settings > About",
         ));
     }
+    if by == FolderRemoval::User
+        && crate::commands::settings::is_feed_share_folder(&state.config.read().await.settings, &canonical_path)
+    {
+        return Err(coded(
+            "sharing_feed_folder_managed",
+            "This feed's folder is shared because sharing is on for the feed; turn it off on the Feeds page",
+        ));
+    }
     // `add_shared_folder` stores the *canonical* form in
     // `shared_folders` and `upload_shared_folders`; the cancel-flag
     // map is also keyed by canonical paths. Comparing against the
@@ -6842,6 +6876,9 @@ pub async fn remove_shared_folder(
         let mut new_settings = config.settings.clone();
         new_settings
             .shared_folders
+            .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
+        new_settings
+            .feed_share_folders
             .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
         new_settings
             .folder_priorities
@@ -6902,6 +6939,10 @@ pub async fn remove_shared_folder(
         config
             .settings
             .shared_folders
+            .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
+        config
+            .settings
+            .feed_share_folders
             .retain(|f| !paths_equal_ignore_case(f, &canonical_path));
         config
             .settings
