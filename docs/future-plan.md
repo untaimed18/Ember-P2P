@@ -49,15 +49,20 @@ unless it says otherwise:
   the file is no longer found from them; and on a machine sharing its whole
   download folder, the feed's folder is shared through that share alone.
 
-What only the tagged release can show is the AppImage built on Ubuntu 24.04:
-`latest.json` carries `linux-x86_64-appimage-glibc` with a `min_glibc` of
-2.39 and no plain `linux-x86_64-appimage`; a 1.7.8 AppImage on Ubuntu 24.04
-or Fedora takes the update and starts; one on Ubuntu 22.04 says the update
-needs glibc 2.39 and keeps its version; and on Fedora the 1.8.0 AppImage
-draws emoji with the system's font, its debug log saying the host FreeType
-matches the bundled WebKit.
-`linux-test-build.yml` builds the same AppImage on demand for the last of
-these.
+The AppImage built on Ubuntu 24.04 was checked on a local build made with the
+release job's command (Ubuntu 24.04 under WSL): the runner records glibc
+2.39; the most any of its binaries asks for is `GLIBC_2.39`, by `ember`
+itself; FreeType is not bundled; and `add-linux-platforms.mjs`, run on that
+file, writes `linux-x86_64-appimage-glibc` with a `min_glibc` of 2.39 and no
+plain `linux-x86_64-appimage`. On Ubuntu 22.04 it does not start (`GLIBC_2.38`
+not found), which is what the gated entry keeps from 1.7.x installs there. On
+24.04 with a COLRv1 emoji font in place, as Fedora 40 and later have, it
+starts and logs that the host FreeType 2.13.2 matches the bundled WebKit, so
+fonts are left as they are. What only the tagged release can show: a 1.7.8
+AppImage taking the update from the signed `latest.json` on 24.04, and on
+22.04 saying it needs glibc 2.39; and an emoji drawn in the window on Fedora
+itself, which WSL could not run here. `linux-test-build.yml` builds the same
+AppImage on demand for the last.
 
 ## 2. Privacy
 
