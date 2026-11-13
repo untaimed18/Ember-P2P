@@ -28,26 +28,8 @@ owning a room stay on one key. The 1.7 sending paths are gone; reading 15,
 "Two devices owning a room".
 
 The release notes are in `docs/index.html`; check the date against the tag.
-What only a run between two machines can show, each with both on 1.8.0
-unless it says otherwise:
-
-- **The cut-over**, from 1.7.8 and beside 1.7.4. A checklist was written and
-  not run; `git log --all -- docs/release-checklist-1.8.0.md` finds it.
-- **Room mail:** a message to a member who has gone offline shows *Waiting in
-  their mailbox* after its first two minutes, arrives when they come back, and
-  turns delivered; to a member on 1.7.8 it is never left.
-- **Disappearing private messages:** each side deletes at its time, and a
-  member on 1.7.8 keeps its copy.
-- **A friend's slot for a friends-only file** granted over the secure dial
-  (`secure_push_grant_target`): the friend's download adopts it and the file
-  is served. Nothing else exercises that dial for an upload grant.
-- **Searching all of a friend's files** (`EBR2`): a friend sharing more than
-  1,000 files is searched whole, and one on 1.7.8 is listed and filtered as
-  before.
-- **Share files from this feed:** with the publisher offline, a follower who
-  shares gives a second follower the file, partial and finished; off again,
-  the file is no longer found from them; and on a machine sharing its whole
-  download folder, the feed's folder is shared through that share alone.
+The runs between two machines once planned here are not to be made (see
+"Two-machine runs before 1.8.0" under Considered and dropped).
 
 The AppImage built on Ubuntu 24.04 was checked on a local build made with the
 release job's command (Ubuntu 24.04 under WSL): the runner records glibc
@@ -308,6 +290,18 @@ Taken off the plan, with why, so they are not added back without a new reason.
   already unshares a subfolder, files added to it later included; only a
   subfolder made later is shared. The eMule import makes flat shares itself
   for users who expect eMule's way.
+- **Two-machine runs before 1.8.0**: the cut-over from 1.7.8 and beside 1.7.4
+  (its checklist: `git log --all -- docs/release-checklist-1.8.0.md`), room
+  mail to a member gone offline, disappearing private messages, a friend's
+  slot for a friends-only file over the secure dial
+  (`secure_push_grant_target`), searching all of a friend's files (`EBR2`),
+  and sharing a feed's files with the publisher offline. Not to be made: each
+  has automated tests of its formats and paths, end to end where they exist
+  (`a_private_message_goes_end_to_end_between_two_members` takes room mail
+  too), and what only real machines would show is left to reports after the
+  release. The cut-over has the most at stake: as the release notes say, a
+  member on 1.7.4 or earlier cannot read a private room once its owner runs
+  1.8.0.
 - **A test of private messages through two network loops, on its own.** It
   needs a `NetworkState` that tests can build, which is the split's work, so
   it is part of that item (section 6).
