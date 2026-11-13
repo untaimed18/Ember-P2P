@@ -43,7 +43,8 @@ export interface UpdaterState {
   total: number | null;
   /** Human-readable error from the last failed check/download. */
   error: string | null;
-  /** Set when the user dismisses the banner for this epoch/version identity. */
+  /** Set when the user dismisses the banner for this epoch/version identity,
+   *  or for the release {@link systemTooOld} names. */
   dismissed: boolean;
   /** `stalled` only: the staged installer is still present and still matches
    *  its signed hash, so offering to run it again is worth doing. When false
@@ -184,6 +185,32 @@ function recordDismissedUpdate(securityEpoch: number, version: string): void {
       DISMISSED_UPDATE_STORAGE_KEY,
       JSON.stringify({ securityEpoch, version } satisfies DismissedUpdateIdentity),
     );
+  } catch {
+    // The store's `dismissed` flag still hides it until the next check.
+  }
+}
+
+// A release this system cannot run is dismissed until a newer one is out, not
+// until the next start as an offer is: brought back at every launch, it would
+// repeat news the user can act on only by changing package or distribution.
+// Settings → About goes on saying it.
+const DISMISSED_TOO_OLD_STORAGE_KEY = 'ember.updater.dismissedSystemTooOld';
+
+function systemTooOldIdentity(tooOld: SystemTooOld): string {
+  return `${tooOld.package}:${tooOld.version}`;
+}
+
+function isSystemTooOldDismissed(tooOld: SystemTooOld): boolean {
+  try {
+    return localStorage.getItem(DISMISSED_TOO_OLD_STORAGE_KEY) === systemTooOldIdentity(tooOld);
+  } catch {
+    return false;
+  }
+}
+
+function recordSystemTooOldDismissed(tooOld: SystemTooOld): void {
+  try {
+    localStorage.setItem(DISMISSED_TOO_OLD_STORAGE_KEY, systemTooOldIdentity(tooOld));
   } catch {
     // The store's `dismissed` flag still hides it until the next check.
   }
@@ -408,7 +435,12 @@ async function applyCheckResult(
       restoreStaged(staged);
       return false;
     }
-    updater.set({ ...INITIAL, phase: 'idle', systemTooOld: result.systemTooOld });
+    updater.set({
+      ...INITIAL,
+      phase: 'idle',
+      systemTooOld: result.systemTooOld,
+      dismissed: isSystemTooOldDismissed(result.systemTooOld),
+    });
     return false;
   }
   if (result.signatureMissing) {
@@ -697,6 +729,7 @@ export function dismissNotice(): void {
     if (!s.fromHandoff && s.version && s.securityEpoch !== null) {
       recordDismissedUpdate(s.securityEpoch, s.version);
     }
+    if (s.systemTooOld) recordSystemTooOldDismissed(s.systemTooOld);
     return { ...s, dismissed: true };
   });
 }

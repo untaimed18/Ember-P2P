@@ -15,6 +15,7 @@
     retryUpdate,
     runStagedInstaller,
     dismissNotice,
+    systemTooOldMessage,
   } from '$lib/stores/updater';
   import IconX from '$lib/components/IconX.svelte';
   import ReleaseNotes from '$lib/components/ReleaseNotes.svelte';
@@ -29,6 +30,10 @@
   const silentWaiting = $derived(silentUpdateHandlesIt($silentUpdate));
   const silentWaitingLong = $derived(silentWaiting && $silentUpdate?.waitingLong === true);
 
+  // A release this system cannot run: said here as well as in Settings → About,
+  // which a user is otherwise unlikely to open before the next one is out.
+  const tooOld = $derived($updater.phase === 'idle' ? $updater.systemTooOld : null);
+
   // Every phase that renders a dismiss control must honour `dismissed`;
   // `ready` and `error` both show "Later" and an ×, so leaving them
   // unconditionally visible made those buttons inert.
@@ -37,7 +42,8 @@
       (($updater.phase === 'available' && (!silentWaiting || silentWaitingLong)) ||
         $updater.phase === 'ready' ||
         $updater.phase === 'stalled' ||
-        ($updater.phase === 'error' && $updater.version !== null))) ||
+        ($updater.phase === 'error' && $updater.version !== null) ||
+        tooOld !== null)) ||
       $updater.phase === 'downloading' ||
       $updater.phase === 'installing',
   );
@@ -91,6 +97,8 @@
           {m.updater_stalled_title()}
         {:else if $updater.phase === 'error'}
           {m.updater_error_title()}
+        {:else if tooOld}
+          {m.updater_system_too_old_title({ version: tooOld.version })}
         {:else}
           {m.updater_available_title()}
         {/if}
@@ -113,6 +121,8 @@
         {percent !== null ? m.updater_downloading_pct({ pct: percent }) : m.updater_downloading()}
       {:else if $updater.phase === 'error'}
         {m.updater_error_body({ detail: $updater.error ?? '' })}
+      {:else if tooOld}
+        {systemTooOldMessage(tooOld)}
       {:else}
         {m.updater_available_body({ version: $updater.version ?? '' })}
         {#if silentWaitingLong}
@@ -142,6 +152,11 @@
         <button type="button" onclick={() => void openReleaseNotes(version).catch(() => {})}>{m.updater_full_notes()}</button>
         <button type="button" onclick={() => void openEmberLink('guide').catch(() => {})}>{m.updater_user_guide()}</button>
       </div>
+    {:else if tooOld}
+      {@const version = tooOld.version}
+      <div class="notice-links">
+        <button type="button" onclick={() => void openReleaseNotes(version).catch(() => {})}>{m.updater_full_notes()}</button>
+      </div>
     {/if}
 
     {#if !inProgress}
@@ -162,6 +177,11 @@
         {:else if $updater.phase === 'error'}
           <button class="ghost" onclick={dismissNotice}>{m.updater_later()}</button>
           <button class="primary" onclick={() => void retryUpdate()}>{m.updater_retry()}</button>
+        {:else if tooOld}
+          <button class="ghost" onclick={dismissNotice}>{m.common_dismiss()}</button>
+          {#if tooOld.package === 'appimage'}
+            <button class="primary" onclick={() => void openEmberLink('website').catch(() => {})}>{m.updater_system_too_old_get_deb()}</button>
+          {/if}
         {:else}
           <button class="ghost" onclick={dismissNotice}>{m.updater_later()}</button>
           <button class="primary" onclick={() => void installUpdate()}>{m.updater_install()}</button>

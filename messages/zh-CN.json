@@ -3973,6 +3973,8 @@
   "updater_signature_missing": "更新信息未经签名，因此 Ember 无法判断你是否已是最新版本。",
   "updater_system_too_old": "Ember {version} 已发布，但它的 AppImage 需要比当前更新的 Linux（glibc {glibc} 或更高版本）。请从 emberp2p.org 安装 .deb 软件包，或继续使用当前版本。",
   "updater_system_too_old_deb": "Ember {version} 已发布，但它的 .deb 软件包需要比当前更新的 Linux（glibc {glibc} 或更高版本）。在升级 Linux 发行版之前，请继续使用当前版本。",
+  "updater_system_too_old_title": "Ember {version} 需要更新的 Linux",
+  "updater_system_too_old_get_deb": "获取 .deb 软件包",
   "updater_error_title": "更新失败",
   "updater_error_body": "无法完成更新：{detail}",
   "updater_retry": "重试",

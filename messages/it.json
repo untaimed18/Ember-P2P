@@ -3973,6 +3973,8 @@
   "updater_signature_missing": "Le informazioni di aggiornamento non erano firmate, quindi Ember non può sapere se sei aggiornato.",
   "updater_system_too_old": "È disponibile Ember {version}, ma come AppImage richiede un Linux più recente di questo (glibc {glibc} o successiva). Installa il pacchetto .deb da emberp2p.org oppure continua a usare questa versione.",
   "updater_system_too_old_deb": "È disponibile Ember {version}, ma come pacchetto .deb richiede un Linux più recente di questo (glibc {glibc} o successiva). Continua a usare questa versione finché non aggiorni la tua distribuzione Linux.",
+  "updater_system_too_old_title": "Ember {version} richiede un Linux più recente",
+  "updater_system_too_old_get_deb": "Scarica il .deb",
   "updater_error_title": "Aggiornamento non riuscito",
   "updater_error_body": "Impossibile completare l'aggiornamento: {detail}",
   "updater_retry": "Riprova",

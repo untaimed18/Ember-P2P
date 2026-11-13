@@ -121,6 +121,26 @@ describe('applyBackgroundCheckResult', () => {
     expect(get(updater).systemTooOld).toBeNull();
   });
 
+  it('keeps a dismissed release this system cannot run hidden across starts, until a newer one is out', async () => {
+    const tooOld = (version: string, pkg: 'appimage' | 'deb' = 'appimage') => ({
+      ...NOTHING,
+      systemTooOld: { version, glibc: '2.39', package: pkg },
+    });
+    await applyBackgroundCheckResult(tooOld('9.9.9'));
+    expect(get(updater).dismissed).toBe(false);
+    dismissNotice();
+    expect(get(updater).dismissed).toBe(true);
+
+    session.clear();
+    await applyBackgroundCheckResult(tooOld('9.9.9'));
+    expect(get(updater).dismissed).toBe(true);
+
+    await applyBackgroundCheckResult(tooOld('9.9.10'));
+    expect(get(updater).dismissed).toBe(false);
+    await applyBackgroundCheckResult(tooOld('9.9.10', 'deb'));
+    expect(get(updater).dismissed).toBe(false);
+  });
+
   it('points an AppImage at the .deb, and a .deb at nothing older', () => {
     const appImage = systemTooOldMessage({ version: '9.9.9', glibc: '2.39', package: 'appimage' });
     const deb = systemTooOldMessage({ version: '9.9.9', glibc: '2.39', package: 'deb' });
