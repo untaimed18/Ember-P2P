@@ -1847,6 +1847,11 @@ pub struct AppSettings {
     /// Refuse inbound friend-browse listings. Outbound browse is unaffected.
     #[serde(default)]
     pub friend_browse_disabled: bool,
+    /// A friend browsing our files sees the folder each is in: the shared
+    /// folder's name and the folders below it, never the path above. Off by
+    /// default, as how a library is arranged can say more than its files.
+    #[serde(default)]
+    pub friend_browse_shows_folders: bool,
     /// Decline files friends send: chat attachments and file offers. Chat
     /// itself is unaffected, and a friend's own `files` override wins.
     #[serde(default)]
@@ -3235,6 +3240,7 @@ impl Default for AppSettings {
             chat_disappear_secs: 0,
             chat_mailbox_enabled: true,
             friend_browse_disabled: false,
+            friend_browse_shows_folders: false,
             friend_files_disabled: false,
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),

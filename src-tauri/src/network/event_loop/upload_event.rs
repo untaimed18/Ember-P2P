@@ -1185,6 +1185,7 @@ pub(in crate::network) async fn on_upload_event(
         supports_ebr1,
         supports_scope,
         ref filter,
+        supports_details,
     } = event.kind
     {
         // Stamped before the walk, as a friend's contact ask is: a request is
@@ -1222,7 +1223,14 @@ pub(in crate::network) async fn on_upload_event(
                 Vec<u8>,
                 Option<[u8; 20]>,
                 Option<[u8; 32]>,
+                ed2k::multi_source::BrowseDetail,
             )> = Vec::new();
+            let details = supports_ebr1 && supports_details;
+            let folder_roots = if details && settings.friend_browse_shows_folders {
+                settings.configured_roots()
+            } else {
+                Vec::new()
+            };
             let mut restricted_entries: Vec<[u8; 16]> = Vec::new();
             // Fail closed until known.met is absorbed: a friends-only row
             // can still read public in the index during that window, and
@@ -1245,7 +1253,7 @@ pub(in crate::network) async fn on_upload_event(
             let mut seen_hashes: std::collections::HashSet<[u8; 16]> =
                 std::collections::HashSet::new();
             let mut total_unique: u32 = 0;
-            let mut approx_bytes = 8usize;
+            let mut approx_bytes = 8usize + if details { ed2k::multi_source::BROWSE_DETAILS_MAGIC.len() } else { 0 };
             let mut answer_full = false;
             for f in visible {
                 let Ok(hash_bytes) = hex::decode(&f.hash) else {
@@ -1296,6 +1304,17 @@ pub(in crate::network) async fn on_upload_event(
                 {
                     restricted_entries.push(hash);
                 }
+                let detail = if details {
+                    let media = known_files.find_by_hash(&hash).and_then(|record| record.media.as_ref());
+                    ed2k::multi_source::BrowseDetail {
+                        folder: crate::network::browse::browse_folder_of(&f.path, &folder_roots),
+                        duration: media.and_then(|m| m.duration),
+                        bitrate: media.and_then(|m| m.bitrate),
+                        codec: media.and_then(|m| m.codec.clone()),
+                    }
+                } else {
+                    Default::default()
+                };
                 // Rough pre-cap so encode stays under the frame budget.
                 approx_bytes += 16
                     + 8
@@ -1303,8 +1322,15 @@ pub(in crate::network) async fn on_upload_event(
                     + name_bytes.len()
                     + 1
                     + if aich.is_some() { 20 } else { 0 }
-                    + 32;
-                encoded_entries.push((hash, f.size, name_bytes, aich, ember));
+                    + 32
+                    + if details {
+                        2 + detail.folder.len().min(ed2k::multi_source::MAX_BROWSE_FOLDER_BYTES)
+                            + 9
+                            + detail.codec.as_ref().map_or(0, String::len)
+                    } else {
+                        0
+                    };
+                encoded_entries.push((hash, f.size, name_bytes, aich, ember, detail));
                 if approx_bytes >= MAX_BROWSE_ANSWER_BYTES {
                     answer_full = true;
                 }
@@ -1354,16 +1380,22 @@ pub(in crate::network) async fn on_upload_event(
                 }
             }
             let res_payload = if supports_ebr1 {
-                ed2k::multi_source::encode_browse_response_v1(
-                    encoded_entries.iter().map(|(h, s, n, a, e)| {
+                let mut payload = ed2k::multi_source::encode_browse_response_v1(
+                    encoded_entries.iter().map(|(h, s, n, a, e, _)| {
                         (h, *s, n.as_slice(), a.as_ref(), e.as_ref())
                     }),
-                )
+                );
+                if details {
+                    payload.extend(ed2k::multi_source::encode_browse_details(
+                        encoded_entries.iter().map(|(.., detail)| detail),
+                    ));
+                }
+                payload
             } else {
                 ed2k::multi_source::encode_browse_response_legacy(
                     encoded_entries
                         .iter()
-                        .map(|(h, s, n, _, _)| (h, *s, n.as_slice())),
+                        .map(|(h, s, n, ..)| (h, *s, n.as_slice())),
                 )
             };
             let mut packet = Vec::with_capacity(6 + res_payload.len());
@@ -1533,6 +1565,7 @@ pub(in crate::network) async fn on_upload_event(
         ember_hash: browse_eh,
         session_id,
         ref entries,
+        ref details,
     } = event.kind
     {
         if !friend_hashes.read().await.contains(&browse_eh) {
@@ -1557,13 +1590,32 @@ pub(in crate::network) async fn on_upload_event(
             .collect();
         let files: Vec<serde_json::Value> = entries
             .iter()
-            .map(|(hash, size, name, aich, ember)| {
+            .enumerate()
+            .map(|(i, (hash, size, name, aich, ember))| {
                 let clean_name = crate::security::sanitize_display_name(name);
                 let mut obj = serde_json::json!({
                     "hash": hash,
                     "size": size,
                     "name": clean_name,
                 });
+                if let Some(detail) = details.get(i) {
+                    let fields = obj.as_object_mut().unwrap();
+                    let folder = crate::network::browse::clean_browse_folder(&detail.folder);
+                    if !folder.is_empty() {
+                        fields.insert("folder".into(), folder.into());
+                    }
+                    if let Some(duration) = detail.duration {
+                        fields.insert("duration".into(), duration.into());
+                    }
+                    if let Some(bitrate) = detail.bitrate {
+                        fields.insert("bitrate".into(), bitrate.into());
+                    }
+                    if let Some(codec) = detail.codec.as_deref().map(|codec| crate::security::sanitize_remote_text(codec, 32)) {
+                        if !codec.is_empty() {
+                            fields.insert("codec".into(), codec.into());
+                        }
+                    }
+                }
                 if parse_ed2k_hash16(hash).is_some_and(|h| restricted.contains(&h)) {
                     obj.as_object_mut()
                         .unwrap()

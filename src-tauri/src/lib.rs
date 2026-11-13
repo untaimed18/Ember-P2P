@@ -1741,8 +1741,9 @@ pub fn run() {
                     let hydration_allowlists = {
                         let state = startup_app.state::<AppState>();
                         let cfg = state.config.read().await;
-                        crate::sharing::indexer::AllowlistOffers::new(
+                        crate::sharing::indexer::AllowlistOffers::with_withheld(
                             &cfg.settings.pending_folder_allowlists,
+                            &cfg.settings.withheld_folder_files,
                         )
                     };
                     let hydrated_records = tokio::task::spawn_blocking(move || {
@@ -1906,6 +1907,7 @@ pub fn run() {
                     pending_file_priorities,
                     pending_friends_only,
                     pending_folder_allowlists,
+                    withheld_folder_files,
                 ) = {
                     let state = startup_app.state::<AppState>();
                     let cfg = state.config.read().await;
@@ -1915,16 +1917,19 @@ pub fn run() {
                         cfg.settings.pending_file_priorities.clone(),
                         cfg.settings.pending_friends_only.clone(),
                         cfg.settings.pending_folder_allowlists.clone(),
+                        cfg.settings.withheld_folder_files.clone(),
                     )
                 };
                 commands::sharing::apply_folder_allowlists(
                     &mut all_discovered,
                     &mut files_to_hash,
                     &pending_folder_allowlists,
+                    &withheld_folder_files,
                 );
                 commands::sharing::withhold_unlisted_known_files(
                     &mut all_discovered,
                     &pending_folder_allowlists,
+                    &withheld_folder_files,
                 );
                 commands::sharing::apply_pending_intents(
                     &mut all_discovered,

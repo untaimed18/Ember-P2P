@@ -532,6 +532,57 @@ pub(crate) fn browse_serve_allowed(friend: &[u8; 16]) -> bool {
     take_browse_slot(&SERVED, friend, BROWSE_SERVE_WINDOW)
 }
 
+/// The folder a friend's browse shows the file at `path` in: the name of the
+/// deepest of `roots` holding it, then the folders between, `/`-separated.
+/// Nothing above the shared folder, which would name the drive and the user.
+/// Empty for a file in none of them.
+pub(crate) fn browse_folder_of(path: &str, roots: &[String]) -> String {
+    use crate::commands::share_browser::display_fs_path;
+    use crate::search::index::normalize_path_key;
+    let file = display_fs_path(std::path::Path::new(path));
+    let Some(root) = roots
+        .iter()
+        .map(|root| display_fs_path(std::path::Path::new(root)))
+        .filter(|root| crate::security::path_within_dir(&file, root))
+        .max_by_key(String::len)
+    else {
+        return String::new();
+    };
+    let root_path = std::path::Path::new(&root);
+    let name = root_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.trim_end_matches(['\\', '/']).to_string());
+    let mut below = match std::path::Path::new(&file).parent() {
+        Some(parent) => parent.components(),
+        None => return name,
+    };
+    let same = |a: std::path::Component, b: std::path::Component| {
+        normalize_path_key(&a.as_os_str().to_string_lossy()) == normalize_path_key(&b.as_os_str().to_string_lossy())
+    };
+    for part in root_path.components() {
+        if !below.next().is_some_and(|ours| same(ours, part)) {
+            return name;
+        }
+    }
+    std::iter::once(name)
+        .chain(below.map(|part| part.as_os_str().to_string_lossy().into_owned()))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A folder a friend's browse answer named, made safe to show: each part
+/// stripped of what reorders or hides text, and parts that are empty, `.` or
+/// `..` dropped.
+pub(crate) fn clean_browse_folder(folder: &str) -> String {
+    folder
+        .split('/')
+        .map(|part| crate::security::sanitize_remote_text(part, 128))
+        .filter(|part| !part.is_empty() && part != "." && part != "..")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Whether another browse request may go to `friend` now, taking it if so.
 fn browse_ask_allowed(friend: &[u8; 16]) -> bool {
     static ASKED: std::sync::OnceLock<std::sync::Mutex<BrowseTimes>> = std::sync::OnceLock::new();
@@ -669,6 +720,20 @@ mod scope_tests {
     fn dispatched_head(pending: &mut PendingBrowseRequests, friend: [u8; 16], session_id: u64) {
         enqueue_browse_request(pending, friend, "req".into(), session_id).unwrap();
         pending.get_mut(&friend).unwrap().front_mut().unwrap().dispatched = true;
+    }
+
+    #[test]
+    fn a_browse_folder_starts_at_the_shared_folder_and_is_cleaned_when_read() {
+        let sep = |path: &str| path.replace('/', std::path::MAIN_SEPARATOR_STR);
+        let roots = vec![sep("/home/ann/Music"), sep("/home/ann/Music/Live"), sep("/data/Films")];
+        assert_eq!(browse_folder_of(&sep("/home/ann/Music/Rock/Album/a.mp3"), &roots), "Music/Rock/Album");
+        assert_eq!(browse_folder_of(&sep("/home/ann/Music/Live/2019/b.mp3"), &roots), "Live/2019", "the deepest share");
+        assert_eq!(browse_folder_of(&sep("/data/Films/c.mkv"), &roots), "Films");
+        assert_eq!(browse_folder_of(&sep("/elsewhere/d.mkv"), &roots), "");
+        assert_eq!(browse_folder_of(&sep("/home/ann/Music/a.mp3"), &[]), "", "folders not shown");
+
+        assert_eq!(clean_browse_folder("Music/../Rock/./\u{202E}gpj.exe/"), "Music/Rock/gpj.exe");
+        assert_eq!(clean_browse_folder(""), "");
     }
 
     #[test]

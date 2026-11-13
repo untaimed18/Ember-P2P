@@ -70,9 +70,14 @@ unless it says otherwise:
   hundreds of boxes a round; a member could instead name, in its presence,
   that it takes first messages by mail, which needs a field the frozen
   presence record does not have.
-- **A test of private messages through two network loops,** for the routing
-  and pacing. The wire and storage path between two members, room mail
-  included, is covered by `a_private_message_goes_end_to_end_between_two_members`.
+- **A test of private messages through two network loops,** for the routing.
+  The wire and storage path between two members, room mail included, is
+  covered by `a_private_message_goes_end_to_end_between_two_members`, and the
+  pacing by `dm_pacing_invariants_hold`. Routing needs two `NetworkState`s a
+  test can build, and today only `start_network` builds one, from live
+  sockets and managers; and an `AppHandle` for the receiver's events, which
+  Tauri's `test` feature provides. Building the state for tests is most of
+  the work of the `NetworkState` split in section 9.
 - **Room transfers: check block-protocol data as it arrives.** The direct
   stream verifies every 256 KiB chunk before writing it; the block protocol
   (the fallback) hashes only the finished file, so an accepted sender can waste
@@ -106,12 +111,6 @@ unless it says otherwise:
 
 ## 5. Friends
 
-- **A folder view and media details in a friend's browse.** 1.8.0 filters a
-  browse on the wire (`EBR2`, sent to a friend that announced
-  `EMBER_FEATURE_FILTERED_BROWSE`); its answer is the v1 one. Folder paths
-  relative to the shared folder (opt-in, since they are a privacy decision)
-  and media details (duration, bitrate) would go in a field the answer gains,
-  announced by a feature bit of their own.
 - **Check friend meets on real restricted NATs.** 1.7.6 resends the first
   handshake message and carries the Noise key in the meet. Tests replay the
   failure, but no meet has run between two real restricted NATs. Compare
@@ -121,11 +120,10 @@ unless it says otherwise:
 
 ## 6. Downloads, uploads and sharing
 
-- **A folder shared from eMule keeps up with new files.** An eMule import
-  that shares a folder without its subfolders takes an allowlist of the files
-  in it then; a file added later waits to be shared, where eMule would share
-  it. Matching eMule needs a share that is flat rather than listed, a setting
-  of its own the indexer walks one level deep.
+- **Share any folder without its subfolders, not only from the eMule
+  import.** 1.8.0 has the share itself (a flat entry in the folder's
+  allowlist, `flat_entry` in `sharing/indexer.rs`), but only the import makes
+  one. The folder picker would need the choice, and the Library a mark for it.
 
 ## 7. The Ember network
 
@@ -234,11 +232,12 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   an explicit message boundary. It is a redesign rather than code motion, so it
   needs integration testing against live peers. `command.rs` is separable and
   `NetworkDeps` gives the entry point a real signature.
-- **Property tests, and overnight runs of Ember itself.** The fuzz loops run
-  200 times longer each night from a new seed (`soak.yml`, `src/fuzz.rs`);
-  what they do not cover is invariants across a sequence of operations (the
-  routing table, the publish queue) and a build left running against the
-  live network.
+- **Overnight runs of Ember itself, and property tests for more of it.** The
+  fuzz loops and the `*_invariants_hold` property tests (the Ember routing
+  table, the batch publisher, private-message pacing) run 200 times longer
+  each night from a new seed (`soak.yml`, `src/fuzz.rs`). Still missing: a
+  build left running against the live network, and the same kind of test for
+  the record store and the KAD routing table.
 - **Find out why most known peers show verification as Needed.** SecureIdent is
   per session, which explains part of it. Run 30 to 60 minutes with
   `RUST_LOG=info,ember_lib::network::ed2k::transfer=debug` and compare each

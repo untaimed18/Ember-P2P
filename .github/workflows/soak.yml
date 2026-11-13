@@ -1,9 +1,10 @@
 name: Soak
 
-# The `*_fuzz_never_panics` loops, run many times longer than every push runs
-# them and from a new seed each night (see `src-tauri/src/fuzz.rs`). A loop
-# prints the seed it used, so a failure found here can be run again locally
-# with the same `EMBER_FUZZ_SEED` and `EMBER_FUZZ_SCALE`.
+# The `*_fuzz_never_panics` loops and the `*_invariants_hold` property tests,
+# run many times longer than every push runs them and from a new seed each
+# night (see `src-tauri/src/fuzz.rs`). A loop prints the seed it used, so a
+# failure found here can be run again locally with the same `EMBER_FUZZ_SEED`
+# and `EMBER_FUZZ_SCALE`.
 #
 # Action pins and toolchain mirror ci.yml.
 
@@ -64,3 +65,9 @@ jobs:
           EMBER_FUZZ_SCALE: ${{ github.event.inputs.scale || '200' }}
           EMBER_FUZZ_SEED: ${{ github.run_id }}
         run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib fuzz_never_panics -- --nocapture
+
+      - name: Run the property tests
+        env:
+          EMBER_FUZZ_SCALE: ${{ github.event.inputs.scale || '200' }}
+          EMBER_FUZZ_SEED: ${{ github.run_id }}
+        run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml --lib invariants_hold -- --nocapture

@@ -1200,7 +1200,7 @@ fn relocate_folder_list_entries(
             continue;
         }
         let offered = match innermost(from) {
-            Some(folder) => allowlist_permits(&offered_now[&folder], &from_key),
+            Some(folder) => allowlist_offers_file(&offered_now[&folder], withheld_now.get(&folder), &from_key),
             None => *shared,
         };
         for entries in offered_now.values_mut().chain(withheld_now.values_mut()) {
@@ -1210,7 +1210,13 @@ fn relocate_folder_list_entries(
         let Some(folder) = innermost(to) else {
             continue;
         };
-        if allowlist_permits(&offered_now[&folder], &to_key) {
+        // Covered already, the way it was: a listed folder covers it either
+        // way, as before; a flat entry only when it was offered, since one
+        // unshared there is kept off by being withheld.
+        let allowed = &offered_now[&folder];
+        if allowlist_permits(allowed, &to_key)
+            || (offered && allowlist_offers_file(allowed, withheld_now.get(&folder), &to_key))
+        {
             continue;
         }
         let now = if offered { &mut offered_now } else { &mut withheld_now };
@@ -4225,6 +4231,7 @@ pub(crate) fn apply_folder_allowlists(
     discovered: &mut [FileInfo],
     files_to_hash: &mut [FileInfo],
     allowlists: &std::collections::HashMap<String, Vec<String>>,
+    withheld: &std::collections::HashMap<String, Vec<String>>,
 ) {
     if allowlists.is_empty() || files_to_hash.is_empty() {
         return;
@@ -4233,12 +4240,16 @@ pub(crate) fn apply_folder_allowlists(
         .iter()
         .map(|(folder, files)| (folder.clone(), files.iter().cloned().collect::<HashSet<_>>()))
         .collect();
+    let withheld: HashMap<&String, HashSet<String>> = withheld
+        .iter()
+        .map(|(folder, files)| (folder, files.iter().cloned().collect()))
+        .collect();
     let pending_paths = files_to_hash
         .iter()
         .map(|file| crate::search::index::normalize_path_key(&file.path))
         .collect::<HashSet<_>>();
     let apply = |file: &mut FileInfo| {
-        let Some((_, allowed)) = lists
+        let Some((folder, allowed)) = lists
             .iter()
             .filter(|(folder, _)| crate::security::path_within_dir(&file.path, folder))
             .max_by_key(|(folder, _)| folder.len())
@@ -4248,7 +4259,7 @@ pub(crate) fn apply_folder_allowlists(
         let key = crate::search::index::normalize_path_key(&file.path);
         // Narrows, never widens: a file arrives shared unless its path
         // carried an unshare over from known.met (see `carry_scope_at_path`).
-        file.shared = file.shared && allowlist_permits(allowed, &key);
+        file.shared = file.shared && allowlist_offers_file(allowed, withheld.get(folder), &key);
     };
     for file in discovered
         .iter_mut()
@@ -4268,11 +4279,12 @@ pub(crate) fn apply_folder_allowlists(
 pub(crate) fn withhold_unlisted_known_files(
     discovered: &mut [FileInfo],
     allowlists: &std::collections::HashMap<String, Vec<String>>,
+    withheld: &std::collections::HashMap<String, Vec<String>>,
 ) {
     if allowlists.is_empty() {
         return;
     }
-    let offers = crate::sharing::indexer::AllowlistOffers::new(allowlists);
+    let offers = crate::sharing::indexer::AllowlistOffers::with_withheld(allowlists, withheld);
     for file in discovered
         .iter_mut()
         .filter(|file| file.shared && !file.hash.is_empty())
@@ -4326,7 +4338,7 @@ pub(crate) fn path_key_covers(entry: &str, key: &str) -> bool {
         })
 }
 
-use crate::sharing::indexer::allowlist_permits;
+use crate::sharing::indexer::{allowlist_offers_file, allowlist_permits, allowlist_permits_file};
 
 /// A folder freshly added under an allowlist offers exactly that list, whatever
 /// known.met remembers of its files from an earlier share of the same folder.
@@ -4351,7 +4363,7 @@ fn withhold_known_files_outside_allowlist(
     {
         let key = crate::search::index::normalize_path_key(&file.path);
         if crate::security::path_within_dir(&file.path, folder)
-            && !allowlist_permits(&allowed, &key)
+            && !allowlist_permits_file(&allowed, &key)
         {
             file.shared = false;
             withheld.push(file.hash.to_ascii_lowercase());
@@ -4397,7 +4409,7 @@ fn known_hashes_outside_allowlist(
         .filter(|record| {
             record.is_shared
                 && crate::security::path_within_dir(&record.file_path, folder)
-                && !allowlist_permits(
+                && !allowlist_permits_file(
                     &allowed,
                     &crate::search::index::normalize_path_key(&record.file_path),
                 )
@@ -4767,9 +4779,7 @@ async fn apply_shares_made_while_hashing(state: &AppState) {
     if withheld.is_empty() {
         return;
     }
-    let offers = crate::sharing::indexer::AllowlistOffers::new(
-        &state.config.read().await.settings.pending_folder_allowlists,
-    );
+    let offers = folder_offers(state).await;
     let mutation = {
         let mut index = state.local_index.write().await;
         let mut mutation = index.set_shared_by_paths(&withheld, true);
@@ -5666,6 +5676,7 @@ pub(crate) async fn add_shared_folder_approved(
             pending_file_priorities,
             pending_friends_only,
             pending_folder_allowlists,
+            withheld_folder_files,
         ) = {
             let cfg = config.read().await;
             (
@@ -5674,6 +5685,7 @@ pub(crate) async fn add_shared_folder_approved(
                 cfg.settings.pending_file_priorities.clone(),
                 cfg.settings.pending_friends_only.clone(),
                 cfg.settings.pending_folder_allowlists.clone(),
+                cfg.settings.withheld_folder_files.clone(),
             )
         };
         apply_folder_defaults_to_new_files(&mut discovered, &mut files_to_hash, &folder_priorities);
@@ -5681,8 +5693,9 @@ pub(crate) async fn add_shared_folder_approved(
             &mut discovered,
             &mut files_to_hash,
             &pending_folder_allowlists,
+            &withheld_folder_files,
         );
-        withhold_unlisted_known_files(&mut discovered, &pending_folder_allowlists);
+        withhold_unlisted_known_files(&mut discovered, &pending_folder_allowlists, &withheld_folder_files);
         let withheld = if limited {
             let mut withheld = withhold_known_files_outside_allowlist(
                 &mut discovered,
@@ -7831,9 +7844,7 @@ pub async fn batch_share(
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
     check_path_batch(&file_paths, MAX_BATCH_IDS)?;
-    let offers = crate::sharing::indexer::AllowlistOffers::new(
-        &state.config.read().await.settings.pending_folder_allowlists,
-    );
+    let offers = folder_offers(&state).await;
     let mutation = {
         let mut index = state.local_index.write().await;
         let mut mutation = index.set_shared_by_paths(&file_paths, true);
@@ -8001,9 +8012,7 @@ pub(crate) async fn offer_all_in_folder(
     folder: &str,
 ) -> Result<Vec<String>, String> {
     queue_rescan(&app, vec![std::path::PathBuf::from(folder)]);
-    let offers = crate::sharing::indexer::AllowlistOffers::new(
-        &state.config.read().await.settings.pending_folder_allowlists,
-    );
+    let offers = folder_offers(state).await;
     let mutation = {
         let mut index = state.local_index.write().await;
         let mut mutation = index.set_shared_by_path_prefix(folder, true);
@@ -8025,6 +8034,15 @@ pub(crate) async fn offer_all_in_folder(
         );
     }
     Ok(paths)
+}
+
+/// What the partly shared folders offer now, their withheld files counted.
+async fn folder_offers(state: &AppState) -> crate::sharing::indexer::AllowlistOffers {
+    let config = state.config.read().await;
+    crate::sharing::indexer::AllowlistOffers::with_withheld(
+        &config.settings.pending_folder_allowlists,
+        &config.settings.withheld_folder_files,
+    )
 }
 
 /// The folder allowlists and withheld files as they stood before an edit that
@@ -8084,8 +8102,12 @@ pub(crate) async fn admit_known_files(
                     .map(|(path, _)| path.clone()),
             )
             .collect::<HashSet<_>>();
-        (settings.pending_folder_allowlists.clone(), kept)
+        (
+            (settings.pending_folder_allowlists.clone(), settings.withheld_folder_files.clone()),
+            kept,
+        )
     };
+    let (after, after_withheld) = after;
     if after == before.allowlists {
         return;
     }
@@ -8097,15 +8119,10 @@ pub(crate) async fn admit_known_files(
         }
     };
     let under = under.to_vec();
-    let before_lists = before.allowlists.clone();
+    let before_offers = crate::sharing::indexer::AllowlistOffers::with_withheld(&before.allowlists, &before.withheld);
+    let after_offers = crate::sharing::indexer::AllowlistOffers::with_withheld(&after, &after_withheld);
     let candidates = tokio::task::spawn_blocking(move || {
-        newly_admitted_unshared(
-            known.all_records(),
-            &under,
-            &crate::sharing::indexer::AllowlistOffers::new(&before_lists),
-            &crate::sharing::indexer::AllowlistOffers::new(&after),
-            &kept_unshared,
-        )
+        newly_admitted_unshared(known.all_records(), &under, &before_offers, &after_offers, &kept_unshared)
     })
     .await
     .unwrap_or_default();
@@ -8314,6 +8331,8 @@ fn readmit_keys(
         let allowed = permitted
             .entry(folder.clone())
             .or_insert_with(|| list.iter().cloned().collect());
+        // Not the flat-aware test: a file withheld under a flat entry is not
+        // offered by it, and is listed by name to be offered again.
         if allowlist_permits(allowed, key) {
             continue;
         }
@@ -9076,6 +9095,7 @@ async fn reload_shared_files_page(
             pending_file_priorities,
             pending_friends_only,
             pending_folder_allowlists,
+            withheld_folder_files,
         ) = {
             let cfg = config.read().await;
             (
@@ -9084,6 +9104,7 @@ async fn reload_shared_files_page(
                 cfg.settings.pending_file_priorities.clone(),
                 cfg.settings.pending_friends_only.clone(),
                 cfg.settings.pending_folder_allowlists.clone(),
+                cfg.settings.withheld_folder_files.clone(),
             )
         };
         apply_folder_defaults_to_new_files(&mut discovered, &mut files_to_hash, &folder_priorities);
@@ -9091,8 +9112,9 @@ async fn reload_shared_files_page(
             &mut discovered,
             &mut files_to_hash,
             &pending_folder_allowlists,
+            &withheld_folder_files,
         );
-        withhold_unlisted_known_files(&mut discovered, &pending_folder_allowlists);
+        withhold_unlisted_known_files(&mut discovered, &pending_folder_allowlists, &withheld_folder_files);
         apply_pending_intents(
             &mut discovered,
             &mut files_to_hash,
@@ -9862,7 +9884,7 @@ fn withhold_under(
         changed |= !dropped.is_empty();
         add_withheld(withheld, listed, dropped);
     }
-    if crate::sharing::indexer::AllowlistOffers::new(allowlists).offers(folder) {
+    if crate::sharing::indexer::AllowlistOffers::new(allowlists).offers_folder(folder) {
         let key = crate::search::index::normalize_path_key(folder);
         allowlists.insert(key.clone(), Vec::new());
         add_withheld(withheld, &key, vec![key.clone()]);
@@ -10630,6 +10652,27 @@ mod tests {
         assert_eq!(withheld[&key(&to_share)], vec![key(&g2)], "unshared where it came from, unshared here");
     }
 
+    /// A file renamed in a flat share stays covered by its folder's flat
+    /// entry, and one moved down into a subfolder is listed there by name,
+    /// as it was offered: the flat entry never takes the subfolder in whole.
+    #[test]
+    fn a_flat_entry_covers_renames_and_never_a_subfolder() {
+        let share = sep("/share");
+        let flat = crate::sharing::indexer::flat_entry(&share);
+        let (a, a2) = (sep("/share/a.zip"), sep("/share/[Ember-P2P] a.zip"));
+        let (b, b2) = (sep("/share/b.zip"), sep("/share/sub/b.zip"));
+        let mut allowlists = folder_lists(&[(&share, &[])]);
+        allowlists.get_mut(&key(&share)).unwrap().push(flat.clone());
+        let mut withheld = Default::default();
+        let moves = vec![(a, a2.clone(), true), (b, b2.clone(), true)];
+        assert!(relocate_folder_list_entries(&mut allowlists, &mut withheld, &moves));
+        assert_eq!(allowlists[&key(&share)], vec![flat, key(&b2)]);
+        let offers = crate::sharing::indexer::AllowlistOffers::new(&allowlists);
+        assert!(offers.offers(&a2) && offers.offers(&b2));
+        assert!(!offers.offers(&sep("/share/sub/other.zip")));
+        assert!(!offers.offers_folder(&sep("/share/sub")));
+    }
+
     #[test]
     fn a_case_only_rename_on_windows_changes_no_list() {
         let share = sep("/share");
@@ -11100,7 +11143,7 @@ mod tests {
                 crate::search::index::normalize_path_key("C:/L/new.bin"),
             ],
         )]);
-        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &lists);
+        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &lists, &Default::default());
         let after = |path: &str| files_to_hash.iter().find(|f| f.path == path).unwrap().shared;
         assert!(!after("C:/L/private.bin"));
         assert!(after("C:/L/new.bin"));
@@ -11821,7 +11864,7 @@ mod tests {
             crate::search::index::normalize_path_key("C:/share"),
             vec![crate::search::index::normalize_path_key(keep)],
         )]);
-        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &allowlists);
+        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &allowlists, &Default::default());
         assert!(discovered[0].shared);
         assert!(!discovered[1].shared);
         assert!(
@@ -11856,7 +11899,7 @@ mod tests {
             crate::search::index::normalize_path_key("C:/share"),
             vec![crate::search::index::normalize_path_key("C:/share/album")],
         )]);
-        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &allowlists);
+        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &allowlists, &Default::default());
         assert!(discovered[0].shared);
         assert!(
             !discovered[1].shared,
@@ -11918,9 +11961,44 @@ mod tests {
 
         withheld.shared = true;
         let mut rediscovered = vec![withheld, indexed_file("C:/music/listed.mp3", &hash)];
-        withhold_unlisted_known_files(&mut rediscovered, &allowlists);
+        withhold_unlisted_known_files(&mut rediscovered, &allowlists, &Default::default());
         assert!(!rediscovered[0].shared);
         assert!(rediscovered[1].shared);
+    }
+
+    /// The same in a flat share, whose entry names no file: one unshared there
+    /// is withheld, and stays off when known.met's per-hash flag says shared,
+    /// when it is renamed, and until it is shared again, when it is listed by
+    /// name and no longer withheld.
+    #[test]
+    fn a_file_unshared_from_a_flat_share_stays_off_until_shared_again() {
+        let hash = "cd".repeat(16);
+        let key = crate::search::index::normalize_path_key;
+        let folder = sep("C:/music");
+        let (off, kept, renamed) = (sep("C:/music/off.mp3"), sep("C:/music/kept.mp3"), sep("C:/music/renamed.mp3"));
+        let mut allowlists = std::collections::HashMap::from([(key(&folder), vec![crate::sharing::indexer::flat_entry(&folder)])]);
+        let mut withheld = std::collections::HashMap::new();
+        assert!(withhold_keys(&mut allowlists, &mut withheld, &HashSet::from([key(&off)])));
+        assert_eq!(withheld[&key(&folder)], vec![key(&off)]);
+        let offers = |lists: &std::collections::HashMap<String, Vec<String>>, held: &std::collections::HashMap<String, Vec<String>>| {
+            crate::sharing::indexer::AllowlistOffers::with_withheld(lists, held)
+        };
+        assert!(!offers(&allowlists, &withheld).offers(&off));
+        assert!(offers(&allowlists, &withheld).offers(&kept));
+
+        let mut rediscovered = vec![indexed_file(&off, &hash), indexed_file(&kept, &hash)];
+        withhold_unlisted_known_files(&mut rediscovered, &allowlists, &withheld);
+        assert!(!rediscovered[0].shared, "the per-hash flag does not bring it back");
+        assert!(rediscovered[1].shared);
+
+        assert!(relocate_folder_list_entries(&mut allowlists, &mut withheld, &[(off.clone(), renamed.clone(), false)]));
+        assert_eq!(withheld[&key(&folder)], vec![key(&renamed)]);
+        assert!(!offers(&allowlists, &withheld).offers(&renamed), "renamed, still unshared");
+
+        assert_eq!(readmit_keys(&mut allowlists, &withheld, &[key(&renamed)]), vec![key(&renamed)]);
+        assert!(offers(&allowlists, &withheld).offers(&renamed));
+        assert!(tidy_withheld(&allowlists, &mut withheld));
+        assert!(withheld.is_empty(), "listed by name, so no longer withheld");
     }
 
     /// known.met keeps one flag per content hash: a limited add must not
@@ -12308,7 +12386,7 @@ mod tests {
 
         let mut discovered = vec![indexed_file(keep, ""), indexed_file(skip, "")];
         let mut files_to_hash = discovered.clone();
-        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &lists);
+        apply_folder_allowlists(&mut discovered, &mut files_to_hash, &lists, &Default::default());
         assert!(discovered[0].shared);
         assert!(
             !discovered[1].shared,

@@ -136,9 +136,27 @@ fn folder_gone_from_recorded_volume(
         .unwrap_or(false)
 }
 
+/// What a flat entry's last component is: a NUL, which no file or folder on
+/// any system can be named, so the entry is never a path that exists.
+const FLAT_ENTRY_NAME: char = '\0';
+
+/// The allowlist entry that offers the files directly in `folder` and nothing
+/// in its subfolders, including files added later: a flat share, as eMule
+/// shares a folder. It sits under its folder like any entry, so moving,
+/// clearing and tidying a list carry it unchanged.
+pub(crate) fn flat_entry(folder: &str) -> String {
+    let key = normalize_path_key(folder);
+    if key.ends_with(std::path::MAIN_SEPARATOR) {
+        format!("{key}{FLAT_ENTRY_NAME}")
+    } else {
+        format!("{key}{}{FLAT_ENTRY_NAME}", std::path::MAIN_SEPARATOR)
+    }
+}
+
 /// Whether an allowlist of `normalize_path_key` forms offers the file or
 /// folder at `key`: it is listed, or sits inside a listed folder. `..=at` as
-/// well, for a drive root, whose key keeps its separator.
+/// well, for a drive root, whose key keeps its separator. A flat entry offers
+/// no folder; [`allowlist_permits_file`] is what reads it.
 pub(crate) fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
     allowed.contains(key)
         || key.rmatch_indices(std::path::MAIN_SEPARATOR).any(|(at, _)| {
@@ -146,34 +164,92 @@ pub(crate) fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
         })
 }
 
+/// [`allowlist_permits`] for a file, which a flat entry for the folder it is
+/// directly in takes in too. What discovery walks; what is offered is
+/// [`allowlist_offers_file`].
+pub(crate) fn allowlist_permits_file(allowed: &HashSet<String>, key: &str) -> bool {
+    allowlist_permits(allowed, key) || flat_covers(allowed, key)
+}
+
+/// Whether a folder's list offers the file at `key`: listed, inside a listed
+/// folder, or directly in a flat entry's folder and not withheld there. A
+/// file the user unshares from a flat share stays in the folder the entry
+/// names, so the withheld list is what keeps it off: known.met has one flag
+/// per content, which a copy shared elsewhere sets.
+pub(crate) fn allowlist_offers_file(allowed: &HashSet<String>, withheld: Option<&HashSet<String>>, key: &str) -> bool {
+    allowlist_permits(allowed, key)
+        || (flat_covers(allowed, key) && !withheld.is_some_and(|withheld| allowlist_permits(withheld, key)))
+}
+
+fn flat_covers(allowed: &HashSet<String>, key: &str) -> bool {
+    key.rfind(std::path::MAIN_SEPARATOR)
+        .is_some_and(|at| allowed.contains(&format!("{}{FLAT_ENTRY_NAME}", &key[..=at])))
+}
+
+pub(crate) fn is_flat_entry(entry: &str) -> bool {
+    entry.ends_with(FLAT_ENTRY_NAME)
+}
+
+/// Whether `entry` is the flat entry for the folder the file at `key` is
+/// directly in.
+pub(crate) fn flat_entry_offers(entry: &str, key: &str) -> bool {
+    entry.strip_suffix(FLAT_ENTRY_NAME).is_some_and(|folder| {
+        key.rfind(std::path::MAIN_SEPARATOR).is_some_and(|at| &key[..=at] == folder)
+    })
+}
+
 /// The folder allowlists as sets, for asking about many paths.
 #[derive(Debug, Default)]
 pub(crate) struct AllowlistOffers {
     lists: Vec<(String, HashSet<String>)>,
+    /// Each partly shared folder's withheld files, which its flat entries do
+    /// not offer.
+    withheld: std::collections::HashMap<String, HashSet<String>>,
 }
 
 impl AllowlistOffers {
+    /// Without the withheld files: for asking about folders, or lists that
+    /// hold no flat entry.
     pub(crate) fn new(allowlists: &std::collections::HashMap<String, Vec<String>>) -> Self {
-        Self {
-            lists: allowlists
+        Self::with_withheld(allowlists, &std::collections::HashMap::new())
+    }
+
+    pub(crate) fn with_withheld(
+        allowlists: &std::collections::HashMap<String, Vec<String>>,
+        withheld: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Self {
+        let sets = |lists: &std::collections::HashMap<String, Vec<String>>| {
+            lists
                 .iter()
-                .map(|(folder, entries)| (folder.clone(), entries.iter().cloned().collect()))
-                .collect(),
+                .map(|(folder, entries)| (folder.clone(), entries.iter().cloned().collect::<HashSet<_>>()))
+                .collect::<Vec<_>>()
+        };
+        Self {
+            lists: sets(allowlists),
+            withheld: sets(withheld).into_iter().collect(),
         }
     }
 
     /// Whether the file at `path` may be offered: no partly shared folder
-    /// holds it, or the innermost one that does lists it.
+    /// holds it, or the innermost one that does offers it.
     pub(crate) fn offers(&self, path: &str) -> bool {
-        let Some((_, allowed)) = self
-            .lists
+        self.innermost(path).is_none_or(|(folder, allowed)| {
+            allowlist_offers_file(allowed, self.withheld.get(folder), &normalize_path_key(path))
+        })
+    }
+
+    /// [`Self::offers`] for a folder, which a flat entry never offers.
+    pub(crate) fn offers_folder(&self, path: &str) -> bool {
+        self.innermost(path)
+            .is_none_or(|(_, allowed)| allowlist_permits(allowed, &normalize_path_key(path)))
+    }
+
+    fn innermost(&self, path: &str) -> Option<(&String, &HashSet<String>)> {
+        self.lists
             .iter()
             .filter(|(folder, _)| crate::security::path_within_dir(path, folder))
             .max_by_key(|(folder, _)| folder.len())
-        else {
-            return true;
-        };
-        allowlist_permits(allowed, &normalize_path_key(path))
+            .map(|(folder, allowed)| (folder, allowed))
     }
 }
 
@@ -231,7 +307,7 @@ impl DiscoveryScope {
     }
 
     fn admits_file(&self, key: &str) -> bool {
-        allowlist_permits(&self.entries, key)
+        allowlist_permits_file(&self.entries, key)
     }
 
     fn admits_dir(&self, key: &str) -> bool {
@@ -2036,6 +2112,45 @@ mod tests {
             }
             other => panic!("a rescan of the root walks what it offers, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A flat share walks its folder's own files, a file added since among
+    /// them, and none of its subfolders; a folder named inside it with a flat
+    /// entry of its own adds that folder's files and no deeper.
+    #[test]
+    fn a_flat_share_walks_one_level_and_keeps_up() {
+        let root = scratch_tree("flat");
+        let key = |path: &Path| normalize_path_key(&path.to_string_lossy());
+        std::fs::create_dir_all(root.join("sub").join("deep")).unwrap();
+        for file in ["a.mp3", "sub/c.mp3", "sub/deep/d.mp3"] {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+        let root_str = root.to_string_lossy().to_string();
+        let flat = DiscoveryScope::new(&[flat_entry(&root_str)]);
+        let page = FileIndexer::discover_directory_page_in(&root_str, None, Some(&flat));
+        assert_eq!(page_names(&page), ["a.mp3"]);
+
+        let with_sub = DiscoveryScope::new(&[flat_entry(&root_str), flat_entry(&root.join("sub").to_string_lossy())]);
+        let page = FileIndexer::discover_directory_page_in(&root_str, None, Some(&with_sub));
+        assert_eq!(page_names(&page), ["a.mp3", "c.mp3"]);
+
+        std::fs::write(root.join("later.mp3"), b"x").unwrap();
+        let lists = std::collections::HashMap::from([(key(&root), vec![flat_entry(&root_str)])]);
+        let scopes = DiscoveryScopes::new(&lists);
+        let roots = vec![root_str.clone()];
+        match FileIndexer::discover_scoped_path(&roots, &scopes, &root.join("later.mp3")) {
+            ScopedDiscovery::Found { files, .. } => assert_eq!(files.len(), 1),
+            other => panic!("expected the file added later, got {other:?}"),
+        }
+        assert!(matches!(
+            FileIndexer::discover_scoped_path(&roots, &scopes, &root.join("sub").join("c.mp3")),
+            ScopedDiscovery::Removed
+        ));
+        let offers = AllowlistOffers::new(&lists);
+        assert!(offers.offers(&root.join("later.mp3").to_string_lossy()));
+        assert!(!offers.offers(&root.join("sub").join("c.mp3").to_string_lossy()));
+        assert!(!offers.offers_folder(&root.join("sub").to_string_lossy()));
         let _ = std::fs::remove_dir_all(&root);
     }
 

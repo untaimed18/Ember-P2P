@@ -500,6 +500,17 @@ separate decision.
   is `encode_constraint_block`, the walk's encoder without keyword hashes or
   resume anchors. The dialog sends only the name and the type.
 
+An answer to a friend that announced `EMBER_FEATURE_BROWSE_DETAILS` (1 << 2)
+also carries a details section after the Ember digests: `EBD1`, then per
+entry in order `folder_len(u16) || folder || duration(u32) || bitrate(u32) ||
+codec_len(u8) || codec` (`encode_browse_details`), from the library's media
+record. The folder is empty unless the user turned on
+`friend_browse_shows_folders`, and then starts at the shared folder's name
+(`browse_folder_of`). Only to a friend that announced the bit: a parser before
+1.8.0 wants the digests to end the answer, and drops them otherwise. The
+receiver keeps the details only when every record reads, and cleans each
+folder part before showing it (`clean_browse_folder`).
+
 The answer is v1's with the filter applied before the dedupe and the caps, and
 the summary frame's total counts the matches, which the dialog shows. Every
 browse answer, filtered or not, is held to ten per friend in 30 seconds,

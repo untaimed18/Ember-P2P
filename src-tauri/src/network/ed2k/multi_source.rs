@@ -15192,11 +15192,105 @@ where
     out
 }
 
+/// Marks the details section of a browse answer, from 1.8.0: after the Ember
+/// digests, and only to a friend that announced
+/// `EMBER_FEATURE_BROWSE_DETAILS`. Then, for each entry in order,
+/// `folder_len(u16 LE) || folder || duration(u32 LE) || bitrate(u32 LE) ||
+/// codec_len(u8) || codec`, a 0 for an unknown number.
+pub(crate) const BROWSE_DETAILS_MAGIC: &[u8; 4] = b"EBD1";
+pub(crate) const MAX_BROWSE_FOLDER_BYTES: usize = 256;
+const MAX_BROWSE_CODEC_BYTES: usize = 32;
+
+/// What a browse answer says of a file besides its name, from 1.8.0.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BrowseDetail {
+    /// The folder it is in: the shared folder's name, then the folders below
+    /// it, `/`-separated. Empty when the friend does not show folders.
+    pub folder: String,
+    /// Playback length in seconds.
+    pub duration: Option<u32>,
+    /// In kbps.
+    pub bitrate: Option<u32>,
+    pub codec: Option<String>,
+}
+
+/// The longest prefix of `text` within `max` bytes that ends on a character.
+fn cut_to(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// A browse answer's details section, one record per entry the answer it
+/// follows carries, in its order.
+pub(crate) fn encode_browse_details<'a>(details: impl IntoIterator<Item = &'a BrowseDetail>) -> Vec<u8> {
+    let mut out = BROWSE_DETAILS_MAGIC.to_vec();
+    for detail in details.into_iter().take(MAX_BROWSE_ENTRIES) {
+        let folder = cut_to(&detail.folder, MAX_BROWSE_FOLDER_BYTES);
+        out.extend_from_slice(&(folder.len() as u16).to_le_bytes());
+        out.extend_from_slice(folder.as_bytes());
+        out.extend_from_slice(&detail.duration.unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(&detail.bitrate.unwrap_or(0).to_le_bytes());
+        let codec = cut_to(detail.codec.as_deref().unwrap_or(""), MAX_BROWSE_CODEC_BYTES);
+        out.push(codec.len() as u8);
+        out.extend_from_slice(codec.as_bytes());
+    }
+    out
+}
+
+/// `count` records of a details section after its marker, or none if they do
+/// not all read: details out of step with the entries are worse than none.
+fn parse_browse_details(data: &[u8], count: usize) -> Vec<BrowseDetail> {
+    let mut details = Vec::with_capacity(count);
+    let mut pos = 0;
+    let take = |pos: &mut usize, len: usize| -> Option<&[u8]> {
+        let bytes = data.get(*pos..pos.checked_add(len)?)?;
+        *pos += len;
+        Some(bytes)
+    };
+    let number = |bytes: &[u8]| Some(u32::from_le_bytes(bytes.try_into().ok()?)).filter(|n| *n > 0);
+    for _ in 0..count {
+        let Some(detail) = (|| {
+            let folder_len = usize::from(u16::from_le_bytes(take(&mut pos, 2)?.try_into().ok()?));
+            if folder_len > MAX_BROWSE_FOLDER_BYTES {
+                return None;
+            }
+            let folder = std::str::from_utf8(take(&mut pos, folder_len)?).ok()?.to_string();
+            let duration = number(take(&mut pos, 4)?);
+            let bitrate = number(take(&mut pos, 4)?);
+            let codec_len = usize::from(take(&mut pos, 1)?[0]);
+            if codec_len > MAX_BROWSE_CODEC_BYTES {
+                return None;
+            }
+            let codec = std::str::from_utf8(take(&mut pos, codec_len)?).ok()?;
+            Some(BrowseDetail {
+                folder,
+                duration,
+                bitrate,
+                codec: (!codec.is_empty()).then(|| codec.to_string()),
+            })
+        })() else {
+            return Vec::new();
+        };
+        details.push(detail);
+    }
+    details
+}
+
+#[cfg(test)]
 pub(crate) fn parse_browse_response(data: &[u8]) -> Vec<BrowseEntry> {
+    parse_browse_response_with_details(data).0
+}
+
+/// [`parse_browse_response`], with the details section's records when the
+/// answer carries one (empty when not).
+pub(crate) fn parse_browse_response_with_details(data: &[u8]) -> (Vec<BrowseEntry>, Vec<BrowseDetail>) {
     if data.starts_with(BROWSE_RESPONSE_V1_MAGIC) {
         return parse_browse_response_v1(&data[BROWSE_RESPONSE_V1_MAGIC.len()..]);
     }
-    parse_browse_response_legacy(data)
+    (parse_browse_response_legacy(data), Vec::new())
 }
 
 fn parse_browse_response_legacy(data: &[u8]) -> Vec<BrowseEntry> {
@@ -15227,10 +15321,10 @@ fn parse_browse_response_legacy(data: &[u8]) -> Vec<BrowseEntry> {
     entries
 }
 
-fn parse_browse_response_v1(data: &[u8]) -> Vec<BrowseEntry> {
+fn parse_browse_response_v1(data: &[u8]) -> (Vec<BrowseEntry>, Vec<BrowseDetail>) {
     let mut entries = Vec::new();
     if data.len() < 4 {
-        return entries;
+        return (entries, Vec::new());
     }
     let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
     let mut pos = 4;
@@ -15268,16 +15362,22 @@ fn parse_browse_response_v1(data: &[u8]) -> Vec<BrowseEntry> {
         entries.push((hash, size, name, aich, None));
     }
     let declared = count.min(MAX_BROWSE_ENTRIES);
-    if entries.len() == declared && pos + declared * 32 == data.len() {
-        for (i, entry) in entries.iter_mut().enumerate() {
-            let start = pos + i * 32;
-            let digest = &data[start..start + 32];
-            if digest.iter().any(|&b| b != 0) {
-                entry.4 = Some(hex::encode(digest));
-            }
+    let digests_end = pos + declared * 32;
+    let details_at = data
+        .get(digests_end..)
+        .and_then(|rest| rest.strip_prefix(BROWSE_DETAILS_MAGIC.as_slice()));
+    if entries.len() != declared || !(digests_end == data.len() || details_at.is_some()) {
+        return (entries, Vec::new());
+    }
+    for (i, entry) in entries.iter_mut().enumerate() {
+        let start = pos + i * 32;
+        let digest = &data[start..start + 32];
+        if digest.iter().any(|&b| b != 0) {
+            entry.4 = Some(hex::encode(digest));
         }
     }
-    entries
+    let details = details_at.map(|rest| parse_browse_details(rest, declared)).unwrap_or_default();
+    (entries, details)
 }
 
 #[cfg(test)]
@@ -15309,6 +15409,64 @@ mod browse_response_tests {
         assert_eq!(parsed[0].4.as_deref(), Some(hex::encode(ember).as_str()));
         assert_eq!(parsed[1].3, None);
         assert_eq!(parsed[1].4, None);
+    }
+
+    /// The details section follows the digests and is read only whole; an
+    /// answer without one is byte for byte what an older friend reads.
+    #[test]
+    fn browse_details_follow_the_digests_and_are_read_only_whole() {
+        let (a, b) = ([0x11u8; 16], [0x22u8; 16]);
+        let ember = [0xCDu8; 32];
+        let rows = || {
+            encode_browse_response_v1([
+                (&a, 42u64, b"song.mp3".as_slice(), None, Some(&ember)),
+                (&b, 7u64, b"readme.txt".as_slice(), None, None),
+            ])
+        };
+        let details = [
+            BrowseDetail {
+                folder: "Music/Rock".into(),
+                duration: Some(212),
+                bitrate: Some(320),
+                codec: Some("mp3".into()),
+            },
+            BrowseDetail::default(),
+        ];
+        let plain = rows();
+        assert_eq!(parse_browse_response_with_details(&plain).1, Vec::new());
+
+        let mut answer = rows();
+        answer.extend(encode_browse_details(&details));
+        assert!(answer.starts_with(&plain), "the details only follow");
+        let (entries, got) = parse_browse_response_with_details(&answer);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].4.as_deref(), Some(hex::encode(ember).as_str()), "the digests still read");
+        assert_eq!(got, details);
+
+        let mut cut = answer.clone();
+        cut.pop();
+        let (entries, got) = parse_browse_response_with_details(&cut);
+        assert_eq!(entries[0].4.as_deref(), Some(hex::encode(ember).as_str()));
+        assert!(got.is_empty(), "a record cut short leaves none");
+
+        let mut long = rows();
+        long.extend(encode_browse_details(&[BrowseDetail {
+            folder: "é".repeat(200),
+            codec: Some("x".repeat(40)),
+            ..BrowseDetail::default()
+        }]));
+        let got = parse_browse_response_with_details(&long).1;
+        assert!(got.is_empty(), "one record for two entries is out of step");
+        let one = encode_browse_response_v1([(&a, 1u64, b"a".as_slice(), None, None)]);
+        let mut capped = one.clone();
+        capped.extend(encode_browse_details(&[BrowseDetail {
+            folder: "é".repeat(200),
+            codec: Some("x".repeat(40)),
+            ..BrowseDetail::default()
+        }]));
+        let got = parse_browse_response_with_details(&capped).1;
+        assert_eq!(got[0].folder.len(), MAX_BROWSE_FOLDER_BYTES, "cut on a character within the cap");
+        assert_eq!(got[0].codec.as_deref().map(str::len), Some(MAX_BROWSE_CODEC_BYTES));
     }
 
     #[test]

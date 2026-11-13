@@ -1053,6 +1053,9 @@ export interface AppSettings {
   chat_mailbox_enabled: boolean;
   /** Disable browse-shares responses to friends */
   friend_browse_disabled: boolean;
+  /** A friend browsing our files sees the folder each is in, from its shared
+   *  folder down. Off by default. */
+  friend_browse_shows_folders: boolean;
   /** Decline files friends send (chat attachments and file offers). A friend's
    *  own `files` override wins; chat off refuses files regardless. */
   friend_files_disabled: boolean;

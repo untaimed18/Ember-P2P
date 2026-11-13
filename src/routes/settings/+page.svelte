@@ -5102,6 +5102,20 @@
                 ariaDescribedby="friend-browse-hint"
               />
             </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="friend-browse-folders-label" for="friend-browse-folders-switch">{m.settings_friend_browse_folders_label()}</label>
+                <span class="hint" id="friend-browse-folders-hint">{m.settings_friend_browse_folders_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="friend-browse-folders-switch"
+                checked={settings.friend_browse_shows_folders === true}
+                disabled={settings.friend_browse_disabled === true}
+                onchange={(on) => { if (settings) settings.friend_browse_shows_folders = on; }}
+                ariaLabelledby="friend-browse-folders-label"
+                ariaDescribedby="friend-browse-folders-hint"
+              />
+            </div>
           </div>
 
           <div class="settings-group">

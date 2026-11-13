@@ -1,4 +1,5 @@
-//! How long the `*_fuzz_never_panics` loops run, and from where.
+//! How long the `*_fuzz_never_panics` loops and the `*_invariants_hold`
+//! property tests run, and from where.
 //!
 //! Every push runs each loop as written, from its own fixed seed, so a failure
 //! there is the same failure everywhere. The nightly soak

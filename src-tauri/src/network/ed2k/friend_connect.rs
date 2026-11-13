@@ -767,17 +767,22 @@ pub async fn run_friend_session_over_transport(
                                                 ),
                                             supports_scope: peer_scope_aware,
                                             filter: super::multi_source::browse_request_filter(&payload),
+                                            supports_details: session_ember_session_handle.has_feature(
+                                                super::messages::EMBER_FEATURE_BROWSE_DETAILS,
+                                            ),
                                         },
                                     }).await;
                                 }
                                 (OP_EMULEPROT, OP_EMBER_BROWSE_RES) => {
-                                    let entries = parse_browse_response(&payload);
+                                    let (entries, details) =
+                                        super::multi_source::parse_browse_response_with_details(&payload);
                                     let _ = session_ul_event_tx.send(UploadEvent {
                                         transfer_id: String::new(),
                                         kind: UploadEventKind::EmberBrowseResponse {
                                             ember_hash: peer_ember_hash,
                                     session_id: session_ember_session_handle.session_id(),
                                             entries,
+                                            details,
                                         },
                                     }).await;
                                 }
@@ -2283,8 +2288,6 @@ async fn relay_friend(
     }
     Err("friend relay ticket was not accepted before timeout".to_string())
 }
-
-use super::multi_source::parse_browse_response;
 
 async fn write_packet<W: AsyncWriteExt + Unpin + ?Sized>(
     writer: &mut W,

@@ -349,6 +349,15 @@ function compactDuration(secs: number): string {
   return formatDurationParts([[Math.floor(secs), 'second']]);
 }
 
+/** A media file's playing time as a player shows it: "3:32", "1:02:05". */
+export function formatMediaLength(secs: number): string {
+  const s = Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0;
+  const h = Math.floor(s / 3600);
+  const min = Math.floor((s % 3600) / 60);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(min)}:${pad(s % 60)}` : `${min}:${pad(s % 60)}`;
+}
+
 /** Format seconds as a human-readable duration (e.g. "2h 15m"). */
 export function formatDurationSecs(secs: number): string {
   if (!Number.isFinite(secs) || secs < 0) return '\u2014';

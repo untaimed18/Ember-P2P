@@ -427,4 +427,12 @@ export interface BrowseFileEntry {
   ember_file_hash?: string;
   /** Set when the friend restricts this file; a download of it stays friends-only. */
   friends_only?: boolean;
+  /** The folder it is in, from its shared folder down, `/`-separated; only
+   *  when the friend shows folders (1.8.0). */
+  folder?: string;
+  /** Playback length in seconds, when the friend knows it (1.8.0). */
+  duration?: number;
+  /** In kbps (1.8.0). */
+  bitrate?: number;
+  codec?: string;
 }

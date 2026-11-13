@@ -52,7 +52,8 @@
     type FileTypeFilter,
     type FileTypeKey,
   } from '$lib/fileTypes';
-  import { compareFileNames, copyToClipboard, formatClockTime, formatNumber, formatSize } from '$lib/utils';
+  import { compareFileNames, copyToClipboard, formatClockTime, formatMediaLength, formatNumber, formatSize } from '$lib/utils';
+  import { browseFolderOptions, inBrowseFolder } from '$lib/browseFolders';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
@@ -92,6 +93,8 @@
   let expectedRequestId = '';
 
   let typeFilter: FileTypeFilter = $state('All');
+  /** The folder picked, or '' for all; only a friend showing folders has any. */
+  let folderFilter = $state('');
   type SortKey = 'name' | 'size';
   let sortKey: SortKey = $state('name');
   let sortAsc = $state(true);
@@ -172,9 +175,14 @@
   let ownedCount = $derived(libraryHashes.size === 0 ? 0 : files.filter(isInLibrary).length);
   let hidingOwned = $derived(hideOwned && ownedCount > 0);
 
+  let folderOptions = $derived(browseFolderOptions(files));
+  /** The folder picked, while the list still has it. */
+  let activeFolder = $derived(folderOptions.some((o) => o.path === folderFilter) ? folderFilter : '');
+
   let textMatchedFiles = $derived.by(() => {
     const q = filterQuery.trim().toLowerCase();
-    const base = hidingOwned ? files.filter((f) => !isInLibrary(f)) : files;
+    let base = hidingOwned ? files.filter((f) => !isInLibrary(f)) : files;
+    if (activeFolder) base = base.filter((f) => inBrowseFolder(f, activeFolder));
     if (!q) return base;
     return base.filter((file) => {
       const name = file.name.toLowerCase();
@@ -210,7 +218,18 @@
   });
 
   let filteredTotalSize = $derived(filteredFiles.reduce((sum, f) => sum + f.size, 0));
-  let isFiltered = $derived(Boolean(filterQuery.trim()) || typeFilter !== 'All' || hidingOwned);
+  let isFiltered = $derived(Boolean(filterQuery.trim()) || typeFilter !== 'All' || hidingOwned || activeFolder !== '');
+
+  /** A file's length, bitrate and codec as one line, when its friend sent any. */
+  function mediaLine(file: BrowseFileEntry): string {
+    return [
+      file.duration ? formatMediaLength(file.duration) : '',
+      file.bitrate ? m.search_bitrate_value({ kbps: formatNumber(file.bitrate) }) : '',
+      file.codec ?? '',
+    ]
+      .filter(Boolean)
+      .join(' \u00b7 ');
+  }
 
   /** `known`: the friend reported more files than fit in one answer.
    *  `maybe`: an older friend filled the answer, the only hint there may be
@@ -455,6 +474,7 @@
       files = [];
       filterQuery = '';
       typeFilter = 'All';
+      folderFilter = '';
       resetResultViewState();
       queuedCount = 0;
       downloadedHashes = new Set();
@@ -1081,6 +1101,19 @@
                   ><IconX size={14} /></button>
                 {/if}
               </div>
+              {#if folderOptions.length > 0}
+                <select
+                  class="browse-folder-select"
+                  value={activeFolder}
+                  onchange={(e) => (folderFilter = e.currentTarget.value)}
+                  aria-label={m.browse_folder_filter()}
+                >
+                  <option value="">{m.browse_all_folders()}</option>
+                  {#each folderOptions as option (option.path)}
+                    <option value={option.path}>{'\u00a0\u00a0'.repeat(option.depth)}{option.name} ({formatNumber(option.count)})</option>
+                  {/each}
+                </select>
+              {/if}
               {#if ownedCount > 0}
                 <button
                   type="button"
@@ -1299,6 +1332,7 @@
                 <tbody>
                   {#each filteredFiles as file (file.hash)}
                     {@const selectable = isSelectable(file)}
+                    {@const media = mediaLine(file)}
                     <tr class:selected={selectable && selectedHashes.has(file.hash)}>
                       <td class="col-select">
                         <input
@@ -1324,7 +1358,7 @@
                         button next to it. The text itself is still
                         rendered exactly as written.
                       -->
-                      <td class="col-name" title={file.name}>
+                      <td class="col-name" title={file.folder ? `${file.folder}/${file.name}` : file.name}>
                         <div class="name-cell">
                           <bdi dir="auto" class="name-text">{file.name}</bdi>
                           {#if file.friends_only}
@@ -1336,6 +1370,12 @@
                             <span class="file-tag tag-done" title={m.browse_downloaded_before_title()}>{m.search_history_downloaded()}</span>
                           {/if}
                         </div>
+                        {#if (file.folder && !activeFolder) || media}
+                          <div class="name-meta">
+                            {#if file.folder && !activeFolder}<bdi dir="auto" class="name-folder">{file.folder}</bdi>{/if}
+                            {#if media}<span class="name-media">{media}</span>{/if}
+                          </div>
+                        {/if}
                       </td>
                       <td class="col-size">{formatSize(file.size)}</td>
                       <td class="col-action">
@@ -1897,6 +1937,39 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .name-meta {
+    display: flex;
+    gap: 10px;
+    min-width: 0;
+    margin-top: 2px;
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+  }
+
+  .name-folder {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .name-media {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .browse-folder-select {
+    flex-shrink: 0;
+    max-width: 220px;
+    font: inherit;
+    font-size: var(--font-size-sm);
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
   }
 
   .file-tag {

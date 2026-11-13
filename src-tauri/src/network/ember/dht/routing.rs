@@ -4636,4 +4636,146 @@ mod tests {
             }
         }
     }
+
+    /// What a recount of the residents says the table's bookkeeping must be,
+    /// and the rules each bucket keeps.
+    fn table_disagreement(rt: &RoutingTable, local: EmberNodeId) -> Option<String> {
+        let mut residents = HashSet::new();
+        let mut subnets: HashMap<u64, usize> = HashMap::new();
+        let mut ips: HashMap<IpAddr, usize> = HashMap::new();
+        let mut by_addr: HashMap<SocketAddr, Vec<EmberNodeId>> = HashMap::new();
+        let mut verified = 0;
+        for (i, bucket) in rt.buckets.iter().enumerate() {
+            if bucket.contacts.len() > K_BUCKET_SIZE || bucket.replacement_cache.len() > K_BUCKET_SIZE {
+                return Some(format!("bucket {i} holds {} and caches {}", bucket.contacts.len(), bucket.replacement_cache.len()));
+            }
+            for c in &bucket.contacts {
+                if local.bucket_index(&c.node_id) != Some(i) {
+                    return Some(format!("{:?} resident in bucket {i}", c.node_id));
+                }
+                if !residents.insert(c.node_id) {
+                    return Some(format!("{:?} resident twice", c.node_id));
+                }
+                if bucket.find_in_cache(&c.node_id).is_some() {
+                    return Some(format!("{:?} resident and cached", c.node_id));
+                }
+                *subnets.entry(c.subnet_key()).or_default() += 1;
+                *ips.entry(c.addr.ip()).or_default() += 1;
+                by_addr.entry(c.addr).or_default().push(c.node_id);
+                verified += usize::from(c.is_verified());
+            }
+            let mut cached = HashSet::new();
+            for c in &bucket.replacement_cache {
+                if local.bucket_index(&c.node_id) != Some(i) || !cached.insert(c.node_id) {
+                    return Some(format!("{:?} cached wrongly in bucket {i}", c.node_id));
+                }
+            }
+        }
+        fn counted<K: Copy + Eq + std::hash::Hash>(held: &HashMap<K, usize>) -> HashMap<K, usize> {
+            held.iter().filter(|(_, n)| **n > 0).map(|(k, n)| (*k, *n)).collect()
+        }
+        if counted(&rt.global_subnet_count) != subnets {
+            return Some("the per-/24 counts disagree with the residents".into());
+        }
+        if counted(&rt.global_ip_count) != ips {
+            return Some("the per-address counts disagree with the residents".into());
+        }
+        if rt.residents.verified != verified {
+            return Some(format!("{} counted verified, {verified} are", rt.residents.verified));
+        }
+        let sorted = |mut ids: Vec<EmberNodeId>| {
+            ids.sort_by_key(|id| id.0);
+            ids
+        };
+        let indexed: HashMap<_, _> = rt.residents.by_addr.iter().map(|(a, ids)| (*a, sorted(ids.clone()))).collect();
+        let recounted: HashMap<_, _> = by_addr.into_iter().map(|(a, ids)| (a, sorted(ids))).collect();
+        if indexed != recounted {
+            return Some("the address index disagrees with the residents".into());
+        }
+        if rt.total_contacts() != residents.len() {
+            return Some(format!("{} counted, {} resident", rt.total_contacts(), residents.len()));
+        }
+        None
+    }
+
+    /// Any sequence of what the table is asked to do keeps it true to itself:
+    /// buckets within K and holding only their own distance, nobody resident
+    /// twice, cached while resident, or ourselves, and every index and
+    /// counter equal to a recount; and a lookup answers nearest first from
+    /// the residents. Ids and addresses come from small pools so that
+    /// contacts collide, crowd one /24 and overflow a bucket.
+    #[test]
+    fn routing_table_invariants_hold() {
+        use rand::Rng;
+        let local = make_id(0);
+        let mut rng = crate::fuzz::rng(0x7AB1_E5E7);
+        for round in 0..crate::fuzz::rounds(30) {
+            let now = chrono::Utc::now().timestamp();
+            let mut rt = RoutingTable::new(local, rng.gen_bool(0.5));
+            for step in 0..400 {
+                let mut id = [0u8; 16];
+                id[0] = [0x80, 0x81, 0xC0, 0x40, 0x20, 0x01, 0x00][rng.gen_range(0..7)];
+                id[1] = rng.gen_range(0..48);
+                let id = EmberNodeId(id);
+                let addr = SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(
+                        [80, 81, 10, 100, 192][rng.gen_range(0..5)],
+                        [64, 168, 1][rng.gen_range(0..3)],
+                        rng.gen_range(0..4),
+                        rng.gen_range(1..6),
+                    )),
+                    [4672, 4673, 0][rng.gen_range(0..3)],
+                );
+                match rng.gen_range(0..14) {
+                    0..=5 => {
+                        let last_seen = match rng.gen_range(0..4) {
+                            0 => 0,
+                            1 => now + rng.gen_range(1..600),
+                            _ => now - rng.gen_range(0..1_800),
+                        };
+                        let _ = rt.add_contact(EmberContact {
+                            node_id: id,
+                            addr,
+                            noise_pub: [rng.gen_range(1..4); 32],
+                            ed25519_pub: [id.0[1]; 32],
+                            last_seen,
+                            failed_queries: rng.gen_range(0..4),
+                        });
+                    }
+                    6 => {
+                        rt.remove_contact(&id);
+                    }
+                    7 => rt.mark_alive(&id, addr, &[rng.gen_range(1..4); 32]),
+                    8 => {
+                        rt.mark_failed(&id);
+                    }
+                    9 => {
+                        rt.evict_and_replace(&id);
+                    }
+                    10 => {
+                        rt.promote_cached_contacts();
+                    }
+                    11 => {
+                        rt.remove_stale(now + rng.gen_range(-600..2_400), 600, &HashSet::new());
+                    }
+                    12 => {
+                        rt.set_block_private_ips(rng.gen_bool(0.5));
+                    }
+                    _ => {
+                        rt.enforce_scale_quotas();
+                        rt.evict_filtered_contacts();
+                    }
+                }
+                if let Some(wrong) = table_disagreement(&rt, local) {
+                    panic!("round {round}, step {step}: {wrong}");
+                }
+                let target = EmberNodeId(rng.r#gen());
+                let found = rt.find_closest(&target, K_BUCKET_SIZE);
+                let distances: Vec<_> = found.iter().map(|c| target.distance(&c.node_id).0).collect();
+                assert!(found.len() <= K_BUCKET_SIZE);
+                assert!(distances.windows(2).all(|w| w[0] < w[1]), "round {round}, step {step}: not nearest first");
+                assert!(found.iter().all(|c| rt.get_contact(&c.node_id).is_some()));
+            }
+        }
+    }
 }

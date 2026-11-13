@@ -3532,6 +3532,9 @@ pub enum UploadEventKind {
         supports_scope: bool,
         /// An `EBR2` request's filter, applied before the answer's caps.
         filter: Option<super::multi_source::BrowseFilter>,
+        /// The session announced `EMBER_FEATURE_BROWSE_DETAILS`, so the
+        /// answer may carry its details section.
+        supports_details: bool,
     },
     /// Incoming Ember browse response from a friend (outbound session).
     /// Each entry is `(ed2k_hash_hex, size, name, optional_aich_hash_hex, optional_ember_hex)`.
@@ -3539,6 +3542,8 @@ pub enum UploadEventKind {
         ember_hash: [u8; 16],
         session_id: u64,
         entries: Vec<(String, u64, String, Option<String>, Option<String>)>,
+        /// One per entry when the answer carried a details section, else none.
+        details: Vec<super::multi_source::BrowseDetail>,
     },
     /// A friend's `EMBER_EXT_BROWSE_SCOPE`: the friends-only hashes of the
     /// browse answer that follows on `session_id`. `body` is still encoded.
@@ -15139,6 +15144,8 @@ impl UploadHandler {
                                             || payload.starts_with(super::multi_source::BROWSE_REQUEST_V2_MAGIC),
                                     supports_scope: peer_scope_aware,
                                     filter: super::multi_source::browse_request_filter(&payload),
+                                    supports_details: session
+                                        .has_feature(super::messages::EMBER_FEATURE_BROWSE_DETAILS),
                                 },
                             }).await;
                         }
@@ -15152,13 +15159,15 @@ impl UploadHandler {
                         if !self.friend_hashes.read().await.contains(&eh) {
                             debug!("Ignoring browse response from removed friend {}", hex::encode(eh));
                         } else {
-                            let entries = super::multi_source::parse_browse_response(&payload);
+                            let (entries, details) =
+                                super::multi_source::parse_browse_response_with_details(&payload);
                             let _ = self.upload_event_tx.send(UploadEvent {
                                 transfer_id: String::new(),
                                 kind: UploadEventKind::EmberBrowseResponse {
                                     ember_hash: eh,
                                     session_id: session.session_id(),
                                     entries,
+                                    details,
                                 },
                             }).await;
                         }

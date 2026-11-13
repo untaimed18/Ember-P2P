@@ -937,6 +937,85 @@ mod tests {
         assert!(pace.waiting.is_empty());
     }
 
+    /// Frames for several rooms, of every kind, offered at random between
+    /// ticks that come early and late, with bursts that fill the queue: no
+    /// window holds more than a room's share, a room's answers and its other
+    /// frames each leave in the order they came, nothing leaves twice or
+    /// after waiting its limit, an answer is never refused, and only answers
+    /// take the queue past its bound.
+    #[test]
+    fn dm_pacing_invariants_hold() {
+        use rand::Rng;
+        let ms = std::time::Duration::from_millis;
+        let mut rng = crate::fuzz::rng(0xD3_FACE);
+        for round in 0..crate::fuzz::rounds(20) {
+            let mut pace = DmPace::default();
+            let t0 = std::time::Instant::now();
+            let mut now = t0;
+            let mut next_tick = t0 + ms(1_000);
+            let mut next_id = 0u32;
+            // id → (room, kind, offered at); and each id's departure.
+            let mut offered: HashMap<u32, ([u8; 16], DmFrameKind, std::time::Instant)> = HashMap::new();
+            let mut sent: Vec<(u32, std::time::Instant)> = Vec::new();
+            let id_of = |peer: &[u8; 32]| u32::from_le_bytes(peer[..4].try_into().unwrap());
+            for step in 0..600 {
+                now += ms(rng.gen_range(50..400));
+                let offers = if rng.gen_bool(0.01) { rng.gen_range(100..300) } else { rng.gen_range(0..4) };
+                for _ in 0..offers {
+                    let room = [rng.gen_range(1..=3u8); 16];
+                    let kind = match rng.gen_range(0..10) {
+                        0..=4 => DmFrameKind::Reply,
+                        5..=7 => DmFrameKind::Message,
+                        _ => DmFrameKind::Answer,
+                    };
+                    let mut peer = [0u8; 32];
+                    peer[..4].copy_from_slice(&next_id.to_le_bytes());
+                    offered.insert(next_id, (room, kind, now));
+                    if pace.offer(room, peer, &receipt(1), kind, now) {
+                        sent.push((next_id, now));
+                    } else if kind == DmFrameKind::Answer {
+                        assert!(pace.waiting.iter().any(|w| id_of(&w.peer) == next_id), "round {round}: an answer was refused");
+                    }
+                    next_id += 1;
+                }
+                if now >= next_tick {
+                    for frame in pace.due(now) {
+                        let left = if rng.gen_bool(0.2) { now + ms(rng.gen_range(1..150)) } else { now };
+                        pace.went_at(frame.room, left);
+                        sent.push((id_of(&frame.peer), left));
+                    }
+                    next_tick = now + ms(rng.gen_range(870..1_130));
+                }
+                let others = pace.waiting.iter().filter(|w| w.kind != DmFrameKind::Answer).count();
+                assert!(others <= MAX_PACED_FRAMES, "round {round}, step {step}: {others} waiting");
+            }
+
+            let mut seen = HashSet::new();
+            for (id, at) in &sent {
+                assert!(seen.insert(*id), "round {round}: frame {id} left twice");
+                let (_, _, offered_at) = offered[id];
+                assert!(at.saturating_duration_since(offered_at) <= DM_PACED_MAX_WAIT + ms(150), "round {round}: frame {id} left late");
+            }
+            for room in 1..=3u8 {
+                let room = [room; 16];
+                let mut times: Vec<_> = sent.iter().filter(|(id, _)| offered[id].0 == room).map(|(_, at)| *at).collect();
+                times.sort();
+                for three in times.windows(DM_FRAMES_PER_ROOM_PER_SEC + 1) {
+                    let span = three[DM_FRAMES_PER_ROOM_PER_SEC].duration_since(three[0]);
+                    assert!(span > DM_PACE_WINDOW, "round {round}: three frames in {span:?}");
+                }
+                for answers in [true, false] {
+                    let order: Vec<u32> = sent
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .filter(|id| offered[id].0 == room && (offered[id].1 == DmFrameKind::Answer) == answers)
+                        .collect();
+                    assert!(order.windows(2).all(|w| w[0] < w[1]), "round {round}: a room's frames left out of order");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_queued_reply_goes_only_while_it_is_still_true() {
         let receipt = DmPayload::Receipt { id: [1; 16] };

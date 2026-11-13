@@ -1366,10 +1366,15 @@ pub const EMBER_FEATURE_FILTERED_BROWSE: u32 = 1 << 0;
 /// into the download queued for it, as a plain push-grant is. A friend waiting
 /// for a friends-only file can only be granted its slot that way.
 pub const EMBER_FEATURE_SECURE_PUSH_GRANT: u32 = 1 << 1;
+/// Feature bit: reads a browse answer's details section (`EBD1`, after the
+/// Ember digests), so one may be sent to it. Older parsers want the digests
+/// to end the answer and would drop them.
+pub const EMBER_FEATURE_BROWSE_DETAILS: u32 = 1 << 2;
 
 /// The feature bits this build advertises. A bit is set only alongside the
 /// code that answers it: a peer that reads one will send what it names.
-pub const EMBER_FEATURES: u32 = EMBER_FEATURE_FILTERED_BROWSE | EMBER_FEATURE_SECURE_PUSH_GRANT;
+pub const EMBER_FEATURES: u32 =
+    EMBER_FEATURE_FILTERED_BROWSE | EMBER_FEATURE_SECURE_PUSH_GRANT | EMBER_FEATURE_BROWSE_DETAILS;
 
 /// Parsed contents of an `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` payload.
 #[derive(Debug, Clone, Default)]

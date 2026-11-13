@@ -407,7 +407,7 @@ fn share_status_for(
             if !path_within(&display, &existing_display) {
                 return ShareBrowserStatus::ContainsShared;
             }
-            return match allowlist_contains(allowlists, existing, path) {
+            return match allowlist_contains(allowlists, existing, path, false) {
                 Some(false) => ShareBrowserStatus::Overlap,
                 // Offered through its share, but unsharing it, or a folder
                 // under it, left it a list of its own.
@@ -431,19 +431,27 @@ fn containing_share<'a>(file: &Path, shared: &'a [PathBuf]) -> Option<&'a Path> 
         .map(PathBuf::as_path)
 }
 
-/// Whether the innermost allowlist above `file` in the share `folder` offers
+/// Whether the innermost allowlist above `path` in the share `folder` offers
 /// it: the share's own, or one a subfolder was left with when it was
-/// unshared. `None` when no list holds it.
-fn allowlist_contains(allowlists: &HashMap<String, Vec<String>>, folder: &Path, file: &Path) -> Option<bool> {
+/// unshared. `None` when no list holds it. A flat entry offers only a file.
+fn allowlist_contains(
+    allowlists: &HashMap<String, Vec<String>>,
+    folder: &Path,
+    path: &Path,
+    is_file: bool,
+) -> Option<bool> {
     let share = display_fs_path(folder);
-    let file_key = normalize_path_key(&display_fs_path(file));
+    let file_key = normalize_path_key(&display_fs_path(path));
     let (_, list) = allowlists
         .iter()
         .filter(|(listed, _)| {
             !same_folder(listed, &file_key) && path_within(&file_key, listed) && path_within(listed, &share)
         })
         .max_by_key(|(listed, _)| listed.len())?;
-    Some(list.iter().any(|item| path_key_covers(item, &file_key)))
+    Some(list.iter().any(|item| {
+        path_key_covers(item, &file_key)
+            || (is_file && crate::sharing::indexer::flat_entry_offers(item, &file_key))
+    }))
 }
 
 /// A file is shared by adding its parent folder. One that already lives in a
@@ -471,7 +479,7 @@ fn file_share_status(
         if unshared.contains(&normalize_path_key(&display)) {
             return ShareBrowserStatus::Shareable;
         }
-        return match allowlist_contains(allowlists, folder, path) {
+        return match allowlist_contains(allowlists, folder, path, true) {
             Some(true) | None => ShareBrowserStatus::Already,
             Some(false) => ShareBrowserStatus::Shareable,
         };
@@ -535,10 +543,15 @@ fn entry_from_stored(
             let shared_count = if share_status == ShareBrowserStatus::Partial {
                 let key = normalize_path_key(&display_fs_path(path));
                 // Before the folder's first scan finishes nothing is indexed
-                // yet, so the allowlist is the only count there is.
+                // yet, so the allowlist is the only count there is, unless a
+                // flat entry stands for files it does not name.
                 match session.offers.get(&key) {
                     Some(offer) if offer.indexed > 0 => Some(offer.offered),
-                    _ => session.allowlists.get(&key).map(|files| files.len() as u32),
+                    _ => session
+                        .allowlists
+                        .get(&key)
+                        .filter(|files| !files.iter().any(|file| crate::sharing::indexer::is_flat_entry(file)))
+                        .map(|files| files.len() as u32),
                 }
             } else {
                 None
