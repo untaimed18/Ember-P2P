@@ -36,6 +36,7 @@ mod publishing;
 pub(crate) mod reachability;
 pub mod rendezvous;
 pub(crate) mod room_dm;
+mod room_dm_mail;
 mod search;
 mod server;
 mod settings;
@@ -119,9 +120,10 @@ use crate::storage::known_files::KnownFileList;
 use crate::storage::statistics::{StatsManager, TransferStats};
 
 use self::browse::{
-    bind_browse_request_to_session, browse_request_is_pending, cancel_browse_request,
-    complete_browse_request, dispatch_browse_head, enqueue_browse_request, remove_browse_request,
-    remove_browse_requests_for_session, send_browse_response_to_origin, PendingBrowseRequests,
+    announce_ember_features, bind_browse_request_to_session, browse_request_is_pending, browse_serve_allowed,
+    cancel_browse_request, complete_browse_request, dispatch_browse_head, enqueue_browse_request,
+    remove_browse_request, remove_browse_requests_for_session, send_browse_response_to_origin, set_browse_filter,
+    PendingBrowseRequests,
 };
 use self::command::handle_command;
 
@@ -134,7 +136,7 @@ use self::host_port_map::HostPortMap;
 use self::ember_publish::{
     ember_batch_ack_deadline, EmberBatchInFlight, EmberBatchPublisher, EmberFlushStats,
     EmberProxyBuddyPacer, EmberPublishAttempts, EmberPublishKind, EmberPublishPassStats, EmberRecordRef,
-    EMBER_BATCH_ACK_TIMEOUT, EMBER_BATCH_QUEUE_MAX, EMBER_FLUSH_INTERVAL,
+    EmberStoreBeat, EMBER_BATCH_ACK_TIMEOUT, EMBER_BATCH_QUEUE_MAX, EMBER_FLUSH_INTERVAL,
     EMBER_MAX_BATCH_FRAMES_PER_PEER, EMBER_PUBLISH_MAX_ATTEMPTS,
     EMBER_STORE_RECORDS_PER_PEER_PER_MIN, K_EMBER_REPLICAS,
 };
@@ -831,6 +833,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         crate::types::room_dm_policy_in_force(&settings.room_dm_policy),
         settings.ignored_members.as_deref(),
     );
+    room_dm::set_collects_room_mail(settings.chat_mailbox_enabled);
 
     let mut state = NetworkState {
         local_id,
@@ -1047,6 +1050,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_session_dht_contacts: HostPortMap::new(),
         ember_rendezvous_published_at: 0,
         ember_rendezvous_search: None,
+        ember_rendezvous_listed: HashSet::new(),
         ember_rendezvous_looked_up_at: 0,
         ember_rendezvous_empty_streak: 0,
         ember_announced_at: HashMap::new(),
@@ -1104,6 +1108,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             ember_gossip_probe_window: (std::time::Instant::now(), 0),
             ember_publish_beat_acked: 0,
             ember_publish_beat_failed: 0,
+            ember_store_beat: EmberStoreBeat::default(),
         ember_udp_epx_rate: HashMap::new(),
         ember_udp_epx_req_rate: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),

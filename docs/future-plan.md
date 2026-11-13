@@ -27,9 +27,23 @@ owning a room stay on one key. The 1.7 sending paths are gone; reading 15,
 "The cut-over in 1.8.0", "The transition, and the cut-over in 1.8.0" and
 "Two devices owning a room".
 
-- **Write the 1.8.0 release notes** in `docs/index.html` before tagging. A
-  cross-machine checklist for the cut-over was written and not run;
-  `git log --all -- docs/release-checklist-1.8.0.md` finds it if it is wanted.
+The release notes are in `docs/index.html`; check the date against the tag.
+What only a run between two machines can show, each with both on 1.8.0
+unless it says otherwise:
+
+- **The cut-over**, from 1.7.8 and beside 1.7.4. A checklist was written and
+  not run; `git log --all -- docs/release-checklist-1.8.0.md` finds it.
+- **Room mail:** a message to a member who has gone offline shows *Waiting in
+  their mailbox* after its first two minutes, arrives when they come back, and
+  turns delivered; to a member on 1.7.8 it is never left.
+- **Disappearing private messages:** each side deletes at its time, and a
+  member on 1.7.8 keeps its copy.
+- **A friend's slot for a friends-only file** granted over the secure dial
+  (`secure_push_grant_target`): the friend's download adopts it and the file
+  is served. Nothing else exercises that dial for an upload grant.
+- **Searching all of a friend's files** (`EBR2`): a friend sharing more than
+  1,000 files is searched whole, and one on 1.7.8 is listed and filtered as
+  before.
 
 ## 2. Privacy
 
@@ -50,14 +64,15 @@ owning a room stay on one key. The 1.7 sending paths are gone; reading 15,
 
 ## 3. Rooms and private messages
 
-- **Offline delivery of room private messages** through the chat mailbox
-  (`derive_chat_mailbox_box` already works for any two identities). Today a
-  message reaches only a recipient online within the 10-minute relay window,
-  and ends "Not delivered" after 20 minutes of resends.
-- **Disappearing-message timers** for room private messages, as friend chat
-  has.
-- **An end-to-end test of private messages** over two network loops. The
-  receive path is covered only by its parts' tests.
+- **Room mail for a stranger's first message.** From 1.8.0 a member collects
+  room mail only from the conversations it has, so a first message still needs
+  its recipient online. Collecting from every member of every room would be
+  hundreds of boxes a round; a member could instead name, in its presence,
+  that it takes first messages by mail, which needs a field the frozen
+  presence record does not have.
+- **A test of private messages through two network loops,** for the routing
+  and pacing. The wire and storage path between two members, room mail
+  included, is covered by `a_private_message_goes_end_to_end_between_two_members`.
 - **Room transfers: check block-protocol data as it arrives.** The direct
   stream verifies every 256 KiB chunk before writing it; the block protocol
   (the fallback) hashes only the finished file, so an accepted sender can waste
@@ -65,20 +80,12 @@ owning a room stay on one key. The 1.7 sending paths are gone; reading 15,
   each 256 KiB run as it completes, re-requesting only a bad run. Needs a new
   frame and a version bump on both ends, so it suits a release that changes
   formats. Detail: `archived-plans/post-1.7.0.md` item 2.
-- **Room transfers: replay protection for control frames (low).** Transfer
-  frames carry no sequence number. A member an offer was forwarded through can
-  replay it once the recipient has forgotten the transfer (180 s after it
-  ended) and put the prompt up again; accepting only stalls. An offer
-  timestamp under the pairwise tag would let the recipient refuse one older
-  than the offer window. Detail: `archived-plans/post-1.7.0.md` item 3.
 - **Tune Discover's spam folding from real use.** `LIKELY_SPAM_SCORE` and
   `DUPLICATE_NAME_FLOOD` stay as they are until reports of folded good rooms,
   or spam that gets through, say otherwise.
 
 ## 4. Feeds
 
-- **"Feeds" on a friend's card, and feed cards in room messages,** with a
-  Follow button.
 - **Carry a feed to another device of the same identity.** The format allows
   several devices to publish one feed (the clock-based `sequence` makes the
   latest publish win), but nothing carries a feed's salt and items to a second
@@ -99,60 +106,26 @@ owning a room stay on one key. The 1.7 sending paths are gone; reading 15,
 
 ## 5. Friends
 
-- **Filter a friend's browse on the wire, and browse past 1,000 files.** A
-  browse answer stops at 1,000 files and 400 KiB, and today's filter runs on
-  the client, so browsing a friend with 40,000 files filters an arbitrary
-  thousand. Designed in `ember-dht.md`, item 6:
-  - Feature bits on the Ember hello (`flags & 0x02`, then a `u32`), so a peer
-    learns what the other speaks before sending; reusable by every later
-    friend-session feature.
-  - A new request marker, `EBR2` with a filter block, sent only to a peer that
-    advertised the bit. `browse_request_supports_v1` compares the whole payload
-    for equality, so appending to `EBR1` would make an old friend answer in the
-    pre-v1 format.
-  - `ValueConstraints` as the filter, applied before the caps, with
-    `total_matched` in the answer so the dialog can say "showing 1,000 of
-    3,400".
-  - A rate limit stamped before the walk, as `EMBER_FRIEND_CONTACT_SERVE_INTERVAL`
-    is.
-
-  Once that is in, the `EBR2` answer is also where a folder view (folder paths
-  relative to the shared folder, opt-in, since they are a privacy decision) and
-  media details (duration, bitrate) would go.
+- **A folder view and media details in a friend's browse.** 1.8.0 filters a
+  browse on the wire (`EBR2`, sent to a friend that announced
+  `EMBER_FEATURE_FILTERED_BROWSE`); its answer is the v1 one. Folder paths
+  relative to the shared folder (opt-in, since they are a privacy decision)
+  and media details (duration, bitrate) would go in a field the answer gains,
+  announced by a feature bit of their own.
 - **Check friend meets on real restricted NATs.** 1.7.6 resends the first
   handshake message and carries the Noise key in the meet. Tests replay the
   failure, but no meet has run between two real restricted NATs. Compare
   `ember_dht_friend_meets` with `ember_dht_friend_meets_converted` in
   Diagnostics; conversions should be close to meets for friends not behind a
   symmetric NAT.
-- **Decide whether the popped-out chat reopens at launch.** Relaunching with
-  the chat popped out remembers the mode but opens no window until a
-  conversation is opened.
 
 ## 6. Downloads, uploads and sharing
 
-- **Keep verified web mirrors with the finished file.** When a download
-  finishes its mirrors are dropped, so Copy eD2K Link on the finished file
-  carries none. Keep a mirror that filled at least one part that passed its
-  hash check and was never blamed for a corrupt one, at most 5 per file in a
-  table keyed by file hash, and have Copy eD2K Link append them as
-  `|s=<url>|`, which eMule reads too. Deleting the file drops them. A switch
-  leaves them out of copied links, since a mirror URL can name the user's own
-  server. Detail: `archived-plans/post-1.7.5.md` item 6, step 2.
-- **Grant a friend's slot for a friends-only file over a secure dial.** A
-  disconnected HighID waiter is dialled for its slot over plain eD2K, which
-  is never served a friends-only file, so a friend waiting for one loses its
-  row when its turn comes and queues again from the back. Skipping the dial
-  does not help: the friend's re-asks arrive by UDP and are answered with a
-  rank, and only an unanswered UDP re-ask makes it reconnect over TCP. The fix
-  is to dial such a waiter with `secure_friend_ember_hash` set from its proven
-  Ember key, so the session is authenticated and the file is served. Needs a
-  run between two machines, since nothing else exercises that dial for an
-  upload grant.
-- **eMule import: offer eMule's one-folder sharing.** eMule shares exactly the
-  folders listed; Ember shares a folder with its subfolders. The import warns
-  and lets each folder be unticked, but cannot import a folder the eMule way.
-  Offer "without subfolders" per imported folder, reusing the allowlist.
+- **A folder shared from eMule keeps up with new files.** An eMule import
+  that shares a folder without its subfolders takes an allowlist of the files
+  in it then; a file added later waits to be shared, where eMule would share
+  it. Matching eMule needs a share that is flat rather than listed, a setting
+  of its own the indexer walks one level deep.
 
 ## 7. The Ember network
 
@@ -173,8 +146,10 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
 - **Find out why rendezvous adverts do not become contacts.** On the 1.7.6
   run, 11 of 20 listed peers matched no contact. They are probably stale
   adverts or changed addresses, but if they are reachable nodes failing to
-  join, that is a real loss. A debug line per listed peer the bridge tries, and
-  how it ended, would settle it in one run.
+  join, that is a real loss. From 1.8.0 each listed peer gets a debug line
+  saying why it is or is not dialable, then its ping and its answer
+  (`Ember rendezvous advert` under `RUST_LOG=debug`); one run with those read
+  settles it.
 
 **Waiting on a number:**
 
@@ -229,8 +204,6 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
 - **Retire the legacy QUIC listener.** It stays on the TCP port number for
   relays that dial a KAD-only source there. It can go once those sources have
   a relay target of their own.
-- **A storer-side replication heartbeat,** to sit beside the publish side's
-  per-minute `Ember publish cycle` log line.
 
 ## 8. Updates and releases
 
@@ -261,7 +234,11 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   an explicit message boundary. It is a redesign rather than code motion, so it
   needs integration testing against live peers. `command.rs` is separable and
   `NetworkDeps` gives the entry point a real signature.
-- **Longer fuzz and property tests in CI,** and overnight soak runs.
+- **Property tests, and overnight runs of Ember itself.** The fuzz loops run
+  200 times longer each night from a new seed (`soak.yml`, `src/fuzz.rs`);
+  what they do not cover is invariants across a sequence of operations (the
+  routing table, the publish queue) and a build left running against the
+  live network.
 - **Find out why most known peers show verification as Needed.** SecureIdent is
   per session, which explains part of it. Run 30 to 60 minutes with
   `RUST_LOG=info,ember_lib::network::ed2k::transfer=debug` and compare each
@@ -271,12 +248,11 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
 
 ## 10. Translations
 
-- **Three Russian plurals read wrongly for 21, 31 and so on:**
-  `channels_reactors_others_one`, `statusbar_epx_title_active_one_one` and
-  `transfers_confirm_batch_cancel_mixed_one_one`. Each carries two counts or a
-  count in another form, so the 1.7.6 fix (`oneShowsCount` in
-  `src/lib/plural.ts`) does not fit them. They need rewording, ideally by a
-  native speaker.
+- **A native speaker's read of the 1.8.0 Russian and Polish plurals.** The
+  source-exchange tooltip and the cancel-and-remove confirmation now carry a
+  form for 2 to 4 and show the count in their singular, which serves 21, 31
+  and so on; `channels_reactors_others_*` needed nothing, as `ещё {count}`
+  takes no noun.
 
 ## Considered and dropped
 

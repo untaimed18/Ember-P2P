@@ -665,6 +665,7 @@ pub(in crate::network) async fn on_upload_event(
             // queue and leave no room for it.
             if still_friend {
                 on_friend_session_for_mailbox(state, settings, *ember_hash).await;
+                announce_ember_features(state, *ember_hash).await;
                 chat_attach::on_friend_session(state, *ember_hash).await;
                 send_friend_status(state, settings, &ed25519_secret_key, *ember_hash).await;
                 crate::network::settings::announce_nickname_to_friend(
@@ -844,6 +845,7 @@ pub(in crate::network) async fn on_upload_event(
                 // Whether we collect goes first, for the reason the
                 // outbound arm gives.
                 on_friend_session_for_mailbox(state, settings, *ember_hash).await;
+                announce_ember_features(state, *ember_hash).await;
                 chat_attach::on_friend_session(state, *ember_hash).await;
                 send_friend_status(state, settings, &ed25519_secret_key, *ember_hash).await;
                 if settings.chat_allowed_with(ember_hash) {
@@ -1182,8 +1184,15 @@ pub(in crate::network) async fn on_upload_event(
         ref reply_tx,
         supports_ebr1,
         supports_scope,
+        ref filter,
     } = event.kind
     {
+        // Stamped before the walk, as a friend's contact ask is: a request is
+        // cheap to send and its answer is a walk of every shared file.
+        if !browse_serve_allowed(&browse_eh) {
+            debug!("Browse request from {} refused: asking too fast", hex::encode(browse_eh));
+            return;
+        }
         // Mutual, not merely listed. The UI already hides Browse
         // until a friendship is mutual, but that is cosmetic: the
         // wire has to enforce it, or anyone who learns our Ember
@@ -1225,8 +1234,13 @@ pub(in crate::network) async fn on_upload_event(
             // what was added most recently rather than index order; and
             // one row per hash, so copies of a file in two shared folders
             // don't spend two of the answer's slots.
-            let mut visible: Vec<&FileInfo> =
-                files.iter().filter(|f| f.is_friend_visible()).collect();
+            // A filtered request's filter comes before the caps and the total,
+            // or a large library would still answer with an arbitrary thousand.
+            let mut visible: Vec<&FileInfo> = files
+                .iter()
+                .filter(|f| f.is_friend_visible())
+                .filter(|f| filter.as_ref().is_none_or(|filter| filter.admits(&f.name, f.size, &f.hash)))
+                .collect();
             visible.sort_by_key(|f| std::cmp::Reverse(f.modified_at));
             let mut seen_hashes: std::collections::HashSet<[u8; 16]> =
                 std::collections::HashSet::new();
@@ -1571,6 +1585,13 @@ pub(in crate::network) async fn on_upload_event(
                 obj
             })
             .collect();
+        // Read off the head before it completes: the friend narrowed this
+        // answer to the filter itself, and the total counts its matches.
+        let filtered = state
+            .pending_browse_requests
+            .get(&browse_eh)
+            .and_then(|queue| queue.front())
+            .is_some_and(|head| head.session_id == session_id && head.dispatched && head.filtered);
         match complete_browse_request(
             &mut state.pending_browse_requests,
             browse_eh,
@@ -1588,6 +1609,7 @@ pub(in crate::network) async fn on_upload_event(
                         "request_id": request_id,
                         "files": files,
                         "total": total,
+                        "filtered": filtered,
                     }));
                 }
                 dispatch_browse_head(state, app_handle, browse_eh).await;

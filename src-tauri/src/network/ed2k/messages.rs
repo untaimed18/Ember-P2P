@@ -342,6 +342,12 @@ pub const EMBER_EXT_DHT_MEET: u8 = 0x0D;
 /// session that has sent this.
 pub const EMBER_EXT_BROWSE_SCOPE_AWARE: u8 = 0x0E;
 
+/// [`OP_EMBER_EXT`] sub-type: the `EMBER_FEATURE_*` bits the sender answers,
+/// as a `u32` LE, sent when a friend session comes up. The Ember hello carries
+/// the same word, but not every friend session exchanges one. A build before
+/// 1.8.0 logs and ignores it.
+pub const EMBER_EXT_FEATURES: u8 = 0x17;
+
 /// [`OP_EMBER_EXT`] sub-type: the sender's disappearing-message timer for
 /// something they just sent — a chat message, named by its body hash, or an
 /// attachment, named by its transfer id. Body is the chat AEAD envelope over
@@ -868,6 +874,9 @@ pub struct PeerCapabilities {
     /// Ed25519 public key for Ember auth, from the same private handshake as
     /// `ember_hash`. The `ET_EMBER_PUBKEY` EmuleInfo harvest was removed too.
     pub ember_pubkey: Option<[u8; 32]>,
+    /// Feature bits from the same handshake (`EMBER_FEATURE_*`); 0 for a peer
+    /// before 1.8.0 or one that is not Ember.
+    pub ember_features: u32,
 }
 
 pub fn build_hello_with_buddy_opts(
@@ -1311,6 +1320,11 @@ pub fn build_emule_info(
 /// - mod_version_len(u16) + mod_version_utf8(...)
 /// - nickname_len(u16) + nickname_utf8(...)
 /// - if flags & 0x01: ed25519_pubkey(32)
+/// - if flags & 0x02: features(u32), the [`EMBER_FEATURES`] this build answers
+///
+/// The feature word is additive: [`parse_ember_hello`] has never required the
+/// payload to end after the pubkey, so builds before 1.8.0 read every field
+/// they know and ignore it.
 ///
 /// `nickname` is the name the Hello carried, site tag and all; an Ember peer
 /// is given it without the tag, which is only for eMule users.
@@ -1322,11 +1336,11 @@ pub fn build_ember_hello(
     let mod_version = format!("Ember {}", env!("CARGO_PKG_VERSION"));
     let mod_bytes = mod_version.as_bytes();
     let nick_bytes = crate::types::without_nickname_site_tag(nickname).as_bytes();
-    let mut buf = Vec::with_capacity(2 + 16 + 2 + mod_bytes.len() + 2 + nick_bytes.len() + 32);
+    let mut buf = Vec::with_capacity(2 + 16 + 2 + mod_bytes.len() + 2 + nick_bytes.len() + 32 + 4);
 
     buf.write_u8(0x01).unwrap(); // version
-    buf.write_u8(if ed25519_pubkey.is_some() { 0x01 } else { 0x00 })
-        .unwrap();
+    let pubkey_flag = if ed25519_pubkey.is_some() { 0x01 } else { 0x00 };
+    buf.write_u8(pubkey_flag | EMBER_HELLO_FLAG_FEATURES).unwrap();
     buf.write_all(ember_hash).unwrap();
     buf.write_u16::<LittleEndian>(mod_bytes.len().min(u16::MAX as usize) as u16)
         .unwrap();
@@ -1339,8 +1353,23 @@ pub fn build_ember_hello(
     if let Some(pk) = ed25519_pubkey {
         buf.write_all(pk).unwrap();
     }
+    buf.write_u32::<LittleEndian>(EMBER_FEATURES).unwrap();
     buf
 }
+
+/// `OP_EMBER_HELLO` flag: a `u32` of feature bits follows the optional pubkey.
+const EMBER_HELLO_FLAG_FEATURES: u8 = 0x02;
+
+/// Feature bit: answers an `EBR2` browse request, filtered before the caps.
+pub const EMBER_FEATURE_FILTERED_BROWSE: u32 = 1 << 0;
+/// Feature bit: adopts a slot grant that arrives over a secure friend dial
+/// into the download queued for it, as a plain push-grant is. A friend waiting
+/// for a friends-only file can only be granted its slot that way.
+pub const EMBER_FEATURE_SECURE_PUSH_GRANT: u32 = 1 << 1;
+
+/// The feature bits this build advertises. A bit is set only alongside the
+/// code that answers it: a peer that reads one will send what it names.
+pub const EMBER_FEATURES: u32 = EMBER_FEATURE_FILTERED_BROWSE | EMBER_FEATURE_SECURE_PUSH_GRANT;
 
 /// Parsed contents of an `OP_EMBER_HELLO` / `OP_EMBER_HELLOANSWER` payload.
 #[derive(Debug, Clone, Default)]
@@ -1349,6 +1378,8 @@ pub struct EmberIdentity {
     pub mod_version: String,
     pub nickname: String,
     pub ed25519_pubkey: Option<[u8; 32]>,
+    /// Feature bits the peer advertised; 0 from a build before 1.8.0.
+    pub features: u32,
 }
 
 /// Parse the Ember-private handshake packet built by [`build_ember_hello`].
@@ -1382,24 +1413,35 @@ pub fn parse_ember_hello(payload: &[u8]) -> Option<EmberIdentity> {
         return None;
     }
     let nickname = String::from_utf8_lossy(&payload[p..p + nick_len]).to_string();
-    cursor.set_position((p + nick_len) as u64);
+    let mut p = p + nick_len;
     let ed25519_pubkey = if (flags & 0x01) != 0 {
-        let p = cursor.position() as usize;
         if p + 32 > payload.len() {
             None
         } else {
             let mut pk = [0u8; 32];
             pk.copy_from_slice(&payload[p..p + 32]);
+            p += 32;
             Some(pk)
         }
     } else {
         None
+    };
+    // A short or missing word reads as no features rather than refusing the
+    // hello: the identity fields above are what the handshake depends on.
+    let features = if (flags & EMBER_HELLO_FLAG_FEATURES) != 0 {
+        payload
+            .get(p..p + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0)
+    } else {
+        0
     };
     Some(EmberIdentity {
         ember_hash,
         mod_version,
         nickname,
         ed25519_pubkey,
+        features,
     })
 }
 
@@ -2636,6 +2678,7 @@ pub fn merge_caps(base: &mut PeerCapabilities, update: PeerCapabilities) {
     if update.ember_pubkey.is_some() {
         base.ember_pubkey = update.ember_pubkey;
     }
+    base.ember_features |= update.ember_features;
 
     // No `is_ember` corroboration check needed anymore — `parse_hello_*`
     // and `parse_emule_info` no longer set `is_ember` from bit-20 or
@@ -3947,6 +3990,35 @@ mod tests {
         assert_eq!(parsed_nopk.ember_hash, hash);
         assert_eq!(parsed_nopk.nickname, "bob");
         assert_eq!(parsed_nopk.ed25519_pubkey, None);
+    }
+
+    /// The feature word rides after the pubkey, or after the nickname when
+    /// there is none, and a hello from before 1.8.0 reads as no features.
+    #[test]
+    fn ember_hello_features_are_additive() {
+        let hash = [0x42u8; 16];
+        let pk = [0xAAu8; 32];
+        for pubkey in [Some(&pk), None] {
+            let payload = build_ember_hello(&hash, "alice", pubkey);
+            let parsed = parse_ember_hello(&payload).expect("must parse");
+            assert_eq!(parsed.features, EMBER_FEATURES);
+            assert_eq!(parsed.ed25519_pubkey, pubkey.copied());
+
+            // What a 1.7 build sends: the same fields, bit 1 clear and no word.
+            let mut old = payload[..payload.len() - 4].to_vec();
+            old[1] &= !EMBER_HELLO_FLAG_FEATURES;
+            let parsed_old = parse_ember_hello(&old).expect("must parse");
+            assert_eq!(parsed_old.features, 0);
+            assert_eq!(parsed_old.ember_hash, parsed.ember_hash);
+            assert_eq!(parsed_old.nickname, parsed.nickname);
+            assert_eq!(parsed_old.ed25519_pubkey, parsed.ed25519_pubkey);
+
+            // A truncated word costs the features, never the identity.
+            let short = &payload[..payload.len() - 2];
+            let parsed_short = parse_ember_hello(short).expect("must parse");
+            assert_eq!(parsed_short.features, 0);
+            assert_eq!(parsed_short.ed25519_pubkey, pubkey.copied());
+        }
     }
 
     #[test]

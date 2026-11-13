@@ -244,7 +244,7 @@ pub async fn send_room_dm(
     rand::rngs::OsRng.fill_bytes(&mut id);
     let message_id = hex::encode(id);
     let (task_member, task_text, task_id) = (member.clone(), text.clone(), message_id.clone());
-    let channel = blocking(
+    let (channel, ttl_secs) = blocking(
         move || {
             let channel = match send_route(&db, &key, &task_member, &ours, now)? {
                 Ok(channel) => channel,
@@ -272,13 +272,17 @@ pub async fn send_room_dm(
                 refund_dm_send(&channel);
             }
             recorded?;
-            Ok(Ok(channel))
+            let ttl_secs = db.dm_disappear_secs(&task_member)?;
+            if ttl_secs > 0 {
+                db.dm_set_sent_timer(&task_member, &task_id, ttl_secs)?;
+            }
+            Ok(Ok((channel, ttl_secs)))
         },
         "channels_dm_failed",
         "Could not send the message",
     )
     .await??;
-    send_frame(&state, &channel, key, DmPayload::Message { id, text: text.clone() });
+    send_message_frames(&state, &channel, key, id, text.clone(), ttl_secs);
     Ok(DmMessage {
         message_id,
         member_pubkey: member,
@@ -287,7 +291,56 @@ pub async fn send_room_dm(
         timestamp: now,
         status: "sending".into(),
         seq: 0,
+        ttl_secs,
+        expires_at: 0,
+        mailboxed: false,
     })
+}
+
+/// A message of ours, and its timer after it when it has one. Every attempt
+/// sends both: whichever copy of the message arrives, its timer follows.
+fn send_message_frames(state: &AppState, channel: &str, member: [u8; 32], id: [u8; 16], text: String, ttl_secs: i64) {
+    send_frame(state, channel, member, DmPayload::Message { id, text });
+    if ttl_secs > 0 {
+        let ttl_secs = u32::try_from(ttl_secs).unwrap_or(u32::MAX);
+        send_frame(state, channel, member, DmPayload::Expire { id, ttl_secs });
+    }
+}
+
+/// The disappearing-message timer chosen for the conversation with `member`,
+/// in seconds; 0 for none.
+#[tauri::command]
+pub async fn get_room_dm_disappear(state: tauri::State<'_, AppState>, member: String) -> Result<i64, String> {
+    let member = member_hex(&member)?;
+    let db = state.db.clone();
+    blocking(move || db.dm_disappear_secs(&member), "channels_dm_failed", "Could not read private messages").await
+}
+
+/// Choose the timer for what is sent to `member` from now on: one of the
+/// choices friend chat offers, or 0 for none. Messages already sent keep theirs.
+#[tauri::command]
+pub async fn set_room_dm_disappear(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    member: String,
+    ttl_secs: i64,
+) -> Result<(), String> {
+    let member = member_hex(&member)?;
+    let offered = ttl_secs == 0
+        || u32::try_from(ttl_secs).is_ok_and(|secs| crate::types::CHAT_DISAPPEAR_CHOICES.contains(&secs));
+    if !offered {
+        return Err(coded("channels_dm_failed", "Could not update private messages"));
+    }
+    let db = state.db.clone();
+    let task_member = member.clone();
+    blocking(
+        move || db.set_dm_disappear_secs(&task_member, ttl_secs),
+        "channels_dm_failed",
+        "Could not update private messages",
+    )
+    .await?;
+    let _ = app.emit(DM_THREAD_EVENT, serde_json::json!({ "member_pubkey": member }));
+    Ok(())
 }
 
 /// Accept or decline someone's first messages. They are told either way.
@@ -332,7 +385,17 @@ pub async fn mark_room_dm_read(
     let member = member_hex(&member)?;
     let db = state.db.clone();
     let task_member = member.clone();
-    blocking(move || db.dm_mark_read(&task_member), "channels_dm_failed", "Could not update private messages").await?;
+    let now = chrono::Utc::now().timestamp();
+    // What they sent with a timer starts running once it has been read.
+    blocking(
+        move || {
+            db.dm_mark_read(&task_member)?;
+            db.dm_start_read_timers(&task_member, now)
+        },
+        "channels_dm_failed",
+        "Could not update private messages",
+    )
+    .await?;
     // The other window's counts follow from this.
     let _ = app.emit(DM_THREAD_EVENT, serde_json::json!({ "member_pubkey": member }));
     Ok(())
@@ -554,7 +617,7 @@ pub fn spawn_resends(app: tauri::AppHandle) {
                 ) else {
                     continue;
                 };
-                send_frame(&state, &room, key, DmPayload::Message { id, text: resend.text });
+                send_message_frames(&state, &room, key, id, resend.text, resend.ttl_secs);
             }
         }
     });

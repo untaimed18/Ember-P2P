@@ -503,6 +503,21 @@ pub fn format_ed2k_link_ext(
     ember_hex: Option<&str>,
     sources: &[(String, u16)],
 ) -> String {
+    format_ed2k_link_with_mirrors(name, size, hash, aich_hex, ember_hex, &[], sources)
+}
+
+/// [`format_ed2k_link_ext`] with `mirrors` as `s=` web sources, before the
+/// closing `/` where eMule reads them (`ED2KLink.cpp`). A `|` in a URL would
+/// end the field, so it goes out as `%7C`, which names the same resource.
+pub fn format_ed2k_link_with_mirrors(
+    name: &str,
+    size: u64,
+    hash: &str,
+    aich_hex: Option<&str>,
+    ember_hex: Option<&str>,
+    mirrors: &[String],
+    sources: &[(String, u16)],
+) -> String {
     let mut link = format!(
         "ed2k://|file|{}|{}|{}|",
         percent_encode_ed2k(name),
@@ -521,6 +536,11 @@ pub fn format_ed2k_link_ext(
     {
         link.push_str("eh=");
         link.push_str(&digest.to_lowercase());
+        link.push('|');
+    }
+    for mirror in mirrors {
+        link.push_str("s=");
+        link.push_str(&mirror.replace('|', "%7C"));
         link.push('|');
     }
     link.push('/');
@@ -986,6 +1006,35 @@ mod link_tests {
         let named = format!("ed2k://|file|s=trick|9|{HASH}|/");
         assert!(ed2k_link_web_sources(&named).is_empty());
         assert!(ed2k_link_web_sources("ed2k://|server|1.2.3.4|4661|/").is_empty());
+    }
+
+    /// Kept mirrors go out where eMule and this parser read them, a `|` in
+    /// one cannot cut the link short, and sources still follow the `/`.
+    #[test]
+    fn mirrors_written_into_a_link_read_back_as_its_web_sources() {
+        let mirrors = vec![
+            "https://mirror.example/a.bin".to_string(),
+            "https://odd.example/a|b.bin".to_string(),
+        ];
+        let sources = vec![("1.2.3.4".to_string(), 4662)];
+        let link = format_ed2k_link_with_mirrors("a.bin", 9, HASH, None, None, &mirrors, &sources);
+        assert_eq!(
+            link,
+            format!(
+                "ed2k://|file|a.bin|9|{}|s=https://mirror.example/a.bin|s=https://odd.example/a%7Cb.bin|/|sources,1.2.3.4:4662|/",
+                HASH.to_uppercase()
+            )
+        );
+        assert_eq!(
+            ed2k_link_web_sources(&link),
+            vec!["https://mirror.example/a.bin", "https://odd.example/a%7Cb.bin"]
+        );
+        let (name, size, hash, _, _) = parse_ed2k_link_strict(&link).expect("parse");
+        assert_eq!((name.as_str(), size, hash.as_str()), ("a.bin", 9, HASH));
+        assert_eq!(
+            format_ed2k_link_with_mirrors("a.bin", 9, HASH, None, None, &[], &[]),
+            format_ed2k_link_ext("a.bin", 9, HASH, None, None, &[])
+        );
     }
 
     #[test]

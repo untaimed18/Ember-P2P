@@ -3104,6 +3104,13 @@ async fn chat_mailbox_post(
     .map_err(|_| format!("chat mailbox {route} timed out"))?
 }
 
+/// Whether a [`chat_mailbox_put`] error is the server refusing the box, or
+/// this sender's address, room for more (507), rather than being busy or
+/// unreachable: other boxes may still take theirs.
+pub fn chat_mailbox_full(error: &str) -> bool {
+    error.contains(": status 507")
+}
+
 /// Leave a sealed entry in `mailbox`. Returns the id the server filed it
 /// under, which deleting it again takes.
 pub async fn chat_mailbox_put(
@@ -3169,6 +3176,20 @@ pub async fn chat_mailbox_delete(
     )
     .await
     .map(|_| ())
+}
+
+#[cfg(test)]
+mod chat_mailbox_tests {
+    use super::chat_mailbox_full;
+
+    #[test]
+    fn only_a_refused_box_is_full() {
+        let status = |code: reqwest::StatusCode| format!("chat mailbox /v4/chat-mailbox/put: status {code}");
+        assert!(chat_mailbox_full(&status(reqwest::StatusCode::INSUFFICIENT_STORAGE)));
+        assert!(!chat_mailbox_full(&status(reqwest::StatusCode::SERVICE_UNAVAILABLE)));
+        assert!(!chat_mailbox_full(&status(reqwest::StatusCode::TOO_MANY_REQUESTS)));
+        assert!(!chat_mailbox_full("chat mailbox /v4/chat-mailbox/put timed out"));
+    }
 }
 
 /// Poll tickets addressed to this registered identity. The server never

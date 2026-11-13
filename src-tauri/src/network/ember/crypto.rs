@@ -725,6 +725,7 @@ const CHAT_MAILBOX_PURPOSE: &[u8] = b"chat-mailbox-v1\0";
 const CHAT_MAILBOX_MAGIC: &[u8; 4] = b"MBX1";
 const CHAT_MAILBOX_KIND_MESSAGE: u8 = 1;
 const CHAT_MAILBOX_KIND_RECEIPT: u8 = 2;
+const CHAT_MAILBOX_KIND_DECLINE: u8 = 3;
 /// `magic(4) || box(32) || kind(1) || body_len(2)`, before the body.
 const CHAT_MAILBOX_HEADER_LEN: usize = 4 + 32 + 1 + 2;
 const CHAT_ID_MAGIC: &[u8; 4] = b"CID1";
@@ -751,6 +752,24 @@ pub fn derive_chat_mailbox_box(
     derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, day)
 }
 
+const ROOM_DM_MAILBOX_PURPOSE: &[u8] = b"room-dm-mailbox-v1\0";
+
+/// [`derive_chat_mailbox_box`] for private messages between room members,
+/// under a purpose of its own: a box of one is never a box of the other, so
+/// a member who later becomes a friend cannot collect room mail as chat, and
+/// every blob binds the box it was left in.
+pub fn derive_room_dm_mailbox_box(
+    our_ed25519_seed: &[u8; 32],
+    peer_ed25519_pubkey: &[u8; 32],
+    recipient_ed25519_pubkey: &[u8; 32],
+    day: i64,
+) -> Option<[u8; 32]> {
+    let mut purpose = Vec::with_capacity(ROOM_DM_MAILBOX_PURPOSE.len() + 32);
+    purpose.extend_from_slice(ROOM_DM_MAILBOX_PURPOSE);
+    purpose.extend_from_slice(recipient_ed25519_pubkey);
+    derive_pairwise_capability(our_ed25519_seed, peer_ed25519_pubkey, &purpose, day)
+}
+
 /// What a sealed mailbox entry carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MailboxPayload {
@@ -764,6 +783,9 @@ pub enum MailboxPayload {
     Receipt {
         msg_ids: Vec<[u8; CHAT_MESSAGE_ID_LEN]>,
     },
+    /// Room mail only: the sender of this declines what we send, as of `at`
+    /// (unix seconds), as a live decline says.
+    Decline { at: i64 },
 }
 
 /// Seal `payload` for the friend at `peer_ed25519_pubkey`, bound to `mailbox`
@@ -799,6 +821,7 @@ pub fn seal_mailbox_payload(
             }
             (CHAT_MAILBOX_KIND_RECEIPT, msg_ids.concat())
         }
+        MailboxPayload::Decline { at } => (CHAT_MAILBOX_KIND_DECLINE, at.to_le_bytes().to_vec()),
     };
     let plain_len = CHAT_MAILBOX_HEADER_LEN + body.len();
     let sealed_len = *CHAT_MAILBOX_BLOB_SIZES
@@ -862,6 +885,9 @@ pub fn open_mailbox_payload(
             let msg_ids = body.as_chunks::<CHAT_MESSAGE_ID_LEN>().0.to_vec();
             Some(MailboxPayload::Receipt { msg_ids })
         }
+        CHAT_MAILBOX_KIND_DECLINE => Some(MailboxPayload::Decline {
+            at: i64::from_le_bytes(body.try_into().ok()?),
+        }),
         _ => None,
     }
 }
@@ -1562,6 +1588,27 @@ mod tests {
         );
     }
 
+    /// Room mail has boxes of its own: the same two members and day give a
+    /// different box than friend chat, and friend collection cannot read it.
+    #[test]
+    fn room_mail_boxes_are_never_friend_chat_boxes() {
+        let (alice_seed, alice_pub, bob_seed, bob_pub) = mailbox_pair();
+        let day = chat_mailbox_day(1_790_000_000);
+        let room = derive_room_dm_mailbox_box(&alice_seed, &bob_pub, &bob_pub, day).unwrap();
+        assert_eq!(derive_room_dm_mailbox_box(&bob_seed, &alice_pub, &bob_pub, day), Some(room));
+        let chat = derive_chat_mailbox_box(&alice_seed, &bob_pub, &bob_pub, day).unwrap();
+        assert_ne!(room, chat);
+        let blob = seal_mailbox_payload(
+            &alice_seed,
+            &bob_pub,
+            &room,
+            &MailboxPayload::Message { msg_id: [1; CHAT_MESSAGE_ID_LEN], ttl_secs: 0, text: "hi".into() },
+        )
+        .unwrap();
+        assert!(open_mailbox_payload(&bob_seed, &alice_pub, &chat, &blob).is_none(), "bound to its box");
+        assert!(open_mailbox_payload(&bob_seed, &alice_pub, &room, &blob).is_some());
+    }
+
     #[test]
     fn a_mailbox_message_and_receipt_round_trip_padded() {
         let (alice_seed, alice_pub, bob_seed, bob_pub) = mailbox_pair();
@@ -1602,6 +1649,11 @@ mod tests {
             open_mailbox_payload(&alice_seed, &bob_pub, &mailbox, &sealed),
             Some(receipt)
         );
+
+        let decline = MailboxPayload::Decline { at: 1_900_000_000 };
+        let sealed = seal_mailbox_payload(&bob_seed, &alice_pub, &mailbox, &decline).unwrap();
+        assert_eq!(sealed.len(), 512);
+        assert_eq!(open_mailbox_payload(&alice_seed, &bob_pub, &mailbox, &sealed), Some(decline));
     }
 
     /// The chat key is the same both ways, so the box inside the seal is what

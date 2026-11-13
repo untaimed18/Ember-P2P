@@ -4646,12 +4646,15 @@
   function batchCancelMixedMessage(count: number, removed: number): string {
     return plural(count, {
       one: () => plural(removed, {
-        one: m.transfers_confirm_batch_cancel_mixed_one_one,
+        one: () => m.transfers_confirm_batch_cancel_mixed_one_one({ removed }),
+        oneShowsCount: true,
+        few: () => m.transfers_confirm_batch_cancel_mixed_one_few({ removed }),
         other: () => m.transfers_confirm_batch_cancel_mixed_one_other({ removed }),
       }),
       other: () => plural(removed, {
         one: () => m.transfers_confirm_batch_cancel_mixed_other_one({ count, removed }),
         oneShowsCount: true,
+        few: () => m.transfers_confirm_batch_cancel_mixed_other_few({ count, removed }),
         other: () => m.transfers_confirm_batch_cancel_mixed_other_other({ count, removed }),
       }),
     });

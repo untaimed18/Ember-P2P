@@ -19,6 +19,8 @@
   } from '$lib/api/friends';
   import { disappearLabel, disappearsIn } from '$lib/chatDisappear';
   import ChatAttachmentBubble from '$lib/components/ChatAttachmentBubble.svelte';
+  import FeedLinkCard from '$lib/components/FeedLinkCard.svelte';
+  import { feedLinksIn } from '$lib/feedLinks';
   import { placeAttachments } from '$lib/chatAttachmentPlacement';
   import {
     deleteChannelMessage,
@@ -3414,6 +3416,8 @@
     mentionsMe: boolean;
     blocks: FormatBlock[];
     long: boolean;
+    /** Feed links in the text, each drawn as a card under it. */
+    feeds: string[];
   };
   let rowCache = new Map<number, CachedRow>();
 
@@ -3491,6 +3495,7 @@
               mentionsMe: msg.direction === 'received' && (pattern?.test(msg.message) ?? false),
               blocks: formatMessage(msg.message),
               long: false,
+              feeds: feedLinksIn(msg.message),
             };
       if (row !== hit) row.long = isLongMessage(row.blocks);
       next.set(msg.id, row);
@@ -3512,7 +3517,7 @@
       return true;
     });
     return messages.map((msg, i) => {
-      const { day, mentionsMe, blocks, long } = derivedRows[i];
+      const { day, mentionsMe, blocks, long, feeds } = derivedRows[i];
       const hasNext = i + 1 < messages.length;
       const newDay = opensDay[i];
       const sameAuthorAsPrev = i > 0 && sameChannelAuthor(messages[i - 1], msg);
@@ -3534,6 +3539,7 @@
         mentionsMe: mentionsMe || repliesToMe,
         blocks,
         long,
+        feeds,
       };
     });
   });
@@ -4096,6 +4102,9 @@
               onclick={() => toggleFold(row.msg.id)}
             >{folded ? m.chat_show_more() : m.chat_show_less()}</button>
           {/if}
+          {#each row.feeds as link (link)}
+            <FeedLinkCard {link} />
+          {/each}
           {/if}
           {#if !isChannel && (endsRun || pending || failed || (row.msg.edited_at ?? 0) > 0 || row.msg.expires_at)}
             {@render messageTimestamp(row.msg)}

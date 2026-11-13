@@ -2046,13 +2046,19 @@ pub(in crate::network) async fn on_download_event(
         let mut sf = spam_filter.write().await;
         sf.auto_mark_not_spam(file_hash);
         drop(sf);
-        // Its mirrors have nothing left to give.
-        if let Some(hash) = parse_ed2k_hash16(file_hash) {
+        // Its mirrors have nothing left to give this download. Those the file
+        // proved stay with it, for a copied link to carry.
+        let proven = parse_ed2k_hash16(file_hash).map_or_else(Vec::new, |hash| {
+            let proven = ed2k::web_sources::proven(&hash);
             ed2k::web_sources::forget(&hash);
-        }
+            proven
+        });
         let db_web = db.clone();
         let fh = file_hash.clone();
         tokio::task::spawn_blocking(move || {
+            if let Err(e) = db_web.keep_library_web_mirrors(&fh, &proven) {
+                debug!("Could not keep the mirrors {fh} proved: {e}");
+            }
             if let Err(e) = db_web.delete_transfer_web_sources(&fh) {
                 debug!("Could not forget the web sources of {fh}: {e}");
             }

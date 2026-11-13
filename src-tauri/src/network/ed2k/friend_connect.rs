@@ -762,8 +762,11 @@ pub async fn run_friend_session_over_transport(
                                             supports_ebr1:
                                                 super::multi_source::browse_request_supports_v1(
                                                     &payload,
+                                                ) || payload.starts_with(
+                                                    super::multi_source::BROWSE_REQUEST_V2_MAGIC,
                                                 ),
                                             supports_scope: peer_scope_aware,
+                                            filter: super::multi_source::browse_request_filter(&payload),
                                         },
                                     }).await;
                                 }
@@ -1118,6 +1121,13 @@ pub async fn run_friend_session_over_transport(
                                         Some((super::messages::EMBER_EXT_BROWSE_SCOPE_AWARE, _)) => {
                                             peer_scope_aware = true;
                                             session_ember_session_handle.mark_honours_friends_only();
+                                        }
+                                        Some((super::messages::EMBER_EXT_FEATURES, body)) => {
+                                            if let Some(word) = body.get(..4) {
+                                                session_ember_session_handle.mark_features(u32::from_le_bytes([
+                                                    word[0], word[1], word[2], word[3],
+                                                ]));
+                                            }
                                         }
                                         Some((super::messages::EMBER_EXT_CHAT_ID, body)) => {
                                             pending_chat_id = crate::network::ember::crypto::decrypt_chat_id(

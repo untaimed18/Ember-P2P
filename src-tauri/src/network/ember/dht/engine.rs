@@ -4592,12 +4592,12 @@ mod tests {
 
     #[test]
     fn handle_message_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xA11C_E11E);
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0xA11C_E11E);
         let mut engine = dht(90);
         let from = addr(90, 4672);
         let noise = [0xEE; 32];
-        for _ in 0..1_000 {
+        for _ in 0..crate::fuzz::rounds(1_000) {
             let len = rng.gen_range(0..=1_024);
             let mut buf = vec![0u8; len];
             rng.fill(&mut buf[..]);

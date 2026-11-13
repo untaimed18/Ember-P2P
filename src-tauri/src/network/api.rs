@@ -488,6 +488,9 @@ pub enum NetworkCommand {
     BrowseFriend {
         ember_hash: [u8; 16],
         request_id: String,
+        /// Sent to a friend that reads one; any other is answered in full,
+        /// for the dialog to filter.
+        filter: Option<crate::network::ed2k::multi_source::BrowseFilter>,
         tx: oneshot::Sender<Result<(), String>>,
     },
     CancelBrowseFriend {

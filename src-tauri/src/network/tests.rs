@@ -5621,6 +5621,64 @@ fn our_own_echoed_source_record_is_not_harvested_as_a_bridge_key() {
 }
 
 #[test]
+fn each_rendezvous_advert_is_told_apart_by_why_it_is_or_is_not_a_contact() {
+    let advert = |ip: Ipv4Addr, udp_port: u16, npub: Option<[u8; 32]>| KadSource {
+        ip,
+        tcp_port: 4662,
+        udp_port,
+        source_type: 1,
+        connect_options: 0,
+        buddy_ip: None,
+        buddy_port: None,
+        buddy_hash: None,
+        source_user_hash: None,
+        lowid: 0,
+        ed2k_server_ip: 0,
+        ed2k_server_port: 0,
+        is_ember_capable: true,
+        ember_noise_pub: npub,
+    };
+    let contact = Ipv4Addr::new(8, 8, 8, 8);
+    let session_peer = Ipv4Addr::new(8, 8, 4, 4);
+    let fresh = Ipv4Addr::new(9, 9, 9, 9);
+    let tried = Ipv4Addr::new(1, 1, 1, 1);
+    let pinned = Ipv4Addr::new(1, 0, 0, 1);
+    let established: HashSet<_> = [(contact, 4672)].into();
+    let session: HashSet<_> = [(session_peer, 4672)].into();
+    let now = std::time::Instant::now();
+    let keys: HashMap<_, _> = [
+        ((fresh, 4672), ([0xAA; 32], now)),
+        ((tried, 4672), ([0xBB; 32], now)),
+        ((pinned, 4672), ([0xCC; 32], now)),
+    ]
+    .into();
+    let attempted: HashMap<_, _> = [((tried, 4672), (now, 3))].into();
+    let status = |s: &KadSource| rendezvous_advert_status(s, &established, &session, &keys, &attempted);
+
+    assert_eq!(status(&advert(contact, 4672, Some([1; 32]))), RendezvousAdvert::Contact);
+    assert_eq!(status(&advert(session_peer, 4672, None)), RendezvousAdvert::Contact);
+    assert_eq!(status(&advert(fresh, 0, Some([0xAA; 32]))), RendezvousAdvert::NoUdpPort);
+    assert_eq!(
+        status(&advert(Ipv4Addr::new(192, 0, 2, 10), 4672, Some([0xDD; 32]))),
+        RendezvousAdvert::Unroutable
+    );
+    assert_eq!(status(&advert(Ipv4Addr::new(5, 5, 5, 5), 4672, None)), RendezvousAdvert::NoNoiseKey);
+    assert_eq!(status(&advert(pinned, 4672, Some([0xEE; 32]))), RendezvousAdvert::KeyConflict);
+    assert_eq!(
+        status(&advert(fresh, 4672, Some([0xAA; 32]))),
+        RendezvousAdvert::Dialable { misses: 0 }
+    );
+    assert_eq!(
+        status(&advert(tried, 4672, Some([0xBB; 32]))),
+        RendezvousAdvert::Dialable { misses: 3 }
+    );
+    assert_eq!(
+        RendezvousAdvert::Dialable { misses: 3 }.to_string(),
+        "dialable, 3 ping(s) unanswered so far"
+    );
+}
+
+#[test]
 fn the_ember_ip_verdict_honours_private_space_and_bans_but_spares_introduced_lan_peers() {
     let public = Ipv4Addr::new(8, 8, 8, 8);
     let lan = Ipv4Addr::new(192, 168, 1, 20);

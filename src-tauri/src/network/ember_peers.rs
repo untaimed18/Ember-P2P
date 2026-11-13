@@ -470,13 +470,115 @@ pub(super) fn ember_established_among(
 pub(super) fn ember_rendezvous_converted_contacts(state: &NetworkState, peers: &[KadSource]) -> usize {
     let established = ember_established_addrs(state);
     let listed: Vec<(Ipv4Addr, u16)> = peers.iter().map(|s| (s.ip, s.udp_port)).collect();
-    let session: HashSet<(Ipv4Addr, u16)> = state
+    let session = ember_verified_session_addrs(state);
+    ember_rendezvous_converted_among(&listed, &established, &session)
+}
+
+/// Addresses of eD2K-session DHT contacts that have answered us.
+pub(super) fn ember_verified_session_addrs(state: &NetworkState) -> HashSet<(Ipv4Addr, u16)> {
+    state
         .ember_session_dht_contacts
         .iter()
         .filter(|(_, c)| c.is_verified())
         .map(|(addr, _)| *addr)
+        .collect()
+}
+
+/// Where one rendezvous-listed peer stands when the lookup that listed it
+/// ends, for the per-advert debug line: whether the bridge can dial it at all,
+/// and if it can, how many of its pings have gone unanswered so far. Read after
+/// the harvest, so a dialable advert's key is already cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RendezvousAdvert {
+    /// Already a contact that has answered us.
+    Contact,
+    /// No address, TCP port or UDP port: the Ember transport cannot reach it.
+    NoUdpPort,
+    /// An address the bridge never dials.
+    Unroutable,
+    /// The record carried no Noise key.
+    NoNoiseKey,
+    /// A live contact at this address holds a different Noise key, which stays pinned.
+    KeyConflict,
+    /// The bridge can dial it; `misses` pings have gone unanswered so far.
+    Dialable { misses: u32 },
+}
+
+impl std::fmt::Display for RendezvousAdvert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Contact => f.write_str("already a contact that has answered"),
+            Self::NoUdpPort => f.write_str("names no UDP port, so it cannot be dialled"),
+            Self::Unroutable => f.write_str("unroutable address, never dialled"),
+            Self::NoNoiseKey => f.write_str("carries no Noise key"),
+            Self::KeyConflict => {
+                f.write_str("its Noise key differs from a live contact's at this address")
+            }
+            Self::Dialable { misses: 0 } => f.write_str("dialable, not pinged yet"),
+            Self::Dialable { misses } => {
+                write!(f, "dialable, {misses} ping(s) unanswered so far")
+            }
+        }
+    }
+}
+
+/// One debug line per rendezvous advert, read once its lookup's keys are
+/// harvested, so the gap between listed peers and contacts can be read off a
+/// single run: never dialable, still unanswered, or a contact already. The
+/// listed addresses are kept so the bridge's own lines follow each dialable one
+/// to its ping and, if it comes, its answer.
+pub(super) fn note_rendezvous_adverts(
+    state: &mut NetworkState,
+    peers: &[KadSource],
+    established: &HashSet<(Ipv4Addr, u16)>,
+) {
+    let session = ember_verified_session_addrs(state);
+    for advert in peers {
+        let status = rendezvous_advert_status(
+            advert,
+            established,
+            &session,
+            &state.ember_noise_keys,
+            &state.ember_kad_bridge_attempted,
+        );
+        debug!(
+            "Ember rendezvous advert {}:{} (TCP {}): {status}",
+            advert.ip, advert.udp_port, advert.tcp_port
+        );
+    }
+    state.ember_rendezvous_listed = peers
+        .iter()
+        .filter(|s| s.udp_port != 0)
+        .map(|s| (s.ip, s.udp_port))
         .collect();
-    ember_rendezvous_converted_among(&listed, &established, &session)
+}
+
+pub(super) fn rendezvous_advert_status(
+    advert: &KadSource,
+    established: &HashSet<(Ipv4Addr, u16)>,
+    session: &HashSet<(Ipv4Addr, u16)>,
+    noise_keys: &HashMap<(Ipv4Addr, u16), ([u8; 32], std::time::Instant)>,
+    attempted: &HashMap<(Ipv4Addr, u16), (std::time::Instant, u32)>,
+) -> RendezvousAdvert {
+    if advert.ip.is_unspecified() || advert.tcp_port == 0 || advert.udp_port == 0 {
+        return RendezvousAdvert::NoUdpPort;
+    }
+    let key = (advert.ip, advert.udp_port);
+    if established.contains(&key) || session.contains(&key) {
+        return RendezvousAdvert::Contact;
+    }
+    if crate::security::is_bogus_v4(advert.ip) {
+        return RendezvousAdvert::Unroutable;
+    }
+    let Some(npub) = advert.ember_noise_pub else {
+        return RendezvousAdvert::NoNoiseKey;
+    };
+    if noise_keys.get(&key).map(|(cached, _)| cached) != Some(&npub) {
+        return RendezvousAdvert::KeyConflict;
+    }
+    RendezvousAdvert::Dialable {
+        misses: attempted.get(&key).map(|(_, n)| *n).unwrap_or(0),
+    }
 }
 
 /// Same membership rule as [`ember_rendezvous_converted_contacts`], for tests
@@ -1772,21 +1874,43 @@ pub(super) async fn send_ember_bridge_ping(
     // user's IP policy or ban list has seen. A firm block is forgotten here so
     // the address stops taking a candidate slot; a ban is rested on the retry
     // backoff like an unanswered dial, since it lifts.
+    let advert = state.ember_rendezvous_listed.contains(&(ip, udp_port));
     match ember_peer_ip_verdict(state, ip, udp_port) {
         EmberIpVerdict::Allowed => {}
         EmberIpVerdict::Blocked => {
+            if advert {
+                debug!("Ember rendezvous advert {ip}:{udp_port}: refused by the IP policy, forgotten");
+            }
             state.ember_noise_keys.remove(&(ip, udp_port));
             state.ember_keyless_peers.remove(&(ip, udp_port));
             state.ember_kad_bridge_attempted.remove(&(ip, udp_port));
             return false;
         }
         EmberIpVerdict::Banned => {
+            if advert {
+                debug!("Ember rendezvous advert {ip}:{udp_port}: banned, left for the retry backoff");
+            }
             note_ember_bridge_attempt(state, ip, udp_port);
             return false;
         }
     }
     let addr = SocketAddr::new(IpAddr::V4(ip), udp_port);
     let sent = send_ember_dht_ping(socket, state, addr, noise_pub).await;
+    if advert {
+        let handshake = if noise_pub.is_some() { "IK" } else { "XX" };
+        match sent {
+            Some(true) => debug!(
+                "Ember rendezvous advert {addr}: pinged over Noise_{handshake} (attempt {})",
+                state
+                    .ember_kad_bridge_attempted
+                    .get(&(ip, udp_port))
+                    .map(|(_, n)| n + 1)
+                    .unwrap_or(1)
+            ),
+            Some(false) => debug!("Ember rendezvous advert {addr}: the ping could not be sent"),
+            None => debug!("Ember rendezvous advert {addr}: our transport declined to build a ping"),
+        }
+    }
     // A peer we never transmitted to has told us nothing, so holding it out of
     // the candidate list for the full retry window spends the bridge's only
     // means of converting a lead on our own transport hiccup. A lost or

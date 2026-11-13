@@ -1956,6 +1956,7 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
                 peers.len(),
                 ember_rendezvous_converted_contacts(state, &peers),
             );
+            note_rendezvous_adverts(state, &peers, &established);
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
             if let Some((target, entries)) = preserved_results.get(sid) {

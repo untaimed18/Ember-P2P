@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, isChatLocked, updateFriendNickname, getMyEmberHash, resetFriendCode, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
+  import { friendsFeeds } from '$lib/api/feeds';
   import { carriesIntroSecret, friendHashFromCode, isAcceptedFriendInput } from '$lib/friendCode';
   import { kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -269,6 +270,20 @@
     openChatTab(f.user_hash, f.nickname || f.user_hash.slice(0, 8) + '\u2026');
   }
 
+  /** Each friend's key and the feeds of theirs this device knows, by hash. */
+  let friendFeeds = $state<Record<string, { publisher: string; known: number }>>({});
+
+  function loadFriendFeeds() {
+    friendsFeeds()
+      .then((found) => { if (!destroyed) friendFeeds = found; })
+      .catch((e) => console.warn('friends: failed to read their feeds:', e));
+  }
+
+  /** Discover, showing this friend's feeds only. */
+  function openFriendFeeds(publisher: string) {
+    void goto(`/feeds?publisher=${encodeURIComponent(publisher)}`).catch(() => {});
+  }
+
   function openBrowse(f: FriendInfo) {
     browseFriendHash = f.user_hash;
     browseFriendName = f.nickname || f.user_hash.slice(0, 8) + '\u2026';
@@ -457,6 +472,7 @@
     loadFriends();
     loadBlocked();
     loadMyHash();
+    loadFriendFeeds();
     isChatLocked()
       .then(v => { if (!destroyed) chatLocked = v; })
       .catch((e) => {
@@ -1492,6 +1508,7 @@
       {@const truncatedId = `${f.user_hash.slice(0, 8)}\u2026${f.user_hash.slice(-6)}`}
       {@const lastAddr = f.last_ip && f.last_port > 0 ? `${f.last_ip}:${f.last_port}` : (f.last_ip || '')}
       {@const shortName = f.nickname || f.user_hash.slice(0, 8)}
+      {@const feeds = friendFeeds[f.user_hash.toLowerCase()]}
       <div class="friend-card" class:editing={editingHash === f.user_hash}>
         <div class="card-avatar">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1592,6 +1609,16 @@
           {#if f.mutual && !isOnline && legacyStrandedFriends.has(f.user_hash.toLowerCase())}
             <span class="card-legacy-hint">{m.friends_legacy_stranded_hint()}</span>
           {/if}
+          {#if (feeds?.known ?? 0) > 0 && feeds}
+            <button type="button" class="card-feeds-link" onclick={() => openFriendFeeds(feeds.publisher)}>
+              {plural(feeds.known, {
+                one: () => m.friends_feeds_known_one({ count: feeds.known }),
+                oneShowsCount: true,
+                few: () => m.friends_feeds_known_few({ count: feeds.known }),
+                other: () => m.friends_feeds_known_other({ count: feeds.known }),
+              })}
+            </button>
+          {/if}
         </div>
 
         <div class="card-controls">
@@ -1662,6 +1689,14 @@
                     ? m.friends_action_browse_files()
                     : m.friends_action_browse_offline()}
               >{m.friends_action_browse_files()}</button>
+              {#if feeds}
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={(e) => { closeCardMenu(e.currentTarget); openFriendFeeds(feeds.publisher); }}
+                  title={m.friends_action_feeds_title()}
+                >{m.friends_action_feeds()}</button>
+              {/if}
               {#if f.mutual && !isOnline}
                 <button
                   type="button"
@@ -2290,6 +2325,21 @@
     font-size: var(--font-size-xs);
     color: var(--warning);
     line-height: 1.35;
+  }
+
+  .card-feeds-link {
+    align-self: flex-start;
+    padding: 0;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--font-size-xs);
+    color: var(--accent);
+    cursor: pointer;
+  }
+
+  .card-feeds-link:hover {
+    text-decoration: underline;
   }
 
   .status-online {

@@ -13,13 +13,18 @@
   import { onMount, tick, untrack } from 'svelte';
   import { get } from 'svelte/store';
   import { goto } from '$app/navigation';
+  import FeedLinkCard from '$lib/components/FeedLinkCard.svelte';
+  import { feedLinksIn } from '$lib/feedLinks';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { CHAT_DISAPPEAR_CHOICES, disappearLabel, disappearsIn } from '$lib/chatDisappear';
   import {
     answerRoomDmRequest,
+    getRoomDmDisappear,
     getRoomDmMessages,
     markRoomDmRead,
     retryRoomDm,
     sendRoomDm,
+    setRoomDmDisappear,
     ROOM_DM_MESSAGE_EVENT,
     ROOM_DM_STATUS_EVENT,
     type RoomDmMessage,
@@ -143,6 +148,33 @@
 
   function rowKey(row: RoomDmMessage): string {
     return `${row.direction}:${row.message_id}`;
+  }
+
+  /** The timer what is sent from now on goes with; 0 for none. */
+  let disappearSecs = $state(0);
+  /** Moves on each half-minute, for the time a timed message has left. */
+  let nowMs = $state(Date.now());
+
+  async function chooseDisappear(secs: number) {
+    const before = disappearSecs;
+    disappearSecs = secs;
+    try {
+      await setRoomDmDisappear(who, secs);
+    } catch (e) {
+      disappearSecs = before;
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
+
+  /** What a timed message's clock says: how long it has left, or the timer
+   *  it will run once delivered (ours) or read (theirs). */
+  function timerText(row: RoomDmMessage): string | null {
+    if (row.expires_at > 0) return disappearsIn(row.expires_at, nowMs);
+    if (row.ttl_secs <= 0) return null;
+    const time = disappearLabel(row.ttl_secs);
+    return row.direction === 'out'
+      ? m.channels_dm_disappear_after_delivery({ time })
+      : m.channels_dm_disappear_after_read({ time });
   }
 
   /** Rows from storage, with any that arrived or were sent while they were
@@ -270,6 +302,17 @@
 
   onMount(() => {
     void load();
+    getRoomDmDisappear(who)
+      .then((secs) => { if (mounted) disappearSecs = secs; })
+      .catch(() => {});
+    // An open conversation drops a message at its time; the sweep deletes it.
+    const clock = setInterval(() => {
+      nowMs = Date.now();
+      const now = Math.floor(nowMs / 1000);
+      if (messages.some((row) => row.expires_at > 0 && row.expires_at <= now)) {
+        messages = messages.filter((row) => !(row.expires_at > 0 && row.expires_at <= now));
+      }
+    }, 30_000);
     // Tells the chat window's presence report, and through it the main
     // window, which conversation is on screen.
     activeChatHash.set(tabKey);
@@ -292,6 +335,9 @@
             timestamp: msg.timestamp,
             status: 'received',
             seq: 0,
+            ttl_secs: 0,
+            expires_at: 0,
+            mailboxed: false,
           };
           messages = merged(messages, [row]);
           void scrollToEnd();
@@ -300,7 +346,9 @@
           const update = event.payload;
           if (update.member_pubkey !== who) return;
           messages = messages.map((row) =>
-            row.direction === 'out' && row.message_id === update.message_id ? { ...row, status: update.status } : row,
+            row.direction === 'out' && row.message_id === update.message_id
+              ? { ...row, status: update.status, mailboxed: update.mailboxed ?? row.mailboxed }
+              : row,
           );
           if (update.status === 'failed') void announceFailed();
         }),
@@ -311,6 +359,7 @@
     return () => {
       alive = false;
       mounted = false;
+      clearInterval(clock);
       unlisten.forEach((fn) => fn());
       document.removeEventListener('visibilitychange', onSeen);
       window.removeEventListener('focus', onSeen);
@@ -402,6 +451,7 @@
   }
 
   function statusLabel(row: RoomDmMessage): string {
+    if (row.status === 'sending' && row.mailboxed) return m.channels_dm_status_mailbox();
     if (row.status === 'sending') return m.channels_dm_status_sending();
     if (row.status === 'delivered') return m.channels_dm_status_delivered();
     if (row.status === 'failed') return m.channels_dm_status_failed();
@@ -449,13 +499,25 @@
     {/if}
     {#each messages as row (rowKey(row))}
       {@const failed = row.direction === 'out' && row.status === 'failed'}
+      {@const timer = timerText(row)}
       <div class="dm-row" class:out={row.direction === 'out'}>
         <div class="dm-bubble" class:failed>
           <p class="dm-text"><bdi dir="auto">{row.text}</bdi></p>
+          {#each feedLinksIn(row.text) as link (link)}
+            <FeedLinkCard {link} />
+          {/each}
           <span class="dm-meta">
             {timeOf(row.timestamp)}
             {#if row.direction === 'out' && row.status !== 'received' && !failed}
               · <span>{statusLabel(row)}</span>
+            {/if}
+            {#if timer}
+              <span class="dm-timer" role="img" title={timer} aria-label={timer}>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="10" height="10" aria-hidden="true">
+                  <circle cx="8" cy="9" r="5.5"/>
+                  <path d="M8 6.2V9l1.8 1.2M6.5 1.8h3"/>
+                </svg>
+              </span>
             {/if}
           </span>
           {#if failed}
@@ -511,6 +573,18 @@
     {#if tooLong}
       <p class="dm-too-long" id={TOO_LONG_ID} role="alert">{m.channels_dm_too_long()}</p>
     {/if}
+    <label class="dm-disappear" title={m.channels_dm_disappear_title()}>
+      <span>{m.channels_dm_disappear_label()}</span>
+      <select
+        value={disappearSecs}
+        onchange={(e) => void chooseDisappear(Number(e.currentTarget.value))}
+      >
+        <option value={0}>{m.chat_disappear_off()}</option>
+        {#each CHAT_DISAPPEAR_CHOICES as secs (secs)}
+          <option value={secs}>{disappearLabel(secs)}</option>
+        {/each}
+      </select>
+    </label>
   {/if}
   <p class="dm-privacy">{m.channels_dm_privacy_hint()}</p>
 </div>
@@ -691,5 +765,25 @@
     margin: 6px 12px 10px;
     color: var(--text-muted);
     font-size: var(--font-size-2xs);
+  }
+
+  .dm-timer {
+    display: inline-flex;
+    margin-left: 4px;
+    vertical-align: -1px;
+  }
+
+  .dm-disappear {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 12px 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+  }
+
+  .dm-disappear select {
+    font: inherit;
+    font-size: var(--font-size-xs);
   }
 </style>

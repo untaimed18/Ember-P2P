@@ -6957,8 +6957,7 @@ pub async fn pick_and_offer_channel_transfer(
     let mut channel_id_bytes = [0u8; 16];
     hex::decode_to_slice(&channel_id, &mut channel_id_bytes)
         .map_err(|_| coded("channels_not_found", "Channel not found"))?;
-    let mut xfer_id = [0u8; 16];
-    OsRng.fill_bytes(&mut xfer_id);
+    let xfer_id = crate::network::ember::channel::mint_xfer_id(chrono::Utc::now().timestamp());
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     state

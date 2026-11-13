@@ -7882,6 +7882,9 @@ async fn download_parts_from_source(
                             hello_caps.ember_pubkey = Some(pk);
                         }
                     }
+                    if !identity_changed {
+                        hello_caps.ember_features = ident.features;
+                    }
                     src_client_software = client_software_from_caps(&hello_caps);
                     debug!(
                         "Source {} identified as Ember via OP_EMBER_HELLO (mod='{}', nick='{}')",
@@ -8604,6 +8607,9 @@ async fn download_parts_from_source(
                     if !identity_changed {
                         hello_caps.ember_pubkey = Some(pk);
                     }
+                }
+                if !identity_changed {
+                    hello_caps.ember_features = ident.features;
                 }
                 src_client_software = client_software_from_caps(&hello_caps);
                 debug!("Source {} identified as Ember via OP_EMBER_HELLO during file-status-wait (mod='{}', nick='{}')",
@@ -15036,6 +15042,80 @@ pub(crate) fn browse_request_supports_v1(payload: &[u8]) -> bool {
     payload == BROWSE_RESPONSE_V1_MAGIC
 }
 
+/// A filtered browse request, from 1.8.0: `EBR2 || name_len(u16 LE) || name
+/// filter (UTF-8) || constraint block`, answered in the v1 format with the
+/// filter applied before the caps. Sent only to a friend that advertised
+/// `EMBER_FEATURE_FILTERED_BROWSE`: to anyone else it is not exactly `EBR1`,
+/// and an unpatched answerer would reply in the format before v1.
+pub(crate) const BROWSE_REQUEST_V2_MAGIC: &[u8; 4] = b"EBR2";
+/// Longest name filter sent or read, in bytes.
+pub(crate) const MAX_BROWSE_FILTER_TEXT: usize = 256;
+
+/// What a filtered browse asks for. The name filter is the browse's own; the
+/// rest is the DHT walk's constraint block, so both read `Video` alike.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BrowseFilter {
+    /// Matched case-insensitively against the name or the hash, as the
+    /// dialog's own filter box matches.
+    pub(crate) text: String,
+    pub(crate) constraints: crate::network::ember::dht::messages::ValueConstraints,
+}
+
+impl BrowseFilter {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.constraints.is_empty()
+    }
+
+    /// Whether a shared file with `name`, `size` and ed2k `hash_hex` passes.
+    /// Size and type as `record_matches_constraints` judges a DHT record.
+    pub(crate) fn admits(&self, name: &str, size: u64, hash_hex: &str) -> bool {
+        let c = &self.constraints;
+        if c.min_size.is_some_and(|min| size < min) || c.max_size.is_some_and(|max| max > 0 && size > max) {
+            return false;
+        }
+        let extension = name.rsplit_once('.').map(|(_, e)| e).unwrap_or_default();
+        if c.file_type.as_ref().is_some_and(|want| crate::search::index::infer_file_type(extension) != *want) {
+            return false;
+        }
+        if c.file_extension.as_ref().is_some_and(|want| !extension.eq_ignore_ascii_case(want)) {
+            return false;
+        }
+        let text = self.text.trim().to_lowercase();
+        text.is_empty() || name.to_lowercase().contains(&text) || hash_hex.to_lowercase().contains(&text)
+    }
+}
+
+pub(crate) fn encode_browse_request_v2(filter: &BrowseFilter) -> Vec<u8> {
+    let mut text = filter.text.trim();
+    while text.len() > MAX_BROWSE_FILTER_TEXT {
+        let mut cut = MAX_BROWSE_FILTER_TEXT;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text = &text[..cut];
+    }
+    let mut out = Vec::with_capacity(4 + 2 + text.len() + 32);
+    out.extend_from_slice(BROWSE_REQUEST_V2_MAGIC);
+    out.extend_from_slice(&(text.len() as u16).to_le_bytes());
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(&crate::network::ember::dht::messages::encode_constraint_block(&filter.constraints));
+    out
+}
+
+/// The filter of an `EBR2` request; `None` for anything else, `EBR1`
+/// included. Compared on its own marker exactly, never as a prefix of
+/// another's, so the next request kind cannot be misread as this one.
+pub(crate) fn browse_request_filter(payload: &[u8]) -> Option<BrowseFilter> {
+    let rest = payload.strip_prefix(BROWSE_REQUEST_V2_MAGIC.as_slice())?;
+    let len = u16::from_le_bytes([*rest.first()?, *rest.get(1)?]) as usize;
+    if len > MAX_BROWSE_FILTER_TEXT {
+        return None;
+    }
+    let text = std::str::from_utf8(rest.get(2..2 + len)?).ok()?.to_string();
+    let constraints = crate::network::ember::dht::messages::decode_constraint_block(&rest[2 + len..]);
+    Some(BrowseFilter { text, constraints })
+}
+
 /// One browse listing row: `(ed2k_hash_hex, size, name, optional_aich_hex, optional_ember_hex)`.
 pub(crate) type BrowseEntry = (String, u64, String, Option<String>, Option<String>);
 
@@ -15273,6 +15353,40 @@ mod browse_response_tests {
         assert!(!encoded.starts_with(BROWSE_RESPONSE_V1_MAGIC));
         assert_eq!(parse_browse_response(&encoded)[0].2, "old.bin");
         assert!(!browse_request_supports_v1(&[]));
+    }
+
+    /// A filtered request reads back as its filter, is never taken for `EBR1`
+    /// (nor `EBR1` for it), and filters as the DHT constraint block does.
+    #[test]
+    fn a_filtered_browse_request_round_trips_and_is_its_own_kind() {
+        use crate::network::ember::dht::messages::ValueConstraints;
+        let filter = BrowseFilter {
+            text: "Holiday".into(),
+            constraints: ValueConstraints {
+                min_size: Some(1_000),
+                file_type: Some("Video".into()),
+                ..ValueConstraints::default()
+            },
+        };
+        let payload = encode_browse_request_v2(&filter);
+        assert_eq!(browse_request_filter(&payload), Some(filter.clone()));
+        assert!(!browse_request_supports_v1(&payload), "an older answerer reads this as not EBR1");
+        assert_eq!(browse_request_filter(BROWSE_RESPONSE_V1_MAGIC), None);
+        assert_eq!(browse_request_filter(b"EBR2"), None, "too short to hold a name length");
+        let no_constraints = encode_browse_request_v2(&BrowseFilter { text: "x".into(), ..BrowseFilter::default() });
+        assert_eq!(no_constraints, b"EBR2\x01\x00x", "an empty block writes nothing");
+
+        assert!(filter.admits("Holiday 2025.mkv", 5_000, "ab"));
+        assert!(filter.admits("my HOLIDAY.MP4", 5_000, "ab"), "case-insensitive, extension too");
+        assert!(!filter.admits("Holiday.mp3", 5_000, "ab"), "not video");
+        assert!(!filter.admits("Holiday.mkv", 999, "ab"), "too small");
+        assert!(!filter.admits("Work.mkv", 5_000, "ab"));
+        let by_hash = BrowseFilter { text: "ABCD".into(), ..BrowseFilter::default() };
+        assert!(by_hash.admits("anything", 1, "00abcd00"));
+
+        let long = BrowseFilter { text: "é".repeat(200), ..BrowseFilter::default() };
+        let read = browse_request_filter(&encode_browse_request_v2(&long)).unwrap();
+        assert!(read.text.len() <= MAX_BROWSE_FILTER_TEXT && long.text.starts_with(&read.text));
     }
 
     #[test]

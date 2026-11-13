@@ -189,6 +189,19 @@ and end in a 16-byte pairwise authenticator (`XFER_MAC_LEN`) under
 read sealed offers, and held no plain offer for it. 1.8.0 sends sealed offers
 only and keeps no such record.
 
+**Stamped transfer ids (from 1.8.0).** A sender mints `xfer_id` as
+`E7 5B 0F FE || seconds(5, LE) || random(7)` (`mint_xfer_id`), so the id
+dates its offer. No frame changes: the id was always 16 opaque bytes to every
+build, and it sits in the header the pairwise authenticator covers, so a
+member the offer is forwarded through can neither read past it nor rewrite the
+time. A recipient drops a stamped offer older than `XFER_OFFER_TTL_SECS` plus
+`CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS`, or ahead by more than the skew
+(`xfer_offer_fresh`), which ends the replay of an offer once the recipient has
+forgotten its transfer. An id from a sender before 1.8.0 is random, carries no
+mark (one in 2^32 does by chance, and is dropped as stale), and is taken as
+before. Forwarders learn when the offer was made, which its arrival already
+told them to within a few seconds.
+
 Retired numbers have no constant left in the code; the table is built from
 the comments beside the live constants and from the test that the retired
 attachment numbers are not read as transfers
@@ -536,8 +549,50 @@ Body: `version(1) = 1 || tag(16) || nonce(24) || ciphertext`.
   are counted (3670); the text cap, `DM_TEXT_MAX_BYTES`, is that less `type ||
   len || message_id` (3651). Types and their fields, exactly: 1 message
   (`message_id(16) || UTF-8 text`), 2 receipt (`message_id(16)`), 3 accept
-  (none), 4 decline (none). One kind of frame for all four, so relays cannot
-  tell a message from a receipt.
+  (none), 4 decline (none), and from 1.8.0 5 timer (`message_id(16) ||
+  ttl_secs(4, LE)`) and 6 collects (none). One kind of frame for all of them,
+  so relays cannot tell a message from a receipt, and a timer pads to the
+  bucket a receipt does.
+
+**Room mail (type 6, from 1.8.0).** A member who collects room mail says so
+with a type 6 frame beside its first receipt to each member in a session;
+the sender keeps that word for 30 days (`room_dm_mail_peers`). One of ours
+still unanswered two minutes after it went, to a member who said so, is left
+on the rendezvous server the way chat mail is (`network::room_dm_mail`): the
+same server calls and the same sealed `MailboxPayload`, in boxes of their own
+(`derive_room_dm_mailbox_box`, purpose `room-dm-mailbox-v1\0 || recipient`),
+which no friend-chat box can be, and every blob binds its box. Once left, a
+message is resent live no more and waits for its receipt for the week the
+server keeps it, shown as waiting in their mailbox. A member collects only
+from the conversations it has, declined ones included, so a stranger's first
+message still needs them online. It collects with private messages off too,
+and leaves nothing of its own then. What it collects is kept on the terms a
+live message is (the roster, the policy, the ignore list, the caps), and its
+entry goes once the answer is on the server: a receipt for what was kept,
+and for what is declined a `MailboxPayload::Decline` (kind 3, room mail
+only, body `at(8, LE)`, unix seconds), which the sender records as a live
+decline dated no later than when it read it. What a live message would drop
+unanswered (ignored, off the roster, over a request's hold) is cleared
+without one; one over the sender's hourly allowance stays for a later round.
+Builds before 1.8.0 drop type 6 as they drop type 5, and so are never left
+mail. It rides the chat mailbox's round and its setting.
+
+**Disappearing messages (type 5, from 1.8.0).** A conversation's timer is
+chosen on the sender's side (`room_dm_disappear`, off by default) and goes out
+as a frame of its own after every copy of a message, new or resent, rather
+than as a field of type 1, whose fields are its text and nothing else. It goes
+once more after the message's receipt, held back as a reply is so its timing
+does not tie the two members together: a copy that was lost, paced out or
+overtook its message is otherwise never taken. A
+build before 1.8.0 opens it, finds a type it does not read, and drops it: the
+message arrives and is kept there for good, as an older friend keeps a friend
+chat message. A recipient takes a timer only for a message it kept, once,
+held to friend chat's bounds (`CHAT_DISAPPEAR_PEER_MIN_SECS` to
+`CHAT_DISAPPEAR_PEER_MAX_SECS`). Ours runs from its receipt and theirs from
+when the conversation is read (at once if it already was), and the cleanup
+sweep deletes each at its time (`dm_expire_due`). Timers live in tables of
+their own (`room_dm_timers`, `room_dm_disappear`) beside `room_dm_messages`,
+which is unchanged.
 
 **Receiving** (`network::room_dm::on_private_message`). Only after the frame
 met the relay rules, only under the room's current key, only within

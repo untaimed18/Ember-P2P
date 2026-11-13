@@ -1736,6 +1736,11 @@ pub struct AppSettings {
     /// computer's address, as any web server does.
     #[serde(default = "default_true")]
     pub web_sources_enabled: bool,
+    /// A copied eD2K link of a finished file carries the mirrors its download
+    /// proved (`s=`), which eMule reads too. On by default; off for someone
+    /// whose mirror is a server of their own they would rather not pass on.
+    #[serde(default = "default_true")]
+    pub copied_links_carry_mirrors: bool,
     /// Absolute path to an external media player for Preview, or empty to
     /// hand the file to the system's default handler (eMule's "Video Player"
     /// preference).
@@ -3207,6 +3212,7 @@ impl Default for AppSettings {
             tag_shared_imports: false,
             preview_priority_all: false,
             web_sources_enabled: true,
+            copied_links_carry_mirrors: true,
             preview_player: String::new(),
             skip_compress_video: true,
             antileech_enabled: true,

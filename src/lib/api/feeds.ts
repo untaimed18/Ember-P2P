@@ -229,6 +229,11 @@ export const addFeedItems = (
 export const publishFeed = (salt: string): Promise<OwnFeed> => invoke('publish_feed', { salt });
 export const deleteFeed = (salt: string): Promise<void> => invoke('delete_feed', { salt });
 
+/** Each friend whose key this device holds, by friend hash: their key, which
+ *  Discover filters a publisher by, and how many of their feeds are known
+ *  here, followed or found by Discover. */
+export const friendsFeeds = (): Promise<Record<string, { publisher: string; known: number }>> =>
+  invoke('friends_feeds');
 export const listFollowedFeeds = (): Promise<FollowedFeed[]> => invoke('list_followed_feeds');
 export const followFeed = (link: string): Promise<FollowedFeed> => invoke('follow_feed', { link });
 /** Look again now, and fetch its list now if owed one. */

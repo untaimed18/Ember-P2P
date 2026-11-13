@@ -43,6 +43,11 @@ pub(crate) struct PendingBrowseRequest {
     /// be taken for the next request's, until [`ABANDONED_BROWSE_HOLD`] after
     /// it was sent, in case that answer never comes.
     pub(crate) abandoned: bool,
+    /// What the user asked the friend to filter by, if anything.
+    pub(crate) filter: Option<ed2k::multi_source::BrowseFilter>,
+    /// The filter went out with the request (`EBR2`), so the answer is
+    /// already narrowed to it. False for a friend that predates it.
+    pub(crate) filtered: bool,
 }
 
 /// How long after sending a cancelled request still holds the head for its
@@ -99,8 +104,25 @@ pub(crate) fn enqueue_browse_request(
         total: None,
         dispatched_at: None,
         abandoned: false,
+        filter: None,
+        filtered: false,
     });
     Ok(())
+}
+
+/// Give a request just queued the filter the user asked for.
+pub(crate) fn set_browse_filter(
+    pending: &mut PendingBrowseRequests,
+    friend: [u8; 16],
+    request_id: &str,
+    filter: Option<ed2k::multi_source::BrowseFilter>,
+) {
+    if let Some(request) = pending
+        .get_mut(&friend)
+        .and_then(|queue| queue.iter_mut().find(|request| request.request_id == request_id))
+    {
+        request.filter = filter.filter(|filter| !filter.is_empty());
+    }
 }
 
 /// Attach a scope frame to the request it precedes: the dispatched head bound
@@ -462,6 +484,60 @@ pub(crate) fn browse_request_is_pending(
         .is_some_and(|queue| queue.iter().any(|request| request.request_id == request_id))
 }
 
+/// Tell a friend whose session just came up which `EMBER_FEATURE_*` this
+/// build answers, so it sends a filtered browse only to a build that reads one.
+pub(crate) async fn announce_ember_features(state: &NetworkState, friend: [u8; 16]) {
+    let sessions = state.ember_sessions.read().await;
+    if let Some(session) = sessions.get(&friend).filter(|h| h.is_fresh() && h.is_secure_v2()) {
+        let _ = session.tx.try_send(ed2k::messages::build_ember_ext_frame(
+            ed2k::messages::EMBER_EXT_FEATURES,
+            &ed2k::messages::EMBER_FEATURES.to_le_bytes(),
+        ));
+    }
+}
+
+/// Browse answers one friend draws in [`BROWSE_SERVE_WINDOW`]. Each is a walk
+/// of every shared file, and a filtered request costs its sender nothing, so a
+/// friend typing into the filter box must not become a loop of walks here.
+/// Far past what someone looking through a friend's files asks for.
+const BROWSE_SERVES_PER_WINDOW: usize = 10;
+const BROWSE_SERVE_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+/// Ours to one friend are held to their limit over a longer window, so the
+/// gaps they see after transit jitter never put one past it: a request over
+/// it goes unanswered, and the dialog would wait out its timeout.
+const BROWSE_ASK_WINDOW: std::time::Duration = std::time::Duration::from_secs(35);
+const _: () = assert!(BROWSE_ASK_WINDOW.as_secs() > BROWSE_SERVE_WINDOW.as_secs());
+
+type BrowseTimes = HashMap<[u8; 16], VecDeque<std::time::Instant>>;
+
+fn take_browse_slot(
+    slots: &'static std::sync::OnceLock<std::sync::Mutex<BrowseTimes>>,
+    friend: &[u8; 16],
+    window: std::time::Duration,
+) -> bool {
+    const MAX_FRIENDS: usize = 4096;
+    let mut times = slots.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if times.len() >= MAX_FRIENDS {
+        times.retain(|_, times| times.back().is_some_and(|at| now.saturating_duration_since(*at) < window));
+    }
+    let times = times.entry(*friend).or_default();
+    super::ember::channel::rate_window_allow(times, now, window, BROWSE_SERVES_PER_WINDOW)
+}
+
+/// Whether `friend` may have another browse answer now, taking it if so.
+/// Taken before the walk, not after a send, as a friend's contact ask is.
+pub(crate) fn browse_serve_allowed(friend: &[u8; 16]) -> bool {
+    static SERVED: std::sync::OnceLock<std::sync::Mutex<BrowseTimes>> = std::sync::OnceLock::new();
+    take_browse_slot(&SERVED, friend, BROWSE_SERVE_WINDOW)
+}
+
+/// Whether another browse request may go to `friend` now, taking it if so.
+fn browse_ask_allowed(friend: &[u8; 16]) -> bool {
+    static ASKED: std::sync::OnceLock<std::sync::Mutex<BrowseTimes>> = std::sync::OnceLock::new();
+    take_browse_slot(&ASKED, friend, BROWSE_ASK_WINDOW)
+}
+
 pub(crate) fn send_browse_response_to_origin(
     reply_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
     packet: Vec<u8>,
@@ -498,16 +574,34 @@ pub(crate) async fn dispatch_browse_head(
 
         let current = state.ember_sessions.read().await.get(&friend).cloned();
         let reason = match current {
+            Some(handle) if handle.session_id() == head.session_id && handle.is_fresh() && !browse_ask_allowed(&friend) => {
+                crate::commands::errors::coded(
+                    "browse_too_fast",
+                    "Asked for this friend's files too often; try again in a moment",
+                )
+            }
             Some(handle) if handle.session_id() == head.session_id && handle.is_fresh() => {
                 let scope_aware = ed2k::messages::build_ember_ext_frame(
                     ed2k::messages::EMBER_EXT_BROWSE_SCOPE_AWARE,
                     &[],
                 );
-                let mut packet = Vec::with_capacity(10);
+                // The filter only to a friend that said it reads one: to any
+                // other, a request that is not exactly `EBR1` is a pre-v1 one.
+                // That friend's answer is filtered here instead, by the dialog.
+                let filter = head
+                    .filter
+                    .as_ref()
+                    .filter(|_| handle.has_feature(ed2k::messages::EMBER_FEATURE_FILTERED_BROWSE));
+                let request = match filter {
+                    Some(filter) => ed2k::multi_source::encode_browse_request_v2(filter),
+                    None => ed2k::multi_source::BROWSE_RESPONSE_V1_MAGIC.to_vec(),
+                };
+                let filtered = filter.is_some();
+                let mut packet = Vec::with_capacity(6 + request.len());
                 packet.push(OP_EMULEPROT);
-                packet.extend_from_slice(&(5u32).to_le_bytes());
+                packet.extend_from_slice(&((1 + request.len()) as u32).to_le_bytes());
                 packet.push(ed2k::messages::OP_EMBER_BROWSE_REQ);
-                packet.extend_from_slice(ed2k::multi_source::BROWSE_RESPONSE_V1_MAGIC);
+                packet.extend_from_slice(&request);
                 // Both or neither: the frame alone would take the request's
                 // slot, and the request alone would get a listing without its
                 // friends-only files. Same channel, so the frame arrives first.
@@ -529,6 +623,7 @@ pub(crate) async fn dispatch_browse_head(
                         {
                             request.dispatched = true;
                             request.dispatched_at = Some(std::time::Instant::now());
+                            request.filtered = filtered;
                         }
                         return;
                     }
@@ -574,6 +669,16 @@ mod scope_tests {
     fn dispatched_head(pending: &mut PendingBrowseRequests, friend: [u8; 16], session_id: u64) {
         enqueue_browse_request(pending, friend, "req".into(), session_id).unwrap();
         pending.get_mut(&friend).unwrap().front_mut().unwrap().dispatched = true;
+    }
+
+    #[test]
+    fn requests_to_a_friend_stop_where_their_answers_would() {
+        let friend = [0xB7; 16];
+        for _ in 0..BROWSE_SERVES_PER_WINDOW {
+            assert!(browse_ask_allowed(&friend));
+        }
+        assert!(!browse_ask_allowed(&friend));
+        assert!(browse_ask_allowed(&[0xB8; 16]), "counted per friend");
     }
 
     #[test]

@@ -34,6 +34,7 @@
   import { setAppSettings, appSettings } from '$lib/stores/settings';
   import { transfers } from '$lib/stores/transfers';
   import { completedFirst } from '$lib/stores/transfersView';
+  import { chatReopenAtLaunch } from '$lib/chatPopout';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
   import {
@@ -3714,6 +3715,18 @@
                 ariaDescribedby="web-sources-hint"
               />
             </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="link-mirrors-label" for="link-mirrors-switch">{m.settings_link_mirrors_label()}</label>
+                <span class="hint" id="link-mirrors-hint">{m.settings_link_mirrors_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="link-mirrors-switch"
+                bind:checked={settings.copied_links_carry_mirrors}
+                ariaLabelledby="link-mirrors-label"
+                ariaDescribedby="link-mirrors-hint"
+              />
+            </div>
           </div>
 
           <div class="settings-group">
@@ -5010,6 +5023,20 @@
                 {/each}
               </select>
               <span id="chat-disappear-hint" class="hint">{m.settings_chat_disappear_hint()}</span>
+            </div>
+            <!-- Kept on this device, like whether the chat is popped out. -->
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="chat-reopen-label" for="chat-reopen-switch">{m.settings_chat_window_reopen_label()}</label>
+                <span class="hint" id="chat-reopen-hint">{m.settings_chat_window_reopen_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="chat-reopen-switch"
+                checked={$chatReopenAtLaunch}
+                onchange={(on) => chatReopenAtLaunch.set(on)}
+                ariaLabelledby="chat-reopen-label"
+                ariaDescribedby="chat-reopen-hint"
+              />
             </div>
           </div>
 

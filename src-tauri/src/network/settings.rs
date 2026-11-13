@@ -96,6 +96,7 @@ pub(super) fn apply_network_settings(
         crate::types::room_dm_policy_in_force(&new_settings.room_dm_policy),
         new_settings.ignored_members.as_deref(),
     );
+    super::room_dm::set_collects_room_mail(new_settings.chat_mailbox_enabled);
     state.obfuscation_enabled = new_settings.obfuscation_enabled;
     state.obfuscation_enabled_shared.store(
         new_settings.obfuscation_enabled,

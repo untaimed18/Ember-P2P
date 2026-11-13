@@ -682,6 +682,47 @@ pub const XFER_BLOCKS_OUT_PER_SEC: usize = 192;
 pub const XFER_MAX_ACTIVE: usize = 4;
 /// How long an offer waits for an answer before it lapses.
 pub const XFER_OFFER_TTL_SECS: i64 = 300;
+
+/// The first bytes of a transfer id that carries the time its offer was made:
+/// `XFER_ID_STAMP_MARK || seconds(5, LE) || random(7)`, from 1.8.0.
+///
+/// The id rides every transfer frame's header, under the pairwise tag, and is
+/// opaque to every earlier build, so the time travels with no frame changed.
+/// It is what lets a recipient refuse an offer replayed by a member it was
+/// forwarded through once the transfer has been forgotten: a stamped offer
+/// older than [`xfer_offer_fresh`] allows is dropped. An unstamped id is from
+/// a sender before 1.8.0 and is taken as before; one of those in 2^32 begins
+/// with the mark by chance, and its "time" is almost surely far from now.
+const XFER_ID_STAMP_MARK: [u8; 4] = [0xE7, 0x5B, 0x0F, 0xFE];
+
+/// A fresh transfer id stamped with `now` (see [`XFER_ID_STAMP_MARK`]).
+pub fn mint_xfer_id(now: i64) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id[..4].copy_from_slice(&XFER_ID_STAMP_MARK);
+    id[4..9].copy_from_slice(&(now.max(0) as u64).to_le_bytes()[..5]);
+    OsRng.fill_bytes(&mut id[9..]);
+    id
+}
+
+/// The time a stamped transfer id was minted at, `None` for an unstamped one.
+pub fn xfer_id_stamp(id: &[u8; 16]) -> Option<i64> {
+    if id[..4] != XFER_ID_STAMP_MARK {
+        return None;
+    }
+    let mut secs = [0u8; 8];
+    secs[..5].copy_from_slice(&id[4..9]);
+    Some(u64::from_le_bytes(secs) as i64)
+}
+
+/// Whether an offer under `id` may still be prompted for at `now`: unstamped,
+/// or stamped within the time an honest sender holds an offer open
+/// ([`XFER_OFFER_TTL_SECS`]), give or take the clock skew rooms allow.
+pub fn xfer_offer_fresh(id: &[u8; 16], now: i64) -> bool {
+    xfer_id_stamp(id).is_none_or(|at| {
+        at >= now.saturating_sub(XFER_OFFER_TTL_SECS + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS)
+            && at <= now.saturating_add(CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS)
+    })
+}
 /// Private rooms keep the existing join secret across ownership transfer.
 pub const HANDOFF_FLAG_KEEP_JOIN_SECRET: u8 = 0x01;
 pub const CHANNEL_MSG_VERSION: u8 = 1;
@@ -7345,8 +7386,8 @@ mod tests {
 
     #[test]
     fn gossip_decode_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_7E11);
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0xC8A1_7E11);
         let key = content_key(&[7u8; 32]);
         let channel_id = CHAT_CHANNEL;
         let author = SigningKey::generate(&mut OsRng);
@@ -7369,7 +7410,7 @@ mod tests {
             ChannelGossip::sealed(channel_id, CHAT_MSG_ID, &key, 2, &mod_plain, 4, CHAT_TS)
                 .encode();
         let mut decoded_ok = 0usize;
-        for i in 0..2_000 {
+        for i in 0..crate::fuzz::rounds(2_000) {
             let buf = match i {
                 0 => well_chat.clone(),
                 1 => well_mod.clone(),
@@ -8541,6 +8582,36 @@ mod tests {
             root: *blake3::hash(b"hello").as_bytes(),
             name: "note.txt".into(),
         }
+    }
+
+    /// A stamped id carries its offer's time through every frame unchanged;
+    /// a replay outside the window is refused, and a 1.7 sender's random id
+    /// is taken as before.
+    #[test]
+    fn a_stamped_transfer_id_dates_its_offer() {
+        let now = 1_800_000_000;
+        let id = mint_xfer_id(now);
+        assert_eq!(xfer_id_stamp(&id), Some(now));
+        assert_ne!(mint_xfer_id(now), id, "random past the stamp");
+        assert!(xfer_offer_fresh(&id, now));
+        assert!(xfer_offer_fresh(&id, now + XFER_OFFER_TTL_SECS));
+        assert!(!xfer_offer_fresh(
+            &id,
+            now + XFER_OFFER_TTL_SECS + CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS + 1
+        ));
+        assert!(!xfer_offer_fresh(&id, now - CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS - 1));
+
+        let unstamped = sample_offer().xfer_id;
+        assert_eq!(xfer_id_stamp(&unstamped), None);
+        assert!(xfer_offer_fresh(&unstamped, now));
+
+        // The stamp is in the header, so the pairwise tag covers it: changing
+        // it to dodge the window breaks the frame.
+        let offer = XferOffer { xfer_id: id, ..sample_offer() };
+        let mut frame = encode_xfer_offer_sealed(&K, &offer);
+        assert_eq!(xfer_frame_peek(&frame).map(|(_, _, x)| x), Some(id));
+        frame[65 + 4] ^= 1;
+        assert!(xfer_verify(&K, &frame).is_none());
     }
 
     fn quic_only(quic: u16) -> XferStreamPorts {

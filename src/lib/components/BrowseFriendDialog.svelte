@@ -38,6 +38,7 @@
     browseFriend,
     cancelBrowseFriend,
     type BrowseFileEntry,
+    type BrowseFilterRequest,
   } from '$lib/api/friends';
   import { startDownload } from '$lib/api/transfers';
   import { formatEd2kLinks, getDownloadHistory } from '$lib/api/search';
@@ -95,8 +96,17 @@
   let sortKey: SortKey = $state('name');
   let sortAsc = $state(true);
   let hideOwned = $state(false);
-  /** See {@link CachedListing}. */
+  /** See {@link CachedListing}. For a search, the files that matched. */
   let total: number | null = $state(null);
+  /** What the friend narrowed the list on screen to, when it did: from 1.8.0
+   *  their build filters before its 1,000-file cap, so a search reaches every
+   *  file they share. */
+  let listedFilter = $state<BrowseFilterRequest | null>(null);
+  /** A search of all their files was asked for and their build answered in
+   *  full: only what one answer holds can be searched. */
+  let searchUnsupported = $state(false);
+  /** The filter asked of the friend by the request in flight. */
+  let pendingFilter: BrowseFilterRequest | null = null;
   let received = $state(0);
   let listFetchedAt = $state(0);
   /** A request is in flight while a list (cached, or the previous one) stays
@@ -209,6 +219,31 @@
     if (total !== null) return total > files.length ? 'known' : null;
     return received >= MAX_BROWSE_FILES ? 'maybe' : null;
   });
+
+  /** The filter in the box and the type bar, as the friend would be asked it. */
+  let currentFilter = $derived<BrowseFilterRequest>({
+    text: filterQuery.trim(),
+    fileType: typeFilter === 'All' ? null : typeFilter,
+  });
+  /** Searching all their files would find more than the list on screen holds:
+   *  it was cut short, or narrowed by a different search. */
+  let canSearchAll = $derived(
+    !searchUnsupported &&
+      (currentFilter.text !== '' || currentFilter.fileType !== null) &&
+      (listedFilter
+        ? listedFilter.text !== currentFilter.text || listedFilter.fileType !== currentFilter.fileType
+        : truncation !== null),
+  );
+
+  function searchAll() {
+    if (!friendHash || !canSearchAll) return;
+    void requestBrowse(friendHash, true, { ...currentFilter });
+  }
+
+  function showAllFiles() {
+    if (!friendHash) return;
+    void requestBrowse(friendHash, true);
+  }
 
   function isInLibrary(file: BrowseFileEntry): boolean {
     return libraryHashes.has(file.hash.toLowerCase());
@@ -352,6 +387,8 @@
    *  opening the dialog resets the category separately. */
   function resetResultViewState() {
     total = null;
+    listedFilter = null;
+    searchUnsupported = false;
     received = 0;
     listFetchedAt = 0;
     refreshing = false;
@@ -543,6 +580,7 @@
         request_id: string;
         files: BrowseFileEntry[];
         total?: number | null;
+        filtered?: boolean;
       }>('ember:browse-result', (event) => {
         if (event.payload.user_hash !== hash) return;
         // Only accept results for the in-flight browse generation.
@@ -572,11 +610,15 @@
           received: raw.length,
           fetchedAt: Math.floor(Date.now() / 1000),
         };
-        rememberListing(hash, listing);
+        // A search's answer is not their listing: the cache keeps the full one.
+        const narrowed = event.payload.filtered === true ? pendingFilter : null;
+        if (!narrowed) rememberListing(hash, listing);
         const wasEmpty = files.length === 0;
         const present = new Set(listing.files.map((f) => f.hash));
         selectedHashes = new Set([...selectedHashes].filter((h) => present.has(h)));
         applyListing(listing);
+        listedFilter = narrowed;
+        searchUnsupported = pendingFilter !== null && !narrowed;
         loading = false;
         refreshing = false;
         refreshError = null;
@@ -638,8 +680,9 @@
 
   /** `keepList` refreshes behind a list already on screen instead of clearing
    *  it; ignored when there is none. */
-  async function requestBrowse(hash: string, keepList = false) {
+  async function requestBrowse(hash: string, keepList = false, filter?: BrowseFilterRequest) {
     error = null;
+    pendingFilter = filter ?? null;
     if (keepList && files.length > 0) {
       refreshing = true;
       refreshError = null;
@@ -667,7 +710,7 @@
     // Generations restart at zero on every close, so only the request id says
     // whether this is still the request on screen once the call returns.
     try {
-      await browseFriend(hash, myRequestId);
+      await browseFriend(hash, myRequestId, filter);
       if (expectedRequestId !== myRequestId) return;
       browseTimeout = setTimeout(() => {
         if (
@@ -1175,12 +1218,28 @@
               <button type="button" class="browse-link-btn" onclick={() => void retryBrowse()}>{m.common_retry()}</button>
             </div>
           {/if}
-          {#if truncation === 'known'}
+          {#if listedFilter}
             <div class="browse-banner browse-banner-note" role="status">
-              {m.browse_showing_of_total({ shown: formatNumber(files.length), total: formatNumber(total ?? 0) })}
+              <span>{m.browse_searched_all({ total: formatNumber(total ?? files.length), shown: formatNumber(files.length) })}</span>
+              {#if canSearchAll}
+                <button type="button" class="browse-link-btn" disabled={refreshing} onclick={searchAll}>{m.browse_search_all_again()}</button>
+              {/if}
+              <button type="button" class="browse-link-btn" disabled={refreshing} onclick={showAllFiles}>{m.browse_show_all_files()}</button>
+            </div>
+          {:else if truncation === 'known'}
+            <div class="browse-banner browse-banner-note" role="status">
+              <span>{m.browse_showing_of_total({ shown: formatNumber(files.length), total: formatNumber(total ?? 0) })}</span>
+              {#if canSearchAll}
+                <button type="button" class="browse-link-btn" disabled={refreshing} onclick={searchAll}>
+                  {m.browse_search_all({ total: formatNumber(total ?? 0) })}
+                </button>
+              {/if}
             </div>
           {:else if truncation === 'maybe'}
             <div class="browse-banner browse-banner-note" role="status">{m.browse_may_share_more()}</div>
+          {/if}
+          {#if searchUnsupported}
+            <div class="browse-banner browse-banner-note" role="status">{m.browse_search_unsupported()}</div>
           {/if}
           {#if queuedCount > 0}
             <div class="browse-banner browse-banner-success" role="status">

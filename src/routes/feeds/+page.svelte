@@ -1107,6 +1107,26 @@
 
   /** Show only this publisher's feeds. */
   let discoverPublisher = $state<string | null>(null);
+
+  // A friend's feeds, asked for from their card: Discover, filtered to them.
+  // Dropped from the address once taken, as a followed link is.
+  $effect(() => {
+    const publisher = page.url.searchParams.get('publisher')?.trim().toLowerCase() ?? '';
+    if (!publisher) return;
+    untrack(() => {
+      if (/^[0-9a-f]{64}$/.test(publisher)) {
+        discoverQuery = '';
+        discoverFilter = 'all';
+        discoverPublisher = publisher;
+        setTab('discover');
+      }
+      const next = new URL(page.url);
+      next.searchParams.delete('publisher');
+      void goto(`${next.pathname}${next.search}${next.hash}`, { replaceState: true, keepFocus: true, noScroll: true }).catch(
+        () => {},
+      );
+    });
+  });
   let discoverMatches = $derived.by(() => {
     const q = discoverQuery.trim().toLowerCase();
     const matched = discovered.filter(

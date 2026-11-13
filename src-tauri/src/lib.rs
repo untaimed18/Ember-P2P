@@ -30,6 +30,8 @@ mod bandwidth;
 mod commands;
 mod emule_import;
 mod finish_action;
+#[cfg(test)]
+mod fuzz;
 mod geoip;
 mod idle;
 mod ipfilter_update;
@@ -2649,6 +2651,8 @@ pub fn run() {
             commands::room_dm::send_room_dm,
             commands::room_dm::answer_room_dm_request,
             commands::room_dm::mark_room_dm_read,
+            commands::room_dm::get_room_dm_disappear,
+            commands::room_dm::set_room_dm_disappear,
             commands::room_dm::delete_room_dm_thread,
             commands::room_dm::drop_room_dm_request,
             commands::room_dm::retry_room_dm,
@@ -2663,6 +2667,8 @@ pub fn run() {
             commands::feeds::delete_feed,
             commands::feeds::list_followed_feeds,
             commands::feeds::follow_feed,
+            commands::feeds::describe_feed_link,
+            commands::feeds::friends_feeds,
             commands::feeds::refresh_feed,
             commands::feeds::get_feed_items,
             commands::feeds::mark_feed_read,

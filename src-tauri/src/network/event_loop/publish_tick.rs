@@ -111,6 +111,41 @@ pub(in crate::network) async fn on_publish_tick(
             );
         }
         state.ember_publish_pass = EmberPublishPassStats::default();
+
+        // The storer's side of the same minute. The "Ember DHT cycle" line
+        // carries the republish schedule; this one says what the store holds
+        // for others and what reached it, so a node taking no records can be
+        // told from one refusing them.
+        let now = ember_store_beat(state);
+        let beat = now.delta(state.ember_store_beat);
+        state.ember_store_beat = now;
+        let (keys, records) = state.ember_dht.store_stats();
+        let (foreign_keys, foreign_records) = state.ember_dht.foreign_store_stats();
+        let replication = if ember_storer_republish_paused(state) {
+            "paused (small network)".to_string()
+        } else {
+            format!("backlog={}", ember_republish_backlog(state))
+        };
+        info!(
+            "Ember store cycle: holding {foreign_records} record(s) for others under \
+             {foreign_keys} key(s) ({records} under {keys} in all), accepted={} of {} total, \
+             refused={} (not closest {}, full {}, share {}, invalid {}) of {} total, \
+             lookups answered={} ({} found) of {} total, republished={} of {} total, \
+             replication {replication}",
+            beat.accepted,
+            now.accepted,
+            beat.refused(),
+            beat.refused_not_closest,
+            beat.refused_full,
+            beat.refused_share,
+            beat.refused_invalid,
+            now.refused(),
+            beat.lookups,
+            beat.hits,
+            now.lookups,
+            beat.republished,
+            now.republished,
+        );
     }
 
     // KAD publish diagnostics only. Presence heartbeat lives on

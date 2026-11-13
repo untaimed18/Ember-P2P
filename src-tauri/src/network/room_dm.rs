@@ -49,8 +49,38 @@ pub(crate) fn set_dm_policy(policy: &str, ignored: Option<&[IgnoredMember]>) {
     current.ignored = ignored.map(<[IgnoredMember]>::to_vec).unwrap_or_default();
 }
 
-fn dm_ignored(member_hex: &str, channel_hex: &str) -> bool {
+/// Whether this device collects room mail: the chat mailbox setting, as
+/// settings last said.
+static COLLECTS_ROOM_MAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_collects_room_mail(collects: bool) {
+    COLLECTS_ROOM_MAIL.store(collects, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `peer` is yet to hear this session that we collect room mail,
+/// marking it told. Said once a session, with a receipt: a sender keeps what
+/// it heard for a while, and it costs a frame of ours in the room.
+fn owe_collects(peer: &[u8; 32]) -> bool {
+    static TOLD: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>> =
+        std::sync::OnceLock::new();
+    const MAX_TOLD: usize = 4096;
+    if !COLLECTS_ROOM_MAIL.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let mut told = TOLD.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if told.len() >= MAX_TOLD {
+        told.clear();
+    }
+    told.insert(*peer)
+}
+
+pub(super) fn dm_ignored(member_hex: &str, channel_hex: &str) -> bool {
     ignored_in(&dm_policy().read().ignored, member_hex, channel_hex)
+}
+
+/// Who may write, as settings last said.
+pub(super) fn dm_policy_now() -> String {
+    dm_policy().read().policy.clone()
 }
 
 fn ignored_in(list: &[IgnoredMember], member_hex: &str, channel_hex: &str) -> bool {
@@ -263,8 +293,10 @@ fn dm_pace() -> &'static std::sync::Mutex<DmPace> {
     PACE.get_or_init(Default::default)
 }
 
+/// A frame something that arrived drew, or the user's answer to a request:
+/// anything but our own messages and the timers that follow them.
 fn is_reply(payload: &DmPayload) -> bool {
-    !matches!(payload, DmPayload::Message { .. })
+    !matches!(payload, DmPayload::Message { .. } | DmPayload::Expire { .. })
 }
 
 /// Drop every reply and answer still waiting to go to `peer`, delayed or
@@ -333,6 +365,11 @@ impl DmChecks {
         match (frame.kind, &frame.payload) {
             (DmFrameKind::Message, DmPayload::Message { id, .. }) => {
                 !policy_off && self.sending.contains(&(frame.peer, *id))
+            }
+            // A timer is owed while its member can still be reached, delivered
+            // or not: one that waited past the receipt still tells them.
+            (DmFrameKind::Message, DmPayload::Expire { .. }) => {
+                !policy_off && self.reachable(frame.room, &frame.peer)
             }
             (DmFrameKind::Message, _) => false,
             (DmFrameKind::Answer, _) => self.reachable(frame.room, &frame.peer),
@@ -514,6 +551,9 @@ pub(super) async fn on_private_message(
                 Ok(DmIncoming::Stored { request, new_thread }) => {
                     if dm_reply_allowed(&ext.sender, false) {
                         queue_reply(gossip.channel_id, ext.sender, DmPayload::Receipt { id });
+                        if owe_collects(&ext.sender) {
+                            queue_reply(gossip.channel_id, ext.sender, DmPayload::Collects);
+                        }
                     }
                     let _ = app_handle.emit(
                         DM_MESSAGE_EVENT,
@@ -552,11 +592,24 @@ pub(super) async fn on_private_message(
             let message_id = hex::encode(id);
             let task_db = db.clone();
             let (from, mid) = (member.clone(), message_id.clone());
-            let moved = tokio::task::spawn_blocking(move || task_db.dm_mark_delivered(&from, &mid))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or(false);
+            // A timer of ours runs from delivery, as friend chat's does.
+            let (moved, timer) = tokio::task::spawn_blocking(move || {
+                let moved = task_db.dm_mark_delivered(&from, &mid)?;
+                let timer = if moved { task_db.dm_start_sent_timer(&from, &mid, now)? } else { None };
+                anyhow::Ok((moved, timer))
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+            // The timer that went with the message once more, now that it is
+            // kept there: the first copy was dropped unread if it was lost,
+            // paced out, or overtook the message. Held back as a reply is, or
+            // it would follow the receipt at once and say whose it was.
+            if let Some(ttl_secs) = timer.filter(|ttl| *ttl > 0) {
+                let ttl_secs = u32::try_from(ttl_secs).unwrap_or(u32::MAX);
+                queue_reply(gossip.channel_id, ext.sender, DmPayload::Expire { id, ttl_secs });
+            }
             if moved {
                 let _ = app_handle.emit(
                     DM_STATUS_EVENT,
@@ -565,29 +618,77 @@ pub(super) async fn on_private_message(
             }
         }
         DmPayload::Accept | DmPayload::Decline => {
-            let accepted = payload == DmPayload::Accept;
+            // By the envelope's time: a replayed old answer cannot undo a
+            // later one.
+            note_peer_answer(db, app_handle, &member, payload == DmPayload::Accept, gossip.timestamp).await;
+        }
+        DmPayload::Collects => {
             let task_db = db.clone();
             let from = member.clone();
-            // Recorded only in a conversation open on our side, and only if
-            // newer than the answer already held, by the envelope's time: a
-            // replayed old answer cannot undo a later one (see
-            // `dm_note_peer_answer`).
-            let answered_at = gossip.timestamp;
-            let (moved, stopped) = tokio::task::spawn_blocking(move || {
-                task_db.dm_note_peer_answer(&from, accepted, answered_at).unwrap_or_default()
-            })
-            .await
-            .unwrap_or_default();
-            for message_id in stopped {
-                let _ = app_handle.emit(
-                    DM_STATUS_EVENT,
-                    serde_json::json!({ "member_pubkey": member, "message_id": message_id, "status": "failed" }),
-                );
-            }
-            if moved {
+            let _ = tokio::task::spawn_blocking(move || task_db.dm_note_collects(&from, now)).await;
+        }
+        DmPayload::Expire { id, ttl_secs } => {
+            // Held to what friend chat takes from a friend's timer, so a
+            // sender cannot set one shorter than a glance or longer than a
+            // timer means.
+            let ttl = i64::from(
+                ttl_secs.clamp(crate::types::CHAT_DISAPPEAR_PEER_MIN_SECS, crate::types::CHAT_DISAPPEAR_PEER_MAX_SECS),
+            );
+            let task_db = db.clone();
+            let (from, mid) = (member.clone(), hex::encode(id));
+            let set = tokio::task::spawn_blocking(move || task_db.dm_set_received_timer(&from, &mid, ttl, now))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+            if set {
                 let _ = app_handle.emit(DM_THREAD_EVENT, serde_json::json!({ "member_pubkey": member }));
             }
         }
+    }
+}
+
+/// A member's Accept or Decline of what we send them, as of `answered_at`.
+/// Recorded only in a conversation open on our side, and only if newer than
+/// the answer already held (see `dm_note_peer_answer`); what a decline
+/// stopped shows as failed.
+pub(super) async fn note_peer_answer(
+    db: &Arc<Database>,
+    app_handle: &tauri::AppHandle,
+    member: &str,
+    accepted: bool,
+    answered_at: i64,
+) {
+    let task_db = db.clone();
+    let from = member.to_string();
+    let (moved, stopped) = tokio::task::spawn_blocking(move || {
+        task_db.dm_note_peer_answer(&from, accepted, answered_at).unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    for message_id in stopped {
+        let _ = app_handle.emit(
+            DM_STATUS_EVENT,
+            serde_json::json!({ "member_pubkey": member, "message_id": message_id, "status": "failed" }),
+        );
+    }
+    if moved {
+        let _ = app_handle.emit(DM_THREAD_EVENT, serde_json::json!({ "member_pubkey": member }));
+    }
+}
+
+/// Delete the private messages whose timers ran out, and tell each of their
+/// conversations. From the loop's cleanup tick, beside friend chat's.
+pub(super) async fn expire_private_messages(db: &Arc<Database>, app_handle: &tauri::AppHandle) {
+    let task_db = db.clone();
+    let now = chrono::Utc::now().timestamp();
+    let members = tokio::task::spawn_blocking(move || task_db.dm_expire_due(now))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    for member in members {
+        let _ = app_handle.emit(DM_THREAD_EVENT, serde_json::json!({ "member_pubkey": member }));
     }
 }
 
@@ -924,5 +1025,207 @@ mod tests {
         assert!(dm_fresh(now - DM_MAX_AGE_SECS, now));
         assert!(!dm_fresh(now - DM_MAX_AGE_SECS - 1, now));
         assert!(!dm_fresh(now + 3_600, now));
+    }
+
+    /// One member of a room and what a device does with each frame: who it is
+    /// and what it keeps.
+    struct Device {
+        seed: [u8; 32],
+        pubkey: [u8; 32],
+        db: Database,
+        path: std::path::PathBuf,
+    }
+
+    impl Device {
+        fn new(byte: u8, tag: &str) -> Self {
+            let seed = [byte; 32];
+            let pubkey = ember::crypto::signing_key_from_bytes(&seed).verifying_key().to_bytes();
+            let path = std::env::temp_dir().join(format!(
+                "ember-dm-e2e-{tag}-{}-{}.db",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            Device { seed, pubkey, db: Database::open_at(&path).expect("open db"), path }
+        }
+
+        /// A frame of kind 66 to `peer`, as `seal_and_send` puts it on the wire.
+        fn send(&self, room: &[u8; 16], key: &[u8; 32], peer: &[u8; 32], payload: &DmPayload, ts: i64) -> Vec<u8> {
+            let base = PairwiseBase::derive(&self.seed, peer, room).unwrap();
+            let msg_id: [u8; 16] = rand::random();
+            let body = base.seal(room, &msg_id, ts, &self.pubkey, payload).unwrap();
+            let kind = ember::channel::EXT_KIND_PRIVATE_MESSAGE;
+            let signing = ember::crypto::signing_key_from_bytes(&self.seed);
+            let signature = ember::channel::ext_author_signature(&signing, room, &msg_id, ts, kind, 0, &body);
+            let frame = ember::channel::encode_channel_ext_frame_presigned(kind, 0, &self.pubkey, &signature, &body);
+            ember::channel::ChannelGossip::sealed(
+                *room,
+                msg_id,
+                key,
+                ts as u64,
+                &frame,
+                ember::channel::CHANNEL_MSG_TTL_DEFAULT,
+                ts,
+            )
+            .encode()
+        }
+
+        /// What `on_private_message` reads from a datagram: the envelope under
+        /// the room key, the signed frame, the checks it holds the frame to,
+        /// and the body opened under the pairwise secret with its sender.
+        fn receive(&self, room: &[u8; 16], key: &[u8; 32], wire: &[u8], now: i64) -> Option<([u8; 32], DmPayload)> {
+            let gossip = ember::channel::ChannelGossip::decode(wire)?;
+            let plain = gossip.decrypt(key)?;
+            let ext = ember::channel::decode_channel_ext_frame(&plain, room, &gossip.msg_id, gossip.timestamp)?;
+            if ext.kind != ember::channel::EXT_KIND_PRIVATE_MESSAGE
+                || ext.flags != 0
+                || ext.sender == self.pubkey
+                || !dm_fresh(gossip.timestamp, now)
+            {
+                return None;
+            }
+            let base = PairwiseBase::derive(&self.seed, &ext.sender, room)?;
+            let payload = base.open(room, &gossip.msg_id, gossip.timestamp, &ext.sender, &ext.body)?;
+            Some((ext.sender, payload))
+        }
+    }
+
+    impl Drop for Device {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.path.display()));
+            }
+        }
+    }
+
+    /// A message from one member to another and back, through every step a
+    /// datagram takes between them short of the network loop's routing: sealed,
+    /// signed and enveloped on one side; opened, checked, kept and answered on
+    /// the other; its receipt and timer back the same way. A member of the
+    /// room relaying it cannot open it, and a frame moved to another room or
+    /// replayed late is nothing. Then the same message through room mail.
+    #[test]
+    fn a_private_message_goes_end_to_end_between_two_members() {
+        use crate::network::ember::crypto::{
+            chat_mailbox_day, derive_room_dm_mailbox_box, open_mailbox_payload, seal_mailbox_payload,
+            MailboxPayload,
+        };
+        let (ann, bob, cat) = (Device::new(0x61, "ann"), Device::new(0x62, "bob"), Device::new(0x63, "cat"));
+        let room = [0x5A; 16];
+        let key = [0x33; 32];
+        let (ann_hex, bob_hex, room_hex) = (hex::encode(ann.pubkey), hex::encode(bob.pubkey), hex::encode(room));
+        let now = 1_900_000_000;
+        let policy = crate::types::ROOM_DM_POLICY_ANYONE;
+
+        // Ann writes, with a five-minute timer.
+        let id = [0x01; 16];
+        let mid = hex::encode(id);
+        ann.db.dm_record_outgoing(&bob_hex, "Bob", &room_hex, &mid, "meet at noon", now, now + 120, now + 1_200).unwrap();
+        ann.db.dm_set_sent_timer(&bob_hex, &mid, 300).unwrap();
+        let message = ann.send(&room, &key, &bob.pubkey, &DmPayload::Message { id, text: "meet at noon".into() }, now);
+        let timer = ann.send(&room, &key, &bob.pubkey, &DmPayload::Expire { id, ttl_secs: 300 }, now);
+
+        // A third member relays both and reads neither; nor in another room,
+        // nor once the relay window has passed.
+        assert!(cat.receive(&room, &key, &message, now).is_none());
+        assert!(bob.receive(&[0x5B; 16], &key, &message, now).is_none());
+        assert!(bob.receive(&room, &key, &message, now + DM_MAX_AGE_SECS + 1).is_none());
+
+        // The timer overtakes the message, and is nothing without it.
+        let (_, payload) = bob.receive(&room, &key, &timer, now + 1).unwrap();
+        assert_eq!(payload, DmPayload::Expire { id, ttl_secs: 300 });
+        assert!(!bob.db.dm_set_received_timer(&ann_hex, &mid, 300, now + 1).unwrap());
+
+        // Bob keeps the message, and reads it.
+        let (from, payload) = bob.receive(&room, &key, &message, now + 2).unwrap();
+        assert_eq!(from, ann.pubkey);
+        let DmPayload::Message { id: got, text } = payload else { panic!("a message") };
+        assert_eq!((got, text.as_str()), (id, "meet at noon"));
+        let kept = bob.db.dm_record_incoming(&ann_hex, "Ann", &room_hex, &mid, &text, now, policy, now + 2).unwrap();
+        assert_eq!(kept, DmIncoming::Stored { request: false, new_thread: true });
+        bob.db.dm_mark_read(&ann_hex).unwrap();
+        bob.db.dm_start_read_timers(&ann_hex, now + 10).unwrap();
+
+        // Its receipt, and that he collects room mail, go back to Ann.
+        let receipt = bob.send(&room, &key, &ann.pubkey, &DmPayload::Receipt { id }, now + 40);
+        let collects = bob.send(&room, &key, &ann.pubkey, &DmPayload::Collects, now + 40);
+        assert!(cat.receive(&room, &key, &receipt, now + 41).is_none());
+        let (_, payload) = ann.receive(&room, &key, &receipt, now + 41).unwrap();
+        assert_eq!(payload, DmPayload::Receipt { id });
+        assert!(ann.db.dm_mark_delivered(&bob_hex, &mid).unwrap());
+        assert_eq!(ann.db.dm_start_sent_timer(&bob_hex, &mid, now + 41).unwrap(), Some(300));
+        assert_eq!(ann.db.dm_start_sent_timer(&bob_hex, &mid, now + 42).unwrap(), None);
+        assert_eq!(ann.receive(&room, &key, &collects, now + 41).map(|(_, p)| p), Some(DmPayload::Collects));
+        ann.db.dm_note_collects(&bob_hex, now + 41).unwrap();
+        let sent = ann.db.dm_messages(&bob_hex, 10, None, None).unwrap();
+        assert_eq!((sent[0].status.as_str(), sent[0].expires_at), ("delivered", now + 341));
+
+        // The timer again after the receipt finds the message kept, and runs
+        // from then, the conversation having been read.
+        let timer = ann.send(&room, &key, &bob.pubkey, &DmPayload::Expire { id, ttl_secs: 300 }, now + 70);
+        let (_, payload) = bob.receive(&room, &key, &timer, now + 71).unwrap();
+        assert_eq!(payload, DmPayload::Expire { id, ttl_secs: 300 });
+        assert!(bob.db.dm_set_received_timer(&ann_hex, &mid, 300, now + 71).unwrap());
+        assert!(!bob.db.dm_set_received_timer(&ann_hex, &mid, 300, now + 72).unwrap());
+        assert_eq!(bob.db.dm_messages(&ann_hex, 10, None, None).unwrap()[0].expires_at, now + 371);
+
+        // Later Bob is away: Ann's next message, unanswered, goes to room mail.
+        let later = now + 3_600;
+        let id2 = [0x02; 16];
+        let mid2 = hex::encode(id2);
+        ann.db.dm_record_outgoing(&bob_hex, "Bob", &room_hex, &mid2, "are you there?", later, later + 120, later + 1_200).unwrap();
+        let due = ann.db.dm_mail_due(later + 130, 120, 86_400).unwrap();
+        assert_eq!(due.iter().map(|d| d.message_id.as_str()).collect::<Vec<_>>(), vec![mid2.as_str()]);
+        let day = chat_mailbox_day(later + 130);
+        let to_bob = derive_room_dm_mailbox_box(&ann.seed, &bob.pubkey, &bob.pubkey, day).unwrap();
+        let blob = seal_mailbox_payload(
+            &ann.seed,
+            &bob.pubkey,
+            &to_bob,
+            &MailboxPayload::Message { msg_id: id2, ttl_secs: 0, text: due[0].text.clone() },
+        )
+        .unwrap();
+        ann.db.dm_note_mailed(&bob_hex, &mid2, &hex::encode(to_bob), "00", later + 130, later + 7 * 86_400).unwrap();
+
+        // Bob finds the box from his side, and nobody else could have.
+        assert_eq!(derive_room_dm_mailbox_box(&bob.seed, &ann.pubkey, &bob.pubkey, day), Some(to_bob));
+        assert_ne!(derive_room_dm_mailbox_box(&cat.seed, &ann.pubkey, &cat.pubkey, day), Some(to_bob));
+        let Some(MailboxPayload::Message { msg_id, text, .. }) = open_mailbox_payload(&bob.seed, &ann.pubkey, &to_bob, &blob)
+        else {
+            panic!("a message from the mailbox")
+        };
+        assert_eq!(msg_id, id2);
+        let at = later + 7_200;
+        let kept = bob.db.dm_record_incoming(&ann_hex, "Ann", &room_hex, &mid2, &text, at, policy, at).unwrap();
+        assert_eq!(kept, DmIncoming::Stored { request: false, new_thread: false });
+
+        // His receipt comes back through the mailbox, and Ann's copy is stale.
+        let to_ann = derive_room_dm_mailbox_box(&bob.seed, &ann.pubkey, &ann.pubkey, day).unwrap();
+        let receipt = seal_mailbox_payload(&bob.seed, &ann.pubkey, &to_ann, &MailboxPayload::Receipt { msg_ids: vec![id2] })
+            .unwrap();
+        assert_eq!(derive_room_dm_mailbox_box(&ann.seed, &bob.pubkey, &ann.pubkey, day), Some(to_ann));
+        let Some(MailboxPayload::Receipt { msg_ids }) = open_mailbox_payload(&ann.seed, &bob.pubkey, &to_ann, &receipt) else {
+            panic!("a receipt from the mailbox")
+        };
+        assert_eq!(msg_ids, vec![id2]);
+        assert!(ann.db.dm_mark_delivered(&bob_hex, &mid2).unwrap());
+        assert_eq!(ann.db.dm_mail_stale().unwrap().len(), 1, "its copy is taken back next round");
+        let texts: Vec<String> = bob.db.dm_messages(&ann_hex, 10, None, None).unwrap().into_iter().map(|m| m.text).collect();
+        assert_eq!(texts, vec!["meet at noon", "are you there?"]);
+
+        // Bob turns private messages off. What she leaves after draws a
+        // decline through the mailbox, and stops there as a live one would.
+        let mid3 = hex::encode([0x03; 16]);
+        let last = later + 8_000;
+        ann.db.dm_record_outgoing(&bob_hex, "Bob", &room_hex, &mid3, "hello?", last, last + 120, last + 1_200).unwrap();
+        ann.db.dm_note_mailed(&bob_hex, &mid3, &hex::encode(to_bob), "01", last + 130, last + 7 * 86_400).unwrap();
+        let off = crate::types::ROOM_DM_POLICY_OFF;
+        let kept = bob.db.dm_record_incoming(&ann_hex, "Ann", &room_hex, &mid3, "hello?", last + 200, off, last + 200).unwrap();
+        assert_eq!(kept, DmIncoming::Declined);
+        let decline = seal_mailbox_payload(&bob.seed, &ann.pubkey, &to_ann, &MailboxPayload::Decline { at: last + 200 }).unwrap();
+        let Some(MailboxPayload::Decline { at }) = open_mailbox_payload(&ann.seed, &bob.pubkey, &to_ann, &decline) else {
+            panic!("a decline from the mailbox")
+        };
+        assert_eq!(ann.db.dm_note_peer_answer(&bob_hex, false, at).unwrap(), (true, vec![mid3.clone()]));
+        assert!(ann.db.dm_mail_stale().unwrap().iter().any(|(_, message, ..)| *message == mid3), "its copy is taken back too");
     }
 }

@@ -1727,6 +1727,96 @@ pub async fn follow_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState
     Ok(FollowedFeedInfo { already_following: !added, ..followed_info(feed) })
 }
 
+/// The feeds a friend publishes, as far as this device knows them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FriendFeeds {
+    /// The friend's Ed25519 key, which Discover filters a publisher by.
+    pub publisher: String,
+    /// Their feeds this device follows or Discover has found.
+    pub known: usize,
+}
+
+/// Each friend whose key this device holds, by friend hash, with the feeds of
+/// theirs it already knows. From the local cache alone: finding feeds no walk
+/// has seen is Discover's work, which the friend's card leads to.
+#[tauri::command]
+pub async fn friends_feeds(state: tauri::State<'_, AppState>) -> Result<HashMap<String, FriendFeeds>, String> {
+    let db = state.db.clone();
+    let now = chrono::Utc::now().timestamp();
+    blocking(
+        move || {
+            let mut known: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+            for feed in db.feeds_followed()? {
+                known.entry(feed.publisher).or_default().insert(feed.salt);
+            }
+            for feed in db.feeds_discovered(now, FEED_LISTING_TTL_SECS)? {
+                known.entry(feed.publisher).or_default().insert(feed.salt);
+            }
+            Ok(db
+                .get_friend_public_keys()?
+                .into_iter()
+                .map(|(hash, key)| {
+                    let publisher = hex::encode(key);
+                    let count = known.get(&publisher).map_or(0, |salts| salts.len());
+                    (hex::encode(hash), FriendFeeds { publisher, known: count })
+                })
+                .collect())
+        },
+        "feeds_failed",
+        "Could not read feeds",
+    )
+    .await
+}
+
+/// What a feed link in a message can say about its feed from what this
+/// device already holds: one of ours, one followed, or one Discover found.
+/// Nothing is looked up on the network for it, so a card for a feed never
+/// seen costs nothing and tells nobody it was shown.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FeedLinkInfo {
+    /// The link as Ember writes it.
+    pub link: String,
+    pub publisher: String,
+    pub salt: String,
+    /// Empty when this device has not seen the feed.
+    pub title: String,
+    pub description: String,
+    pub item_count: i64,
+    pub following: bool,
+    pub own: bool,
+}
+
+#[tauri::command]
+pub async fn describe_feed_link(state: tauri::State<'_, AppState>, link: String) -> Result<FeedLinkInfo, String> {
+    let parsed = FeedLink::parse(&link).ok_or_else(|| coded("feeds_bad_link", "That is not a feed link"))?;
+    let (publisher, salt) = (hex::encode(parsed.publisher), hex::encode(parsed.salt));
+    let own = parsed.publisher == state.identity.ed25519_public_key;
+    let db = state.db.clone();
+    let (key_pub, key_salt) = (publisher.clone(), salt.clone());
+    let now = chrono::Utc::now().timestamp();
+    let (known, following) = blocking(
+        move || {
+            if own {
+                let feed = db.feeds_own()?.into_iter().find(|f| f.salt == key_salt);
+                return Ok((feed.map(|f| (f.title, f.description, f.item_count)), false));
+            }
+            if let Some(f) = db.feed_followed(&key_pub, &key_salt)? {
+                return Ok((Some((f.title, f.description, f.item_count)), true));
+            }
+            let feed = db
+                .feeds_discovered(now, FEED_LISTING_TTL_SECS)?
+                .into_iter()
+                .find(|f| f.publisher == key_pub && f.salt == key_salt);
+            Ok((feed.map(|f| (f.title, f.description, f.item_count)), false))
+        },
+        "feeds_failed",
+        "Could not read feeds",
+    )
+    .await?;
+    let (title, description, item_count) = known.unwrap_or_default();
+    Ok(FeedLinkInfo { link: parsed.format(), publisher, salt, title, description, item_count, following, own })
+}
+
 /// Look again now, rather than at the next half hour, and fetch its list at
 /// once if it is owed one, even while resting after a fetch gave up or after
 /// its list did not match: the user asked. What the lookup came to.

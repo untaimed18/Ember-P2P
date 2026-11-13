@@ -1603,6 +1603,7 @@ pub async fn browse_friend(
     state: tauri::State<'_, AppState>,
     user_hash_hex: String,
     request_id: String,
+    filter: Option<BrowseFilterArg>,
 ) -> Result<(), String> {
     if request_id.is_empty() || request_id.len() > 128 {
         return Err(coded(
@@ -1627,6 +1628,7 @@ pub async fn browse_friend(
         NetworkCommand::BrowseFriend {
             ember_hash: hash,
             request_id,
+            filter: filter.map(BrowseFilterArg::into_filter),
             tx,
         },
     )
@@ -1640,6 +1642,41 @@ pub async fn browse_friend(
         Ok(Ok(result)) => result,
         Ok(Err(_)) => Err(coded("peers_no_response", "No response")),
         Err(_) => Err(coded("network_timeout", "The network is not responding")),
+    }
+}
+
+/// What the browse dialog asks a friend to filter their listing by.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowseFilterArg {
+    #[serde(default)]
+    text: String,
+    /// One of the dialog's type filters: `Audio`, `Video`, `Image`, `Archive`,
+    /// `Document`, `Program`, `CD/DVD` or `Collection`.
+    #[serde(default)]
+    file_type: Option<String>,
+}
+
+impl BrowseFilterArg {
+    fn into_filter(self) -> crate::network::ed2k::multi_source::BrowseFilter {
+        // The dialog's names for what `infer_file_type` calls them, so the
+        // friend files each extension as the dialog does.
+        let file_type = self.file_type.as_deref().and_then(|name| match name {
+            "Audio" | "Video" | "Image" => Some(name.to_string()),
+            "Archive" => Some("Arc".into()),
+            "Document" => Some("Doc".into()),
+            "Program" => Some("Pro".into()),
+            "CD/DVD" => Some("Iso".into()),
+            "Collection" => Some("EmuleCollection".into()),
+            _ => None,
+        });
+        crate::network::ed2k::multi_source::BrowseFilter {
+            text: self.text.chars().take(128).collect(),
+            constraints: crate::network::ember::dht::messages::ValueConstraints {
+                file_type,
+                ..Default::default()
+            },
+        }
     }
 }
 

@@ -410,6 +410,29 @@ pub(super) fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+/// The storer's session counters for the store heartbeat, read from where they
+/// are kept rather than from `ember_diagnostics`, whose refusal fields are only
+/// mirrored when diagnostics are read.
+pub(super) fn ember_store_beat(state: &NetworkState) -> EmberStoreBeat {
+    let diag = &state.ember_diagnostics;
+    let rejects = state.ember_dht.store_reject_stats();
+    EmberStoreBeat {
+        accepted: diag.ember_dht_stores_received.into(),
+        lookups: diag.ember_dht_find_values_received.into(),
+        hits: diag.ember_dht_find_value_hits.into(),
+        republished: diag.ember_dht_records_republished.into(),
+        refused_not_closest: state.ember_dht.store_reject_proximity(),
+        refused_full: rejects.key_cap.saturating_add(rejects.per_key_cap),
+        refused_share: rejects.publisher_cap.saturating_add(rejects.source_ip_cap),
+        refused_invalid: state
+            .ember_dht
+            .store_reject_verify()
+            .saturating_add(rejects.signature)
+            .saturating_add(rejects.timestamp)
+            .saturating_add(state.ember_dht.store_reject_source_ip()),
+    }
+}
+
 /// Copy the counters the DHT store, engine and frame limiter keep themselves
 /// into `diag`. Done when diagnostics are read, not per frame: several of them
 /// only move on frames that are refused, so a copy taken on the accept path
@@ -2703,6 +2726,9 @@ pub(super) async fn handle_ember_dht_message(
         // way back.
         if let std::net::IpAddr::V4(v4) = from.ip() {
             state.ember_kad_bridge_attempted.remove(&(v4, from.port()));
+            if state.ember_rendezvous_listed.remove(&(v4, from.port())) {
+                debug!("Ember rendezvous advert {from}: answered");
+            }
         }
         // And if this peer was a lead somebody named, that name has just been
         // shown to be worth something. Any signed frame counts, not only the

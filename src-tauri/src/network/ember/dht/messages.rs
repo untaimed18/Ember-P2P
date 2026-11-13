@@ -390,6 +390,24 @@ fn encode_value_constraints(
     buf.extend_from_slice(&tlv);
 }
 
+/// The constraint block by itself, as a friend's filtered browse (`EBR2`)
+/// carries it: the same encoder and decoder a keyword walk uses, so the two
+/// agree on what every field means. Keyword hashes and resume anchors are a
+/// walk's alone and never written. Empty constraints encode to nothing.
+pub fn encode_constraint_block(constraints: &ValueConstraints) -> Vec<u8> {
+    let content = ValueConstraints { extra_keys: Vec::new(), ..constraints.clone() };
+    let mut buf = Vec::new();
+    encode_value_constraints(&mut buf, &content, &ResumeAnchors::default());
+    buf
+}
+
+/// [`encode_constraint_block`]'s reader, as lenient as a walk's: what it
+/// cannot read is left unfiltered.
+pub fn decode_constraint_block(bytes: &[u8]) -> ValueConstraints {
+    let (constraints, _) = decode_value_constraints(bytes);
+    ValueConstraints { extra_keys: Vec::new(), ..constraints }
+}
+
 /// Read the optional block trailing a `FIND_VALUE` payload.
 ///
 /// Lenient by design, and never an error. A missing magic or a block length
@@ -3131,13 +3149,13 @@ mod tests {
 
     #[test]
     fn decode_message_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xE19E_19E1);
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0xE19E_19E1);
         // Header-level soak: truncated frames, bad versions, random trailing
         // junk. Deliberately does *not* reach `decode_payload` — random bytes
         // cannot pass an Ed25519 check — which is what
         // `decode_payload_fuzz_never_panics` below exists to cover.
-        for _ in 0..2_000 {
+        for _ in 0..crate::fuzz::rounds(2_000) {
             let len = rng.gen_range(0..=2_048);
             let mut buf = vec![0u8; len];
             rng.fill(&mut buf[..]);
@@ -3157,9 +3175,9 @@ mod tests {
     /// where the parsing is.
     #[test]
     fn decode_payload_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
+        use rand::Rng;
         let (sk, id) = test_keypair();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0EC0_DEC0);
+        let mut rng = crate::fuzz::rng(0x0EC0_DEC0);
         let types = [
             MSG_PING,
             MSG_PONG,
@@ -3193,7 +3211,7 @@ mod tests {
         // prove that `PING` decodes. Counting the random ones separately is
         // what makes the claim real.
         let mut random_decoded_ok = 0usize;
-        for _ in 0..2_000 {
+        for _ in 0..crate::fuzz::rounds(2_000) {
             let msg_type = types[rng.gen_range(0..types.len())];
             // Up to the wire ceiling, not 600: every length prefix above that
             // — `FOUND_VALUE` pages, `STORE_BATCH` bodies, the source-contact

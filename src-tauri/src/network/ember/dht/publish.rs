@@ -5727,8 +5727,8 @@ mod tests {
 
     #[test]
     fn decode_source_contact_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0x50C0_17AC);
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0x50C0_17AC);
 
         let plain = SourceContact {
             ip: std::net::Ipv4Addr::new(203, 0, 113, 7),
@@ -5765,7 +5765,7 @@ mod tests {
         }
 
         let mut decoded_ok = 0usize;
-        for i in 0..2_000 {
+        for i in 0..crate::fuzz::rounds(2_000) {
             // Mostly random, with well-formed encodings and bit-flipped copies
             // mixed in so the trailer's own length checks are actually reached.
             let buf = match i % 7 {
@@ -6171,11 +6171,11 @@ mod tests {
 
     #[test]
     fn settings_fields_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5E77_1465);
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0x5E77_1465);
         let well_formed = encode_settings_extra(&[(4, [4; 32]), (2, [2; 32])], 1).unwrap();
         let mut read = 0usize;
-        for i in 0..2_000 {
+        for i in 0..crate::fuzz::rounds(2_000) {
             let buf = match i % 3 {
                 0 => well_formed.clone(),
                 1 => {
@@ -6226,8 +6226,8 @@ mod tests {
     /// no fuzz input at all.
     #[test]
     fn decode_epoch_extra_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xE70C_4EA5);
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0xE70C_4EA5);
 
         let mut well_formed = Vec::new();
         well_formed.extend_from_slice(&[0x21u8; 32]);
@@ -6235,7 +6235,7 @@ mod tests {
         well_formed.extend_from_slice(&[0xEE; 48]);
 
         let mut decoded_ok = 0usize;
-        for i in 0..2_000 {
+        for i in 0..crate::fuzz::rounds(2_000) {
             let buf = match i % 5 {
                 0 => well_formed.clone(),
                 1 => {
@@ -6268,8 +6268,8 @@ mod tests {
 
     #[test]
     fn decode_moderation_extra_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_E07A);
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0xC8A1_E07A);
         let well_formed = encode_moderation_extra(
             "welcome ☕",
             &[[0x11u8; 32], [0x22u8; 32]],
@@ -6279,7 +6279,7 @@ mod tests {
         let mut legacy = encode_moderation_extra("hi", &[[0x11u8; 32]], &[], &ModerationTail::default());
         legacy.truncate(legacy.len() - 2);
         let mut decoded_ok = 0usize;
-        for i in 0..2_000 {
+        for i in 0..crate::fuzz::rounds(2_000) {
             let extra = match i {
                 0 => well_formed.clone(),
                 1 => legacy.clone(),
@@ -6312,8 +6312,8 @@ mod tests {
 
     #[test]
     fn channel_record_parse_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC8A1_51C6);
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0xC8A1_51C6);
         let ident = channel::ChannelIdentity::generate();
         let member = SigningKey::generate(&mut OsRng);
         let join = channel::public_join_secret(&ident.pubkey);
@@ -6344,7 +6344,7 @@ mod tests {
         let mut moderation_blob = moderation.data.clone();
         moderation_blob.extend_from_slice(&moderation.signature);
         let mut parsed_ok = 0usize;
-        for i in 0..2_000 {
+        for i in 0..crate::fuzz::rounds(2_000) {
             let buf = match i {
                 0 => presence_blob.clone(),
                 1 => moderation_blob.clone(),

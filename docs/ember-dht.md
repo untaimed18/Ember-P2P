@@ -369,7 +369,7 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 `ember_dht_iterative_find_node`, `ember_dht_publish_keyword`,
 `ember_dht_find_value`, and `ember_dht_run_maintenance`.
 
-### 6. Filter the friend browse on the wire — designed, not started
+### 6. Filter the friend browse on the wire — built in 1.8.0
 
 What the constraint cannot do is answer "show me every `.mp3`" with no keyword at
 all. Kademlia has to walk *toward* something, and the only key such a query could
@@ -484,6 +484,30 @@ excludes `friends_only`, and refuses explicitly with `OP_ASKSHAREDDENIEDANS`. A
 filter there would let a stranger enumerate a library far past the single capped
 packet the setting was reasoned about, which is a genuine exposure change and a
 separate decision.
+
+**As built in 1.8.0**, with two departures from the design above:
+
+- **Feature bits travel twice.** The Ember hello carries them as designed
+  (`flags & 0x02`, then `EMBER_FEATURES` as a `u32`), which is how a queued
+  waiter's are known for the secure slot grant (`EMBER_FEATURE_SECURE_PUSH_GRANT`).
+  A friend session does not always exchange an Ember hello, so each side also
+  sends them as `EMBER_EXT_FEATURES` (0x17) when one comes up, and the session
+  handle keeps them (`EmberSessionHandle::has_feature`), spread to the friend's
+  other live sessions as its other marks are.
+- **The request carries a name filter too:** `EBR2 || name_len(u16) || name ||
+  constraint block` (`encode_browse_request_v2`). The name is matched as the
+  dialog's own filter box matches it, against the name or the hash; the block
+  is `encode_constraint_block`, the walk's encoder without keyword hashes or
+  resume anchors. The dialog sends only the name and the type.
+
+The answer is v1's with the filter applied before the dedupe and the caps, and
+the summary frame's total counts the matches, which the dialog shows. Every
+browse answer, filtered or not, is held to ten per friend in 30 seconds,
+taken before the walk (`browse_serve_allowed`), and one over it gets no
+answer. So the asker holds its own requests to ten per friend in 35 seconds
+(`browse_ask_allowed`) and says *try again in a moment* rather than waiting
+out its timeout. A friend that did not announce
+the bit gets `EBR1` and is filtered by the dialog as before.
 
 ### 7. Deferred from the 1.7.7 overlay work
 

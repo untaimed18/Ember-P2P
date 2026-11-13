@@ -882,6 +882,10 @@ pub(super) struct NetworkState {
     /// download and UI source searches so its results can be harvested for
     /// Noise keys and then discarded — nobody is waiting on them.
     pub(super) ember_rendezvous_search: Option<SearchId>,
+    /// The addresses the last rendezvous lookup listed, so the bridge's debug
+    /// lines can follow each advert to a contact or to silence. An address
+    /// leaves when it first answers.
+    pub(super) ember_rendezvous_listed: HashSet<(Ipv4Addr, u16)>,
     /// Unix time the last rendezvous lookup started, to space out retries
     /// while the routing table is still empty. 0 = never.
     pub(super) ember_rendezvous_looked_up_at: i64,
@@ -1134,6 +1138,8 @@ pub(super) struct NetworkState {
     /// instead of printing a lifetime counter among per-cycle ones.
     pub(super) ember_publish_beat_acked: u32,
     pub(super) ember_publish_beat_failed: u32,
+    /// The storer's counters as of the previous store heartbeat.
+    pub(super) ember_store_beat: EmberStoreBeat,
     /// Per-peer rate limit for UDP EPX `ExchangeData` ingestion —
     /// `(accepted_count_in_window, window_start)`. Unlike TCP EPX, which
     /// resets `MAX_EPX_PACKETS_PER_CONNECTION` naturally when the TCP

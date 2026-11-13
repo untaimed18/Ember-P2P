@@ -1202,6 +1202,14 @@ pub(super) async fn apply_xfer_offer(
 ) {
     let sender_hex = hex::encode(offer.sender);
     let channel_id = gossip.channel_id;
+    if !ember::channel::xfer_offer_fresh(&offer.xfer_id, chrono::Utc::now().timestamp()) {
+        debug!(
+            "Ember channel xfer: dropping an offer from {sender_hex} stamped outside the offer window \
+             (transfer {})",
+            hex::encode(offer.xfer_id)
+        );
+        return;
+    }
     let gate = xfer_offer_gate(
         state,
         sealed,

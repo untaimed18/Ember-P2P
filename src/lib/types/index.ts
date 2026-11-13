@@ -1003,6 +1003,9 @@ export interface AppSettings {
   /** Download from the HTTP/HTTPS mirrors (`s=`) an ed2k link names. On by
    *  default. */
   web_sources_enabled: boolean;
+  /** A copied eD2K link of a finished file carries the mirrors its download
+   *  proved. On by default. */
+  copied_links_carry_mirrors: boolean;
   /** External media player for Preview; empty uses the system default handler.
    *  Only settable via `pickPreviewPlayer()` — see that function. */
   preview_player: string;

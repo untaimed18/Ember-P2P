@@ -21,7 +21,7 @@ pub use feeds::{
     DeletedFeed, DiscoveredFeed, DueListing, ElsewhereCopy, FeedItem, FollowedFeed, FollowedItem, OwnFeed,
     OwnPublish, TakenHead,
 };
-pub use room_dm::{DmIncoming, DmMessage, DmThread};
+pub use room_dm::{DmIncoming, DmMessage, DmThread, DM_STATE_REQUEST};
 
 const MAX_PEERS_ROWS: i64 = 10_000;
 const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
@@ -13155,6 +13155,93 @@ impl Database {
         Self::ensure_transfer_web_sources_locked(&conn)?;
         conn.execute(
             "DELETE FROM transfer_web_sources WHERE file_hash = ?1",
+            params![file_hash.to_ascii_lowercase()],
+        )?;
+        Ok(())
+    }
+
+    /// Mirrors a finished download proved, kept with the file so a copied
+    /// eD2K link carries them. A table of its own for the reason
+    /// [`Self::ensure_transfer_part_folders_locked`] gives.
+    fn ensure_library_web_mirrors_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS library_web_mirrors (
+                file_hash TEXT NOT NULL,
+                url TEXT NOT NULL,
+                kept_at INTEGER NOT NULL,
+                PRIMARY KEY (file_hash, url)
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Keep `urls` with the finished file `file_hash`, after any it already
+    /// has, up to the web sources a file holds
+    /// ([`crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE`]).
+    pub fn keep_library_web_mirrors(&self, file_hash: &str, urls: &[String]) -> anyhow::Result<()> {
+        if urls.is_empty() {
+            return Ok(());
+        }
+        let file_hash = file_hash.to_ascii_lowercase();
+        let conn = self.conn.lock();
+        Self::ensure_library_web_mirrors_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        let held: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM library_web_mirrors WHERE file_hash = ?1",
+            params![file_hash],
+            |row| row.get(0),
+        )?;
+        let mut room = crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE
+            .saturating_sub(held.max(0) as usize);
+        for url in urls {
+            if room == 0 {
+                break;
+            }
+            room -= tx.execute(
+                "INSERT OR IGNORE INTO library_web_mirrors (file_hash, url, kept_at) VALUES (?1, ?2, ?3)",
+                params![file_hash, url, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The mirrors kept for each of `file_hashes` that has any, oldest first.
+    pub fn library_web_mirrors_for(
+        &self,
+        file_hashes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
+        let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        if file_hashes.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.conn.lock();
+        Self::ensure_library_web_mirrors_locked(&conn)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT url FROM library_web_mirrors WHERE file_hash = ?1 ORDER BY kept_at, rowid",
+        )?;
+        for hash in file_hashes {
+            let hash = hash.to_ascii_lowercase();
+            if out.contains_key(&hash) {
+                continue;
+            }
+            let urls = stmt
+                .query_map(params![hash], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !urls.is_empty() {
+                out.insert(hash, urls);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget the mirrors kept for `file_hash`: the file left the Library.
+    pub fn delete_library_web_mirrors(&self, file_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_library_web_mirrors_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM library_web_mirrors WHERE file_hash = ?1",
             params![file_hash.to_ascii_lowercase()],
         )?;
         Ok(())
@@ -28221,6 +28308,38 @@ mod tests {
         );
         db.delete_transfer_web_sources(&kept).unwrap();
         assert!(db.load_transfer_web_sources().unwrap().is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mirrors_kept_with_a_finished_file_are_capped_and_go_with_it() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-library-mirrors-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let file = "AB".repeat(16);
+        let other = "cd".repeat(16);
+        let first: Vec<String> = (0..3).map(|i| format!("https://m{i}.example/f")).collect();
+        db.keep_library_web_mirrors(&file, &first).unwrap();
+        // Downloaded again: what it already kept stays, the rest fill the cap.
+        let again: Vec<String> = (2..9).map(|i| format!("https://m{i}.example/f")).collect();
+        db.keep_library_web_mirrors(&file, &again).unwrap();
+        db.keep_library_web_mirrors(&other, &first[..1]).unwrap();
+
+        let held = db.library_web_mirrors_for(&[file.clone(), other.clone(), "ef".repeat(16)]).unwrap();
+        let expected: Vec<String> = (0..5).map(|i| format!("https://m{i}.example/f")).collect();
+        assert_eq!(held.get(&file.to_ascii_lowercase()), Some(&expected));
+        assert_eq!(held.get(&other), Some(&first[..1].to_vec()));
+        assert_eq!(held.len(), 2, "a file with none is left out");
+
+        db.delete_library_web_mirrors(&file).unwrap();
+        let held = db.library_web_mirrors_for(&[file.clone(), other.clone()]).unwrap();
+        assert!(!held.contains_key(&file.to_ascii_lowercase()));
+        assert!(held.contains_key(&other));
 
         drop(db);
         let _ = std::fs::remove_file(&path);

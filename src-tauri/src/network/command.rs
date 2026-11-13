@@ -6736,6 +6736,7 @@ async fn handle_command_inner(
         NetworkCommand::BrowseFriend {
             ember_hash: friend_eh,
             request_id,
+            filter,
             tx,
         } => {
             if !friend_hashes.read().await.contains(&friend_eh) {
@@ -6772,6 +6773,7 @@ async fn handle_command_inner(
                             let _ = tx.send(Err("Duplicate browse request".into()));
                         }
                         Ok(()) => {
+                            set_browse_filter(&mut state.pending_browse_requests, friend_eh, &request_id, filter);
                             dispatch_browse_head(state, app_handle, friend_eh).await;
                             if browse_request_is_pending(
                                 &state.pending_browse_requests,
@@ -6802,6 +6804,7 @@ async fn handle_command_inner(
                             let _ = tx.send(Err("Duplicate browse request".into()));
                             return;
                         }
+                        set_browse_filter(&mut state.pending_browse_requests, friend_eh, &request_id, filter);
                         let db2 = db.clone();
                         let hash_hex = hex::encode(friend_eh);
                         let addr_opt =

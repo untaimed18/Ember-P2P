@@ -382,11 +382,20 @@ export async function getIdleAway(): Promise<IdleAwayInfo> {
   return invoke('get_idle_away');
 }
 
+/** What a friend is asked to narrow their listing to, before its 1,000-file
+ *  cap. A friend on a build before 1.8.0 answers in full instead. */
+export interface BrowseFilterRequest {
+  text: string;
+  /** A type filter's name (`Audio`, `Archive`, `CD/DVD`, …), or null for any. */
+  fileType: string | null;
+}
+
 export async function browseFriend(
   userHashHex: string,
   requestId: string,
+  filter?: BrowseFilterRequest,
 ): Promise<void> {
-  return invoke('browse_friend', { userHashHex, requestId });
+  return invoke('browse_friend', { userHashHex, requestId, filter: filter ?? null });
 }
 
 export async function cancelBrowseFriend(

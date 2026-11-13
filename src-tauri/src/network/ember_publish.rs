@@ -83,6 +83,51 @@ pub(crate) struct EmberPublishPassStats {
     pub(crate) flush: EmberFlushStats,
 }
 
+/// The storer's session counters as of the previous store heartbeat, so that
+/// line can report what each minute brought beside the session total, as the
+/// publish heartbeat does for acks. Refusals are grouped by what they say
+/// about the network rather than listed one counter each.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EmberStoreBeat {
+    /// Records taken into the store, counted per record as acks are.
+    pub(crate) accepted: u64,
+    /// `FIND_VALUE` queries answered, and of those, the ones we held records for.
+    pub(crate) lookups: u64,
+    pub(crate) hits: u64,
+    pub(crate) republished: u64,
+    /// Refused because closer nodes to the key are known.
+    pub(crate) refused_not_closest: u64,
+    /// Refused because the key, or the whole store, was full.
+    pub(crate) refused_full: u64,
+    /// Refused by a per-publisher or per-address share.
+    pub(crate) refused_share: u64,
+    /// Refused as unparseable, badly signed, out of date, or naming an
+    /// address that is not the sender's.
+    pub(crate) refused_invalid: u64,
+}
+
+impl EmberStoreBeat {
+    pub(crate) fn delta(self, since: EmberStoreBeat) -> EmberStoreBeat {
+        EmberStoreBeat {
+            accepted: self.accepted.saturating_sub(since.accepted),
+            lookups: self.lookups.saturating_sub(since.lookups),
+            hits: self.hits.saturating_sub(since.hits),
+            republished: self.republished.saturating_sub(since.republished),
+            refused_not_closest: self.refused_not_closest.saturating_sub(since.refused_not_closest),
+            refused_full: self.refused_full.saturating_sub(since.refused_full),
+            refused_share: self.refused_share.saturating_sub(since.refused_share),
+            refused_invalid: self.refused_invalid.saturating_sub(since.refused_invalid),
+        }
+    }
+
+    pub(crate) fn refused(self) -> u64 {
+        self.refused_not_closest
+            .saturating_add(self.refused_full)
+            .saturating_add(self.refused_share)
+            .saturating_add(self.refused_invalid)
+    }
+}
+
 /// What one `flush_ember_batch_publish` pass actually managed to do.
 ///
 /// Reported by the publish heartbeat: without it there is no way to tell a
@@ -926,6 +971,37 @@ impl EmberProxyBuddyPacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_beat_reports_the_minute_and_never_goes_negative() {
+        let before = EmberStoreBeat {
+            accepted: 10,
+            lookups: 4,
+            hits: 1,
+            republished: 2,
+            refused_not_closest: 3,
+            refused_full: 0,
+            refused_share: 1,
+            refused_invalid: 0,
+        };
+        let now = EmberStoreBeat {
+            accepted: 25,
+            lookups: 9,
+            hits: 3,
+            republished: 2,
+            refused_not_closest: 5,
+            refused_full: 1,
+            refused_share: 1,
+            refused_invalid: 4,
+        };
+        let beat = now.delta(before);
+        assert_eq!((beat.accepted, beat.lookups, beat.hits, beat.republished), (15, 5, 2, 0));
+        assert_eq!(beat.refused(), 2 + 1 + 4);
+        assert_eq!(now.refused(), 11);
+        // A counter that went backwards (a store rebuilt mid-session) reads as
+        // nothing new, not as a huge wrapped number.
+        assert_eq!(before.delta(now), EmberStoreBeat::default());
+    }
 
     fn contact(id: u8) -> ember::dht::EmberContact {
         let ip = std::net::Ipv4Addr::new(10, 0, 0, id);

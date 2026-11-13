@@ -1045,8 +1045,30 @@ pub async fn cancel_search(
     bounded_send(&state.network_tx, NetworkCommand::CancelSearch { request_id }).await
 }
 
+/// The mirrors kept with each of `file_hashes` (`library_web_mirrors_for`),
+/// for copied links to carry, unless Settings leave them out. A failed read
+/// costs the links their mirrors, never the copy.
+async fn kept_mirrors(
+    state: &AppState,
+    file_hashes: Vec<String>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    if !state.config.read().await.settings.copied_links_carry_mirrors {
+        return std::collections::HashMap::new();
+    }
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.library_web_mirrors_for(&file_hashes)).await {
+        Ok(Ok(mirrors)) => mirrors,
+        Ok(Err(e)) => {
+            tracing::debug!("Could not read the mirrors kept for copied links: {e}");
+            std::collections::HashMap::new()
+        }
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
 #[tauri::command]
-pub fn format_ed2k_link(
+pub async fn format_ed2k_link(
+    state: tauri::State<'_, AppState>,
     name: String,
     size: u64,
     file_hash: String,
@@ -1068,12 +1090,14 @@ pub fn format_ed2k_link(
         let t = h.trim();
         (t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
     });
-    Ok(hash::format_ed2k_link_ext(
+    let mirrors = kept_mirrors(&state, vec![file_hash.clone()]).await;
+    Ok(hash::format_ed2k_link_with_mirrors(
         &name,
         size,
         &file_hash,
         None,
         ember,
+        mirrors.get(&file_hash.to_ascii_lowercase()).map_or(&[][..], Vec::as_slice),
         &[],
     ))
 }
@@ -1095,7 +1119,10 @@ const MAX_ED2K_LINK_BATCH: usize = 50_000;
 
 /// Format many standard eD2K links in one IPC round-trip (newline-separated).
 #[tauri::command]
-pub fn format_ed2k_links(files: Vec<Ed2kLinkFileInput>) -> Result<String, String> {
+pub async fn format_ed2k_links(
+    state: tauri::State<'_, AppState>,
+    files: Vec<Ed2kLinkFileInput>,
+) -> Result<String, String> {
     if files.len() > MAX_ED2K_LINK_BATCH {
         return Err(coded_ctx(
             "search_ed2k_link_batch_too_large",
@@ -1103,6 +1130,7 @@ pub fn format_ed2k_links(files: Vec<Ed2kLinkFileInput>) -> Result<String, String
             MAX_ED2K_LINK_BATCH,
         ));
     }
+    let mirrors = kept_mirrors(&state, files.iter().map(|f| f.hash.clone()).collect()).await;
     let mut out = String::new();
     for (i, f) in files.into_iter().enumerate() {
         if f.name.is_empty() || f.name.len() > 4096 {
@@ -1124,12 +1152,13 @@ pub fn format_ed2k_links(files: Vec<Ed2kLinkFileInput>) -> Result<String, String
             let t = h.trim();
             (t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
         });
-        out.push_str(&hash::format_ed2k_link_ext(
+        out.push_str(&hash::format_ed2k_link_with_mirrors(
             &f.name,
             f.size,
             &f.hash,
             None,
             ember,
+            mirrors.get(&f.hash.to_ascii_lowercase()).map_or(&[][..], Vec::as_slice),
             &[],
         ));
     }
@@ -1350,12 +1379,14 @@ pub async fn build_ed2k_link(
         }
     }
 
-    Ok(hash::format_ed2k_link_ext(
+    let mirrors = kept_mirrors(&state, vec![file_hash.clone()]).await;
+    Ok(hash::format_ed2k_link_with_mirrors(
         &name,
         size,
         &file_hash,
         aich.as_deref(),
         ember.as_deref(),
+        mirrors.get(&file_hash.to_ascii_lowercase()).map_or(&[][..], Vec::as_slice),
         &sources,
     ))
 }

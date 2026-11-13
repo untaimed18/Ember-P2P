@@ -866,6 +866,7 @@ pub(in crate::network) async fn on_search_poll_tick(
             let keys_learned = state.ember_noise_keys.len().saturating_sub(keys_before);
             let converted = ember_rendezvous_converted_contacts(state, &peers);
             note_ember_rendezvous_lookup(state, peers.len(), converted);
+            note_rendezvous_adverts(state, &peers, &established);
             info!(
                 "Ember rendezvous lookup finished: {found} advertised peer(s), \
                  {} after dropping self, {converted} already overlay contact(s), \

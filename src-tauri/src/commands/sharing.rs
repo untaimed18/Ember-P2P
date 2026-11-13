@@ -5057,7 +5057,7 @@ fn discovery_form(path: &std::path::Path) -> Option<(String, bool)> {
 /// exactly the one this add asked for, or none for a whole-folder add. One
 /// left from an earlier share of the same folder would otherwise go on
 /// limiting a folder the user has just shared in full.
-fn set_added_folder_allowlist(
+pub(crate) fn set_added_folder_allowlist(
     lists: &mut std::collections::HashMap<String, Vec<String>>,
     folder: &str,
     limit: Option<&(Vec<String>, Vec<String>)>,
@@ -10052,6 +10052,15 @@ pub(crate) async fn delete_indexed_library_file(
         let unpublish = hashes_no_longer_offered(&index, &gone);
         (removed, hashes, unpublish)
     };
+    // The mirrors kept for its content go with the last copy in the Library.
+    if let Some(file) = removed.as_ref() {
+        let last_copy = state.local_index.read().await.get_by_hash(&file.hash).is_none();
+        if last_copy {
+            let db = state.db.clone();
+            let hash = file.hash.clone();
+            let _ = tokio::task::spawn_blocking(move || db.delete_library_web_mirrors(&hash)).await;
+        }
+    }
     discard_fresh_part_hashes(&state.fresh_part_hashes, &removed_hashes).await;
     refresh_file_cache(&state.local_index, &state.cached_shared_files).await;
 

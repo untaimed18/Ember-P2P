@@ -80,6 +80,10 @@ pub struct EmberSessionHandle {
     /// hold a file it offers us once we say we are keeping the offer for the
     /// user. Shared and spread exactly as `honours_friends_only` is.
     holds_offers: Arc<std::sync::atomic::AtomicBool>,
+    /// The feature bits the friend announced on this session
+    /// (`EMBER_EXT_FEATURES`); 0 from a build before 1.8.0. Shared and spread
+    /// as `honours_friends_only` is.
+    features: Arc<std::sync::atomic::AtomicU32>,
 }
 
 static NEXT_EMBER_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -95,6 +99,8 @@ struct SecureSessionEntry {
     /// The session's [`EmberSessionHandle::holds_offers`] flag, for the same
     /// reason.
     holds_offers: Arc<std::sync::atomic::AtomicBool>,
+    /// The session's feature bits, likewise.
+    features: Arc<std::sync::atomic::AtomicU32>,
 }
 
 type SecureRevocationIndex = std::sync::Mutex<HashMap<[u8; 16], HashMap<u64, SecureSessionEntry>>>;
@@ -174,7 +180,28 @@ impl EmberSessionHandle {
             peer_addr: None,
             honours_friends_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             holds_offers: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            features: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    /// Take up the feature bits the friend announced, on this session and on
+    /// every other live secure session of the same friend.
+    pub fn mark_features(&self, features: u32) {
+        self.features.store(features, Ordering::Relaxed);
+        let (Some(registration), Some(index)) =
+            (self.secure_registration.as_ref(), SECURE_REVOCATION_INDEX.get())
+        else {
+            return;
+        };
+        let index = index.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for entry in index.get(&registration.ember_hash).into_iter().flat_map(|s| s.values()) {
+            entry.features.store(features, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the friend announced `feature` (`EMBER_FEATURE_*`).
+    pub fn has_feature(&self, feature: u32) -> bool {
+        self.features.load(Ordering::Relaxed) & feature != 0
     }
 
     /// Record that the friend's build honours friends-only markings, on this
@@ -262,12 +289,20 @@ impl EmberSessionHandle {
         {
             handle.holds_offers.store(true, Ordering::Relaxed);
         }
+        if let Some(features) = sessions
+            .values()
+            .map(|entry| entry.features.load(Ordering::Relaxed))
+            .find(|&features| features != 0)
+        {
+            handle.features.store(features, Ordering::Relaxed);
+        }
         sessions.insert(
             handle.session_id,
             SecureSessionEntry {
                 shutdown: handle.shutdown.clone(),
                 honours_friends_only: handle.honours_friends_only.clone(),
                 holds_offers: handle.holds_offers.clone(),
+                features: handle.features.clone(),
             },
         );
         drop(index);
@@ -2314,6 +2349,21 @@ fn proven_session_ember_pubkey(
     hello_caps.ember_pubkey.filter(|_| secure_v2_authenticated)
 }
 
+/// The Ember identity to grant `entry` its slot to over a secure friend dial,
+/// when its row was queued on a session that proved that identity and the
+/// waiter said it adopts such a grant. A plain push-grant session is never
+/// served a friends-only file, so without this a friend waiting for one lost
+/// its row the moment its turn came. Whether the identity is a mutual friend
+/// is the caller's to check.
+fn secure_push_grant_target(entry: &QueueEntry) -> Option<[u8; 16]> {
+    if !entry.ember_verified
+        || entry.ember_features & super::messages::EMBER_FEATURE_SECURE_PUSH_GRANT == 0
+    {
+        return None;
+    }
+    crate::network::ember::crypto::node_id_from_ed25519_bytes(&entry.ember_pubkey?)
+}
+
 fn proven_key_matches_row(entry: &QueueEntry, proven_ember_pubkey: Option<[u8; 32]>) -> bool {
     matches!(
         (proven_ember_pubkey, entry.ember_pubkey),
@@ -2880,6 +2930,9 @@ pub(crate) struct QueueEntry {
     /// verified peer's cleartext hash and hung up was scored with that peer's
     /// ratio. See [`Self::credit_ip_now`].
     pub(crate) credit_ip: u32,
+    /// The Ember feature bits the session that last bound this row advertised,
+    /// kept for the push-grant dial, which runs once that session is gone.
+    pub(crate) ember_features: u32,
 }
 
 impl QueueEntry {
@@ -3000,6 +3053,7 @@ fn queue_entry_from_hello(
         peer_name: hello_caps.peer_name.clone(),
         client_software: client_software_from_caps(hello_caps),
         credit_ip,
+        ember_features: hello_caps.ember_features,
     }
 }
 
@@ -3476,6 +3530,8 @@ pub enum UploadEventKind {
         /// The session has sent `EMBER_EXT_BROWSE_SCOPE_AWARE`, so it will
         /// honour friends-only markings. Without it, none are listed.
         supports_scope: bool,
+        /// An `EBR2` request's filter, applied before the answer's caps.
+        filter: Option<super::multi_source::BrowseFilter>,
     },
     /// Incoming Ember browse response from a friend (outbound session).
     /// Each entry is `(ed2k_hash_hex, size, name, optional_aich_hash_hex, optional_ember_hex)`.
@@ -6513,6 +6569,7 @@ impl UploadHandler {
             entry.file_hash = current_file_hash.unwrap_or([0u8; 16]);
             entry.peer_name = hello_caps.peer_name.clone();
             entry.client_software = client_software_from_caps(hello_caps);
+            entry.ember_features = hello_caps.ember_features;
             // The slot just spent was this peer's turn. A row it queued
             // meanwhile must not keep the older wait, or the peer outscores
             // every waiter and takes the slot straight back.
@@ -7727,18 +7784,28 @@ impl UploadHandler {
         };
 
         let identity = entry.identity.clone();
+        let secure_friend = match secure_push_grant_target(&entry) {
+            Some(hash)
+                if self.mutual_friend_hashes.read().await.contains(&hash)
+                    && self.friend_hashes.read().await.contains(&hash) =>
+            {
+                Some(hash)
+            }
+            _ => None,
+        };
         let req = ConnectServeRequest {
             peer_addr,
             crypt_options: entry.crypt_options,
             user_hash: waiter_user_hash,
             push_grant_file_hash: Some(entry.file_hash),
             push_grant_accepted: Some(grant_accepted.clone()),
-            secure_friend_ember_hash: None,
+            secure_friend_ember_hash: secure_friend,
         };
 
         info!(
-            "AddUpNextClient: dialing HighID push-grant to {peer_addr} for file {}",
-            hex::encode(entry.file_hash)
+            "AddUpNextClient: dialing HighID push-grant to {peer_addr} for file {}{}",
+            hex::encode(entry.file_hash),
+            if secure_friend.is_some() { " over a secure friend dial" } else { "" }
         );
 
         // Granting a queued peer its slot is the one connection eMule refuses
@@ -9088,6 +9155,64 @@ impl UploadHandler {
                             peer_caps: hello_caps.clone(),
                             friend_ember_hash: Some(peer.ember_hash),
                             origin: Some(crate::types::SourceOrigin::Ember),
+                            answers_server_callback: false,
+                        })
+                        .await;
+                    return Ok(());
+                }
+
+                // A friend we are queued on, granting us its slot over a secure
+                // dial (`EMBER_FEATURE_SECURE_PUSH_GRANT`): the Path B adoption
+                // below, which cannot take a secure stream, matched as there on
+                // the address and user hash, and only for a peer Noise proved is
+                // a friend. A relayed stream's address is the relay's.
+                let secure_grant_file = match peer_addr.ip() {
+                    std::net::IpAddr::V4(peer_v4)
+                        if !relayed && self.friend_hashes.read().await.contains(&peer.ember_hash) =>
+                    {
+                        let idx = reconnect_index();
+                        let guard = idx.read().unwrap_or_else(|e| e.into_inner());
+                        guard
+                            .get(&peer_v4)
+                            .and_then(|entries| path_b_divert_file(entries, peer_user_hash))
+                            .map(|file_hash| (peer_v4, file_hash))
+                    }
+                    _ => None,
+                };
+                if let Some((peer_v4, file_hash)) = secure_grant_file {
+                    let (StreamReader::Boxed(dyn_reader), StreamWriter::Boxed(dyn_writer)) =
+                        (reader, writer)
+                    else {
+                        warn!("Secure push-grant from {peer_addr} was not a boxed secure stream; dropping");
+                        return Ok(());
+                    };
+                    info!(
+                        "Friend {} ({peer_addr}) granted us its slot for file {} over a secure dial",
+                        hex::encode(peer.ember_hash),
+                        hex::encode(file_hash)
+                    );
+                    crate::network::ed2k::multi_source::note_push_grant_diversion();
+                    let peer_hello_port = if hello_data.len() >= 23 {
+                        u16::from_le_bytes([hello_data[21], hello_data[22]])
+                    } else {
+                        0
+                    };
+                    let _ = self
+                        .kad_callback_tx
+                        .send(KadCallbackParts {
+                            peer_ip: peer_v4,
+                            peer_port: peer_addr.port(),
+                            peer_hello_port,
+                            peer_user_hash,
+                            file_hash,
+                            reader: dyn_reader,
+                            writer: dyn_writer,
+                            // As for the connect-back above: the secure branch
+                            // already answered with our EmuleInfoAnswer.
+                            emule_info_done: true,
+                            peer_caps: hello_caps.clone(),
+                            friend_ember_hash: Some(peer.ember_hash),
+                            origin: None,
                             answers_server_callback: false,
                         })
                         .await;
@@ -11684,6 +11809,7 @@ impl UploadHandler {
                             // later handshake still names itself in the tab.
                             queue[pos].peer_name = hello_caps.peer_name.clone();
                             queue[pos].client_software = client_software_from_caps(&hello_caps);
+                            queue[pos].ember_features = hello_caps.ember_features;
                             // If this session qualifies for friend priority,
                             // upgrade an existing queue entry's friend-slot
                             // flag (it may have been added before the peer
@@ -14546,6 +14672,9 @@ impl UploadHandler {
                                 hello_caps.ember_pubkey = Some(pk);
                             }
                         }
+                        if !identity_changed {
+                            hello_caps.ember_features = ident.features;
+                        }
                         ul_client_software = client_software_from_caps(&hello_caps);
                         if peer_user_hash != [0u8; 16] {
                             self.credit_manager.write().await.note_client_identity(
@@ -15006,8 +15135,10 @@ impl UploadHandler {
                                     session_id: session.session_id(),
                                     reply_tx: outbound_tx.clone(),
                                     supports_ebr1:
-                                        super::multi_source::browse_request_supports_v1(&payload),
+                                        super::multi_source::browse_request_supports_v1(&payload)
+                                            || payload.starts_with(super::multi_source::BROWSE_REQUEST_V2_MAGIC),
                                     supports_scope: peer_scope_aware,
+                                    filter: super::multi_source::browse_request_filter(&payload),
                                 },
                             }).await;
                         }
@@ -15355,6 +15486,13 @@ impl UploadHandler {
                                 peer_scope_aware = true;
                                 if let Some(session) = ember_session_handle.as_ref() {
                                     session.mark_honours_friends_only();
+                                }
+                            }
+                            Some((super::messages::EMBER_EXT_FEATURES, body)) => {
+                                if let (Some(session), Some(word)) =
+                                    (ember_session_handle.as_ref(), body.get(..4))
+                                {
+                                    session.mark_features(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
                                 }
                             }
                             Some((super::messages::EMBER_EXT_CHAT_ID, body)) => {
@@ -17423,6 +17561,25 @@ mod ember_session_handle_tests {
         assert!(!EmberSessionHandle::new_secure(channel(), [2; 32], hash).holds_offers());
     }
 
+    /// Feature bits a friend announced on one session hold on its duplicates
+    /// and on one opened while either is up, and on nobody else's.
+    #[test]
+    fn announced_features_spread_like_the_other_marks() {
+        let hash = [0xE9; 16];
+        let channel = || tokio::sync::mpsc::channel::<Vec<u8>>(1).0;
+        let a = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let b = EmberSessionHandle::new_secure(channel(), [2; 32], hash);
+        let stranger = EmberSessionHandle::new_secure(channel(), [3; 32], [0xEA; 16]);
+        let browse = super::super::messages::EMBER_FEATURE_FILTERED_BROWSE;
+        assert!(!a.has_feature(browse));
+
+        a.mark_features(super::super::messages::EMBER_FEATURES);
+        assert!(b.has_feature(browse) && !stranger.has_feature(browse));
+        assert!(EmberSessionHandle::new_secure(channel(), [2; 32], hash).has_feature(browse));
+        drop((a, b));
+        assert!(!EmberSessionHandle::new_secure(channel(), [2; 32], hash).has_feature(browse));
+    }
+
     /// Each end of a crossed pair of dials routes through its own and reads
     /// the friend's frames on the other, so holds can be agreed over a
     /// session that never held the slot. Its end reaches the loop too, as an
@@ -18075,6 +18232,7 @@ mod abuse_and_seniority_tests {
             peer_name: String::new(),
             client_software: String::new(),
             credit_ip: last_ip.map_or(0, queue_row_credit_ip),
+            ember_features: 0,
         }
     }
 
@@ -18086,6 +18244,24 @@ mod abuse_and_seniority_tests {
         let mut entry = queue_entry(Some(ip.parse().unwrap()), None);
         entry.udp_port = udp_port;
         entry
+    }
+
+    #[test]
+    fn only_a_proven_waiter_that_adopts_secure_grants_is_dialled_securely() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let ember_hash = crate::network::ember::crypto::node_id_from_ed25519_bytes(&key).unwrap();
+        let mut entry = queue_entry(Some("8.8.8.8".parse().unwrap()), Some(key));
+        // A 1.7 waiter: proven, but it would not know what to do with the grant.
+        assert_eq!(secure_push_grant_target(&entry), None);
+
+        entry.ember_features = super::super::messages::EMBER_FEATURE_SECURE_PUSH_GRANT;
+        assert_eq!(secure_push_grant_target(&entry), Some(ember_hash));
+
+        // A key claimed on a plain session proves nothing.
+        entry.ember_verified = false;
+        assert_eq!(secure_push_grant_target(&entry), None);
     }
 
     /// The key a session reclaims with is the one its own state proves: on a
