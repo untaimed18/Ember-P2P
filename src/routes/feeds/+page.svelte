@@ -603,6 +603,8 @@
       shownSettingsFor = key;
       autoEnabled = feed.auto_download;
       shareEnabled = feed.share_files;
+      // Asked about another feed, which is not the one shown any more.
+      shareAsk = null;
       autoItemMib = feed.auto_max_item_mib;
       autoDayMib = feed.auto_max_day_mib;
       autoOpen = false;
@@ -669,13 +671,35 @@
   }
 
   let shareQueue: Promise<unknown> = Promise.resolve();
+  /** The feed whose sharing is being turned on, asked about first: it tells
+   *  anyone who looks one of its files up that this follower has it. */
+  let shareAsk = $state<FollowedFeed | null>(null);
+  /** Its name as asked, as `unfollowTitle` is. */
+  let shareAskTitle = $state('');
 
-  /** Saves at once, one change at a time, as the auto-download switch does. */
+  /** Turning sharing on asks first, as listing in Discover does; off saves at once. */
   function toggleShare(on: boolean) {
     const feed = selected;
     if (!feed) return;
-    const key = keyOf(feed);
     shareEnabled = on;
+    if (on) {
+      shareAskTitle = feed.title.trim() || m.feeds_untitled();
+      shareAsk = feed;
+    } else {
+      shareAsk = null;
+      saveShare(feed, false);
+    }
+  }
+
+  function cancelShare() {
+    const feed = shareAsk;
+    shareAsk = null;
+    if (feed && selectedKey === keyOf(feed)) shareEnabled = feed.share_files;
+  }
+
+  /** Saves one change at a time, as the auto-download switch does. */
+  function saveShare(feed: FollowedFeed, on: boolean) {
+    const key = keyOf(feed);
     shareQueue = shareQueue.then(async () => {
       try {
         await setFeedShareFiles(feed.publisher, feed.salt, on);
@@ -894,7 +918,7 @@
       case 'too_large':
         return m.feeds_state_too_large();
       case 'busy':
-        return m.feeds_state_waiting_short();
+        return m.feeds_check_busy();
       case 'deleted':
         return m.feeds_check_deleted();
       default:
@@ -3283,6 +3307,20 @@
     if (feed) void setListed(feed, true);
   }}
   oncancel={cancelListing}
+/>
+
+<ConfirmDialog
+  open={shareAsk !== null}
+  title={m.feeds_share_confirm_title({ title: shareAskTitle })}
+  message={m.feeds_share_desc()}
+  confirmLabel={m.feeds_share_confirm()}
+  focusCancel
+  onconfirm={() => {
+    const feed = shareAsk;
+    shareAsk = null;
+    if (feed) saveShare(feed, true);
+  }}
+  oncancel={cancelShare}
 />
 
 <ConfirmDialog

@@ -489,8 +489,9 @@ fn recover_restored_copies(
 }
 
 /// The publisher of each followed feed, by the folder in `Feeds` its files
-/// finish in: who a feed's restored download is held for again. Read only
-/// when one of `incomplete` is a feed's.
+/// finish in: who a feed's restored download is held for again, with a
+/// friend publisher's last address dialled at once, as when it was started.
+/// Read only when one of `incomplete` is a feed's.
 async fn feed_publishers(
     db: &Arc<Database>,
     incomplete: &[Transfer],
@@ -502,8 +503,23 @@ async fn feed_publishers(
         return HashMap::new();
     }
     let db = db.clone();
-    let feeds = match tokio::task::spawn_blocking(move || db.feeds_followed()).await {
-        Ok(Ok(feeds)) => feeds,
+    let read = tokio::task::spawn_blocking(move || {
+        let feeds = db.feeds_followed()?;
+        let friends = db.get_friend_public_keys().unwrap_or_default();
+        let addresses: HashMap<String, std::net::SocketAddr> = feeds
+            .iter()
+            .filter_map(|feed| {
+                let mut key = [0u8; 32];
+                hex::decode_to_slice(&feed.publisher, &mut key).ok()?;
+                let (hash, _) = friends.iter().find(|(_, friend)| *friend == key)?;
+                let (ip, port) = db.get_friend_address(&hex::encode(hash)).ok().flatten()?;
+                Some((feed.publisher.clone(), crate::network::feed_direct::friend_tcp(&ip, port)?))
+            })
+            .collect();
+        anyhow::Ok((feeds, addresses))
+    });
+    let (feeds, addresses) = match read.await {
+        Ok(Ok(read)) => read,
         Ok(Err(e)) => {
             warn!("Could not read followed feeds for their restored downloads: {e}");
             return HashMap::new();
@@ -520,9 +536,10 @@ async fn feed_publishers(
             let (mut key, mut salt) = ([0u8; 32], [0u8; 16]);
             hex::decode_to_slice(&feed.publisher, &mut key).ok()?;
             hex::decode_to_slice(&feed.salt, &mut salt).ok()?;
+            let friend_tcp = addresses.get(&feed.publisher).copied();
             Some((
                 feed.folder,
-                crate::network::feed_direct::Publisher { key, salt, friend_tcp: None },
+                crate::network::feed_direct::Publisher { key, salt, friend_tcp },
             ))
         })
         .collect()

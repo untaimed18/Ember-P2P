@@ -126,32 +126,47 @@ pub(crate) async fn reconcile(app: &tauri::AppHandle, rescan: &[String]) {
     let plan = plan(&wanted, &shared, &managed);
 
     for folder in plan.add {
-        match crate::commands::sharing::add_shared_folder_approved(
+        // Recorded before it is shared: one shared and not recorded would be,
+        // to Ember, a folder the user shared, never taken back. A record left
+        // by an add that does not happen is dropped below, or by the next
+        // pass if this one is cut short.
+        let recorded = crate::commands::settings::save_settings_change(app, &state, |settings| {
+            if settings.feed_share_folders.iter().any(|listed| same_folder(listed, &folder)) {
+                return Ok(false);
+            }
+            settings.feed_share_folders.push(folder.clone());
+            Ok(true)
+        })
+        .await;
+        if let Err(error) = recorded {
+            tracing::warn!("Feed sharing: not sharing the feed folder {folder}, as it could not be recorded: {error}");
+            continue;
+        }
+        let added = crate::commands::sharing::add_shared_folder_approved(
             app.clone(),
             app.state::<AppState>(),
             folder.clone(),
             None,
             crate::commands::sharing::ShareApproval::Native,
         )
-        .await
-        {
+        .await;
+        match added {
             Ok(added) if added.outcome == crate::commands::sharing::FolderAddOutcome::Added => {
-                let stored = added.folder;
-                let recorded = crate::commands::settings::save_settings_change(app, &state, |settings| {
-                    if settings.feed_share_folders.iter().any(|folder| same_folder(folder, &stored)) {
-                        return Ok(false);
-                    }
-                    settings.feed_share_folders.push(stored.clone());
-                    Ok(true)
-                })
-                .await;
-                if let Err(error) = recorded {
-                    tracing::warn!("Feed sharing: shared {folder}, but could not record it as the feed's: {error}");
-                }
                 tracing::info!("Feed sharing: shared the feed folder {folder}");
+                continue;
             }
+            // The user's own share of it, made meanwhile: theirs to keep.
             Ok(_) => {}
             Err(error) => tracing::warn!("Feed sharing: could not share the feed folder {folder}: {error}"),
+        }
+        let dropped = crate::commands::settings::save_settings_change(app, &state, |settings| {
+            let before = settings.feed_share_folders.len();
+            settings.feed_share_folders.retain(|listed| !same_folder(listed, &folder));
+            Ok(settings.feed_share_folders.len() != before)
+        })
+        .await;
+        if let Err(error) = dropped {
+            tracing::debug!("Feed sharing: could not drop the record of {folder}: {error}");
         }
     }
     for folder in plan.remove {

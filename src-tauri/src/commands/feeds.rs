@@ -106,6 +106,16 @@ fn publish_unreachable() -> String {
     coded("feeds_publish_unreachable", "Could not reach the Ember network to publish the feed. Try again in a minute.")
 }
 
+/// A head sent that too few nodes confirmed in time: it may well be stored,
+/// and is kept to be sent again by itself (`keep_pending`), so trying again
+/// is not the user's to do.
+fn publish_unconfirmed() -> String {
+    coded(
+        "feeds_publish_unconfirmed",
+        "The feed was sent, but too few nodes confirmed it in time. Ember sends it again by itself.",
+    )
+}
+
 fn hex_salt(salt: &str) -> Result<FeedSalt, String> {
     let mut out = [0u8; 16];
     hex::decode_to_slice(salt.trim(), &mut out).map_err(|_| coded("feeds_not_found", "That feed could not be found"))?;
@@ -1221,7 +1231,7 @@ pub async fn publish_feed(
         Placed::Unknown => {
             keep_pending(&state, &owner, &feed, &held, new_list.clone(), &published).await;
             refresh_served_files(&state).await;
-            return Err(publish_unreachable());
+            return Err(publish_unconfirmed());
         }
     }
 
@@ -2447,11 +2457,7 @@ async fn start_item_download(app: &tauri::AppHandle, feed: &FollowedFeed, item: 
     // Not handed over as a peer to dial over eD2K: the stream asks it first,
     // and every network is asked, the friends' path with them, if it fails.
     let friend_tcp = match &friend {
-        Some((_, Some((ip, port)))) => ip
-            .parse::<std::net::Ipv4Addr>()
-            .ok()
-            .filter(|ip| *port != 0 && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast())
-            .map(|ip| std::net::SocketAddr::from((ip, *port))),
+        Some((_, Some((ip, port)))) => crate::network::feed_direct::friend_tcp(ip, *port),
         _ => None,
     };
     let started = crate::commands::transfers::start_download_to(
