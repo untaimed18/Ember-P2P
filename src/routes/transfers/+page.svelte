@@ -15,7 +15,7 @@
   import { removeToast, setToastMessage, toastsFor } from '$lib/stores/toast';
   const { addActionToast, toastError, toastSuccess, toastWarning } = toastsFor('downloads');
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
-  import { completedFirst as completedFirstPref } from '$lib/stores/transfersView';
+  import { completedFirst as completedFirstPref, revealDownloadRequested } from '$lib/stores/transfersView';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
@@ -4038,6 +4038,31 @@
   });
   $effect(() => {
     if (!addLinksOpen) addLinksText = null;
+  });
+
+  // "Show in Transfers" from another page: select the download and scroll to
+  // it, clearing a filter or category that would hide it. Waits for the list
+  // to load; a download gone by then is let go of.
+  $effect(() => {
+    const id = $revealDownloadRequested;
+    if (id === null) return;
+    const row = allDownloads.find((t) => t.id === id);
+    if (!row) {
+      if ($transfersLoaded) revealDownloadRequested.set(null);
+      return;
+    }
+    revealDownloadRequested.set(null);
+    untrack(() => {
+      const shown = (t: Transfer) => t.id === id;
+      if (!filteredActiveDownloads.some(shown) && !filteredCompletedDownloads.some(shown)) {
+        transferFilter = '';
+        categoryFilter = '';
+      }
+      if (row.status === 'completed') completedCollapsed = false;
+      focusedDlId = id;
+      lastClickedDlId = id;
+    });
+    void tick().then(() => requestAnimationFrame(() => revealDownloadRow(id)));
   });
 
   async function queueLinksFromDialog(text: string) {

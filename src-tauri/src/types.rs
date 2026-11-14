@@ -2124,6 +2124,9 @@ pub struct AppSettings {
     /// way.
     #[serde(default)]
     pub notify_channel_message: bool,
+    /// A followed feed has new files.
+    #[serde(default = "default_true")]
+    pub notify_feed_update: bool,
 
     /// Show the confirmation and info pop-ups (toasts) each part of the window
     /// raises: "Download queued", "Link copied" and the like. Off hides only
@@ -3283,6 +3286,7 @@ impl Default for AppSettings {
             // See the field docs: a room is chatty enough that this is the one
             // notification a user has to ask for.
             notify_channel_message: false,
+            notify_feed_update: true,
             popups_downloads: true,
             popups_search: true,
             popups_library: true,

@@ -9206,6 +9206,28 @@ impl Database {
     /// already holds.
     pub fn unread_message_counts(&self) -> anyhow::Result<Vec<(String, i64, i64)>> {
         let conn = self.conn.lock();
+        Self::unread_message_counts_in(&conn)
+    }
+
+    /// Mark every conversation read but for the disappearing messages nobody
+    /// has opened: a received message's timer starts when it is read, so
+    /// marking it read unseen would start the countdown on words the user has
+    /// not seen. Returns what is left unread, as [`Self::unread_message_counts`]
+    /// does.
+    pub fn mark_all_chats_read(&self) -> anyhow::Result<Vec<(String, i64, i64)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        conn.execute(
+            "UPDATE chat_messages SET read = 1 \
+             WHERE read = 0 AND direction = 'received' \
+               AND id NOT IN (SELECT message_id FROM chat_message_timers \
+                   WHERE ttl_secs > 0 AND expires_at IS NULL)",
+            [],
+        )?;
+        Self::unread_message_counts_in(&conn)
+    }
+
+    fn unread_message_counts_in(conn: &Connection) -> anyhow::Result<Vec<(String, i64, i64)>> {
         // `direction = 'received'` for the same reason the channel tally in
         // `list_channels` carries it: unread means "they said something I have
         // not read", and a sent row has no business in that count. The insert
@@ -28272,6 +28294,34 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Marking every chat read leaves the disappearing messages nobody has
+    /// opened unread, their timers not started: reading is what starts them.
+    #[test]
+    fn marking_every_chat_read_leaves_unopened_disappearing_messages() {
+        let path = std::env::temp_dir().join(format!("ember-mark-all-read-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        let (friend, other) = ("ab".repeat(16), "cd".repeat(16));
+        db.insert_chat_message_ttl(&friend, "received", "plain", CHAT_DELIVERED, 0).unwrap();
+        let fleeting = db
+            .insert_chat_message_ttl(&friend, "received", "fleeting", CHAT_DELIVERED, 0)
+            .unwrap();
+        let hash = Database::friend_chat_body_hash_hex("fleeting");
+        assert_eq!(db.apply_peer_chat_ttl(&friend, &hash, 3_600).unwrap(), Some((fleeting, None)));
+        db.insert_chat_message_ttl(&other, "received", "hi", CHAT_DELIVERED, 0).unwrap();
+
+        let left = db.mark_all_chats_read().unwrap();
+        assert_eq!(left, vec![(friend.clone(), 1, fleeting)]);
+        assert!(db.chat_expiries(&friend, &[fleeting]).unwrap().is_empty(), "its timer has not started");
+
+        assert_eq!(db.mark_messages_read(&friend).unwrap().len(), 1, "opening the chat starts it");
+        assert!(db.mark_all_chats_read().unwrap().is_empty());
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

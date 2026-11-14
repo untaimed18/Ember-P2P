@@ -28,6 +28,10 @@ const SETTLING_SECS: u64 = 15 * 60;
 /// checking. Kad's check answers within minutes when it can; past this it has
 /// nothing more to say, and "checking" would otherwise last all session.
 const KAD_TCP_CHECK_SECS: u64 = 30 * 60;
+/// How long into a session an enabled IP filter with no list in place may
+/// still be loading one. Past this the load failed, and the filter, failing
+/// closed, blocks every peer until a list loads.
+const IP_FILTER_LOAD_SECS: u64 = 60;
 
 /// The one-line answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -151,6 +155,11 @@ pub struct Signals {
     /// Saved ports or UPnP differ from what this session runs on, so a fix
     /// for them only takes effect at a restart.
     pub restart_pending: bool,
+    /// The network said how the IP filter stands: whether it is on, and
+    /// whether its list is in place. Unknown, the filter has no check.
+    pub ip_filter_known: bool,
+    pub ip_filter_enabled: bool,
+    pub ip_filter_ready: bool,
 }
 
 impl Signals {
@@ -184,6 +193,15 @@ impl Signals {
     fn online(&self) -> bool {
         self.kad_connected || self.server_connected || self.dht_contacts > 0
     }
+
+    /// The filter is on with no list, past the time a load takes: it is
+    /// blocking every peer.
+    fn ip_filter_blocking_all(&self) -> bool {
+        self.ip_filter_known
+            && self.ip_filter_enabled
+            && !self.ip_filter_ready
+            && self.session_secs >= IP_FILTER_LOAD_SECS
+    }
 }
 
 /// The verdict, the checks and the ranked fixes, from `s`. Pure, so every
@@ -214,6 +232,17 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
         if s.tcp_listen_failed { Fail } else if s.udp_port_moved { Warn } else { Pass },
         if s.tcp_listen_failed { "tcp_taken" } else if s.udp_port_moved { "udp_moved" } else { "ok" },
     );
+    if s.ip_filter_known {
+        if !s.ip_filter_enabled {
+            check("ip_filter", Skip, "off");
+        } else if s.ip_filter_ready {
+            check("ip_filter", Pass, "ok");
+        } else if s.ip_filter_blocking_all() {
+            check("ip_filter", Fail, "blocking_all");
+        } else {
+            check("ip_filter", Skip, "loading");
+        }
+    }
     match s.firewall_rules {
         Some(true) => check("windows_firewall", Pass, "ok"),
         Some(false) => check("windows_firewall", Fail, "missing"),
@@ -311,6 +340,10 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     // another NAT for certain, whatever the verdict and whatever is saved, so
     // that is said wherever peers do not already reach us.
     let mut fixes = Vec::new();
+    // Ahead of everything: while it lasts, no other fix can show.
+    if s.ip_filter_blocking_all() {
+        fixes.push(Fix { id: "ip_filter", action: Some("download_ip_filter") });
+    }
     if s.restart_pending {
         fixes.push(Fix { id: "restart", action: None });
     }
@@ -434,6 +467,26 @@ struct Gathered {
     probed: bool,
 }
 
+/// Whether the IP filter is on, and whether its list is in place; `None`
+/// when the network does not answer, so the check says nothing it cannot know.
+async fn ip_filter_state(state: &AppState) -> Option<(bool, bool)> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // In the order the ranges are kept, so the page asked for costs no sort.
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetIpFilterStats {
+            query: String::new(),
+            sort: "range".to_string(),
+            sort_asc: true,
+            offset: 0,
+            limit: 1,
+            tx,
+        })
+        .ok()?;
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await.ok()?.ok()?;
+    Some((stats.enabled, stats.ranges_ready))
+}
+
 /// Read every signal, running the outside-in probe when `probe` is set.
 async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
     let stats = network_stats(state).await?;
@@ -474,6 +527,9 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         session_secs: stats.session_age_secs,
         ..Signals::default()
     };
+    if let Some((enabled, ready)) = ip_filter_state(state).await {
+        (signals.ip_filter_known, signals.ip_filter_enabled, signals.ip_filter_ready) = (true, enabled, ready);
+    }
 
     let mut probed = false;
     if probe {
@@ -683,6 +739,38 @@ mod tests {
             clock_skew_secs: Some(2),
             ..Signals::default()
         }
+    }
+
+    /// An IP filter that is on with no list blocks every peer: once a load has
+    /// had its time, that is the first thing the doctor says and offers to
+    /// fix. Before then the list may still be loading, and with no answer
+    /// from the network the filter has no check at all.
+    #[test]
+    fn an_ip_filter_with_no_list_is_named_first() {
+        let blocking = Signals {
+            ip_filter_known: true,
+            ip_filter_enabled: true,
+            ip_filter_ready: false,
+            session_secs: IP_FILTER_LOAD_SECS,
+            ..reachable()
+        };
+        let (_, checks, _, fixes) = assess(&blocking);
+        assert!(checks.contains(&Check { id: "ip_filter", status: CheckStatus::Fail, detail: "blocking_all" }));
+        assert_eq!(fixes[0], Fix { id: "ip_filter", action: Some("download_ip_filter") });
+
+        let loading = Signals { session_secs: IP_FILTER_LOAD_SECS - 1, ..blocking.clone() };
+        assert!(!fix_ids(&loading).contains(&"ip_filter"));
+        assert!(assess(&loading).1.contains(&Check { id: "ip_filter", status: CheckStatus::Skip, detail: "loading" }));
+
+        let off = Signals { ip_filter_known: true, ..reachable() };
+        for (ready, detail) in [(Signals { ip_filter_ready: true, ..blocking.clone() }, "ok"), (off, "off")] {
+            assert!(!fix_ids(&ready).contains(&"ip_filter"));
+            assert!(assess(&ready).1.iter().any(|c| c.id == "ip_filter" && c.detail == detail));
+        }
+
+        let unknown = Signals { ip_filter_known: false, ..blocking };
+        assert!(!fix_ids(&unknown).contains(&"ip_filter"));
+        assert!(!assess(&unknown).1.iter().any(|c| c.id == "ip_filter"), "no answer is no check");
     }
 
     fn fix_ids(s: &Signals) -> Vec<&'static str> {

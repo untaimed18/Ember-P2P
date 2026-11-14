@@ -8,6 +8,8 @@
   import { formatSize, formatNumber, formatDateTime, formatDateWithYear as formatDate } from '$lib/utils';
   import { onMount, onDestroy, tick, untrack } from 'svelte';
   import * as m from '$lib/paraglide/messages';
+  import { networkStats, serverStatus } from '$lib/stores/network';
+  import { unpublishedText } from '$lib/publishState';
 
   type SortField =
     | 'name'
@@ -104,6 +106,11 @@
   } = $props();
 
   let highlightLower = $derived(highlight.trim().toLowerCase());
+  let publishNetworks = $derived({
+    kad: $networkStats.status === 'connected',
+    server: $serverStatus === 'connected',
+    ember: ($networkStats.ember_dht_verified_contacts ?? 0) > 0,
+  });
 
   /** `name` split around its first case-insensitive match of the search, the
    *  same test the filter uses; `null` when there is nothing to mark. */
@@ -825,7 +832,7 @@
                       {#if file.aich_hash}<span class="shared-badge aich" title={m.library_aich_available()}>AICH</span>{/if}
                     </span>
                   {:else}
-                    <span class="not-published" title={m.library_not_published_yet()}>&#x2014;</span>
+                    <span class="not-published" title={unpublishedText(file.friends_only, publishNetworks)}>&#x2014;</span>
                     <!-- Repair data, not a place the file has reached, so it
                          rides along without counting as published. -->
                     {#if file.aich_hash}

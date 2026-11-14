@@ -30,6 +30,7 @@ function settingsWith(patch: Partial<AppSettings> = {}): AppSettings {
     notify_friend_request: true,
     notify_shares_browsed: true,
     notify_channel_message: true,
+    notify_feed_update: true,
     ...patch,
   } as AppSettings;
 }
@@ -75,6 +76,12 @@ describe('shouldNotify', () => {
     appSettings.set(settingsWith({ notify_channel_message: false }));
     expect(shouldNotify('channel_message')).toBe(false);
     expect(shouldNotify('friend_message')).toBe(true);
+  });
+
+  it("lets new feed files be silenced without the rest", () => {
+    appSettings.set(settingsWith({ notify_feed_update: false }));
+    expect(shouldNotify('feed_update')).toBe(false);
+    expect(shouldNotify('download_complete')).toBe(true);
   });
 
   it('suppresses while Ember is focused, unless the user opted out', () => {

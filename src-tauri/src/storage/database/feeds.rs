@@ -194,6 +194,10 @@ pub struct FollowedFeed {
     /// "Share files from this feed": its downloads are advertised and served
     /// as any download is, and its folder is shared. Off by default.
     pub share_files: bool,
+    /// The file types auto-download takes, as eD2K type terms
+    /// (`search::index::infer_file_type`) joined by commas; empty for every
+    /// type. Kept in the `auto_category` column.
+    pub auto_types: String,
 }
 
 /// An item of a followed feed's list, with what this side knows of it.
@@ -957,7 +961,7 @@ impl Database {
         let select = "SELECT publisher, salt, title, description, sequence, list_ed2k, list_blake3, list_size,
                     item_count, state, list_sequence, unread, followed_at, checked_at, auto_download,
                     auto_max_item_mib, auto_max_day_mib, held_ed2k, held_blake3, held_size, folder,
-                    auto_since, seen_at, total_size, deleted, share_files
+                    auto_since, seen_at, total_size, deleted, share_files, auto_category
              FROM feeds_followed";
         let map = |row: &rusqlite::Row<'_>| {
             Ok(FollowedFeed {
@@ -987,6 +991,7 @@ impl Database {
                 total_size: row.get(23)?,
                 deleted: row.get::<_, i64>(24)? != 0,
                 share_files: row.get::<_, i64>(25)? != 0,
+                auto_types: row.get(26)?,
             })
         };
         let rows = match key {
@@ -1327,8 +1332,9 @@ impl Database {
         Ok(())
     }
 
-    /// Set a followed feed's auto-download. Turned on from off at `now`, it
-    /// takes the files first seen from then.
+    /// Set a followed feed's auto-download: its caps and the file types it
+    /// takes (see [`FollowedFeed::auto_types`]). Turned on from off at `now`,
+    /// it takes the files first seen from then.
     #[allow(clippy::too_many_arguments)]
     pub fn feed_set_auto_download(
         &self,
@@ -1337,16 +1343,17 @@ impl Database {
         enabled: bool,
         max_item_mib: i64,
         max_day_mib: i64,
+        types: &str,
         now: i64,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         self.ensure_feeds_locked(&conn)?;
         Ok(conn.execute(
             "UPDATE feeds_followed SET
-                    auto_since = CASE WHEN ?3 AND auto_download = 0 THEN ?6 ELSE auto_since END,
-                    auto_download = ?3, auto_max_item_mib = ?4, auto_max_day_mib = ?5, auto_category = ''
+                    auto_since = CASE WHEN ?3 AND auto_download = 0 THEN ?7 ELSE auto_since END,
+                    auto_download = ?3, auto_max_item_mib = ?4, auto_max_day_mib = ?5, auto_category = ?6
              WHERE publisher = ?1 AND salt = ?2",
-            params![publisher, salt, enabled, max_item_mib, max_day_mib, now],
+            params![publisher, salt, enabled, max_item_mib, max_day_mib, types, now],
         )? > 0)
     }
 
@@ -1990,15 +1997,16 @@ mod tests {
         db.feed_follow(PUB, SALT, 1).unwrap();
         let since = |salt: &str| db.feed_followed(PUB, salt).unwrap().unwrap().auto_since;
         assert_eq!(since(SALT), 0);
-        assert!(db.feed_set_auto_download(PUB, SALT, true, 0, 0, 100).unwrap());
+        assert!(db.feed_set_auto_download(PUB, SALT, true, 0, 0, "", 100).unwrap());
         assert_eq!(since(SALT), 100);
-        db.feed_set_auto_download(PUB, SALT, true, 50, 0, 200).unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 50, 0, "Video", 200).unwrap();
         assert_eq!(since(SALT), 100, "a cap changed while on");
-        db.feed_set_auto_download(PUB, SALT, false, 50, 0, 300).unwrap();
+        assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().auto_types, "Video", "and the types kept");
+        db.feed_set_auto_download(PUB, SALT, false, 50, 0, "Video", 300).unwrap();
         assert_eq!(since(SALT), 100);
-        db.feed_set_auto_download(PUB, SALT, true, 50, 0, 400).unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 50, 0, "", 400).unwrap();
         assert_eq!(since(SALT), 400, "turned on again");
-        assert!(!db.feed_set_auto_download(PUB, "nope", true, 0, 0, 500).unwrap(), "not followed");
+        assert!(!db.feed_set_auto_download(PUB, "nope", true, 0, 0, "", 500).unwrap(), "not followed");
 
         db.feed_follow(PUB, "older", 1).unwrap();
         db.feed_start_auto_since(PUB, "older", 50).unwrap();
@@ -2184,7 +2192,7 @@ mod tests {
             "the column defaults"
         );
 
-        db.feed_set_auto_download(PUB, SALT, true, 0, 0, 1).unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 0, 0, "", 1).unwrap();
         let feed = db.feed_followed(PUB, SALT).unwrap().unwrap();
         assert_eq!((feed.auto_download, feed.auto_max_item_mib, feed.auto_max_day_mib), (true, 0, 0));
         drop_db(db, path);

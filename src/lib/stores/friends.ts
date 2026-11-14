@@ -9,6 +9,7 @@ import {
   getIdleAway,
   getOnlineFriends,
   getUnreadMessageCounts,
+  markAllChatsRead,
   isFriendDiscoverable,
   parseChatAttachment,
   type FriendInfo,
@@ -703,6 +704,13 @@ export async function initFriendsStore() {
       }),
     );
     registered.push(
+      await listen<{ user_hash: string; count: number }>(UNREAD_SET_EVENT, (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        const count = event.payload?.count;
+        if (hash && Number.isSafeInteger(count) && count > 0) setUnread(hash, count);
+      }),
+    );
+    registered.push(
       await listen<{ user_hash: string; file_hash: string }>(FILE_OFFER_CLEARED_EVENT, (event) => {
         const user_hash = validFriendHash(event.payload?.user_hash);
         const file_hash = validFriendHash(event.payload?.file_hash);
@@ -1182,6 +1190,37 @@ function dropUnread(friendHash: string) {
 export function clearUnread(friendHash: string) {
   dropUnread(friendHash);
   void emit(UNREAD_CLEARED_EVENT, { user_hash: friendHash.toLowerCase() }).catch(() => {});
+}
+
+/** Frontend-only: a window set a friend's unread count to what the backend
+ *  left unread, as `markAllFriendChatsRead` does. */
+const UNREAD_SET_EVENT = 'ember-ui:unread-set';
+
+function setUnread(hash: string, count: number) {
+  unreadCounts.update((current) => {
+    if (current.get(hash) === count) return current;
+    const next = new Map(current);
+    next.set(hash, count);
+    return next;
+  });
+}
+
+/** Mark every friend conversation read but for disappearing messages not yet
+ *  opened (see `markAllChatsRead`), and bring the counts down to what is left,
+ *  in both windows. Returns how many friends still have unread messages,
+ *  which are those. */
+export async function markAllFriendChatsRead(): Promise<number> {
+  const left = new Map(
+    (await markAllChatsRead()).map(([hash, count]) => [hash.toLowerCase(), count] as const),
+  );
+  for (const hash of get(unreadCounts).keys()) {
+    if (!left.has(hash.toLowerCase())) clearUnread(hash);
+  }
+  for (const [hash, count] of left) {
+    setUnread(hash, count);
+    void emit(UNREAD_SET_EVENT, { user_hash: hash, count }).catch(() => {});
+  }
+  return left.size;
 }
 
 /**

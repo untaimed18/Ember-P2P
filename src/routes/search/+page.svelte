@@ -14,6 +14,8 @@
   import { getEmberDiagnostics } from '$lib/api/ember';
   import { startDownload } from '$lib/api/transfers';
   import { transfers } from '$lib/stores/transfers';
+  import { revealDownloadRequested } from '$lib/stores/transfersView';
+  import { goto } from '$app/navigation';
   import type { Transfer } from '$lib/types';
   import { appSettings } from '$lib/stores/settings';
   import {
@@ -1767,6 +1769,12 @@
     const t = getDownloadTransfer(result);
     if (!t) return undefined;
     return BLOCKING_DOWNLOAD_STATUSES.has(t.status) ? t : undefined;
+  }
+
+  /** Open Transfers on the download this result is already part of. */
+  function showInTransfers(t: Transfer) {
+    revealDownloadRequested.set(t.id);
+    void goto('/transfers');
   }
 
   function dlBadgeLabel(t: Transfer): string {
@@ -5490,9 +5498,9 @@
                 <button
                   class="row-dl-btn"
                   type="button"
-                  disabled
-                  title={m.search_action_already_downloading_title()}
-                  aria-label={m.search_action_already_downloading_aria({ name: displayName(result) })}
+                  onclick={(e) => { e.stopPropagation(); showInTransfers(blockingDl); }}
+                  title={m.search_action_show_in_transfers_title()}
+                  aria-label={m.search_action_show_in_transfers_aria({ name: displayName(result) })}
                 >
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <circle cx="8" cy="8" r="6.5"/>
@@ -5595,6 +5603,17 @@
             : getBlockingDownloadTransfer(contextMenu.result) ? m.search_action_already_downloading_title() : undefined}
           onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}
         >{m.search_ctx_download()}</button>
+        {#if getBlockingDownloadTransfer(contextMenu.result)}
+          <button
+            class="ctx-item"
+            role="menuitem"
+            onclick={() => {
+              const t = contextMenu && getBlockingDownloadTransfer(contextMenu.result);
+              closeContextMenu();
+              if (t) showInTransfers(t);
+            }}
+          >{m.search_show_in_transfers()}</button>
+        {/if}
         {#if checkedCount > 1}
           <button class="ctx-item" role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: formatNumber(checkedCount) })}</button>
         {/if}
@@ -5889,6 +5908,17 @@
         </div>
         <div class="modal-footer">
           <button type="button" class="ghost" onclick={closeFileDetails}>{m.common_close()}</button>
+          {#if getBlockingDownloadTransfer(selectedResult)}
+            <button
+              type="button"
+              class="ghost"
+              onclick={() => {
+                const t = selectedResult && getBlockingDownloadTransfer(selectedResult);
+                closeFileDetails();
+                if (t) showInTransfers(t);
+              }}
+            >{m.search_show_in_transfers()}</button>
+          {/if}
           <button
             type="button"
             disabled={isInLibraryOnly(selectedResult) || !!getBlockingDownloadTransfer(selectedResult) || !!downloadPending[resultKey(selectedResult)]}

@@ -3470,6 +3470,21 @@
                   />
                 </div>
               </div>
+
+              <div class="settings-subgroup" role="group" aria-labelledby="notify-feeds-title">
+                <h5 class="subgroup-title" id="notify-feeds-title">{m.nav_feeds()}</h5>
+                <div class="field toggle-row" class:is-disabled={notifyOff}>
+                  <div class="toggle-info">
+                    <label class="toggle-title" id="notify-feed-update-label" for="notify-feed-update-switch">{m.settings_notify_feed_update()}</label>
+                  </div>
+                  <ToggleSwitch
+                    id="notify-feed-update-switch"
+                    bind:checked={settings.notify_feed_update}
+                    disabled={notifyOff}
+                    ariaLabelledby="notify-feed-update-label"
+                  />
+                </div>
+              </div>
             </div>
           </div>
 

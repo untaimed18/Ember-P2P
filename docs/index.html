@@ -223,17 +223,22 @@
                   <li><strong>A friend&rsquo;s feeds on their card.</strong> The Friends page says how many of a friend&rsquo;s feeds Ember has seen, and <em>Their feeds</em> in the card&rsquo;s menu opens Discover showing only theirs</li>
                   <li><strong>A friend waiting for a friends-only file gets their turn.</strong> When a slot frees up, Ember connects to them securely so the file can be sent, instead of giving the slot to the next in line</li>
                   <li><strong>Add friend from a private conversation</strong> no room carries any more: it opens the Friends page with their code and name filled in</li>
+                  <li><strong>Mark all as read</strong> on the Friends page clears every conversation&rsquo;s unread count at once. Disappearing messages stay unread until you open them, so their timers do not start unseen</li>
                 </ul>
 
                 <h5>Feeds</h5>
                 <ul>
                   <li><strong>Share files from this feed,</strong> for one feed at a time and off until you turn it on, shares its files like your other shared files, those still downloading included, so its other followers can get them from you and not from the publisher alone. Its folder is added to your shared folders while it is on; turned off, or on Unfollow, the files are private again, but those you share some other way</li>
+                  <li><strong>Automatic downloads can take only some file types.</strong> Tick video, audio, images, documents or archives under <em>Automatic downloads</em>, and a new file of another type waits in the feed for you to download it. With none ticked, every type is downloaded as before; programs and disc images never are</li>
+                  <li><strong>A switch of their own for feed notifications.</strong> <em>A followed feed has new files</em>, under Feeds in Settings &gt; Notifications, silences them without silencing the rest</li>
                 </ul>
 
                 <h5>Library and downloads</h5>
                 <ul>
                   <li><strong>Copied eD2K links carry proven mirrors.</strong> A finished download keeps the web mirrors that sent it parts that passed their check and none that failed, and <em>Copy eD2K Link</em> adds them as <code>s=</code> parts, which eMule reads too. <em>Put proven mirrors in copied links</em> in Settings &gt; Transfers leaves them out. Deleting the file forgets them</li>
                   <li><strong>eMule import: share a folder without its subfolders,</strong> as eMule did. The files directly in it, and in folders eMule listed inside it, are shared, including files added later, and nothing in its other subfolders</li>
+                  <li><strong>Show in Transfers from Search.</strong> A result you are already downloading has <em>Show in Transfers</em> on its clock icon, in its right-click menu and in its details, which opens Transfers with that download picked out</li>
+                  <li><strong>The Library says why a file is not published.</strong> Where it showed <em>Not published yet</em>, it now says whether the file is shared with friends only, waiting for KAD, an eD2K server or the Ember network to connect, or still in line to be published</li>
                 </ul>
 
                 <h5>Chat</h5>
@@ -246,6 +251,11 @@
                   <li><strong>Lookups finish sooner.</strong> Looking for a file&rsquo;s sources or a room&rsquo;s members now stops once the nodes that hold them have answered, as a search does, and a node that never answers a first connection is given up on after 6 seconds rather than 12. <em>Find Sources</em> clicked while Ember is still looking for that file no longer starts a second Ember lookup</li>
                   <li><strong>Less work per message.</strong> A room message going straight to several members is signed once for all of them, and each record another node asks Ember to keep is signature-checked once rather than twice</li>
                   <li><strong>The log shows what the store holds for others</strong> once a minute, beside the publish line: records held, accepted and refused by reason, lookups answered and records republished. At debug level, each peer a rendezvous lookup lists gets a line saying whether it can be dialled and how its ping ended</li>
+                </ul>
+
+                <h5>Security</h5>
+                <ul>
+                  <li><strong>An IP filter whose list did not load is shown everywhere.</strong> With the filter on and no list, Ember blocks every peer to be safe; this used to show on the Security page alone. A notice now says so wherever you are in Ember, the Connection Doctor names it first, and the notice, the Doctor and the Security page each have <em>Download IP Filter</em> to fix it in one click</li>
                 </ul>
 
                 <h5>Linux</h5>

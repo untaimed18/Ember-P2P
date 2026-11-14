@@ -70,6 +70,7 @@
   import { toastsFor } from '$lib/stores/toast';
   const { addActionToast, toast: toastInfo, toastSuccess, toastError, toastWarning } = toastsFor('library');
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
+  import { unpublishedText } from '$lib/publishState';
   import {
     formatSize,
     formatNumber,
@@ -2990,6 +2991,11 @@
    * `relatedSearchSupported`.
    */
   let relatedSearchReady = $derived($serverStatus === 'connected' && $relatedSearchSupported !== false);
+  let publishNetworks = $derived({
+    kad: $networkStats.status === 'connected',
+    server: $serverStatus === 'connected',
+    ember: ($networkStats.ember_dht_verified_contacts ?? 0) > 0,
+  });
   let ctxPrioritySub = $state(false);
   let ctxCopySub = $state(false);
   let ctxSendSub = $state(false);
@@ -5800,7 +5806,7 @@
                   {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
                 </span>
                 {#if !selectedFile.shared_kad && !selectedFile.shared_ed2k && !selectedFile.shared_ember}
-                  <span class="shared-status">{m.library_not_published_yet()}</span>
+                  <span class="shared-status">{unpublishedText(selectedFile.friends_only, publishNetworks)}</span>
                 {/if}
               {:else}
                 <span class="shared-status">{m.common_pending()}</span>

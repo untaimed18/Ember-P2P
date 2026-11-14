@@ -184,6 +184,13 @@ export async function getUnreadMessageCounts(): Promise<[string, number, number]
   return invoke('get_unread_message_counts');
 }
 
+/** Mark every friend conversation read but for disappearing messages not yet
+ *  opened, whose timers start only when they are read. Returns what is left
+ *  unread, as `getUnreadMessageCounts` does. */
+export async function markAllChatsRead(): Promise<[string, number, number][]> {
+  return invoke('mark_all_chats_read');
+}
+
 /**
  * Offer one of our shared files to a friend. Sends an invitation only — the
  * friend chooses whether to download it.

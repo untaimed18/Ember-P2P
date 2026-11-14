@@ -1294,6 +1294,27 @@ pub async fn get_unread_message_counts(
         })
 }
 
+/// Mark every friend conversation read but for the disappearing messages not
+/// yet opened, whose timers only reading may start, and return what is left
+/// unread. No read receipts go: one goes when a conversation is opened, which
+/// is what it reports.
+#[tauri::command]
+pub async fn mark_all_chats_read(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<(String, i64, i64)>, String> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || db.mark_all_chats_read())
+        .await
+        .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+        .map_err(|e| {
+            coded_ctx(
+                "peers_failed_mark_messages_read",
+                "Failed to mark messages read",
+                e,
+            )
+        })
+}
+
 #[tauri::command]
 pub async fn get_friend_requests(
     state: tauri::State<'_, AppState>,

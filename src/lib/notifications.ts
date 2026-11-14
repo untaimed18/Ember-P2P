@@ -71,9 +71,7 @@ const CATEGORY_SETTING: Record<NotifyCategory, keyof AppSettings> = {
   // Has its own switch, the threshold in Settings ("Never warn"), so only the
   // master switch silences it here.
   disk_space: 'notifications_enabled',
-  // A followed feed's new items. Following a feed is the opt-in; unfollowing
-  // or the master switch silences it.
-  feed_update: 'notifications_enabled',
+  feed_update: 'notify_feed_update',
 };
 
 /** Identical notifications inside this window collapse into one. */

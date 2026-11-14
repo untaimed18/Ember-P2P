@@ -13,7 +13,7 @@
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
   import { prefersReducedMotion } from 'svelte/motion';
-  import { toastError, toastWarning } from '$lib/stores/toast';
+  import { toast, toastError, toastWarning } from '$lib/stores/toast';
   import { copyToClipboard, formatBytes, formatCalendarDate } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { alreadyQueuedText } from '$lib/alreadyQueued';
@@ -34,6 +34,7 @@
     isDiscoverable as isDiscoverableStore,
     discoverabilityFailed as discoverabilityFailedStore,
     clearUnread,
+    markAllFriendChatsRead,
     beginFriendRequestMutation,
     endFriendRequestMutation,
     dropFriendRequest,
@@ -259,6 +260,22 @@
   // can momentarily hold a hash that isn't in the current friend list, which
   // would inflate the header count.
   let onlineFriendCount = $derived(friends.filter(f => isFriendOnline(f.user_hash)).length);
+  let anyUnread = $derived(friends.some((f) => (unreadCounts.get(f.user_hash.toLowerCase()) ?? 0) > 0));
+  let markingAllRead = $state(false);
+
+  async function markAllRead() {
+    if (markingAllRead) return;
+    markingAllRead = true;
+    try {
+      // What is left unread is disappearing messages nobody has opened.
+      if ((await markAllFriendChatsRead()) > 0) toast(m.friends_mark_all_read_kept());
+    } catch (e) {
+      console.warn('Friends: mark all as read failed', e);
+      toastError(translateError(e, m.friends_mark_all_read_failed()));
+    } finally {
+      markingAllRead = false;
+    }
+  }
 
   function openChat(f: FriendInfo) {
     if (chatDisabledFor(f.user_hash)) return;
@@ -1065,6 +1082,15 @@
     <span class="beta-badge">{m.common_beta()}</span>
   </h2>
   <div class="header-actions">
+    {#if anyUnread}
+      <button
+        class="ghost"
+        title={m.friends_mark_all_read_title()}
+        disabled={markingAllRead}
+        aria-busy={markingAllRead ? 'true' : undefined}
+        onclick={markAllRead}
+      >{markingAllRead ? m.friends_marking_all_read() : m.friends_mark_all_read()}</button>
+    {/if}
     <button class="ghost" onclick={() => void refreshAll()} disabled={loading}>{m.common_refresh()}</button>
   </div>
 </div>

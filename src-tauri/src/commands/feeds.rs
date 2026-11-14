@@ -2161,11 +2161,45 @@ fn auto_takes(feed: &FollowedFeed, item: &FollowedItem) -> bool {
         && !item.removed
 }
 
+/// The file types a follower may limit auto-download to, as eD2K type terms
+/// (`search::index::infer_file_type`). Programs and disc images are not
+/// among them: auto-download never takes those (`auto_download_refuses`).
+const AUTO_TYPES: [&str; 5] = ["Video", "Audio", "Image", "Doc", "Arc"];
+
+/// `types` as [`FollowedFeed::auto_types`] keeps them: the known ones, once
+/// each, in [`AUTO_TYPES`] order. Empty, as for no choice, takes every type.
+fn auto_types_saved(types: &[String]) -> String {
+    AUTO_TYPES
+        .iter()
+        .filter(|known| types.iter().any(|t| t == *known))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Whether a file named `name` is of a type `feed`'s auto-download takes.
+/// Only [`AUTO_TYPES`] count, as on the Feeds page, so a value naming none of
+/// them takes every type, as the page says.
+fn auto_takes_type(feed: &FollowedFeed, name: &str) -> bool {
+    let mut chosen = feed.auto_types.split(',').filter(|t| AUTO_TYPES.contains(t)).peekable();
+    if chosen.peek().is_none() {
+        return true;
+    }
+    let extension = Path::new(name.trim_end_matches(['.', ' ']))
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let kind = crate::search::index::infer_file_type(extension);
+    chosen.any(|t| t == kind)
+}
+
 /// Why auto-download is holding `item` back, if a cap or its type is why.
 fn auto_hold_reason(feed: &FollowedFeed, item: &FeedItem, spent: i64) -> Option<&'static str> {
     const MIB: i64 = 1024 * 1024;
     if auto_download_refuses(&item.name) {
         Some("risky")
+    } else if !auto_takes_type(feed, &item.name) {
+        Some("type")
     } else if feed.auto_max_item_mib != 0 && item.size > feed.auto_max_item_mib.saturating_mul(MIB) {
         Some("too_large")
     } else if feed.auto_max_day_mib != 0 && spent.saturating_add(item.size) > feed.auto_max_day_mib.saturating_mul(MIB) {
@@ -2189,9 +2223,9 @@ pub struct FollowedItemInfo {
     pub status: ItemStatus,
     /// Of a download on its way, 0 to 100.
     pub progress: f64,
-    /// Why auto-download has not started it: `risky`, `too_large`,
-    /// `day_limit`, `disk` (too little free space, or none could be read) or
-    /// `spam`.
+    /// Why auto-download has not started it: `risky`, `type` (not one of the
+    /// types it takes), `too_large`, `day_limit`, `disk` (too little free
+    /// space, or none could be read) or `spam`.
     pub held: Option<&'static str>,
     /// Its download, while it is in the transfer list.
     pub transfer: Option<ItemTransfer>,
@@ -2261,8 +2295,9 @@ fn auto_cap(mib: i64) -> i64 {
     mib.clamp(0, 1 << 30)
 }
 
-/// Auto-download for one feed: off by default, and bounded per item and per
-/// 24 hours by the caps given, each 0 for no limit. Returns the feed as
+/// Auto-download for one feed: off by default, bounded per item and per 24
+/// hours by the caps given, each 0 for no limit, and taking only `types` of
+/// [`AUTO_TYPES`], or every type when none is given. Returns the feed as
 /// saved.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -2274,15 +2309,17 @@ pub async fn set_feed_auto_download(
     enabled: bool,
     max_item_mib: i64,
     max_day_mib: i64,
+    types: Vec<String>,
 ) -> Result<FollowedFeedInfo, String> {
     let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
     let db = state.db.clone();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
     let now = chrono::Utc::now().timestamp();
+    let types = auto_types_saved(&types);
     let feed = blocking(
         move || {
             let (item, day) = (auto_cap(max_item_mib), auto_cap(max_day_mib));
-            if !db.feed_set_auto_download(&key_pub, &key_salt, enabled, item, day, now)? {
+            if !db.feed_set_auto_download(&key_pub, &key_salt, enabled, item, day, &types, now)? {
                 return Ok(None);
             }
             db.feed_followed(&key_pub, &key_salt)
@@ -5112,6 +5149,7 @@ mod tests {
             seen_at: 0,
             deleted: false,
             share_files: false,
+            auto_types: String::new(),
         }
     }
 
@@ -5692,6 +5730,30 @@ mod tests {
         assert_eq!(auto_hold_reason(&feed, &item("track.flac", 60), 100 * MIB), Some("day_limit"));
         assert_eq!(auto_hold_reason(&feed, &item("track.flac", 50), 100 * MIB), None, "exactly at the day's cap");
         assert_eq!(auto_hold_reason(&followed(0, 0), &item("huge.mkv", 4000), i64::MAX), None, "no caps");
+    }
+
+    /// A follower can limit auto-download to some types: a file of another is
+    /// held back, saying so, while a program is still held as risky, as it is
+    /// whatever was chosen. No choice takes every type.
+    #[test]
+    fn auto_download_takes_only_the_types_chosen() {
+        let chosen = |types: &[&str]| FollowedFeed {
+            auto_types: auto_types_saved(&types.iter().map(|t| t.to_string()).collect::<Vec<_>>()),
+            ..followed(0, 0)
+        };
+        let video = chosen(&["Video"]);
+        assert_eq!(auto_hold_reason(&video, &item("Show.S01E01.mkv", 1), 0), None);
+        assert_eq!(auto_hold_reason(&video, &item("track.flac", 1), 0), Some("type"));
+        assert_eq!(auto_hold_reason(&video, &item("README", 1), 0), Some("type"), "no type is not video");
+        assert_eq!(auto_hold_reason(&video, &item("setup.exe", 1), 0), Some("risky"));
+        assert_eq!(auto_hold_reason(&chosen(&[]), &item("track.flac", 1), 0), None, "no choice takes every type");
+        let category = FollowedFeed { auto_types: "Movies".to_string(), ..followed(0, 0) };
+        assert_eq!(auto_hold_reason(&category, &item("track.flac", 1), 0), None, "nothing known is no choice");
+        assert_eq!(
+            chosen(&["Arc", "Pro", "Video", "Video", "nonsense"]).auto_types,
+            "Video,Arc",
+            "known types only, once each, in a fixed order"
+        );
     }
 
     #[test]

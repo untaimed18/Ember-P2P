@@ -1164,6 +1164,8 @@ export interface AppSettings {
    *  can carry hundreds of messages an hour. Muted rooms and ignored members
    *  are excluded regardless. */
   notify_channel_message: boolean;
+  /** A followed feed has new files. */
+  notify_feed_update: boolean;
 
   /** Show each part of the window's confirmation and info toasts. Off hides
    *  only those; warnings, errors and Undo offers always show. See

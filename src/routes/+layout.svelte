@@ -16,6 +16,7 @@
   import { initFinishAction } from '$lib/stores/finishAction';
   import { startUserActivityReporting } from '$lib/userActivity';
   import { startClipboardWatch } from '$lib/clipboardWatch';
+  import { startIpFilterWatch } from '$lib/ipFilterWatch';
   import { notify } from '$lib/notifications';
   import { formatBytes } from '$lib/utils';
 
@@ -367,6 +368,7 @@
     let unlistenDownloadFolder: UnlistenFn | null = null;
     let unlistenDiskSpace: UnlistenFn | null = null;
     const stopClipboardWatch = startClipboardWatch();
+    const stopIpFilterWatch = startIpFilterWatch();
     let stopChatPopout: (() => void) | null = null;
 
     void initChatPopoutMain().then((stop) => {
@@ -911,6 +913,7 @@
       if (unlistenDownloadFolder) unlistenDownloadFolder();
       if (unlistenDiskSpace) unlistenDiskSpace();
       stopClipboardWatch();
+      stopIpFilterWatch();
       stopChatPopout?.();
     };
   });

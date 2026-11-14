@@ -2618,6 +2618,7 @@ pub fn run() {
             commands::peers::mark_messages_read,
             commands::peers::send_chat_typing,
             commands::peers::get_unread_message_counts,
+            commands::peers::mark_all_chats_read,
             commands::peers::offer_file_to_friend,
             commands::peers::get_friend_requests,
             commands::peers::accept_friend_request,
