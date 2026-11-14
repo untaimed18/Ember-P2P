@@ -5952,6 +5952,15 @@ fn discovered_room_name(raw: &str, channel_id_hex: &str) -> String {
         .to_string()
 }
 
+/// Our own rooms and the Discover cache, for the Discover views. Our rooms
+/// fail the read, as in `list_channels`: read as none, every room we are in
+/// was offered to join and every one we hid came back. The cache only lends
+/// hints, so it may fail quietly. Blocking.
+fn discover_room_lists(db: &Database) -> anyhow::Result<(Vec<StoredChannel>, Vec<CachedChannel>)> {
+    let local = db.list_channels()?;
+    Ok((local, db.list_cached_channels().unwrap_or_default()))
+}
+
 fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
     rows.iter()
         .filter(|c| c.in_room_now())
@@ -6082,14 +6091,10 @@ pub async fn gather_channels(
 
     require_ember(&state).await?;
     let db = state.db.clone();
-    let (local, cached) = tokio::task::spawn_blocking(move || {
-        (
-            db.list_channels().unwrap_or_default(),
-            db.list_cached_channels().unwrap_or_default(),
-        )
-    })
-    .await
-    .unwrap_or_default();
+    let (local, cached) = tokio::task::spawn_blocking(move || discover_room_lists(&db))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
     let joined_ids = inside_ids(&local);
     let hidden: std::collections::HashSet<String> = local
         .iter()
@@ -6329,14 +6334,10 @@ pub async fn cached_channels(
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<GatheredChannelInfo>, String> {
     let db = state.db.clone();
-    let (cached, joined) = tokio::task::spawn_blocking(move || {
-        (
-            db.list_cached_channels().unwrap_or_default(),
-            db.list_channels().unwrap_or_default(),
-        )
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?;
+    let (joined, cached) = tokio::task::spawn_blocking(move || discover_room_lists(&db))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
 
     let joined_ids = inside_ids(&joined);
     let hidden: std::collections::HashSet<String> = joined
@@ -7350,6 +7351,37 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Discover's read of our own rooms fails rather than reading as none,
+    /// which offered every room we are in to join and brought back every one
+    /// we hid. A broken cache costs only its hints.
+    #[test]
+    fn a_failed_read_of_our_rooms_is_not_read_as_none() {
+        let path = std::env::temp_dir().join(format!("ember-discover-rooms-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        db.insert_channel(&"ab".repeat(16), &"01".repeat(32), "News", "public", false, None, None)
+            .expect("insert room");
+        let (local, _) = discover_room_lists(&db).expect("both read");
+        assert_eq!(local.len(), 1);
+
+        let other = rusqlite::Connection::open(&path).expect("second connection");
+        other
+            .execute_batch("ALTER TABLE channel_index_cache RENAME TO channel_index_cache_gone")
+            .expect("break the cache");
+        let (local, cached) = discover_room_lists(&db).expect("a broken cache is only hints");
+        assert_eq!((local.len(), cached.len()), (1, 0));
+
+        other
+            .execute_batch("ALTER TABLE channels RENAME TO channels_gone")
+            .expect("break our rooms");
+        assert!(discover_room_lists(&db).is_err());
+
+        drop(other);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     /// In an announcement-only room the owner and the snapshot's moderators

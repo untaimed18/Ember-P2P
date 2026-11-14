@@ -559,31 +559,125 @@ pub(in crate::network) async fn on_cleanup_tick(
     }
 
     let now = chrono::Utc::now().timestamp();
-    // Collect stale per-(target, peer) entries, then dedupe by
-    // file_hash so we reset publish_manager at most once per
-    // file regardless of how many peers we had outstanding.
-    let stale_keys: Vec<((KadId, SocketAddr), KadId, bool)> = state.publish_pending
+    let stale: Vec<StalePublish> = state
+        .publish_pending
         .iter()
         .filter(|(_, (_, sent_at, _, _))| now - sent_at > 120)
-        .map(|(k, (file_hash, _, is_source, _))| (*k, *file_hash, *is_source))
+        .map(|(key, (target, sent_at, is_source, _))| StalePublish {
+            key: *key,
+            target: *target,
+            sent_at: *sent_at,
+            is_source: *is_source,
+        })
         .collect();
-    let mut retried_files: std::collections::HashSet<(KadId, bool)> = std::collections::HashSet::new();
-    for (key, file_hash, is_source) in &stale_keys {
-        state.publish_pending.remove(key);
-        // Skip stale-retry bookkeeping if any peer for this file
-        // has already succeeded (file_hash still in
-        // publish_pending under a different key → recently acked).
-        // The dedupe set covers the common "all peers timed out"
-        // path.
-        if retried_files.insert((*file_hash, *is_source)) {
-            if *is_source {
-                state.publish_manager.reset_source_publish(file_hash);
-            } else {
-                state
-                    .publish_manager
-                    .reset_keyword_target_publish(file_hash);
-            }
-            debug!("Retrying unconfirmed publish for target {} (peer {})", key.0, key.1);
+    for entry in &stale {
+        state.publish_pending.remove(&entry.key);
+    }
+    for (target, is_source) in unconfirmed_publishes(&stale, &state.publish_last_ack) {
+        if is_source {
+            state.publish_manager.reset_source_publish(&target);
+        } else if let Some(note) = state.published_notes.get_mut(&target) {
+            // A note's pending entries carry its file hash, which names no
+            // keyword record, so the keyword reset below did nothing for it.
+            note.last_publish = 0;
+        } else {
+            state.publish_manager.reset_keyword_target_publish(&target);
         }
+        debug!("Retrying publish for target {target}: no peer confirmed it");
+    }
+    state
+        .publish_last_ack
+        .retain(|_, at| now - *at < PUBLISH_ACK_MEMORY_SECS);
+}
+
+/// A publish to one peer that has waited past the cleanup's limit for its
+/// confirmation.
+struct StalePublish {
+    key: (KadId, SocketAddr),
+    target: KadId,
+    sent_at: i64,
+    is_source: bool,
+}
+
+/// How long before a round's earliest unanswered send a confirmation still
+/// belongs to that round. One publish asks its peers over a single store
+/// search, which runs for a few minutes at most.
+const PUBLISH_ROUND_SECS: i64 = 300;
+
+/// How long a confirmation is kept: past the oldest a stale entry can be when
+/// the cleanup looks (its 120 s limit plus the 300 s tick), and the round
+/// before it.
+const PUBLISH_ACK_MEMORY_SECS: i64 = 3600;
+
+/// The publishes to redo, as `(target, is_source)`: those none of whose peers
+/// confirmed the round the stale entries were sent in. A round some peer
+/// confirmed has landed, and redoing it for the peers that stayed silent only
+/// sends it again to the nodes that already hold it.
+fn unconfirmed_publishes(stale: &[StalePublish], last_ack: &HashMap<(KadId, bool), i64>) -> Vec<(KadId, bool)> {
+    let mut rounds: HashMap<(KadId, bool), i64> = HashMap::new();
+    for entry in stale {
+        rounds
+            .entry((entry.target, entry.is_source))
+            .and_modify(|first| *first = (*first).min(entry.sent_at))
+            .or_insert(entry.sent_at);
+    }
+    let mut unconfirmed: Vec<(KadId, bool)> = rounds
+        .into_iter()
+        .filter(|(target, first_sent)| {
+            last_ack
+                .get(target)
+                .is_none_or(|acked| *acked < first_sent - PUBLISH_ROUND_SECS)
+        })
+        .map(|(target, _)| target)
+        .collect();
+    unconfirmed.sort_by_key(|(target, is_source)| (target.0, *is_source));
+    unconfirmed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stale(target: u8, port: u16, sent_at: i64, is_source: bool) -> StalePublish {
+        let target = KadId([target; 16]);
+        StalePublish {
+            key: (target, SocketAddr::from(([203, 0, 113, 1], port))),
+            target,
+            sent_at,
+            is_source,
+        }
+    }
+
+    /// A round no peer confirmed is redone once, however many peers it went
+    /// to; one a peer confirmed is not, for the peers that stayed silent.
+    #[test]
+    fn only_a_publish_nobody_confirmed_is_redone() {
+        let now = 10_000;
+        let entries = [
+            stale(1, 1, now - 200, false),
+            stale(1, 2, now - 190, false),
+            stale(2, 1, now - 200, true),
+            stale(3, 1, now - 200, false),
+        ];
+        let mut acks = HashMap::new();
+        acks.insert((KadId([2; 16]), true), now - 199);
+        acks.insert((KadId([3; 16]), false), now - 400);
+        assert_eq!(
+            unconfirmed_publishes(&entries, &acks),
+            vec![(KadId([1; 16]), false)],
+            "one silent peer of a confirmed round is no reason to redo it"
+        );
+
+        acks.insert((KadId([3; 16]), false), now - 200 - PUBLISH_ROUND_SECS - 1);
+        assert_eq!(
+            unconfirmed_publishes(&entries, &acks),
+            vec![(KadId([1; 16]), false), (KadId([3; 16]), false)],
+            "a confirmation from an earlier round does not count for this one"
+        );
+        let source_only = HashMap::from([((KadId([1; 16]), true), now)]);
+        assert!(
+            unconfirmed_publishes(&entries, &source_only).contains(&(KadId([1; 16]), false)),
+            "a source and a keyword of one hash are rounds of their own"
+        );
     }
 }

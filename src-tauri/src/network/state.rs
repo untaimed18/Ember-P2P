@@ -349,6 +349,11 @@ pub(super) struct NetworkState {
     /// this `(target, peer)` pair. The count matters for eMule-style keyword
     /// batches split into multiple `PublishKeyReq` packets with the same target.
     pub(super) publish_pending: HashMap<(KadId, SocketAddr), (KadId, i64, bool, u32)>,
+    /// When a peer last confirmed a publish of each target, keyed
+    /// `(target, is_source)` as `publish_pending`'s values name them: what
+    /// lets the cleanup tell a publish nobody confirmed, which it redoes,
+    /// from one a peer or two left unanswered.
+    pub(super) publish_last_ack: HashMap<(KadId, bool), i64>,
     pub(super) publish_confirmed: u32,
     /// Diagnostic counters for `PublishRes` packet accounting. These let
     /// the `Publish cycle:` log line surface exactly where packets are

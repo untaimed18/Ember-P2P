@@ -2261,6 +2261,9 @@ pub(super) async fn handle_udp_packet_inner(
             });
             if let Some((key, publish_file_hash, is_source_publish)) = matched_pending {
                 state.publish_confirmed += 1;
+                state
+                    .publish_last_ack
+                    .insert((publish_file_hash, is_source_publish), chrono::Utc::now().timestamp());
                 debug!(
                     "Publish confirmed for {target} from {from} (orig_key={:?}, load={load}, total_confirmed={})",
                     key, state.publish_confirmed

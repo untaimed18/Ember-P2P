@@ -899,6 +899,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         shared_nickname: Arc::new(tokio::sync::RwLock::new(settings.ed2k_nickname())),
         peer_nicknames: HashMap::new(),
         publish_pending: HashMap::new(),
+        publish_last_ack: HashMap::new(),
         publish_confirmed: 0,
         publish_res_plain_seen: 0,
         publish_res_obf_decoded: 0,
