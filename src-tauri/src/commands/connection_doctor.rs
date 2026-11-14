@@ -737,6 +737,9 @@ mod tests {
             probe_udp: Some(true),
             session_secs: 20 * 60,
             clock_skew_secs: Some(2),
+            ip_filter_known: true,
+            ip_filter_enabled: true,
+            ip_filter_ready: true,
             ..Signals::default()
         }
     }
@@ -747,13 +750,7 @@ mod tests {
     /// from the network the filter has no check at all.
     #[test]
     fn an_ip_filter_with_no_list_is_named_first() {
-        let blocking = Signals {
-            ip_filter_known: true,
-            ip_filter_enabled: true,
-            ip_filter_ready: false,
-            session_secs: IP_FILTER_LOAD_SECS,
-            ..reachable()
-        };
+        let blocking = Signals { ip_filter_ready: false, session_secs: IP_FILTER_LOAD_SECS, ..reachable() };
         let (_, checks, _, fixes) = assess(&blocking);
         assert!(checks.contains(&Check { id: "ip_filter", status: CheckStatus::Fail, detail: "blocking_all" }));
         assert_eq!(fixes[0], Fix { id: "ip_filter", action: Some("download_ip_filter") });
@@ -762,10 +759,10 @@ mod tests {
         assert!(!fix_ids(&loading).contains(&"ip_filter"));
         assert!(assess(&loading).1.contains(&Check { id: "ip_filter", status: CheckStatus::Skip, detail: "loading" }));
 
-        let off = Signals { ip_filter_known: true, ..reachable() };
-        for (ready, detail) in [(Signals { ip_filter_ready: true, ..blocking.clone() }, "ok"), (off, "off")] {
-            assert!(!fix_ids(&ready).contains(&"ip_filter"));
-            assert!(assess(&ready).1.iter().any(|c| c.id == "ip_filter" && c.detail == detail));
+        let off = Signals { ip_filter_enabled: false, ..reachable() };
+        for (fine, detail) in [(reachable(), "ok"), (off, "off")] {
+            assert!(!fix_ids(&fine).contains(&"ip_filter"));
+            assert!(assess(&fine).1.iter().any(|c| c.id == "ip_filter" && c.detail == detail));
         }
 
         let unknown = Signals { ip_filter_known: false, ..blocking };
