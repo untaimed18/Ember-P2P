@@ -15055,8 +15055,8 @@ pub(crate) const MAX_BROWSE_FILTER_TEXT: usize = 256;
 /// rest is the DHT walk's constraint block, so both read `Video` alike.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct BrowseFilter {
-    /// Matched case-insensitively against the name or the hash, as the
-    /// dialog's own filter box matches.
+    /// Matched case-insensitively against the name, or against the hash when
+    /// it is eight hex digits or more, as the dialog's own filter box matches.
     pub(crate) text: String,
     pub(crate) constraints: crate::network::ember::dht::messages::ValueConstraints,
 }
@@ -15081,7 +15081,13 @@ impl BrowseFilter {
             return false;
         }
         let text = self.text.trim().to_lowercase();
-        text.is_empty() || name.to_lowercase().contains(&text) || hash_hex.to_lowercase().contains(&text)
+        // The hash only for text that can be part of one: a short word such as
+        // `face` is in some hashes by chance, and those hits used up the room
+        // in the answer before the names that match.
+        let could_be_hash = text.len() >= 8 && text.bytes().all(|b| b.is_ascii_hexdigit());
+        text.is_empty()
+            || name.to_lowercase().contains(&text)
+            || (could_be_hash && hash_hex.to_lowercase().contains(&text))
     }
 }
 
@@ -15539,8 +15545,11 @@ mod browse_response_tests {
         assert!(!filter.admits("Holiday.mp3", 5_000, "ab"), "not video");
         assert!(!filter.admits("Holiday.mkv", 999, "ab"), "too small");
         assert!(!filter.admits("Work.mkv", 5_000, "ab"));
-        let by_hash = BrowseFilter { text: "ABCD".into(), ..BrowseFilter::default() };
-        assert!(by_hash.admits("anything", 1, "00abcd00"));
+        let by_hash = BrowseFilter { text: "ABCD1234".into(), ..BrowseFilter::default() };
+        assert!(by_hash.admits("anything", 1, "00abcd123400"));
+        let short = BrowseFilter { text: "face".into(), ..BrowseFilter::default() };
+        assert!(!short.admits("anything", 1, "00face00"), "a word, not a hash");
+        assert!(short.admits("Face Off.mkv", 1, "00"));
 
         let long = BrowseFilter { text: "é".repeat(200), ..BrowseFilter::default() };
         let read = browse_request_filter(&encode_browse_request_v2(&long)).unwrap();

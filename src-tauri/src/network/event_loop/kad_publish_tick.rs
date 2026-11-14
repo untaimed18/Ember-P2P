@@ -229,7 +229,9 @@ pub(in crate::network) async fn on_kad_publish_tick(
                     );
                     let local_note_file = {
                         let index = local_index.read().await;
-                        index.get_by_hash(&file_hash.to_hex()).cloned()
+                        index
+                            .get_by_hash(&hex::encode(kad::publish::kad_id_to_md4_bytes(&file_hash)))
+                            .cloned()
                     };
                     let message = build_publish_notes_message(
                         state.local_id,

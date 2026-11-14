@@ -650,6 +650,23 @@ fn single_word_share(record: &SearchResultRecord) -> Option<(ShareKey, [u8; 32])
     Some(((Responder::of(record.from_node, record.from_subnet), file, digest), publisher))
 }
 
+/// `records` with each responder held to its share of every file across them
+/// all, as [`IterativeSearch::absorb_results`] holds it once a finished walk
+/// joins its search: for the rows of several walks folded while they run.
+pub fn within_shares<'a, T>(
+    records: impl Iterator<Item = (&'a SearchResultRecord, T)>,
+) -> impl Iterator<Item = (&'a SearchResultRecord, T)> {
+    let mut counted: HashMap<ShareKey, HashSet<[u8; 32]>> = HashMap::new();
+    records.filter(move |(record, _)| {
+        let Some((share, publisher)) = single_word_share(record) else {
+            return true;
+        };
+        let publishers = counted.entry(share).or_default();
+        publishers.contains(&publisher)
+            || (publishers.len() < MAX_PUBLISHERS_PER_FILE_PER_NODE && publishers.insert(publisher))
+    })
+}
+
 /// An active iterative search.
 pub struct IterativeSearch {
     pub id: u32,
@@ -1011,7 +1028,11 @@ impl IterativeSearch {
                 if !publishers.contains(&publisher) && publishers.len() >= MAX_PUBLISHERS_PER_FILE_PER_NODE {
                     continue;
                 }
-                publishers.insert(publisher);
+                // Charged where this search's own walk reads it too, or a
+                // responder could give the rest of the walk five more.
+                if publishers.insert(publisher) {
+                    *self.publishers_taken.entry(share).or_insert(0) += 1;
+                }
             }
             self.seen_results.insert(blob_digest);
             self.result_slots.insert(blob_digest, self.results.len());
@@ -6862,5 +6883,32 @@ mod tests {
             let key = SigningKey::from_bytes(&[over; 32]).verifying_key().to_bytes();
             assert!(!publishers.contains(&key), "publisher {over} is past the host's share");
         }
+
+        // The search's own walk goes on reading what absorbing charged.
+        let (key, _) = single_word_share(&from(0x40, 1, by_publisher("ubuntu", 1, FILE, DIGEST))).unwrap();
+        assert_eq!(search.publishers_taken.get(&key), Some(&MAX_PUBLISHERS_PER_FILE_PER_NODE));
+    }
+
+    /// Rows folded from walks still running hold a responder to one share
+    /// across them, as absorbing does once they finish.
+    #[test]
+    fn walks_folded_while_running_give_a_responder_one_share() {
+        const FILE: [u8; 16] = [0x22; 16];
+        const DIGEST: [u8; 32] = [0x78; 32];
+        let share = MAX_PUBLISHERS_PER_FILE_PER_NODE as u8;
+        let record = |keyword: &str, publisher: u8| SearchResultRecord {
+            data: by_publisher(keyword, publisher, FILE, DIGEST),
+            from_node: make_id(0x40),
+            confirmed_by: None,
+            from_subnet: Some(1),
+            confirmed_subnet: None,
+            from_local_store: false,
+        };
+        let walks: Vec<SearchResultRecord> = (1..=share)
+            .map(|p| record("ubuntu", p))
+            .chain((1..=share + 3).map(|p| record("linux", p)))
+            .collect();
+        let kept = within_shares(walks.iter().map(|r| (r, ()))).count();
+        assert_eq!(kept, 2 * usize::from(share), "repeats of counted publishers, and none past them");
     }
 }

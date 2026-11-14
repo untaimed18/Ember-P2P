@@ -192,6 +192,7 @@ pub(crate) use self::downloads::{
 };
 pub(crate) use self::friends::{deliver_friend_request_verdict, FriendRequestVerdict};
 pub use self::search::SearchMoreOutcome;
+pub(crate) use self::search::clip_note_comment;
 pub use self::server::{clear_server_log_history, server_log_history, ServerLogLine};
 pub use self::state::{
     EmberMaintenanceResult, EmberPublishPending, EmberPublishResult, EmberValueLookupPending,
@@ -865,6 +866,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_search_age: 0,
         server_udp_search_age: 0,
         udp_search_queue: VecDeque::new(),
+        udp_sweep_last_sent: None,
         download_source_searches: HashMap::new(),
         source_search_stream_cursor: HashMap::new(),
         evicted_kad_sources: Vec::new(),
@@ -3720,6 +3722,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // visibility is in the periodic discovery health log.
                         debug!("UDP global search send_to {addr} failed: {e}");
                     } else {
+                        state.udp_sweep_last_sent = Some(addr);
                         // eMule SentUDPRequestNotification: only accept replies
                         // from IPs we successfully queried this search.
                         if let (Some(active), IpAddr::V4(ip)) =

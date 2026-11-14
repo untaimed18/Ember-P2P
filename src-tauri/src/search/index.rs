@@ -270,8 +270,9 @@ impl LocalIndex {
 
     /// Boolean name search, plus optional type/size/extension filters.
     ///
-    /// An empty / unparseable query still scans when a filter is present so
-    /// type- or size-only searches can list matching shared files.
+    /// A query with no word long enough for the networks (`U2`) is looked for
+    /// by its short words; an empty one still scans when a filter is present,
+    /// so type- or size-only searches can list matching shared files.
     pub fn search_with_filters(
         &self,
         query: &str,
@@ -281,18 +282,21 @@ impl LocalIndex {
         file_extension: Option<&str>,
     ) -> Vec<SearchResult> {
         // Same boolean grammar as KAD/server (`AND`/`OR`/`NOT`/`-`/quotes).
-        let expr = crate::search::query::parse(query);
+        let query = nfkc(query);
+        let expr = crate::search::query::parse(&query);
+        let short = if expr.is_none() { ShortWords::parse(&query) } else { None };
         let has_filters = file_type.is_some_and(|t| !t.is_empty())
             || file_extension.is_some_and(|e| !e.trim_start_matches('.').is_empty())
             || min_size.is_some_and(|v| v > 0)
             || max_size.is_some_and(|v| v > 0);
-        if expr.is_none() && !has_filters {
+        if expr.is_none() && short.is_none() && !has_filters {
             return Vec::new();
         }
-        let positive = expr
-            .as_ref()
-            .map(|e| e.positive_terms())
-            .unwrap_or_default();
+        let positive = match (&expr, &short) {
+            (Some(expr), _) => expr.positive_terms(),
+            (None, Some(short)) => short.include.clone(),
+            (None, None) => Vec::new(),
+        };
         // `ed2k::<hash>` names files outright. The directive text appears in no
         // filename, so the keyword path below could only ever answer "not
         // shared" for a file that is sitting in the library — including the one
@@ -326,12 +330,18 @@ impl LocalIndex {
                         .any(|hash| hash.eq_ignore_ascii_case(&file.hash))
                         .then_some((idx, LocalHitRank::default()));
                 }
-                let expr = match expr.as_ref() {
-                    None => return Some((idx, LocalHitRank::default())),
-                    Some(expr) => expr,
+                let expr = match (expr.as_ref(), short.as_ref()) {
+                    (Some(expr), _) => expr,
+                    (None, Some(short)) => {
+                        let name_lower = kad_keyword_lowercase(&nfkc(&file.name));
+                        return short
+                            .matches(&name_lower)
+                            .then(|| (idx, LocalHitRank::of(&name_lower, &positive)));
+                    }
+                    (None, None) => return Some((idx, LocalHitRank::default())),
                 };
                 // The terms' lowercaser; see `QueryExpr::matches_name`.
-                let name_lower = kad_keyword_lowercase(&file.name);
+                let name_lower = kad_keyword_lowercase(&nfkc(&file.name));
                 if !expr.matches(&name_lower) {
                     return None;
                 }
@@ -1042,6 +1052,8 @@ impl LocalIndex {
         };
         let hash = selected.hash.clone();
         let mut mutation = ShareMutation::default();
+        // `mutation.hashes` once each, without a scan of it per row.
+        let mut noted: HashSet<String> = HashSet::new();
         for file in &mut self.files {
             let is_target = if hash.is_empty() {
                 normalize_path_key(&file.path) == key
@@ -1055,7 +1067,7 @@ impl LocalIndex {
                     mutation.pending_paths.push(file.path.clone());
                 } else {
                     mutation.hashed_paths.push(file.path.clone());
-                    if !mutation.hashes.contains(&file.hash) {
+                    if noted.insert(file.hash.clone()) {
                         mutation.hashes.push(file.hash.clone());
                     }
                 }
@@ -1080,6 +1092,8 @@ impl LocalIndex {
             .map(|file| normalize_path_key(&file.path))
             .collect();
         let mut mutation = ShareMutation::default();
+        // `mutation.hashes` once each, without a scan of it per row.
+        let mut noted: HashSet<String> = HashSet::new();
         for file in &mut self.files {
             if (hashes.contains(&file.hash)
                 || (file.hash.is_empty()
@@ -1092,7 +1106,7 @@ impl LocalIndex {
                     mutation.pending_paths.push(file.path.clone());
                 } else {
                     mutation.hashed_paths.push(file.path.clone());
-                    if !mutation.hashes.contains(&file.hash) {
+                    if noted.insert(file.hash.clone()) {
                         mutation.hashes.push(file.hash.clone());
                     }
                 }
@@ -1123,6 +1137,8 @@ impl LocalIndex {
             .map(|file| normalize_path_key(&file.path))
             .collect();
         let mut mutation = ShareMutation::default();
+        // `mutation.hashes` once each, without a scan of it per row.
+        let mut noted: HashSet<String> = HashSet::new();
         for file in &mut self.files {
             if (hashes.contains(&file.hash)
                 || (file.hash.is_empty()
@@ -1135,7 +1151,7 @@ impl LocalIndex {
                     mutation.pending_paths.push(file.path.clone());
                 } else {
                     mutation.hashed_paths.push(file.path.clone());
-                    if !mutation.hashes.contains(&file.hash) {
+                    if noted.insert(file.hash.clone()) {
                         mutation.hashes.push(file.hash.clone());
                     }
                 }
@@ -1231,6 +1247,8 @@ impl LocalIndex {
             .map(|file| normalize_path_key(&file.path))
             .collect();
         let mut mutation = ShareMutation::default();
+        // `mutation.hashes` once each, without a scan of it per row.
+        let mut noted: HashSet<String> = HashSet::new();
         for file in &mut self.files {
             if (hashes.contains(&file.hash)
                 || (file.hash.is_empty()
@@ -1243,7 +1261,7 @@ impl LocalIndex {
                     mutation.pending_paths.push(file.path.clone());
                 } else {
                     mutation.hashed_paths.push(file.path.clone());
-                    if !mutation.hashes.contains(&file.hash) {
+                    if noted.insert(file.hash.clone()) {
                         mutation.hashes.push(file.hash.clone());
                     }
                 }
@@ -1294,8 +1312,9 @@ impl LocalIndex {
         // for a map that has drifted, and verify the hit actually points at
         // this path so a stale entry cannot overwrite an unrelated row.
         //
-        // Unlike `add_files`, a miss here still scans: this is the single-file
-        // path, so the fallback costs one pass rather than one per row.
+        // A miss is a miss, as in `add_files`. It used to scan as well, and
+        // every hashed file misses, its pending row just removed, so hashing
+        // a large new share paid that pass once per file.
         let existing = match self.path_map.get(&key) {
             Some(&pos)
                 if self
@@ -1305,10 +1324,11 @@ impl LocalIndex {
             {
                 Some(pos)
             }
-            _ => self
+            Some(_) => self
                 .files
                 .iter()
                 .position(|f| normalize_path_key(&f.path) == key),
+            None => None,
         };
         self.place_file_indexed(file, existing);
     }
@@ -1445,6 +1465,53 @@ fn preserve_runtime_state(existing: &FileInfo, file: &mut FileInfo) {
 }
 
 /// Categorize a file by its extension, matching eMule's g_aED2KFileTypes table
+/// `text` in NFKC, the form the library is searched in. A name copied off a
+/// Mac arrives decomposed (`e` and a combining accent), a full-width one in
+/// code points of its own, and neither met a query typed the ordinary way.
+fn nfkc(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.is_ascii() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    icu_normalizer::ComposingNormalizerBorrowed::new_nfkc().normalize(text)
+}
+
+/// The words of a query too short for any network (`U2`, `tv -sport`), which
+/// the library can still look for: as whole words of a name, since two letters
+/// are a substring of half of any library. A word after `-` keeps a name out.
+struct ShortWords {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl ShortWords {
+    fn parse(query: &str) -> Option<Self> {
+        let mut include = Vec::new();
+        let mut exclude = Vec::new();
+        for raw in query.split_whitespace() {
+            if matches!(raw, "AND" | "OR" | "NOT") {
+                continue;
+            }
+            let (words, raw) = match raw.strip_prefix('-') {
+                Some(rest) => (&mut exclude, rest),
+                None => (&mut include, raw),
+            };
+            words.extend(
+                kad_keyword_lowercase(raw)
+                    .split(is_kad_keyword_separator)
+                    .filter(|word| !word.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        (!include.is_empty()).then_some(Self { include, exclude })
+    }
+
+    fn matches(&self, name_lower: &str) -> bool {
+        let words: HashSet<&str> = name_lower.split(is_kad_keyword_separator).collect();
+        self.include.iter().all(|word| words.contains(word.as_str()))
+            && !self.exclude.iter().any(|word| words.contains(word.as_str()))
+    }
+}
+
 fn local_file_matches_filters(
     file: &FileInfo,
     file_type: Option<&str>,
@@ -1474,7 +1541,12 @@ fn local_file_matches_filters(
     if let Some(ft) = file_type {
         if !ft.is_empty() {
             let inferred = infer_file_type(&file.extension);
-            if inferred != ft {
+            let admitted = if ft == "Pro" {
+                crate::search::merge::is_program_wire_type(&inferred)
+            } else {
+                inferred == ft
+            };
+            if !admitted {
                 return false;
             }
         }
@@ -2511,6 +2583,74 @@ mod local_index_tests {
         let sized = index.search_with_filters("", None, Some(10_000), None, None);
         assert_eq!(sized.len(), 1);
         assert_eq!(sized[0].file.name, "film.mkv");
+    }
+
+    /// Program covers what eMule files under it on the wire: programs,
+    /// archives and disc images, and nothing else.
+    #[test]
+    fn a_program_search_lists_programs_archives_and_disc_images() {
+        let mut index = LocalIndex::new();
+        let files = ["office.exe", "office.rar", "office.iso", "the office.mkv"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut f = file(&format!("A/{name}"), &format!("{i:032x}"), true, "normal");
+                f.extension = name.rsplit_once('.').unwrap().1.to_string();
+                f
+            })
+            .collect();
+        index.add_files(files);
+        let mut names: Vec<String> = index
+            .search_with_filters("office", Some("Pro"), None, None, None)
+            .into_iter()
+            .map(|r| r.file.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["office.exe", "office.iso", "office.rar"]);
+    }
+
+    /// Words too short for the networks are looked for in the library, as
+    /// whole words, rather than standing for "everything the filters allow".
+    #[test]
+    fn a_query_of_short_words_finds_them_in_the_library() {
+        let mut index = LocalIndex::new();
+        let files = ["U2 - One.mp3", "Mu2.mp3", "U2 Live TV.mp3", "Other.mp3"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let mut f = file(&format!("A/{name}"), &format!("{i:032x}"), true, "normal");
+                f.extension = "mp3".to_string();
+                f
+            })
+            .collect();
+        index.add_files(files);
+        let names = |query: &str, file_type: Option<&str>| -> Vec<String> {
+            let mut names: Vec<String> = index
+                .search_with_filters(query, file_type, None, None, None)
+                .into_iter()
+                .map(|r| r.file.name)
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names("U2", None), ["U2 - One.mp3", "U2 Live TV.mp3"]);
+        assert_eq!(names("u2", Some("Audio")), ["U2 - One.mp3", "U2 Live TV.mp3"]);
+        assert_eq!(names("u2 -tv", Some("Audio")), ["U2 - One.mp3"]);
+        assert_eq!(names("", Some("Audio")).len(), 4, "a filter alone still lists");
+    }
+
+    /// A name in another Unicode form of the same text is found.
+    #[test]
+    fn a_decomposed_or_full_width_name_is_found() {
+        let mut index = LocalIndex::new();
+        let files = ["Cafe\u{0301} Noir.mp3", "\u{FF2D}\u{FF55}\u{FF53}\u{FF49}\u{FF43} Box.mp3"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| file(&format!("A/{name}"), &format!("{i:032x}"), true, "normal"))
+            .collect();
+        index.add_files(files);
+        assert_eq!(index.search("café noir").len(), 1);
+        assert_eq!(index.search("music box").len(), 1);
     }
 
     #[test]

@@ -942,6 +942,10 @@ pub(super) struct ActiveSearchRequest {
     /// search had no UDP leg, which is also what keeps Search More from adding
     /// one.
     pub(super) udp_search_expr: Vec<u8>,
+    /// The same question for a server that cannot read a 64-bit size: the
+    /// limit cut to 32 bits, which leaves out nothing it can index. `None` when
+    /// the search sends no 64-bit size, or wants only files past 4 GiB.
+    pub(super) udp_search_expr_32: Option<Vec<u8>>,
     /// The connected server ended this search's leg while still flagging more
     /// results — the page cap or the result cap stopped it, not the server —
     /// so Search More can ask it for further pages.
@@ -982,6 +986,7 @@ impl ActiveSearchRequest {
             exclude_hashes: HashSet::new(),
             batch_spam: crate::search::spam::BatchSpamContext::default(),
             udp_search_expr: Vec::new(),
+            udp_search_expr_32: None,
             server_has_more: false,
             continued: false,
         }
@@ -1038,22 +1043,51 @@ pub(super) fn unasked_udp_search_packets(
     if request.udp_search_expr.is_empty() {
         return Vec::new();
     }
-    let uses_64bit_search = kad::messages::search_expression_uses_64bit(&request.udp_search_expr);
-    let connected_addr = state.server_addr;
-    state
-        .server_list
-        .servers()
-        .iter()
-        .filter(|server| is_eligible_udp_server(server, connected_addr))
-        .filter_map(|server| {
-            ServerUdpSocket::build_global_search_packet(server, &request.udp_search_expr, uses_64bit_search)
-        })
+    udp_search_packets(state, &request.udp_search_expr, request.udp_search_expr_32.as_deref())
+        .into_iter()
         .filter(|(_, addr)| match addr.ip() {
             std::net::IpAddr::V4(ip) => !request.udp_search_sent_ips.contains(&ip),
             std::net::IpAddr::V6(_) => false,
         })
         .take(MAX_UDP_SEARCH_QUEUE)
         .collect()
+}
+
+/// A global-search packet for every eligible server in the list, starting
+/// after the one the last sweep reached, so its caps (the queue, the source
+/// backstop, the deadline) do not spend every sweep on the top of the list.
+///
+/// A server that cannot read a 64-bit size gets `expr_32`: eMule skips it,
+/// but it cannot index a file past 4 GiB, so a limit cut to 32 bits leaves out
+/// nothing it holds — and a server whose flags are not known yet is one.
+pub(super) fn udp_search_packets(
+    state: &NetworkState,
+    expr: &[u8],
+    expr_32: Option<&[u8]>,
+) -> Vec<(Vec<u8>, std::net::SocketAddr)> {
+    let uses_64bit = kad::messages::search_expression_uses_64bit(expr);
+    let connected_addr = state.server_addr;
+    let mut packets: Vec<(Vec<u8>, std::net::SocketAddr)> = state
+        .server_list
+        .servers()
+        .iter()
+        .filter(|server| is_eligible_udp_server(server, connected_addr))
+        .filter_map(|server| {
+            let large = server.udp_flags & ed2k::server_udp::SRV_UDPFLG_LARGEFILES != 0;
+            if uses_64bit && !large {
+                ServerUdpSocket::build_global_search_packet(server, expr_32?, false)
+            } else {
+                ServerUdpSocket::build_global_search_packet(server, expr, uses_64bit)
+            }
+        })
+        .collect();
+    if let Some(at) = state
+        .udp_sweep_last_sent
+        .and_then(|last| packets.iter().position(|(_, addr)| *addr == last))
+    {
+        packets.rotate_left(at + 1);
+    }
+    packets
 }
 
 /// Whether the connected server can still give `request` more pages: it said
@@ -1143,6 +1177,18 @@ pub(super) fn start_search_more(
 /// `ActiveSearchRequest::dht_noted_availability` is held to the same number the
 /// per-batch tags are, and a Sybil cannot rank a file by asserting millions.
 pub(super) const MAX_KAD_AVAILABILITY: u32 = 5_000;
+
+/// A source count a KAD keyword answer gives a file. Past 65,500 it is no
+/// count, as eMule reads it (`CSearch::ProcessResultKeyword`), and unknown
+/// rather than held to the ceiling, where a node making it up ranked its file
+/// above every honest one.
+pub(super) fn kad_source_count(claimed: u64) -> u32 {
+    if claimed > 65_500 {
+        0
+    } else {
+        claimed.min(MAX_KAD_AVAILABILITY.into()) as u32
+    }
+}
 
 /// Soft cap on `ActiveSearchRequest::streamed_hashes`. Once reached, the set
 /// stops growing (bounding memory for a pathological all-servers global
@@ -1268,6 +1314,24 @@ pub(super) struct PendingNotePublish {
     pub(super) message: KadMessage,
 }
 
+/// eMule's `MAXFILECOMMENTLEN`, in the UTF-16 units it counts. Its KAD readers
+/// drop a longer description (`Search.cpp`), and a storing node that holds one
+/// past about 2,000 bytes fails to serialize it and so answers no note request
+/// for that file at all (`CIndexed::SendValidNoteResult`).
+pub(crate) const MAX_NOTE_COMMENT_UNITS: usize = 128;
+
+/// `comment` cut to what an eMule note can carry.
+pub(crate) fn clip_note_comment(comment: &str) -> &str {
+    let mut units = 0;
+    for (at, c) in comment.char_indices() {
+        units += c.len_utf16();
+        if units > MAX_NOTE_COMMENT_UNITS {
+            return &comment[..at];
+        }
+    }
+    comment
+}
+
 pub(super) fn build_publish_notes_message(
     local_id: KadId,
     file_hash: KadId,
@@ -1301,6 +1365,7 @@ pub(super) fn build_publish_notes_message(
             });
         }
     }
+    let comment = clip_note_comment(comment);
     if !comment.is_empty() {
         tags.push(KadTag {
             name: TagName::Id(TAG_DESCRIPTION),
@@ -2335,6 +2400,25 @@ pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_absurd_kad_source_count_is_unknown() {
+        assert_eq!(kad_source_count(42), 42);
+        assert_eq!(kad_source_count(20_000), MAX_KAD_AVAILABILITY);
+        assert_eq!(kad_source_count(65_500), MAX_KAD_AVAILABILITY);
+        assert_eq!(kad_source_count(65_501), 0);
+        assert_eq!(kad_source_count(u64::MAX), 0);
+    }
+
+    /// A note's description is cut to the 128 UTF-16 units eMule reads, on a
+    /// character boundary.
+    #[test]
+    fn a_note_comment_is_cut_to_what_emule_reads() {
+        assert_eq!(clip_note_comment(&"a".repeat(300)).len(), 128);
+        assert_eq!(clip_note_comment(&"あ".repeat(300)).chars().count(), 128);
+        assert_eq!(clip_note_comment(&"😀".repeat(100)).chars().count(), 64);
+        assert_eq!(clip_note_comment("short"), "short");
+    }
 
     fn row(hash: &str, name: &str) -> SearchResult {
         SearchResult {

@@ -2500,7 +2500,7 @@ const KAD_KEYWORD_STREAM_FLUSH: std::time::Duration = std::time::Duration::from_
 /// soon as it arrives, then a full batch at a time, or whatever has gathered
 /// once [`KAD_KEYWORD_STREAM_FLUSH`] has passed since the last batch, so a
 /// handful of rows does not wait for the walk to end.
-fn kad_keyword_batch_due(streamed: usize, total: usize, since_last: std::time::Duration) -> bool {
+pub(super) fn kad_keyword_batch_due(streamed: usize, total: usize, since_last: std::time::Duration) -> bool {
     total > streamed
         && (streamed == 0
             || total - streamed >= KAD_KEYWORD_STREAM_BATCH

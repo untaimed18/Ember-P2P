@@ -377,8 +377,8 @@ async fn handle_command_inner(
             let mut tx = Some(tx);
             let mut local_results: Option<Vec<SearchResult>> = Some(Vec::new());
             let ui_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
-            // eMule: Arc/Iso → Pro on the wire; Program clears local filter;
-            // Arc/Iso keep theirs for post-filter.
+            // eMule: Arc/Iso → Pro on the wire, and keep their type for the
+            // post-filter; Program keeps its own for the library and Ember rows.
             let file_type_filter =
                 crate::search::merge::client_search_file_type_filter(ui_file_type.as_deref());
             let wire_file_type =
@@ -637,25 +637,28 @@ async fn handle_command_inner(
             // --- UDP global search ---
             if legs.udp {
                 active_request.udp_search_expr = search_expr.clone();
-                let uses_64bit_search = kad::messages::search_expression_uses_64bit(&search_expr);
-                let connected_addr = state.server_addr;
-                let servers = state.server_list.servers().to_vec();
+                active_request.udp_search_expr_32 =
+                    if kad::messages::search_expression_uses_64bit(&search_expr) {
+                        server_keyword_expression(
+                            &search_expr,
+                            query_expr.as_ref(),
+                            &search_constraints,
+                            false,
+                        )
+                    } else {
+                        None
+                    };
                 let mut dropped = 0usize;
-                for server in &servers {
-                    if !is_eligible_udp_server(server, connected_addr) {
+                for (packet, addr) in udp_search_packets(
+                    state,
+                    &search_expr,
+                    active_request.udp_search_expr_32.as_deref(),
+                ) {
+                    if state.udp_search_queue.len() >= MAX_UDP_SEARCH_QUEUE {
+                        dropped = dropped.saturating_add(1);
                         continue;
                     }
-                    if let Some(pkt) = ServerUdpSocket::build_global_search_packet(
-                        server,
-                        &search_expr,
-                        uses_64bit_search,
-                    ) {
-                        if state.udp_search_queue.len() >= MAX_UDP_SEARCH_QUEUE {
-                            dropped = dropped.saturating_add(1);
-                            continue;
-                        }
-                        state.udp_search_queue.push_back((request_id, pkt.0, pkt.1));
-                    }
+                    state.udp_search_queue.push_back((request_id, packet, addr));
                 }
                 if dropped > 0 {
                     debug!(
@@ -886,6 +889,7 @@ async fn handle_command_inner(
                                 file_extension: active_request.file_extension.clone(),
                                 min_availability: active_request.min_availability,
                                 last_streamed_count: 0,
+                                last_streamed_at: std::time::Instant::now(),
                                 streamed_files: HashSet::new(),
                                 streamed_publishers: HashSet::new(),
                             },
@@ -2286,7 +2290,9 @@ async fn handle_command_inner(
             } else {
                 let local_note_file = {
                     let index = local_index.read().await;
-                    index.get_by_hash(&file_hash.to_hex()).cloned()
+                    index
+                        .get_by_hash(&hex::encode(kad::publish::kad_id_to_md4_bytes(&file_hash)))
+                        .cloned()
                 };
                 let message = build_publish_notes_message(
                     state.local_id,

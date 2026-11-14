@@ -799,7 +799,7 @@ pub(in crate::network) async fn on_ember_search_tick(
     //    before its neighbourhood settles, and buffering until then
     //    would leave KAD rows on screen with nothing from Ember.
     //    Cadence matches the KAD path: a rebuild on the first record,
-    //    then every 20.
+    //    then every 20, or what has gathered once two seconds pass.
     if !state.ember_keyword_searches.is_empty() {
         let search_ids: Vec<u32> =
             state.ember_keyword_searches.keys().copied().collect();
@@ -831,8 +831,19 @@ pub(in crate::network) async fn on_ember_search_tick(
             // first record, and the search page's spinner has
             // nothing else to say during it. KAD reports this from
             // its own sweep, so Ember-only searches were the one
-            // case that showed a bare spinner.
-            if let Some(kw) = state.ember_keyword_searches.get(&search_id) {
+            // case that showed a bare spinner. Only for those: beside a KAD
+            // leg the two counts took turns on the same line.
+            let kad_reporting = |request_id: u64| {
+                state
+                    .pending_keyword_searches
+                    .values()
+                    .any(|pending| pending.request_id == request_id)
+            };
+            if let Some(kw) = state
+                .ember_keyword_searches
+                .get(&search_id)
+                .filter(|kw| !kad_reporting(kw.request_id))
+            {
                 let _ = app_handle.emit(
                     "search-progress",
                     SearchProgressEvent {
@@ -852,17 +863,22 @@ pub(in crate::network) async fn on_ember_search_tick(
             }
             // A row held back for the next rebuild (see `ember_stream_rows`)
             // gets it on the next tick, whether or not new records are due.
-            let threshold = if cursor == 0 { 1 } else { 20 };
             let Some(kw) = state.ember_keyword_searches.get_mut(&search_id) else {
                 continue;
             };
-            if gathered < cursor + threshold && !ember_rows_held(&kw.streamed_publishers) {
+            let due = super::search_poll_tick::kad_keyword_batch_due(
+                cursor,
+                gathered,
+                kw.last_streamed_at.elapsed(),
+            );
+            if !due && !ember_rows_held(&kw.streamed_publishers) {
                 continue;
             }
             // Advanced even when the rows below all fail the query
             // filter: those records have been considered, and not
             // moving the cursor would re-examine them every tick.
             kw.last_streamed_count = gathered;
+            kw.last_streamed_at = std::time::Instant::now();
             // Every slice is a rebuild over all the walk has gathered: a
             // row's count is the publishers agreeing with its plurality
             // digest, which only the whole set can say, so each batch is a
@@ -875,12 +891,12 @@ pub(in crate::network) async fn on_ember_search_tick(
                     read_ember_keyword_records(search, &reader);
                 }
             }
-            let built = fold_ember_keyword_rows(
+            let built = fold_ember_keyword_rows(ember::dht::search::within_shares(
                 walks
                     .iter()
                     .filter_map(|walk| state.ember_search.get(*walk))
                     .flat_map(ember_keyword_readings),
-            );
+            ));
             let results = ember_stream_rows(&mut kw.streamed_publishers, built);
             // Streamed pages deliberately do not seed the enforced
             // digest map. A rebuild part-way through the walk can find

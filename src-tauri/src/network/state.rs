@@ -247,6 +247,9 @@ pub(super) struct NetworkState {
     /// getting that wrong puts answers to the previous query into the current
     /// tab. Carrying the id makes it a property of the packet instead.
     pub(super) udp_search_queue: VecDeque<(u64, Vec<u8>, std::net::SocketAddr)>,
+    /// The server a global search last reached, so the next sweep starts
+    /// after it (eMule `GetNextSearchServer` keeps its place the same way).
+    pub(super) udp_sweep_last_sent: Option<std::net::SocketAddr>,
     /// Source searches tied to pending downloads (search_id -> (transfer_id, file_hash_md4)).
     /// File hash is carried alongside so the search-completion handler can build
     /// CallbackReqs / inject sources without re-reading `pending_downloads`, which

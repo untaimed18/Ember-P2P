@@ -63,9 +63,9 @@
       if (!raw) return;
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        recent = parsed
-          .filter((s): s is string => typeof s === 'string')
-          .slice(0, recentMax);
+        // Once each: the list is keyed by the query, and a restored backup
+        // writes it back as it was.
+        recent = [...new Set(parsed.filter((s): s is string => typeof s === 'string'))].slice(0, recentMax);
       }
     } catch {
       try { localStorage.removeItem(recentKey); } catch { /* ignore */ }

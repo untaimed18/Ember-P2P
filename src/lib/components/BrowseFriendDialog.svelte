@@ -184,10 +184,12 @@
     let base = hidingOwned ? files.filter((f) => !isInLibrary(f)) : files;
     if (activeFolder) base = base.filter((f) => inBrowseFolder(f, activeFolder));
     if (!q) return base;
+    // The hash only for what can be part of one, as the friend's own
+    // search matches: a short word is in some hashes by chance.
+    const couldBeHash = /^[0-9a-f]{8,}$/.test(q);
     return base.filter((file) => {
       const name = file.name.toLowerCase();
-      const hash = file.hash.toLowerCase();
-      return name.includes(q) || hash.includes(q);
+      return name.includes(q) || (couldBeHash && file.hash.toLowerCase().includes(q));
     });
   });
 

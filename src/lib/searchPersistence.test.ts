@@ -263,6 +263,25 @@ describe('buildPersistPayload', () => {
     expect(payload.tabs.at(-1)?.id).toBe(`t${PERSIST_MAX_TABS + 2}`);
   });
 
+  it('keeps the tab on screen wherever it sits in the strip', () => {
+    const tabs = Array.from({ length: PERSIST_MAX_TABS + 3 }, (_, i) => tab(`t${i}`));
+    const payload = buildPersistPayload(tabs, 't1');
+
+    expect(payload.tabs).toHaveLength(PERSIST_MAX_TABS);
+    expect(payload.tabs[0].id).toBe('t1');
+    expect(payload.tabs.at(-1)?.id).toBe(`t${PERSIST_MAX_TABS + 2}`);
+    expect(new Set(payload.tabs.map((t) => t.id)).size).toBe(PERSIST_MAX_TABS);
+  });
+
+  it('marks a tab saved while it was searching as cut short', () => {
+    const [saved] = buildPersistPayload([tab('a', 3)], 'a').tabs;
+    expect(saved.isSearching).toBe(false);
+    expect(saved.interruption).toBeTruthy();
+
+    const finished = { ...tab('b', 3), isSearching: false };
+    expect(buildPersistPayload([finished], 'b').tabs[0].interruption).toBeUndefined();
+  });
+
   it('honours a smaller row budget for a retry after a refused write', () => {
     const payload = buildPersistPayload([tab('a', 400)], 'a', 25);
 

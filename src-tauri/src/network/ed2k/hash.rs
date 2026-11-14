@@ -643,6 +643,17 @@ fn aich_base32_to_hex(b32: &str) -> Option<String> {
 }
 
 pub fn percent_decode_str(s: &str) -> String {
+    String::from_utf8(percent_decode_bytes(s)).unwrap_or_else(|_| s.to_string())
+}
+
+/// A link's file name, decoded: escapes that do not make UTF-8 are read as
+/// Windows-1252, as eMule reads an old link's name in the ANSI code page
+/// (`OptUtf8ToStr`), rather than leaving the whole name encoded.
+fn percent_decode_name(s: &str) -> String {
+    crate::network::ed2k::server::decode_wire_text(&percent_decode_bytes(s))
+}
+
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let mut result = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -659,7 +670,7 @@ pub fn percent_decode_str(s: &str) -> String {
         result.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+    result
 }
 
 fn strip_ed2k_wrapper(raw: &str) -> &str {
@@ -824,7 +835,7 @@ pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str
         return Err("ed2k file name is too long");
     }
     // Sanitize after decoding: `%E2%80%AE` only becomes an RLO here.
-    let name = crate::security::sanitize_remote_text(&percent_decode_str(raw_name), 4096);
+    let name = crate::security::sanitize_remote_text(&percent_decode_name(raw_name), 4096);
     let size = parts
         .next()
         .ok_or("Missing ed2k file size")?
@@ -913,6 +924,16 @@ mod link_tests {
     const HASH: &str = "0123456789abcdef0123456789abcdef";
     // 20-byte AICH root (hex) -> known base32.
     const AICH_HEX: &str = "0000000000000000000000000000000000000000";
+
+    /// An old link's name escaped in Latin-1 reads as eMule reads it, and a
+    /// stray byte in a UTF-8 name costs only itself.
+    #[test]
+    fn a_latin1_escaped_name_decodes() {
+        let name = |raw: &str| parse_ed2k_link_strict(&format!("ed2k://|file|{raw}|1|{HASH}|/")).unwrap().0;
+        assert_eq!(name("Am%E9lie%20Poulain.avi"), "Amélie Poulain.avi");
+        assert_eq!(name("Caf%C3%A9%20%E9t%E9.avi"), "Café été.avi");
+        assert_eq!(name("Plain%20Name.avi"), "Plain Name.avi");
+    }
 
     #[test]
     fn base32_round_trips_aich() {

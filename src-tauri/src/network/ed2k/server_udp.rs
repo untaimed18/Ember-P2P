@@ -989,7 +989,7 @@ fn read_udp_search_tag(
     cursor: &mut Cursor<&[u8]>,
     payload: &[u8],
     file_name: &mut String,
-    file_size: &mut u64,
+    file_size: &mut super::server::FileSizeTags,
     source_count: &mut u32,
     complete_source_count: &mut u32,
     rating: &mut Option<u8>,
@@ -1072,10 +1072,8 @@ fn read_udp_search_tag(
         0x03 => {
             // TAGTYPE_UINT32
             if let Ok(v) = cursor.read_u32::<LittleEndian>() {
-                match name_id {
-                    0x02 => *file_size = (*file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
-                    0x3A => *file_size = (*file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32),
-                    _ => apply_udp_uint_tag(
+                if !file_size.apply(name_id, v as u64, false) {
+                    apply_udp_uint_tag(
                         name_id,
                         tag_name,
                         v as u64,
@@ -1083,7 +1081,7 @@ fn read_udp_search_tag(
                         complete_source_count,
                         rating,
                         media,
-                    ),
+                    );
                 }
                 true
             } else {
@@ -1131,9 +1129,7 @@ fn read_udp_search_tag(
         0x08 => {
             // TAGTYPE_UINT16
             if let Ok(v) = cursor.read_u16::<LittleEndian>() {
-                if name_id == 0x02 {
-                    *file_size = v as u64;
-                } else {
+                if !file_size.apply(name_id, v as u64, false) {
                     apply_udp_uint_tag(
                         name_id,
                         tag_name,
@@ -1152,9 +1148,7 @@ fn read_udp_search_tag(
         0x09 => {
             // TAGTYPE_UINT8
             if let Ok(v) = cursor.read_u8() {
-                if name_id == 0x02 {
-                    *file_size = v as u64;
-                } else {
+                if !file_size.apply(name_id, v as u64, false) {
                     apply_udp_uint_tag(
                         name_id,
                         tag_name,
@@ -1187,9 +1181,7 @@ fn read_udp_search_tag(
         0x0B => {
             // TAGTYPE_UINT64
             if let Ok(v) = cursor.read_u64::<LittleEndian>() {
-                if name_id == 0x02 {
-                    *file_size = v;
-                } else {
+                if !file_size.apply(name_id, v, true) {
                     apply_udp_uint_tag(
                         name_id,
                         tag_name,
@@ -1252,7 +1244,7 @@ fn parse_search_results(payload: &[u8], addr: SocketAddr) -> Option<ServerUdpRes
         }
 
         let mut file_name = String::new();
-        let mut file_size: u64 = 0;
+        let mut size_tags = super::server::FileSizeTags::default();
         let mut source_count: u32 = 0;
         let mut complete_source_count: u32 = 0;
         let mut rating: Option<u8> = None;
@@ -1273,7 +1265,7 @@ fn parse_search_results(payload: &[u8], addr: SocketAddr) -> Option<ServerUdpRes
                 &mut cursor,
                 payload,
                 &mut file_name,
-                &mut file_size,
+                &mut size_tags,
                 &mut source_count,
                 &mut complete_source_count,
                 &mut rating,
@@ -1284,6 +1276,7 @@ fn parse_search_results(payload: &[u8], addr: SocketAddr) -> Option<ServerUdpRes
                 break;
             }
         }
+        let file_size = size_tags.size;
 
         // A result may legitimately carry more than MAX_APPLIED_TAGS tags;
         // consume (and discard) the surplus so the cursor stays aligned for
@@ -1303,7 +1296,7 @@ fn parse_search_results(payload: &[u8], addr: SocketAddr) -> Option<ServerUdpRes
                 mut d_media,
             ) = (
                 String::new(),
-                0u64,
+                super::server::FileSizeTags::default(),
                 0u32,
                 0u32,
                 None,
@@ -1678,6 +1671,42 @@ mod tests {
         }
     }
 
+    /// The two halves of a size over 4 GiB at any integer width and in either
+    /// order, and a 64-bit size taken whole, as eMule reads them.
+    #[test]
+    fn a_large_size_reads_whatever_width_its_halves_come_in() {
+        let addr: SocketAddr = "127.0.0.1:4665".parse().unwrap();
+        let size: u64 = 6_000_000_000;
+        let int_tag = |packet: &mut Vec<u8>, id: u8, value: u64, width: u8| {
+            let ty = match width {
+                1 => 0x09,
+                2 => 0x08,
+                4 => 0x03,
+                _ => 0x0B,
+            };
+            packet.push(0x80 | ty);
+            packet.push(id);
+            packet.extend_from_slice(&value.to_le_bytes()[..width as usize]);
+        };
+        let parse = |tags: &dyn Fn(&mut Vec<u8>)| {
+            let mut packet = udp_result_header(3);
+            packet.push(0x80 | 0x02);
+            packet.push(0x01);
+            packet.extend_from_slice(&9u16.to_le_bytes());
+            packet.extend_from_slice(b"movie.mkv");
+            tags(&mut packet);
+            match parse_server_udp_response(&packet, addr).unwrap() {
+                ServerUdpResponse::SearchResult { results, .. } => results[0].file_size,
+                other => panic!("unexpected response: {other:?}"),
+            }
+        };
+        let (lo, hi) = (size & 0xFFFF_FFFF, size >> 32);
+        assert_eq!(parse(&|p| { int_tag(p, 0x02, lo, 4); int_tag(p, 0x3A, hi, 1) }), size);
+        assert_eq!(parse(&|p| { int_tag(p, 0x3A, hi, 2); int_tag(p, 0x02, lo, 4) }), size);
+        assert_eq!(parse(&|p| { int_tag(p, 0x3A, hi, 1); int_tag(p, 0x02, 700, 2) }), (hi << 32) | 700);
+        assert_eq!(parse(&|p| { int_tag(p, 0x02, size, 8); int_tag(p, 0x3A, 5, 1) }), size);
+    }
+
     fn udp_result_header(tag_count: u32) -> Vec<u8> {
         let mut packet = vec![OP_GLOBSEARCHRES];
         packet.extend_from_slice(&[0xCDu8; 16]);
@@ -1701,7 +1730,8 @@ mod tests {
 
         let tail = &packet[1 + 16 + 4 + 2 + 4..];
         let mut cursor = Cursor::new(tail);
-        let (mut name, mut size, mut sources, mut complete) = (String::new(), 0u64, 0u32, 0u32);
+        let (mut name, mut size, mut sources, mut complete) =
+            (String::new(), super::super::server::FileSizeTags::default(), 0u32, 0u32);
         let (mut rating, mut comment) = (None, None);
         let mut media = crate::types::MediaMetadata::default();
         let mut read = || {

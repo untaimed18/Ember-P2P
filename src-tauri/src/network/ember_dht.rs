@@ -739,6 +739,9 @@ pub(super) struct EmberKeywordSearch {
     /// `IterativeSearch::results` is append-only and deduped before push, so
     /// everything past this index is new.
     pub(super) last_streamed_count: usize,
+    /// When the last streaming rebuild went out, for the flush a few records
+    /// get when no full batch follows them.
+    pub(super) last_streamed_at: std::time::Instant,
     /// Distinct eD2K file hashes of the rows this lookup has put on screen, or
     /// found again once another network had, for the `results_so_far` the
     /// search page shows while the walk runs.

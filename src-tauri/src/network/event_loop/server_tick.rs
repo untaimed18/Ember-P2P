@@ -1050,6 +1050,16 @@ pub(in crate::network) async fn on_server_tick(
                             // search, not another page of the first.
                             state.server_search_more_due_at = None;
                             state.server_search_more_requests = 0;
+                            // And the server pages only its last search,
+                            // so what the first had left is out of reach;
+                            // this one's own pages say whether there is more.
+                            if let Some(active) = state
+                                .active_search_request
+                                .as_mut()
+                                .filter(|active| active.request_id == followup_id)
+                            {
+                                active.server_has_more = false;
+                            }
                             // Only queued behind a first request the
                             // server answered.
                             state.pending_server_search = Some(PendingServerSearch {

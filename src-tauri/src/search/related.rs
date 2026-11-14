@@ -490,9 +490,12 @@ fn boundary_at(tokens: &[&str], i: usize, release_year_idx: Option<usize>) -> bo
     if matches!(tok, "season" | "episode") && next.is_some_and(is_all_digits) {
         return true;
     }
-    // `cd1`, and the split form `cd` + `1`.
-    if let Some(word) = VOLUME_WORDS.iter().find(|w| tok.starts_with(**w)) {
-        let rest = &tok[word.len()..];
+    // `cd1`, and the split form `cd` + `1`. Every word is tried: `vol` is the
+    // start of `volume`, and stopping at it left `ume`.
+    for word in VOLUME_WORDS {
+        let Some(rest) = tok.strip_prefix(word) else {
+            continue;
+        };
         if !rest.is_empty() && is_all_digits(rest) {
             return true;
         }
@@ -814,6 +817,9 @@ mod tests {
         assert_eq!(analyze("Part of Me.mp3").title, "part of me");
         assert!(analyze("Part of Me.mp3").volume.is_none());
         assert_eq!(analyze("Movie.Name.Part.2.1080p.mkv").title, "movie name");
+        assert_eq!(analyze("Audiobook Volume 3 - Chapter Title.mp3").title, "audiobook");
+        assert_eq!(analyze("Audiobook Volume3.mp3").title, "audiobook");
+        assert_eq!(analyze("Audiobook Vol 3.mp3").title, "audiobook");
     }
 
     #[test]

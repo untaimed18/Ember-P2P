@@ -185,7 +185,8 @@ impl ObfuscatedReadHalf {
         }
 
         if protocol == 0xD4 {
-            let decompressed = decompress_payload(&payload)?;
+            let decompressed = decompress_payload(&payload)
+                .map_err(|e| super::server::unreadable_packet(opcode, e))?;
             Ok((opcode, decompressed))
         } else {
             Ok((opcode, payload))

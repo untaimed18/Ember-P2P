@@ -23,12 +23,34 @@ pub fn wire_search_file_type(file_type: Option<&str>) -> Option<&str> {
 }
 
 /// Client-side type filter after remapping for the wire.
-/// Program clears the local filter (eMule); Arc/Iso keep theirs.
+/// Arc/Iso keep theirs. Program keeps one too, which
+/// [`result_matches_client_filters`] reads as [`program_admits`].
 pub fn client_search_file_type_filter(file_type: Option<&str>) -> Option<String> {
     match file_type {
-        None | Some("") | Some("Pro") => None,
+        None | Some("") => None,
         Some(other) => Some(other.to_string()),
     }
+}
+
+/// What a Program search covers: eMule files archives and disc images under
+/// Program on the wire.
+pub fn is_program_wire_type(file_type: &str) -> bool {
+    matches!(file_type, "Pro" | "Arc" | "Iso")
+}
+
+/// Whether a row of `result_type` belongs in a Program search.
+///
+/// eMule clears its type filter for Program (`SearchResultsWnd.cpp`), because
+/// the server and KAD were asked for the type and answer with what they file
+/// under it, and that is the rule for a row either of them sent. The library
+/// and the Ember network were never asked, so their rows have to be one of the
+/// types Program covers.
+fn program_admits(origin: &str, result_type: &str) -> bool {
+    let asked = origin
+        .split('·')
+        .map(str::trim)
+        .any(|part| part == ORIGIN_SERVER_TCP || part == ORIGIN_SERVER_UDP || part == ORIGIN_KAD);
+    asked || is_program_wire_type(result_type)
 }
 
 /// Client-side post-filter for size / extension / availability / type.
@@ -48,7 +70,12 @@ pub fn result_matches_client_filters(
         } else {
             r.file_type.clone()
         };
-        if result_type != ft {
+        let admitted = if ft == "Pro" {
+            program_admits(&r.result_origin, &result_type)
+        } else {
+            result_type == ft
+        };
+        if !admitted {
             return false;
         }
     }
@@ -531,28 +558,17 @@ pub fn sort_search_results(v: &mut [SearchResult]) {
             0
         }
     };
-    v.sort_by(|a, b| {
-        // Rank on clamped counts: both fields are remote-controlled, so a row
-        // that has never been merged (and therefore never passed through the
-        // cap in `merge_into`) must not buy the top slot with a padded number.
-        ranked_complete(b)
-            .cmp(&ranked_complete(a))
-            .then_with(|| {
-                clamp_source_count(b.availability).cmp(&clamp_source_count(a.availability))
-            })
-            .then_with(|| {
-                let an = if a.clean_name.is_empty() {
-                    &a.file.name
-                } else {
-                    &a.clean_name
-                };
-                let bn = if b.clean_name.is_empty() {
-                    &b.file.name
-                } else {
-                    &b.clean_name
-                };
-                an.to_lowercase().cmp(&bn.to_lowercase())
-            })
+    // Rank on clamped counts: both fields are remote-controlled, so a row
+    // that has never been merged (and therefore never passed through the cap
+    // in `merge_into`) must not buy the top slot with a padded number. Each
+    // row's key once, rather than two lowercased names per comparison.
+    v.sort_by_cached_key(|r| {
+        let name = if r.clean_name.is_empty() { &r.file.name } else { &r.clean_name };
+        (
+            std::cmp::Reverse(ranked_complete(r)),
+            std::cmp::Reverse(clamp_source_count(r.availability)),
+            name.to_lowercase(),
+        )
     });
 }
 
@@ -1226,10 +1242,29 @@ mod tests {
         assert_eq!(wire_search_file_type(Some("Arc")), Some("Pro"));
         assert_eq!(wire_search_file_type(Some("Iso")), Some("Pro"));
         assert_eq!(wire_search_file_type(Some("Video")), Some("Video"));
-        assert_eq!(client_search_file_type_filter(Some("Pro")), None);
+        assert_eq!(client_search_file_type_filter(Some("Pro")), Some("Pro".into()));
         assert_eq!(
             client_search_file_type_filter(Some("Arc")),
             Some("Arc".into())
         );
+    }
+
+    /// A Program search keeps every row the server or KAD sent, as eMule does,
+    /// and narrows the library's and the Ember network's to what Program covers.
+    #[test]
+    fn a_program_search_narrows_only_the_rows_nobody_asked_for_a_type() {
+        let hash = "a".repeat(32);
+        let passes = |name: &str, origin: &str| {
+            result_matches_client_filters(&typed(&hash, name, origin), Some("Pro"), None, None, None, None)
+        };
+        for origin in [ORIGIN_LOCAL, ORIGIN_EMBER] {
+            assert!(!passes("The Office S01E01.mkv", origin), "{origin}");
+            for name in ["Office Setup.exe", "Office.rar", "Office.iso"] {
+                assert!(passes(name, origin), "{origin} {name}");
+            }
+        }
+        for origin in [ORIGIN_SERVER_TCP, ORIGIN_SERVER_UDP, ORIGIN_KAD, "Local · Server"] {
+            assert!(passes("The Office S01E01.mkv", origin), "{origin}");
+        }
     }
 }

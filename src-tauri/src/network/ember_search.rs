@@ -1161,10 +1161,12 @@ pub(super) fn ember_stream_rows(stream: &mut HashSet<EmberStreamMark>, built: Em
     }
     let mut out = Vec::new();
     let mut resent: HashMap<EmberRowKey, HashSet<[u8; 32]>> = HashMap::new();
+    let mut built_rows: HashSet<EmberRowKey> = HashSet::new();
     for mut row in built.results {
         let Some(key) = ember_row_key(&row) else {
             continue;
         };
+        built_rows.insert(key);
         let now = counted.remove(&key).unwrap_or_default();
         let due = match sent.get(&key) {
             Some(before) => *before != now,
@@ -1181,7 +1183,10 @@ pub(super) fn ember_stream_rows(stream: &mut HashSet<EmberStreamMark>, built: Em
         resent.insert(key, now);
     }
     stream.retain(|mark| match mark {
-        EmberStreamMark::Sent(row, _) | EmberStreamMark::Held(row) => !resent.contains_key(row),
+        EmberStreamMark::Sent(row, _) => !resent.contains_key(row),
+        // A held row this build no longer has, its digest outvoted, has
+        // nothing to send, and its mark would ask for a rebuild every tick.
+        EmberStreamMark::Held(row) => built_rows.contains(row) && !resent.contains_key(row),
     });
     for (row, publishers) in resent {
         stream.extend(publishers.into_iter().map(|publisher| EmberStreamMark::Sent(row, publisher)));
@@ -3076,6 +3081,25 @@ mod ember_keyword_match_tests {
         ember_stream_rows(stream, fold_ember_keyword_rows(ember_keyword_readings(search)))
     }
 
+    /// A row held back for the next rebuild that the next rebuild no longer
+    /// builds leaves no mark asking for rebuilds.
+    #[test]
+    fn a_held_row_that_drops_out_of_the_build_is_forgotten() {
+        let row = ember_keyword_row([7; 16], 10, "x.iso".to_string(), None, 1, String::new());
+        let key = ember_row_key(&row).unwrap();
+        let built = |results: Vec<SearchResult>, publishers: &[[u8; 32]]| EmberKeywordBuilt {
+            results,
+            corroborated: Vec::new(),
+            counted_publishers: Vec::new(),
+            counted_rows: publishers.iter().map(|p| (key, *p)).collect(),
+        };
+        let mut stream = HashSet::new();
+        assert!(ember_stream_rows(&mut stream, built(vec![row], &[[1; 32]])).is_empty());
+        assert!(ember_rows_held(&stream), "one publisher waits a rebuild");
+        assert!(ember_stream_rows(&mut stream, built(Vec::new(), &[])).is_empty());
+        assert!(!ember_rows_held(&stream));
+    }
+
     fn two_linked_walks() -> (ember::dht::search::SearchManager, u32, u32) {
         use ember::dht::search::{Companion, SearchManager};
         let rt = ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0; 16]), false);
@@ -3542,6 +3566,7 @@ mod ember_keyword_match_tests {
             file_extension: None,
             min_availability: None,
             last_streamed_count: 0,
+            last_streamed_at: std::time::Instant::now(),
             streamed_files: HashSet::new(),
             streamed_publishers: HashSet::new(),
         };

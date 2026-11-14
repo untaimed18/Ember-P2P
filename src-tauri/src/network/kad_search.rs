@@ -239,12 +239,12 @@ pub(super) fn convert_search_results_matching(
                     }
                     TagName::Id(TAG_SOURCES) => {
                         if let Some(v) = tag.as_uint() {
-                            sources_tag = v.min(MAX_KAD_AVAILABILITY.into()) as u32;
+                            sources_tag = kad_source_count(v);
                         }
                     }
                     TagName::Id(TAG_COMPLETE_SOURCES) => {
                         if let Some(v) = tag.as_uint() {
-                            complete_sources_tag = v.min(MAX_KAD_AVAILABILITY.into()) as u32;
+                            complete_sources_tag = kad_source_count(v);
                         }
                     }
                     TagName::Id(TAG_SOURCEIP) => {

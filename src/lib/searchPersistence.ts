@@ -22,6 +22,7 @@ import {
   type SearchMethod,
 } from '$lib/api/search';
 import { SEARCH_NOTICES } from '$lib/searchNotices';
+import * as m from '$lib/paraglide/messages';
 import type { RelatedSearchInfo, SearchTab } from '$lib/stores/search';
 import type { SearchResult } from '$lib/types';
 
@@ -30,7 +31,7 @@ import type { SearchResult } from '$lib/types';
  *  page and not outlive the window. */
 export const SEARCH_STORAGE_KEY = 'ember.searchTabs.v1';
 
-/** Tabs kept, oldest dropped first. */
+/** Tabs kept: the one on screen, and the last of the others in the strip. */
 export const PERSIST_MAX_TABS = 8;
 
 /**
@@ -181,7 +182,10 @@ export function forPersist(tab: SearchTab, limit = PERSIST_MAX_RESULTS): SearchT
     notices: Array.isArray(tab.notices)
       ? tab.notices.filter((n) => typeof n === 'string' && SEARCH_NOTICES.has(n))
       : undefined,
-    interruption: typeof tab.interruption === 'string' && tab.interruption ? tab.interruption : undefined,
+    // Saved while it ran, it comes back with part of an answer, and says so.
+    interruption: typeof tab.interruption === 'string' && tab.interruption
+      ? tab.interruption
+      : tab.isSearching ? m.search_interrupted_by_reload() : undefined,
     startedAt: undefined,
     // A `Map` does not survive JSON, and `mergeIntoTab` rebuilds it from its
     // length check whenever it is missing.
@@ -209,9 +213,19 @@ export function buildPersistPayload(
   limit = PERSIST_MAX_RESULTS,
 ): PersistedSearch {
   return {
-    tabs: tabs.slice(-PERSIST_MAX_TABS).map((t) => forPersist(t, limit)),
+    tabs: tabsWorthStoring(tabs, activeId).map((t) => forPersist(t, limit)),
     activeId,
   };
+}
+
+/** The tabs a reload brings back, in strip order. The last ones in the strip,
+ *  and the one on screen wherever it is: Search again re-runs a tab in its
+ *  own place, so a tab near the start can be the newest. */
+function tabsWorthStoring(tabs: SearchTab[], activeId: string | null): SearchTab[] {
+  const last = tabs.slice(-PERSIST_MAX_TABS);
+  const active = tabs.find((t) => t.id === activeId);
+  if (!active || last.includes(active)) return last;
+  return [active, ...tabs.slice(-(PERSIST_MAX_TABS - 1))];
 }
 
 /**

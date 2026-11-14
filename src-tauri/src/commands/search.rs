@@ -472,24 +472,29 @@ pub async fn plan_related_search(
             MAX_RELATED_SEEDS,
         ));
     }
-    if seeds.iter().any(|s| {
-        s.name.as_deref().is_some_and(|n| n.len() > MAX_MARK_SPAM_FILENAME)
-            || s.artist.as_deref().is_some_and(|a| a.len() > MAX_SEARCH_FILTER_LEN)
-            || s.album.as_deref().is_some_and(|a| a.len() > MAX_SEARCH_FILTER_LEN)
-    }) {
+    if seeds
+        .iter()
+        .any(|s| s.name.as_deref().is_some_and(|n| n.len() > MAX_MARK_SPAM_FILENAME))
+    {
         return Err(coded(
             "search_related_seed_too_long",
             "Related-search seed metadata is too long",
         ));
     }
 
+    // A result's tags run far longer than a search term can be, and are
+    // only a hint: cut, a long album still names the album.
+    let tag = |tag: Option<String>| {
+        tag.map(|t| crate::commands::feeds::clip(&t, MAX_SEARCH_FILTER_LEN))
+            .filter(|t| !t.is_empty())
+    };
     let seeds: Vec<crate::search::related::SeedFile> = seeds
         .into_iter()
         .map(|s| crate::search::related::SeedFile {
             hash: s.hash.unwrap_or_default(),
             name: s.name.unwrap_or_default(),
-            artist: s.artist,
-            album: s.album,
+            artist: tag(s.artist),
+            album: tag(s.album),
         })
         .collect();
 
@@ -629,8 +634,8 @@ pub async fn search_files(
     let client_max_size = max_size;
     let client_file_extension = file_extension.clone();
     let client_min_availability = min_availability;
-    // eMule: Program search clears the local type filter; Archive/CD-Image keep
-    // theirs so Pro-wire replies can be narrowed client-side.
+    // Archive/CD-Image keep their type so Pro-wire replies can be narrowed
+    // client-side; Program keeps it for the rows no server or KAD node filtered.
     let file_type_filter =
         crate::search::merge::client_search_file_type_filter(ui_file_type.as_deref());
 
@@ -836,12 +841,13 @@ pub async fn find_notes(
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let timeout_secs = {
+    // A notes search runs as long as a keyword search, whatever the setting.
+    let timeout_secs = search_reply_wait_secs({
         let c = state.config.read().await;
         c.settings
             .search_timeout_secs
             .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
-    };
+    });
     let mut results =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
             Ok(Ok(Ok(results))) => results,
@@ -979,6 +985,7 @@ pub async fn publish_note(
             "Add a rating or a comment before publishing",
         ));
     }
+    let comment = crate::network::clip_note_comment(&comment).to_string();
     let kad_hash = md4_bytes_to_kad_id(&parse_exact_file_hash(&file_hash)?);
     let (tx, rx) = oneshot::channel();
 
@@ -1261,23 +1268,23 @@ pub fn parse_ed2k_links(text: String) -> Result<Ed2kLinkBatch, String> {
     let mut links = Vec::new();
     let mut invalid = 0usize;
     let mut skipped = 0usize;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    for link in text.lines().flat_map(links_on_line) {
+        let link = link.trim();
+        if link.is_empty() {
             continue;
         }
         if links.len() >= MAX_ED2K_PASTE_LINKS {
             skipped += 1;
             continue;
         }
-        match hash::parse_ed2k_link_strict(line) {
+        match hash::parse_ed2k_link_strict(link) {
             Ok((name, size, hash, aich, ember)) => links.push(Ed2kLinkInfo {
                 name,
                 size,
                 hash,
                 aich,
                 ember,
-                web_sources: link_web_sources(line),
+                web_sources: link_web_sources(link),
             }),
             Err(_) => invalid += 1,
         }
@@ -1287,6 +1294,25 @@ pub fn parse_ed2k_links(text: String) -> Result<Ed2kLinkBatch, String> {
         invalid,
         skipped,
     })
+}
+
+/// The links on one line of pasted text. eMule splits a paste at every space
+/// (`AddEd2kLinksToDownload`), but a name here may hold raw spaces, so a line
+/// is split only where whitespace is followed by another link.
+fn links_on_line(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut starts: Vec<usize> = line
+        .char_indices()
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            at > 0
+                && bytes[at - 1].is_ascii_whitespace()
+                && line[at..].get(..5).is_some_and(|scheme| scheme.eq_ignore_ascii_case("ed2k:"))
+        })
+        .collect();
+    starts.insert(0, 0);
+    starts.push(line.len());
+    starts.windows(2).map(|w| &line[w[0]..w[1]]).collect()
 }
 
 /// Build an ed2k link with optional AICH and/or our own endpoint as a source,
@@ -2205,6 +2231,36 @@ mod ed2k_paste_tests {
         assert_eq!(batch.skipped, 0);
         assert_eq!(batch.links[0].name, "a.bin");
         assert_eq!(batch.links[2].size, 3);
+    }
+
+    /// A result's album tag runs longer than any search term; the plan cuts
+    /// it rather than refusing the file.
+    #[tokio::test]
+    async fn a_long_album_tag_is_cut_not_refused() {
+        let seed = |album: String| RelatedSeedInput {
+            hash: Some("ab".repeat(16)),
+            name: Some("Artist - Song.mp3".to_string()),
+            artist: Some("Artist".to_string()),
+            album: Some(album),
+        };
+        let plan = plan_related_search(vec![seed("日本語のアルバム".repeat(20))]).await;
+        assert!(plan.is_ok(), "{plan:?}");
+    }
+
+    /// Links side by side on a line, as forum text gives them, each count; a
+    /// raw space inside a name does not split one.
+    #[test]
+    fn links_side_by_side_on_one_line_are_each_read() {
+        let text = format!(
+            "{} {}\tED2K://|file|with space.bin|4|{}|/",
+            link("a.bin", 1, 0xAA),
+            link("b.bin", 2, 0xBB),
+            "cc".repeat(16)
+        );
+        let batch = parse_ed2k_links(text).expect("parse");
+        let names: Vec<&str> = batch.links.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["a.bin", "b.bin", "with space.bin"]);
+        assert_eq!(batch.invalid, 0);
     }
 
     #[test]
