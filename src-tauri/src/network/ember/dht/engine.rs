@@ -27,7 +27,7 @@ use super::publish::{
     RECORD_TYPE_FEED_LISTING, RECORD_TYPE_KEYWORD, RECORD_TYPE_SOURCE,
 };
 use super::routing::{AddResult, RoutingTable};
-use super::store::{DhtStore, DhtStoreEntry, StoreRejectStats};
+use super::store::{CheckedRecord, DhtStore, DhtStoreEntry, StoreRejectStats};
 use super::{EmberContact, EmberNodeId, ID_BITS, K_BUCKET_SIZE};
 use crate::network::ember::crypto;
 use crate::network::ember::SOURCE_FLAG_FIREWALLED;
@@ -1426,8 +1426,8 @@ impl EmberDht {
         // acknowledged on the strength of signed fields. Its place in the order
         // is the point: junk is refused for the price of reading it, and the
         // Ed25519 check is paid only by a record that would be kept if genuine.
-        // `DhtStore::store` checks the signature again (defence in depth) and
-        // enforces capacity.
+        // `DhtStore::store_checked` takes the proof of that check rather than
+        // repeating it, and enforces capacity.
         let Some(parsed) = SignedRecord::parse_unverified(&record, record_signature) else {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected(StoreRefusal::Invalid);
@@ -1552,10 +1552,10 @@ impl EmberDht {
             return StoreOutcome::Rejected(StoreRefusal::Stale);
         }
 
-        if !self.verify_inbound_record(&parsed) {
+        let Some(checked) = self.check_inbound_record(record, record_signature) else {
             self.store_reject_verify = self.store_reject_verify.saturating_add(1);
             return StoreOutcome::Rejected(StoreRefusal::Invalid);
-        }
+        };
 
         // The other way a seen signature stops being held is the publisher
         // superseding it with a republish. That is not an eviction to make
@@ -1611,7 +1611,7 @@ impl EmberDht {
         // count climbing with no attacker involved.
         //
         // Cheap next to what admitting a record has already cost by this line:
-        // a few BLAKE3 hashes of short words against two Ed25519 verifications.
+        // a few BLAKE3 hashes of short words against an Ed25519 verification.
         if parsed.record_type == RECORD_TYPE_KEYWORD
             && !super::search::name_hashes_to_key(&parsed.file_name, &key)
         {
@@ -1639,10 +1639,7 @@ impl EmberDht {
                 | RECORD_TYPE_FEED_LISTING
         );
         let rejects_before = self.store.reject_stats();
-        if self
-            .store
-            .store_attributed(key, record, record_signature, attributed_ip)
-        {
+        if self.store.store_checked(key, checked, attributed_ip) {
             if unknown_type {
                 self.unknown_record_types_stored = self.unknown_record_types_stored.saturating_add(1);
             }
@@ -1678,6 +1675,18 @@ impl EmberDht {
             self.inbound_record_verifications += 1;
         }
         parsed.verify()
+    }
+
+    /// [`Self::verify_inbound_record`] for a record headed for our own store,
+    /// keeping the proof [`DhtStore::store_checked`] takes in place of a
+    /// second check. The same check: the body's own author, over the whole
+    /// body.
+    fn check_inbound_record(&mut self, record: Vec<u8>, signature: [u8; 64]) -> Option<CheckedRecord> {
+        #[cfg(test)]
+        {
+            self.inbound_record_verifications += 1;
+        }
+        CheckedRecord::verify(record, signature)
     }
 
     /// Whether we should take on one more `PROXY_STORE` fan-out for `sender`,
@@ -4244,6 +4253,23 @@ mod tests {
         assert_eq!(held.noise_pub, alice.local_noise_pub);
     }
 
+    /// A room fan-out signs one `CHANNEL_MSG` for all its neighbours. That is
+    /// sound because the frame names no recipient and is bound to its
+    /// sender's session key, so each neighbour reads it alike.
+    #[test]
+    fn one_channel_msg_frame_is_read_by_every_neighbour() {
+        let mut alice = dht(51);
+        let mut bob = dht(52);
+        let mut carol = dht(53);
+        let alice_addr = addr(51, 4672);
+        let (_rid, frame) = alice.build_channel_msg(b"gossip".to_vec());
+        for neighbour in [&mut bob, &mut carol] {
+            let inbound = neighbour.handle_message(&frame, alice_addr, alice.local_noise_pub, 1000);
+            assert!(inbound.error.is_none());
+            assert_eq!(inbound.channel_msg.as_deref(), Some(&b"gossip"[..]));
+        }
+    }
+
     #[test]
     fn ping_pong_round_trip_learns_both_contacts() {
         let mut a = dht(1);
@@ -4797,6 +4823,11 @@ mod tests {
         assert!(frames > 1, "twelve records exceed one datagram");
         assert_eq!(acked_total, records.len());
         assert_eq!(b.store_stats().1, records.len());
+        assert_eq!(
+            (b.inbound_record_verifications, b.store.signature_checks),
+            (records.len() as u64, 0),
+            "one signature check per record"
+        );
 
         // Every record is individually retrievable, so batching did not merge
         // or lose any of them.
@@ -5259,6 +5290,7 @@ mod tests {
         let (_rid, frame) = a.build_store(record.keyword_hash, record.data.clone(), record.signature);
         assert!(b.handle_message(&frame, a_addr, a_noise, 1002).stored_record);
         assert_eq!(b.inbound_record_verifications, 1);
+        assert_eq!(b.store.signature_checks, 0, "the store takes its proof rather than checking again");
     }
 
     /// A feed index shard key holds listings only: a keyword record filed

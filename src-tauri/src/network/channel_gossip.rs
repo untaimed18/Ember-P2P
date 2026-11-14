@@ -610,8 +610,14 @@ pub(super) async fn fanout_channel_gossip_retry(
     // typed is stored and on screen before this runs, so one that reaches
     // nobody has to come back here rather than be counted as sent.
     let mut delivered = false;
+    // One frame for them all: it names no recipient, and its signature binds
+    // it to our own session key, which every neighbour checks it against alike.
+    let frame = if direct.is_empty() {
+        Vec::new()
+    } else {
+        state.ember_dht.build_channel_msg(body.clone()).1
+    };
     for (pk, contact) in direct {
-        let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
         if send_ember_dht_frame_established(socket, state, &contact, &frame).await {
             delivered = true;
         } else {
@@ -3371,12 +3377,12 @@ pub(super) async fn send_channel_typing(
     );
     // Seen before it leaves, so a peer echoing it back is dropped at dedup.
     remember_originated_gossip(state, &sealed);
-    let body = sealed.encode();
+    // One frame for every recipient, as in `fanout_channel_gossip_retry`.
+    let (_rid, frame) = state.ember_dht.build_channel_msg(sealed.encode());
     for pk in recipients {
         let Some(contact) = contacts.get(&pk) else {
             continue;
         };
-        let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
         send_ember_dht_frame_established(socket, state, contact, &frame).await;
     }
 }
