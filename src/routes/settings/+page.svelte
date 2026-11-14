@@ -3174,6 +3174,7 @@
               <div class="apply-input">
                 <input
                   id="nickname"
+                  class="short-text"
                   value={settings.nickname}
                   maxlength="128"
                   oninput={clampNicknameInput}
@@ -3613,7 +3614,7 @@
               <div class="field half">
                 <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
                 <div class="apply-input">
-                  <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} onkeydown={(e) => applyOnEnter(e, ['max_download_file_size_gib'])} />
+                  <input id="max-dl-gib" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} onkeydown={(e) => applyOnEnter(e, ['max_download_file_size_gib'])} />
                   {@render applyButton(['max_download_file_size_gib'], m.settings_max_file_size_label())}
                 </div>
                 <span class="hint">{m.settings_max_file_size_hint()}</span>
@@ -3979,7 +3980,6 @@
               <div class="apply-input">
                 <input
                   id="search-timeout-secs"
-                  class="compact-number"
                   type="number"
                   min="30"
                   max="600"
@@ -4212,26 +4212,28 @@
           {/if}
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_speed_limits()}</h4>
-            <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
-              <div class="apply-input">
-                <div class="apply-grow">
-                  <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} onescape={() => revertTyped(['max_upload_speed'])} />
+            <div class="field-row">
+              <div class="field half manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
+                <div class="apply-input">
+                  <div class="apply-grow">
+                    <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} onescape={() => revertTyped(['max_upload_speed'])} />
+                  </div>
+                  {@render applyButton(['max_upload_speed'], m.settings_max_upload_speed())}
                 </div>
-                {@render applyButton(['max_upload_speed'], m.settings_max_upload_speed())}
+                <span class="hint">{m.settings_max_upload_speed_hint()}</span>
               </div>
-              <span class="hint">{m.settings_max_upload_speed_hint()}</span>
-            </div>
-            <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
-              <div class="apply-input">
-                <div class="apply-grow">
-                  <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} onescape={() => revertTyped(['max_download_speed'])} />
+              <div class="field half manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
+                <div class="apply-input">
+                  <div class="apply-grow">
+                    <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} onescape={() => revertTyped(['max_download_speed'])} />
+                  </div>
+                  {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
                 </div>
-                {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
+                <span class="hint">{m.settings_max_download_speed_hint()}</span>
+                {#if !runtimeStatus?.alt_speed}
+                  {@render downloadRatioCapNote()}
+                {/if}
               </div>
-              <span class="hint">{m.settings_max_download_speed_hint()}</span>
-              {#if !runtimeStatus?.alt_speed}
-                {@render downloadRatioCapNote()}
-              {/if}
             </div>
             <div class="field toggle-row" class:is-disabled={savedSettings?.max_upload_speed === 0}>
               <div class="toggle-info">
@@ -4265,17 +4267,19 @@
             <!-- Editable while off, so the limits can be ready before they are
                  switched on from the tray; dimmed because they are not in force. -->
             <div class="field nested alt-speed-limits" class:is-inactive={!settings.alt_speed_enabled}>
-              <div class="apply-input">
-                <div class="apply-grow">
-                  <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} onenter={() => void applyFields(['alt_max_upload_speed'])} onescape={() => revertTyped(['alt_max_upload_speed'])} />
+              <div class="speed-pair">
+                <div class="apply-input">
+                  <div class="apply-grow">
+                    <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} onenter={() => void applyFields(['alt_max_upload_speed'])} onescape={() => revertTyped(['alt_max_upload_speed'])} />
+                  </div>
+                  {@render applyButton(['alt_max_upload_speed'], m.settings_alt_max_upload_speed())}
                 </div>
-                {@render applyButton(['alt_max_upload_speed'], m.settings_alt_max_upload_speed())}
-              </div>
-              <div class="apply-input">
-                <div class="apply-grow">
-                  <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} onenter={() => void applyFields(['alt_max_download_speed'])} onescape={() => revertTyped(['alt_max_download_speed'])} />
+                <div class="apply-input">
+                  <div class="apply-grow">
+                    <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} onenter={() => void applyFields(['alt_max_download_speed'])} onescape={() => revertTyped(['alt_max_download_speed'])} />
+                  </div>
+                  {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
                 </div>
-                {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
               </div>
               {#if runtimeStatus?.alt_speed}
                 {@render downloadRatioCapNote()}
@@ -4304,7 +4308,6 @@
               <div class="apply-input">
                 <input
                   id="upload-quota-gb"
-                  class="compact-number"
                   type="number"
                   min="1"
                   max={UPLOAD_QUOTA_MAX_GB}
@@ -5117,7 +5120,6 @@
               <div class="apply-input">
                 <input
                   id="max-friends"
-                  class="compact-number"
                   type="number"
                   min="1"
                   max="500"
@@ -5161,6 +5163,7 @@
               <div class="apply-input">
                 <input
                   id="channel_username"
+                  class="short-text"
                   value={settings.channel_username}
                   maxlength={CHANNEL_USERNAME_MAX}
                   spellcheck="false"
@@ -5461,7 +5464,7 @@
               />
               <span class="hint">{m.settings_backup_passphrase_hint()}</span>
             </div>
-            <div class="field">
+            <div class="field continues">
               <label for="backup-passphrase-confirm">{m.settings_backup_passphrase_confirm_label()}</label>
               <input
                 id="backup-passphrase-confirm"
@@ -6365,11 +6368,28 @@
     line-height: 1.4;
   }
 
-  .field input[type='number'],
+  /* Text and paths take the row. A number, or a choice from a list, is as
+     wide as what it holds, so a two-digit limit does not span the card. */
   .field input[type='text'],
-  .field input:not([type]),
-  .field > select {
+  .field input:not([type]) {
     width: 100%;
+  }
+
+  .field input[type='number'] {
+    width: 120px;
+  }
+
+  /* `align-self`, or the field's column would stretch it to the row. */
+  .field > select {
+    align-self: flex-start;
+    width: auto;
+    min-width: 16rem;
+    max-width: 100%;
+  }
+
+  /* A name rather than a path: room for a long one, not the card's width. */
+  .field input.short-text {
+    max-width: 24rem;
   }
 
   .field input[type='password'] {
@@ -6400,12 +6420,6 @@
     color: var(--badge-danger-text);
   }
 
-  /* Counts and sizes want a few digits, not the whole card; specific enough
-     to beat the `.field input[type='number']` full-width rule above. */
-  .field input[type='number'].compact-number {
-    width: 120px;
-  }
-
   /* A typed field and the Apply button that appears once it is edited. */
   .apply-input {
     display: flex;
@@ -6414,10 +6428,29 @@
     gap: 8px;
   }
 
-  .apply-input > input:not(.compact-number),
+  .apply-input > input:not([type='number']),
   .apply-input > .apply-grow {
     flex: 1;
     min-width: 0;
+  }
+
+  /* A speed box, with the unit and Unlimited beside the number, needs no
+     more than this. */
+  .apply-input > .apply-grow {
+    max-width: 24rem;
+  }
+
+  /* `SpeedInput` draws its own label; here it reads as every other one. */
+  .field :global(.speed-label) {
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+
+  /* Two speeds that go together, upload and download, side by side. */
+  .speed-pair {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
   }
 
   .field-apply {
@@ -6497,6 +6530,27 @@
 
   .toggle-info .hint {
     margin-top: 0;
+  }
+
+  /* Settings, each with a line of its own explaining it, read as one block
+     without a hairline between them: every setting after the first in its
+     group draws one above itself, in the middle of the group's gap, so
+     nothing moves. A setting nested under the one above has its own rule
+     down the side instead, a notice framed on its own needs none on either
+     side, and `.continues` is the second half of the setting above, as
+     typing a passphrase again is. */
+  .settings-group > :is(.field, .field-row):not(.schedule-unsaved) + :is(.field, .field-row):not(.nested, .schedule-unsaved, .continues) {
+    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    margin-top: -9px;
+    padding-top: 9px;
+  }
+
+  /* While filtering, the row above may be a hidden one, which would leave
+     the line under the group's heading. */
+  .cards-grid.filtering .settings-group > :is(.field, .field-row):not(.schedule-unsaved) + :is(.field, .field-row):not(.nested, .schedule-unsaved, .continues) {
+    border-top: none;
+    margin-top: 0;
+    padding-top: 0;
   }
 
   /* A setting that only means something while the one above it is on. */
@@ -7483,7 +7537,8 @@
     min-width: 0;
   }
 
-  .lang-text .behavior-title,
+  /* A name too long for the chip, as "Português (Brasil)" is, takes a
+     second line rather than losing its end. */
   .lang-text .behavior-desc {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7546,6 +7601,10 @@
     .field-row {
       flex-direction: column;
     }
+
+    .speed-pair {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
 
   /* Shared "this is happening right now" marker: the sleep inhibitor being
@@ -7603,12 +7662,6 @@
   .upload-quota-limits.is-inactive,
   .manual-speed-limit.is-inactive {
     opacity: 0.62;
-  }
-
-  .alt-speed-limits {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 12px;
   }
 
   .schedule-empty {
@@ -7988,7 +8041,7 @@
     box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
-  /* Specific enough to beat `.field input[type='number'] { width: 100% }`. */
+  /* Specific enough to beat `.field input[type='number']`. */
   .field .unit-input input[type='number'] {
     width: 96px;
     border: none;
@@ -8024,8 +8077,8 @@
   }
 
   .channel-offers-row select {
-    flex: 1;
-    min-width: 200px;
+    min-width: 16rem;
+    max-width: 100%;
   }
 
   .channel-language-row {
