@@ -142,6 +142,7 @@
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
+  import NavIcon from '$lib/components/NavIcon.svelte';
   import PortTest from '$lib/components/PortTest.svelte';
   import ConnectionDoctor from '$lib/components/ConnectionDoctor.svelte';
   import { highlightMatches } from '$lib/stores/highlight';
@@ -2555,15 +2556,73 @@
   }
 
   /** The parts of the window whose confirmation toasts can be turned off,
-   *  named as the sidebar names them. See `toastsFor`. */
+   *  named and drawn as the sidebar names and draws them. See `toastsFor`. */
   const popupAreas = [
-    { id: 'downloads', key: 'popups_downloads', label: m.nav_transfers },
-    { id: 'search', key: 'popups_search', label: m.nav_search },
-    { id: 'library', key: 'popups_library', label: m.nav_library },
-    { id: 'friends', key: 'popups_friends', label: m.nav_friends },
-    { id: 'channels', key: 'popups_channels', label: m.nav_channels },
-    { id: 'feeds', key: 'popups_feeds', label: m.nav_feeds },
-    { id: 'network', key: 'popups_network', label: m.nav_group_networks },
+    { id: 'downloads', key: 'popups_downloads', label: m.nav_transfers, icon: 'transfers' },
+    { id: 'search', key: 'popups_search', label: m.nav_search, icon: 'search' },
+    { id: 'library', key: 'popups_library', label: m.nav_library, icon: 'library' },
+    { id: 'friends', key: 'popups_friends', label: m.nav_friends, icon: 'friends' },
+    { id: 'channels', key: 'popups_channels', label: m.nav_channels, icon: 'channels' },
+    { id: 'feeds', key: 'popups_feeds', label: m.nav_feeds, icon: 'feeds' },
+    { id: 'network', key: 'popups_network', label: m.nav_group_networks, icon: 'kad' },
+  ] as const;
+
+  /** The desktop notification events, under the part of Ember each comes
+   *  from, named and drawn as the sidebar names and draws it. `manageRooms`
+   *  ends the hint with a way to the rooms that notify less. */
+  const notifyAreas = [
+    {
+      id: 'transfers',
+      label: m.nav_transfers,
+      events: [
+        { id: 'download-complete', key: 'notify_download_complete', label: m.settings_notify_download_complete },
+        { id: 'download-failed', key: 'notify_download_failed', label: m.settings_notify_download_failed },
+      ],
+    },
+    {
+      id: 'friends',
+      label: m.nav_friends,
+      events: [
+        { id: 'friend-online', key: 'notify_friend_online', label: m.settings_notify_friend_online },
+        {
+          id: 'friend-message',
+          key: 'notify_friend_message',
+          label: m.settings_notify_friend_message,
+          hint: m.settings_notify_friend_message_hint,
+        },
+        { id: 'friend-request', key: 'notify_friend_request', label: m.settings_notify_friend_request },
+      ],
+    },
+    {
+      id: 'library',
+      label: m.nav_library,
+      events: [
+        {
+          id: 'shares-browsed',
+          key: 'notify_shares_browsed',
+          label: m.settings_notify_shares_browsed,
+          hint: m.settings_notify_shares_browsed_hint,
+        },
+      ],
+    },
+    {
+      id: 'channels',
+      label: m.nav_channels,
+      events: [
+        {
+          id: 'channel-message',
+          key: 'notify_channel_message',
+          label: m.settings_notify_channel_message,
+          hint: m.settings_notify_channel_message_hint,
+          manageRooms: true,
+        },
+      ],
+    },
+    {
+      id: 'feeds',
+      label: m.nav_feeds,
+      events: [{ id: 'feed-update', key: 'notify_feed_update', label: m.settings_notify_feed_update }],
+    },
   ] as const;
 
   /** The master switch, which every notification event depends on. */
@@ -3350,141 +3409,55 @@
                 ariaDescribedby="notifications-enabled-hint"
               />
             </div>
-            <!-- Everything the switch above governs, indented under it and
-                 sorted by the part of Ember each event comes from. -->
-            <div class="nested notify-options" class:is-disabled={notifyOff}>
-              <div class="field toggle-row" class:is-disabled={notifyOff}>
-                <div class="toggle-info">
-                  <label class="toggle-title" id="notifications-unfocused-label" for="notifications-unfocused-switch">{m.settings_notifications_unfocused_label()}</label>
-                  <span class="hint" id="notifications-unfocused-hint">{m.settings_notifications_unfocused_hint()}</span>
-                </div>
-                <ToggleSwitch
-                  id="notifications-unfocused-switch"
-                  bind:checked={settings.notifications_only_when_unfocused}
-                  disabled={notifyOff}
-                  ariaLabelledby="notifications-unfocused-label"
-                  ariaDescribedby="notifications-unfocused-hint"
-                />
+            <div class="field toggle-row nested" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <label class="toggle-title" id="notifications-unfocused-label" for="notifications-unfocused-switch">{m.settings_notifications_unfocused_label()}</label>
+                <span class="hint" id="notifications-unfocused-hint">{m.settings_notifications_unfocused_hint()}</span>
               </div>
-
-              <div class="settings-subgroup" role="group" aria-labelledby="notify-transfers-title">
-                <h5 class="subgroup-title" id="notify-transfers-title">{m.nav_transfers()}</h5>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-download-complete-label" for="notify-download-complete-switch">{m.settings_notify_download_complete()}</label>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-download-complete-switch"
-                    bind:checked={settings.notify_download_complete}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-download-complete-label"
-                  />
+              <ToggleSwitch
+                id="notifications-unfocused-switch"
+                bind:checked={settings.notifications_only_when_unfocused}
+                disabled={notifyOff}
+                ariaLabelledby="notifications-unfocused-label"
+                ariaDescribedby="notifications-unfocused-hint"
+              />
+            </div>
+            <!-- Everything the switch above governs, a panel for each part of
+                 Ember the events come from. -->
+            <div class="notify-options" class:is-disabled={notifyOff}>
+              {#each notifyAreas as area (area.id)}
+                <div class="settings-subgroup notify-panel" role="group" aria-labelledby="notify-{area.id}-title">
+                  <h5 class="subgroup-title" id="notify-{area.id}-title">
+                    <span class="area-icon" aria-hidden="true"><NavIcon id={area.id} size={14} /></span>
+                    {area.label()}
+                  </h5>
+                  {#each area.events as event (event.id)}
+                    {@const hint = 'hint' in event ? event.hint : undefined}
+                    <div class="field toggle-row" class:is-disabled={notifyOff}>
+                      <div class="toggle-info">
+                        <label class="toggle-title" id="notify-{event.id}-label" for="notify-{event.id}-switch">{event.label()}</label>
+                        {#if hint}
+                          <span class="hint" id="notify-{event.id}-hint">
+                            {hint()}
+                            {#if 'manageRooms' in event}
+                              <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
+                                {m.settings_notify_channel_manage()}
+                              </button>
+                            {/if}
+                          </span>
+                        {/if}
+                      </div>
+                      <ToggleSwitch
+                        id="notify-{event.id}-switch"
+                        bind:checked={settings[event.key]}
+                        disabled={notifyOff}
+                        ariaLabelledby="notify-{event.id}-label"
+                        ariaDescribedby={hint ? `notify-${event.id}-hint` : undefined}
+                      />
+                    </div>
+                  {/each}
                 </div>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-download-failed-label" for="notify-download-failed-switch">{m.settings_notify_download_failed()}</label>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-download-failed-switch"
-                    bind:checked={settings.notify_download_failed}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-download-failed-label"
-                  />
-                </div>
-              </div>
-
-              <div class="settings-subgroup" role="group" aria-labelledby="notify-friends-title">
-                <h5 class="subgroup-title" id="notify-friends-title">{m.nav_friends()}</h5>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-friend-online-label" for="notify-friend-online-switch">{m.settings_notify_friend_online()}</label>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-friend-online-switch"
-                    bind:checked={settings.notify_friend_online}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-friend-online-label"
-                  />
-                </div>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-friend-message-label" for="notify-friend-message-switch">{m.settings_notify_friend_message()}</label>
-                    <span class="hint" id="notify-friend-message-hint">{m.settings_notify_friend_message_hint()}</span>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-friend-message-switch"
-                    bind:checked={settings.notify_friend_message}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-friend-message-label"
-                    ariaDescribedby="notify-friend-message-hint"
-                  />
-                </div>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-friend-request-label" for="notify-friend-request-switch">{m.settings_notify_friend_request()}</label>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-friend-request-switch"
-                    bind:checked={settings.notify_friend_request}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-friend-request-label"
-                  />
-                </div>
-              </div>
-
-              <div class="settings-subgroup" role="group" aria-labelledby="notify-library-title">
-                <h5 class="subgroup-title" id="notify-library-title">{m.nav_library()}</h5>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-shares-browsed-label" for="notify-shares-browsed-switch">{m.settings_notify_shares_browsed()}</label>
-                    <span class="hint" id="notify-shares-browsed-hint">{m.settings_notify_shares_browsed_hint()}</span>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-shares-browsed-switch"
-                    bind:checked={settings.notify_shares_browsed}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-shares-browsed-label"
-                    ariaDescribedby="notify-shares-browsed-hint"
-                  />
-                </div>
-              </div>
-
-              <div class="settings-subgroup" role="group" aria-labelledby="notify-channels-title">
-                <h5 class="subgroup-title" id="notify-channels-title">{m.nav_channels()}</h5>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-channel-message-label" for="notify-channel-message-switch">{m.settings_notify_channel_message()}</label>
-                    <span class="hint" id="notify-channel-message-hint">
-                      {m.settings_notify_channel_message_hint()}
-                      <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
-                        {m.settings_notify_channel_manage()}
-                      </button>
-                    </span>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-channel-message-switch"
-                    bind:checked={settings.notify_channel_message}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-channel-message-label"
-                    ariaDescribedby="notify-channel-message-hint"
-                  />
-                </div>
-              </div>
-
-              <div class="settings-subgroup" role="group" aria-labelledby="notify-feeds-title">
-                <h5 class="subgroup-title" id="notify-feeds-title">{m.nav_feeds()}</h5>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-feed-update-label" for="notify-feed-update-switch">{m.settings_notify_feed_update()}</label>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-feed-update-switch"
-                    bind:checked={settings.notify_feed_update}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-feed-update-label"
-                  />
-                </div>
-              </div>
+              {/each}
             </div>
           </div>
 
@@ -3493,9 +3466,12 @@
             <p class="hint" id="popups-hint">{m.settings_popups_hint()}</p>
             <div class="toggle-grid">
               {#each popupAreas as area (area.key)}
-                <div class="field toggle-row">
+                <div class="field toggle-row toggle-tile">
                   <div class="toggle-info">
-                    <label class="toggle-title" id="popups-{area.id}-label" for="popups-{area.id}-switch">{area.label()}</label>
+                    <label class="toggle-title" id="popups-{area.id}-label" for="popups-{area.id}-switch">
+                      <span class="area-icon" aria-hidden="true"><NavIcon id={area.icon} size={14} /></span>
+                      {area.label()}
+                    </label>
                   </div>
                   <ToggleSwitch
                     id="popups-{area.id}-switch"
@@ -6531,37 +6507,85 @@
     border-left: 2px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
-  /* Several such settings at once: the group's own rhythm, inside the rule. */
+  /* The notification events, a panel for each part of Ember, two columns of
+     them where the card is wide enough. Columns rather than a grid, so a short
+     panel leaves no hole beside a tall one. */
   .notify-options {
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
+    columns: 2 280px;
+    column-gap: 14px;
   }
 
-  /* A run of fields within a group, named for the part of Ember they are
-     about. Quieter than the group heading above it. */
-  .settings-subgroup {
+  /* One part of Ember's events: its name and icon over its switches, as the
+     sidebar names and draws it. */
+  .notify-panel {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    break-inside: avoid;
+    margin: 0 0 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    overflow: hidden;
   }
 
   .subgroup-title {
-    margin: 0 0 -7px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    padding: 8px 14px;
+    background: var(--bg-surface);
     font-size: var(--font-size-sm);
     font-weight: 600;
-    color: var(--text-secondary);
+    color: var(--text-primary);
+  }
+
+  /* Every row draws the line above it, the first one under the panel's
+     name, so a row the filter hides takes no line with it. */
+  .notify-panel > .toggle-row {
+    padding: 11px 14px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* The sidebar's icon for the area, on the tint the card header's icon has. */
+  .area-icon {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
   }
 
   .notify-options.is-disabled .subgroup-title {
+    color: var(--text-muted);
+  }
+
+  .notify-options.is-disabled .area-icon {
     opacity: 0.55;
   }
 
-  /* Short switches with one-word labels, two to a row. */
+  /* Short switches with one-word labels, each in a tile of its own, as many
+     to a row as fit. */
   .toggle-grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 18px 32px;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 10px;
+  }
+
+  .toggle-tile {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    gap: 10px;
+  }
+
+  .toggle-tile .toggle-title {
+    gap: 10px;
   }
 
   /* Its control is disabled; the words go quiet with it. The control dims
@@ -7509,8 +7533,7 @@
   }
 
   @media (max-width: 760px) {
-    .behavior-picker,
-    .toggle-grid {
+    .behavior-picker {
       grid-template-columns: 1fr;
     }
 
@@ -7858,7 +7881,7 @@
 
   @media (max-width: 980px) {
     .settings-layout {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
       gap: 12px;
       padding: 12px;
       max-width: none;
