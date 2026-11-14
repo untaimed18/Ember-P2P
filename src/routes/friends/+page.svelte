@@ -64,6 +64,7 @@
   import IconX from '$lib/components/IconX.svelte';
   import IconGear from '$lib/components/IconGear.svelte';
   import FriendSettingsDialog from '$lib/components/FriendSettingsDialog.svelte';
+  import { OpenFriend } from '$lib/openFriend.svelte';
   import { chatAllowedWith, friendNameTooLong, friendOverrides, FRIEND_NAME_MAX_CHARS } from '$lib/friendSettings';
 
   let friends: FriendInfo[] = $derived($friendsListStore);
@@ -71,14 +72,7 @@
     return !chatAllowedWith($appSettings, hash);
   }
   /** The friend whose settings dialog is open. */
-  let settingsFor: FriendInfo | null = $state(null);
-  $effect(() => {
-    const open = settingsFor;
-    if (!open) return;
-    const fresh = $friendsListStore.find((f) => f.user_hash === open.user_hash);
-    if (!fresh) settingsFor = null;
-    else if (fresh !== open) settingsFor = fresh;
-  });
+  const settingsFor = new OpenFriend(() => $friendsListStore);
   /** Whether a friend has any setting of their own, for the dot on the gear. */
   function hasOverrides(hash: string): boolean {
     return Object.keys(friendOverrides($appSettings, hash)).length > 0;
@@ -904,7 +898,8 @@
   /** The open settings dialog and the chat tab keep their own copy of the
    *  name; the list and the name cache follow the store. */
   function showFriendName(hash: string, nick: string, alias: string) {
-    if (settingsFor?.user_hash === hash) settingsFor = { ...settingsFor, nickname: nick, alias };
+    const open = settingsFor.current;
+    if (open?.user_hash === hash) settingsFor.current = { ...open, nickname: nick, alias };
     renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
   }
 
@@ -1068,11 +1063,11 @@
   onclose={closeBrowse}
 />
 
-{#if settingsFor}
+{#if settingsFor.current}
   <FriendSettingsDialog
-    friend={settingsFor}
+    friend={settingsFor.current}
     onrename={renameFriend}
-    onclose={() => (settingsFor = null)}
+    onclose={() => (settingsFor.current = null)}
   />
 {/if}
 
@@ -1678,7 +1673,7 @@
             class="card-settings-btn"
             class:has-overrides={hasOverrides(f.user_hash)}
             disabled={!$appSettings}
-            onclick={() => (settingsFor = f)}
+            onclick={() => (settingsFor.current = f)}
             title={hasOverrides(f.user_hash)
               ? m.friend_settings_open_custom({ name: shortName })
               : m.friend_settings_open({ name: shortName })}
