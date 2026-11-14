@@ -3974,6 +3974,10 @@ pub(super) async fn start_channel_presence_fetch(
         ) else {
             break;
         };
+        // Members' presence is stored on the k nodes closest to the key.
+        if let Some(search) = state.ember_search.get_mut(search_id) {
+            search.mark_settling_lookup();
+        }
         seed_ember_local_records(state, search_id, &key, &[]);
         state
             .ember_channel_presence_searches

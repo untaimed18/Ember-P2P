@@ -600,29 +600,28 @@ showing a number rather than "Paused (small network)"), or "Stores acked"
 grows faster than the overlay does. Gate it on an advertised capability as in
 7a. A storer that predates it must never be left owing a reply.
 
-**7c. Ending source, room and directory lookups sooner.**
+**7c. Ending source, room and directory lookups sooner — mostly built in 1.8.0.**
 
 *What.* A keyword walk ends a few seconds after the k closest live contacts
-have answered (`KEYWORD_SETTLE_SECS`). Every other `FIND_VALUE` (download
-sources, room presence, feed heads, the rendezvous directory) walks its whole
-shortlist by design, for recall, and each silent node on it costs the full
-query wait (`EMBER_SEARCH_QUEUED_QUERY_TIMEOUT`, 12 seconds) before the walk can
-end. The 1.7.6 run averaged 20 seconds a lookup, against 9.7 seconds on 1.7.3.
+have answered (`KEYWORD_SETTLE_SECS`). Every other `FIND_VALUE` walked its
+whole shortlist, and each silent first contact on it cost the full queued-query
+wait (`EMBER_SEARCH_QUEUED_QUERY_TIMEOUT`, 12 seconds). The 1.7.6 run averaged
+20 seconds a lookup, against 9.7 seconds on 1.7.3.
 
-*Why it waited.* The 20 seconds mixes the user's searches with background
-lookups, and changing walk termination without knowing which is slow risks
-recall for nothing. 1.7.7 added "Keyword search avg. time"
-(`ember_dht_keyword_search_outcomes`, `ember_dht_keyword_search_elapsed_ms_sum`)
-to tell them apart.
+*Built in 1.8.0.* Source and room presence lookups settle the way keyword walks
+do (`IterativeSearch::mark_settling_lookup`). Records live on the k closest, so
+the cost is only records held by stragglers outside them. Lookups whose empty
+answer is read as "there is none" (a room's moderation, settings, handoff or
+claim) still ask every node they can, and the feed and directory walks are
+unchanged. And a query queued behind a first contact's handshake fails at
+`EMBER_SEARCH_HANDSHAKE_TIMEOUT` (6 seconds) if the handshake has not
+completed by then, rather than at 12; once it completes, the query keeps the
+rest of its budget.
 
-*When.* If keyword searches stay quick while the overall average stays high,
-the slow ones are the background walks. Two changes, in this order:
-
-- Per-peer timeouts from measured round-trip times instead of the fixed 12
-  seconds, so one silent node stops setting the pace.
-- Settling for source and presence lookups, once the k closest have answered
-  and nothing new has arrived for a few seconds. Records live on the k closest,
-  so the cost is only records held by stragglers outside them.
+*Still open.* Per-peer timeouts from measured round-trip times instead of the
+fixed 5 and 12 seconds, so one slow node stops setting the pace. Pick it up if
+the overall lookup average on `/ember` stays well above "Keyword search avg.
+time" (`ember_dht_keyword_search_elapsed_ms_sum`) on 1.8.0.
 
 **7d. Rendezvous adverts that never become contacts.**
 
@@ -1166,49 +1165,6 @@ against KAD.
   `ember_dht_rate_limited` for the total. The total climbing while the ceiling
   stays flat is pacing; the two climbing together is the case proof-of-work
   would be for.
-- **A replayed `IK_INIT` can take over a crossed dial (deferred from 1.7.1).**
-  A crossed IK dial is settled by static key before anything shows the inbound
-  init is current, and past `HANDSHAKE_REPLAY_TTL` (30 s) a captured `IK_INIT`
-  reads as fresh. Replayed from the peer's address while the higher key has a
-  dial pending to that identity, it makes that node drop its initiator and seal
-  the first message and queue into a session the real peer cannot read. The real
-  `IK_RESP` then finds no pending handshake, and sends go into the unproven
-  session until a liveness fault or `SESSION_TIMEOUT`. It needs a captured init,
-  a way to send from the peer's address, and timing against our dial.
-
-  The case with no dial pending is closed (1.7.6): `prepare_outgoing` seals only
-  into a session whose address is proven, and otherwise dials the peer, whose
-  answer replaces the replayed session; `has_live_session` likewise counts only
-  a proven session. The session a lost crossing leaves is the one exception —
-  our first message is already in it — so the crossing replay below stays open.
-
-  Not fixed in 1.7.1 because each narrow change found trades this for an honest
-  fault. Keeping the initiator so the real `IK_RESP` can still complete it lets
-  both handshakes complete when our `IK_INIT` reaches the lower key after our
-  reply to its own: it answers the late init, and if that answer arrives before
-  the peer's first frame on the crossing session, our first message and queue
-  reach it twice (nothing above the transport collapses a repeated
-  `CHANNEL_MSG`, `CALLBACK_REQ` or EPX frame), or the peer's frames on the
-  replaced session are lost, its first message among them. A crossing session
-  evicted before it is proven also leaves later sends queued behind an
-  initiator the peer refused.
-
-  The fix is responder-side key confirmation, as WireGuard has: a session we
-  answered is not sent on until it decrypts a frame from the peer.
-  `prepare_outgoing` queues behind an unconfirmed responder session, its first
-  decrypt releases the queue, and when we need that slot we also start our own
-  IK dial, whose validated session replaces it. A crossing then keeps the
-  initiator and its payloads, marked with the crossing session's generation:
-  that session's first decrypt seals them into it and drops the initiator, and
-  an `IK_RESP` that completes the initiator first takes them instead, the first
-  message reaching the peer through its own deferral, so each payload is sealed
-  into one session. An evicted crossing session hands the payloads to a fresh
-  dial, and a second crossing init re-points the marker without sealing again,
-  so a replayer cannot multiply what we send to the address it names. Still to
-  settle there: the peer's frames on a crossing session that a faster
-  `IK_RESP` replaced. The cost is a round trip before the higher key's first
-  message in an honest crossing, and before anything we start on a session a
-  peer opened that has not yet sent us a frame.
 
 ---
 
@@ -1288,6 +1244,24 @@ bump. What was weighed and held back is item 7.
   learned one contact (`ember_friend_contact_backoff`).
 - Diagnostics: keyword search time apart from the overall average, our refused
   stores by reason, and contacts by reachability.
+
+**Shipped in 1.8.0** — no wire change.
+
+- Source and room presence lookups settle once their neighbourhood has
+  answered, and a first contact's handshake has a deadline of its own (item 7c).
+- A replayed `IK_INIT` could take over a crossed dial (deferred from 1.7.1).
+  Past `HANDSHAKE_REPLAY_TTL` (30 s) a captured `IK_INIT` reads as fresh, and
+  replayed from the peer's address while the higher key had a dial pending, it
+  made that node seal its first message and queue into a session the real peer
+  could not read, and send into it until a fault. The higher key of a crossed
+  dial now holds its messages, and anything sent meanwhile, until the session
+  the peer's handshake built decrypts a frame from the peer; past
+  `CROSSING_HOLD` (3 s) they go out over a fresh dial, which the real peer
+  answers and a replayer cannot (`crossing_holds`). It still gives up its own
+  dial rather than keep it pending: a peer before 1.7.1 answers a kept dial's
+  resend once its own dial has completed, which could leave the two ends on
+  different sessions. The cost is a round trip before the higher key's first
+  message in an honest crossing.
 
 ---
 

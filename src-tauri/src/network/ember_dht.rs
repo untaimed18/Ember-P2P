@@ -813,6 +813,16 @@ pub(super) const EMBER_SEARCH_QUERY_TIMEOUT: std::time::Duration = std::time::Du
 /// inside the 60-second whole-search cap.
 pub(super) const EMBER_SEARCH_QUEUED_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
+/// How long a query queued behind a Noise handshake waits for the handshake
+/// alone. Most of a lookup's shortlist is first contacts learned from
+/// `FOUND_NODE` answers, and the silent among them never answer the
+/// handshake at all: holding each for the whole
+/// [`EMBER_SEARCH_QUEUED_QUERY_TIMEOUT`] is what made a lookup that walked its
+/// shortlist cost 12 seconds per silent node. Past both resends of message 1
+/// (`MSG1_RESEND_AFTER`, the last at 3 seconds) and a slow round trip; once
+/// the handshake completes, the query keeps the rest of its budget.
+pub(super) const EMBER_SEARCH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
 // ── DHT maintenance (slice 6) ──
 
 /// How often the maintenance loop runs (bucket refresh, liveness pings,

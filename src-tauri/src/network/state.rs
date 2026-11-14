@@ -1918,6 +1918,11 @@ pub(super) struct EmberSearchRequest {
     /// the search treats differently from a lost reply — see
     /// [`ember::dht::search::QueryFailure::HandshakeNeverCompleted`].
     pub(super) handshake_to: Option<(std::net::SocketAddr, [u8; 32])>,
+    /// When the sweep gives up on that handshake, for a query sent behind one:
+    /// a peer that has not answered it by then is not going to, and the query
+    /// fails then rather than at `deadline`. See
+    /// `ember_dht::EMBER_SEARCH_HANDSHAKE_TIMEOUT`.
+    pub(super) handshake_deadline: Option<std::time::Instant>,
     /// Where the query went. An answer is taken only from there: the reply's
     /// sender id is whatever key it was signed with, and a host holding many
     /// keys could otherwise answer for ones it had gossiped at addresses in

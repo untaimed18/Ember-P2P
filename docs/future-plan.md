@@ -101,12 +101,12 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
 
 **Waiting on a number:**
 
-- **End source, room and directory lookups sooner.** Lookups other than keyword
-  searches walk their whole shortlist, and each silent node costs the full 12
-  seconds. The 1.7.6 run averaged 20 seconds a lookup against 9.7 on 1.7.3.
-  *When:* if "Keyword search avg. time" stays quick while the overall average
-  stays high. Then per-peer timeouts from measured round trips first, and
-  settling for source and presence lookups second.
+- **Per-peer lookup timeouts from measured round trips,** instead of the fixed
+  5 and 12 seconds. 1.8.0 lets source and presence lookups stop once the
+  closest nodes have answered, and gives up on a silent first contact after 6
+  seconds rather than 12; the 1.7.6 run averaged 20 seconds a lookup against
+  9.7 on 1.7.3. *When:* the overall lookup average on 1.8.0 still stays well
+  above "Keyword search avg. time".
 - **Hole punching through an introducer** (BitTorrent's BEP 55 on the DHT), so
   a node that says it is firewalled can be a routing contact. *When:*
   `ember_dht_contacts_reach_firewalled` reaches tens of percent of verified
@@ -135,14 +135,6 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
 
 **Larger work:**
 
-- **Responder-side key confirmation for crossed IK dials.** A captured
-  `IK_INIT` replayed from the peer's address while we have a dial pending can
-  take over the crossing, and our first message and queue go into a session
-  the real peer cannot read until a fault. The fix, as WireGuard has it: a
-  session we answered is not sent on until it decrypts a frame from the peer.
-  Still to settle: the peer's frames on a crossing session that a faster
-  `IK_RESP` replaced. Costs one round trip before the first message in an
-  honest crossing.
 - **Ember-native transfers.** Library downloads find sources over Ember and
   move bytes over eD2K. Ember Transfer moves files between room members over
   the room session, in 1008-byte blocks. Moving it onto QUIC would lift the

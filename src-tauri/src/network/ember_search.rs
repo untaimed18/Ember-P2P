@@ -585,14 +585,16 @@ async fn drive_ember_search_once(socket: &UdpSocket, state: &mut NetworkState, s
         } else {
             EMBER_SEARCH_QUERY_TIMEOUT
         };
+        let sent_at = std::time::Instant::now();
         state.ember_dht_search_requests.insert(
             wire_req_id,
             EmberSearchRequest {
                 search_id,
                 per_search_req_id,
-                deadline: std::time::Instant::now() + budget,
+                deadline: sent_at + budget,
                 sent_unix: chrono::Utc::now().timestamp(),
                 handshake_to: behind_handshake.then_some((contact.addr, contact.noise_pub)),
+                handshake_deadline: behind_handshake.then(|| sent_at + EMBER_SEARCH_HANDSHAKE_TIMEOUT),
                 sent_to: contact.addr,
             },
         );
@@ -2065,6 +2067,10 @@ pub(super) async fn start_ember_source_search(
     else {
         return false;
     };
+    // Sources are stored on the k nodes closest to the file's key.
+    if let Some(search) = state.ember_search.get_mut(search_id) {
+        search.mark_settling_lookup();
+    }
     seed_ember_local_records(state, search_id, &source_key, &[]);
     seed_ember_session_search_contacts(state, search_id);
     state

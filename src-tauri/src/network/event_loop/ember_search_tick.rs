@@ -4,6 +4,20 @@
 
 use super::*;
 
+/// Whether a search query is past its time: its deadline, or, behind a
+/// handshake, the handshake's own deadline with no session from it yet.
+fn search_query_expired(
+    request: &EmberSearchRequest,
+    now: std::time::Instant,
+    has_live_session: impl Fn(&std::net::SocketAddr, &[u8; 32]) -> bool,
+) -> bool {
+    now >= request.deadline
+        || (request.handshake_deadline.is_some_and(|due| now >= due)
+            && request
+                .handshake_to
+                .is_some_and(|(addr, key)| !has_live_session(&addr, &key)))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_ember_search_tick(
     udp_socket: &Arc<UdpSocket>,
@@ -90,6 +104,13 @@ pub(in crate::network) async fn on_ember_search_tick(
             debug!("Ember: resending handshake message 1 to {addr} failed: {e}");
         }
     }
+    // And what a crossed dial held for a session that never proved itself,
+    // over a fresh dial (see `CROSSING_HOLD`).
+    for (addr, packet) in state.ember_transport.due_crossing_redials(std::time::Instant::now()) {
+        if let Err(e) = send_ember_udp(udp_socket, &packet, addr, &state.ember_dht_overhead).await {
+            debug!("Ember: redialling a crossed dial to {addr} failed: {e}");
+        }
+    }
 
     // Ahead of the idle guard: a queued lookup is not one of the maps it reads.
     top_up_awaited_target_lookups(udp_socket, state).await;
@@ -137,11 +158,13 @@ pub(in crate::network) async fn on_ember_search_tick(
     let now = std::time::Instant::now();
 
     // 1) Expire search queries unanswered too long, marking
-    //    their shortlist entry failed.
+    //    their shortlist entry failed: past their deadline, or, behind a
+    //    handshake the peer has not answered, past the handshake's own.
+    let transport = &state.ember_transport;
     let stale: Vec<u32> = state
         .ember_dht_search_requests
         .iter()
-        .filter(|(_, r)| now >= r.deadline)
+        .filter(|(_, r)| search_query_expired(r, now, |addr, key| transport.has_live_session(addr, key)))
         .map(|(wire_id, _)| *wire_id)
         .collect();
 
@@ -1146,5 +1169,57 @@ async fn apply_channel_ingest_results(
         if let Some(started) = state.channel_handoff_fetch_at.get(&channel_id).copied() {
             state.channel_handoff_absent_at.insert(channel_id, started);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(sent: std::time::Instant, behind_handshake: bool) -> EmberSearchRequest {
+        let addr: std::net::SocketAddr = "203.0.113.9:4672".parse().unwrap();
+        EmberSearchRequest {
+            search_id: 1,
+            per_search_req_id: 1,
+            deadline: sent
+                + if behind_handshake {
+                    EMBER_SEARCH_QUEUED_QUERY_TIMEOUT
+                } else {
+                    EMBER_SEARCH_QUERY_TIMEOUT
+                },
+            sent_unix: 0,
+            handshake_to: behind_handshake.then_some((addr, [7u8; 32])),
+            handshake_deadline: behind_handshake.then(|| sent + EMBER_SEARCH_HANDSHAKE_TIMEOUT),
+            sent_to: addr,
+        }
+    }
+
+    #[test]
+    fn a_first_contact_that_never_answers_the_handshake_fails_at_the_handshake_deadline() {
+        let sent = std::time::Instant::now();
+        let queued = request(sent, true);
+        let no_session = |_: &std::net::SocketAddr, _: &[u8; 32]| false;
+        let session = |_: &std::net::SocketAddr, _: &[u8; 32]| true;
+        let just_before = sent + EMBER_SEARCH_HANDSHAKE_TIMEOUT - std::time::Duration::from_millis(1);
+        assert!(!search_query_expired(&queued, just_before, no_session));
+        assert!(
+            search_query_expired(&queued, sent + EMBER_SEARCH_HANDSHAKE_TIMEOUT, no_session),
+            "silent: given up at 6 seconds, not 12"
+        );
+        assert!(
+            !search_query_expired(&queued, sent + EMBER_SEARCH_HANDSHAKE_TIMEOUT, session),
+            "the handshake completed: the query keeps the rest of its budget"
+        );
+        assert!(search_query_expired(&queued, sent + EMBER_SEARCH_QUEUED_QUERY_TIMEOUT, session));
+        assert!(EMBER_SEARCH_HANDSHAKE_TIMEOUT < EMBER_SEARCH_QUEUED_QUERY_TIMEOUT);
+    }
+
+    #[test]
+    fn a_query_on_a_live_session_keeps_its_own_deadline() {
+        let sent = std::time::Instant::now();
+        let live = request(sent, false);
+        let no_session = |_: &std::net::SocketAddr, _: &[u8; 32]| false;
+        assert!(!search_query_expired(&live, sent + EMBER_SEARCH_QUERY_TIMEOUT - std::time::Duration::from_millis(1), no_session));
+        assert!(search_query_expired(&live, sent + EMBER_SEARCH_QUERY_TIMEOUT, no_session));
     }
 }
