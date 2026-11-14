@@ -1526,12 +1526,144 @@ fn spawn_spam_filter_save(
     });
 }
 
+/// Take back the spam mark on a file and what it taught, leaving the file
+/// judged like any other whatever it was before the mark, as the learned
+/// spam data's Unmark does ([`SpamFilter::unmark_spam`]).
+#[tauri::command]
+pub async fn unmark_spam(
+    state: tauri::State<'_, AppState>,
+    file_hash: String,
+) -> Result<(), String> {
+    if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
+        return Err(coded("search_invalid_file_hash", "Invalid file hash"));
+    }
+    let dirty = {
+        let mut spam = state.spam_filter.write().await;
+        spam.unmark_spam(&file_hash);
+        spam.is_dirty()
+    };
+    spawn_spam_filter_save(state.spam_filter.clone(), dirty);
+    Ok(())
+}
+
+/// Stop trusting a file marked not spam, or a finished download, so it is
+/// judged like any other file from then on.
+#[tauri::command]
+pub async fn forget_not_spam(
+    state: tauri::State<'_, AppState>,
+    file_hash: String,
+) -> Result<(), String> {
+    if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
+        return Err(coded("search_invalid_file_hash", "Invalid file hash"));
+    }
+    let dirty = {
+        let mut spam = state.spam_filter.write().await;
+        spam.forget_not_spam(&file_hash);
+        spam.is_dirty()
+    };
+    spawn_spam_filter_save(state.spam_filter.clone(), dirty);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_spam_stats(
     state: tauri::State<'_, AppState>,
 ) -> Result<crate::search::spam::SpamStats, String> {
     let spam = state.spam_filter.read().await;
     Ok(spam.stats())
+}
+
+/// The most entries [`get_learned_spam`] returns at once.
+const MAX_LEARNED_SPAM_PAGE: usize = 500;
+
+/// A page of one learned spam list.
+#[derive(serde::Serialize)]
+pub struct LearnedSpamPage {
+    pub entries: Vec<crate::search::spam::LearnedEntry>,
+    /// How many entries match the query.
+    pub matched: usize,
+    /// How many entries the list holds.
+    pub total: usize,
+}
+
+/// The entries of one learned spam list whose name, address or hash holds
+/// `query` (any case), newest first, `limit` of them from `offset`. A file the
+/// filter kept no name for takes the Library's, or failing that the download
+/// history's, where either has it.
+#[tauri::command]
+pub async fn get_learned_spam(
+    state: tauri::State<'_, AppState>,
+    list: crate::search::spam::LearnedList,
+    query: String,
+    offset: usize,
+    limit: usize,
+) -> Result<LearnedSpamPage, String> {
+    let mut entries = state.spam_filter.read().await.learned(list);
+    let total = entries.len();
+    let unnamed = |e: &crate::search::spam::LearnedEntry| e.hash.is_some() && e.text.is_empty();
+    if entries.iter().any(unnamed) {
+        let index = state.local_index.read().await;
+        for entry in entries.iter_mut().filter(|e| e.text.is_empty()) {
+            let Some(hash) = &entry.hash else { continue };
+            let file = index
+                .get_by_hash(hash)
+                .or_else(|| index.get_by_hash(&hash.to_ascii_uppercase()));
+            if let Some(file) = file {
+                entry.text = file.name.clone();
+                if entry.size.is_none() && file.size > 0 {
+                    entry.size = Some(file.size);
+                }
+            }
+        }
+    }
+    let needle: String = query.trim().chars().take(MAX_SEARCH_FILTER_LEN).collect::<String>().to_lowercase();
+    // The download history is read for the names a search could match, or
+    // with none, only for the page shown.
+    if !needle.is_empty() {
+        name_from_download_history(&state, &mut entries).await;
+        entries.retain(|e| {
+            e.text.to_lowercase().contains(&needle) || e.hash.as_deref().is_some_and(|h| h.contains(&needle))
+        });
+    }
+    let matched = entries.len();
+    let mut entries: Vec<_> = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit.clamp(1, MAX_LEARNED_SPAM_PAGE))
+        .collect();
+    if needle.is_empty() {
+        name_from_download_history(&state, &mut entries).await;
+    }
+    Ok(LearnedSpamPage { entries, matched, total })
+}
+
+/// Name the files among `entries` that have none yet, and give them a size,
+/// from the download history. A history that cannot be read leaves them
+/// unnamed: names are all it is read for.
+async fn name_from_download_history(state: &AppState, entries: &mut [crate::search::spam::LearnedEntry]) {
+    let hashes: Vec<String> = entries
+        .iter()
+        .filter(|e| e.text.is_empty())
+        .filter_map(|e| e.hash.clone())
+        .collect();
+    if hashes.is_empty() {
+        return;
+    }
+    let db = state.db.clone();
+    let history = tokio::task::spawn_blocking(move || db.download_history_names(&hashes))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    for entry in entries.iter_mut().filter(|e| e.text.is_empty()) {
+        let Some((name, size)) = entry.hash.as_ref().and_then(|h| history.get(&h.to_ascii_lowercase())) else {
+            continue;
+        };
+        entry.text = name.clone();
+        if entry.size.is_none() && *size > 0 {
+            entry.size = Some(*size);
+        }
+    }
 }
 
 #[derive(serde::Serialize)]

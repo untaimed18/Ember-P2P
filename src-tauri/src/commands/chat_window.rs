@@ -175,8 +175,9 @@ pub async fn close_chat_window(app: tauri::AppHandle) -> Result<(), String> {
 
 /// Commands the chat window may not call. The capability files scope plugin
 /// permissions only; every app command is callable from every window unless
-/// refused here. These change what is shared or filtered, delete, open or run
-/// files, restore backups, install updates or act on the whole machine, and
+/// refused here. These change what is shared or filtered, read what the spam
+/// filter learned, delete, open or run files, restore backups, install
+/// updates or act on the whole machine, and
 /// none of them is reachable from the chat window's code
 /// (`scripts/chat-window-commands.test.mjs` holds that), so refusing them costs
 /// the chat nothing and keeps a compromised chat webview from them.
@@ -198,10 +199,15 @@ pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "discard_pending_restore",
     "download_and_load_ipfilter",
     "download_feed_items",
+    "explain_spam_result",
     "export_backup",
     "follow_feed",
+    "forget_not_spam",
+    "get_learned_spam",
     "import_backup",
     "kad_bootstrap_url",
+    "mark_not_spam",
+    "mark_spam",
     "move_files_to_category",
     "open_feed_item",
     "open_shared_file",
@@ -215,6 +221,7 @@ pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "remove_server",
     "remove_shared_folder",
     "rename_library_file",
+    "rescore_search_results",
     "reset_antileech_to_defaults",
     "reset_spam_filter",
     "restore_library_file_names",
@@ -240,7 +247,9 @@ pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "stage_emule_import",
     "tag_library_files",
     "unban_peer",
+    "undo_mark_spam",
     "unfollow_feed",
+    "unmark_spam",
     "unshare_file",
     "unshare_folder",
     "update_ipfilter_from_url",

@@ -1325,6 +1325,12 @@ async fn write_backup(
     let app_version = app.package_info().version.to_string();
     let data_dir = paths::resolve_data_dir_with_app(app);
     let passphrase = Zeroizing::new(passphrase);
+    // The spam filter writes some of what it learns once a minute: what
+    // finished downloads earned and how server reputations aged. The archive
+    // reads the file, so it takes them only once they are on disk.
+    if let Err(e) = crate::search::spam::SpamFilter::drain_saves(&state.spam_filter).await {
+        tracing::warn!("Backup: could not save the spam filter first: {e}");
+    }
 
     tokio::task::spawn_blocking(move || {
         let scratch = temp_dir_in(&data_dir, "backup-tmp")?;

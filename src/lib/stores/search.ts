@@ -1197,8 +1197,9 @@ async function rescoreRowsIntoTab(tabId: string, query: string, rows: SearchResu
 }
 
 /** Re-score every open tab after spam settings change (SF8). Honors per-hash
- *  user mark/unmark overrides so an explicit classification is not overwritten. */
-async function rescoreOpenTabs() {
+ *  user mark/unmark overrides so an explicit classification is not overwritten.
+ *  With `which`, only the rows it picks are sent. */
+async function rescoreOpenTabs(which?: (r: SearchResult) => boolean) {
   const tabs = get(searchTabs);
   // Active tab first, so the one the user is looking at is corrected before the
   // work for up to nineteen others they cannot see. Each call is a full re-pass
@@ -1210,13 +1211,43 @@ async function rescoreOpenTabs() {
     a.id === activeId ? -1 : b.id === activeId ? 1 : 0,
   );
   for (const tab of ordered) {
-    if (tab.results.length === 0) continue;
+    const rows = which ? tab.results.filter(which) : tab.results;
+    if (rows.length === 0) continue;
     try {
-      await rescoreRowsIntoTab(tab.id, tab.query, tab.results);
+      await rescoreRowsIntoTab(tab.id, tab.query, rows);
     } catch (e) {
       console.error('Failed to rescore search results:', e);
     }
   }
+}
+
+let openTabsRescoreTimer: ReturnType<typeof setTimeout> | null = null;
+let openTabsRescoreAll = false;
+
+/**
+ * Re-score every open tab once a burst of changes to the learned data settles,
+ * so ten files unmarked in a row cost one pass rather than ten. A change that
+ * can only pull scores down passes `onlyScored`, which leaves out the rows with
+ * no score to lose; one that can raise them re-scores every row.
+ */
+function rescoreOpenTabsSoon(onlyScored: boolean) {
+  openTabsRescoreAll ||= !onlyScored;
+  if (openTabsRescoreTimer !== null) clearTimeout(openTabsRescoreTimer);
+  openTabsRescoreTimer = setTimeout(() => {
+    openTabsRescoreTimer = null;
+    const all = openTabsRescoreAll;
+    openTabsRescoreAll = false;
+    void rescoreOpenTabs(all ? undefined : (r) => r.is_spam || r.spam_rating > 0);
+  }, SPAM_MARK_RESCORE_DEBOUNCE_MS);
+}
+
+/**
+ * After a spam mark is taken back, by Undo or by marking the file not spam.
+ * What the mark taught went into every search run since, in any tab, so every
+ * open tab is re-scored, not only the one the mark was made in.
+ */
+export function rescoreTabsAfterSpamUnmark() {
+  rescoreOpenTabsSoon(true);
 }
 
 /**
@@ -1295,7 +1326,21 @@ async function runSpamMarkRescore(pending: {
 export async function notifySpamFilterReset() {
   spamUserOverrides.clear();
   spamFilterEpoch.update((n) => n + 1);
+  if (openTabsRescoreTimer !== null) clearTimeout(openTabsRescoreTimer);
+  openTabsRescoreTimer = null;
+  openTabsRescoreAll = false;
   await rescoreOpenTabs();
+}
+
+/** After the learned spam data drops its verdict on `fileHash`, a spam mark
+ *  or a not-spam one: drop this session's mark of it, which would otherwise
+ *  keep its rows as they were, and rescore. */
+export function notifySpamVerdictRemoved(fileHash: string) {
+  spamUserOverrides.delete(fileHash);
+  spamUserOverrides.delete(fileHash.toLowerCase());
+  spamUserOverrides.delete(fileHash.toUpperCase());
+  spamFilterEpoch.update((n) => n + 1);
+  rescoreOpenTabsSoon(false);
 }
 
 export async function initSearchStore() {
@@ -1426,6 +1471,9 @@ export function cleanupSearchStore() {
   if (spamMarkRescoreTimer !== null) clearTimeout(spamMarkRescoreTimer);
   spamMarkRescoreTimer = null;
   spamMarkRescorePending = null;
+  if (openTabsRescoreTimer !== null) clearTimeout(openTabsRescoreTimer);
+  openTabsRescoreTimer = null;
+  openTabsRescoreAll = false;
   spamUserOverrides.clear();
   spamFilterEpoch.update((n) => n + 1);
   // Save the tabs before dropping them, and leave the emptied store unsaved.

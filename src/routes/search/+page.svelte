@@ -8,6 +8,7 @@
     RELATED_SEARCH_METHOD,
   } from '$lib/relatedSearch';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import SpamDataDialog from '$lib/components/SpamDataDialog.svelte';
   import { getSettings } from '$lib/api/settings';
   import { libraryHashesAmong } from '$lib/api/sharing';
   import { isUploadCounterPhase } from '$lib/sharedFileStats';
@@ -30,6 +31,7 @@
     patchSearchTabByRequestId,
     patchSpamFlagByHash,
     rescoreTabAfterSpamMark,
+    rescoreTabsAfterSpamUnmark,
     searchRowPatchEpoch,
     searchTabs,
     setActiveSearchTab,
@@ -711,6 +713,7 @@
       ?? 'balanced',
   );
   let showSpamHelp = $state(false);
+  let spamDataOpen = $state(false);
   let contextMenu: { x: number; y: number; result: SearchResult } | null = $state(null);
   let ctxWebSub = $state(false);
   // Opens on hover and on click, as the Library's submenus do; see `hoverSubmenus`.
@@ -3736,7 +3739,7 @@
           stopWatching();
           // Marked or unmarked again since: that choice stands.
           if (spamToggleGen.get(hash) !== gen) return;
-          void undoSpamMark(hash, prior, tabId, undoPatch);
+          void undoSpamMark(hash, prior, undoPatch);
         },
       },
       () => stopWatching(),
@@ -3752,18 +3755,13 @@
     });
   }
 
-  async function undoSpamMark(
-    hash: string,
-    prior: PriorSpamVerdict,
-    tabId: string | null,
-    undoPatch: () => void,
-  ) {
+  async function undoSpamMark(hash: string, prior: PriorSpamVerdict, undoPatch: () => void) {
     const gen = nextSpamToggleGen(hash);
     undoPatch();
     try {
       await undoMarkSpam(hash, prior);
       if (spamToggleGen.get(hash) !== gen) return;
-      if (tabId) rescoreTabAfterSpamMark(tabId, 'not-spam');
+      rescoreTabsAfterSpamUnmark();
     } catch (e) {
       console.error('Failed to undo spam mark:', e);
       if (spamToggleGen.get(hash) === gen) {
@@ -3777,7 +3775,6 @@
     const hash = result.file.hash;
     if (!hash || spamMarkBlockedReason(result)) return;
     const gen = nextSpamToggleGen(hash);
-    const markedTabId = activeTab?.id ?? null;
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
     const undoPatch = patchSpamFlagByHash(hash, false, 0, [m.search_spam_reason_manual_not_spam()]);
@@ -3787,7 +3784,7 @@
       if (spamToggleGen.get(hash) !== gen) return;
       // Unmarking drops the collateral the mark taught — the filename, the
       // size, the IPs — so rows flagged only by those are clean again.
-      if (markedTabId) rescoreTabAfterSpamMark(markedTabId, 'not-spam');
+      rescoreTabsAfterSpamUnmark();
     } catch (e) {
       console.error('Failed to unmark spam:', e);
       if (spamToggleGen.get(hash) === gen) {
@@ -4497,6 +4494,9 @@
     }
   }}
   onkeydown={(e) => {
+  // The spam data dialog takes its own keys; Ctrl+C there must not copy a
+  // result's link from behind it.
+  if (spamDataOpen) return;
   if (e.key === 'Escape') {
     const openHelp = [syntaxHelpEl, tableHelpEl].find((help) => help?.open);
     if (openHelp) {
@@ -4874,6 +4874,7 @@
             </div>
           </span>
         </label>
+        <button type="button" class="filter-link" onclick={() => (spamDataOpen = true)}>{m.settings_spam_data_view()}</button>
         <label class="filter-toggle" title={m.search_hide_owned_title()}>
           <input type="checkbox" bind:checked={hideOwned} />
           <span>{m.search_hide_owned()}</span>
@@ -5933,6 +5934,8 @@
     {/if}
   {/if}
 </div>
+
+<SpamDataDialog bind:open={spamDataOpen} />
 
 <ConfirmDialog
   bind:open={confirmOpen}
@@ -7347,6 +7350,20 @@
   .filter-count {
     font-size: var(--font-size-xs);
     color: var(--text-muted);
+  }
+
+  /* Beside Hide spam: what the filter has learned from your marks. */
+  .filter-link {
+    padding: 5px 4px;
+    border: none;
+    background: none;
+    color: var(--text-accent);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .filter-link:hover {
+    text-decoration: underline;
   }
 
   .filter-help-wrap {

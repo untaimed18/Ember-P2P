@@ -143,6 +143,7 @@
   import { plural } from '$lib/plural';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import NavIcon from '$lib/components/NavIcon.svelte';
+  import SpamDataDialog from '$lib/components/SpamDataDialog.svelte';
   import PortTest from '$lib/components/PortTest.svelte';
   import ConnectionDoctor from '$lib/components/ConnectionDoctor.svelte';
   import { highlightMatches } from '$lib/stores/highlight';
@@ -1969,6 +1970,7 @@
   // delete, IP-filter range remove, etc.) — same focus trap, same dark
   // theme, same Escape-to-cancel.
   let spamResetConfirmOpen = $state(false);
+  let spamDataOpen = $state(false);
   let ignoredClearConfirmOpen = $state(false);
   let mutedClearConfirmOpen = $state(false);
   let hiddenClearConfirmOpen = $state(false);
@@ -2003,7 +2005,8 @@
     spamResetting = true;
     try {
       await resetSpamFilter();
-      await notifySpamFilterReset();
+      // Re-scoring every open search tab can take a while; the reset is done.
+      void notifySpamFilterReset();
       await refreshSpamStats();
       showSaveMsg(m.settings_spam_reset_success(), false, 3000);
     } catch (e: unknown) {
@@ -3957,13 +3960,14 @@
                 <span class="hint hint-error" role="alert">{spamStatsError}</span>
               {:else if spamStats}
                 <div class="stat-grid">
-                  <div class="stat"><span>{m.settings_spam_stat_hashes()}</span><strong>{spamStats.spam_hashes}</strong></div>
-                  <div class="stat"><span>{m.settings_spam_stat_not_spam_hashes()}</span><strong>{spamStats.not_spam_hashes}</strong></div>
-                  <div class="stat"><span>{m.settings_spam_stat_names()}</span><strong>{spamStats.spam_filenames}</strong></div>
-                  <div class="stat"><span>{m.settings_spam_stat_source_ips()}</span><strong>{spamStats.spam_source_ips}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_hashes()}</span><strong>{formatNumber(spamStats.spam_hashes)}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_not_spam_hashes()}</span><strong>{formatNumber(spamStats.not_spam_hashes)}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_names()}</span><strong>{formatNumber(spamStats.spam_filenames)}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_source_ips()}</span><strong>{formatNumber(spamStats.spam_source_ips)}</strong></div>
                 </div>
               {/if}
               <div class="action-row">
+                <button class="action-btn" onclick={() => (spamDataOpen = true)} disabled={spamResetting}>{m.settings_spam_data_view()}</button>
                 <button class="action-btn" onclick={refreshSpamStats} disabled={spamStatsLoading || spamResetting}>{m.settings_refresh_stats()}</button>
                 <button class="action-btn danger" onclick={handleResetSpamData} disabled={spamResetting}>
                   {spamResetting ? m.settings_resetting() : m.settings_reset_spam_data()}
@@ -5940,6 +5944,8 @@
   danger={true}
   onconfirm={confirmClearHistory}
 />
+
+<SpamDataDialog bind:open={spamDataOpen} onchange={() => void refreshSpamStats()} />
 
 <ConfirmDialog
   bind:open={antileechResetConfirmOpen}

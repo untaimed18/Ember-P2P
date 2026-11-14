@@ -17201,6 +17201,45 @@ impl Database {
         Ok(result)
     }
 
+    /// The names and sizes the download history holds for `hashes`, keyed by
+    /// the hash in lower case, whatever case either side is in. A row with no
+    /// name is left out.
+    pub fn download_history_names(
+        &self,
+        hashes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, (String, u64)>> {
+        let mut result = std::collections::HashMap::new();
+        if hashes.is_empty() {
+            return Ok(result);
+        }
+        // Each hash in both cases, rather than `lower(file_hash)`, so the
+        // primary key's index answers each one.
+        let forms: Vec<String> = hashes
+            .iter()
+            .flat_map(|h| [h.to_ascii_lowercase(), h.to_ascii_uppercase()])
+            .collect();
+        let conn = self.conn.lock();
+        const CHUNK_SIZE: usize = 900;
+        for chunk in forms.chunks(CHUNK_SIZE) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT lower(file_hash), file_name, file_size FROM download_history
+                 WHERE file_hash IN ({}) AND file_name != ''",
+                placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })?;
+            for (hash, name, size) in rows.filter_map(|r| r.ok()) {
+                result.insert(hash, (name, u64::try_from(size).unwrap_or(0)));
+            }
+        }
+        Ok(result)
+    }
+
     /// Remove a specific file from download history (per-row user override).
     pub fn remove_download_history(&self, file_hash: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
@@ -28294,6 +28333,31 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The download history names a file by its hash in any case, with its
+    /// size; a row without a name gives nothing.
+    #[test]
+    fn the_download_history_names_files_whatever_the_hash_case() {
+        let path = std::env::temp_dir().join(format!("ember-history-names-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        let (named, unnamed) = ("AB".repeat(16), "cd".repeat(16));
+        db.record_download_history_batch(&[
+            (named.clone(), "Big Buck Bunny.mkv".to_string(), 725_106_140, "completed"),
+            (unnamed.clone(), String::new(), 10, "completed"),
+        ])
+        .unwrap();
+
+        let names = db
+            .download_history_names(&[named.to_ascii_lowercase(), unnamed.to_ascii_uppercase(), "ef".repeat(16)])
+            .unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[&named.to_ascii_lowercase()], ("Big Buck Bunny.mkv".to_string(), 725_106_140));
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     /// Marking every chat read leaves the disappearing messages nobody has

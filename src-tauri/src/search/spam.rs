@@ -6,7 +6,9 @@ use tracing::{debug, info, warn};
 
 use crate::types::SearchResult;
 
-const SPAM_FILEHASH_HIT: u32 = 60;
+/// A hash the user marked is the file they marked, whatever it is called now:
+/// enough on its own on every profile, Relaxed included.
+const SPAM_FILEHASH_HIT: u32 = SEARCH_SPAM_THRESHOLD_RELAXED;
 const SPAM_FULLNAME_HIT: u32 = 40;
 const SPAM_SMALLFULLNAME_HIT: u32 = 10;
 const SPAM_SIMILARNAME_HIT: u32 = 30;
@@ -765,7 +767,7 @@ impl FifoSet {
     }
 
     /// Entries oldest first.
-    fn iter(&self) -> impl Iterator<Item = &String> {
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &String> {
         self.order.iter()
     }
 
@@ -1041,6 +1043,9 @@ pub struct SpamExplanation {
 #[serde(default)]
 pub struct SpamMarkEntry {
     pub hash: String,
+    /// The name as it was marked, for showing; `filename` is the form names
+    /// are compared in. Empty for marks made before it was kept.
+    pub name: String,
     pub filename: String,
     pub similar_name: String,
     pub size: u64,
@@ -1365,6 +1370,8 @@ enum HeldUserChange {
         server_ip: Option<String>,
     },
     MarkNotSpam(String),
+    UnmarkSpam(String),
+    ForgetNotSpam(String),
     UndoMarkSpam(String, PriorSpamVerdict),
     Reset,
 }
@@ -1442,6 +1449,36 @@ pub struct SpamStats {
     pub spam_filenames: usize,
     pub spam_server_ips: usize,
     pub spam_source_ips: usize,
+}
+
+/// One of the learned lists [`SpamStats`] counts, as [`SpamFilter::learned`]
+/// reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LearnedList {
+    /// Files marked spam.
+    Spam,
+    /// Files marked not spam, and finished downloads.
+    NotSpam,
+    /// File names learned from the files marked spam.
+    Names,
+    /// Addresses learned from the sources of the files marked spam.
+    SourceIps,
+}
+
+/// An entry of a learned list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LearnedEntry {
+    /// The file's eD2K hash, for the file lists.
+    pub hash: Option<String>,
+    /// A file's name, a learned name, or an address. Empty for a file whose
+    /// name the filter never kept.
+    pub text: String,
+    /// A marked file's size, when it is known.
+    pub size: Option<u64>,
+    /// A not-spam file that is trusted because it finished downloading, not
+    /// because it was marked.
+    pub downloaded: bool,
 }
 
 // Per-set caps. Enforced identically at write time (`mark_spam`) and on load,
@@ -1558,10 +1595,19 @@ impl SpamFilter {
     fn sanitize_loaded(db: &mut SpamDatabase) {
         // Truncate to per-set caps so a corrupted or hand-edited file can't
         // produce a runtime db larger than `mark_spam` would ever produce.
-        // Hashes first take the form every lookup uses.
-        db.spam_hashes.normalize_entries(normalize_hash);
-        db.not_spam_hashes.normalize_entries(normalize_hash);
-        db.auto_not_spam_hashes.normalize_entries(normalize_hash);
+        // Hashes first take the form every lookup uses. One that is not an
+        // eD2K hash could never match a file, and is dropped.
+        let file_hash = |hash: &str| {
+            let hash = normalize_hash(hash);
+            if hash.len() == 32 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                hash
+            } else {
+                String::new()
+            }
+        };
+        db.spam_hashes.normalize_entries(file_hash);
+        db.not_spam_hashes.normalize_entries(file_hash);
+        db.auto_not_spam_hashes.normalize_entries(file_hash);
         db.spam_hashes.truncate_oldest(MAX_SPAM_HASHES);
         db.not_spam_hashes.truncate_oldest(NOT_SPAM_HASHES_CAP);
         db.auto_not_spam_hashes.truncate_oldest(AUTO_NOT_SPAM_HASHES_CAP);
@@ -1586,8 +1632,26 @@ impl SpamFilter {
                 .map(|n| similar_name_signature(n, &[]))
                 .filter(|n| is_learnable_signature(n)),
         );
+        // Addresses in the form lookups read them in: builds from before an
+        // IPv4-mapped IPv6 address was read as the IPv4 it is kept that form,
+        // which never matched again.
+        let canonical_ip = |ip: &str| extract_ip(ip).unwrap_or_default();
+        db.spam_source_ips.normalize_entries(canonical_ip);
+        db.spam_server_ips.normalize_entries(canonical_ip);
+        db.udp_server_spam_ratios = std::mem::take(&mut db.udp_server_spam_ratios)
+            .into_iter()
+            // A ratio is a share, 0 to 1. Anything else, as a damaged file can
+            // hold, would be written back as `null` and fail the next load.
+            .filter(|(_, ratio)| !ratio.is_nan())
+            .filter_map(|(ip, ratio)| Some((extract_ip(&ip)?, ratio.clamp(0.0, 1.0))))
+            .collect();
         for mark in &mut db.spam_marks {
             mark.hash = normalize_hash(&mark.hash);
+            if mark.name.len() > MAX_NAME_ENTRY_BYTES {
+                mark.name.clear();
+            }
+            mark.source_ips = dedup_in_order(mark.source_ips.iter().filter_map(|ip| extract_ip(ip)));
+            mark.server_ip = mark.server_ip.as_deref().and_then(extract_ip);
             mark.filename = normalize_filename(&mark.filename);
             let signature = similar_name_signature(&mark.similar_name, &[]);
             mark.similar_name = if is_learnable_signature(&signature) {
@@ -1848,6 +1912,8 @@ impl SpamFilter {
                     self.apply_mark_spam(&result, &keywords, server_ip.as_deref());
                 }
                 HeldUserChange::MarkNotSpam(hash) => self.apply_mark_not_spam(&hash),
+                HeldUserChange::UnmarkSpam(hash) => self.apply_unmark_spam(&hash),
+                HeldUserChange::ForgetNotSpam(hash) => self.apply_forget_not_spam(&hash),
                 HeldUserChange::UndoMarkSpam(hash, prior) => {
                     self.apply_undo_mark_spam(&hash, prior)
                 }
@@ -1905,10 +1971,68 @@ impl SpamFilter {
     pub fn stats(&self) -> SpamStats {
         SpamStats {
             spam_hashes: self.db.spam_hashes.len(),
-            not_spam_hashes: self.db.not_spam_hashes.len() + self.db.auto_not_spam_hashes.len(),
+            not_spam_hashes: self.db.not_spam_hashes.len()
+                + self
+                    .db
+                    .auto_not_spam_hashes
+                    .iter()
+                    .filter(|h| !self.db.not_spam_hashes.contains(h))
+                    .count(),
             spam_filenames: self.db.spam_filenames.len(),
             spam_server_ips: self.db.spam_server_ips.len(),
             spam_source_ips: self.db.spam_source_ips.len(),
+        }
+    }
+
+    /// The entries of `list`, newest first; for [`LearnedList::NotSpam`], the
+    /// files marked not spam before the finished downloads. A marked file
+    /// shows the name it was marked under, or for a mark made before names
+    /// were kept, the form names are compared in.
+    pub fn learned(&self, list: LearnedList) -> Vec<LearnedEntry> {
+        let file = |hash: &String, downloaded: bool| LearnedEntry {
+            hash: Some(hash.clone()),
+            text: String::new(),
+            size: None,
+            downloaded,
+        };
+        let text = |text: &String| LearnedEntry {
+            hash: None,
+            text: text.clone(),
+            size: None,
+            downloaded: false,
+        };
+        match list {
+            LearnedList::Spam => {
+                let marks: HashMap<&str, &SpamMarkEntry> =
+                    self.db.spam_marks.iter().map(|m| (m.hash.as_str(), m)).collect();
+                self.db
+                    .spam_hashes
+                    .iter()
+                    .rev()
+                    .map(|hash| match marks.get(hash.as_str()) {
+                        Some(mark) => LearnedEntry {
+                            text: if mark.name.is_empty() { mark.filename.clone() } else { mark.name.clone() },
+                            size: (mark.size > 0).then_some(mark.size),
+                            ..file(hash, false)
+                        },
+                        None => file(hash, false),
+                    })
+                    .collect()
+            }
+            LearnedList::NotSpam => {
+                let marked = self.db.not_spam_hashes.iter().rev().map(|h| file(h, false));
+                // Once each, even from a hand-edited file holding a hash in both.
+                let downloaded = self
+                    .db
+                    .auto_not_spam_hashes
+                    .iter()
+                    .rev()
+                    .filter(|h| !self.db.not_spam_hashes.contains(h))
+                    .map(|h| file(h, true));
+                marked.chain(downloaded).collect()
+            }
+            LearnedList::Names => self.db.spam_filenames.iter().rev().map(text).collect(),
+            LearnedList::SourceIps => self.db.spam_source_ips.iter().rev().map(text).collect(),
         }
     }
 
@@ -2408,9 +2532,7 @@ impl SpamFilter {
             .map(|pos| self.db.spam_marks.remove(pos));
         match (undo, mark) {
             (Some((undo, later)), _) => self.take_back_mark(undo, later),
-            (None, Some(mark)) => {
-                self.db.drop_mark_collateral(&mark);
-            }
+            (None, Some(mark)) => self.drop_mark_learning(&mark),
             (None, None) => {}
         }
         self.rebuild_similar_name_features();
@@ -2486,6 +2608,28 @@ impl SpamFilter {
         self.db.restore_learned(&undo.pushed_out_named, true);
     }
 
+    /// Take back what `mark` taught when it goes other than through its own
+    /// undo record: on Mark not spam, on an undo or Unmark whose record is gone
+    /// (records are kept for this session's last marks only), or when its hash
+    /// is marked again. What it learned that no other mark names goes. What
+    /// another mark still names is handed to that mark's record, so undoing
+    /// that one later takes it back, as it would had this mark never been
+    /// made; the server too, as one that mark listed and gave its ratio.
+    fn drop_mark_learning(&mut self, mark: &SpamMarkEntry) {
+        self.db.drop_mark_collateral(mark);
+        self.hand_over_added(mark);
+        let Some(ip) = mark.server_ip.as_deref() else { return };
+        let db = &self.db;
+        let heir = self.mark_undos.iter_mut().find(|u| {
+            u.server.as_ref().is_some_and(|s| s.ip == ip)
+                && db.spam_marks.iter().any(|m| m.hash == u.hash && m.server_ip.as_deref() == Some(ip))
+        });
+        if let Some(server) = heir.and_then(|u| u.server.as_mut()) {
+            server.listed = true;
+            server.had_ratio = false;
+        }
+    }
+
     /// Record `added`'s entries still learned as added by each kept mark's
     /// record whose mark names them.
     fn hand_over_added(&mut self, added: &SpamMarkEntry) {
@@ -2558,7 +2702,7 @@ impl SpamFilter {
             // learn this row's filename/IPs so a shared name is not dropped.
             if let Some(pos) = self.db.spam_marks.iter().position(|m| m.hash == file_hash) {
                 let old = self.db.spam_marks.remove(pos);
-                self.db.drop_mark_collateral(&old);
+                self.drop_mark_learning(&old);
             }
             undo.marks = self.drop_orphaned_marks();
         }
@@ -2667,6 +2811,7 @@ impl SpamFilter {
         if !file_hash.is_empty() {
             self.db.spam_marks.push(SpamMarkEntry {
                 hash: file_hash,
+                name: name.clone(),
                 filename: name_norm,
                 similar_name: stripped,
                 size: result.file.size,
@@ -2714,12 +2859,78 @@ impl SpamFilter {
         self.db.spam_hashes.remove(&file_hash);
         if let Some(pos) = self.db.spam_marks.iter().position(|m| m.hash == file_hash) {
             let mark = self.db.spam_marks.remove(pos);
-            self.db.drop_mark_collateral(&mark);
+            self.drop_mark_learning(&mark);
             self.rebuild_similar_name_features();
         }
         self.mark_undos.retain(|u| u.hash != file_hash);
         self.mark_dirty();
         info!("Marked as not spam: {file_hash}");
+    }
+
+    /// Take back the spam mark on `file_hash` and what it taught, leaving the
+    /// file judged like any other. Unlike [`Self::undo_mark_spam`], which puts
+    /// the file back where it stood before the mark, whatever that was: spam
+    /// still, for a hash marked twice, or trusted.
+    pub fn unmark_spam(&mut self, file_hash: &str) {
+        if normalize_hash(file_hash).is_empty() {
+            return;
+        }
+        self.begin_user_change();
+        if self.persist_blocked {
+            self.hold(HeldUserChange::UnmarkSpam(file_hash.to_string()));
+        }
+        self.apply_unmark_spam(file_hash);
+    }
+
+    fn apply_unmark_spam(&mut self, file_hash: &str) {
+        let file_hash = normalize_hash(file_hash);
+        let undo = self
+            .mark_undos
+            .iter()
+            .position(|u| u.hash == file_hash)
+            .and_then(|pos| Some((self.mark_undos.remove(pos)?, pos)));
+        let was_spam = self.db.spam_hashes.remove(&file_hash);
+        let mark = self
+            .db
+            .spam_marks
+            .iter()
+            .position(|m| m.hash == file_hash)
+            .map(|pos| self.db.spam_marks.remove(pos));
+        if !was_spam && mark.is_none() && undo.is_none() {
+            return;
+        }
+        match (undo, mark) {
+            (Some((undo, later)), _) => self.take_back_mark(undo, later),
+            (None, Some(mark)) => self.drop_mark_learning(&mark),
+            (None, None) => {}
+        }
+        self.rebuild_similar_name_features();
+        self.mark_dirty();
+        info!("Unmarked as spam: {file_hash}");
+    }
+
+    /// Stop trusting `file_hash`, whether it was marked not spam or finished
+    /// downloading, so it is judged like any other file. A file in the
+    /// Library is never flagged either way.
+    pub fn forget_not_spam(&mut self, file_hash: &str) {
+        if normalize_hash(file_hash).is_empty() {
+            return;
+        }
+        self.begin_user_change();
+        if self.persist_blocked {
+            self.hold(HeldUserChange::ForgetNotSpam(file_hash.to_string()));
+        }
+        self.apply_forget_not_spam(file_hash);
+    }
+
+    fn apply_forget_not_spam(&mut self, file_hash: &str) {
+        let file_hash = normalize_hash(file_hash);
+        let marked = self.db.not_spam_hashes.remove(&file_hash);
+        let downloaded = self.db.auto_not_spam_hashes.remove(&file_hash);
+        if marked || downloaded {
+            self.mark_dirty();
+            info!("No longer trusted as not spam: {file_hash}");
+        }
     }
 
     /// Reverse collateral for marks whose hash left `spam_hashes` (FIFO cap),
@@ -2928,10 +3139,13 @@ fn normalized_from_canonical(canonical: &str) -> String {
 }
 
 /// Whether a signature is specific enough to learn: within the comparable
-/// length range and carrying at least one distinctive token.
+/// length range and carrying at least two distinctive tokens. One alone, once
+/// the search's words and release metadata are gone, is mostly a release
+/// group's tag, which every release from that group carries.
 fn is_learnable_signature(signature: &str) -> bool {
     let len = signature.chars().count();
-    (MIN_SIMILAR_NAME_LEN..=MAX_LEVENSHTEIN_LEN).contains(&len) && has_distinctive_token(signature)
+    (MIN_SIMILAR_NAME_LEN..=MAX_LEVENSHTEIN_LEN).contains(&len)
+        && name_tokens(signature).filter(|t| is_distinctive_token(t)).take(2).count() == 2
 }
 
 /// A token (already canonical) that identifies nothing on its own: release
@@ -5564,6 +5778,234 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Each learned list reads newest first. A marked file shows the name it
+    /// was marked under; one marked before names were kept shows the form
+    /// names are compared in, and a hash with no mark at all shows no name.
+    /// Files marked not spam come before finished downloads.
+    #[test]
+    fn learned_lists_read_newest_first_with_the_names_marked_under() {
+        let dir = temp_dir("learned-lists");
+        let mut filter = SpamFilter::load(&dir);
+        let (bare, old, new) = ("a1".repeat(16), "b2".repeat(16), "c3".repeat(16));
+        filter.db.spam_hashes.insert(bare.clone(), MAX_SPAM_HASHES);
+        filter.mark_spam(&sized_result(&old, "Old.Fake.Movie.mkv", 700, &["8.8.8.8:4662"]), &[], None);
+        filter.mark_spam(&sized_result(&new, "New Fake Album.zip", 900, &["1.1.1.1:4662"]), &[], None);
+
+        let spam = filter.learned(LearnedList::Spam);
+        let shown: Vec<(&str, Option<u64>)> = spam.iter().map(|e| (e.text.as_str(), e.size)).collect();
+        assert_eq!(shown, [("New Fake Album.zip", Some(900)), ("Old.Fake.Movie.mkv", Some(700)), ("", None)]);
+        assert_eq!(spam[0].hash.as_deref(), Some(new.as_str()));
+
+        filter.db.spam_marks.iter_mut().for_each(|m| m.name.clear());
+        assert_eq!(filter.learned(LearnedList::Spam)[0].text, normalize_filename("New Fake Album.zip"));
+
+        let names: Vec<String> = filter.learned(LearnedList::Names).into_iter().map(|e| e.text).collect();
+        assert_eq!(names, [normalize_filename("New Fake Album.zip"), normalize_filename("Old.Fake.Movie.mkv")]);
+        let ips: Vec<String> = filter.learned(LearnedList::SourceIps).into_iter().map(|e| e.text).collect();
+        assert_eq!(ips, ["1.1.1.1", "8.8.8.8"]);
+
+        let (kept, finished) = ("d4".repeat(16), "e5".repeat(16));
+        filter.auto_mark_not_spam(&finished);
+        filter.mark_not_spam(&kept);
+        let not_spam: Vec<(String, bool)> = filter
+            .learned(LearnedList::NotSpam)
+            .into_iter()
+            .map(|e| (e.hash.unwrap_or_default(), e.downloaded))
+            .collect();
+        assert_eq!(not_spam, [(kept, false), (finished, true)]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A file no longer trusted is judged like any other, whether it was
+    /// marked not spam or finished downloading, and the hash's case does not
+    /// matter.
+    #[test]
+    fn a_file_no_longer_trusted_is_judged_like_any_other() {
+        let dir = temp_dir("forget-not-spam");
+        let mut filter = SpamFilter::load(&dir);
+        let (kept, finished) = ("a7".repeat(16), "b8".repeat(16));
+        filter.mark_not_spam(&kept);
+        filter.auto_mark_not_spam(&finished);
+        let row = sample_result(&kept, "anything.bin");
+        assert_eq!(codes(&explain(&filter, &row, &[])), vec!["not_spam_marked"]);
+
+        filter.forget_not_spam(&kept);
+        filter.forget_not_spam(&finished.to_ascii_uppercase());
+        assert!(filter.learned(LearnedList::NotSpam).is_empty());
+        assert_eq!(filter.stats().not_spam_hashes, 0);
+        assert!(!codes(&explain(&filter, &row, &[])).contains(&"not_spam_marked"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two marks taught the same name, size, source and server, the first in
+    /// an earlier session, so its undo record is gone. Whichever goes first,
+    /// by Unmark or by Mark not spam, once both have gone nothing they taught
+    /// is left to flag other files.
+    #[test]
+    fn what_two_marks_shared_goes_with_the_second_of_them() {
+        let name = "Great Movie 2024 Extended Cut.avi";
+        let server = "93.184.216.34";
+        let row = |hash: &str| {
+            let mut r = sized_result(hash, name, 7 * 1024 * 1024, &["9.9.9.9:4662"]);
+            r.result_origin = crate::search::merge::ORIGIN_SERVER_UDP.to_string();
+            r.origin_server_ip = Some(server.to_string());
+            r
+        };
+        for older_first in [true, false] {
+            for by_not_spam in [false, true] {
+                let dir = temp_dir("shared-learning");
+                let (older, newer) = ("a1".repeat(16), "b2".repeat(16));
+                {
+                    let mut filter = SpamFilter::load(&dir);
+                    filter.mark_spam(&row(&older), &[], None);
+                    filter.save();
+                }
+                let mut filter = SpamFilter::load(&dir);
+                filter.mark_spam(&row(&newer), &[], None);
+                assert!(filter.db.spam_server_ips.contains(server));
+                let order = if older_first { [&older, &newer] } else { [&newer, &older] };
+                for hash in order {
+                    if by_not_spam {
+                        filter.mark_not_spam(hash);
+                    } else {
+                        filter.unmark_spam(hash);
+                    }
+                }
+                let case = format!("older first: {older_first}, by Mark not spam: {by_not_spam}");
+                assert!(filter.db.spam_marks.is_empty(), "{case}");
+                assert!(filter.db.spam_filenames.is_empty(), "{case}");
+                assert!(filter.db.spam_similar_names.is_empty(), "{case}");
+                assert!(filter.db.spam_sizes.is_empty(), "{case}");
+                assert_eq!(filter.db.spam_source_ips.len(), 0, "{case}");
+                assert!(!filter.db.spam_server_ips.contains(server), "{case}");
+                assert!(!filter.db.udp_server_spam_ratios.contains_key(server), "{case}");
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// Unmark takes the mark back whatever came before it: a hash marked
+    /// twice is unmarked, where its undo keeps the mark, and a file marked
+    /// not spam before is not trusted again.
+    #[test]
+    fn unmarking_takes_the_mark_back_whatever_came_before() {
+        let dir = temp_dir("unmark");
+        let mut filter = SpamFilter::load(&dir);
+        let (twice, trusted) = ("c1".repeat(16), "d2".repeat(16));
+        filter.mark_spam(&sample_result(&twice, "Fake One Movie.zip"), &[], None);
+        filter.mark_spam(&sample_result(&twice, "Fake Two Movie.zip"), &[], None);
+        filter.mark_not_spam(&trusted);
+        filter.mark_spam(&sample_result(&trusted, "Was Trusted File.zip"), &[], None);
+
+        filter.unmark_spam(&twice);
+        filter.unmark_spam(&trusted.to_ascii_uppercase());
+        assert!(filter.learned(LearnedList::Spam).is_empty());
+        assert!(filter.learned(LearnedList::NotSpam).is_empty(), "not trusted again");
+        assert!(filter.db.spam_marks.is_empty());
+        assert!(filter.db.spam_filenames.is_empty());
+        assert!(filter.db.spam_sizes.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A file the user marked is spam under any name, on every profile.
+    #[test]
+    fn a_marked_hash_is_spam_under_any_name_on_every_profile() {
+        let dir = temp_dir("marked-hash-profiles");
+        let mut filter = SpamFilter::load(&dir);
+        let hash = "e3".repeat(16);
+        filter.mark_spam(&sample_result(&hash, "Fake A.avi"), &[], None);
+        let renamed = sample_result(&hash, "Totally Different Name.avi");
+        for profile in [SpamFilterProfile::Relaxed, SpamFilterProfile::Balanced, SpamFilterProfile::Aggressive] {
+            let verdict = filter.explain_result(
+                &renamed,
+                &[],
+                None,
+                profile,
+                CommunityRating::default(),
+                &BatchSpamContext::default(),
+            );
+            assert!(verdict.is_spam, "{profile:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A name pattern of one word, left once the search's words and release
+    /// metadata are gone, is mostly a release group's tag: not learned. Two
+    /// distinctive words are.
+    #[test]
+    fn a_one_word_name_pattern_is_not_learned() {
+        let dir = temp_dir("one-word-pattern");
+        let mut filter = SpamFilter::load(&dir);
+        let keywords = vec!["inception".to_string()];
+        filter.mark_spam(
+            &sample_result(&"f4".repeat(16), "Inception.2010.1080p.BluRay.x264-SPARKS.mkv"),
+            &keywords,
+            None,
+        );
+        assert!(filter.db.spam_similar_names.is_empty());
+        filter.mark_spam(
+            &sample_result(&"f5".repeat(16), "Inception.2010.Free.Download.Crack.Keygen.mkv"),
+            &keywords,
+            None,
+        );
+        assert_eq!(filter.db.spam_similar_names.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A file from an older build or a damaged one loads in the form lookups
+    /// use: an IPv4-mapped address as the IPv4 it is, everywhere, and a
+    /// server ratio out of range brought back within it, so the next save
+    /// writes a file the next load can read. A hash that is not an eD2K hash
+    /// is dropped.
+    #[test]
+    fn learned_addresses_and_ratios_load_in_the_form_lookups_use() {
+        let dir = temp_dir("load-addresses");
+        let hash = "a9".repeat(16);
+        let long = "c".repeat(4096);
+        std::fs::write(
+            dir.join("search_spam.json"),
+            format!(
+                r#"{{
+                    "spam_hashes": ["{hash}", "not\"a hash", "{long}"],
+                    "not_spam_hashes": ["{upper}", "zz"],
+                    "spam_source_ips": ["::ffff:9.9.9.9"],
+                    "spam_server_ips": ["::ffff:93.184.216.34"],
+                    "udp_server_spam_ratios": {{"::ffff:93.184.216.34": 1e39, "8.8.8.8": 0.5}},
+                    "spam_marks": [{{"hash": "{hash}", "source_ips": ["::ffff:9.9.9.9"], "server_ip": "::ffff:93.184.216.34"}}]
+                }}"#,
+                upper = "D1".repeat(16),
+            ),
+        )
+        .unwrap();
+        let mut filter = SpamFilter::load(&dir);
+        assert_eq!(filter.db.spam_hashes.iter().collect::<Vec<_>>(), [&hash]);
+        assert_eq!(filter.db.not_spam_hashes.iter().collect::<Vec<_>>(), [&"d1".repeat(16)]);
+        assert!(filter.db.spam_source_ips.contains("9.9.9.9"));
+        assert!(filter.db.spam_server_ips.contains("93.184.216.34"));
+        assert_eq!(filter.db.udp_server_spam_ratios.get("93.184.216.34"), Some(&1.0));
+        assert_eq!(filter.db.spam_marks[0].source_ips, ["9.9.9.9"]);
+        assert_eq!(filter.db.spam_marks[0].server_ip.as_deref(), Some("93.184.216.34"));
+
+        filter.mark_not_spam(&"b0".repeat(16));
+        filter.save();
+        let reloaded = SpamFilter::load(&dir);
+        assert_eq!(reloaded.db.spam_hashes.len(), 1, "the saved file loads");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A mark keeps the name it was made under through a save and a load.
+    #[test]
+    fn a_marks_name_survives_a_save_and_a_load() {
+        let dir = temp_dir("mark-name");
+        let mut filter = SpamFilter::load(&dir);
+        let hash = "f6".repeat(16);
+        filter.mark_spam(&sample_result(&hash, "Kept Name.zip"), &[], None);
+        filter.save();
+        let reloaded = SpamFilter::load(&dir);
+        assert_eq!(reloaded.learned(LearnedList::Spam)[0].text, "Kept Name.zip");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Past the caps, a mark pushes out the oldest learned name and the oldest
     /// marked hash with its mark; undoing it puts them back where they were.
     #[test]
@@ -5807,9 +6249,9 @@ mod tests {
     fn the_stronger_of_exact_and_similar_name_is_the_name_signal() {
         let dir = temp_dir("exact-vs-similar");
         let mut filter = SpamFilter::load(&dir);
-        filter.mark_spam(&sample_result(&"a7".repeat(16), "Sample Video.avi"), &[], None);
-        filter.mark_spam(&sample_result(&"b8".repeat(16), "Sample Videos.mkv"), &[], None);
-        let mut probe = sample_result(&"c9".repeat(16), "Sample Video.avi");
+        filter.mark_spam(&sample_result(&"a7".repeat(16), "Sample Video Final.avi"), &[], None);
+        filter.mark_spam(&sample_result(&"b8".repeat(16), "Sampler Videos Final.mkv"), &[], None);
+        let mut probe = sample_result(&"c9".repeat(16), "Sample Video Final.avi");
         probe.file.size = 0;
         let verdict = explain(&filter, &probe, &[]);
         assert_eq!(codes(&verdict), vec!["similar_name"]);
