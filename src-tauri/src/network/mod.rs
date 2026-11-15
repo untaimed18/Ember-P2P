@@ -70,7 +70,6 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use futures::FutureExt;
 use tauri::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
@@ -386,6 +385,31 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
         }
     }
+    // Nor before the network interface Settings keep Ember on is there
+    // (`net_bind`): a VPN that connects after Ember starts brings it online
+    // then, and until it does nothing goes out by another way. Looked at here
+    // as well as by the watch in `lib.rs`, so going online waits on nothing
+    // else.
+    if crate::net_bind::binding() == crate::net_bind::Binding::Unavailable {
+        info!("Waiting for the chosen network interface before going online");
+    }
+    while crate::net_bind::binding() == crate::net_bind::Binding::Unavailable {
+        tokio::select! {
+            command = cmd_rx.recv() => {
+                match command {
+                    Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
+                    Some(NetworkCommand::StartupLibraryIndexed) => library_indexed_during_gate = true,
+                    Some(_) => {
+                        debug!("Dropping network command while the chosen network interface is not connected");
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                let _ = tokio::task::spawn_blocking(crate::net_bind::refresh).await;
+            }
+        }
+    }
+    crate::net_bind::hold_address();
     // Taken after the policy wait, which drops commands: a line sent during it
     // never reaches the retry queue and belongs to the startup sweep.
     let channel_sweep_cutoff = chrono::Utc::now().timestamp();
@@ -448,8 +472,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let _ = sock2.set_recv_buffer_size(8 * 1024 * 1024);
         let _ = sock2.set_send_buffer_size(2 * 1024 * 1024);
         sock2.set_nonblocking(true)?;
-        let addr: SocketAddr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), candidate);
-        if let Err(e) = sock2.bind(&socket2::SockAddr::from(addr)) {
+        if let Err(e) = crate::net_bind::bind_socket(&sock2, candidate) {
             last_bind_err = format!("port {candidate}: {e}");
             if candidate == udp_port {
                 warn!("UDP port {candidate} in use, trying fallback ports");
@@ -622,7 +645,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     // Read once: gates the maintenance retries, the QUIC port mapping and the
     // shutdown teardown for the whole session, so a change applies at restart.
-    let upnp_enabled = settings.upnp_enabled;
+    // Off while Ember is kept on one interface: UPnP would ask the home router
+    // to open ports for traffic that leaves by the VPN instead.
+    let upnp_enabled = settings.upnp_enabled && !crate::net_bind::is_configured();
 
     // Defer UPnP gateway discovery/mapping and heavy disk loads until after
     // the event loop is running so splash IPC / GetNetworkStats are not
@@ -851,7 +876,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             bound_udp_port: udp_port,
             session_tcp_port: tcp_port,
             session_udp_port: settings.udp_port,
-            session_upnp_enabled: upnp_enabled,
+            session_upnp_enabled: settings.upnp_enabled,
+            interface_bound: crate::net_bind::is_configured(),
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),
@@ -1863,8 +1889,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // returned `Err` from `start_network` and surfaced a fatal network error
     // while the TCP listener stayed bound and accepting, with no event loop
     // left to coordinate it.
-    let mut server_udp =
-        ServerUdpSocket::from_socket(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+    let mut server_udp = ServerUdpSocket::from_socket(crate::net_bind::udp(0).await?);
 
     // Defer auto-connect until the event loop is running (and, when needed,
     // until server.met bootstrap finishes). Starting the TCP login before the

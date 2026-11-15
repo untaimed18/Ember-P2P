@@ -17,6 +17,7 @@
   import { startUserActivityReporting } from '$lib/userActivity';
   import { startClipboardWatch } from '$lib/clipboardWatch';
   import { startIpFilterWatch } from '$lib/ipFilterWatch';
+  import { startNetworkBindWatch } from '$lib/networkBindWatch';
   import { notify } from '$lib/notifications';
   import { formatBytes } from '$lib/utils';
 
@@ -369,6 +370,7 @@
     let unlistenDiskSpace: UnlistenFn | null = null;
     const stopClipboardWatch = startClipboardWatch();
     const stopIpFilterWatch = startIpFilterWatch();
+    const stopNetworkBindWatch = startNetworkBindWatch();
     let stopChatPopout: (() => void) | null = null;
 
     void initChatPopoutMain().then((stop) => {
@@ -914,6 +916,7 @@
       if (unlistenDiskSpace) unlistenDiskSpace();
       stopClipboardWatch();
       stopIpFilterWatch();
+      stopNetworkBindWatch();
       stopChatPopout?.();
     };
   });

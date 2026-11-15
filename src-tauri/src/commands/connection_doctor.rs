@@ -126,6 +126,9 @@ pub struct Signals {
     pub upnp_enabled: bool,
     pub upnp_mapped: bool,
     pub upnp_stood_down: bool,
+    /// Every connection is kept on one chosen network interface, so UPnP
+    /// does not run and the router cannot be asked to forward.
+    pub bound_interface: bool,
     /// Internet traffic leaves through a VPN's adapter, which the router's
     /// UPnP cannot open ports on; the VPN's own port forwarding is what can.
     pub behind_vpn: bool,
@@ -249,7 +252,9 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
         None if s.firewall_check_failed => check("windows_firewall", Skip, "check_failed"),
         None => check("windows_firewall", Skip, "not_windows"),
     }
-    if !s.upnp_enabled {
+    if s.bound_interface {
+        check("upnp", Skip, "bound_interface");
+    } else if !s.upnp_enabled {
         check("upnp", Skip, "off");
     } else if s.upnp_stood_down {
         check("upnp", Warn, "stood_down");
@@ -359,7 +364,9 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     } else if unreachable && settled && !s.restart_pending {
         // A forward the router did make still counts behind a VPN: a client
         // that tunnels only some programs can leave Ember outside it.
-        if s.upnp_stood_down || (s.behind_vpn && !s.upnp_mapped) {
+        if s.bound_interface {
+            fixes.push(Fix { id: "bound_interface", action: None });
+        } else if s.upnp_stood_down || (s.behind_vpn && !s.upnp_mapped) {
             fixes.push(Fix { id: "vpn", action: None });
         } else if !s.upnp_enabled {
             fixes.push(Fix { id: "enable_upnp", action: Some("enable_upnp") });
@@ -408,7 +415,7 @@ fn behind_another_nat(wan: Ipv4Addr) -> bool {
 /// This computer's address on the local network: the source address the OS
 /// would use to reach the internet. Nothing is sent.
 fn lan_ip() -> String {
-    std::net::UdpSocket::bind("0.0.0.0:0")
+    crate::net_bind::std_udp(0)
         .and_then(|socket| {
             socket.connect("192.0.2.1:9")?;
             socket.local_addr()
@@ -511,6 +518,7 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         upnp_enabled,
         upnp_mapped: stats.upnp_mapped,
         upnp_stood_down: stats.upnp_stood_down,
+        bound_interface: stats.interface_bound,
         behind_vpn: crate::vpn::default_route_is_vpn().unwrap_or(false),
         router_behind_nat: wan.is_some_and(behind_another_nat),
         router_wan_known: wan.is_some(),
@@ -823,6 +831,26 @@ mod tests {
         assert_eq!(fix_ids(&cgnat), vec!["carrier_nat"]);
         let vpn = Signals { upnp_stood_down: true, ..closed };
         assert_eq!(fix_ids(&vpn), vec!["vpn"]);
+    }
+
+    /// On a chosen interface UPnP never runs, whatever Settings says, so
+    /// neither turning it on nor asking the router again is offered.
+    #[test]
+    fn on_a_chosen_interface_upnp_is_not_offered() {
+        let closed = Signals {
+            kad_tcp: Some(false),
+            low_id: Some(true),
+            probe_tcp: Some(TcpProbe::Timeout),
+            upnp_mapped: false,
+            bound_interface: true,
+            ..reachable()
+        };
+        let (_, checks, _, _) = assess(&closed);
+        let upnp = checks.iter().find(|c| c.id == "upnp").expect("a UPnP line");
+        assert_eq!((upnp.status, upnp.detail), (CheckStatus::Skip, "bound_interface"));
+        assert_eq!(fix_ids(&closed), vec!["bound_interface"]);
+        let upnp_off = Signals { upnp_enabled: false, ..closed };
+        assert_eq!(fix_ids(&upnp_off), vec!["bound_interface"]);
     }
 
     /// A LowID the outside test contradicts is from before the port opened:

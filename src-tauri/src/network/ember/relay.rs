@@ -3405,7 +3405,7 @@ pub async fn connect_server_relay(
     let tcp_stream = tokio::time::timeout(RELAY_CONTROL_TIMEOUT, async {
         let mut last_error = None;
         for addr in &addrs {
-            match tokio::net::TcpStream::connect(addr).await {
+            match crate::net_bind::tcp_connect(*addr).await {
                 Ok(stream) => return Ok(stream),
                 Err(e) => last_error = Some(e),
             }

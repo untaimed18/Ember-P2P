@@ -47,11 +47,12 @@ pub struct PendingFolderDrop {
 
 /// The settings the network stack reads once, as this process started with
 /// them. A saved value that differs from one of these waits for a restart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct LaunchSettings {
     pub tcp_port: u16,
     pub udp_port: u16,
     pub upnp_enabled: bool,
+    pub bind_interface: String,
 }
 
 impl LaunchSettings {
@@ -60,6 +61,7 @@ impl LaunchSettings {
             tcp_port: settings.tcp_port,
             udp_port: settings.udp_port,
             upnp_enabled: settings.upnp_enabled,
+            bind_interface: settings.bind_interface.clone(),
         }
     }
 }

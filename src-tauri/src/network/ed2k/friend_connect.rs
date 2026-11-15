@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -77,7 +76,7 @@ pub async fn open_and_run_friend_session(
     ed25519_pubkey: Option<[u8; 32]>,
     ed25519_secret_key: Option<[u8; 32]>,
 ) -> anyhow::Result<FriendSessionHandle> {
-    let stream = tokio::time::timeout(std::time::Duration::from_secs(15), TcpStream::connect(addr))
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(15), crate::net_bind::tcp_connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
     super::multi_source::tune_peer_stream(&stream);
@@ -217,7 +216,7 @@ async fn send_friend_request_verdict(
     let our_sk =
         ed25519_secret_key.ok_or_else(|| anyhow::anyhow!(secure_stream::UPGRADE_REQUIRED_ERROR))?;
 
-    let stream = tokio::time::timeout(RETRACTION_DIAL_TIMEOUT, TcpStream::connect(addr))
+    let stream = tokio::time::timeout(RETRACTION_DIAL_TIMEOUT, crate::net_bind::tcp_connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
     super::multi_source::tune_peer_stream(&stream);

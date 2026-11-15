@@ -860,7 +860,7 @@ pub async fn validate_fetch_url_with(
         const DNS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         let addrs = tokio::time::timeout(
             DNS_LOOKUP_TIMEOUT,
-            tokio::net::lookup_host((host.as_str(), url_port)),
+            crate::net_bind::lookup_host((host.as_str(), url_port)),
         )
         .await
         .map_err(|_| "DNS lookup timed out".to_string())?
@@ -897,7 +897,8 @@ pub fn build_pinned_client(
     host: &str,
     addrs: &[std::net::SocketAddr],
 ) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::net_bind::http_client()
+        .map_err(|e| e.to_string())?
         // Keep these guarantees on the client itself, not just in
         // `validate_fetch_url`: callers can reuse this client for more than
         // the originally validated request, and reqwest otherwise accepts
@@ -940,7 +941,8 @@ pub fn build_pinned_web_source_client(
     user_agent: &str,
     idle: std::time::Duration,
 ) -> Result<reqwest::Client, String> {
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::net_bind::http_client()
+        .map_err(|e| e.to_string())?
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(15))

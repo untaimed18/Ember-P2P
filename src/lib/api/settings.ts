@@ -17,6 +17,7 @@ export interface LaunchSettings {
   tcp_port: number;
   udp_port: number;
   upnp_enabled: boolean;
+  bind_interface: string;
 }
 
 export async function getLaunchSettings(): Promise<LaunchSettings> {

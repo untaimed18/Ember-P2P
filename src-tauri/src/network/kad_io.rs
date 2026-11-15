@@ -932,7 +932,7 @@ pub(super) async fn send_udp_firewall_probe_request(
     obfuscation_enabled: bool,
 ) -> anyhow::Result<()> {
     let addr = SocketAddr::new(contact.ip.into(), contact.tcp_port);
-    let stream = tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr))
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(10), crate::net_bind::tcp_connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("TCP connect timeout to {addr}"))??;
     let (reader, writer) = stream.into_split();

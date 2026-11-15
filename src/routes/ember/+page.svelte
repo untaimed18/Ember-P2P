@@ -445,10 +445,12 @@
   // What a relayed user can do about it. Forwarding on the router does nothing
   // while traffic leaves through a VPN (the backend has stood UPnP down for
   // exactly that), and is no advice at all once UPnP has already forwarded
-  // the ports, so those cases point elsewhere.
+  // the ports, so those cases point elsewhere. On a chosen interface UPnP
+  // does not run at all, so turning it on is no advice either.
   let relayedFix = $derived.by(() => {
     if (reachability !== 'relayed' || !$appSettings) return '';
     const ports = { tcp: $appSettings.tcp_port, udp: $appSettings.udp_port };
+    if ($networkStats.interface_bound) return m.ember_health_relayed_fix_interface(ports);
     if (!$appSettings.upnp_enabled) return m.ember_health_relayed_fix_upnp_off(ports);
     if ($networkStats.upnp_stood_down) return m.ember_health_relayed_fix_vpn(ports);
     if ($networkStats.upnp_mapped) return m.ember_health_relayed_fix_forwarded();

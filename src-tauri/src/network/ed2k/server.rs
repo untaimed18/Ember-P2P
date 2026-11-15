@@ -4,7 +4,6 @@ use std::sync::{Arc, OnceLock};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -387,7 +386,7 @@ pub struct Ed2kServerConnection {
 impl Ed2kServerConnection {
     pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
         let stream =
-            tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr))
+            tokio::time::timeout(std::time::Duration::from_secs(10), crate::net_bind::tcp_connect(addr))
                 .await??;
         let _ = stream.set_nodelay(true);
 
@@ -1679,6 +1678,7 @@ pub(super) fn server_name_from_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;

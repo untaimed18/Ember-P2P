@@ -1744,7 +1744,7 @@ async fn resolve_kad_host(input: &str, port: u16) -> Result<String, String> {
         }
         return Ok(input.to_string());
     }
-    let addr = tokio::net::lookup_host((input, port))
+    let addr = crate::net_bind::lookup_host((input, port))
         .await
         .map_err(|_| {
             coded(

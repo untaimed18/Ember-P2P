@@ -811,7 +811,22 @@ pub async fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettin
 
 #[tauri::command]
 pub fn get_launch_settings(state: tauri::State<'_, AppState>) -> LaunchSettings {
-    state.launch_settings
+    state.launch_settings.clone()
+}
+
+/// This computer's network interfaces, for the one Settings keeps Ember on.
+#[tauri::command]
+pub async fn list_network_interfaces() -> Vec<crate::net_bind::NetworkInterface> {
+    tauri::async_runtime::spawn_blocking(crate::net_bind::list)
+        .await
+        .unwrap_or_default()
+}
+
+/// Whether the interface Ember is kept on is there, for the main window's
+/// notice.
+#[tauri::command]
+pub fn get_network_binding() -> crate::net_bind::BindingStatus {
+    crate::net_bind::status()
 }
 
 /// Upper bounds for IPC inputs. These exist to prevent a malicious/buggy
@@ -1351,6 +1366,17 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
             "settings_rendezvous_url_too_long",
             format!("Rendezvous URL exceeds {MAX_URL_LEN} bytes"),
             MAX_URL_LEN,
+        ));
+    }
+    // Both come from `list_network_interfaces`, which reports nothing longer
+    // or stranger than this.
+    if [&settings.bind_interface, &settings.bind_interface_name]
+        .iter()
+        .any(|text| text.len() > 256 || text.chars().any(char::is_control))
+    {
+        return Err(coded(
+            "settings_bind_interface_invalid",
+            "The network interface setting is not valid",
         ));
     }
     if settings.nodes_dat_path.len() > MAX_PATH_LEN {
@@ -3458,7 +3484,7 @@ async fn reject_non_public_external_host(validated: &str) -> Result<(), String> 
             // so the deadline actually releases the task.
             let addrs = tokio::time::timeout(
                 EXTERNAL_URL_DNS_TIMEOUT,
-                tokio::net::lookup_host((lowered.as_str(), port)),
+                crate::net_bind::lookup_host((lowered.as_str(), port)),
             )
             .await
             .map_err(|_| invalid())?

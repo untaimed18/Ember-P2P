@@ -123,7 +123,7 @@ pub(super) async fn try_connect_server(
     };
     if !force_plain {
         if let Some(enc_port) = enc_port {
-            let enc_addr = tokio::net::lookup_host((ip, enc_port))
+            let enc_addr = crate::net_bind::lookup_host((ip, enc_port))
                 .await?
                 .find(|addr| addr.is_ipv4())
                 .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for {ip}:{enc_port}"))?;
@@ -152,7 +152,7 @@ pub(super) async fn try_connect_server(
     } else {
         info!("Skipping encryption (force_plain) for server {ip}:{port}");
     }
-    let addr = tokio::net::lookup_host((ip, port))
+    let addr = crate::net_bind::lookup_host((ip, port))
         .await?
         .find(|addr| addr.is_ipv4())
         .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for {ip}:{port}"))?;
@@ -673,7 +673,7 @@ pub(super) async fn initiate_server_connect(
                         &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
                     );
                     drop(conn);
-                    let plain_addr = tokio::net::lookup_host((ip_clone.as_str(), port))
+                    let plain_addr = crate::net_bind::lookup_host((ip_clone.as_str(), port))
                         .await
                         .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
                         .find(|addr| addr.is_ipv4())
@@ -724,7 +724,7 @@ pub(super) async fn resolve_moved_server(dyn_host: &str, ip: &str, port: u16) ->
     if dyn_host.is_empty() {
         return None;
     }
-    let addrs: Vec<IpAddr> = tokio::time::timeout(DYN_HOST_LOOKUP_TIMEOUT, tokio::net::lookup_host((dyn_host, port)))
+    let addrs: Vec<IpAddr> = tokio::time::timeout(DYN_HOST_LOOKUP_TIMEOUT, crate::net_bind::lookup_host((dyn_host, port)))
         .await
         .ok()?
         .ok()?

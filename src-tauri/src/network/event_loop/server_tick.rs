@@ -1301,7 +1301,7 @@ pub(in crate::network) async fn on_server_tick(
                                 &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
                             );
                             drop(conn);
-                            let plain_addr = tokio::net::lookup_host((ip.as_str(), port))
+                            let plain_addr = crate::net_bind::lookup_host((ip.as_str(), port))
                                 .await
                                 .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
                                 .find(|addr| addr.is_ipv4())

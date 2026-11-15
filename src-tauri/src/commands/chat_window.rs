@@ -176,8 +176,8 @@ pub async fn close_chat_window(app: tauri::AppHandle) -> Result<(), String> {
 /// Commands the chat window may not call. The capability files scope plugin
 /// permissions only; every app command is callable from every window unless
 /// refused here. These change what is shared or filtered, read what the spam
-/// filter learned, delete, open or run files, restore backups, install
-/// updates or act on the whole machine, and
+/// filter learned or this computer's network interfaces, delete, open or run
+/// files, restore backups, install updates or act on the whole machine, and
 /// none of them is reachable from the chat window's code
 /// (`scripts/chat-window-commands.test.mjs` holds that), so refusing them costs
 /// the chat nothing and keeps a compromised chat webview from them.
@@ -204,8 +204,10 @@ pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "follow_feed",
     "forget_not_spam",
     "get_learned_spam",
+    "get_network_binding",
     "import_backup",
     "kad_bootstrap_url",
+    "list_network_interfaces",
     "mark_not_spam",
     "mark_spam",
     "move_files_to_category",

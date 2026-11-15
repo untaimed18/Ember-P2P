@@ -6613,7 +6613,6 @@ async fn download_parts_from_source(
     conn_budget: &SourceConnBudget,
 ) -> anyhow::Result<SessionEnd> {
     use super::messages::*;
-    use tokio::net::TcpStream;
 
     let addr: SocketAddr = format!("{}:{}", source.peer_ip, source.peer_port).parse()?;
     let src_ip = addr.ip().to_string();
@@ -7054,7 +7053,7 @@ async fn download_parts_from_source(
         let (conn_is_obf, r0, w0, hello_ans_data) = loop {
             let stream = match tokio::time::timeout(
                 std::time::Duration::from_secs(PEER_CONNECT_TIMEOUT_SECS),
-                TcpStream::connect(addr),
+                crate::net_bind::tcp_connect(addr),
             )
             .await
             {
@@ -7123,7 +7122,7 @@ async fn download_parts_from_source(
                         attempt = attempt.saturating_add(1);
                         let plain_stream = match tokio::time::timeout(
                             std::time::Duration::from_secs(PEER_CONNECT_TIMEOUT_SECS),
-                            TcpStream::connect(addr),
+                            crate::net_bind::tcp_connect(addr),
                         )
                         .await
                         {

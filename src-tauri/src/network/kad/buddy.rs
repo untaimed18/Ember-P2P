@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info};
 
@@ -396,7 +395,7 @@ impl BuddyManager {
 
         let stream = match tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            TcpStream::connect(addr),
+            crate::net_bind::tcp_connect(addr),
         )
         .await
         {
@@ -452,7 +451,7 @@ impl BuddyManager {
                     drop(raw_writer);
                     let plain_stream = match tokio::time::timeout(
                         std::time::Duration::from_secs(30),
-                        tokio::net::TcpStream::connect(addr),
+                        crate::net_bind::tcp_connect(addr),
                     )
                     .await
                     {

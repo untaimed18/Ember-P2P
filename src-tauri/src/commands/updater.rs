@@ -20,13 +20,13 @@ use sha2::{Digest, Sha256};
 use tauri::{ipc::Channel, AppHandle, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::{
-    net::lookup_host,
     sync::Mutex,
     time::{timeout, Instant},
 };
 use url::{Host, Url};
 
 use crate::commands::errors::coded;
+use crate::net_bind::lookup_host;
 
 const MANIFEST_MAX_BYTES: usize = 512 * 1024;
 const SIGNATURE_MAX_BYTES: usize = 16 * 1024;
@@ -646,7 +646,7 @@ async fn client_for_url(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("updater URL has no port"))?;
-    let builder = Client::builder()
+    let builder = crate::net_bind::http_client()?
         .user_agent(concat!("ember-secure-updater/", env!("CARGO_PKG_VERSION")))
         .redirect(RedirectPolicy::none())
         .connect_timeout(CONNECT_TIMEOUT)
@@ -1768,6 +1768,8 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     // `configure_client` rather than the plugin's own `proxy`, which logs the
     // proxy URL and with it any credentials the proxy carries.
     let final_proxy = system_proxy_for(&manifest_response.final_url)?;
+    // Read here, where it can fail: the plugin's client builder cannot.
+    let local_ip = crate::net_bind::local_addr(0)?.ip();
     let builder = app.updater_builder();
     let builder = match pinned_target {
         Some(target) => builder.target(target),
@@ -1793,6 +1795,7 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
                 .redirect(RedirectPolicy::none())
                 .connect_timeout(CONNECT_TIMEOUT)
                 .read_timeout(READ_TIMEOUT);
+            let builder = if local_ip.is_unspecified() { builder } else { builder.local_address(local_ip) };
             match &final_proxy {
                 Some(proxy) => builder.proxy(proxy.clone()),
                 None => builder.resolve_to_addrs(&final_host, &final_addresses),

@@ -315,6 +315,9 @@ export interface NetworkStats {
   /** UPnP removed its forwards because the router's address is not the one
    *  peers see (a VPN, typically). Not a failure. */
   upnp_stood_down?: boolean;
+  /** This run keeps every connection on the network interface chosen in
+   *  Settings, so UPnP does not run whatever its setting says. */
+  interface_bound?: boolean;
   stores_acknowledged: number;
   kad_users_estimate: number;
   tcp_status?: string;
@@ -959,6 +962,12 @@ export interface AppSettings {
   udp_port: number;
   nodes_dat_path: string;
   upnp_enabled: boolean;
+  /** The network interface every connection leaves from, empty for any. The
+   *  adapter's GUID on Windows, its name elsewhere. Read at startup. */
+  bind_interface: string;
+  /** The interface's name when it was chosen, to name it by while it is not
+   *  connected. */
+  bind_interface_name: string;
   /** Keep full-cone/CGNAT mappings alive via STUN + TCP hold; advertise public ports. */
   stun_keepalive_enabled: boolean;
   obfuscation_enabled: boolean;

@@ -14,6 +14,7 @@
     type LaunchSettings,
     type UpdateSettingsResult,
   } from '$lib/api/settings';
+  import { listNetworkInterfaces, type NetworkInterface } from '$lib/api/networkInterface';
   import type { WebService } from '$lib/types';
   import { openChatFilesFolder } from '$lib/api/friends';
   import {
@@ -385,6 +386,85 @@
   let launchSettings: LaunchSettings | null = $state(null);
   let showRestartPrompt = $state(false);
   let restarting = $state(false);
+
+  // --- Network interface ---
+  /** Null until first read. */
+  let networkInterfaces: NetworkInterface[] | null = $state(null);
+  let interfacesReading = false;
+
+  /** Read the interfaces again: a VPN adds its adapter when it connects. */
+  async function refreshInterfaces() {
+    if (interfacesReading) return;
+    interfacesReading = true;
+    try {
+      const list = await listNetworkInterfaces();
+      if (!unmounted) networkInterfaces = list;
+    } catch (e) {
+      console.warn('Settings: network interfaces unavailable', e);
+    } finally {
+      interfacesReading = false;
+    }
+  }
+
+  $effect(() => {
+    if (!sectionOnScreen('network') || networkInterfaces !== null) return;
+    void refreshInterfaces();
+  });
+
+  function interfaceLabel(iface: NetworkInterface): string {
+    if (!iface.connected) {
+      return iface.vpn
+        ? m.settings_bind_interface_option_off_vpn({ name: iface.name })
+        : m.settings_bind_interface_option_off({ name: iface.name });
+    }
+    const address = iface.addresses.find((a) => !a.startsWith('169.254.')) ?? iface.addresses[0] ?? '';
+    return iface.vpn
+      ? m.settings_bind_interface_option_vpn({ name: iface.name, address })
+      : m.settings_bind_interface_option({ name: iface.name, address });
+  }
+
+  /** The picker's entries. One saved but not on this computer now (a VPN
+   *  that is off, a backup from another computer) stays listed, by the name
+   *  it was chosen under, so the picker never shows a choice that is not in
+   *  force. */
+  let interfaceChoices = $derived.by((): { id: string; label: string; title: string }[] => {
+    const list = networkInterfaces ?? [];
+    const choices = list.map((iface) => ({ id: iface.id, label: interfaceLabel(iface), title: iface.description }));
+    const chosen = settings?.bind_interface ?? '';
+    if (chosen && !list.some((iface) => iface.id === chosen)) {
+      const name = settings?.bind_interface_name || chosen;
+      choices.unshift({
+        id: chosen,
+        label: networkInterfaces === null ? name : m.settings_bind_interface_option_off({ name }),
+        title: '',
+      });
+    }
+    return choices;
+  });
+
+  let interfaceChosen = $derived.by(() => Boolean(settings?.bind_interface));
+
+  /** The chosen interface is not connected now, as last read. */
+  let chosenInterfaceOffline = $derived.by(() => {
+    const chosen = settings?.bind_interface;
+    const list = networkInterfaces;
+    return Boolean(chosen) && list !== null && !list.some((iface) => iface.id === chosen && iface.connected);
+  });
+
+  function chooseInterface(id: string) {
+    if (!settings) return;
+    const iface = networkInterfaces?.find((candidate) => candidate.id === id);
+    settings.bind_interface = id;
+    settings.bind_interface_name = id ? (iface?.name ?? settings.bind_interface_name) : '';
+  }
+
+  /** What an interface id is called, for the restart banner. */
+  function interfaceName(id: string, saved: AppSettings): string {
+    if (!id) return m.settings_bind_interface_any();
+    return networkInterfaces?.find((iface) => iface.id === id)?.name
+      || (id === saved.bind_interface ? saved.bind_interface_name : '')
+      || id;
+  }
 
   // --- Backup / restore ---
   // A restore cannot be applied while the app is running (SQLite holds the
@@ -1738,7 +1818,7 @@
     untrack(scheduleAutoSave);
   });
 
-  type RestartField = 'tcp_port' | 'udp_port' | 'upnp_enabled';
+  type RestartField = 'tcp_port' | 'udp_port' | 'upnp_enabled' | 'bind_interface';
 
   /** Saved values the running network stack has not picked up yet. */
   let pendingRestart = $derived.by((): { field: RestartField; reason: string }[] => {
@@ -1770,6 +1850,15 @@
         reason: saved.upnp_enabled
           ? m.settings_restart_reason_upnp_on()
           : m.settings_restart_reason_upnp_off(),
+      });
+    }
+    if (saved.bind_interface !== launch.bind_interface) {
+      pending.push({
+        field: 'bind_interface',
+        reason: m.settings_restart_reason_interface({
+          from: interfaceName(launch.bind_interface, saved),
+          to: interfaceName(saved.bind_interface, saved),
+        }),
       });
     }
     return pending;
@@ -4609,14 +4698,17 @@
                 <span class="hint">{m.settings_udp_port_hint()}</span>
               </div>
             </div>
-            <div class="field toggle-row">
+            <div class="field toggle-row" class:is-disabled={interfaceChosen}>
               <div class="toggle-info">
                 <label class="toggle-title" id="upnp-label" for="upnp-switch">{m.settings_upnp_label()} {@render restartBadge('upnp_enabled', 'upnp-restart')}</label>
-                <span class="hint" id="upnp-hint">{m.settings_upnp_hint()}</span>
+                <span class="hint" id="upnp-hint">
+                  {interfaceChosen ? m.settings_upnp_off_for_interface() : m.settings_upnp_hint()}
+                </span>
               </div>
               <ToggleSwitch
                 id="upnp-switch"
                 bind:checked={settings.upnp_enabled}
+                disabled={interfaceChosen}
                 ariaLabelledby="upnp-label"
                 ariaDescribedby="upnp-restart upnp-hint"
               />
@@ -4635,6 +4727,35 @@
                 ariaLabelledby="stun-keepalive-label"
                 ariaDescribedby="stun-keepalive-hint"
               />
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_interface()}</h4>
+            <div class="field">
+              <label for="bind-interface">
+                {m.settings_bind_interface_label()}
+                {@render restartBadge('bind_interface', 'bind-interface-restart')}
+              </label>
+              <select
+                id="bind-interface"
+                onfocus={() => void refreshInterfaces()}
+                onchange={(e) => chooseInterface(e.currentTarget.value)}
+                aria-describedby="bind-interface-restart bind-interface-hint bind-interface-note"
+              >
+                <option value="" selected={!settings.bind_interface}>{m.settings_bind_interface_any()}</option>
+                {#each interfaceChoices as choice (choice.id)}
+                  <option value={choice.id} title={choice.title || undefined} selected={choice.id === settings.bind_interface}>{choice.label}</option>
+                {/each}
+              </select>
+              <span id="bind-interface-hint" class="hint">{m.settings_bind_interface_hint()}</span>
+              {#if chosenInterfaceOffline}
+                <span id="bind-interface-note" class="hint hint-warning">
+                  {m.settings_bind_interface_offline({ name: settings.bind_interface_name || settings.bind_interface })}
+                </span>
+              {:else if interfaceChosen}
+                <span id="bind-interface-note" class="hint">{m.settings_bind_interface_limits()}</span>
+              {/if}
             </div>
           </div>
 
@@ -6424,6 +6545,10 @@
 
   .hint.hint-error {
     color: var(--badge-danger-text);
+  }
+
+  .hint.hint-warning {
+    color: var(--warning);
   }
 
   /* A typed field and the Apply button that appears once it is edited. */

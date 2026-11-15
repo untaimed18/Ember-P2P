@@ -20,6 +20,9 @@
 #![allow(clippy::manual_div_ceil)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
+// `clippy.toml` sends every socket through `net_bind`. Tests open loopback
+// sockets of their own; the build without them still checks the rest.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 mod app_state;
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
@@ -44,6 +47,7 @@ mod session_end;
 mod sharing;
 mod storage;
 mod login_launch;
+mod net_bind;
 mod tray;
 mod types;
 mod vpn;
@@ -527,7 +531,7 @@ pub fn run() {
     // QUIC is fine because `quic.rs::build_{server,client}_config`
     // pass `builder_with_provider(...)` explicitly, but the WS client
     // used by `connect_server_relay` (every LowID-to-LowID relay
-    // fallback) goes through `tokio_tungstenite::connect_async`,
+    // fallback) goes through tokio-tungstenite's TLS client,
     // which uses the global default — no install, every relay
     // attempt panicked the spawned task.
     //
@@ -883,6 +887,24 @@ pub fn run() {
             let emule_import = emule_import::apply::apply_pending(&data_dir, &db, &mut config);
             storage::part_folders::forget_finished_previous_folders(&db, &mut config);
             let settings = config.settings.clone();
+            // Before anything opens a socket: with an interface chosen and not
+            // there, nothing does (see `net_bind`).
+            net_bind::configure(&settings.bind_interface, &settings.bind_interface_name);
+            if net_bind::is_configured() {
+                tauri::async_runtime::spawn(async {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+                    loop {
+                        tick.tick().await;
+                        let before = net_bind::binding();
+                        let now = tauri::async_runtime::spawn_blocking(net_bind::refresh)
+                            .await
+                            .unwrap_or(before);
+                        if now != before {
+                            tracing::info!("Chosen network interface: {}", net_bind::status().state);
+                        }
+                    }
+                });
+            }
             // Before the library is scanned or a download restored: both must
             // know which downloads, and which folders, are feeds' and private.
             sharing::feed_downloads::set_roots(&settings.download_roots());
@@ -2742,6 +2764,8 @@ pub fn run() {
             commands::channels::list_channel_transfers,
             commands::settings::get_settings,
             commands::settings::get_launch_settings,
+            commands::settings::list_network_interfaces,
+            commands::settings::get_network_binding,
             commands::settings::update_settings,
             commands::settings::pick_download_folder,
             commands::settings::pick_preview_player,

@@ -5631,15 +5631,10 @@ pub async fn start_upload_server(
     // not reach our QUIC port. See `crate::network::ember::attach_tcp`.
     file_stream_serve: Option<crate::network::ember::relay::FileStreamServe>,
 ) -> anyhow::Result<()> {
-    let addr: SocketAddr = format!("0.0.0.0:{tcp_port}").parse()?;
     // SO_REUSEADDR so the NATMAP-style TCP mapping hold can bind the same
     // local port for outbound keep-alive connects without conflicting.
     let listener = {
-        let sock = tokio::net::TcpSocket::new_v4()
-            .map_err(|e| anyhow::anyhow!("TCP socket create failed: {e}"))?;
-        sock.set_reuseaddr(true)
-            .map_err(|e| anyhow::anyhow!("TCP SO_REUSEADDR failed: {e}"))?;
-        sock.bind(addr)
+        let sock = crate::net_bind::tcp_socket(tcp_port, true)
             .map_err(|e| anyhow::anyhow!("TCP bind {tcp_port} failed: {e}"))?;
         match sock.listen(1024) {
             Ok(l) => l,
@@ -7963,7 +7958,7 @@ impl UploadHandler {
         loop {
             let stream = match tokio::time::timeout(
                 std::time::Duration::from_secs(OUTBOUND_SERVE_HANDSHAKE_SECS),
-                TcpStream::connect(peer_addr),
+                crate::net_bind::tcp_connect(peer_addr),
             )
             .await
             {

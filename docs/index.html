@@ -263,6 +263,7 @@
                 <h5>Security</h5>
                 <ul>
                   <li><strong>An IP filter whose list did not load is shown everywhere.</strong> With the filter on and no list, Ember blocks every peer to be safe; this used to show on the Security page alone. A notice now says so wherever you are in Ember, the Connection Doctor names it first, and the notice, the Doctor and the Security page each have <em>Download IP Filter</em> to fix it in one click</li>
+                  <li><strong>Keep Ember on one network interface,</strong> such as your VPN&rsquo;s, with <em>Connect through</em> in Settings &gt; Network (<a href="https://github.com/untaimed18/Ember-P2P/issues/178" target="_blank" rel="noopener">#178</a>). Every connection Ember makes, to peers, servers, the Rendezvous server, websites and for updates, leaves from that interface alone, and while it is not connected nothing goes out at all: Ember waits for it before going online, and a notice says so wherever you are. If it comes back at another address, the notice offers a restart. UPnP is off while an interface is chosen, so others reach you directly only if the VPN forwards your ports. Name lookups (DNS) still go through your system&rsquo;s resolver, and on Linux traffic from the VPN&rsquo;s address follows the system&rsquo;s routes, so a VPN that tunnels only some programs must include Ember</li>
                 </ul>
 
                 <h5>Linux</h5>

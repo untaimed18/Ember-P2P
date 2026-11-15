@@ -2931,7 +2931,7 @@ pub(super) async fn handle_udp_packet_inner(
                     let _permit = permit;
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        tokio::net::TcpStream::connect(tcp_addr),
+                        crate::net_bind::tcp_connect(tcp_addr),
                     )
                     .await;
                     match result {
@@ -3098,7 +3098,7 @@ pub(super) async fn handle_udp_packet_inner(
                     let _permit = permit;
                     let connect_result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        tokio::net::TcpStream::connect(tcp_addr),
+                        crate::net_bind::tcp_connect(tcp_addr),
                     )
                     .await;
                     match connect_result {
@@ -3131,7 +3131,7 @@ pub(super) async fn handle_udp_packet_inner(
                                         drop(reader);
                                         match tokio::time::timeout(
                                             std::time::Duration::from_secs(5),
-                                            tokio::net::TcpStream::connect(tcp_addr),
+                                            crate::net_bind::tcp_connect(tcp_addr),
                                         )
                                         .await
                                         {

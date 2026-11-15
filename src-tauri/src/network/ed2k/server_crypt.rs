@@ -4,7 +4,6 @@ use std::net::SocketAddr;
 use digest::Digest;
 use num_bigint_dig::BigUint;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tracing::info;
 
 use super::server::read_step;
@@ -244,7 +243,7 @@ const DH_STEP_TIMEOUT_SECS: u64 = 10;
 pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServerStream> {
     info!("Connecting to server obfuscation port {addr}");
 
-    let stream = tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr))
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(10), crate::net_bind::tcp_connect(addr))
         .await
         .map_err(|_| {
             io::Error::new(
@@ -392,6 +391,7 @@ pub async fn connect_obfuscated(addr: SocketAddr) -> io::Result<ObfuscatedServer
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
     use tokio::net::TcpListener;
 
     /// Padding the server side sends inside Message 2, so the test drives the
