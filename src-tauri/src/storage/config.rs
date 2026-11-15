@@ -55,6 +55,43 @@ fn parse_settings(data: &str) -> serde_json::Result<(AppSettings, bool)> {
     Ok((settings, old_auto))
 }
 
+/// The defaults a `config.json` that cannot be used is replaced with, still on
+/// the network interface it named. Resetting that too would send every
+/// connection out of whatever interface is up, off the VPN the user bound
+/// Ember to, which is what the binding is there to prevent (`net_bind`). A
+/// value that is itself unreadable is kept as far as it reads: it names no
+/// interface, so the network stays off until one is chosen again.
+fn defaults_on_its_interface(data: &str) -> AppSettings {
+    let field = |key: &str| -> Option<String> {
+        match serde_json::from_str::<serde_json::Value>(data) {
+            Ok(value) => value.get(key).and_then(serde_json::Value::as_str).map(str::to_string),
+            // Not JSON at all: the value may still read as written.
+            Err(_) => regex::Regex::new(&format!(r#""{key}"\s*:\s*"([^"]*)""#))
+                .ok()?
+                .captures(data)
+                .map(|found| found[1].to_string()),
+        }
+    };
+    let usable = |text: String| -> String {
+        let mut text: String = text.chars().filter(|c| !c.is_control()).collect();
+        while text.len() > 256 {
+            text.pop();
+        }
+        text
+    };
+    let mut settings = AppSettings::default();
+    if let Some(interface) = field("bind_interface").map(usable) {
+        if !interface.is_empty() {
+            tracing::warn!("Keeping the network interface config.json named, so the reset cannot move traffic off it");
+        }
+        settings.bind_interface = interface;
+    }
+    if let Some(name) = field("bind_interface_name").map(usable) {
+        settings.bind_interface_name = name;
+    }
+    settings
+}
+
 /// Move a corrupt or semantically-invalid `config.json` aside so the user's
 /// original settings stay recoverable, returning the backup path on success.
 /// Uses a timestamp + counter so repeated failures within the same wall-clock
@@ -273,7 +310,7 @@ impl AppConfig {
                                 &format!("has invalid settings after soft-repair ({e})"),
                             )?);
                             config_changed = true;
-                            AppSettings::default()
+                            defaults_on_its_interface(data.as_deref().unwrap_or_default())
                         }
                     }
                 }
@@ -283,7 +320,7 @@ impl AppConfig {
                         &format!("corrupt ({e})"),
                     )?);
                     config_changed = true;
-                    AppSettings::default()
+                    defaults_on_its_interface(data.as_deref().unwrap_or_default())
                 }
             }
         } else {
@@ -500,6 +537,39 @@ mod ember_default_on_tests {
         assert_eq!(settings.auto_away_minutes, 120, "a later build's idle time is kept");
         assert_eq!(settings.room_dm_policy, "friends", "and its policy");
         assert_eq!(settings.ignored_members.map(|list| list.len()), Some(1));
+    }
+
+    /// A config reset to defaults keeps the interface Ember was bound to, so
+    /// the reset cannot put traffic on the wrong one; whatever else was wrong
+    /// with the file.
+    #[test]
+    fn a_reset_config_stays_on_its_network_interface() {
+        let mut bound = serde_json::to_value(AppSettings::default()).unwrap();
+        bound["bind_interface"] = "{6B29FC40-CA47-1067-B31D-00DD010662DA}".into();
+        bound["bind_interface_name"] = "VPN".into();
+        bound["download_folder"] = "C:\\Windows\\System32".into();
+        let reset = defaults_on_its_interface(&bound.to_string());
+        assert_eq!(reset.bind_interface, "{6B29FC40-CA47-1067-B31D-00DD010662DA}");
+        assert_eq!(reset.bind_interface_name, "VPN");
+        assert_eq!(reset.download_folder, AppSettings::default().download_folder, "everything else resets");
+
+        let mut unparsable = bound.clone();
+        unparsable["max_friends"] = "many".into();
+        assert!(parse_settings(&unparsable.to_string()).is_err());
+        assert_eq!(defaults_on_its_interface(&unparsable.to_string()).bind_interface_name, "VPN");
+
+        let truncated = r#"{"nickname": "x", "bind_interface": "tun0", "bind_interface_name": "wg", "tcp_po"#;
+        let reset = defaults_on_its_interface(truncated);
+        assert_eq!((reset.bind_interface.as_str(), reset.bind_interface_name.as_str()), ("tun0", "wg"));
+
+        let mut strange = bound;
+        strange["bind_interface"] = format!("tun\u{7}{}", "x".repeat(400)).into();
+        let reset = defaults_on_its_interface(&strange.to_string());
+        assert!(reset.bind_interface.starts_with("tunx") && reset.bind_interface.len() == 256);
+        crate::commands::settings::validate_settings(&reset).expect("a reset config can be saved");
+
+        let unbound = defaults_on_its_interface("not json at all");
+        assert!(unbound.bind_interface.is_empty());
     }
 
     /// The upload-slot count a config reads as, and whether it is rewritten.
