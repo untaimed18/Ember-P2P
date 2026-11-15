@@ -10,7 +10,7 @@ pub(in crate::network) async fn on_cache_refresh_tick(
     settings: &AppSettings,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     known_files: &KnownFileList,
     cache_write_handle: &mut Option<tokio::task::JoinHandle<()>>,
     last_cache_refresh_started_at: &mut i64,

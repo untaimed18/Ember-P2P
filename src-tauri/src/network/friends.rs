@@ -16,7 +16,7 @@ use super::*;
 pub(super) async fn forget_friend_network_state(
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     upload_queue: &ed2k::upload::UploadQueueRef,
     friend: [u8; 16],
     browse_error: &str,
@@ -692,7 +692,7 @@ static NEW_FRIEND_REQUEST_RATE: std::sync::LazyLock<parking_lot::Mutex<NewFriend
 /// status. Adding them *was* the approval; their accept must not ask again.
 pub(super) async fn process_inbound_friend_request(
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     online_friends: &mut HashMap<[u8; 16], i64>,
     mutual_friend_hashes: &crate::app_state::SharedFriendHashes,
     req_hash: [u8; 16],
@@ -924,7 +924,7 @@ pub(super) async fn process_inbound_friend_request(
 /// friend on our list. The user's own label for them is never touched.
 async fn refresh_friend_name(
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     req_hash: [u8; 16],
     peer_pubkey: Option<[u8; 32]>,
     nickname: &str,
@@ -975,7 +975,7 @@ async fn refresh_friend_name(
 /// the request carries none.
 pub(super) async fn process_room_friend_request(
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     sender_pubkey: [u8; 32],
     nickname: &str,
     channel_id: [u8; 16],
@@ -1187,7 +1187,7 @@ pub(crate) async fn deliver_friend_request_verdict(
 /// again through a room we share with them. Paced by
 /// `commands::channels::send_room_friend_request`, since the retry sweep
 /// that lands here runs every few minutes.
-async fn ask_unmatched_friend_through_rooms(app_handle: &tauri::AppHandle, target_hash: [u8; 16]) {
+async fn ask_unmatched_friend_through_rooms(app_handle: &crate::host::AppHandle, target_hash: [u8; 16]) {
     let Some(app_state) = app_handle.try_state::<crate::app_state::AppState>() else {
         return;
     };
@@ -1213,7 +1213,7 @@ pub(super) fn spawn_rendezvous_friend_lookup(
     state: &NetworkState,
     ember_hash: [u8; 16],
     target_hash: [u8; 16],
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     friend_hashes: &crate::app_state::SharedFriendHashes,
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
     ed25519_pubkey: [u8; 32],

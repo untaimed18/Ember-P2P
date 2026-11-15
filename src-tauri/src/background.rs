@@ -26,8 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
+#[cfg(feature = "desktop")]
 use tauri::window::{ProgressBarState, ProgressBarStatus};
-use tauri::{Emitter, Manager};
+use crate::host::{Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::bandwidth::{quota, schedule};
@@ -62,7 +63,7 @@ fn published_upload_count(bytes: u64) -> u64 {
 
 /// Write the day's upload count if it moved since the last write: by a step
 /// at least while Ember runs, by anything at all when `leaving`.
-pub async fn save_upload_quota(app: &tauri::AppHandle, state: &AppState, leaving: bool) {
+pub async fn save_upload_quota(app: &crate::host::AppHandle, state: &AppState, leaving: bool) {
     let session_total = state.bandwidth_limiter.total_uploaded();
     let pending = {
         let mut quota = state.upload_quota.lock();
@@ -112,8 +113,8 @@ const TICK: Duration = Duration::from_secs(1);
 /// The network task takes the same precaution (`lib.rs`), for the same reason:
 /// the release profile enables `overflow-checks`, so arithmetic reachable from
 /// hostile input panics rather than wrapping.
-pub fn spawn(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
+pub fn spawn(app: crate::host::AppHandle) {
+    crate::host::async_runtime::spawn(async move {
         loop {
             let handle = app.clone();
             let result = std::panic::AssertUnwindSafe(run(handle))
@@ -136,7 +137,7 @@ pub fn spawn(app: tauri::AppHandle) {
 /// tick cannot become a busy loop of panics.
 const RESTART_DELAY: Duration = Duration::from_secs(5);
 
-async fn run(app: tauri::AppHandle) {
+async fn run(app: crate::host::AppHandle) {
     let wake_lock = WakeLock::new();
     let sleep_inhibit_supported = wake_lock.is_running();
 
@@ -144,6 +145,7 @@ async fn run(app: tauri::AppHandle) {
     // the world rather than trusting that startup already matched it.
     let mut applied_limits: Option<(u64, u64)> = None;
     let mut quota_held = false;
+    #[cfg(feature = "desktop")]
     let mut applied_tooltip: Option<String> = None;
     let mut holding_wake_lock = false;
     let mut applied_taskbar: Option<Taskbar> = None;
@@ -344,10 +346,13 @@ async fn run(app: tauri::AppHandle) {
             }
         }
 
-        let tooltip = tray_tooltip(&state, working);
-        if applied_tooltip.as_deref() != Some(tooltip.as_str()) {
-            set_tray_tooltip(&app, tooltip.clone());
-            applied_tooltip = Some(tooltip);
+        #[cfg(feature = "desktop")]
+        {
+            let tooltip = tray_tooltip(&state, working);
+            if applied_tooltip.as_deref() != Some(tooltip.as_str()) {
+                set_tray_tooltip(&app, tooltip.clone());
+                applied_tooltip = Some(tooltip);
+            }
         }
     }
 }
@@ -439,7 +444,12 @@ impl Taskbar {
     }
 }
 
-fn set_taskbar(app: &tauri::AppHandle, taskbar: Taskbar) {
+/// `emberd` has no taskbar button.
+#[cfg(not(feature = "desktop"))]
+fn set_taskbar(_app: &crate::host::AppHandle, _taskbar: Taskbar) {}
+
+#[cfg(feature = "desktop")]
+fn set_taskbar(app: &crate::host::AppHandle, taskbar: Taskbar) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
@@ -621,6 +631,7 @@ fn existing_ancestor(path: &Path) -> Option<&Path> {
 /// owned by the backend, which has no idea which of the ten shipped locales
 /// the user is reading. `↓`/`↑` and `MB/s` need no translation; "3 downloads"
 /// would.
+#[cfg(feature = "desktop")]
 fn tray_tooltip(state: &AppState, working: usize) -> String {
     // A silent update about to install says so, with the time left, since the
     // tray may be the only part of Ember on screen.
@@ -673,7 +684,8 @@ fn format_rate(bytes_per_sec: u64) -> String {
 /// task happens to be parked on. `run_on_main_thread` is the only safe hop.
 /// Best-effort: the tray may legitimately not exist (its builder is allowed to
 /// fail at startup on a session with no notification area).
-fn set_tray_tooltip(app: &tauri::AppHandle, tooltip: String) {
+#[cfg(feature = "desktop")]
+fn set_tray_tooltip(app: &crate::host::AppHandle, tooltip: String) {
     let handle = app.clone();
     if let Err(error) = app.run_on_main_thread(move || {
         if let Some(tray) = handle.tray_by_id("main") {
@@ -704,7 +716,7 @@ pub fn effective_limits_now(settings: &crate::types::AppSettings) -> (u64, u64) 
 /// switch off mid-save and the limits it left behind should not outlive the
 /// command that removed them.
 pub fn apply_effective_limits(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     settings: &crate::types::AppSettings,
 ) {
@@ -746,6 +758,7 @@ pub fn apply_effective_limits(
     if let Err(error) = app.emit("ember:runtime-status", &status) {
         tracing::debug!("Could not emit runtime status after a settings save: {error}");
     }
+    #[cfg(feature = "desktop")]
     if crate::tray::note_alt_speed(settings.alt_speed_enabled) {
         crate::auto_update::silent::rebuild_tray_menu(app);
     }

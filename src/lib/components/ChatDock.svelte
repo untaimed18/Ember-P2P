@@ -59,6 +59,7 @@
   } from '$lib/dockWidth';
   import { defaultSwitcherRow, filterSwitcherRows, searchNeedle } from '$lib/dockSearch';
   import { dockBack, popOutChat, showInMainWindow } from '$lib/chatPopout';
+  import { isServer } from '$lib/runtime';
 
   /** Drawn as the whole of the popped-out chat window rather than as a panel
    *  over the main window: always open, full size, and closing it docks the
@@ -830,7 +831,7 @@
           <line x1="3" y1="8" x2="13" y2="8"/>
         </svg>
       </button>
-      {#if !windowed}
+      {#if !windowed && !isServer}
         <button
           type="button"
           class="dock-new"

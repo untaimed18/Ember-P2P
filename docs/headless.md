@@ -1,414 +1,332 @@
 # Headless Ember
 
-Design for running Ember on a server with no screen: a program, `emberd`,
-that shares and downloads like the desktop app and is driven from a web browser
-or the command line, as aMule's `amuled` is with `amuleweb` and `amulecmd`.
+`emberd` runs Ember on a server with no screen. It shares and downloads like
+the desktop app and is driven from a web browser, as aMule's `amuled` is with
+`amuleweb`.
 
-**Status:** designed, with its questions settled under [Decisions](#decisions).
-Nothing is built yet; the work starts after 1.8.0 ships. The order it would be
-built in, each step leaving the desktop app working as before, is under
-[Implementation order](#implementation-order).
+**Status:** built, for Linux on x86-64, from the same code as the desktop app.
+It is published only as test builds, by `.github/workflows/emberd-test-build.yml`,
+until the release jobs under [Still to do](#still-to-do) are in place. CI
+checks, lints and tests it on every push.
 
 ## What the user gets
 
-- **One program**, `emberd`, for Linux on x86-64 and ARM64. It needs no
-  display, GTK or WebKit, and runs as a systemd service or in a Docker
-  container. It keeps running when nobody is logged in and stops cleanly when
-  the service is stopped.
+- **One program**, `emberd`. It needs no display, GTK or WebKit, runs as a
+  systemd service or in a Docker container, keeps running when nobody is logged
+  in, and stops cleanly when the service is stopped.
 - **The same networks and features** as the desktop app: eD2K servers, KAD, the
-  Ember network, search and the spam filter, downloads and uploads, the
-  library and hashing, friends and chat, rooms and private messages, feeds,
-  collections, the IP filter, statistics, the Connection Doctor and
-  *Connect through* (useful for a seedbox behind a VPN).
-- **The same pages in a web browser.** The desktop UI, built a second time for
-  the browser, with a login page in front of it. Controls that mean nothing
-  on a server are hidden; the few that need a different form get one
+  Ember network, search and the spam filter, downloads and uploads, the library
+  and hashing, friends and chat, rooms and private messages, feeds, the IP
+  filter, statistics, the Connection Doctor and *Connect through*.
+- **The same pages in a web browser,** behind a sign-in. Controls that mean
+  nothing on a server are hidden; the few that need another form have one
   (see [Features by build](#features-by-build)).
-- **Finished files can be fetched** through the browser, and audio and video
-  played in it, in place of *Open file* and the external player.
-- **A command line** for scripts: status, add a link, list, pause, resume and
-  cancel downloads, search. It talks to the same interface the web pages use.
+- **Finished files are saved to the browser's computer** (*Save to this
+  computer*), and audio and video play in the page.
+- **Backups** download to the browser's computer and restore from a file sent
+  from it, so a desktop Ember moves onto a server with its identity, friends
+  and rooms.
 - **A config file** for what the desktop app asks for with native dialogs: the
   download folder, the shared folders, and where the web interface listens.
 
-The desktop app gives up nothing. It keeps every feature it has, and is built
-from the same code.
+The desktop app gives up nothing, and is built from the same code.
 
-## Scope
+## Installing and running
 
-**First version:** Linux x86-64 and ARM64, as a plain binary, a `.deb` with a
-systemd unit, and a Docker image, with the web UI and the command line. One
-administrator account.
+### With systemd
 
-**Not in the first version** (the reasons for the first three are under
-[Decisions](#decisions)):
+Unpack the tarball (`emberd-<version>-linux-x86_64.tar.gz`) to `/opt/emberd`,
+so that `/opt/emberd/emberd` sits beside `web/` and `resources/`. Then:
 
-- Windows and macOS servers. Nothing in the design rules them out (DPAPI works
-  under a service account), but each needs its own service wrapper and tests.
-- Changing folders from the browser beyond sharing inside the operator's
-  `browse_under` (see [Folders and files](#folders-and-files)).
-- The web interface in the desktop app, to reach a desktop Ember from a phone.
-- More than one account, or accounts with fewer rights.
-- Sending a file from the browser's computer to a friend or a room. A file has
-  to be on the server to be sent; uploading it there first can come later.
-
-## Why it can be done
-
-The work is large, but none of it fights the code:
-
-- **The core does not need a window.** Search, security, bandwidth and eMule
-  import do not touch Tauri. The network code (about 297,000 lines) holds an
-  `AppHandle` in 65 files, and across it, sharing and storage, apart from
-  cloning the handle, the only calls made on it are 184 `emit`s to the UI and
-  2 `path()` lookups: one for the bundled GeoIP database, one for an old data
-  folder to migrate, which only the desktop has.
-- **`AppState` holds plain Rust types,** no Tauri ones.
-- **The UI reaches the backend two ways:** `invoke`, wrapped almost entirely in
-  `src/lib/api/*.ts` (about 320 calls there, 17 elsewhere), and `listen`. The
-  frontend is already a static single-page app (`adapter-static`,
-  `ssr = false`), so a server can hand it to a browser as files.
-- **Commands already speak JSON:** arguments in, `Result<T, String>` out, with
-  errors as the coded envelope from `commands/errors.rs` that `translateError`
-  reads. That is what an HTTP call carries too.
-- **The repository already ships a headless server,** `rendezvous-server`, on
-  axum with WebSockets and signal handling.
-- **The shutdown that saves everything is one function,**
-  `run_graceful_shutdown` in `lib.rs`, already called from three places.
-
-What stands in the way, measured:
-
-| What | How much |
-|---|---|
-| Commands to make callable without Tauri | 372 (plus 9 debug-only) |
-| Commands taking `tauri::State<AppState>` / `AppHandle` / `WebviewWindow` | 314 / 105 / 62 |
-| Distinct events the backend emits | about 105, from about 311 call sites |
-| Places the core reaches back into `commands` | 82 (error helpers, `emit_transfer_status`, settings saves, path helpers) |
-| Startup inside Tauri's `.setup` closure | about 1,750 lines of `lib.rs` |
-
-## How it works
-
-### Three crates
-
-- **`ember-core`**, a library with no Tauri dependency: the network, sharing,
-  storage, search, security, bandwidth and import code, `net_bind`, GeoIP,
-  automatic IP filter updates, the core of `background.rs`, startup and
-  shutdown, and the body of every command. Because the crate cannot name
-  Tauri, a desktop call slipping back into the core fails to build, the way
-  `clippy.toml` now refuses a socket made outside `net_bind`.
-- **`ember`**, the desktop app (today's `src-tauri`): thin `#[tauri::command]`
-  wrappers, the tray, windows, dialogs, notifications, the updater, deep links
-  and the `ember-media` protocol.
-- **`emberd`**, the binary: config, the HTTP and WebSocket interface on
-  axum, login, the web UI's files, the command line, signals and the lock file.
-
-### The host the core talks to
-
-Where the core holds an `AppHandle` today, it holds a `Host`:
-
-```rust
-pub trait Host: Send + Sync + 'static {
-    /// Tell every UI attached that `event` happened.
-    fn emit(&self, event: &'static str, payload: serde_json::Value);
-    /// Where read-only files shipped with Ember are (the GeoIP database).
-    fn resource_dir(&self) -> PathBuf;
-}
+```sh
+sudo useradd --system --home-dir /var/lib/emberd --shell /usr/sbin/nologin emberd
+sudo install -Dm644 /opt/emberd/emberd.service /etc/systemd/system/emberd.service
+sudo install -Dm644 /opt/emberd/emberd.toml /etc/emberd/emberd.toml
+sudo systemctl enable --now emberd
+journalctl -u emberd
 ```
 
-The desktop implements it on `AppHandle`. The server implements it with a
-`tokio::sync::broadcast` channel that each WebSocket subscribes to. Events stay
-named and shaped exactly as they are, so the UI's listeners do not change. The
-two events sent to one window (`emit_to` the main window for the update-resume
-snapshot, and to the chat window to dock it) stay in the desktop crate.
+Ember keeps its data in `/var/lib/emberd/data`. Unless the config names a
+download folder, downloads go to `/var/lib/emberd/Downloads/Ember`.
 
-Desktop-only abilities a command needs (a dialog, a notification, opening a
-folder) are not on `Host`. Those commands stay in the desktop crate whole, and
-the server does not offer them.
+### With Docker
 
-### Commands over HTTP
+```sh
+docker build -f packaging/emberd/Dockerfile -t emberd .
+docker run -d --name emberd --restart unless-stopped \
+  -p 4711:4711 -p 4662:4662/tcp -p 4662:4662/udp -p 4672:4672/udp \
+  -v emberd-data:/data -v /srv/downloads:/downloads emberd
+docker logs emberd
+```
 
-Each command body becomes a plain function in `ember-core` taking `&Ctx` (the
-`AppState`, the `Host`, and the updater and resume services where needed) and
-its arguments. One list names every command once, with whether the server
-offers it, and a macro generates from it both the Tauri wrappers with
-`generate_handler!` and the server's dispatch table. A test holds the list,
-the desktop handler and the server table to the same names.
+The data volume is `/data` and downloads go to `/downloads`. To share a
+folder, mount it and name it:
+`-v /srv/music:/shared/music:ro -e EMBERD_SHARED_DIRS=/shared/music`.
 
-- `POST /api/invoke/{command}`, the arguments as a JSON object with the
-  camelCase names the UI already sends (Tauri's default; no command overrides
-  it). The answer is the command's value as JSON, or a 4xx with the same coded
-  error string the desktop returns, so `translateError` works unchanged.
-- A command the server does not offer answers with the coded error
-  `server_unsupported`, never 404 by accident.
-- No command streams on the server: the only one that does,
-  `secure_updater_install`, is desktop-only.
-- Requests are capped in size, and every command keeps the timeouts it has
-  (`CMD_REPLY_TIMEOUT` for the network task).
+### The first visit
 
-### Events over a WebSocket
+On its first start `emberd` writes a setup code to its log, and to
+`emberd-setup-code` in its data folder:
 
-- `GET /api/events` upgrades to a WebSocket that carries `{ event, payload }`
-  frames. The browser shim hands them to listeners in Tauri's shape,
-  `{ event, id, payload }`.
-- Each connection has a bounded queue. A browser that falls behind (a laptop
-  lid closed) is disconnected rather than allowed to hold memory, and on
-  reconnecting the shim tells the stores to read their state afresh. Most
-  already poll (network statistics every 3 seconds, transfers), so this is a
-  small list to complete, not a new mechanism.
-- `emit` from the frontend is only used between the main window and the
-  popped-out chat. The browser build has no chat window, so it does nothing.
+```text
+No password is set for the web interface yet. Open http://localhost:4711
+and enter this setup code to choose one: 2BLD-WZ8J
+```
 
-### The web UI
+Open the address, enter the code and choose a password. The code proves the
+person choosing it can read the server's log, so nobody else on the network
+can claim a fresh install first. Case and the dash do not matter.
 
-The same SvelteKit app, built with `VITE_EMBER_RUNTIME=web`. Vite aliases
-`@tauri-apps/api/core`, `/event`, `/window`, `/webview` and
-`@tauri-apps/plugin-process` to shims in `src/lib/runtime/web/`:
+To set the password from a shell instead, stop `emberd` and run
+`emberd passwd` (or `emberd passwd --stdin` to read it from a pipe).
 
-- `invoke` posts to `/api/invoke/{command}`; `listen` and `once` subscribe on
-  the WebSocket; `Channel` is never used.
-- `convertFileSrc(path, 'ember-media')` becomes a same-origin `/api/media/…`
-  URL, served with the checks `serve_media_request` applies today: the file
-  must be in the library index, inside an approved root, and opened through
-  its handle.
-- `getCurrentWindow()` answers as the main window; its theme follows the
-  browser's `prefers-color-scheme`.
-- `relaunch()` asks the server to restart its network (or is hidden where a
-  restart means the whole service).
+### Reaching it from another computer
 
-An `isServer` flag hides or replaces the desktop-only controls listed below.
-The server embeds the built files in its binary and serves them with its own
-Content-Security-Policy (`default-src 'self'`, `connect-src 'self'`,
-`frame-ancestors 'none'`).
+By default the web interface listens on `127.0.0.1:4711`, this computer only.
+To use it from elsewhere, set `listen = "0.0.0.0:4711"` and either:
 
-### Login and exposure
+- give it a certificate and key (`tls_cert`, `tls_key`) to serve HTTPS, or
+- put it behind a reverse proxy that serves HTTPS, listening on loopback.
 
-The desktop UI is local and its webview cannot reach the network. The web
-interface is a network service, and everything behind it can read the library,
-delete files and talk as the user's identity. So:
-
-- **Listens on `127.0.0.1:4711` by default** (eMule's web interface port). A
-  non-loopback address must be asked for in the config, and then needs either
-  a TLS certificate and key or `behind_proxy = true` for a reverse proxy that
-  terminates TLS. Ember refuses to start otherwise.
-- **One administrator password,** stored as an Argon2id hash. On first run
-  `emberd` writes a random one to `<data dir>/initial-password` (mode
-  `0600`) and logs where, not what; `emberd passwd` sets another.
-- **Sessions** are random tokens in an `HttpOnly`, `SameSite=Strict` cookie,
-  `Secure` under TLS, expiring after a period without use.
-- **Every request is checked:** a session or an API token for every route,
-  the WebSocket upgrade included; the `Origin` header must be the server's
-  own; state-changing requests also need a custom header, which a cross-site
-  form cannot send. There are no CORS headers.
-- **Logins are rate-limited** per address, with a growing delay.
-- **API tokens** for the command line and scripts, kept in a file only the
-  service user can read.
-- **The interface's listener is the one socket outside `net_bind`,** on
-  purpose: it is for the administrator, not the networks, and must stay on
-  loopback or the LAN even when *Connect through* keeps everything else on a
-  VPN.
-- Logins, failed logins and file deletions are logged.
-
-### Folders and files
-
-The desktop app never lets the webview name a folder to write to or share.
-Folders count only once a native dialog or the share browser picked them, and
-`ApprovedRootRegistry` (`security/filesystem.rs`) records each by file
-identity, in `approved_roots.json`, and checks it on every open, write, rename
-and delete. The server keeps every one of those checks, and replaces only how a
-folder gets approved:
-
-- **The operator names the folders** in the config file: the download folder,
-  the shared folders, and optionally `browse_under`, folders inside which the
-  browser may pick more to share.
-- **At startup** the server writes them into the settings and approves them
-  with `initialize_approved_roots_with_additions`, as an eMule import and a
-  backup restore already do, before anything is indexed.
-- **From the browser,** with `browse_under` set, the share browser lists only
-  what is inside those folders, and its selection is approved as it is after
-  the desktop's confirmation; folders shared that way can be unshared there
-  too. The download folder and the folders the config names change only in
-  the config (see [Decisions](#decisions)).
-- **Fetching a finished file** is `GET /api/files/{id}` by library or transfer
-  id, never by path, through the same handle-bound open, sent as an
-  attachment with `X-Content-Type-Options: nosniff`, so a downloaded HTML file
-  is never shown as a page.
-- **Backups** download as a file and restore from an uploaded one; **eMule
-  import** takes the eMule folder from the command line.
-- **The IP filter, a collection, or a web services list** from a file is an
-  upload in the browser, read from memory, never written where it was named.
-
-The system-folder refusals the desktop applies (the system drive, the profile,
-Ember's own data folder) apply to the config's folders too, with `/` and
-`/etc`, `/proc`, `/sys` and `/dev` added for Linux.
-
-### Startup and shutdown
-
-`ember-core::start(options, host)` does what the `.setup` closure does today
-that a server needs, in the same order: the data folder and a pending restore,
-the database, the config, the identity, the eMule import, `net_bind`, the
-approved roots, the security policy gate, the spam filter and caches, the
-library scan, `start_network`, and the bandwidth refill. The desktop calls it
-inside `.setup` and adds what only it has: the tray, the window, deep links, the
-`ember-media` protocol, the WebView's media scope and login-at-start. The
-server calls it from `main`.
-
-Two parts are split rather than moved:
-
-- **`background::spawn`** keeps the schedule, disk-space and upload-quota work
-  in the core; keep-awake, the tray tooltip, the taskbar badge and *When
-  downloads finish* stay on the desktop.
-- **The update scheduler** only checks on the server, and the web UI says when
-  a release is out. Installing is the package manager's or Docker's job.
-
-The server holds a lock file in the data folder in place of the single-instance
-plugin, and `EMBER_DATA_DIR` keeps working as it does now.
-
-**Shutdown:** SIGTERM or SIGINT calls `run_graceful_shutdown` directly, which
-`session_end.rs` reaches today through `app.exit(0)`: hashing stops, the
-network task saves `nodes.dat`, `known.met`, credits and the rest (it is given
-up to 45 seconds), then the upload queue and spam filter are saved and the
-database is marked clean. The systemd unit sets `TimeoutStopSec=60` and the
-Docker example `stop_grace_period: 60s`, so neither kills Ember mid-save.
-
-**Logs** go to standard output as now, where journald and Docker collect them,
-and to `<data dir>/logs` unless `log_files = false`.
-
-**GeoIP:** the server embeds the database in its binary, so it has no resource
-folder to find.
-
-### Keys at rest
-
-`secret_store.rs` protects `identity.json` and `cryptkey.dat`. On Linux it
-keeps the wrapping key in the system keyring, and falls back to a key derived
-from `/etc/machine-id` and the uid when no keyring answers. A server rarely
-runs a keyring, so it would use the fallback and warn, which works. But a
-container often has no machine-id at all, and then sealing fails closed:
-Ember could not create its identity.
-
-So the server takes a **key file**: 32 random bytes, named in the config or
-passed as a systemd credential (`LoadCredential=`) or Docker secret, recorded
-as a key source of its own in the sealed file's header. Kept on the same volume
-as the data, it protects no more than the machine-id key does; its worth is
-that a container starts at all and the data volume can move to another host. The
-docs will say to mount it separately.
-
-## Features by build
-
-**Dropped on the server,** with what stands in:
-
-- The tray, close to tray, start minimized or maximized, the remembered window
-  position and the splash screen.
-- The popped-out chat window: chat stays in the page.
-- Start at login: the systemd unit or Docker's restart policy.
-- Desktop notifications: the browser's, while the page is open and allowed.
-- Watching the clipboard for links, and opening `ed2k://` links from other
-  programs: an *Add links* box, and `emberd ctl add <link>`.
-- Keeping the computer awake, and *When downloads finish* (exit or sleep).
-- Showing friends *Away* after idle time: the status is set by hand.
-- *Open file*, *Show in folder*, *Open log folder* and preview in an external
-  player: downloading the file, and playing audio and video in the browser.
-- Native file and folder pickers: the config file, and uploads.
-- Silent updates, the update watchdog and the in-app installer: the package
-  manager and Docker images. *An update is available* stays.
-- The Windows Firewall fix in the Connection Doctor, and the AppImage emoji
-  font workaround.
-- Dragging files from the desktop onto the Library.
-
-**Changed:** choosing folders, backups, eMule import and file imports (see
-[Folders and files](#folders-and-files)); key storage (see
-[Keys at rest](#keys-at-rest)); UPnP stays available but is usually off on a
-server.
-
-**The same:** everything else, as listed under
-[What the user gets](#what-the-user-gets).
+Over plain HTTP from another computer it still works, and says so: the log
+warns at every start and the sign-in page shows that the password would travel
+unencrypted. The Docker image listens on every address, so that the port can be
+published at all.
 
 ## Configuration
 
-```toml
-# /etc/ember/emberd.toml
-data_dir = "/var/lib/ember"
-key_file = "/run/credentials/emberd.service/ember-key"
+Every key is optional. An environment variable wins over the file, so a
+container needs no file at all. `packaging/emberd/emberd.toml` is the same
+list with comments.
 
-[web]
-listen = "127.0.0.1:4711"
-# tls_cert = "/etc/ember/cert.pem"
-# tls_key = "/etc/ember/key.pem"
-# behind_proxy = true
+| Key | Variable | Default |
+|---|---|---|
+| (the file itself) | `EMBERD_CONFIG` | `/etc/emberd/emberd.toml` if it exists |
+| `data_dir` | `EMBER_DATA_DIR` | the desktop app's data folder for the user |
+| `key_file` | `EMBERD_KEY_FILE` | `<data_dir>/emberd-secret.key` |
+| `resource_dir` | `EMBERD_RESOURCE_DIR` | beside the program if `web/` is there, else `/usr/share/emberd` |
+| `web.root` | `EMBERD_WEB_ROOT` | `<resource_dir>/web` |
+| `web.listen` | `EMBERD_LISTEN` | `127.0.0.1:4711` (a bare port means 127.0.0.1) |
+| `web.tls_cert`, `web.tls_key` | `EMBERD_TLS_CERT`, `EMBERD_TLS_KEY` | none: plain HTTP |
+| `folders.download` | `EMBERD_DOWNLOAD_DIR` | Ember's default in the home folder |
+| `folders.shared` | `EMBERD_SHARED_DIRS` | none |
+| `folders.browse_under` | `EMBERD_BROWSE_UNDER` | none |
 
-[folders]
-download = "/srv/ember/downloads"
-shared = ["/srv/ember/share"]
-# browse_under = ["/srv/media"]
-```
+The folder variables take a list separated by `:`. Unknown keys are refused, so
+a typing mistake stops `emberd` rather than being ignored.
 
-Only what the operator owns is in this file. Every other setting is in
-`config.json` as on the desktop, and changed from the web UI.
+**Folders** have to be full paths, outside the data folder, and outside system
+and private folders: no folder on the way to one may be named `etc`, `usr`,
+`var`, `tmp`, `temp`, `AppData`, `.ssh`, `.config` and the like, except the
+folders leading to the home folder. These are the desktop app's own rules for
+the download and shared folders, checked at startup so a folder they refuse
+stops `emberd` with its name, instead of Ember resetting its settings once it
+runs. This is why the systemd unit sets the service's home to its state
+folder: the default download folder is then under it.
+
+Everything else is in `config.json` as on the desktop, and set in the web
+interface's Settings. The section *This server* shows what the config file set
+and where `emberd` keeps its data.
+
+## How it works
+
+### One crate, two builds
+
+`src-tauri` builds both programs. The Cargo feature `desktop` (the default)
+builds the app with Tauri; `--no-default-features --features server` builds
+`emberd` with no Tauri in its dependency tree at all, so a desktop call slipping
+into shared code fails to build there.
+
+- **`crate::host`** is what the code talks to instead of Tauri. On the desktop
+  it re-exports Tauri's `AppHandle`, `State`, `Manager`, `Emitter` and friends.
+  On the server (`host/server.rs`) it supplies types of the same names: events
+  go to a `tokio::sync::broadcast` channel the web pages subscribe to, state is
+  kept by type, and `exit` asks `emberd` to stop or restart.
+- **Confirmations** that the desktop asks in a native dialog
+  (`host::confirm`) are asked of every open page as an `ember:confirm` event,
+  answered with `answer_confirm`. No page open, or no answer in five minutes,
+  is *no*. A question whose answer opens a web address carries it, so the page
+  opens the tab as the button is clicked, the only time a browser allows it.
+- **Commands** are marked `#[ember_macros::command]` (shared),
+  `(desktop)` or `(server)`. `command_table.rs` names every command once;
+  `ember_macros::command_table!` turns it into the desktop's
+  `generate_handler!` and the server's dispatch table, so the two cannot list
+  different commands by accident.
+- **Startup and shutdown** are shared: `init_process` (logging, the runtime,
+  the crypto provider) and `setup` (the data folder, database, config,
+  identity, approved roots, library scan and network) run in both, the desktop
+  adding its tray, window, deep links and updater around them.
+  `run_graceful_shutdown` saves everything in both.
+
+### The web interface
+
+- `POST /api/invoke/{command}` with the arguments as JSON, in the camelCase the
+  UI already sends. The answer is `{ "ok": value }` or `{ "error": coded }`,
+  the same coded error string the desktop returns, so `translateError` works
+  unchanged. A command the server does not have answers `server_unsupported`
+  and is logged, since a page that still offers it is a bug.
+- `GET /api/events` is a WebSocket carrying `{ event, payload }`. A page that
+  falls behind is closed with code 4000 and reloads; one whose session ended
+  is closed with 4001 and shows the sign-in.
+- `GET /api/media/{path}` serves the library's audio and video for the
+  player, with the desktop's `ember-media` checks.
+- `GET /api/file/{path}` is *Save to this computer*: only a file in the library
+  index, opened through an approved folder, sent as an attachment.
+- `GET /api/backup` downloads the backup `export_backup_for_download` just
+  made, once; `POST /api/backup` receives one to restore, which Settings then
+  inspects and restores as it would a picked file.
+- Sign-in: `/api/session`, `/api/setup`, `/api/login`, `/api/logout`,
+  `/api/password`, and `/api/restart` for Settings' restart.
+
+The pages are the desktop UI built a second time with `npm run build:web`
+(into `build-web/`). Vite points `@tauri-apps/api/core`, `/event`, `/window`,
+`/webview` and `@tauri-apps/plugin-process` at stand-ins in
+`src/lib/runtime/web/`, and `isServer` hides or replaces what a browser cannot
+do.
+
+### Sign-in and exposure
+
+- **One password,** stored as an Argon2id hash in `emberd-auth.json`. The
+  first one is chosen with the setup code; changing it signs out every other
+  browser and keeps the one that changed it.
+- **Sessions** are random tokens in an `HttpOnly`, `SameSite=Strict` cookie,
+  `Secure` under HTTPS, kept by their SHA-256 and dropped after 30 days unused.
+- **Every request is checked.** Everything but the files, the health check and
+  sign-in needs a session or the API token; the `Origin`, if any, must be this
+  server; and a request that changes anything must carry `X-Ember-Request`,
+  which a form on another site cannot send. There are no CORS headers.
+- **Wrong passwords slow down:** three are free, then each address waits twice
+  as long as the last time, up to five minutes, even for the right one. Behind
+  a reverse proxy every browser comes from the proxy's address, so they share
+  one count.
+- **The API token** in `emberd-cli-token` lets scripts call the same interface
+  with `Authorization: Bearer`, without the same-site checks a browser needs.
+  Changing the password replaces it, so a token that leaked with the password
+  stops working too.
+- **Security headers** on everything: a Content-Security-Policy that allows the
+  page's own scripts by hash and nothing else, `nosniff`, `no-referrer`,
+  `DENY` for framing, and `no-store` for the interface and the page.
+- **The interface's listener is the one socket outside `net_bind`,** on
+  purpose: it is for the administrator, and must stay on loopback or the LAN
+  when *Connect through* keeps everything else on a VPN.
+
+### Folders and files
+
+The desktop app never lets the webview name a folder to write to or share;
+`ApprovedRootRegistry` checks every open, write, rename and delete against
+the folders the user approved. `emberd` keeps all of that and changes only how
+a folder gets approved:
+
+- **The config file names them.** At startup they are written into the
+  settings and approved, before anything is indexed. A shared folder taken out
+  of the config is unshared at the next start.
+- **The share browser lists only what is inside `browse_under`,** and refuses
+  to list, open or share anything outside it, whatever path the page sends. A
+  folder shared from it can be unshared there.
+- **The download folder, `browse_under` and the shared folders the config
+  names change only in the config.** The pages show them as set there and offer
+  no way to remove them.
+
+### Keys at rest
+
+On the desktop, `secret_store.rs` seals `identity.json` and `cryptkey.dat`
+with the system keyring, or on Linux with a key derived from
+`/etc/machine-id`. A server rarely runs a keyring and a container often has no
+machine-id, so `emberd` seals them with a **key file** of its own: 32 random
+bytes made on first start, readable by `emberd` alone, recorded as its own key
+source in each sealed file. Keep it with the data in backups; without it the
+data folder cannot be read. (On Windows, where `emberd` is not shipped, the
+account's DPAPI key is used as on the desktop.)
+
+### Restarting
+
+Settings' restart (after a restore, or changing the network interface) stops
+Ember with everything saved and starts it again in the same process, by
+`exec`, so systemd and Docker see one service throughout. The page shows
+*Lost the connection to emberd*, reconnects, and reloads.
+
+A lock file, `instance.lock` in the data folder, keeps a second `emberd`, or
+the desktop app, from opening the same data.
+
+## Features by build
+
+**Not on the server,** with what stands in:
+
+- The tray, closing to the tray, starting minimized, the window's position,
+  the splash screen and the popped-out chat window.
+- Starting at login: the systemd unit or Docker's restart policy.
+- Desktop notifications. In-app pop-ups stay.
+- Watching the clipboard for links, and `ed2k://` links from other programs:
+  pasting into the page, which reads the browser's clipboard.
+- Keeping the computer awake, and *When downloads finish*.
+- *Open file*, *Show in folder*, *Open log folder* and the external player:
+  *Save to this computer*, the in-page player, and the log path shown in
+  About.
+- Native pickers: the config file for folders, and a file sent from the
+  browser for a backup. The rest (an IP filter, a collection, a web services
+  list or eMule's folder from a file, and sending a file to a friend or a room)
+  is not offered yet.
+- Silent updates and the in-app installer: emberd is updated the way it was
+  installed.
+- The Windows Firewall fix, the AppImage font workaround, and dragging files
+  onto the Library.
+
+**Everything else is the same,** as listed under
+[What the user gets](#what-the-user-gets).
 
 ## Where it lives and how it ships
 
-- **In this repository, on the same branches.** `emberd` is built from the
-  same code as the desktop app, so a long-lived branch of its own would
-  collide with every desktop change in the files steps 1 to 5 touch. Each step
-  goes to `develop` on a short branch, as fixes do now, and ships in the next
-  desktop release. `emberd` itself is a crate beside `src-tauri` and
-  `rendezvous-server`, which already lives here with its own CI job and
-  Dockerfile.
-- **Built on every push, published only when ready.** CI checks, lints and
-  tests `emberd` like the other crates from the day it is added. Until the web
-  UI is done it is published only by a workflow run on demand, unsigned and
-  with no release, as `linux-test-build.yml` does for the desktop packages.
+- **In this repository, on the same branches,** as one crate with the desktop
+  app, so a change to shared code is built and tested for both at once.
+- **Built on every push, published when ready.** CI's `emberd` job checks,
+  lints and tests the server build on Ubuntu 22.04, and the desktop `check` job
+  builds the web interface. Until the release jobs exist, `emberd-test-build.yml`
+  builds a tarball and the Docker image on demand, unsigned and with no
+  release, as `linux-test-build.yml` does for the desktop packages.
 - **Released with the desktop app, under the same version and tag.** It speaks
-  the same network formats and its web UI is the desktop UI, so `emberd` 1.9.0
-  is desktop 1.9.0 without the window, and one set of release notes, *Before
-  you upgrade* included, holds for both. `release.yml` gains jobs that build it
-  for x86-64 and ARM64, attach the binary and the `.deb` to the release, and
-  push the Docker image. `emberd` stays out of `latest.json`, so the desktop
-  updater never offers it, and the release policy test holds that.
+  the same network formats and its pages are the desktop UI, so one set of
+  release notes holds for both. `emberd` stays out of `latest.json`, so the
+  desktop updater never offers it.
 - **A fix only `emberd` needs** goes out as a patch release that publishes
-  `emberd` alone and leaves `latest.json` as it was, so desktop users are not
-  offered an update with nothing in it.
+  `emberd` alone and leaves `latest.json` as it was.
 
-## Implementation order
+## Still to do
 
-Steps 1 to 5 change no behavior, and each lands with the desktop tests passing.
-
-1. **Host trait.** Add `Host`, implement it on `AppHandle`, and replace
-   `AppHandle` with it in the network, sharing and storage code.
-2. **Untangle the core from `commands`.** Move the 82 helpers the core
-   borrows (coded errors, `emit_transfer_status`, settings saves, path helpers)
-   into the core.
-3. **Startup and shutdown as functions.** Lift the core steps of `.setup`
-   into `ember-core::start`, and split `background::spawn`.
-4. **Command bodies on `&Ctx`.** Move each body out of its `#[tauri::command]`,
-   generate the wrappers from the one command list, and add the parity test.
-5. **Split the crates.** `ember-core` without Tauri, and CI building and
-   testing it alone.
-6. **`emberd` without a web UI.** Config, key file, lock file, signals,
-   logs, the HTTP interface with API tokens, and the command line: `amuled`
-   and `amulecmd`. Published as test builds only, not as a release (see
-   [Decisions](#decisions)).
-7. **The web UI.** The shims, the `isServer` gating, the login page, the media
-   and file routes, and the security headers.
-8. **Packaging.** The `.deb` with its systemd unit, the Docker image, docs on
-   the website, and a release workflow.
-9. **Hardening.** A security review of the interface, fuzzing its request
-   parsing, and the rate limits under load.
+1. **Release jobs** in `release.yml`: x86-64 and ARM64 tarballs, a `.deb` with
+   the systemd unit and the `emberd` user, the Docker image pushed, and the
+   release policy test holding `emberd` out of `latest.json`.
+2. **`emberd ctl`,** the command line over the same interface and the API
+   token: status, add a link, list, pause, resume and cancel downloads, search.
+3. **The remaining uploads:** an IP filter, a collection or a web services list
+   from a file, and a file for a friend or a room.
+4. **Browser notifications,** while the page is open and allowed.
+5. **Hardening:** a security review of the interface by someone who did not
+   write it, fuzzing its request parsing, and the rate limits under load.
 
 ## Testing
 
-- The Rust suite runs against both builds, and CI checks with `cargo tree`
-  that `ember-core` has no Tauri dependency.
-- The command-list parity test, and a test that every command the server
-  offers takes no desktop-only argument.
-- Interface tests start `emberd` on loopback with a scratch data folder:
-  without a session every route, the WebSocket included, refuses; a wrong
-  `Origin` or a missing custom header refuses; repeated failed logins slow down;
-  a command's answer and its coded error match the desktop's.
-- The folder rules: a path outside the configured folders is refused for
-  every file route; `browse_under` cannot be left with `..` or a symbolic link.
-- The vitest suite also runs with the web runtime, with tests for the shims.
-- A Docker smoke test: start the container, log in, add a link, stop it, and
-  check that it shut down clean (`mark_clean_shutdown`) with `nodes.dat`
-  saved.
+- The Rust suite runs against both builds, on Windows and Linux.
+- The interface's own tests cover the same-origin rule, the cookie, the
+  Content-Security-Policy, the saved file's name, the config file's rules
+  (including folders the settings would refuse), and the sign-in: the setup
+  code, wrong passwords slowing down, sessions, and a password change keeping
+  the browser that made it.
+- The shared code's tests cover the host stand-ins: command arguments and
+  results, state, events and confirmations. The browser's stand-ins have tests
+  of their own: a refused request before sign-in never reloads the page, and a
+  link opens only as a web address.
+- A settings file reset because it cannot be read keeps the network interface
+  it named, so a reset cannot send traffic out of another one, on the desktop
+  as on `emberd`.
+- Before this landed, `emberd` was run on a scratch data folder with the
+  network held offline by a network interface that does not exist, and every
+  page was used from a browser: the first visit and its setup code, signing in
+  and out, a wrong and a changed password, the share browser inside and
+  outside `browse_under`, its confirmation, sharing and unsharing, *Save to
+  this computer*, a backup downloaded and restored from an upload, Settings'
+  restart, and the page reconnecting after `emberd` was stopped and started
+  again. Every page was visited with `emberd` logging any command it does not
+  have; none was asked for.
 
 ## Decisions
 
@@ -416,38 +334,34 @@ These were the open questions. Each is settled here with its reason, so it is
 not reopened without a new one.
 
 - **The name is `emberd`:** the binary, the package, the systemd unit and the
-  Docker image, with `emberd ctl` for the command line and `emberd passwd` for
-  the password. In Ember, *server* already means an eD2K server (Settings →
-  Servers, `server.met`) or the Rendezvous server (`rendezvous-server`), so
-  `ember-server` would read as one of those. A trailing `d` is what Linux
-  administrators expect of a daemon, and what aMule's `amuled` taught eMule's
-  users.
-- **The first release includes the web UI.** The command-line build (step 6)
-  goes out as test builds only, to try the daemon's startup, shutdown and keys
-  on real servers. The people asking for this run it on a machine they reach
-  over the network, and from a command line they could only manage downloads:
-  search, friends, chat, rooms and feeds need the pages. The web UI is also the
-  cheaper half, being the desktop UI already written, and the login it needs
-  guards the command line's interface as well.
-- **Linux only at first, with no Windows or macOS server.** The requests are
-  for Linux machines, NAS boxes and Docker, and the Docker image also covers
-  Synology, Unraid and TrueNAS. On Windows the desktop app already starts at
-  login, sits in the tray and updates itself silently, which is most of what a
-  Windows user wants from a server; a Windows service would add a service
-  wrapper, session 0's differences and another installer to test. `emberd`
-  keeps nothing Linux-only outside its service glue, so either can be added
-  when someone needs it.
-- **The desktop app does not offer the web interface yet.** Turning it on would
-  put a network service on the computer that holds the user's own files, and
-  the reason to do it, using Ember from a phone, is met by running `emberd` at
+  Docker image, with `emberd passwd` for the password and `emberd ctl` for the
+  command line to come. In Ember, *server* already means an eD2K server or the
+  Rendezvous server, so `ember-server` would read as one of those. A trailing
+  `d` is what Linux administrators expect of a daemon, and what aMule's
+  `amuled` taught eMule's users.
+- **The first release includes the web interface.** The people asking for this
+  run it on a machine they reach over the network, and from a command line they
+  could only manage downloads: search, friends, chat, rooms and feeds need the
+  pages.
+- **Linux only at first.** The requests are for Linux machines, NAS boxes and
+  Docker, and the Docker image also covers Synology, Unraid and TrueNAS. On
+  Windows the desktop app already starts at login, sits in the tray and
+  updates itself. `emberd` builds and runs on Windows (it was tested there),
+  but a Windows service would need its own wrapper and installer.
+- **Plain HTTP is allowed beyond loopback, and said aloud.** The design first
+  refused to listen on the network without HTTPS. That turns the most common
+  setup, a home server reached from the same network, into certificates before
+  the first page loads, and the people it stops are the ones least able to
+  set one up. So it listens, warns in the log at every start, and the sign-in
+  page says the password travels unencrypted.
+- **The desktop app does not offer the web interface yet.** It would put a
+  network service on the computer that holds the user's own files, and the
+  reason to do it, using Ember from a phone, is met by running `emberd` at
   home. Once `emberd`'s interface has had its security review and some months
-  of use, the desktop can link the same crate behind a switch: off by default,
-  on the local network only, and with no more power over folders than the web
-  pages have.
+  of use, the desktop can offer it behind a switch: off by default, on the
+  local network only, and with no more power over folders than the pages have.
 - **The browser can share and unshare folders inside `browse_under`, and
   nothing more.** Sharing only reads files, and `browse_under`, empty unless the
   operator sets it, bounds what a stolen session could publish. The download
   folder is where files from strangers are written, so it changes only in the
-  config, as do `browse_under` itself and the shared folders the config names.
-  Those show in the browser as set in the config, and cannot be unshared there:
-  the next start would share them again, and the page would have been wrong.
+  config, as do `browse_under` and the shared folders the config names.

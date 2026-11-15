@@ -1,4 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
+import { isServer } from '$lib/runtime';
+import { saveFrom, uploadFile } from '$lib/runtime/web/files';
 
 export interface BackupSummary {
   path: string;
@@ -51,12 +53,24 @@ export interface PendingRestoreStatus {
 }
 
 /** Write an encrypted profile backup. The save location is chosen in a native
- *  dialog. `webviewPrefs` is the window's own preferences, from `collectBackupPrefs`. */
+ *  dialog; on emberd the browser saves it, and `path` is the name it saves
+ *  it as. `webviewPrefs` is the window's own preferences, from `collectBackupPrefs`. */
 export async function exportBackup(
   passphrase: string,
   webviewPrefs: Record<string, string> | null,
 ): Promise<BackupSummary | null> {
+  if (isServer) {
+    const summary = await invoke<BackupSummary>('export_backup_for_download', { passphrase, webviewPrefs });
+    saveFrom('/api/backup');
+    return summary;
+  }
   return invoke('export_backup', { passphrase, webviewPrefs });
+}
+
+/** emberd: send a backup from the browser's computer, chosen for restore as
+ *  {@link pickBackupFile} chooses one. */
+export async function uploadBackupFile(file: File): Promise<void> {
+  return uploadFile('/api/backup', file);
 }
 
 /** The window preferences a restore applied at this launch brought back, once. */

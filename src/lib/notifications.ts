@@ -36,6 +36,7 @@ import { appSettings } from '$lib/stores/settings';
 import type { AppSettings } from '$lib/types';
 import { chatWindowFocused, isChatWindow } from '$lib/windowRole';
 import { friendNotifies } from '$lib/friendSettings';
+import { isServer } from '$lib/runtime';
 
 /** The categories a user can switch off independently, keyed to their setting. */
 export type NotifyCategory =
@@ -191,6 +192,8 @@ export async function notify(
   body = '',
   friendHash?: string,
 ): Promise<void> {
+  // emberd runs on a computer nobody is looking at.
+  if (isServer) return;
   if (!shouldNotify(category, friendHash)) return;
   const trimmedTitle = title.trim();
   if (!trimmedTitle) return;

@@ -9,7 +9,7 @@ pub(in crate::network) async fn on_kad_process_tick(
     settings: &AppSettings,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     credit_manager: &Arc<RwLock<CreditManager>>,
     xfer_finish_rx: &mut mpsc::UnboundedReceiver<XferFinishResult>,
 ) {

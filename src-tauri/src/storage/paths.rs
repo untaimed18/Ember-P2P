@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tauri::Manager;
+use crate::host::Manager;
 
 /// Environment variable that overrides the resolved data directory for
 /// every Ember subsystem (config, identity, database, sharing, network,
@@ -55,7 +55,7 @@ fn env_override() -> Option<PathBuf> {
 /// already have one, but it intentionally does not affect the returned path.
 /// This keeps frontend commands, startup tasks, and the network task on the
 /// same on-disk state.
-pub fn resolve_data_dir_with_app(_app: &tauri::AppHandle) -> PathBuf {
+pub fn resolve_data_dir_with_app(_app: &crate::host::AppHandle) -> PathBuf {
     resolve_data_dir()
 }
 
@@ -100,7 +100,7 @@ fn project_dirs_fallback() -> PathBuf {
 /// `app_data_dir()` into the canonical `ProjectDirs` location. Harness runs
 /// set `EMBER_DATA_DIR`, which skips this migration so isolated node
 /// directories stay isolated.
-pub fn ensure_data_dir_with_app(app: &tauri::AppHandle) -> std::io::Result<PathBuf> {
+pub fn ensure_data_dir_with_app(app: &crate::host::AppHandle) -> std::io::Result<PathBuf> {
     let dir = resolve_data_dir();
     std::fs::create_dir_all(&dir)?;
     if env_override().is_none() {

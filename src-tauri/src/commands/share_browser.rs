@@ -241,7 +241,7 @@ fn lock_session() -> Result<std::sync::MutexGuard<'static, Option<ShareBrowserSe
         .map_err(|_| coded("sharing_browser_session", "Folder browser session is busy"))
 }
 
-fn require_main_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+fn require_main_window(window: &crate::host::WebviewWindow) -> Result<(), String> {
     if window.label() != "main" {
         return Err(coded(
             "sharing_browser_wrong_window",
@@ -669,6 +669,47 @@ fn special_folder_children() -> Vec<PendingChild> {
     out
 }
 
+/// Where browsing starts. emberd's web page may browse and share only under
+/// the folders its config lists in `browse_under`.
+#[cfg(feature = "server")]
+fn browse_roots() -> Vec<PendingChild> {
+    crate::server::browse_under()
+        .into_iter()
+        .filter(|root| root.is_dir())
+        .map(|root| {
+            let root = root.canonicalize().unwrap_or(root);
+            PendingChild {
+                name: display_fs_path(&root),
+                location: Location::Path(root),
+                kind: ShareBrowserKind::Folder,
+                letter: None,
+                size: None,
+            }
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "server"))]
+fn browse_roots() -> Vec<PendingChild> {
+    this_pc_children()
+}
+
+/// Outside every `browse_under` folder, for emberd; never, for the desktop
+/// app, which browses the whole computer.
+#[cfg(feature = "server")]
+fn outside_browse_roots(path: &Path) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    !crate::server::browse_under().iter().any(|root| {
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        path.starts_with(&root)
+    })
+}
+
+#[cfg(not(feature = "server"))]
+fn outside_browse_roots(_path: &Path) -> bool {
+    false
+}
+
 fn this_pc_children() -> Vec<PendingChild> {
     let mut children = special_folder_children();
     for (letter, path) in logical_drives() {
@@ -877,7 +918,7 @@ fn folder_name(path: &Path) -> String {
 /// shared" marks are the whole reason this browser exists over the OS dialog,
 /// and a folder added moments ago (here, by a drop, or in Settings) has to
 /// show as shared the next time it is listed.
-async fn current_shared_folders(state: &tauri::State<'_, AppState>) -> Vec<PathBuf> {
+async fn current_shared_folders(state: &crate::host::State<'_, AppState>) -> Vec<PathBuf> {
     let config = state.config.read().await;
     config
         .settings
@@ -888,7 +929,7 @@ async fn current_shared_folders(state: &tauri::State<'_, AppState>) -> Vec<PathB
 }
 
 async fn current_allowlists(
-    state: &tauri::State<'_, AppState>,
+    state: &crate::host::State<'_, AppState>,
 ) -> HashMap<String, Vec<String>> {
     state
         .config
@@ -908,7 +949,7 @@ async fn current_allowlists(
 /// write through, so it costs one key per file and no more: the roots are
 /// keyed once up front and matched by prefix.
 async fn current_offer_state(
-    state: &tauri::State<'_, AppState>,
+    state: &crate::host::State<'_, AppState>,
     shared: &[PathBuf],
 ) -> (HashSet<String>, HashMap<String, FolderOffer>) {
     let index = state.local_index.read().await;
@@ -960,18 +1001,25 @@ fn offer_state<'a>(
 
 /// Start a folder-browser session and return This PC / Computer plus its
 /// first-level children (known folders and drives).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn open_share_browser(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<ShareBrowserView, String> {
     require_main_window(&window)?;
+    #[cfg(feature = "server")]
+    if crate::server::browse_under().is_empty() {
+        return Err(coded(
+            "sharing_browse_under_unset",
+            "emberd's config names no folders to browse; list them under browse_under in [folders]",
+        ));
+    }
     let shared_folders = current_shared_folders(&state).await;
     let allowlists = current_allowlists(&state).await;
     let (unshared, offers) = current_offer_state(&state, &shared_folders).await;
     let data_dir = resolve_data_dir();
     let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
-    let roots = tokio::task::spawn_blocking(this_pc_children)
+    let roots = tokio::task::spawn_blocking(browse_roots)
         .await
         .map_err(|error| {
             coded_ctx(
@@ -990,7 +1038,9 @@ pub async fn open_share_browser(
         location: Location::ThisPc,
         kind: ShareBrowserKind::ThisPc,
         letter: None,
-        name: if cfg!(windows) {
+        name: if cfg!(feature = "server") {
+            "Server".to_string()
+        } else if cfg!(windows) {
             "This PC".to_string()
         } else {
             "Computer".to_string()
@@ -1015,10 +1065,10 @@ pub async fn open_share_browser(
 }
 
 /// List the folders and files inside a previously issued browser entry.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn list_share_browser_children(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     session_id: u64,
     entry_id: u64,
 ) -> Result<ShareBrowserView, String> {
@@ -1049,7 +1099,10 @@ pub async fn list_share_browser_children(
     };
 
     let (pending, truncated) = tokio::task::spawn_blocking(move || match location {
-        Location::ThisPc => Ok((this_pc_children(), false)),
+        Location::ThisPc => Ok((browse_roots(), false)),
+        Location::Path(path) if outside_browse_roots(&path) => {
+            Err(coded("sharing_browser_blocked", "Cannot share this location"))
+        }
         Location::Path(path) => list_child_dirs(&path, &data_dir),
     })
     .await
@@ -1079,10 +1132,10 @@ pub async fn list_share_browser_children(
 
 /// Jump the browser to a typed path. The path is listed (so it receives an
 /// entry id) rather than shared; sharing still goes through selection ids.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn navigate_share_browser(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     session_id: u64,
     path: String,
 ) -> Result<ShareBrowserView, String> {
@@ -1117,7 +1170,7 @@ pub async fn navigate_share_browser(
 
     if cfg!(windows) && crate::security::is_network_path(trimmed) {
         let shared_folders = current_shared_folders(&state).await;
-        let app = tauri::Manager::app_handle(&window).clone();
+        let app = crate::host::Manager::app_handle(&window).clone();
         if !network_location_allowed(&app, trimmed, &shared_folders).await {
             return Err(coded(
                 "sharing_browser_blocked",
@@ -1139,7 +1192,10 @@ pub async fn navigate_share_browser(
         let mut guard = lock_session()?;
         require_session(&mut guard, session_id)?.data_dir.clone()
     };
-    if path_has_sensitive_component(&resolved) || inside_data_dir(&resolved, &browser_data_dir) {
+    if path_has_sensitive_component(&resolved)
+        || inside_data_dir(&resolved, &browser_data_dir)
+        || outside_browse_roots(&resolved)
+    {
         return Err(coded(
             "sharing_browser_blocked",
             "Cannot share this location",
@@ -1576,11 +1632,10 @@ static BROWSE_APPROVED_SHARES: std::sync::Mutex<Vec<String>> = std::sync::Mutex:
 /// a path the renderer typed is never opened on its own say: a share already
 /// shared, or one the user confirms here once per session, is.
 async fn network_location_allowed(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     path: &str,
     shared_folders: &[PathBuf],
 ) -> bool {
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     if shared_folders
         .iter()
         .any(|folder| crate::security::path_within_dir(path, &folder.to_string_lossy()))
@@ -1602,21 +1657,11 @@ async fn network_location_allowed(
     let prompt = format!(
         "Open the network location {share}?\n\nOpening it connects to that computer, which can receive your Windows sign-in details. Continue only if you typed this location yourself and trust that computer."
     );
-    let dialog_app = app.clone();
-    let confirmed = tokio::task::spawn_blocking(move || {
-        dialog_app
-            .dialog()
-            .message(prompt)
-            .title("Open network location?")
-            .kind(MessageDialogKind::Warning)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "Open".to_string(),
-                "Cancel".to_string(),
-            ))
-            .blocking_show()
-    })
-    .await
-    .unwrap_or(false);
+    let confirmed = crate::host::confirm(
+        app,
+        crate::host::Confirm::new("Open network location?", prompt, "Open", "Cancel"),
+    )
+    .await;
     if confirmed && !approved() {
         let mut list = BROWSE_APPROVED_SHARES.lock().unwrap_or_else(|e| e.into_inner());
         if list.len() >= 32 {
@@ -1630,11 +1675,10 @@ async fn network_location_allowed(
 /// Ask, in a dialog the renderer can neither draw nor dismiss, whether to share
 /// `roots`. False for a dismissed dialog, and while another is still open.
 pub(crate) async fn confirm_share_roots(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     roots: &[NewShareRoot],
     origin: ShareOrigin,
 ) -> bool {
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     struct Release;
     impl Drop for Release {
         fn drop(&mut self) {
@@ -1649,19 +1693,9 @@ pub(crate) async fn confirm_share_roots(
     let release = Release;
     let (title, prompt) = share_confirmation_text(roots, origin);
     let app = app.clone();
-    // `blocking_show` waits on the main thread to pump the dialog, so it
-    // cannot run on the command's own task.
     tokio::task::spawn_blocking(move || {
         let _release = release;
-        app.dialog()
-            .message(prompt)
-            .title(title)
-            .kind(MessageDialogKind::Warning)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "Share".to_string(),
-                "Cancel".to_string(),
-            ))
-            .blocking_show()
+        crate::host::confirm_blocking(&app, crate::host::Confirm::new(title, prompt, "Share", "Cancel"))
     })
     .await
     .unwrap_or(false)
@@ -1696,8 +1730,7 @@ pub(crate) fn earlier_unshared_text(count: usize) -> (String, String) {
 /// Ask whether a widened share should also offer `count` files unshared
 /// before origins were recorded. False for a dismissed dialog, and while a
 /// share confirmation is still open.
-pub(crate) async fn confirm_share_earlier_unshared(app: &tauri::AppHandle, count: usize) -> bool {
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+pub(crate) async fn confirm_share_earlier_unshared(app: &crate::host::AppHandle, count: usize) -> bool {
     struct Release;
     impl Drop for Release {
         fn drop(&mut self) {
@@ -1712,15 +1745,8 @@ pub(crate) async fn confirm_share_earlier_unshared(app: &tauri::AppHandle, count
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
         let _release = release;
-        app.dialog()
-            .message(prompt)
-            .title(title)
-            .kind(MessageDialogKind::Info)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                if count == 1 { "Share it" } else { "Share them" }.to_string(),
-                "Keep unshared".to_string(),
-            ))
-            .blocking_show()
+        let ok = if count == 1 { "Share it" } else { "Share them" };
+        crate::host::confirm_blocking(&app, crate::host::Confirm::new(title, prompt, ok, "Keep unshared").without_warning())
     })
     .await
     .unwrap_or(false)
@@ -1735,11 +1761,11 @@ pub(crate) async fn confirm_share_earlier_unshared(app: &tauri::AppHandle, count
 /// Every folder the selection would newly share, or widen from a partial
 /// share, is put to the user in one native dialog first; declining shares
 /// nothing. Re-sharing a folder already shared whole does not ask.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn share_browser_selection(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     session_id: u64,
     entry_ids: Vec<u64>,
 ) -> Result<SharedFolderPick, String> {
@@ -1782,10 +1808,13 @@ pub async fn share_browser_selection(
     // a mapped drive, a `subst` drive or a junctioned parent is recognised as
     // the share it already is rather than added a second time.
     let picked = tokio::task::spawn_blocking(move || {
-        picked
+        if picked.iter().any(|(path, _)| outside_browse_roots(path)) {
+            return Err(coded("sharing_browser_blocked", "Cannot share this location"));
+        }
+        Ok(picked
             .into_iter()
             .map(|(path, kind)| (resolve_selected(&path, kind), kind))
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>())
     })
     .await
     .map_err(|error| {
@@ -1794,7 +1823,7 @@ pub async fn share_browser_selection(
             "Folder browser failed",
             error,
         )
-    })?;
+    })??;
     let shared_folders = current_shared_folders(&state).await;
     let allowlists = current_allowlists(&state).await;
     let lists_before = FolderListsBefore::take(&state).await;
@@ -2034,9 +2063,9 @@ pub struct ShareBrowserMeasure {
 ///
 /// Starting a measurement stops the previous one: it answered a selection that
 /// has since changed.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn measure_share_browser_entries(
-    window: tauri::WebviewWindow,
+    window: crate::host::WebviewWindow,
     session_id: u64,
     entry_ids: Vec<u64>,
 ) -> Result<ShareBrowserMeasure, String> {
@@ -2099,9 +2128,9 @@ pub async fn measure_share_browser_entries(
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn close_share_browser(
-    window: tauri::WebviewWindow,
+    window: crate::host::WebviewWindow,
     session_id: u64,
 ) -> Result<(), String> {
     require_main_window(&window)?;

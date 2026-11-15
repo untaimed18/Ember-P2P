@@ -653,7 +653,7 @@ pub(super) async fn abandon_friend_transfer_attempt(
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     pending: &upload_server::PendingKadCallbacks,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     friend: [u8; 16],
     nonce: [u8; 16],
 ) {
@@ -719,7 +719,7 @@ pub(super) async fn handle_friend_transfer_ack(
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     pending: &upload_server::PendingKadCallbacks,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ul_event_tx: &mpsc::Sender<upload_server::UploadEvent>,
     settings: &AppSettings,
     ed25519_secret_key: [u8; 32],
@@ -895,7 +895,7 @@ pub(super) async fn maybe_escalate_to_friend_transfer(
     credit_manager: &Arc<RwLock<CreditManager>>,
     friend_hashes: &Arc<RwLock<HashSet<[u8; 16]>>>,
     pending: &upload_server::PendingKadCallbacks,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_id: &str,
     ip: Ipv4Addr,
     port: u16,
@@ -996,7 +996,7 @@ pub(super) async fn route_friend_transfer_only_source(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     friend_hashes: &Arc<RwLock<HashSet<[u8; 16]>>>,
     pending: &upload_server::PendingKadCallbacks,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_id: &str,
     ip: Ipv4Addr,
     port: u16,
@@ -1046,7 +1046,7 @@ pub(super) fn friend_transfer_only_parking(
 pub(super) async fn release_sources_waiting_on_friend(
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     friend: [u8; 16],
 ) {
     for transfer_id in take_sources_waiting_on_friend(&mut state.friend_xfer_waiting, friend) {
@@ -1092,7 +1092,7 @@ async fn transfer_file_hash(
 async fn park_friend_source(
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_id: &str,
     ip: Ipv4Addr,
     port: u16,
@@ -1228,7 +1228,7 @@ pub(super) async fn drop_pending_friend_callback(
 pub(super) async fn release_friend_connect_sources(
     state: &mut NetworkState,
     transfer_manager: &Arc<RwLock<TransferManager>>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_id: &str,
 ) {
     let released = {

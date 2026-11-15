@@ -494,7 +494,7 @@ fn dm_fresh(timestamp: i64, now: i64) -> bool {
 pub(super) async fn on_private_message(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     gossip: &ember::channel::ChannelGossip,
     channel_id_hex: &str,
     ext: &ember::channel::ChannelExtFrame,
@@ -654,7 +654,7 @@ pub(super) async fn on_private_message(
 /// stopped shows as failed.
 pub(super) async fn note_peer_answer(
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     member: &str,
     accepted: bool,
     answered_at: i64,
@@ -679,7 +679,7 @@ pub(super) async fn note_peer_answer(
 
 /// Delete the private messages whose timers ran out, and tell each of their
 /// conversations. From the loop's cleanup tick, beside friend chat's.
-pub(super) async fn expire_private_messages(db: &Arc<Database>, app_handle: &tauri::AppHandle) {
+pub(super) async fn expire_private_messages(db: &Arc<Database>, app_handle: &crate::host::AppHandle) {
     let task_db = db.clone();
     let now = chrono::Utc::now().timestamp();
     let members = tokio::task::spawn_blocking(move || task_db.dm_expire_due(now))

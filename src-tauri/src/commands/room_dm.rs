@@ -3,7 +3,7 @@
 //! frames themselves are `network::room_dm`.
 
 use rand::RngCore;
-use tauri::{Emitter, Manager};
+use crate::host::{Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
@@ -161,8 +161,8 @@ fn send_frame(state: &AppState, channel_id: &str, member: [u8; 32], payload: DmP
 }
 
 /// Every conversation, newest first.
-#[tauri::command]
-pub async fn list_room_dm_threads(state: tauri::State<'_, AppState>) -> Result<Vec<DmThreadInfo>, String> {
+#[ember_macros::command]
+pub async fn list_room_dm_threads(state: crate::host::State<'_, AppState>) -> Result<Vec<DmThreadInfo>, String> {
     let db = state.db.clone();
     let ours = hex::encode(state.identity.ed25519_public_key);
     let now = chrono::Utc::now().timestamp();
@@ -194,9 +194,9 @@ pub async fn list_room_dm_threads(state: tauri::State<'_, AppState>) -> Result<V
 /// A conversation's messages, oldest first: the newest `limit` before the
 /// message at `before` (its timestamp) and `before_seq` (its row), or the
 /// newest of all.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_room_dm_messages(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     member: String,
     before: Option<i64>,
     before_seq: Option<i64>,
@@ -214,9 +214,9 @@ pub async fn get_room_dm_messages(
 }
 
 /// Write to a member privately, through a room both are in.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn send_room_dm(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     member: String,
     text: String,
 ) -> Result<DmMessage, String> {
@@ -309,8 +309,8 @@ fn send_message_frames(state: &AppState, channel: &str, member: [u8; 32], id: [u
 
 /// The disappearing-message timer chosen for the conversation with `member`,
 /// in seconds; 0 for none.
-#[tauri::command]
-pub async fn get_room_dm_disappear(state: tauri::State<'_, AppState>, member: String) -> Result<i64, String> {
+#[ember_macros::command]
+pub async fn get_room_dm_disappear(state: crate::host::State<'_, AppState>, member: String) -> Result<i64, String> {
     let member = member_hex(&member)?;
     let db = state.db.clone();
     blocking(move || db.dm_disappear_secs(&member), "channels_dm_failed", "Could not read private messages").await
@@ -318,10 +318,10 @@ pub async fn get_room_dm_disappear(state: tauri::State<'_, AppState>, member: St
 
 /// Choose the timer for what is sent to `member` from now on: one of the
 /// choices friend chat offers, or 0 for none. Messages already sent keep theirs.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_room_dm_disappear(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
     ttl_secs: i64,
 ) -> Result<(), String> {
@@ -344,10 +344,10 @@ pub async fn set_room_dm_disappear(
 }
 
 /// Accept or decline someone's first messages. They are told either way.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn answer_room_dm_request(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
     accept: bool,
 ) -> Result<(), String> {
@@ -376,10 +376,10 @@ pub async fn answer_room_dm_request(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_room_dm_read(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
 ) -> Result<(), String> {
     let member = member_hex(&member)?;
@@ -404,10 +404,10 @@ pub async fn mark_room_dm_read(
 /// Delete a conversation and everything in it, here only. A request deleted
 /// is declined, without telling its sender, and that refusal is answered
 /// with a decline if they write again while it holds.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_room_dm_thread(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
 ) -> Result<(), String> {
     let member = member_hex(&member)?;
@@ -423,10 +423,10 @@ pub async fn delete_room_dm_thread(
 /// already waiting: for a sender being ignored, who sees their messages go
 /// undelivered as if we were offline. Ignore them first, so nothing they
 /// send next opens a new one.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn drop_room_dm_request(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
 ) -> Result<(), String> {
     let key = member_key(&member)?;
@@ -445,10 +445,10 @@ pub async fn drop_room_dm_request(
 /// Try a message that was not delivered again, on the terms a new one meets:
 /// the same refusals, and a place in its room's [`DM_SEND_PER_ROOM_MINUTE`],
 /// handed back if it is not retried after all.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn retry_room_dm(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
     message_id: String,
 ) -> Result<(), String> {
@@ -499,10 +499,10 @@ pub async fn retry_room_dm(
 /// is the one private messages are dropped by. In force when this returns,
 /// not only once the network loop takes up the settings, so a request
 /// dropped next cannot be reopened by a message already on its way.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_ignored_members(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     members: Vec<IgnoredMember>,
 ) -> Result<(), String> {
     let cleaned = clean_ignored_members(members);
@@ -563,8 +563,8 @@ pub(crate) fn clean_ignored_members(members: Vec<IgnoredMember>) -> Vec<IgnoredM
 
 /// Resend ours that have not been answered, and mark those tried for long
 /// enough as not delivered. Runs for the life of the app.
-pub fn spawn_resends(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
+pub fn spawn_resends(app: crate::host::AppHandle) {
+    crate::host::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(DM_RESEND_TICK).await;
             let Some(state) = app.try_state::<AppState>() else {

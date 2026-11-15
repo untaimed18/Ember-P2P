@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use tauri::Emitter;
+use crate::host::Emitter;
 
 use super::ed2k;
 use super::ed2k::messages::OP_EMULEPROT;
@@ -598,7 +598,7 @@ pub(crate) fn send_browse_response_to_origin(
 
 pub(crate) async fn dispatch_browse_head(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     friend: [u8; 16],
 ) {
     loop {

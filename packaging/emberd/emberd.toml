@@ -1,0 +1,47 @@
+# emberd's config file: /etc/emberd/emberd.toml, or the file `--config` or
+# EMBERD_CONFIG names. Every key is optional, and an EMBERD_* environment
+# variable (shown beside each key) wins over the file. Change it, then restart
+# emberd.
+#
+# Everything else Ember does is set in the web interface's Settings, as in the
+# desktop app.
+
+# Where Ember keeps its identity, settings, library and database (EMBER_DATA_DIR).
+# The systemd unit and the Docker image set this themselves.
+# data_dir = "/var/lib/emberd/data"
+
+# The file Ember's identity and keys are sealed with (EMBERD_KEY_FILE). Made on
+# first start, readable by emberd alone. Keep it with the data folder in
+# backups: without it, that folder cannot be read.
+# key_file = "/var/lib/emberd/data/emberd-secret.key"
+
+[web]
+# Where the web interface listens (EMBERD_LISTEN). The default,
+# 127.0.0.1:4711, is this computer only. To use it from other computers, listen
+# on the network ("0.0.0.0:4711") and either give it a certificate below or put
+# it behind a reverse proxy that serves HTTPS: over plain HTTP the password and
+# everything on the page travel unencrypted.
+# listen = "127.0.0.1:4711"
+
+# A certificate and its key, in PEM files, to serve HTTPS
+# (EMBERD_TLS_CERT, EMBERD_TLS_KEY). Both or neither.
+# tls_cert = "/etc/emberd/cert.pem"
+# tls_key = "/etc/emberd/key.pem"
+
+[folders]
+# Where downloads are saved (EMBERD_DOWNLOAD_DIR). Without it, Ember's default
+# in the home folder of the user emberd runs as.
+# download = "/srv/emberd/downloads"
+
+# Folders shared in full, always (EMBERD_SHARED_DIRS, separated by ":"). The
+# web interface cannot unshare these; take one out here instead.
+# shared = ["/srv/media/music", "/srv/media/films"]
+
+# Folders the web interface may browse to share more from, and nothing outside
+# them (EMBERD_BROWSE_UNDER, separated by ":"). Without any, the web interface
+# shares only what `shared` names.
+# browse_under = ["/srv/media"]
+
+# Ember keeps out of system and private folders: no folder on a path above may
+# be named etc, usr, var, tmp, temp, .ssh, .config or the like, except the
+# folders leading to the home folder. emberd says which one at startup.

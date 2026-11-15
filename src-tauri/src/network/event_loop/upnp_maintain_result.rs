@@ -5,7 +5,7 @@ use super::*;
 pub(in crate::network) async fn on_upnp_maintain_result(
     result: UpnpMaintainResult,
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     upnp_maintain_handle: &mut Option<tokio::task::JoinHandle<()>>,
     upnp_maintain_in_flight: &mut bool,
     upnp_maintain_started_at: &mut Option<tokio::time::Instant>,
@@ -76,7 +76,7 @@ pub(in crate::network) async fn on_upnp_maintain_result(
 /// gone, the FirewallChecker's own measurement of TCP stands again. Only a
 /// measured `Firewalled` is restored; HighID records itself in the checker as
 /// a connect-back, so it reads `Open` and is left alone.
-fn reassert_checker_firewalled(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+fn reassert_checker_firewalled(state: &mut NetworkState, app_handle: &crate::host::AppHandle) {
     if state.firewalled || !state.firewall_checker.tcp_firewalled() {
         return;
     }

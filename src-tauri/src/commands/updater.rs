@@ -1924,7 +1924,7 @@ fn spawn_seed(app: &AppHandle, manifest: &SignedManifest, public_key: &str) {
         }
         queue.0 = true;
     }
-    tauri::async_runtime::spawn(async {
+    crate::host::async_runtime::spawn(async {
         // Only a panic reaches this with the task still marked running; an
         // ordinary end clears it under the lock, together with the check that
         // nothing is waiting, so no check can fall between the two.
@@ -2063,7 +2063,7 @@ async fn seed_release(job: &SeedJob) {
     };
     if wrote > 0 || pruned > 0 {
         tracing::info!("Release sharing: {wrote} file(s) of Ember {version} kept to share, {pruned} older removed");
-        use tauri::Manager;
+        use crate::host::Manager;
         if let Some(watcher) = app.state::<crate::app_state::AppState>().shared_folder_watcher.clone() {
             watcher.queue_rescan_after(vec![folder.clone()], Duration::from_secs(2));
         }
@@ -2568,7 +2568,7 @@ async fn install_locked(
 /// database closed cleanly, but this process keeps running and writing to it
 /// until the user restarts, and a crash meanwhile must still be unclean.
 fn mark_session_running(app: &AppHandle) {
-    if let Some(state) = tauri::Manager::try_state::<crate::app_state::AppState>(app) {
+    if let Some(state) = crate::host::Manager::try_state::<crate::app_state::AppState>(app) {
         state.db.mark_session_running();
     }
 }
@@ -2680,7 +2680,7 @@ fn public_failure(operation: UpdaterOperation, error: anyhow::Error) -> String {
     envelope
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn secure_updater_check(
     app: AppHandle,
     service: State<'_, UpdaterService>,
@@ -2709,7 +2709,7 @@ pub(crate) async fn run_check(
 /// The last update check's result as it applies now, or nothing before the
 /// first check. For a webview that was not listening when the scheduler's
 /// result was emitted: one still starting up, or one reloaded since.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn get_last_update_check_result(
     service: State<'_, UpdaterService>,
 ) -> Option<SecureUpdateCheckResult> {
@@ -2867,7 +2867,7 @@ pub(crate) async fn install_prepared_update(
     install_locked(app, &mut pending, &config.public_key, reason).await
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn secure_updater_install(
     app: AppHandle,
     service: State<'_, UpdaterService>,
@@ -2933,7 +2933,7 @@ pub async fn secure_updater_install(
 /// The only thing a rewritten one buys is keeping an offer alive that every other
 /// check here already has to pass, or discarding it early, which the attacker
 /// could do by deleting the file anyway.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn secure_updater_handoff_status(
     app: AppHandle,
     service: State<'_, UpdaterService>,
@@ -3074,7 +3074,7 @@ pub async fn secure_updater_handoff_status(
 /// Deliberately interactive: no silent or passive flags. The first attempt was
 /// the invisible one, and if something is going to refuse this binary the user
 /// should be able to see it happen and answer whatever prompt appears.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn secure_updater_run_saved_installer(
     app: AppHandle,
     service: State<'_, UpdaterService>,

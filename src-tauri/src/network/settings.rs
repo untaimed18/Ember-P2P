@@ -80,7 +80,7 @@ pub(super) fn apply_network_settings(
     state: &mut NetworkState,
     settings: &mut AppSettings,
     mut new_settings: AppSettings,
-    _app_handle: &tauri::AppHandle,
+    _app_handle: &crate::host::AppHandle,
 ) -> bool {
     let stun_was_enabled = state.stun_keepalive_enabled;
     state.stun_keepalive_enabled = new_settings.stun_keepalive_enabled;
@@ -219,7 +219,7 @@ pub(super) async fn apply_settings_update(
     new_settings: AppSettings,
     db: &Arc<Database>,
     identity: &Arc<crate::storage::identity::NodeIdentity>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     shared_nickname: &Arc<tokio::sync::RwLock<String>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,

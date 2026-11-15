@@ -18,7 +18,7 @@ pub(in crate::network) async fn on_cleanup_tick(
     state: &mut NetworkState,
     settings: &AppSettings,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,

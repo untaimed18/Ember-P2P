@@ -5,11 +5,17 @@
 import adapter from "@sveltejs/adapter-static";
 import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 
+// The browser build for emberd (`npm run build:web`) goes to its own folder,
+// beside the desktop app's.
+const out = process.env.EMBER_WEB === "1" ? "build-web" : "build";
+
 /** @type {import('@sveltejs/kit').Config} */
 const config = {
   preprocess: vitePreprocess(),
   kit: {
     adapter: adapter({
+      pages: out,
+      assets: out,
       fallback: "index.html",
     }),
   },

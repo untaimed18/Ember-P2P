@@ -5,7 +5,7 @@ use super::*;
 pub(in crate::network) async fn on_flood_cleanup_tick(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     banned_ips_sync_in_flight: &mut bool,
     banned_ips_sync_tx: &mpsc::UnboundedSender<Option<BannedIpsSyncInputs>>,
 ) {

@@ -80,7 +80,7 @@ pub(super) async fn take_back_stale(db: &Arc<Database>, base_url: &str) {
 /// online to take it.
 pub(super) async fn run_round(
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     base_url: &str,
     seed: &[u8; 32],
     our_pubkey: &[u8; 32],
@@ -105,7 +105,7 @@ struct MailMember {
 #[allow(clippy::too_many_arguments)]
 async fn collect(
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     base_url: &str,
     seed: &[u8; 32],
     our_pubkey: &[u8; 32],
@@ -229,7 +229,7 @@ enum Received {
 /// Keep a message a member left for us, on the terms a live one is kept on.
 async fn receive(
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     member: &MailMember,
     msg_id: [u8; 16],
     ttl_secs: u32,
@@ -299,7 +299,7 @@ fn received(kept: DmIncoming, requested: bool) -> Received {
 }
 
 /// The member collected these of ours: delivered, and their timers start.
-async fn confirm(db: &Arc<Database>, app_handle: &tauri::AppHandle, member: &MailMember, msg_ids: Vec<[u8; 16]>, now: i64) {
+async fn confirm(db: &Arc<Database>, app_handle: &crate::host::AppHandle, member: &MailMember, msg_ids: Vec<[u8; 16]>, now: i64) {
     let task_db = db.clone();
     let from = member.hex.clone();
     let delivered = tokio::task::spawn_blocking(move || {
@@ -354,7 +354,7 @@ async fn leave(base_url: &str, seed: &[u8; 32], member: &[u8; 32], day: i64, pay
 
 /// Leave ours that went unanswered live in today's box for each member who
 /// collects.
-async fn deposit(db: &Arc<Database>, app_handle: &tauri::AppHandle, base_url: &str, seed: &[u8; 32], day: i64, now: i64) {
+async fn deposit(db: &Arc<Database>, app_handle: &crate::host::AppHandle, base_url: &str, seed: &[u8; 32], day: i64, now: i64) {
     let task_db = db.clone();
     let Ok(Ok(due)) =
         tokio::task::spawn_blocking(move || task_db.dm_mail_due(now, MAIL_AFTER_SECS, COLLECTS_FOR_SECS)).await

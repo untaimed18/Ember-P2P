@@ -350,7 +350,7 @@ struct Driver {
     version: Option<String>,
     quiet_since: Option<Instant>,
     countdown_ends: Option<(Instant, i64)>,
-    prepare_task: Option<tauri::async_runtime::JoinHandle<Result<Option<String>, String>>>,
+    prepare_task: Option<crate::host::async_runtime::JoinHandle<Result<Option<String>, String>>>,
     next_prepare_at: Option<Instant>,
     activity: Option<(Instant, Activity)>,
     record: UpdateRecord,
@@ -397,7 +397,7 @@ impl TickClock {
 /// the tray exists.
 pub fn spawn(app: AppHandle) {
     note_user_activity_now();
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         loop {
             let result = std::panic::AssertUnwindSafe(run(app.clone()))
                 .catch_unwind()
@@ -507,7 +507,7 @@ impl Driver {
             self.quiet_since = None;
             if self.prepare_task.is_none() && self.next_prepare_at.is_none_or(|at| now >= at) {
                 let task_app = app.clone();
-                self.prepare_task = Some(tauri::async_runtime::spawn(async move {
+                self.prepare_task = Some(crate::host::async_runtime::spawn(async move {
                     let service = task_app.state::<UpdaterService>();
                     updater::prepare_pending_update(&task_app, &service).await
                 }));
@@ -1113,7 +1113,7 @@ fn outcome_of_attempt(attempt: &Attempt, running: &str) -> UpdateOutcome {
 // ── Commands ────────────────────────────────────────────────────────────────
 
 /// The current silent-update state, as last published.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn get_silent_update_status() -> SilentUpdateStatus {
     if let Some(status) = LAST_STATUS.lock().clone() {
         return status;
@@ -1134,7 +1134,7 @@ pub fn get_silent_update_status() -> SilentUpdateStatus {
 }
 
 /// "Update now" on the countdown.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn silent_update_now() {
     INSTALL_NOW.store(true, Ordering::Release);
 }
@@ -1150,8 +1150,8 @@ async fn record_answer(
 }
 
 /// "Not now": no silent install for the next 24 hours.
-#[tauri::command]
-pub async fn silent_update_postpone(window: tauri::WebviewWindow) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn silent_update_postpone(window: crate::host::WebviewWindow) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
     postpone().await;
     Ok(())
@@ -1170,8 +1170,8 @@ pub async fn postpone() {
 
 /// "Skip this version": never install it silently. The ordinary notice still
 /// offers it, and the next release is handled normally.
-#[tauri::command]
-pub async fn silent_update_skip(window: tauri::WebviewWindow, version: String) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn silent_update_skip(window: crate::host::WebviewWindow, version: String) -> Result<(), String> {
     // Keeps a security update from installing silently.
     crate::commands::chat_window::require_main_window(&window)?;
     let version: String = version.chars().take(64).collect();
@@ -1185,7 +1185,7 @@ pub async fn silent_update_skip(window: tauri::WebviewWindow, version: String) -
 }
 
 /// Lift a "Not now" early, from Settings → About.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn silent_update_resume() {
     ANSWERS.lock().postponed_until = Some(None);
     if let Err(error) = record_answer(|record| record.postponed_until = None).await {
@@ -1195,15 +1195,15 @@ pub async fn silent_update_resume() {
 }
 
 /// Keyboard or mouse input in a webview. The frontend throttles these.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn note_user_activity() {
     note_user_activity_now();
 }
 
 /// How the silent update this launch resumed from turned out, once, so the
 /// frontend can say so. Manual installs are not reported: the user was there.
-#[tauri::command]
-pub fn take_update_outcome(service: tauri::State<'_, ResumeService>) -> Option<UpdateOutcome> {
+#[ember_macros::command(desktop)]
+pub fn take_update_outcome(service: crate::host::State<'_, ResumeService>) -> Option<UpdateOutcome> {
     service
         .take_outcome()
         .filter(|outcome| outcome.reason == ResumeReason::Silent)
@@ -1370,7 +1370,7 @@ mod tests {
         let guard = Dropped(dropped.clone());
         let mut driver = Driver {
             version: Some("1.8.0".to_string()),
-            prepare_task: Some(tauri::async_runtime::spawn(async move {
+            prepare_task: Some(crate::host::async_runtime::spawn(async move {
                 let _guard = guard;
                 std::future::pending::<Result<Option<String>, String>>().await
             })),

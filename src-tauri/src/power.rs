@@ -48,9 +48,10 @@ const REASSERT_INTERVAL: Duration = Duration::from_secs(60);
 /// The UI asks so it can disable the toggle rather than offer a switch that
 /// does nothing. On Linux this only says an implementation exists: a session
 /// with neither a portal nor logind refuses every request, and that shows up
-/// as [`WakeLock::is_held`] staying false, not here.
+/// as [`WakeLock::is_held`] staying false, not here. `emberd` never holds one:
+/// a server is not put to sleep by an idle timer.
 pub const fn supported() -> bool {
-    cfg!(any(windows, target_os = "linux"))
+    cfg!(all(feature = "desktop", any(windows, target_os = "linux")))
 }
 
 /// A held-or-released system sleep inhibitor.
@@ -222,7 +223,7 @@ fn own_execution_state(
 }
 
 /// Set or clear this thread's inhibitor. Returns whether the OS accepted it.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "desktop"))]
 fn apply(keep_awake: bool) -> bool {
     use windows_sys::Win32::System::Power::{
         SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
@@ -248,7 +249,7 @@ fn apply(keep_awake: bool) -> bool {
 ///
 /// The lease lives in a thread-local because only the owning thread calls
 /// this, and dropping it is what releases it.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "desktop"))]
 fn apply(keep_awake: bool) -> bool {
     use std::cell::RefCell;
     thread_local! {
@@ -286,7 +287,7 @@ fn apply(keep_awake: bool) -> bool {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "desktop"))]
 mod linux {
     use std::collections::HashMap;
     use zbus::blocking::Connection;
@@ -371,7 +372,7 @@ mod linux {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(all(feature = "desktop", any(windows, target_os = "linux"))))]
 fn apply(_keep_awake: bool) -> bool {
     // No implementation on this platform (see `supported`). Reported as
     // accepted so the owning thread — which is never spawned here anyway —

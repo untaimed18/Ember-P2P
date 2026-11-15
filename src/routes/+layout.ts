@@ -6,8 +6,23 @@ import { browser } from '$app/environment';
 import { takePendingRestoredPrefs } from '$lib/api/backup';
 import { applyRestoredPrefs } from '$lib/backupPrefs';
 import { isChatWindow } from '$lib/windowRole';
+import { isServer } from '$lib/runtime';
+import { markSignedIn, readSession, type ServerSession } from '$lib/runtime/web/session';
 
 export const ssr = false;
+
+/** emberd served this page a moment ago, so a failed check is most likely it
+ *  restarting: asked again for a few seconds before the page gives up. */
+async function readSessionPatiently(): Promise<ServerSession> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await readSession();
+    } catch (error) {
+      if (attempt >= 5) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
+}
 
 /**
  * Put back the window preferences a restore applied at this launch carried.
@@ -17,8 +32,15 @@ export const ssr = false;
  * layout's `onMount` consumes one-shot startup notices a reload would lose.
  * Nothing has mounted while this runs, so reloading costs nothing.
  */
-export async function load() {
+export async function load(): Promise<{ serverLogin?: ServerSession } | undefined> {
   if (!browser || isChatWindow()) return;
+  if (isServer) {
+    // Signed out, the page is the login and nothing else: every command
+    // would be refused.
+    const session = await readSessionPatiently();
+    if (!session.authenticated) return { serverLogin: session };
+    markSignedIn();
+  }
   let prefs: Record<string, string> | null = null;
   try {
     prefs = await takePendingRestoredPrefs();

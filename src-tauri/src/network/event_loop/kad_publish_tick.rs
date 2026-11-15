@@ -7,7 +7,7 @@ pub(in crate::network) async fn on_kad_publish_tick(
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
     const KADEMLIA_TOTAL_STORE_SRC: usize = 4;
     const KADEMLIA_TOTAL_STORE_KEY: usize = 3;

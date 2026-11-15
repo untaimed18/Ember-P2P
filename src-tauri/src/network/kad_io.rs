@@ -764,7 +764,7 @@ pub(super) const UDP_FW_CANDIDATE_POOL_MAX: usize = 64;
 
 pub(super) fn dispatch_udp_firewall_probe_requests(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
 ) {
     if !state.firewall_checker.needs_udp_firewall_probes() {

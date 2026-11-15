@@ -13,7 +13,7 @@ pub(in crate::network) async fn on_stats_tick(
     settings: &AppSettings,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     stats_manager: &mut StatsManager,
     known_files: &mut KnownFileList,

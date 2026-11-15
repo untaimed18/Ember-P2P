@@ -3,8 +3,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use tauri::Emitter;
-use tauri::Manager;
+use crate::host::Emitter;
+use crate::host::Manager;
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 
 use tokio::sync::RwLock;
@@ -78,7 +79,7 @@ impl HashProgressEmitter {
         }
     }
 
-    pub(crate) fn emit(&mut self, app: &tauri::AppHandle, current: usize, total: usize, file_name: &str) {
+    pub(crate) fn emit(&mut self, app: &crate::host::AppHandle, current: usize, total: usize, file_name: &str) {
         let now = std::time::Instant::now();
         // The first update always goes out, so the bar appears immediately
         // rather than after the first interval.
@@ -1051,7 +1052,7 @@ fn row_moved_with(row: &FileInfo, mv: &FileMove) -> bool {
 /// caller to report: those files leave the Library at the next reload.
 #[must_use]
 pub(crate) async fn relocate_library_files(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     moves: &[FileMove],
 ) -> Option<String> {
@@ -1275,10 +1276,10 @@ pub struct CategoryMoveReport {
 /// anything finished before the last restart — this is the only way to file
 /// them. A file must be in the library, hashed, and inside a `Downloads` of a
 /// download folder; anything else stays where it is and is reported.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn move_files_to_category(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     paths: Vec<String>,
     category: String,
 ) -> Result<CategoryMoveReport, String> {
@@ -1536,10 +1537,10 @@ pub struct RenameReport {
 /// altered to be safe (a separator, a reserved character) is refused rather
 /// than quietly turned into a different name from the one typed. An existing
 /// file is never replaced.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn rename_library_file(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_path: String,
     new_name: String,
 ) -> Result<RenameReport, String> {
@@ -1628,10 +1629,10 @@ pub struct TagReport {
 /// false take it off, in place. Each file is renamed as [`rename_library_file`]
 /// renames one: nothing is hashed again, an existing file is never replaced,
 /// and a file that cannot be renamed keeps its name and is reported.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn tag_library_files(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     paths: Vec<String>,
     add: bool,
 ) -> Result<TagReport, String> {
@@ -1642,10 +1643,10 @@ pub async fn tag_library_files(
 /// Put back the names a [`tag_library_files`] call changed, each file at `to`
 /// renamed to the name it had at `from`, exactly as it was. Only within its
 /// own folder, and checked and recorded as the tag's own renames are.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn restore_library_file_names(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     renames: Vec<TaggedFile>,
 ) -> Result<TagReport, String> {
     let paths: Vec<String> = renames
@@ -1742,7 +1743,7 @@ fn tag_report(
 
 /// [`tag_library_files`] without the batch check, for callers inside the app.
 pub(crate) async fn tag_paths(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     paths: Vec<String>,
     add: bool,
@@ -1802,7 +1803,7 @@ pub(crate) async fn tag_paths(
 /// later try to `retry` as well. Returns the moves made, and the coded error
 /// when the partly shared folders' lists could not follow them.
 async fn rename_library_paths(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     candidates: Vec<(String, String, String)>,
     failed: &mut Vec<String>,
@@ -2132,7 +2133,7 @@ pub(crate) async fn unseed_name_tag_seen(state: &AppState) {
 /// was reseeded or reset since, so a pass over an unchanged Library does not
 /// read the whole table.
 pub(crate) async fn tag_new_shared_imports(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     cache: &mut NameTagSeenCache,
 ) {
@@ -2302,9 +2303,9 @@ pub(crate) async fn tag_new_shared_imports(
 
 /// Open a folder of the Library's tree — a shared folder or one inside it,
 /// such as a download category's — in the file manager.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_library_folder(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     folder_path: String,
 ) -> Result<(), String> {
     if folder_path.len() > MAX_PATH_LEN {
@@ -2571,7 +2572,7 @@ fn effective_shared_root_changes(
 /// replace the entire root list in one save and must revoke removed roots
 /// before any fallible network publication work.
 pub(crate) async fn reconcile_shared_folder_roots(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     removed_roots: &[String],
     added_roots: &[String],
@@ -3175,7 +3176,7 @@ fn shared_access_dirs_in(settings: &crate::types::AppSettings) -> Vec<String> {
 /// `allow_directory` cannot revoke a previous root without making a later
 /// re-add permanently inaccessible in this process.
 pub(crate) fn sync_asset_protocol_scope(
-    _app: &tauri::AppHandle,
+    _app: &crate::host::AppHandle,
     _config: &crate::storage::config::AppConfig,
 ) {
 }
@@ -3262,13 +3263,13 @@ fn parse_single_range(range: Option<&str>, length: u64) -> Result<Option<(u64, u
 /// only when the UI originally created the URL. This makes a removed share root
 /// immediately inaccessible even if a stale WebView URL is retained.
 pub(crate) async fn serve_media_request(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     encoded_path: String,
     range: Option<String>,
-) -> tauri::http::Response<Vec<u8>> {
+) -> http::Response<Vec<u8>> {
     let Some(file_path) = percent_decode_path(&encoded_path) else {
-        return tauri::http::Response::builder()
-            .status(tauri::http::StatusCode::BAD_REQUEST)
+        return http::Response::builder()
+            .status(http::StatusCode::BAD_REQUEST)
             .body(b"invalid media path".to_vec())
             .unwrap_or_default();
     };
@@ -3341,37 +3342,80 @@ pub(crate) async fn serve_media_request(
     let (canonical, length, start, end, partial, body) = match result {
         Ok(Ok(response)) => response,
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            return tauri::http::Response::builder()
-                .status(tauri::http::StatusCode::RANGE_NOT_SATISFIABLE)
+            return http::Response::builder()
+                .status(http::StatusCode::RANGE_NOT_SATISFIABLE)
                 .body(b"invalid media range".to_vec())
                 .unwrap_or_default();
         }
         _ => {
-            return tauri::http::Response::builder()
-                .status(tauri::http::StatusCode::NOT_FOUND)
+            return http::Response::builder()
+                .status(http::StatusCode::NOT_FOUND)
                 .body(b"media is unavailable".to_vec())
                 .unwrap_or_default();
         }
     };
-    let mut response = tauri::http::Response::builder()
+    let mut response = http::Response::builder()
         .status(if partial {
-            tauri::http::StatusCode::PARTIAL_CONTENT
+            http::StatusCode::PARTIAL_CONTENT
         } else {
-            tauri::http::StatusCode::OK
+            http::StatusCode::OK
         })
         .header(
-            tauri::http::header::CONTENT_TYPE,
+            http::header::CONTENT_TYPE,
             media_content_type(&canonical),
         )
-        .header(tauri::http::header::ACCEPT_RANGES, "bytes")
-        .header(tauri::http::header::CONTENT_LENGTH, body.len().to_string());
+        .header(http::header::ACCEPT_RANGES, "bytes")
+        .header(http::header::CONTENT_LENGTH, body.len().to_string());
     if partial {
         response = response.header(
-            tauri::http::header::CONTENT_RANGE,
+            http::header::CONTENT_RANGE,
             format!("bytes {start}-{end}/{length}"),
         );
     }
     response.body(body).unwrap_or_default()
+}
+
+/// emberd's "Save to this computer": a Library file opened for the browser to
+/// download, with its length and Library name. The containment of
+/// [`serve_media_request`], without its media-type rule: the file is saved,
+/// never shown.
+#[cfg(feature = "server")]
+pub(crate) async fn open_library_file_for_download(
+    app: &crate::host::AppHandle,
+    encoded_path: &str,
+) -> Option<(std::fs::File, u64, String)> {
+    let file_path = percent_decode_path(encoded_path)?;
+    let (allowed_dirs, indexed) = {
+        let state = app.state::<AppState>();
+        let config = state.config.read().await;
+        let allowed_dirs = shared_access_dirs(&config);
+        drop(config);
+        let index = state.local_index.read().await;
+        let indexed = index.get_by_path(&file_path).map(|file| {
+            (
+                crate::search::index::normalize_path_key(&file.path),
+                file.name.clone(),
+            )
+        });
+        (allowed_dirs, indexed)
+    };
+    let (key, name) = indexed?;
+    tokio::task::spawn_blocking(move || {
+        let (canonical, file) = crate::security::filesystem::open_existing_approved(
+            std::path::Path::new(&file_path),
+            &allowed_dirs,
+            false,
+        )
+        .ok()?;
+        if crate::search::index::normalize_path_key(&canonical.to_string_lossy()) != key {
+            return None;
+        }
+        let length = file.metadata().ok()?.len();
+        Some((file, length, name))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// `shared_folders` must be the stored shared list (or a subset of it, or
@@ -3390,7 +3434,7 @@ pub(crate) fn file_in_shared_folders(file_path: &str, shared_folders: &[String])
 /// renderer can neither draw nor answer. `permanently` is the user's Settings
 /// choice to skip the bin, which itself took a native confirmation to make.
 pub(crate) async fn recycle_library_file(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     path: &std::path::Path,
     allowed_roots: &[String],
     expected: &crate::security::filesystem::ObjectIdentity,
@@ -3449,26 +3493,16 @@ pub(crate) async fn recycle_library_file(
         .unwrap_or_else(|| "it is on a network location".to_string());
     tracing::warn!("Could not move {} to the Recycle Bin: {recycle_error}", path.display());
 
-    let confirm_app = app.clone();
     let prompt = format!(
         "This file cannot be moved to the Recycle Bin{}:\n\n{}\n\nDelete it permanently? This cannot be undone.",
         if on_network { " (it is on a network location)" } else { "" },
         crate::commands::settings::elide_for_dialog(&path.to_string_lossy())
     );
-    let confirmed = tokio::task::spawn_blocking(move || {
-        confirm_app
-            .dialog()
-            .message(prompt)
-            .title("Delete permanently?")
-            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                "Delete permanently".to_string(),
-                "Keep file".to_string(),
-            ))
-            .blocking_show()
-    })
-    .await
-    .unwrap_or(false);
+    let confirmed = crate::host::confirm(
+        app,
+        crate::host::Confirm::new("Delete permanently?", prompt, "Delete permanently", "Keep file"),
+    )
+    .await;
     if !confirmed {
         return Err(coded(
             "sharing_delete_declined",
@@ -3753,7 +3787,7 @@ fn hash_top_up() -> &'static tokio::sync::Mutex<HashTopUp> {
 /// Additive: a second scan while one is running appends to the same queue
 /// rather than starting a competing pass, which is what keeps the per-device
 /// read limits meaningful.
-pub(crate) async fn queue_hash_top_up(app: tauri::AppHandle, files: &[FileInfo]) {
+pub(crate) async fn queue_hash_top_up(app: crate::host::AppHandle, files: &[FileInfo]) {
     // No early return for an empty `files`: a pass that brings nothing new
     // still has to restart what a Stop left queued, which happens below.
     // Returning first left that queue idle after a Resume until next launch.
@@ -3817,7 +3851,7 @@ pub(crate) async fn queue_hash_top_up(app: tauri::AppHandle, files: &[FileInfo])
 
 /// A folder scan ended before it could index anything. Logged only, this left
 /// the Library showing a scan that never finished, with no word of why.
-pub(crate) fn report_scan_failure(app: &tauri::AppHandle, folder: Option<&str>) {
+pub(crate) fn report_scan_failure(app: &crate::host::AppHandle, folder: Option<&str>) {
     let _ = app.emit(
         "file-hash-progress",
         serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }),
@@ -3868,7 +3902,7 @@ pub(crate) async fn hash_top_up_progress() -> Option<(usize, usize)> {
 /// and is served throughout, so there is no pending id to finalize, nothing to
 /// abandon on failure, and cancelling costs only the work not yet done. A file
 /// that fails, or that changed underneath us, is just left for next time.
-async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
+async fn run_hash_top_up(app: crate::host::AppHandle, cancel: Arc<AtomicBool>) {
     let state = app.state::<AppState>();
     let local_index = state.local_index.clone();
     let file_cache = state.cached_shared_files.clone();
@@ -4159,7 +4193,7 @@ async fn run_hash_top_up(app: tauri::AppHandle, cancel: Arc<AtomicBool>) {
 /// Have the Library show the roots and digests the pass has added. It reloads
 /// on `shared-files-changed` alone, so a refreshed cache without the event left
 /// a new AICH badge unseen until the page was opened again.
-fn emit_top_up_progress(app: &tauri::AppHandle) {
+fn emit_top_up_progress(app: &crate::host::AppHandle) {
     let _ = app.emit("shared-files-changed", serde_json::json!({ "phase": "digests" }));
 }
 
@@ -5022,8 +5056,8 @@ pub(crate) enum FolderAddOutcome {
 ///   Phase 1: discover files (metadata only) → show in UI via event
 ///   Phase 2: hash files one at a time → update UI + publish to KAD
 pub(crate) async fn add_shared_folder(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     path: String,
 ) -> Result<FolderAdd, String> {
     add_shared_folder_limited(app, state, path, None).await
@@ -5139,28 +5173,18 @@ async fn extend_folder_allowlist(
 /// arrives here. The in-app browser asks once for its whole selection instead,
 /// drive warning included, so it is not asked a second time; see
 /// [`ShareApproval::Confirmed`].
-pub(crate) async fn confirm_drive_root_share(app: &tauri::AppHandle, root: &std::path::Path) -> bool {
-    use tauri_plugin_dialog::{MessageDialogButtons, MessageDialogKind};
+pub(crate) async fn confirm_drive_root_share(app: &crate::host::AppHandle, root: &std::path::Path) -> bool {
     let shown = crate::commands::share_browser::display_fs_path(root);
     let prompt = format!(
         "Share the entire drive {}?\n\nEvery file on it, in every folder, will be offered to other peers. \
          Only do this for a drive that holds nothing but files you mean to share.",
         crate::commands::settings::elide_for_dialog(&shown)
     );
-    let app = app.clone();
-    tokio::task::spawn_blocking(move || {
-        app.dialog()
-            .message(prompt)
-            .title("Share a whole drive?")
-            .kind(MessageDialogKind::Warning)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                "Share the drive".to_string(),
-                "Cancel".to_string(),
-            ))
-            .blocking_show()
-    })
+    crate::host::confirm(
+        app,
+        crate::host::Confirm::new("Share a whole drive?", prompt, "Share the drive", "Cancel"),
+    )
     .await
-    .unwrap_or(false)
 }
 
 /// [`add_shared_folder`], optionally offering only `only` out of the folder:
@@ -5185,8 +5209,8 @@ pub(crate) async fn confirm_drive_root_share(app: &tauri::AppHandle, root: &std:
 /// path the renderer named; those go through [`add_shared_folder_approved`]
 /// with the roots the user confirmed natively.
 pub(crate) async fn add_shared_folder_limited(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     path: String,
     only: Option<Vec<String>>,
 ) -> Result<FolderAdd, String> {
@@ -5220,8 +5244,8 @@ impl ShareApproval<'_> {
 
 /// [`add_shared_folder_limited`] under an explicit [`ShareApproval`].
 pub(crate) async fn add_shared_folder_approved(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     path: String,
     only: Option<Vec<String>>,
     approval: ShareApproval<'_>,
@@ -6086,11 +6110,11 @@ pub struct SharedFolderPick {
 /// locations, unusual devices). The Library's primary add-folder UI is
 /// [`crate::commands::share_browser`], which lists folders and shares by
 /// session token rather than by a path the renderer invented.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_shared_folder(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     title: Option<String>,
 ) -> Result<SharedFolderPick, String> {
     let dialog_title = super::picker_title(title, "Choose folders to share");
@@ -6207,7 +6231,7 @@ const DROP_CONFIRM_FOLDER_COUNT: usize = 8;
 /// whole feature and a drop that shares nothing would look exactly like one the
 /// app never received. Unlike the picker there is no return value to carry
 /// either — the drop arrives on a window event, with no call to fail.
-fn emit_drop_result(app: &tauri::AppHandle, added: usize, failed: usize) {
+fn emit_drop_result(app: &crate::host::AppHandle, added: usize, failed: usize) {
     if added > 0 {
         let _ = app.emit(
             "shared-folders-added",
@@ -6236,7 +6260,7 @@ fn emit_drop_result(app: &tauri::AppHandle, added: usize, failed: usize) {
 /// here is folder-granular, so the only thing a file can mean is "share the
 /// folder holding it", which is a much larger action than the gesture implies
 /// and is therefore put to the user first.
-pub async fn share_dropped_paths(app: tauri::AppHandle, paths: Vec<std::path::PathBuf>) {
+pub async fn share_dropped_paths(app: crate::host::AppHandle, paths: Vec<std::path::PathBuf>) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
@@ -6387,7 +6411,7 @@ pub async fn share_dropped_paths(app: tauri::AppHandle, paths: Vec<std::path::Pa
 /// whole folder again would also republish files the user unshared one at a
 /// time outside them. One shared whole and nothing more is left as it is.
 async fn share_partial_folder_whole(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     folder: &str,
 ) -> Result<(), String> {
@@ -6437,8 +6461,8 @@ fn rewhole_targets(folder: &str, listed: Vec<String>) -> Vec<String> {
 /// to the native window, and a round trip through the renderer would make it
 /// something the renderer chose instead.
 async fn queue_drop_confirmation(
-    app: &tauri::AppHandle,
-    state: &tauri::State<'_, AppState>,
+    app: &crate::host::AppHandle,
+    state: &crate::host::State<'_, AppState>,
     folders: Vec<String>,
     files: Vec<String>,
     reason: &'static str,
@@ -6490,10 +6514,10 @@ async fn queue_drop_confirmation(
 /// the whole folder a dropped file sits in, or a whole drive, is put to the
 /// user again in a native dialog first, since the renderer could otherwise
 /// pick "the whole folder" on the user's behalf.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn confirm_dropped_folders(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     token: u64,
     only_dropped_files: Option<bool>,
 ) -> Result<usize, String> {
@@ -6721,9 +6745,9 @@ fn outermost_folders(folders: Vec<String>) -> Vec<String> {
 
 /// Discard a pending dropped-file prompt the user declined, so a later
 /// confirmation cannot resurrect it.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn dismiss_dropped_folders(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     token: u64,
 ) -> Result<(), String> {
     let mut pending = state.pending_folder_drop.lock().await;
@@ -6733,12 +6757,24 @@ pub async fn dismiss_dropped_folders(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_shared_folder(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    // A folder `emberd.toml` names is shared again at the next start, so the
+    // web interface cannot take it off the list.
+    #[cfg(feature = "server")]
+    if crate::server::operator_shared_folders()
+        .iter()
+        .any(|folder| crate::search::index::normalize_path_key(folder) == crate::search::index::normalize_path_key(&path))
+    {
+        return Err(coded(
+            "sharing_folder_set_in_config",
+            "This folder is shared by emberd's config file; take it out there",
+        ));
+    }
     remove_shared_folder_as(app, state, path, FolderRemoval::User).await
 }
 
@@ -6754,8 +6790,8 @@ pub(crate) enum FolderRemoval {
 }
 
 pub(crate) async fn remove_shared_folder_as(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     path: String,
     by: FolderRemoval,
 ) -> Result<(), String> {
@@ -7038,9 +7074,9 @@ const MAX_LIBRARY_HASH_QUERY: usize = 20_000;
 /// the search result that would download it again. For "hide files I already
 /// have" in Search and the clipboard links offer, which would otherwise pull
 /// every library row over IPC to answer a yes or no.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn library_hashes_among(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     hashes: Vec<String>,
 ) -> Result<Vec<String>, String> {
     if hashes.len() > MAX_LIBRARY_HASH_QUERY {
@@ -7102,9 +7138,9 @@ pub struct SharedFilesSnapshot {
 
 /// Hashing the cached rows costs a fraction of cloning, serializing and
 /// shipping them, so a Library refresh with nothing new skips all three.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_shared_files_if_changed(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     etag: Option<String>,
 ) -> Result<SharedFilesSnapshot, String> {
     let cached = state.cached_shared_files.read().await;
@@ -7131,9 +7167,9 @@ pub struct SharedFileStats {
     pub total_bytes: u64,
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_shared_file_count(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<SharedFileStats, String> {
     let cached = state.cached_shared_files.read().await;
     let mut count = 0usize;
@@ -7152,9 +7188,9 @@ const MAX_LIBRARY_HASH_CHECK: usize = 5_000;
 /// Which of `hashes` (eD2K MD4 hex, any case) are in the library, shared or
 /// not, returned lowercased. Lets a caller mark files the user already has
 /// without shipping the whole `Vec<FileInfo>` over IPC.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn library_has_hashes(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     hashes: Vec<String>,
 ) -> Result<Vec<String>, String> {
     if hashes.len() > MAX_LIBRARY_HASH_CHECK {
@@ -7203,8 +7239,8 @@ fn hashes_in_library<'a>(
     found
 }
 
-#[tauri::command]
-pub async fn get_shared_folders(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+#[ember_macros::command]
+pub async fn get_shared_folders(state: crate::host::State<'_, AppState>) -> Result<Vec<String>, String> {
     let config = state.config.read().await;
     Ok(config.settings.shared_folders.clone())
 }
@@ -7216,9 +7252,9 @@ pub async fn get_shared_folders(state: tauri::State<'_, AppState>) -> Result<Vec
 /// comes back with its drive, and re-approving it could not capture anything.
 /// Nor is a network share with no approval record, which is not looked at:
 /// that would connect to its server and offer it the user's credentials.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_unapproved_shared_folders(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
     let folders = state.config.read().await.settings.shared_folders.clone();
     let Ok(registry) = crate::security::filesystem::approved_roots() else {
@@ -7256,7 +7292,7 @@ fn unapproved_among(
 /// scan of just these, as adding a folder does. While hashing is stopped the
 /// walk waits for the resume, as the watcher's changes do: a full reload
 /// would undo the Stop. Returns whether it waits.
-async fn scan_reapproved_folders(app: &tauri::AppHandle, folders: &[String]) -> bool {
+async fn scan_reapproved_folders(app: &crate::host::AppHandle, folders: &[String]) -> bool {
     let state = app.state::<AppState>();
     if defer_while_hashing_paused(&state.hashing_paused, &state.hashing_fs_dirty) {
         info!("Hashing is stopped; re-approved shared folders will be scanned on resume");
@@ -7288,7 +7324,7 @@ pub struct ReapproveReport {
 }
 
 impl ReapproveReport {
-    async fn after_scan(app: &tauri::AppHandle, approved: Vec<String>) -> Self {
+    async fn after_scan(app: &crate::host::AppHandle, approved: Vec<String>) -> Self {
         let scan_on_resume = scan_reapproved_folders(app, &approved).await;
         Self { approved, scan_on_resume }
     }
@@ -7320,10 +7356,10 @@ const REAPPROVE_ALL_LISTED: usize = 8;
 /// every share's approval is tied to the volume and file IDs it was given on,
 /// so all of them lapse at once, and approving them one dialog at a time was a
 /// chore the Library did not even explain.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn reapprove_shared_folders(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<ReapproveReport, String> {
     let registry = crate::security::filesystem::approved_roots()
         .map_err(|error| coded_ctx("sharing_reapprove_failed", "Could not re-approve the folders", error))?;
@@ -7347,16 +7383,10 @@ pub async fn reapprove_shared_folders(
             "Ember no longer recognises these shared folders:\n\n{}\n\nThis happens after restoring a backup on a new or reinstalled computer, or after a drive is reconnected. Re-approve them only if they are still your folders. If something else was put at one of these paths, re-approving shares whatever is there now.",
             list.join("\n")
         );
-        let approved = dialog_app
-            .dialog()
-            .message(prompt)
-            .title("Re-approve shared folders?")
-            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                "Re-approve all".to_string(),
-                "Keep blocked".to_string(),
-            ))
-            .blocking_show();
+        let approved = crate::host::confirm_blocking(
+            &dialog_app,
+            crate::host::Confirm::new("Re-approve shared folders?", prompt, "Re-approve all", "Keep blocked"),
+        );
         Some((pending, approved))
     })
     .await
@@ -7416,10 +7446,10 @@ pub async fn reapprove_shared_folders(
 /// after a drive was reconnected and exactly wrong after something else was
 /// put there, so the renderer may ask but only the user can answer: the dialog
 /// is drawn by the OS, where the webview cannot reach it.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn reapprove_shared_folder(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     path: String,
 ) -> Result<ReapproveReport, String> {
     let is_shared = |settings: &crate::types::AppSettings| settings.shared_folders.contains(&path);
@@ -7445,18 +7475,10 @@ pub async fn reapprove_shared_folder(
         if dialog_registry.verify_root(target).is_ok() {
             return Ok(None);
         }
-        Ok(Some(
-            dialog_app
-                .dialog()
-                .message(prompt)
-                .title("Re-approve shared folder?")
-                .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-                .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                    "Re-approve".to_string(),
-                    "Keep blocked".to_string(),
-                ))
-                .blocking_show(),
-        ))
+        Ok(Some(crate::host::confirm_blocking(
+            &dialog_app,
+            crate::host::Confirm::new("Re-approve shared folder?", prompt, "Re-approve", "Keep blocked"),
+        )))
     })
     .await
     .map_err(|error| coded_ctx("sharing_task_failed", "Task failed", error))??;
@@ -7542,9 +7564,9 @@ pub(crate) fn extract_media_metadata(path: &str) -> Option<crate::types::MediaMe
 /// properties drawer). Restricted to files inside shared folders so the IPC
 /// surface can't be used to probe arbitrary paths. Returns `None` when the
 /// file isn't a recognized media file.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_file_media_metadata(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_path: String,
 ) -> Result<Option<crate::types::MediaMetadata>, String> {
     let _single_flight = crate::security::try_begin_single_flight(&MEDIA_METADATA_IN_FLIGHT)
@@ -7596,9 +7618,9 @@ pub async fn get_file_media_metadata(
 }
 
 /// Current per-folder default upload priorities (folder path -> priority).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_folder_priorities(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     let config = state.config.read().await;
     Ok(config.settings.folder_priorities.clone())
@@ -7608,9 +7630,9 @@ pub async fn get_folder_priorities(
 /// for a shared folder. The default is persisted and applied immediately to
 /// every file currently indexed under the folder, mirroring eMule's
 /// per-directory priority. Returns the number of files updated.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_folder_priority(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     folder_path: String,
     priority: String,
 ) -> Result<u32, String> {
@@ -7738,9 +7760,9 @@ pub async fn set_folder_priority(
     Ok(changed.len() as u32)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_file_priority(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_path: String,
     priority: String,
 ) -> Result<(), String> {
@@ -7806,9 +7828,9 @@ pub async fn set_file_priority(
 /// the number of files actually updated (paths that did not match a known
 /// shared file are silently skipped). Cuts N invoke round-trips down to 1
 /// for the library multi-select action.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn batch_set_priority(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_paths: Vec<String>,
     priority: String,
 ) -> Result<u32, String> {
@@ -7880,8 +7902,8 @@ pub async fn batch_set_priority(
 /// Bulk-share many files. Returns the count of files actually flipped to
 /// shared (already-shared paths and unknown paths contribute 0).
 pub async fn batch_share(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
     check_path_batch(&file_paths, MAX_BATCH_IDS)?;
@@ -7917,10 +7939,10 @@ static FRIENDS_SCOPE_CHANGE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 /// it out of the ed2k offer list and the KAD publish set, so an already
 /// published file stops being discoverable rather than merely being hidden
 /// from browse.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_files_friends_only(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_paths: Vec<String>,
     friends_only: bool,
 ) -> Result<u32, String> {
@@ -8036,7 +8058,7 @@ pub async fn set_files_friends_only(
 /// `before` is how the folder lists stood before the promotion; see
 /// [`admit_known_files`].
 pub(crate) async fn share_all_in_folder(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     state: &AppState,
     folder: &str,
     before: &FolderListsBefore,
@@ -8048,7 +8070,7 @@ pub(crate) async fn share_all_in_folder(
 /// [`share_all_in_folder`] for a caller that has already run
 /// [`admit_known_files`] over `folder`.
 pub(crate) async fn offer_all_in_folder(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     state: &AppState,
     folder: &str,
 ) -> Result<Vec<String>, String> {
@@ -8119,7 +8141,7 @@ impl FolderListsBefore {
 /// unshared before origins were recorded is offered only if the user agrees
 /// in a native dialog. Best effort: on failure the files stay unshared.
 pub(crate) async fn admit_known_files(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     before: &FolderListsBefore,
     under: &[String],
@@ -8272,10 +8294,10 @@ fn newly_admitted_unshared<'a>(
 
 /// Bulk-unshare many files in a single Tauri call. Returns the count of
 /// files actually flipped to unshared.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn batch_unshare(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
     check_path_batch(&file_paths, MAX_BATCH_IDS)?;
@@ -8307,10 +8329,10 @@ pub async fn batch_unshare(
 /// partly shared folder withheld goes back on that folder's allowlist first:
 /// [`batch_share`] keeps a file the lists do not offer unshared, and the next
 /// scan would unshare it again.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn share_library_files(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_paths: Vec<String>,
 ) -> Result<u32, String> {
     check_path_batch(&file_paths, MAX_BATCH_IDS)?;
@@ -8390,10 +8412,10 @@ fn readmit_keys(
     added
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn reload_shared_files(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<(), String> {
     reload_shared_files_page(app, &state, MAX_CHAINED_SCAN_PAGES, None).await
 }
@@ -8407,7 +8429,7 @@ pub async fn reload_shared_files(
 /// the wrong price for one file landing in one folder — and it was paid on
 /// every coalescing window for as long as anything kept writing.
 pub(crate) async fn rescan_shared_paths(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     state: &AppState,
     paths: Vec<std::path::PathBuf>,
 ) -> Result<(), String> {
@@ -8661,7 +8683,7 @@ fn split_scoped_discoveries(
 }
 
 /// Rescan files left to settle once the newest of them has gone quiet.
-fn schedule_settle_recheck(app: &tauri::AppHandle, settling: &[FileInfo], now: i64) {
+fn schedule_settle_recheck(app: &crate::host::AppHandle, settling: &[FileInfo], now: i64) {
     let newest = settling
         .iter()
         .map(|file| file.modified_at)
@@ -8696,7 +8718,7 @@ fn schedule_settle_recheck(app: &tauri::AppHandle, settling: &[FileInfo], now: i
 /// Scan `paths` now, the way a filesystem event would: files and folders a
 /// partly shared folder has just taken on, which discovery left alone while
 /// they were off its allowlist and so are not in the index to be shared.
-pub(crate) fn queue_rescan(app: &tauri::AppHandle, paths: Vec<std::path::PathBuf>) {
+pub(crate) fn queue_rescan(app: &crate::host::AppHandle, paths: Vec<std::path::PathBuf>) {
     if paths.is_empty() {
         return;
     }
@@ -8719,7 +8741,7 @@ pub(crate) fn queue_rescan(app: &tauri::AppHandle, paths: Vec<std::path::PathBuf
 /// same reason as [`chained_scan_page`]: it is mutually recursive with
 /// [`reload_shared_files_page`].
 fn settle_recheck_without_watcher(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     paths: Vec<std::path::PathBuf>,
     wait: std::time::Duration,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
@@ -8753,7 +8775,7 @@ fn settle_recheck_without_watcher(
 /// [`reload_shared_files_page`], which needs one concrete future type to
 /// terminate the type cycle on.
 fn chained_scan_page(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     chained_pages_left: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move {
@@ -8810,7 +8832,7 @@ fn chained_scan_page(
 /// Register the next chained page as a tracked background scan so shutdown can
 /// abort it, instead of leaving an untracked task able to start a fresh scan
 /// while the exit flush is running.
-pub(crate) async fn schedule_chained_scan_page(app: tauri::AppHandle, chained_pages_left: u32) {
+pub(crate) async fn schedule_chained_scan_page(app: crate::host::AppHandle, chained_pages_left: u32) {
     let handle = tokio::spawn(chained_scan_page(app.clone(), chained_pages_left));
     if let Some(state) = app.try_state::<AppState>() {
         state.register_background_scan(handle).await;
@@ -8821,7 +8843,7 @@ pub(crate) async fn schedule_chained_scan_page(app: tauri::AppHandle, chained_pa
 /// queue for itself; see [`MAX_CHAINED_SCAN_PAGES`]. `scope` limits the pass to
 /// those paths; see [`rescan_shared_paths`].
 async fn reload_shared_files_page(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     state: &AppState,
     chained_pages_left: u32,
     scope: Option<Vec<std::path::PathBuf>>,
@@ -9634,18 +9656,18 @@ async fn reload_shared_files_page(
     Ok(())
 }
 
-#[tauri::command]
-pub fn get_hashing_paused(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[ember_macros::command]
+pub fn get_hashing_paused(state: crate::host::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.hashing_paused.load(Ordering::Relaxed))
 }
 
-#[tauri::command]
-pub fn get_scan_status(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[ember_macros::command]
+pub fn get_scan_status(state: crate::host::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.scanning_count.load(Ordering::Relaxed) > 0)
 }
 
-#[tauri::command]
-pub fn get_library_scan_truncated(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[ember_macros::command]
+pub fn get_library_scan_truncated(state: crate::host::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.library_scan_truncated.load(Ordering::Relaxed))
 }
 
@@ -9713,13 +9735,13 @@ async fn folders_losing_files_on_stop(state: &AppState) -> Vec<String> {
 ///
 /// Read-only, so the confirmation dialog can say what will actually happen
 /// rather than warning by default.
-#[tauri::command]
-pub async fn preview_stop_hashing(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+#[ember_macros::command]
+pub async fn preview_stop_hashing(state: crate::host::State<'_, AppState>) -> Result<Vec<String>, String> {
     Ok(folders_losing_files_on_stop(&state).await)
 }
 
-#[tauri::command]
-pub async fn stop_hashing(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+#[ember_macros::command]
+pub async fn stop_hashing(state: crate::host::State<'_, AppState>) -> Result<Vec<String>, String> {
     // Latch pause before signalling cancel so a concurrent FS-watcher tick
     // cannot start a new reload that races past the cancel flags.
     state.hashing_paused.store(true, Ordering::Relaxed);
@@ -9746,23 +9768,23 @@ pub async fn stop_hashing(state: tauri::State<'_, AppState>) -> Result<Vec<Strin
 /// Polled rather than pushed: it is a quiet, hours-long background pass, and an
 /// event per file would be thousands of webview wakeups to move a number the
 /// user is not watching.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn hash_top_up_status() -> Result<Option<(usize, usize)>, String> {
     Ok(hash_top_up_progress().await)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn resume_hashing(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<(), String> {
     reload_shared_files(app, state).await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn unshare_file(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_path: String,
     file_hash: Option<String>,
 ) -> Result<(), String> {
@@ -9955,10 +9977,10 @@ fn add_withheld(
     added
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn unshare_folder(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
     // The allowlist and row changes below are drive-aware, so a request naming
@@ -9991,10 +10013,10 @@ pub async fn unshare_folder(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_shared_file(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_path: String,
     file_hash: Option<String>,
 ) -> Result<(), String> {
@@ -10030,7 +10052,7 @@ pub(crate) async fn indexed_library_entry(state: &AppState, path: &str) -> Optio
 /// known.met, and every network it was published on. Returns the canonical
 /// path deleted and whether the index still held the row when it was removed.
 pub(crate) async fn delete_indexed_library_file(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     file_path: &str,
 ) -> Result<(std::path::PathBuf, bool), String> {
@@ -10150,9 +10172,9 @@ pub(crate) async fn delete_indexed_library_file(
 /// `paths` is capped at [`MAX_SCAN_MISSING_RESULTS`]; when the cap is hit,
 /// `truncated` is true and `total_missing` still reflects the full count so
 /// the UI can warn instead of silently under-counting.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn scan_missing_files(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<MissingScanResult, String> {
     // Offered files only. The Library lists what peers can download, so a
     // count that also included files the user has taken off the network
@@ -10270,10 +10292,10 @@ impl MissingCheck {
 /// they no longer exist on disk. This double-check protects against races
 /// where a file reappears (e.g. an external drive mounts back) between the
 /// missing-scan and the user's confirmation click.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_missing_files(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<u32, String> {
     if paths.is_empty() {
@@ -10333,9 +10355,9 @@ pub async fn remove_missing_files(
     Ok(removed)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn republish_file(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
     let cleaned = file_hash.trim().to_lowercase();
@@ -10367,9 +10389,9 @@ pub async fn republish_file(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_shared_file(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_path: String,
 ) -> Result<(), String> {
     if file_path.len() > MAX_PATH_LEN {
@@ -10432,9 +10454,9 @@ pub async fn open_shared_file(
 
 /// Validate that `file_path` is a real file inside a shared/download folder and
 /// return its canonical path for `convertFileSrc` / in-app media playback.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn resolve_media_asset_path(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_path: String,
 ) -> Result<String, String> {
     if file_path.len() > MAX_PATH_LEN {
@@ -10476,9 +10498,9 @@ pub async fn resolve_media_asset_path(
     .map_err(|e| coded_ctx("sharing_task_failed", "Task failed", e))?
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_shared_folder(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_path: String,
 ) -> Result<(), String> {
     if file_path.len() > MAX_PATH_LEN {

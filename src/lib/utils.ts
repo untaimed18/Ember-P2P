@@ -1,5 +1,6 @@
 import { getLocale } from '$lib/i18n';
 import { noteOwnClipboardText } from '$lib/clipboardOwn';
+import { isServer } from '$lib/runtime';
 
 /**
  * Format a byte count as a human-readable string (e.g. "1.5 MB", "1,5 Mo").
@@ -498,12 +499,16 @@ export { TimeoutError, withTimeout } from './timeout';
  */
 export async function copyToClipboard(text: string): Promise<boolean> {
   noteOwnClipboardText(text);
-  try {
-    const { writeClipboardText } = await import('$lib/api/system');
-    await writeClipboardText(text);
-    return true;
-  } catch {
-    // Fall through to the webview paths.
+  // emberd's clipboard is the server's. A browser copies only while the
+  // click that asked is still being handled, so its own paths go first.
+  if (!isServer) {
+    try {
+      const { writeClipboardText } = await import('$lib/api/system');
+      await writeClipboardText(text);
+      return true;
+    } catch {
+      // Fall through to the webview paths.
+    }
   }
   try {
     await navigator.clipboard.writeText(text);
@@ -805,16 +810,18 @@ export function insertMention(
  * callers treat both as nothing to paste.
  */
 export async function readFromClipboard(): Promise<string | null> {
-  try {
-    const { readClipboardText } = await import('$lib/api/system');
-    const text = await readClipboardText();
-    if (text) return text;
-    // An empty (or image-only) clipboard is an answer, not a failure — don't
-    // retry the webview paths, which cannot do better and on Linux report a
-    // permission error that would be shown as if the read had broken.
-    return null;
-  } catch {
-    // Fall through to the webview paths.
+  if (!isServer) {
+    try {
+      const { readClipboardText } = await import('$lib/api/system');
+      const text = await readClipboardText();
+      if (text) return text;
+      // An empty (or image-only) clipboard is an answer, not a failure — don't
+      // retry the webview paths, which cannot do better and on Linux report a
+      // permission error that would be shown as if the read had broken.
+      return null;
+    } catch {
+      // Fall through to the webview paths.
+    }
   }
   try {
     return await navigator.clipboard.readText();

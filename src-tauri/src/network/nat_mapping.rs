@@ -320,7 +320,7 @@ pub(super) fn maybe_suspend_stun_from_nat_type(state: &mut NetworkState) {
 pub(super) fn apply_udp_mapping_keepalive(
     state: &mut NetworkState,
     mapped: SocketAddr,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
 ) -> bool {
     if !stun_keepalive_should_run(state) {
         return false;
@@ -524,7 +524,7 @@ pub(super) fn apply_tcp_mapping_keepalive(
     state: &mut NetworkState,
     hold_ok: bool,
     mapped: Option<SocketAddr>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
 ) -> bool {
     if !stun_keepalive_should_run(state) {
         return false;

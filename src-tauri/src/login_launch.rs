@@ -8,9 +8,9 @@
 //! command lines that split on spaces.
 
 use auto_launch::{AutoLaunch, AutoLaunchBuilder};
-use tauri::AppHandle;
+use crate::host::AppHandle;
 #[cfg(target_os = "linux")]
-use tauri::Manager;
+use crate::host::Manager;
 
 /// Passed by the OS entry, so a launch at sign-in can be told apart.
 pub const AUTOSTART_ARG: &str = "--autostart";
@@ -122,7 +122,7 @@ pub fn reconcile_at_launch(app: &AppHandle, enabled: bool) {
         return;
     }
     let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::host::async_runtime::spawn_blocking(move || {
         let result = launcher(&app).and_then(|launcher| {
             if enabled {
                 restore_missing_entry(&app, &launcher)

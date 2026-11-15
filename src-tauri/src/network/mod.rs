@@ -68,7 +68,7 @@ use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use futures::FutureExt;
-use tauri::{Emitter, Manager};
+use crate::host::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -276,7 +276,7 @@ const RENDEZVOUS_REGISTER_WATCHDOG: std::time::Duration = std::time::Duration::f
 pub struct NetworkDeps {
     // --- Runtime handles ---
     /// Tauri handle used for event emission and resource/data path lookups.
-    pub app_handle: tauri::AppHandle,
+    pub app_handle: crate::host::AppHandle,
     /// Inbound commands from the Tauri command layer. Not clonable: the
     /// network task is the sole consumer, so `start_network` takes
     /// `NetworkDeps` by value.
@@ -1897,7 +1897,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // the server's HighID port-test against a not-yet-listening socket.
     // A restart for an update goes back to the server the user was on, whether
     // or not auto-connect is set: they were connected a minute ago.
+    #[cfg(feature = "desktop")]
     let mut resume_server = crate::auto_update::resume::take_resume_server();
+    // `emberd` installs no updates of its own, so it never restarts for one.
+    #[cfg(not(feature = "desktop"))]
+    let mut resume_server = None;
     let mut pending_auto_connect_server = settings.auto_connect_server || resume_server.is_some();
     // After a successful login, OP_OFFERFILES is queued into pending_offer_files
     // (declared with other deferred startup state) and drained one chunk/turn.

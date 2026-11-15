@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 
-use tauri::{Emitter, Manager};
+use crate::host::{Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
@@ -444,7 +444,7 @@ async fn examine<E: RecoveryEnv>(
 #[allow(clippy::too_many_arguments)]
 async fn restore_room<E: RecoveryEnv>(
     env: &E,
-    app: Option<&tauri::AppHandle>,
+    app: Option<&crate::host::AppHandle>,
     salt: OwnedRoomSalt,
     seed: [u8; 32],
     ident: &ChannelIdentity,
@@ -701,7 +701,7 @@ async fn read_owned_rooms_list<E: RecoveryEnv>(env: &E) -> Option<Vec<OwnedRoomS
 /// its own list once the network's has been read.
 pub(crate) async fn scan_owned_rooms(
     state: &AppState,
-    app: Option<&tauri::AppHandle>,
+    app: Option<&crate::host::AppHandle>,
     pass: Pass,
 ) -> Result<OwnedRoomScan, String> {
     scan_owned_rooms_with(state, app, pass).await
@@ -721,7 +721,7 @@ impl Drop for LookEnded {
 /// [`scan_owned_rooms`] over any [`RecoveryEnv`].
 async fn scan_owned_rooms_with<E: RecoveryEnv>(
     env: &E,
-    app: Option<&tauri::AppHandle>,
+    app: Option<&crate::host::AppHandle>,
     pass: Pass,
 ) -> Result<OwnedRoomScan, String> {
     let _single = scan_lock().lock().await;
@@ -889,10 +889,10 @@ async fn scan_owned_rooms_with<E: RecoveryEnv>(
 }
 
 /// Look for the rooms this identity owns now, from Settings.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn recover_owned_channels(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<OwnedRoomScan, String> {
     crate::commands::channels::require_ember(&state).await?;
     scan_owned_rooms(&state, Some(&app), Pass::Restore).await
@@ -902,8 +902,8 @@ pub async fn recover_owned_channels(
 /// list — on every launch of a profile that uses Channels or owns a room, and
 /// after a restore — and keep looking at rooms that could not be settled.
 /// Until the list is read, this device publishes none of its own.
-pub fn spawn_startup_scan(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
+pub fn spawn_startup_scan(app: crate::host::AppHandle) {
+    crate::host::async_runtime::spawn(async move {
         let due = match app.try_state::<AppState>() {
             Some(state) => {
                 let owed = state.db.owned_rooms_list_read_owed().unwrap_or(false);
@@ -923,7 +923,7 @@ pub fn spawn_startup_scan(app: tauri::AppHandle) {
 
 /// After taking up Channels this session: read the list now, so a room made
 /// today is listed today rather than after the next launch.
-pub fn ensure_list_read(app: tauri::AppHandle) {
+pub fn ensure_list_read(app: crate::host::AppHandle) {
     if !crate::network::channel_membership::owned_rooms_list_read() {
         spawn_list_read(app, std::time::Duration::ZERO);
     }
@@ -933,7 +933,7 @@ pub fn ensure_list_read(app: tauri::AppHandle) {
 /// so the list is read again on its cadence, and at once when the list that
 /// now names the room is about to go out ([`wait_or_wanted`]). Nothing when
 /// it already runs.
-pub fn keep_reading_list(app: tauri::AppHandle) {
+pub fn keep_reading_list(app: crate::host::AppHandle) {
     let delay = if crate::network::channel_membership::owned_rooms_list_read() {
         std::time::Duration::from_secs(SETTLED_REREAD_SECS)
     } else {
@@ -962,12 +962,12 @@ impl Drop for ReadLoopRunning {
 /// going while this identity owns nothing, every [`SETTLED_REREAD_SECS`], so
 /// a room taken over or handed here later is read for without another start.
 /// One such loop at a time.
-fn spawn_list_read(app: tauri::AppHandle, delay: std::time::Duration) {
+fn spawn_list_read(app: crate::host::AppHandle, delay: std::time::Duration) {
     if READ_LOOP_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
     let running = ReadLoopRunning;
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         let _running = running;
         wait_or_wanted(delay).await;
         let mut failures = 0u32;

@@ -6,7 +6,7 @@ use super::*;
 pub(in crate::network) async fn on_udp_mapping_keepalive_result(
     result: UdpMappingKeepaliveResult,
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     mapping_ka_cycle_success: &mut bool,
     tcp_map_ka_in_flight: bool,
     udp_map_ka_gen: &mut Option<u64>,

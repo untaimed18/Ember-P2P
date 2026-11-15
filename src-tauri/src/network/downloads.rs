@@ -817,7 +817,7 @@ pub(super) fn spawn_transfer_status_write(
 pub(super) async fn mark_download_insufficient(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_id: &str,
     file_name: &str,
     status_writes: &Arc<TransferStatusWriteClock>,
@@ -860,7 +860,7 @@ pub(super) async fn mark_download_insufficient(
     promoted
 }
 
-pub(super) fn emit_transfer_health(app_handle: &tauri::AppHandle, update: &TransferHealthUpdate) {
+pub(super) fn emit_transfer_health(app_handle: &crate::host::AppHandle, update: &TransferHealthUpdate) {
     let _ = app_handle.emit(
         "transfer-health",
         serde_json::json!({
@@ -905,7 +905,7 @@ pub(super) async fn try_start_pending_download_from_known_sources(
     credit_manager: &Arc<RwLock<CreditManager>>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     shared_ember_payload: &ember::SharedEmberPayload,
     ember_payload_generation: &ember::EmberPayloadGeneration,
@@ -957,7 +957,7 @@ pub(super) async fn start_pending_download_for_callback(
     credit_manager: &Arc<RwLock<CreditManager>>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     shared_ember_payload: &ember::SharedEmberPayload,
     ember_payload_generation: &ember::EmberPayloadGeneration,
@@ -1005,7 +1005,7 @@ async fn start_pending_download_worker(
     credit_manager: &Arc<RwLock<CreditManager>>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     shared_ember_payload: &ember::SharedEmberPayload,
     ember_payload_generation: &ember::EmberPayloadGeneration,

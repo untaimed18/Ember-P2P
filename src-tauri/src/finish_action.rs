@@ -13,9 +13,11 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use crate::host::{AppHandle, Emitter};
 
+#[cfg(feature = "desktop")]
 use crate::app_state::AppState;
+#[cfg(feature = "desktop")]
 use crate::commands::errors::coded;
 use crate::sharing::manager::TransferManager;
 use crate::types::{Transfer, TransferDirection, TransferStatus};
@@ -213,6 +215,7 @@ fn publish(app: &AppHandle, status: &FinishActionStatus) {
     }
     let counting = status.countdown_ends_at.is_some();
     if TRAY_SHOWS_CANCEL.swap(counting, std::sync::atomic::Ordering::AcqRel) != counting {
+        #[cfg(feature = "desktop")]
         crate::auto_update::silent::rebuild_tray_menu(app);
     }
 }
@@ -249,7 +252,7 @@ fn run(app: &AppHandle, action: FinishAction) {
             tracing::info!("Downloads finished; putting the computer to sleep as asked");
             *SLEEP_REQUESTED_AT.lock() = Some(Instant::now());
             let app = app.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            crate::host::async_runtime::spawn_blocking(move || {
                 // Long enough for the monitor's next tick to let go of the
                 // sleep inhibitor it holds while uploads run; logind refuses
                 // a suspend while a block lock is held, ours included.
@@ -267,7 +270,7 @@ fn run(app: &AppHandle, action: FinishAction) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "desktop"))]
 fn suspend() -> Result<(), String> {
     // Sleep, not hibernate (the first argument), and wake events stay enabled
     // (the third): a scheduled task or a wake-on-LAN should still be able to
@@ -280,7 +283,7 @@ fn suspend() -> Result<(), String> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "desktop"))]
 fn suspend() -> Result<(), String> {
     let connection = zbus::blocking::Connection::system().map_err(|e| e.to_string())?;
     connection
@@ -297,7 +300,7 @@ fn suspend() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "desktop"))]
 fn suspend() -> Result<(), String> {
     let status = std::process::Command::new("/usr/bin/pmset")
         .arg("sleepnow")
@@ -310,20 +313,21 @@ fn suspend() -> Result<(), String> {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+/// `emberd` never sleeps the machine it serves from.
+#[cfg(not(all(feature = "desktop", any(windows, target_os = "linux", target_os = "macos"))))]
 fn suspend() -> Result<(), String> {
     Err("not supported on this platform".to_string())
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn get_finish_action() -> FinishActionStatus {
     MACHINE.lock().status()
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn set_finish_action(
     app: AppHandle,
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     action: FinishAction,
 ) -> Result<FinishActionStatus, String> {
     if action == FinishAction::Sleep && !sleep_supported() {
@@ -352,7 +356,7 @@ pub async fn set_finish_action(
 }
 
 /// "Cancel" in the countdown: the choice goes back to doing nothing.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn cancel_finish_action(app: AppHandle) -> FinishActionStatus {
     let status = {
         let mut machine = MACHINE.lock();
@@ -365,7 +369,7 @@ pub fn cancel_finish_action(app: AppHandle) -> FinishActionStatus {
 
 /// "Now" in the countdown. Only while one is running, so a stale dialog
 /// cannot fire an action the countdown already gave up on.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn run_finish_action_now(app: AppHandle) -> FinishActionStatus {
     let (action, status) = {
         let mut machine = MACHINE.lock();

@@ -7,7 +7,7 @@ pub(in crate::network) async fn on_small_tick(
     udp_socket: &Arc<UdpSocket>,
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
     // eMule KADEMLIADISCONNECTDELAY: if no valid KAD contact for 20 minutes,
     // transition back to Connecting so bootstrap re-engages. Do NOT tear

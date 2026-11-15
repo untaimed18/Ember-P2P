@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter, Manager};
+use crate::host::{AppHandle, Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::commands::chat_window::CHAT_WINDOW_LABEL;
@@ -746,9 +746,9 @@ fn write_to(dir: &Path, state: &ResumeState) -> anyhow::Result<()> {
 // ── Commands ────────────────────────────────────────────────────────────────
 
 /// The main window's answer to [`UI_SNAPSHOT_REQUEST_EVENT`].
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn submit_resume_ui_snapshot(
-    service: tauri::State<'_, ResumeService>,
+    service: crate::host::State<'_, ResumeService>,
     id: u64,
     route: Option<String>,
     search_tabs: Option<String>,
@@ -763,8 +763,8 @@ pub fn submit_resume_ui_snapshot(
 
 /// The page, search tabs and chat window a resumed launch should restore.
 /// Handed over once; later calls get nothing.
-#[tauri::command]
-pub fn take_update_resume_ui(service: tauri::State<'_, ResumeService>) -> Option<UiResume> {
+#[ember_macros::command(desktop)]
+pub fn take_update_resume_ui(service: crate::host::State<'_, ResumeService>) -> Option<UiResume> {
     service.launch_ui.lock().take()
 }
 

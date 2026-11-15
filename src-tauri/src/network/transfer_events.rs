@@ -294,7 +294,7 @@ fn remove_leftover_partial(path: &std::path::Path, root: &str) -> std::io::Resul
 
 pub(super) async fn handle_download_event(
     event: DownloadEvent,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     db: &Arc<Database>,
@@ -1057,7 +1057,7 @@ pub(super) async fn handle_download_event(
 
 pub(super) async fn handle_upload_event(
     event: UploadEvent,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     promoted_out: &mut Vec<Transfer>,
     stats_manager: &mut StatsManager,

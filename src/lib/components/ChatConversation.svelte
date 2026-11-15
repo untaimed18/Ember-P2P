@@ -117,6 +117,7 @@
   import { prefersReducedMotion } from 'svelte/motion';
   import { fade, fly, slide } from 'svelte/transition';
   import { openExternalUrl } from '$lib/api/settings';
+  import { isServer } from '$lib/runtime';
   import { toastsFor } from '$lib/stores/toast';
   const { toast, toastError, toastSuccess } = toastsFor('friends');
   import IconX from '$lib/components/IconX.svelte';
@@ -4527,7 +4528,8 @@
            it. Unpositioned: the mention list and the sheets still anchor to
            the row. -->
       <div class="conv-composer" class:is-sending={sending}>
-        {#if !isChannel}
+        <!-- emberd picks the file with a dialog on its own computer, which nobody sees. -->
+        {#if !isChannel && !isServer}
           <!-- Usable while the friend is offline too: the file waits and is
                offered when they are back, which the title says. -->
           <button

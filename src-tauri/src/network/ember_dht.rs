@@ -1190,7 +1190,7 @@ pub(super) fn ember_rendezvous_retry_secs(empty_streak: u32) -> i64 {
 /// no reachable seeds could not rejoin no matter how long it ran.
 pub(super) fn maybe_start_ember_rendezvous_lookup(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ember_native_enabled: bool,
 ) -> bool {
     // Cheapest gates first: this is re-evaluated every second while the table
@@ -2600,7 +2600,7 @@ pub(super) async fn handle_ember_dht_message(
     remote_noise_pub: [u8; 32],
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     // Slice 14: per-IP rate limit before any crypto/table work. Wire layout

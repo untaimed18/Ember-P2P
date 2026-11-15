@@ -1,4 +1,4 @@
-use tauri::Emitter;
+use crate::host::Emitter;
 use tokio::sync::oneshot;
 
 use crate::app_state::AppState;
@@ -455,7 +455,7 @@ pub struct RelatedSeedInput {
 /// `co_share_hashes` and feeds them straight back into [`search_files`], so a
 /// related search is an ordinary search and inherits streaming, dedup, spam
 /// scoring, filters and cancellation unchanged.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn plan_related_search(
     seeds: Vec<RelatedSeedInput>,
 ) -> Result<crate::search::related::RelatedPlan, String> {
@@ -518,7 +518,7 @@ pub async fn plan_related_search(
 /// otherwise, which is what the UI uses this for. The flag mirror is updated on
 /// login, on every `OP_IDCHANGE` and on disconnect, so this is an atomic read
 /// rather than a round-trip to the network task.
-#[tauri::command]
+#[ember_macros::command]
 pub fn related_search_supported() -> bool {
     crate::network::ed2k::server::related_search_supported()
 }
@@ -531,11 +531,11 @@ pub fn related_search_supported() -> bool {
 /// that server advertises `SRV_TCPFLG_RELATEDSEARCH`, and is ignored otherwise
 /// — every other leg always runs `query`. `exclude_hashes` withholds the seed
 /// files from the results, since a file is not related to itself.
-#[tauri::command]
+#[ember_macros::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn search_files(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     query: String,
     method: Option<SearchMethod>,
     request_id: u64,
@@ -817,9 +817,9 @@ pub async fn search_files(
     Ok(results)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn find_notes(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_size: u64,
 ) -> Result<Vec<SearchResult>, String> {
@@ -914,9 +914,9 @@ pub async fn find_notes(
 /// send it. The sources themselves arrive on each network's own schedule and go
 /// straight into the transfer, so there is nothing to wait for here and no
 /// timeout worth imposing beyond the network task picking the command up.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn find_sources(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
     file_hash: String,
     file_size: u64,
@@ -949,10 +949,10 @@ pub async fn find_sources(
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn publish_note(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_name: Option<String>,
     file_size: Option<u64>,
@@ -1026,9 +1026,9 @@ pub async fn publish_note(
 /// `request_id`, and `search-complete` fires for it again when they are in.
 /// `started` is false when there is nothing left to ask, or the search is no
 /// longer the latest one.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn search_more(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     request_id: u64,
 ) -> Result<crate::network::SearchMoreOutcome, String> {
     let (tx, rx) = oneshot::channel();
@@ -1036,9 +1036,9 @@ pub async fn search_more(
     await_reply(rx, "search_more_failed", "Could not search for more results").await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cancel_search(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     request_id: u64,
 ) -> Result<(), String> {
     // `bounded_send`, not `try_send`. A cancel that never reaches the network
@@ -1073,9 +1073,9 @@ async fn kept_mirrors(
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn format_ed2k_link(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     name: String,
     size: u64,
     file_hash: String,
@@ -1125,9 +1125,9 @@ pub struct Ed2kLinkFileInput {
 const MAX_ED2K_LINK_BATCH: usize = 50_000;
 
 /// Format many standard eD2K links in one IPC round-trip (newline-separated).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn format_ed2k_links(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     files: Vec<Ed2kLinkFileInput>,
 ) -> Result<String, String> {
     if files.len() > MAX_ED2K_LINK_BATCH {
@@ -1202,7 +1202,7 @@ fn link_web_sources(link: &str) -> Vec<String> {
     out
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub fn parse_ed2k_link(link: String) -> Result<Ed2kLinkInfo, String> {
     if link.len() > MAX_ED2K_LINK_LEN {
         return Err(coded_ctx(
@@ -1256,7 +1256,7 @@ pub struct Ed2kLinkBatch {
 /// as unrecognised `|`-segments that the tag loop skips in silence. A user who
 /// pasted ten links got one download and a success toast. Reporting the invalid
 /// and skipped counts here is what lets the caller say so out loud.
-#[tauri::command]
+#[ember_macros::command]
 pub fn parse_ed2k_links(text: String) -> Result<Ed2kLinkBatch, String> {
     if text.len() > MAX_ED2K_PASTE_BYTES {
         return Err(coded_ctx(
@@ -1321,9 +1321,9 @@ fn links_on_line(line: &str) -> Vec<&str> {
 /// `with_sources` is set we append our reachable IP:port — this only makes
 /// sense with a HighID, so a firewalled client returns an error the UI can
 /// surface rather than emitting an unreachable source.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn build_ed2k_link(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     name: String,
     size: u64,
     file_hash: String,
@@ -1417,9 +1417,9 @@ pub async fn build_ed2k_link(
     ))
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_spam(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_name: String,
     file_size: u64,
@@ -1494,9 +1494,9 @@ pub async fn mark_spam(
 }
 
 /// Undo a [`mark_spam`], given the verdict it returned.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn undo_mark_spam(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     prior: crate::search::spam::PriorSpamVerdict,
 ) -> Result<(), String> {
@@ -1512,9 +1512,9 @@ pub async fn undo_mark_spam(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_not_spam(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
@@ -1555,9 +1555,9 @@ fn spawn_spam_filter_save(
 /// Take back the spam mark on a file and what it taught, leaving the file
 /// judged like any other whatever it was before the mark, as the learned
 /// spam data's Unmark does ([`SpamFilter::unmark_spam`]).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn unmark_spam(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
@@ -1574,9 +1574,9 @@ pub async fn unmark_spam(
 
 /// Stop trusting a file marked not spam, or a finished download, so it is
 /// judged like any other file from then on.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn forget_not_spam(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
@@ -1591,9 +1591,9 @@ pub async fn forget_not_spam(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_spam_stats(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<crate::search::spam::SpamStats, String> {
     let spam = state.spam_filter.read().await;
     Ok(spam.stats())
@@ -1616,9 +1616,9 @@ pub struct LearnedSpamPage {
 /// `query` (any case), newest first, `limit` of them from `offset`. A file the
 /// filter kept no name for takes the Library's, or failing that the download
 /// history's, where either has it.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_learned_spam(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     list: crate::search::spam::LearnedList,
     query: String,
     offset: usize,
@@ -1710,9 +1710,9 @@ pub struct SpamExplainResponse {
     pub reason_details: Vec<crate::search::spam::SpamReason>,
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn explain_spam_result(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_name: String,
     file_size: u64,
@@ -1891,8 +1891,8 @@ pub async fn explain_spam_result(
     })
 }
 
-#[tauri::command]
-pub async fn reset_spam_filter(state: tauri::State<'_, AppState>) -> Result<String, String> {
+#[ember_macros::command]
+pub async fn reset_spam_filter(state: crate::host::State<'_, AppState>) -> Result<String, String> {
     {
         let mut spam = state.spam_filter.write().await;
         spam.reset();
@@ -1906,9 +1906,9 @@ pub async fn reset_spam_filter(state: tauri::State<'_, AppState>) -> Result<Stri
 /// Re-score an existing search-result list under the current spam profile
 /// and community votes. Used when the user changes spam settings so rows
 /// already on screen pick up the new classification without a new search.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn rescore_search_results(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     mut results: Vec<SearchResult>,
     search_keywords: Vec<String>,
     search_query: Option<String>,
@@ -1994,9 +1994,9 @@ pub async fn rescore_search_results(
 
 /// Look up download history for a batch of file hashes.
 /// Returns a map of hash → status ("completed" or "cancelled").
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_download_history(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     hashes: Vec<String>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     // Cap the batch size so the IPC frame and the SQL `IN (?,?,…)`
@@ -2028,9 +2028,9 @@ pub struct DownloadHistoryStats {
 }
 
 /// Return completed / cancelled / total download-history counts.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_download_history_stats(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<DownloadHistoryStats, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<DownloadHistoryStats> {
@@ -2055,10 +2055,10 @@ pub async fn get_download_history_stats(
 }
 
 /// Clear download history entries by status ("completed", "cancelled", or "all").
-#[tauri::command]
+#[ember_macros::command]
 pub async fn clear_download_history(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     status: String,
 ) -> Result<(), String> {
     let db = state.db.clone();
@@ -2098,9 +2098,9 @@ pub async fn clear_download_history(
 /// specific entry — use it when the UI surfaces a per-row "remove from
 /// history" action (e.g. a search-results context menu on a row the
 /// user has previously downloaded and wants re-surfaced as fresh).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_download_history_entry(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
     let _ = parse_exact_file_hash(&file_hash)?;

@@ -27,7 +27,7 @@ pub(in crate::network) async fn on_ember_search_tick(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
@@ -1068,7 +1068,7 @@ async fn apply_channel_ingest_results(
     udp_socket: &Arc<UdpSocket>,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     results: ChannelIngestResults,
 ) {
     if !results.presence.is_empty() {

@@ -1,6 +1,9 @@
 fn main() {
-    built_against_freetype();
-    tauri_build::build()
+    #[cfg(feature = "desktop")]
+    {
+        built_against_freetype();
+        tauri_build::build()
+    }
 }
 
 /// The FreeType this build's WebKit was compiled against, for
@@ -8,6 +11,7 @@ fn main() {
 /// the build distro's FreeType is the one whose header is here. Read from the
 /// header rather than written down, so the value moves with the distro the
 /// AppImage is built on.
+#[cfg(feature = "desktop")]
 fn built_against_freetype() {
     const HEADER: &str = "/usr/include/freetype2/freetype/freetype.h";
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {

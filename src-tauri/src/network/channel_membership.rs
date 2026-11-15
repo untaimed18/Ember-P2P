@@ -2463,7 +2463,7 @@ pub(super) async fn publish_presence_under_new_username(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     identity: &crate::storage::identity::NodeIdentity,
     old_username: &str,
@@ -3242,7 +3242,7 @@ pub(super) fn flush_channel_member_touches(state: &mut NetworkState, db: &Databa
 /// often than membership does, and firing that event every time somebody was
 /// heard from turned a quiet room into a steady stream of full refetches. What
 /// changed here is one number on one row, so that is what goes across.
-pub(super) fn emit_channel_presence_deltas(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+pub(super) fn emit_channel_presence_deltas(state: &mut NetworkState, app_handle: &crate::host::AppHandle) {
     if state.channel_presence_dirty.is_empty() {
         return;
     }
@@ -3578,7 +3578,7 @@ pub(super) async fn apply_channel_presence_beacons(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ch: &crate::storage::database::StoredChannel,
     gossip: &ember::channel::ChannelGossip,
     beacons: Vec<ember::channel::PresenceBeacon>,

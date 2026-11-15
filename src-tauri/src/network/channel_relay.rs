@@ -745,7 +745,7 @@ pub(super) async fn apply_channel_relay_event(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     event: ChannelRelayEvent,
 ) {
     match event {

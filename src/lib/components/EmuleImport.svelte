@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { isServer } from '$lib/runtime';
   import { plural } from '$lib/plural';
   import { formatDateTime, formatSize } from '$lib/utils';
   import ToggleSwitch from './ToggleSwitch.svelte';
@@ -351,9 +352,11 @@
             placeholder={detecting ? m.emule_import_detecting() : ''}
             aria-label={m.emule_import_folder_label()}
           />
-          <button type="button" class="folder-btn" onclick={pickFolder} disabled={reading || staging}>
-            {m.settings_browse()}
-          </button>
+          {#if !isServer}
+            <button type="button" class="folder-btn" onclick={pickFolder} disabled={reading || staging}>
+              {m.settings_browse()}
+            </button>
+          {/if}
         </div>
         {#if reading}
           <span class="hint">{m.emule_import_reading()}</span>
@@ -411,7 +414,7 @@
           </button>
         {/each}
       {/if}
-      {#if !preview}
+      {#if !preview && !isServer}
         <button type="button" class="ghost" onclick={pickFolder} disabled={reading || staging}>
           {m.emule_import_choose()}
         </button>
@@ -660,9 +663,11 @@
           <strong>{m.emule_import_found({ client: preview.source.client === 'amule' ? 'aMule' : 'eMule' })}</strong>
           <span class="source-path mono">{preview.source.path}</span>
         </div>
-        <button type="button" class="link" onclick={pickFolder} disabled={staging}>
-          {m.emule_import_choose_other()}
-        </button>
+        {#if !isServer}
+          <button type="button" class="link" onclick={pickFolder} disabled={staging}>
+            {m.emule_import_choose_other()}
+          </button>
+        {/if}
       </div>
       <ul class="stats">
         {#if preview.known_files > 0}

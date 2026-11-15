@@ -1058,7 +1058,7 @@ impl OpenFailure {
 }
 
 impl Database {
-    pub fn new(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
+    pub fn new(app_handle: &crate::host::AppHandle) -> anyhow::Result<Self> {
         let app_dir =
             paths::ensure_data_dir_with_app(app_handle).context("Failed to prepare data dir")?;
 

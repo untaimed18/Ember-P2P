@@ -54,7 +54,7 @@ pub(super) fn record_server_log(message: &str) -> ServerLogLine {
     line
 }
 
-pub(super) fn emit_server_log(app: &tauri::AppHandle, message: &str) {
+pub(super) fn emit_server_log(app: &crate::host::AppHandle, message: &str) {
     let _ = app.emit("server-log", record_server_log(message));
 }
 
@@ -91,7 +91,7 @@ pub(super) async fn try_connect_server(
     ip: &str,
     port: u16,
     obf_port: u16,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     force_plain: bool,
     obfuscation_enabled: bool,
 ) -> anyhow::Result<(Ed2kServerConnection, SocketAddr)> {
@@ -164,7 +164,7 @@ pub(super) async fn try_connect_server(
 
 /// Clear per-session eD2K identity and in-flight search state. Does not touch
 /// the connection fields.
-pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &crate::host::AppHandle) {
     // No session means no server capabilities; leaving the mirror set would
     // have a related search keep planning around a co-share request that can no
     // longer be sent.
@@ -235,7 +235,7 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
 pub(super) async fn handle_server_disconnect(
     state: &mut NetworkState,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     reason: &str,
 ) {
     debug!("Server connection lost: {reason}");
@@ -294,7 +294,7 @@ pub(super) async fn handle_server_disconnect(
 pub(super) async fn disconnect_connected_server_if_ip_filtered(
     state: &mut NetworkState,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     filter_servers_by_ip: bool,
 ) {
     if !filter_servers_by_ip {
@@ -347,7 +347,7 @@ pub(super) async fn disconnect_connected_server_if_ip_filtered(
 pub(super) async fn apply_server_ip_filter(
     state: &mut NetworkState,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     filter_servers_by_ip: bool,
 ) {
     if !filter_servers_by_ip {
@@ -487,7 +487,7 @@ fn server_retry_log_line(error: &str, attempt: u32, wait_secs: u64, network_down
 pub(super) fn record_server_connect_failure(
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ip: &str,
     port: u16,
     error: &str,
@@ -526,7 +526,7 @@ pub(super) fn record_server_connect_failure(
     network_down
 }
 
-pub(super) fn emit_server_auto_connect_failed(app_handle: &tauri::AppHandle, detail: &str) {
+pub(super) fn emit_server_auto_connect_failed(app_handle: &crate::host::AppHandle, detail: &str) {
     warn!("eD2K auto-connect abandoned: {detail}");
     emit_server_log(
         app_handle,
@@ -540,7 +540,7 @@ pub(super) fn emit_server_auto_connect_failed(app_handle: &tauri::AppHandle, det
 
 pub(super) fn abandon_server_auto_reconnect(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     detail: &str,
 ) {
     state.server_auto_reconnect = false;
@@ -553,7 +553,7 @@ pub(super) fn abandon_server_auto_reconnect(
 /// to a new login picks the port the same way.
 pub(super) fn capture_advertised_tcp_port_then_reset_ed2k_session(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) -> u16 {
     reset_ed2k_server_session(state, app_handle);
     login_tcp_port(state)
@@ -571,7 +571,7 @@ pub(super) fn capture_advertised_tcp_port_then_reset_ed2k_session(
 pub(super) async fn initiate_server_connect(
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     ip: String,
     port: u16,
@@ -799,7 +799,7 @@ pub(super) fn login_tcp_port(state: &NetworkState) -> u16 {
 /// live session with it carries on until it ends.
 pub(super) async fn forget_removed_server_as_target(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     ip: &str,
     port: u16,

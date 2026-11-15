@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use tauri::{AppHandle, Emitter, Manager};
+use crate::host::{AppHandle, Emitter, Manager};
 
 use crate::app_state::{AppState, PendingDeepLink};
 use crate::commands::errors::{coded, coded_ctx};
@@ -200,7 +200,7 @@ pub(crate) fn preview_deep_link_payload(payload: &str) -> Result<DeepLinkPreview
     ))
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub fn preview_deep_link(payload: String) -> Result<DeepLinkPreview, String> {
     if payload.len() > MAX_PAYLOAD_LEN {
         return Err(coded(
@@ -423,7 +423,7 @@ fn should_claim_scheme(current_default: &str, own_entries: &[&str]) -> bool {
 /// Register `ed2k://` with the desktop unless another handler already has it.
 ///
 /// Linux has no installer step to do this, unlike NSIS/MSI on Windows.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "desktop"))]
 pub fn register_scheme_unless_taken(app: &AppHandle) {
     use tauri_plugin_deep_link::DeepLinkExt;
     // The plugin names its entry after the executable, in the same way; the
@@ -499,7 +499,7 @@ pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
         if enqueued {
             let app_for_persist = app.clone();
             // Detached: the window proc must return before the fsync completes.
-            drop(tauri::async_runtime::spawn_blocking(move || {
+            drop(crate::host::async_runtime::spawn_blocking(move || {
                 if let Err(error) = persist_live_pending_queue(&app_for_persist, &queue, None) {
                     tracing::warn!("Failed to persist deep-link queue: {error}");
                 }
@@ -513,11 +513,14 @@ pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
         return;
     }
 
-    crate::commands::chat_window::set_chat_window_visible(app, true);
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
+    #[cfg(feature = "desktop")]
+    {
+        crate::commands::chat_window::set_chat_window_visible(app, true);
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
     }
 
     let _ = app.emit("deep-link-received", ());
@@ -525,17 +528,17 @@ pub fn dispatch_deep_links(app: &AppHandle, payloads: Vec<String>) {
 
 /// Return every pending deep link without removing it. The frontend must call
 /// `ack_pending_deep_link` only after the associated action has completed.
-#[tauri::command]
+#[ember_macros::command]
 pub fn list_pending_deep_links(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<PendingDeepLink>, String> {
     Ok(state.pending_deep_links.lock().clone())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ack_pending_deep_link(
     app: AppHandle,
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
     {
@@ -645,9 +648,9 @@ fn collection_path_from_pending(pending: &[PendingDeepLink], id: &str) -> Result
 /// rather than accepting a renderer-provided path. The entry remains queued
 /// until the existing acknowledgement flow confirms the Library presentation,
 /// preserving retry behaviour if parsing or navigation fails.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn open_pending_collection(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     id: String,
 ) -> Result<Collection, String> {
     let path = {

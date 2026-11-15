@@ -10,7 +10,7 @@ use super::*;
 /// each retry, and one notice says everything the next hundred would.
 const DOWNLOAD_FOLDER_NOTICE_INTERVAL_SECS: i64 = 300;
 
-fn emit_download_folder_unavailable(app_handle: &tauri::AppHandle) {
+fn emit_download_folder_unavailable(app_handle: &crate::host::AppHandle) {
     static LAST_NOTICE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let now = chrono::Utc::now().timestamp();
     let last = LAST_NOTICE.load(std::sync::atomic::Ordering::Relaxed);
@@ -345,7 +345,7 @@ pub(in crate::network) async fn on_download_event(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,

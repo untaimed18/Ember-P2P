@@ -2633,6 +2633,7 @@ fn strip_extended_path_prefix(value: &str) -> String {
 }
 
 #[cfg(windows)]
+#[cfg(feature = "desktop")]
 pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
     let value = path
@@ -2660,6 +2661,7 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
 /// `reveal_in_file_manager` already strips it. A path that genuinely needs
 /// the prefix to exceed MAX_PATH cannot be launched by the shell either way.
 #[cfg(target_os = "windows")]
+#[cfg(feature = "desktop")]
 pub fn open_with_default_app(path: &Path) -> io::Result<()> {
     let value = path
         .to_str()
@@ -2679,11 +2681,13 @@ pub fn open_with_default_app(path: &Path) -> io::Result<()> {
 /// nothing at all. So the AppDir is subtracted from the child's environment
 /// before the host's `xdg-open` is asked to take over.
 #[cfg(target_os = "linux")]
+#[cfg(feature = "desktop")]
 pub fn open_with_default_app(path: &Path) -> io::Result<()> {
     spawn_linux_host_open(path.as_os_str())
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(feature = "desktop")]
 pub fn open_with_default_app(path: &Path) -> io::Result<()> {
     opener::open(path).map_err(|e| io::Error::other(e.to_string()))
 }
@@ -2705,6 +2709,7 @@ pub fn open_with_default_app(path: &Path) -> io::Result<()> {
 /// On Windows the `\\?\` prefix comes off for the reason
 /// [`open_with_default_app`] gives, and because some players (VLC among them)
 /// cannot open the extended form either.
+#[cfg(feature = "desktop")]
 pub fn launch_with_player(player: &Path, file: &Path) -> io::Result<()> {
     use std::process::Stdio;
     let mut cmd = std::process::Command::new(player);
@@ -2737,6 +2742,7 @@ pub fn launch_with_player(player: &Path, file: &Path) -> io::Result<()> {
 /// Deciding whether a URL is *safe* to open belongs to the caller — see
 /// `validate_external_url` and the consent gates in `commands::settings`. This
 /// only decides how it is launched.
+#[cfg(feature = "desktop")]
 pub fn open_url_with_default_app(url: &str) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -2764,6 +2770,7 @@ pub fn open_url_with_default_app(url: &str) -> io::Result<()> {
 /// bundled value from the session's own — and dropping the session's would take
 /// the user's input method away from whatever we launch.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(feature = "desktop")]
 const APPIMAGE_PATH_VARS: &[(&str, Option<&str>)] = &[
     ("PATH", Some("/usr/local/bin:/usr/bin:/bin")),
     ("XDG_DATA_DIRS", Some("/usr/local/share:/usr/share")),
@@ -2797,10 +2804,12 @@ const APPIMAGE_PATH_VARS: &[(&str, Option<&str>)] = &[
 /// to reduce — the whole value is about this AppImage, and `ARGV0` in
 /// particular confuses any shell that inherits it.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(feature = "desktop")]
 const APPIMAGE_MARKER_VARS: &[&str] = &["APPDIR", "APPIMAGE", "APPIMAGE_UUID", "ARGV0", "OWD"];
 
 /// Drop colon-separated entries that live inside `appdir` (the bundled tree).
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(feature = "desktop")]
 fn strip_colon_prefix_entries(value: &std::ffi::OsStr, appdir: &Path) -> std::ffi::OsString {
     let raw = value.to_string_lossy();
     let kept: Vec<&str> = raw
@@ -2813,6 +2822,7 @@ fn strip_colon_prefix_entries(value: &std::ffi::OsStr, appdir: &Path) -> std::ff
 /// What [`apply_host_desktop_env`] should do with one inherited variable.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(feature = "desktop")]
 enum HostEnvAction {
     /// Nothing in the value came from the bundle, so it is the session's own.
     Leave,
@@ -2821,6 +2831,7 @@ enum HostEnvAction {
 }
 
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(feature = "desktop")]
 fn host_env_action(value: &std::ffi::OsStr, appdir: &Path, fallback: Option<&str>) -> HostEnvAction {
     let kept = strip_colon_prefix_entries(value, appdir);
     if kept.as_os_str() == value {
@@ -2841,6 +2852,7 @@ fn host_env_action(value: &std::ffi::OsStr, appdir: &Path, fallback: Option<&str
 /// being subtracted and every `AppRun` exports it. A `.deb` install or a
 /// `cargo run` has neither and needs nothing done.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(feature = "desktop")]
 fn apply_host_desktop_env(cmd: &mut std::process::Command) {
     let Some(appdir) = std::env::var_os("APPDIR").map(PathBuf::from) else {
         return;
@@ -2881,6 +2893,7 @@ fn apply_host_desktop_env(cmd: &mut std::process::Command) {
 /// `exec` the player it picked, so waiting would block Open and Preview until
 /// the user quit VLC.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(feature = "desktop")]
 fn spawn_linux_host_open(target: &std::ffi::OsStr) -> io::Result<()> {
     use std::process::Stdio;
     let attempts: [(&str, &[&str]); 4] = [
@@ -2909,6 +2922,7 @@ fn spawn_linux_host_open(target: &std::ffi::OsStr) -> io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+#[cfg(feature = "desktop")]
 pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     std::process::Command::new("open")
         .arg("-R")
@@ -2934,6 +2948,7 @@ pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
 /// showing the folder, so they are given the parent directory instead.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "desktop")]
 enum RevealStyle {
     /// `fm --select <file>`
     SelectFlag,
@@ -2944,6 +2959,7 @@ enum RevealStyle {
 }
 
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(feature = "desktop")]
 const LINUX_REVEAL_COMMANDS: &[(&str, RevealStyle)] = &[
     ("nautilus", RevealStyle::SelectFlag),
     ("dolphin", RevealStyle::SelectFlag),
@@ -2961,6 +2977,7 @@ const LINUX_REVEAL_COMMANDS: &[(&str, RevealStyle)] = &[
 /// what lets [`show_item_over_dbus`] paste it into `gdbus`'s `['…']` array
 /// literal without the path being able to break out of it.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(feature = "desktop")]
 fn file_uri(path: &Path) -> io::Result<String> {
     let value = path
         .to_str()
@@ -2995,6 +3012,7 @@ fn file_uri(path: &Path) -> io::Result<String> {
 /// their multi-second default reply timeouts so a desktop with no such
 /// service falls through quickly instead of hanging the menu action.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
+#[cfg(feature = "desktop")]
 fn show_item_over_dbus(path: &Path) -> io::Result<()> {
     use std::process::Stdio;
     const DEST: &str = "org.freedesktop.FileManager1";
@@ -3059,6 +3077,7 @@ fn show_item_over_dbus(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(feature = "desktop")]
 pub fn reveal_in_file_manager(path: &Path) -> io::Result<()> {
     use std::process::Stdio;
 
@@ -3426,6 +3445,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "desktop")]
     fn strip_colon_prefix_entries_drops_the_appdir_tree() {
         let appdir = Path::new("/tmp/Ember.AppDir");
         let value = std::ffi::OsString::from(
@@ -3450,6 +3470,7 @@ mod tests {
     /// empty `GST_PLUGIN_SYSTEM_PATH_1_0` means "no plugins", not "the
     /// defaults".
     #[test]
+    #[cfg(feature = "desktop")]
     fn host_env_action_only_subtracts_what_the_bundle_added() {
         let appdir = Path::new("/tmp/Ember.AppDir");
 
@@ -3490,6 +3511,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "desktop")]
     fn host_desktop_env_is_callable_without_appimage_vars() {
         let mut cmd = std::process::Command::new("true");
         apply_host_desktop_env(&mut cmd);
@@ -3500,6 +3522,7 @@ mod tests {
     /// `cargo test` type checks its body. Referencing it is the whole point —
     /// calling it would hand a file to the developer's own desktop.
     #[test]
+    #[cfg(feature = "desktop")]
     fn the_host_open_path_type_checks_off_linux() {
         let launcher: fn(&std::ffi::OsStr) -> io::Result<()> = spawn_linux_host_open;
         let _ = launcher;
@@ -3516,6 +3539,7 @@ mod tests {
     /// the parent directory, never the file: handed a file they act like
     /// `xdg-open` and would play it instead of showing where it lives.
     #[test]
+    #[cfg(feature = "desktop")]
     fn only_file_managers_that_document_select_are_given_it() {
         let style = |name: &str| {
             LINUX_REVEAL_COMMANDS
@@ -3535,6 +3559,7 @@ mod tests {
     /// `['…']` array literal `gdbus` is handed, so the quote, the bracket
     /// and the backslash matter as much as the space.
     #[test]
+    #[cfg(feature = "desktop")]
     fn file_uri_escapes_everything_a_gdbus_array_literal_would_read() {
         assert_eq!(
             file_uri(Path::new("/home/u/Videos/clip.mp4")).unwrap(),

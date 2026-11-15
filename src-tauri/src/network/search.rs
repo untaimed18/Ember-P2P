@@ -758,7 +758,7 @@ pub(super) fn note_ed2k_batch_availability(
 /// the cap map and carry **absolute** summed/max availability for the UI
 /// (frontend takes max). Kad rows only refresh availability/sources/origin.
 pub(super) fn emit_search_resight_updates(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     request_id: u64,
     mut updates: Vec<SearchResult>,
     active: &mut ActiveSearchRequest,
@@ -775,7 +775,7 @@ pub(super) fn emit_search_resight_updates(
     emit_search_results_event(app_handle, request_id, &updates);
 }
 
-pub(super) fn stop_ed2k_udp_search_if_capped(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+pub(super) fn stop_ed2k_udp_search_if_capped(state: &mut NetworkState, app_handle: &crate::host::AppHandle) {
     let Some(active) = state.active_search_request.as_mut() else {
         return;
     };
@@ -1267,11 +1267,11 @@ pub(super) struct SearchNoticeEvent {
 }
 
 pub(super) fn emit_search_notice(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     request_id: u64,
     notice: &'static str,
 ) {
-    use tauri::Emitter;
+    use crate::host::Emitter;
     let _ = app_handle.emit("search-notice", SearchNoticeEvent { request_id, notice });
 }
 
@@ -1520,7 +1520,7 @@ pub(super) fn related_search_flag_set(server_flags: u32) -> bool {
 }
 
 pub(super) fn emit_search_results_event(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     request_id: u64,
     results: &[SearchResult],
 ) {
@@ -1608,7 +1608,7 @@ pub(super) fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool 
 /// count the same publishers a second time.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn enrich_and_emit_search_results(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     spam_filter: &Arc<RwLock<crate::search::spam::SpamFilter>>,
     comment_manager: &Arc<RwLock<CommentManager>>,
     settings: &AppSettings,
@@ -1867,7 +1867,7 @@ pub(super) fn note_dht_recall_sample(state: &mut NetworkState) {
 
 pub(super) fn maybe_finish_active_search(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     request_id: u64,
 ) {
     let should_complete = state.active_search_request.as_ref().is_some_and(|active| {
@@ -1909,7 +1909,7 @@ pub(super) fn maybe_finish_active_search(
 /// removal.
 pub(super) fn finalize_removed_searches(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     removed_sids: &[SearchId],
     released_in_use: &[KadId],
     rendezvous_target: Option<KadId>,
@@ -1943,7 +1943,7 @@ pub(super) fn rendezvous_search_target(state: &NetworkState) -> Option<KadId> {
 /// [`ember_rendezvous_id_reused`].
 pub(super) fn finalize_removed_searches_with_keyword_results(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     removed_sids: &[SearchId],
     released_in_use: &[KadId],
     preserved_results: &HashMap<SearchId, (KadId, Vec<kad::messages::SearchResultEntry>)>,
@@ -2121,7 +2121,7 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
 /// `download_source_searches` / store maps orphaned until their own timeouts.
 pub(super) fn start_kad_search(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     target: KadId,
     search_type: SearchType,
     initial_contacts: Vec<KadContact>,
@@ -2208,7 +2208,7 @@ pub(super) fn drop_running_ember_companion(state: &mut NetworkState, search_id: 
 /// into the abandoned caller's map.
 pub(super) fn release_ember_search_state(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     search_id: u32,
 ) {
     // A given id is either a node- or a value-lookup; draining both maps
@@ -2280,7 +2280,7 @@ fn settle_stopped_continuation(request: &mut ActiveSearchRequest) {
     request.ember_pending = false;
 }
 
-pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
+pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &crate::host::AppHandle, request_id: u64) {
     // Drop in-flight Ember DHT keyword lookups for this request so a
     // cancelled search stops walking (not just unmapping bookkeeping while
     // FIND_VALUE continues until the 60s expiry).

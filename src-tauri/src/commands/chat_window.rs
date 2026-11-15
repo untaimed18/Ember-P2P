@@ -14,10 +14,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(feature = "desktop")]
 use serde::Deserialize;
+#[cfg(feature = "desktop")]
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-use crate::commands::errors::{coded, coded_ctx};
+use crate::commands::errors::coded;
+#[cfg(feature = "desktop")]
+use crate::commands::errors::coded_ctx;
 
 pub const CHAT_WINDOW_LABEL: &str = "chat";
 /// Emitted when the chat window is gone, however it went, so the main window
@@ -28,22 +32,31 @@ pub const CHAT_WINDOW_CLOSED_EVENT: &str = "ember:chat-window-closed";
 pub const CHAT_WINDOW_REDOCK_EVENT: &str = "ember:chat-window-redock";
 /// How long a chat window that was asked to dock back has to do it before it
 /// is closed anyway. A hung webview must not leave a window that cannot close.
+#[cfg(feature = "desktop")]
 const REDOCK_GRACE: Duration = Duration::from_millis(1_500);
 
 /// Bumped for every chat window opened, so a grace timer started for one
 /// window cannot close the next one opened in the meantime.
+#[cfg(feature = "desktop")]
 static WINDOW_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "desktop")]
 const DEFAULT_WIDTH: f64 = 440.0;
+#[cfg(feature = "desktop")]
 const DEFAULT_HEIGHT: f64 = 640.0;
+#[cfg(feature = "desktop")]
 const MIN_WIDTH: f64 = 340.0;
+#[cfg(feature = "desktop")]
 const MIN_HEIGHT: f64 = 420.0;
 /// Far past any real monitor; bounds larger than this are a corrupt setting.
+#[cfg(feature = "desktop")]
 const MAX_EXTENT: f64 = 16_384.0;
+#[cfg(feature = "desktop")]
 const MAX_TITLE_CHARS: usize = 80;
 
 /// Where the chat window was last left, in logical pixels, as the renderer
 /// remembered it.
+#[cfg(feature = "desktop")]
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct ChatWindowBounds {
     pub x: f64,
@@ -52,6 +65,7 @@ pub struct ChatWindowBounds {
     pub height: f64,
 }
 
+#[cfg(feature = "desktop")]
 impl ChatWindowBounds {
     fn is_sane(&self) -> bool {
         [self.x, self.y, self.width, self.height]
@@ -65,6 +79,7 @@ impl ChatWindowBounds {
 /// Whether a window at `bounds` would have its title bar on a monitor that is
 /// still attached. A window restored onto a monitor that was unplugged since
 /// opens where nobody can see it, and cannot be dragged back.
+#[cfg(feature = "desktop")]
 fn title_bar_on_screen(bounds: &ChatWindowBounds, monitors: &[tauri::Monitor]) -> bool {
     let grab_x = bounds.x + bounds.width.min(240.0) / 2.0;
     let grab_y = bounds.y + 12.0;
@@ -79,17 +94,18 @@ fn title_bar_on_screen(bounds: &ChatWindowBounds, monitors: &[tauri::Monitor]) -
     })
 }
 
-fn bring_forward(window: &tauri::WebviewWindow) {
+#[cfg(feature = "desktop")]
+fn bring_forward(window: &crate::host::WebviewWindow) {
     let _ = window.unminimize();
     let _ = window.show();
     let _ = window.set_focus();
 }
 
 /// Open the chat window, or bring it forward if it is already open.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_chat_window(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
     title: String,
     bounds: Option<ChatWindowBounds>,
 ) -> Result<(), String> {
@@ -134,6 +150,7 @@ pub async fn open_chat_window(
 /// which ends in [`close_chat_window`] — and close it regardless once
 /// [`REDOCK_GRACE`] has passed; the main window then docks the chat back from
 /// [`CHAT_WINDOW_CLOSED_EVENT`] with whatever drafts it last heard about.
+#[cfg(feature = "desktop")]
 pub fn request_redock(window: &tauri::Window) {
     let app = window.app_handle().clone();
     if app.emit_to(CHAT_WINDOW_LABEL, CHAT_WINDOW_REDOCK_EVENT, ()).is_err() {
@@ -141,7 +158,7 @@ pub fn request_redock(window: &tauri::Window) {
         return;
     }
     let generation = WINDOW_GENERATION.load(Ordering::Acquire);
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         tokio::time::sleep(REDOCK_GRACE).await;
         if WINDOW_GENERATION.load(Ordering::Acquire) != generation {
             return;
@@ -155,7 +172,8 @@ pub fn request_redock(window: &tauri::Window) {
 /// Hide the chat window with the main one when Ember goes to the tray, and
 /// bring it back with it. Left on screen alone it would be Ember with no way
 /// back to the rest of it.
-pub fn set_chat_window_visible(app: &tauri::AppHandle, visible: bool) {
+#[cfg(feature = "desktop")]
+pub fn set_chat_window_visible(app: &crate::host::AppHandle, visible: bool) {
     if let Some(chat) = app.get_webview_window(CHAT_WINDOW_LABEL) {
         let _ = if visible { chat.show() } else { chat.hide() };
     }
@@ -163,8 +181,8 @@ pub fn set_chat_window_visible(app: &tauri::AppHandle, visible: bool) {
 
 /// Close the chat window, once the chat is docked back. Destroys rather than
 /// closes: a close would come back through the X's redock handling.
-#[tauri::command]
-pub async fn close_chat_window(app: tauri::AppHandle) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn close_chat_window(app: crate::host::AppHandle) -> Result<(), String> {
     if let Some(chat) = app.get_webview_window(CHAT_WINDOW_LABEL) {
         chat.destroy().map_err(|error| {
             coded_ctx("chat_window_close_failed", "Could not close the chat window", error)
@@ -267,7 +285,7 @@ pub fn chat_window_may_invoke(command: &str) -> bool {
 /// sits in the same module as `get_settings`), which
 /// [`CHAT_WINDOW_DENIED_COMMANDS`] cannot name without failing the check that
 /// the chat reaches none of them.
-pub fn require_main_window(window: &tauri::WebviewWindow) -> Result<(), String> {
+pub fn require_main_window(window: &crate::host::WebviewWindow) -> Result<(), String> {
     if window.label() == "main" {
         Ok(())
     } else {
@@ -281,14 +299,15 @@ pub fn require_main_window(window: &tauri::WebviewWindow) -> Result<(), String> 
 /// Bring the main window to the front, for the chat window's links into it
 /// (the Friends page, docking back). The renderer cannot focus another window
 /// itself without a capability that would let it focus any of them.
-#[tauri::command]
-pub async fn focus_main_window(app: tauri::AppHandle) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn focus_main_window(app: crate::host::AppHandle) -> Result<(), String> {
     if let Some(main) = app.get_webview_window("main") {
         bring_forward(&main);
     }
     Ok(())
 }
 
+#[cfg(feature = "desktop")]
 #[cfg(test)]
 mod tests {
     use super::*;

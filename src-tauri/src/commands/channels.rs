@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use rand::rngs::OsRng;
 use rand::RngCore;
-use tauri::Emitter;
+use crate::host::Emitter;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, coded, coded_ctx, CMD_SEND_TIMEOUT};
@@ -25,6 +25,7 @@ use crate::storage::database::{
     CachedChannel, ChannelEditOutcome, ChannelReplyLookup, ChannelReplyParent, Database,
     StoredChannel, StoredChannelMember,
 };
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 
 /// Room names are bounded in characters, not only by the record's bytes: a
@@ -593,7 +594,7 @@ pub(crate) async fn apply_channel_username_locally(state: &AppState, username: &
 /// itself is the network loop's, when it applies `UpdateSettings`, for the
 /// reason [`apply_channel_username_locally`] gives.
 pub(crate) async fn apply_channel_language_locally(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     languages: ChannelLanguages,
 ) {
@@ -803,8 +804,8 @@ async fn discard_partial_channel(state: &AppState, channel_id: &str) {
     );
 }
 
-#[tauri::command]
-pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
+#[ember_macros::command]
+pub async fn list_channels(state: crate::host::State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
     require_ember(&state).await?;
     let our_pk = hex::encode(state.identity.ed25519_public_key);
     let db = state.db.clone();
@@ -878,10 +879,10 @@ pub(crate) fn new_room_tail(
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn create_channel(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     name: String,
     private: bool,
     language: Option<String>,
@@ -1153,9 +1154,9 @@ pub async fn create_channel(
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn join_channel(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     uri: String,
 ) -> Result<ChannelInfo, String> {
     require_ember(&state).await?;
@@ -1328,9 +1329,9 @@ pub async fn join_channel(
 }
 
 /// Re-enter a room this device already has a row for, without an invite URI.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn enter_channel(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
     require_ember(&state).await?;
@@ -1574,9 +1575,9 @@ async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, usernam
         });
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn leave_channel(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
     require_ember(&state).await?;
@@ -1649,9 +1650,9 @@ pub async fn leave_channel(
 /// this off my list" into "never let me back in". Removing the row leaves the
 /// room reachable through Discover or a fresh invite, which is what a member
 /// who changes their mind expects.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn forget_channel(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
     let channel_id = parse_channel_id(&channel_id)?;
@@ -1695,11 +1696,11 @@ pub async fn forget_channel(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn claim_channel_username(
-    window: tauri::WebviewWindow,
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     name: String,
 ) -> Result<String, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -1713,10 +1714,10 @@ pub async fn claim_channel_username(
 
 /// Owner-only permanent delete: tombstone the name on Rendezvous and walk
 /// this device out. Moderators cannot call this.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_owned_channel(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -1791,9 +1792,9 @@ pub struct RoomDeletedElsewhere {
 }
 
 /// Rooms waiting on the user's answer.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn list_rooms_deleted_elsewhere(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<RoomDeletedElsewhere>, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.rooms_deleted_elsewhere())
@@ -1811,9 +1812,9 @@ pub async fn list_rooms_deleted_elsewhere(
 /// it would have, `keep` keeps it here and stops asking. Only for a room the
 /// prompt lists: this is not a way to delete any room without its own
 /// confirmation.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn confirm_room_deleted_elsewhere(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     delete: bool,
 ) -> Result<(), String> {
@@ -1840,9 +1841,9 @@ pub async fn confirm_room_deleted_elsewhere(
         .map_err(|e| coded_ctx("channels_delete_failed", "Failed to delete the room", e))
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_invite(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInviteInfo, String> {
     require_ember(&state).await?;
@@ -1928,9 +1929,9 @@ pub async fn get_channel_invite(
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn list_channel_members(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<Vec<ChannelMemberInfo>, String> {
     require_ember(&state).await?;
@@ -1968,7 +1969,7 @@ pub struct ChannelPresenceConfig {
     pub beat_secs: i64,
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn channel_presence_config() -> Result<ChannelPresenceConfig, String> {
     Ok(ChannelPresenceConfig {
         mesh_fresh_secs: channel::PRESENCE_MESH_FRESH_SECS,
@@ -1982,9 +1983,9 @@ pub async fn channel_presence_config() -> Result<ChannelPresenceConfig, String> 
 /// Presence costs are per room and a user who has joined thirty is reading one.
 /// Naming it is what lets that one be walked at the rate somebody watching it
 /// would expect without paying the same for the other twenty-nine.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_focus(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: Option<String>,
 ) -> Result<(), String> {
     require_ember(&state).await?;
@@ -2000,9 +2001,9 @@ pub async fn set_channel_focus(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_messages(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     limit: Option<i64>,
     before_id: Option<i64>,
@@ -2026,9 +2027,9 @@ pub async fn get_channel_messages(
 
 /// Substring search over one room's stored history. Local only — nothing is
 /// asked of the network, so this finds what this device has kept.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn search_channel_messages(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     query: String,
     limit: Option<i64>,
@@ -2066,10 +2067,10 @@ pub async fn search_channel_messages(
 ///
 /// The room's slow mode deliberately does not apply. It exists to bound how fast
 /// *new* lines arrive, and a revision replaces one that has already been counted.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn edit_channel_message(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     message_id: i64,
     message: String,
@@ -2327,9 +2328,9 @@ async fn reply_lookup_for(
 /// would silently displace the first on any v1.6.x peer and in what it
 /// re-serves. Clearing is stored rather than deleted, because the row carries
 /// the timestamp that stops a stale frame reasserting what was withdrawn.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_message_reaction(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     message_id: i64,
     reaction: u8,
@@ -2473,9 +2474,9 @@ pub async fn set_channel_message_reaction(
 /// cached view, so this costs no database read per keystroke; and a full
 /// command queue drops the signal rather than waiting, since the next
 /// keystroke sends a fresh one and a late one would be wrong.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn send_channel_typing(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     typing: bool,
 ) -> Result<(), String> {
@@ -2489,9 +2490,9 @@ pub async fn send_channel_typing(
 
 /// Every live reaction tally in a room, so the UI can draw counts in one read
 /// rather than a query per bubble.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_reactions(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<Vec<ChannelReactionInfo>, String> {
     let channel_id = parse_channel_id(&channel_id)?;
@@ -2557,9 +2558,9 @@ fn tally_channel_reactions(rows: Vec<(String, String, u8)>, mine: &str) -> Vec<C
 /// Remove one message from this device. Deliberately does not propagate: the
 /// protocol has no redaction, so pretending otherwise would be a lie about
 /// what every other member still holds.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_channel_message(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     message_id: i64,
 ) -> Result<(), String> {
@@ -2585,9 +2586,9 @@ pub async fn delete_channel_message(
 /// show it, so it is checked against something real rather than passed through
 /// — and a line the sender cannot see is not one they can meaningfully answer.
 /// Receivers are not held to this, since a reply can outrun its parent.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn send_channel_message(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     message: String,
     reply_to: Option<String>,
@@ -2858,9 +2859,9 @@ pub async fn send_channel_message(
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_channel_messages_read(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
     require_ember(&state).await?;
@@ -2874,9 +2875,9 @@ pub async fn mark_channel_messages_read(
 }
 
 /// The line left half-typed in a room, kept across restarts.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_draft(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<String, String> {
     require_ember(&state).await?;
@@ -2889,9 +2890,9 @@ pub async fn get_channel_draft(
 }
 
 /// Keep a room's draft, or drop it when `text` is empty.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_draft(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     text: String,
 ) -> Result<(), String> {
@@ -3484,9 +3485,9 @@ async fn channel_info_from_id(state: &AppState, channel_id: &str) -> Result<Chan
 
 /// The user has seen that some of a room's lines need a newer Ember. Returns
 /// the room as it reads now.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn dismiss_channel_newer_lines(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
     let channel_id = channel_id.trim().to_ascii_lowercase();
@@ -4072,10 +4073,10 @@ async fn reseal_current_epoch_to_member(
 /// Rotation otherwise only happens on a ban, so an owner whose invite link had
 /// leaked had no remedy but to ban somebody who had done nothing wrong. Every
 /// invite handed out before this stops working, which is the point.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn rotate_channel_room_key(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -4143,10 +4144,10 @@ pub(crate) async fn rekey_recovered_room(
 /// way they learn bans. Enforcement is each client refusing to mint, which
 /// makes this a guard against carelessness rather than against a member who
 /// patches their build — they already hold the key either way.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_invite_policy(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     owner_only: bool,
 ) -> Result<ChannelInfo, String> {
@@ -4199,10 +4200,10 @@ pub async fn set_channel_invite_policy(
 /// the same way they learn bans, and like the invite policy it is enforced by
 /// each client declining to send — a guard against a flood of ordinary clients
 /// rather than against a patched one.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_slow_mode(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     secs: u16,
 ) -> Result<ChannelInfo, String> {
@@ -4255,10 +4256,10 @@ pub async fn set_channel_slow_mode(
 /// snapshot like slow mode, and like slow mode it is each member's client that
 /// declines to send; nothing is dropped on receipt (see
 /// `ModerationTail::announce_only`). Reactions stay open.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_announce_only(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     announce_only: bool,
 ) -> Result<ChannelInfo, String> {
@@ -4316,10 +4317,10 @@ fn parse_channel_language(code: Option<&str>) -> Result<Option<&'static str>, St
 /// Shown to members as a flag beside the room's name, and nothing more — it
 /// filters nothing and stops no one writing in another language. Rides the
 /// owner-signed moderation snapshot like the posting rule.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_language(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     language: Option<String>,
 ) -> Result<ChannelInfo, String> {
@@ -4415,9 +4416,9 @@ fn next_pins(current: &[String], msg_id: &str, pinned: bool) -> Result<Option<Ve
 /// a refresh and a patched client cannot forge one. The pin commit refuses
 /// rather than sheds when the record is full ([`PinFit::Require`]); every other
 /// commit sheds the oldest pin first.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_message_pinned(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     msg_id: String,
     pinned: bool,
@@ -4489,9 +4490,9 @@ pub struct ChannelPinInfo {
 
 /// The room's pins, oldest first, each resolved against local history the way
 /// a reply's quote is.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_pins(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<Vec<ChannelPinInfo>, String> {
     require_ember(&state).await?;
@@ -4669,10 +4670,10 @@ async fn apply_local_mod_ban(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn update_channel_moderation(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     topic: String,
     welcome: String,
@@ -4709,10 +4710,10 @@ const RENAME_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// learn the new name from the owner's moderation snapshot, the record that
 /// already carries the topic, which they fetch every few minutes while in the
 /// room — so one who is offline picks it up when they are back.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn rename_channel(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     name: String,
 ) -> Result<ChannelInfo, String> {
@@ -4894,10 +4895,10 @@ pub async fn rename_channel(
     channel_info_from_id(&state, &channel_id).await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ban_channel_member(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -5096,10 +5097,10 @@ pub async fn ban_channel_member(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn unban_channel_member(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -5170,10 +5171,10 @@ async fn refuse_protected_ban_target(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn add_channel_moderator(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -5227,10 +5228,10 @@ pub async fn add_channel_moderator(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_channel_moderator(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -5264,10 +5265,10 @@ pub async fn remove_channel_moderator(
 /// Nominate who may take the room over if the owner stops republishing, and
 /// after how long. Both facts ride the owner-signed moderation record, so every
 /// member can check a later claim against them.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_successor_nominee(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: Option<String>,
     claim_after_days: Option<u16>,
@@ -5406,10 +5407,10 @@ async fn register_nominee_with_registry(
 /// Mints a fresh room key — the old owner's seed is never copied — and publishes
 /// a claim every member checks against the nomination in the owner's last signed
 /// record before following it.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn claim_channel_ownership(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -6070,10 +6071,10 @@ const GATHER_WALK_MAX: usize = 64;
 /// slowest walk gives up, and the merged result is cached for the next open.
 /// The return value is still the complete set: a caller that ignores the
 /// events behaves exactly as before.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn gather_channels(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     walk: String,
 ) -> Result<Vec<GatheredChannelInfo>, String> {
     use futures::StreamExt;
@@ -6329,9 +6330,9 @@ pub async fn gather_channels(
 /// Answers without touching the network so the browse has something on screen
 /// while [`gather_channels`] is still walking. These are hints and may name a
 /// room that has since gone; the walk that follows is what confirms them.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cached_channels(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<GatheredChannelInfo>, String> {
     let db = state.db.clone();
     let (joined, cached) = tokio::task::spawn_blocking(move || discover_room_lists(&db))
@@ -6473,10 +6474,10 @@ pub(crate) async fn find_raw_keys_counted(
 
 /// Owner starts a transfer: the named member mints a new channel key; the
 /// old key then signs a DHT handoff. The seed is never copied.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn transfer_channel_ownership(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -6644,9 +6645,9 @@ async fn clear_channel_pending_handoff(
 /// Deriving it here rather than in the UI keeps one implementation of that
 /// binding, and hands `add_friend` a code whose pubkey it can verify instead
 /// of a bare hash it would have to learn the key for later.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn channel_member_friend_code(
-    _state: tauri::State<'_, AppState>,
+    _state: crate::host::State<'_, AppState>,
     member_pubkey: String,
 ) -> Result<String, String> {
     let pk = parse_member_pubkey(&member_pubkey)?;
@@ -6838,10 +6839,10 @@ mod room_friend_request_backoff_tests {
 /// `canonicalize`.
 ///
 /// `Ok(None)` means the user dismissed the picker.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_and_offer_channel_transfer(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
     title: Option<String>,
@@ -6979,9 +6980,9 @@ pub async fn pick_and_offer_channel_transfer(
 }
 
 /// Accept or decline an offer someone made you.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn respond_channel_transfer(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     xfer_id: String,
     accept: bool,
 ) -> Result<(), String> {
@@ -7006,9 +7007,9 @@ pub async fn respond_channel_transfer(
 }
 
 /// Stop a transfer in either direction, and tell the other end.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cancel_channel_transfer(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     xfer_id: String,
 ) -> Result<(), String> {
     require_ember(&state).await?;
@@ -7023,8 +7024,8 @@ pub async fn cancel_channel_transfer(
 }
 
 /// Open the Channel Files folder, creating it if nothing has landed there yet.
-#[tauri::command]
-pub async fn open_channel_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn open_channel_files_folder(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     let dl_folder = state.config.read().await.settings.download_folder.clone();
     tokio::task::spawn_blocking(move || {
         let allowed = vec![dl_folder.clone()];
@@ -7047,9 +7048,9 @@ pub async fn open_channel_files_folder(state: tauri::State<'_, AppState>) -> Res
 }
 
 /// Everything currently offered, awaiting an answer, or moving.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn list_channel_transfers(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<crate::network::ChannelTransferSnapshot>, String> {
     if !state.config.read().await.settings.ember_native_enabled {
         return Ok(Vec::new());

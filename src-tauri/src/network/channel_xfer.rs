@@ -732,7 +732,7 @@ async fn sync_xfer_streams(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -887,7 +887,7 @@ async fn sync_xfer_streams(
 /// wants.
 pub(super) fn drop_channel_transfers_for(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     channel_id: [u8; 16],
     member: Option<[u8; 32]>,
     status: &str,
@@ -958,7 +958,7 @@ pub(super) fn drop_channel_transfers_for(
 pub(super) fn drop_banned_channel_transfers(
     state: &mut NetworkState,
     db: &Database,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     channel_id: [u8; 16],
 ) {
     let channel_id_hex = hex::encode(channel_id);
@@ -981,7 +981,7 @@ pub(super) fn drop_banned_channel_transfers(
 }
 
 pub(super) fn emit_xfer_update(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     xfer_id: &[u8; 16],
     channel_id: &[u8; 16],
     peer: &[u8; 32],
@@ -1192,7 +1192,7 @@ pub(super) async fn apply_xfer_offer(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ch: &crate::storage::database::StoredChannel,
     gossip: &ember::channel::ChannelGossip,
     offer: ember::channel::XferOffer,
@@ -1365,7 +1365,7 @@ pub(super) async fn apply_xfer_offer(
 
 pub(super) async fn apply_xfer_reply(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     xfer_id: [u8; 16],
     sender: [u8; 32],
     reply: ember::channel::XferReply,
@@ -1493,7 +1493,7 @@ fn xfer_accept_refusal(
 
 fn refuse_xfer_accept(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     xfer_id: [u8; 16],
     offer: &ember::xfer::PendingOffer,
     refusal: XferAcceptRefusal,
@@ -1535,7 +1535,7 @@ fn refuse_xfer_accept(
 pub(super) fn begin_xfer_accept(
     state: &mut NetworkState,
     db: &Database,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     xfer_id: [u8; 16],
     offer: ember::xfer::PendingOffer,
     download_folder: std::path::PathBuf,
@@ -1643,7 +1643,7 @@ pub(super) async fn apply_xfer_accept_prepared(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     done: XferAcceptPrepared,
 ) {
     let XferAcceptPrepared {
@@ -1725,7 +1725,7 @@ pub(super) async fn answer_xfer_offer(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     xfer_id: [u8; 16],
     offer: ember::xfer::PendingOffer,
     accept: bool,
@@ -1799,7 +1799,7 @@ pub(super) fn apply_xfer_block_request(
 
 pub(super) fn apply_xfer_block_data(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     xfer_id: [u8; 16],
     sender: [u8; 32],
     offset: u64,
@@ -2046,7 +2046,7 @@ pub(super) async fn apply_xfer_finish(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     credit_manager: &Arc<RwLock<CreditManager>>,
     result: XferFinishResult,
 ) {
@@ -2164,7 +2164,7 @@ pub(super) async fn answer_finished_xfer(
 /// The recipient has the whole file and it matched. Retire the send side.
 pub(super) fn apply_xfer_done(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     xfer_id: [u8; 16],
     sender: [u8; 32],
 ) {
@@ -2200,7 +2200,7 @@ pub(super) fn apply_xfer_done(
 
 pub(super) fn apply_xfer_cancel(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     xfer_id: [u8; 16],
     sender: [u8; 32],
     reason: ember::channel::XferCancel,
@@ -2267,7 +2267,7 @@ pub(super) async fn drive_channel_transfers(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     // Ahead of the early return: a fetch can end, and a grant can need

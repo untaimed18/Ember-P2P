@@ -3,7 +3,8 @@ use crate::commands::errors::{bounded_send, coded, coded_ctx};
 use crate::network::ed2k::collection::{Collection, CollectionFile};
 use crate::network::ed2k::transfer::TransferFailureCode;
 use crate::types::{Transfer, TransferDirection, TransferStatus};
-use tauri::Emitter;
+use crate::host::Emitter;
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 
 const MAX_COLLECTION_FIELD_LEN: usize = 1024;
@@ -20,8 +21,8 @@ pub struct CollectionDownloadResult {
 
 /// Native picker path for Library. Selecting a file is an explicit user
 /// authorization, so use the same bounded parser as OS file-association opens.
-#[tauri::command]
-pub async fn pick_and_load_collection(app: tauri::AppHandle) -> Result<Option<Collection>, String> {
+#[ember_macros::command(desktop)]
+pub async fn pick_and_load_collection(app: crate::host::AppHandle) -> Result<Option<Collection>, String> {
     let selected = tokio::task::spawn_blocking(move || {
         app.dialog()
             .file()
@@ -198,9 +199,9 @@ async fn create_collection_internal(
 /// OS dialog *is* the user's authorization, so no shared/download-root policy
 /// applies — mirrors `pick_and_load_collection`. Restricting it here only broke
 /// exports to the desktop or documents folder.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn create_collection_with_dialog(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     name: String,
     author: String,
     files: Vec<CollectionFile>,
@@ -245,10 +246,10 @@ pub async fn create_collection_with_dialog(
 /// Absent, every file finishes where any download does, as before. The folders
 /// are cleaned before use (`category_folders::collection_segments`), so a
 /// collection cannot name a place outside the download folder.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn download_collection_files(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     files: Vec<CollectionFile>,
     collection_name: Option<String>,
 ) -> Result<CollectionDownloadResult, String> {

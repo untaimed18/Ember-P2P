@@ -81,6 +81,7 @@
     exportBackup,
     importBackup,
     pickBackupFile,
+    uploadBackupFile,
     clearPickedBackup,
     pendingRestoreStatus,
     previewBackup,
@@ -167,9 +168,71 @@
   import { toastError } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
   import { isShortcutLetter } from '$lib/shortcutKey';
+  import { isServer } from '$lib/runtime';
+  import { changePassword, logOut } from '$lib/runtime/web/session';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const appLicense = import.meta.env.VITE_APP_LICENSE;
+
+  /** emberd's "This server" section: how it was started (`server_overview`). */
+  interface ServerOverview {
+    version: string;
+    config_file: string | null;
+    data_folder: string;
+    web_address: string;
+    https: boolean;
+    download_folder: string | null;
+    shared_folders: string[];
+    browse_under: string[];
+    min_password_chars: number;
+  }
+  let serverOverview = $state<ServerOverview | null>(null);
+  let currentPassword = $state('');
+  let newPassword = $state('');
+  let repeatPassword = $state('');
+  let passwordBusy = $state(false);
+  let passwordMessage = $state<{ text: string; error: boolean } | null>(null);
+  let signingOut = $state(false);
+
+  onMount(() => {
+    if (!isServer) return;
+    invoke<ServerOverview | null>('server_overview')
+      .then((overview) => (serverOverview = overview))
+      .catch((e) => console.error('Failed to read how emberd was started:', e));
+  });
+
+  async function submitPasswordChange(event: SubmitEvent) {
+    event.preventDefault();
+    if (passwordBusy) return;
+    passwordMessage = null;
+    if (newPassword !== repeatPassword) {
+      passwordMessage = { text: m.server_setup_mismatch(), error: true };
+      return;
+    }
+    passwordBusy = true;
+    try {
+      await changePassword(currentPassword, newPassword);
+      currentPassword = '';
+      newPassword = '';
+      repeatPassword = '';
+      passwordMessage = { text: m.server_settings_password_changed(), error: false };
+    } catch (e) {
+      passwordMessage = { text: translateError(e, m.error_operation_failed()), error: true };
+    } finally {
+      passwordBusy = false;
+    }
+  }
+
+  async function signOut() {
+    if (signingOut) return;
+    signingOut = true;
+    try {
+      await logOut();
+    } catch (e) {
+      signingOut = false;
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
 
   // Silent updates. `supported` is the backend's answer for this install;
   // the status line describes what the saved setting is doing right now.
@@ -583,11 +646,13 @@
         // Only the reminder's clock is lost.
       }
       lastBackupMs = readLastBackup();
-      const done = m.settings_backup_export_done({
-        files: summary.files,
-        size: formatSize(summary.bytes),
-        path: summary.path,
-      });
+      const done = isServer
+        ? m.server_backup_export_done({ files: summary.files, size: formatSize(summary.bytes), name: summary.path })
+        : m.settings_backup_export_done({
+            files: summary.files,
+            size: formatSize(summary.bytes),
+            path: summary.path,
+          });
       showBackupMsg(
         summary.skipped.length > 0 ? `${done} ${m.settings_backup_export_skipped_chat_key()}` : done,
         'success',
@@ -599,7 +664,33 @@
     }
   }
 
+  /** emberd: the backup is chosen on the browser's computer and sent over. */
+  let backupFileInput: HTMLInputElement | undefined = $state(undefined);
+
+  async function handleUploadBackupFile(event: Event & { currentTarget: HTMLInputElement }) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file || backupBusy) return;
+    backupBusy = true;
+    showBackupMsg(m.server_backup_uploading(), 'progress');
+    try {
+      await uploadBackupFile(file);
+      restoreSource = file.name;
+      restorePreview = null;
+      backupMessage = null;
+    } catch (e) {
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
+    } finally {
+      backupBusy = false;
+    }
+  }
+
   async function handlePickBackupFile() {
+    if (isServer) {
+      backupFileInput?.click();
+      return;
+    }
     try {
       const selected = await pickBackupFile();
       if (typeof selected === 'string') {
@@ -924,14 +1015,16 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'library' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'server' | 'notifications' | 'downloads' | 'library' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
 
   /// Sidebar order, and the order the cards are declared in below. Keep them
   /// in step: while filtering, every matching card is on screen in DOM order,
   /// and the arrow-key handling below walks this array, so a mismatch makes
-  /// the keyboard order disagree with what is on screen.
+  /// the keyboard order disagree with what is on screen. emberd has a
+  /// section of its own.
   const sections: SettingsSection[] = [
     'general',
+    ...(isServer ? (['server'] as const) : []),
     'notifications',
     'downloads',
     'library',
@@ -1165,6 +1258,7 @@
   function sectionLabel(id: SettingsSection): string {
     switch (id) {
       case 'general': return m.settings_section_general();
+      case 'server': return m.server_settings_section();
       case 'notifications': return m.settings_section_notifications();
       case 'downloads': return m.settings_section_downloads();
       case 'library': return m.nav_library();
@@ -2981,6 +3075,13 @@
                   <line x1="3" y1="10" x2="17" y2="10"/>
                   <line x1="3" y1="14.5" x2="17" y2="14.5"/>
                 </svg>
+              {:else if section === 'server'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="3" width="14" height="5.5" rx="1"/>
+                  <rect x="3" y="11.5" width="14" height="5.5" rx="1"/>
+                  <line x1="6" y1="5.75" x2="6.01" y2="5.75"/>
+                  <line x1="6" y1="14.25" x2="6.01" y2="14.25"/>
+                </svg>
               {:else if section === 'notifications'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M10 2.5a4.5 4.5 0 0 0-4.5 4.5c0 3.5-1.5 4.5-1.5 5.5h12c0-1-1.5-2-1.5-5.5A4.5 4.5 0 0 0 10 2.5z"/>
@@ -3294,6 +3395,7 @@
             </div>
           </div>
 
+          {#if !isServer}
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_startup()}</h4>
             <div class="field">
@@ -3440,6 +3542,7 @@
               />
             </div>
           </div>
+          {/if}
 
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_power()}</h4>
@@ -3469,6 +3572,114 @@
         </div>
       </section>
 
+      {#if isServer}
+      <!-- This server: emberd's sign-in, and what its config file set -->
+      <section class="card" class:hidden={!filtering && activeSection !== 'server'} id={panelId('server')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('server')}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="14" height="5.5" rx="1"/>
+              <rect x="3" y="11.5" width="14" height="5.5" rx="1"/>
+              <line x1="6" y1="5.75" x2="6.01" y2="5.75"/>
+              <line x1="6" y1="14.25" x2="6.01" y2="14.25"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.server_settings_section()}</h3>
+            <p class="card-desc">{m.server_settings_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.server_settings_group_signin()}</h4>
+            <form class="field" onsubmit={submitPasswordChange}>
+              <span class="field-label">{m.server_settings_change_password()}</span>
+              <label for="server-current-password">{m.server_settings_current_password()}</label>
+              <input id="server-current-password" type="password" autocomplete="current-password" bind:value={currentPassword} required />
+              <label for="server-new-password">{m.server_settings_new_password()}</label>
+              <input
+                id="server-new-password"
+                type="password"
+                autocomplete="new-password"
+                minlength={serverOverview?.min_password_chars ?? 8}
+                bind:value={newPassword}
+                required
+              />
+              <span class="hint">{m.server_password_hint({ count: serverOverview?.min_password_chars ?? 8 })}</span>
+              <label for="server-repeat-password">{m.server_setup_repeat()}</label>
+              <input id="server-repeat-password" type="password" autocomplete="new-password" bind:value={repeatPassword} required />
+              <div class="action-row">
+                <button type="submit" class="action-btn primary" disabled={passwordBusy}>{m.server_settings_change_password_button()}</button>
+              </div>
+              {#if passwordMessage}
+                <span class="feedback {passwordMessage.error ? 'error' : 'success'}" role={passwordMessage.error ? 'alert' : 'status'}>{passwordMessage.text}</span>
+              {/if}
+            </form>
+            <div class="field">
+              <span class="field-label">{m.server_settings_sign_out()}</span>
+              <span class="hint">{m.server_settings_sign_out_hint()}</span>
+              <div class="action-row">
+                <button type="button" class="action-btn" onclick={signOut} disabled={signingOut}>{m.server_settings_sign_out()}</button>
+              </div>
+            </div>
+          </div>
+
+          {#if serverOverview}
+            {@const overview = serverOverview}
+            <div class="settings-group">
+              <h4 class="subsection-title">{m.server_settings_group_config()}</h4>
+              <span class="hint">{m.server_settings_config_hint()}</span>
+              <div class="field">
+                <span class="field-label">{m.server_settings_web_address()}</span>
+                <span class="hint server-path">{overview.web_address}</span>
+                <span class="hint">{overview.https ? m.server_settings_https() : m.server_settings_plain_http()}</span>
+              </div>
+              <div class="field">
+                <span class="field-label">{m.server_settings_config_file()}</span>
+                <span class="hint server-path">{overview.config_file ?? m.server_settings_config_none()}</span>
+              </div>
+              <div class="field">
+                <span class="field-label">{m.server_settings_data_folder()}</span>
+                <span class="hint server-path">{overview.data_folder}</span>
+              </div>
+              <div class="field">
+                <span class="field-label">{m.settings_download_folder_label()}</span>
+                <span class="hint server-path">
+                  {overview.download_folder ?? m.server_settings_download_default({ path: settings?.download_folder ?? '' })}
+                </span>
+              </div>
+              <div class="field">
+                <span class="field-label">{m.server_settings_shared_folders()}</span>
+                {#each overview.shared_folders as folder (folder)}
+                  <span class="hint server-path">{folder}</span>
+                {:else}
+                  <span class="hint">{m.server_settings_none()}</span>
+                {/each}
+              </div>
+              <div class="field">
+                <span class="field-label">{m.server_settings_browse_under()}</span>
+                {#each overview.browse_under as folder (folder)}
+                  <span class="hint server-path">{folder}</span>
+                {:else}
+                  <span class="hint">{m.server_settings_browse_under_none()}</span>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.server_settings_restart()}</h4>
+            <div class="field">
+              <span class="hint">{m.server_settings_restart_hint()}</span>
+              <div class="action-row">
+                <button type="button" class="action-btn" onclick={performRestart}>{m.server_settings_restart()}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      {/if}
+
       <!-- Notifications -->
       <section class="card" class:hidden={!filtering && activeSection !== 'notifications'} id={panelId('notifications')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('notifications')}>
         <div class="card-header">
@@ -3487,7 +3698,8 @@
           <!-- Two systems, kept apart: desktop notifications come from the
                operating system and reach the user outside the window; pop-ups
                are Ember's own, inside it. Neither group's switches govern the
-               other's. -->
+               other's. emberd runs on a computer nobody is looking at. -->
+          {#if !isServer}
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_desktop_notifications()}</h4>
             <div class="field toggle-row">
@@ -3553,6 +3765,7 @@
               {/each}
             </div>
           </div>
+          {/if}
 
           <div class="settings-group">
             <h4 class="subsection-title" id="popups-title">{m.settings_popups_title()}</h4>
@@ -3608,9 +3821,14 @@
               <label for="download-folder">{m.settings_download_folder_label()}</label>
               <div class="folder-input">
                 <input id="download-folder" value={settings.download_folder} readonly />
-                <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
+                {#if !isServer}
+                  <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
+                {/if}
               </div>
               <span class="hint">{folderLayoutHint(settings.download_folder)}</span>
+              {#if isServer}
+                <span class="hint">{m.server_download_folder_hint()}</span>
+              {/if}
             </div>
             <div class="field">
               <span class="field-label">{m.settings_category_folders_label()}</span>
@@ -3828,6 +4046,7 @@
                 ariaDescribedby="preview-priority-all-hint"
               />
             </div>
+            {#if !isServer}
             <div class="field">
               <label for="preview-player">{m.settings_preview_player_label()}</label>
               <div class="folder-input">
@@ -3842,6 +4061,7 @@
               </div>
               <span class="hint">{m.settings_preview_player_hint()}</span>
             </div>
+            {/if}
           </div>
 
           <div class="settings-group">
@@ -4207,9 +4427,11 @@
                     {m.webservices_add_example()}
                   </button>
                 {/if}
-                <button class="action-btn ghost" onclick={handleImportWebServices}>
-                  {m.webservices_import()}
-                </button>
+                {#if !isServer}
+                  <button class="action-btn ghost" onclick={handleImportWebServices}>
+                    {m.webservices_import()}
+                  </button>
+                {/if}
               </div>
               {#if webServiceMessage}
                 <span class="feedback {webServiceMessage.kind === 'err' ? 'error' : 'success'}">
@@ -5196,12 +5418,14 @@
                   </div>
                   {@render applyButton(['chat_attachment_auto_accept_mb'], m.settings_chat_attach_auto_label())}
                 </div>
-                <button type="button" class="action-btn chat-files-btn" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
-                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
-                  </svg>
-                  {m.settings_chat_attach_open_folder()}
-                </button>
+                {#if !isServer}
+                  <button type="button" class="action-btn chat-files-btn" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                    </svg>
+                    {m.settings_chat_attach_open_folder()}
+                  </button>
+                {/if}
               </div>
               <span id="chat-attach-auto-hint" class="hint">{m.settings_chat_attach_auto_hint()}</span>
             </div>
@@ -5359,12 +5583,14 @@
                   <option value="friends">{m.settings_channel_file_offers_friends()}</option>
                   <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
                 </select>
-                <button type="button" class="action-btn chat-files-btn" onclick={() => void openChannelFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
-                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
-                  </svg>
-                  {m.settings_channel_files_open_folder()}
-                </button>
+                {#if !isServer}
+                  <button type="button" class="action-btn chat-files-btn" onclick={() => void openChannelFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                    </svg>
+                    {m.settings_channel_files_open_folder()}
+                  </button>
+                {/if}
               </div>
               <span class="hint">{m.settings_channel_file_offers_hint()}</span>
             </div>
@@ -5631,6 +5857,15 @@
                 <button class="action-btn" onclick={handlePickBackupFile} disabled={backupBusy}>
                   {m.settings_backup_choose_file()}
                 </button>
+                {#if isServer}
+                  <input
+                    bind:this={backupFileInput}
+                    type="file"
+                    accept=".emberbackup"
+                    hidden
+                    onchange={handleUploadBackupFile}
+                  />
+                {/if}
               </div>
               {#if restoreSource}
                 <span class="hint backup-path" title={restoreSource}>{restoreSource}</span>
@@ -5762,6 +5997,17 @@
             <div class="about-actions">
               <!-- The same links, in the same order, as the About dialog. -->
               <EmberLinks />
+              {#if isServer}
+                <div class="about-action">
+                  <span class="about-action-body">
+                    <span class="about-action-title">{m.server_settings_logs()}</span>
+                    <span class="about-action-desc">{m.server_settings_logs_hint()}</span>
+                    {#if logFolderPath}
+                      <code class="about-action-path">{logFolderPath}</code>
+                    {/if}
+                  </span>
+                </div>
+              {:else}
               <button type="button" class="about-action" onclick={() => void revealLogs()}>
                 <span class="about-action-icon" aria-hidden="true">
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -5786,6 +6032,7 @@
                   </svg>
                 </span>
               </button>
+              {/if}
             </div>
           </div>
 
@@ -5808,6 +6055,11 @@
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_updates()}</h4>
 
+            {#if isServer}
+              <div class="field">
+                <span class="hint">{m.server_settings_update_hint()}</span>
+              </div>
+            {:else}
             <!-- A `.field`, so the filter can find the check and install
                  buttons by their text. -->
             <div class="field about-update-panel">
@@ -5923,6 +6175,7 @@
                 ariaDescribedby="silent-update-hint silent-update-status"
               />
             </div>
+            {/if}
 
             <div class="field toggle-row">
               <div class="toggle-info">
@@ -8193,6 +8446,11 @@
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
     font-weight: 600;
+  }
+
+  .server-path {
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
   }
 
   .chat-files-btn {

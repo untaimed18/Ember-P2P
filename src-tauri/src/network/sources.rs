@@ -1246,7 +1246,7 @@ pub(super) fn inject_source_into_active_transfers(
 pub(super) async fn ask_networks_for_sources(
     socket: &UdpSocket,
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     transfer_id: &str,
     file_hash: [u8; 16],

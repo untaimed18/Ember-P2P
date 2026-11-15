@@ -17,7 +17,7 @@ use crate::network::{EmberMaintenanceResult, EmberPublishResult};
 use crate::security::MAX_FRIEND_NICKNAME_CHARS;
 use crate::types::EmberDiagnostics;
 use crate::types::*;
-use tauri::Emitter;
+use crate::host::Emitter;
 
 /// Result returned by the `ember_ping_peer` harness command — either
 /// the round-trip time of the matching `Pong` or the reason the
@@ -349,10 +349,10 @@ fn friend_name_to_store(nickname: &str, name_is_theirs: bool) -> String {
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn add_friend(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     nickname: Option<String>,
     // The name is one the peer goes by (a room nickname, an eD2K Hello name)
@@ -536,11 +536,11 @@ pub async fn add_friend(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_friend(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -643,11 +643,11 @@ async fn tear_down_friend(state: &AppState, hash: [u8; 16]) -> Result<(), String
 /// so nothing records the decision, and the same peer can send a fresh
 /// request immediately — which, for a user who has turned approval off, puts
 /// them straight back to mutual without a prompt.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn block_friend(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -668,10 +668,10 @@ pub async fn block_friend(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn unblock_friend(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -686,9 +686,9 @@ pub async fn unblock_friend(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_blocked_friends(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<BlockedInfo>, String> {
     let db = state.db.clone();
     let rows = tokio::task::spawn_blocking(move || db.get_blocked_friends())
@@ -707,10 +707,10 @@ pub async fn get_blocked_friends(
 
 /// Set the user's own label for a friend. An empty name clears it, and the
 /// card goes back to the name the friend chose.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn update_friend_nickname(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     nickname: String,
 ) -> Result<(), String> {
@@ -757,8 +757,8 @@ pub async fn update_friend_nickname(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<FriendInfo>, String> {
+#[ember_macros::command]
+pub async fn get_friends(state: crate::host::State<'_, AppState>) -> Result<Vec<FriendInfo>, String> {
     let db = state.db.clone();
     let rows = tokio::task::spawn_blocking(move || db.get_friends_full())
         .await
@@ -795,10 +795,10 @@ pub async fn get_friends(state: tauri::State<'_, AppState>) -> Result<Vec<Friend
         .collect())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub fn get_my_ember_hash(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<String, String> {
     crate::commands::chat_window::require_main_window(&window)?;
     let intro_secret = crate::network::friend_intro::own_intro_secret()
@@ -812,11 +812,11 @@ pub fn get_my_ember_hash(
 
 /// Mint a new intro secret, so every friend code shared so far stops
 /// locating us. Returns the new code.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn reset_friend_code(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<String, String> {
     crate::commands::chat_window::require_main_window(&window)?;
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
@@ -871,10 +871,10 @@ pub struct ChatExpiryInfo {
 
 /// Delete the whole conversation with a friend from this device. Their copy is
 /// theirs; the confirmation in the UI says so.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_chat_history(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
     let canonical = user_hash_hex.to_lowercase();
@@ -896,10 +896,10 @@ pub async fn delete_chat_history(
 
 /// Delete one message of a conversation from this device. A message still
 /// waiting to be sent is withdrawn, so it never goes.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_chat_message(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     id: i64,
 ) -> Result<(), String> {
@@ -930,9 +930,9 @@ fn delivery_label(delivery: i64) -> String {
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn send_chat_message(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     message: String,
 ) -> Result<ChatSendResult, String> {
@@ -1047,9 +1047,9 @@ pub async fn send_chat_message(
 /// Drop a sent message the outbox gave up on, after Resend put its text out as
 /// a new one. Without this the failed copy came back on the next load, next to
 /// the one that was delivered.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn discard_failed_chat_message(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     id: i64,
 ) -> Result<(), String> {
@@ -1127,17 +1127,17 @@ fn code_permanent_chat_failure(reason: String) -> String {
 /// The rest of the app opens and works normally in that state, so without
 /// asking, the UI would show every conversation as empty and every send as
 /// failing with no indication why.
-#[tauri::command]
-pub async fn is_chat_locked(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[ember_macros::command]
+pub async fn is_chat_locked(state: crate::host::State<'_, AppState>) -> Result<bool, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.chat_locked())
         .await
         .map_err(|e| coded_ctx("peers_task_error", "Task error", e))
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_chat_messages(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     friend_hash: String,
     limit: Option<i64>,
     before_id: Option<i64>,
@@ -1174,9 +1174,9 @@ pub async fn get_chat_messages(
 /// This only sends an invitation over the existing friend session. The
 /// recipient decides whether to accept, and if they do they start an ordinary
 /// download — we never push bytes at someone who did not ask.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn offer_file_to_friend(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     file_hash: String,
 ) -> Result<(), String> {
@@ -1199,9 +1199,9 @@ pub async fn offer_file_to_friend(
     await_reply(rx, "peers_no_response", "No response").await?
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_messages_read(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     friend_hash: String,
 ) -> Result<Vec<ChatExpiryInfo>, String> {
     let friend_hash = friend_hash.to_lowercase();
@@ -1256,9 +1256,9 @@ pub async fn mark_messages_read(
 
 /// Tell a friend we are (or have stopped) composing. Live only; ignored if
 /// they are not currently reachable.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn send_chat_typing(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     typing: bool,
 ) -> Result<(), String> {
@@ -1277,9 +1277,9 @@ pub async fn send_chat_typing(
     .await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_unread_message_counts(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<(String, i64, i64)>, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.unread_message_counts())
@@ -1298,9 +1298,9 @@ pub async fn get_unread_message_counts(
 /// yet opened, whose timers only reading may start, and return what is left
 /// unread. No read receipts go: one goes when a conversation is opened, which
 /// is what it reports.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_all_chats_read(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<(String, i64, i64)>, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.mark_all_chats_read())
@@ -1315,9 +1315,9 @@ pub async fn mark_all_chats_read(
         })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_friend_requests(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<FriendRequestInfo>, String> {
     let db = state.db.clone();
     let rows = tokio::task::spawn_blocking(move || db.get_friend_requests())
@@ -1344,10 +1344,10 @@ pub async fn get_friend_requests(
         .collect())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn accept_friend_request(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     sender_hash: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -1487,10 +1487,10 @@ pub async fn accept_friend_request(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn reject_friend_request(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     sender_hash: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -1533,8 +1533,8 @@ pub async fn reject_friend_request(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn is_friend_discoverable(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[ember_macros::command]
+pub async fn is_friend_discoverable(state: crate::host::State<'_, AppState>) -> Result<bool, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -1543,8 +1543,8 @@ pub async fn is_friend_discoverable(state: tauri::State<'_, AppState>) -> Result
     await_reply(rx, "peers_no_response", "No response").await
 }
 
-#[tauri::command]
-pub async fn get_online_friends(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+#[ember_macros::command]
+pub async fn get_online_friends(state: crate::host::State<'_, AppState>) -> Result<Vec<String>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -1555,9 +1555,9 @@ pub async fn get_online_friends(state: tauri::State<'_, AppState>) -> Result<Vec
 
 /// Online friends that set a status, by lowercase hex hash. A friend absent
 /// from the map is online or offline as `get_online_friends` says.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_friend_statuses(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, crate::types::FriendStatus>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -1581,8 +1581,8 @@ pub struct IdleAwayInfo {
 /// the network loop, and the Settings page would otherwise call a busy loop
 /// an unsupported system. `active` falls back to false, which the next
 /// `ember:idle-away` event corrects.
-#[tauri::command]
-pub async fn get_idle_away(state: tauri::State<'_, AppState>) -> Result<IdleAwayInfo, String> {
+#[ember_macros::command]
+pub async fn get_idle_away(state: crate::host::State<'_, AppState>) -> Result<IdleAwayInfo, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let active = match state.network_tx.try_send(NetworkCommand::GetIdleAway { tx }) {
         Ok(()) => await_reply(rx, "peers_no_response", "No response").await.unwrap_or(false),
@@ -1594,9 +1594,9 @@ pub async fn get_idle_away(state: tauri::State<'_, AppState>) -> Result<IdleAway
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn retry_friend_search(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<(), String> {
     let canonical = user_hash_hex.to_lowercase();
@@ -1619,9 +1619,9 @@ pub async fn retry_friend_search(
     await_reply(rx, "peers_no_response", "No response").await?
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn browse_friend(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     request_id: String,
     filter: Option<BrowseFilterArg>,
@@ -1705,9 +1705,9 @@ impl BrowseFilterArg {
 /// dial and the whole punch-and-relay phase, with room for the lookups.
 const BROWSE_CONNECT_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cancel_browse_friend(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     request_id: String,
 ) -> Result<(), String> {
@@ -1769,8 +1769,8 @@ async fn resolve_kad_host(input: &str, port: u16) -> Result<String, String> {
     Ok(addr.ip().to_string())
 }
 
-#[tauri::command]
-pub async fn get_network_stats(state: tauri::State<'_, AppState>) -> Result<NetworkStats, String> {
+#[ember_macros::command]
+pub async fn get_network_stats(state: crate::host::State<'_, AppState>) -> Result<NetworkStats, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -1784,8 +1784,8 @@ pub async fn get_network_stats(state: tauri::State<'_, AppState>) -> Result<Netw
     .await
 }
 
-#[tauri::command]
-pub async fn ban_peer(state: tauri::State<'_, AppState>, peer_id: String) -> Result<(), String> {
+#[ember_macros::command]
+pub async fn ban_peer(state: crate::host::State<'_, AppState>, peer_id: String) -> Result<(), String> {
     if peer_id.len() != 32 || !peer_id.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(coded(
             "peers_invalid_peer_id",
@@ -1815,8 +1815,8 @@ pub async fn ban_peer(state: tauri::State<'_, AppState>, peer_id: String) -> Res
     Ok(())
 }
 
-#[tauri::command]
-pub async fn unban_peer(state: tauri::State<'_, AppState>, peer_id: String) -> Result<(), String> {
+#[ember_macros::command]
+pub async fn unban_peer(state: crate::host::State<'_, AppState>, peer_id: String) -> Result<(), String> {
     if peer_id.len() != 32 || !peer_id.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(coded(
             "peers_invalid_peer_id",
@@ -1859,9 +1859,9 @@ pub struct BannedPeerInfo {
     pub addresses: Vec<String>,
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_banned_peers(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<BannedPeerInfo>, String> {
     let db = state.db.clone();
     let rows = tokio::task::spawn_blocking(move || db.get_banned_peers())
@@ -1885,8 +1885,8 @@ pub async fn get_banned_peers(
         .collect())
 }
 
-#[tauri::command]
-pub fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command]
+pub fn kad_connect(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     state
         .network_tx
         .try_send(NetworkCommand::KadConnect)
@@ -1894,10 +1894,10 @@ pub fn kad_connect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn kad_bootstrap_ip(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     ip: String,
     port: u16,
 ) -> Result<String, String> {
@@ -1933,9 +1933,9 @@ pub async fn kad_bootstrap_ip(
     .await?
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn kad_bootstrap_url(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
     // Validate up front so an obviously-bad URL (non-https, private address,
@@ -2101,8 +2101,8 @@ async fn fetch_bootstrap_contacts(
     Ok(contacts)
 }
 
-#[tauri::command]
-pub async fn kad_bootstrap_clients(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command]
+pub async fn kad_bootstrap_clients(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -2117,8 +2117,8 @@ pub async fn kad_bootstrap_clients(state: tauri::State<'_, AppState>) -> Result<
     .map(|_| ())
 }
 
-#[tauri::command]
-pub async fn kad_recheck_firewall(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command]
+pub async fn kad_recheck_firewall(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -2133,9 +2133,9 @@ pub async fn kad_recheck_firewall(state: tauri::State<'_, AppState>) -> Result<(
     .map(|_| ())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_kad_contacts(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<KadContactInfo>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -2150,9 +2150,9 @@ pub async fn get_kad_contacts(
     .await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_kad_searches(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<KadSearchInfo>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -2172,8 +2172,8 @@ pub async fn get_kad_searches(
 /// 2^53-bit precision problem. Returns `()` on success; a missing/
 /// invalid id or a completed search that has already been pruned both
 /// surface as `Ok(())` so the UI can refresh idempotently.
-#[tauri::command]
-pub fn kad_cancel_search(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+#[ember_macros::command]
+pub fn kad_cancel_search(state: crate::host::State<'_, AppState>, id: String) -> Result<(), String> {
     let parsed: u64 = id
         .parse()
         .map_err(|_| coded("peers_invalid_search_id", "Invalid search id"))?;
@@ -2198,9 +2198,9 @@ pub fn kad_cancel_search(state: tauri::State<'_, AppState>, id: String) -> Resul
 /// Malformed hashes are skipped rather than failing the whole request: the
 /// caller is rendering a table, and one bad row must not blank the other
 /// nine hundred and ninety-nine. Absent peers come back as `null`.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_peer_reputation_batch(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     user_hashes: Vec<String>,
 ) -> Result<std::collections::HashMap<String, Option<PeerReputationInfo>>, String> {
     /// Matches the display limit of the table this serves, so one call can
@@ -2226,9 +2226,9 @@ pub async fn get_peer_reputation_batch(
 }
 
 /// Aggregate reputation-tracker stats for the security / statistics UI.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_reputation_stats(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<ReputationStatsInfo, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -2243,9 +2243,9 @@ pub async fn get_reputation_stats(
 /// the mesh peer cache. Distinct from `get_network_stats` (which carries
 /// the EmberDHT status-bar gauges) so heavy diagnostic counters stay off
 /// the hot poll path.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_ember_diagnostics(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<EmberDiagnostics, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -2276,9 +2276,9 @@ pub async fn get_ember_diagnostics(
 /// them (and everything only they call) compiled into release builds as
 /// unreachable code.
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ember_ping_peer(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     peer_ip: String,
     peer_port: u16,
     peer_pubkey_hex: Option<String>,
@@ -2380,9 +2380,9 @@ pub async fn ember_ping_peer(
 ///
 /// `debug_assertions`-only for the same reason as [`ember_ping_peer`].
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ember_request_sources(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     peer_ip: String,
     peer_port: u16,
     peer_pubkey_hex: Option<String>,
@@ -2513,9 +2513,9 @@ fn parse_node_id16(label: &str, hex_str: &str) -> Result<[u8; 16], String> {
 /// from signed PING/PONG traffic, or been seeded with. Backs the contacts
 /// table on the Ember Network page. Peer addresses are omitted so the
 /// webview never sees them.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_ember_dht_contacts(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<EmberDhtContactInfo>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -2526,9 +2526,9 @@ pub async fn get_ember_dht_contacts(
 }
 
 /// Snapshot in-flight Ember DHT iterative searches (slice 16).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_ember_dht_searches(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<EmberDhtSearchInfo>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -2539,9 +2539,9 @@ pub async fn get_ember_dht_searches(
 }
 
 /// Snapshot live Ember DHT store keys (slice 16).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_ember_dht_store(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<EmberDhtStoreInfo>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -2559,9 +2559,9 @@ pub async fn get_ember_dht_store(
 /// introduce two nodes directly, which is what a local multi-node test needs
 /// when neither can reach KAD.
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[ember_macros::command]
 pub async fn add_ember_dht_contact(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     peer_ip: String,
     peer_port: u16,
     ed25519_pubkey_hex: String,
@@ -2606,9 +2606,9 @@ pub async fn add_ember_dht_contact(
 /// nodes' routing tables. `peer_pubkey_hex` is the peer's **Noise**
 /// key; when omitted it is resolved from the KAD-fed cache.
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ember_dht_ping_peer(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     peer_ip: String,
     peer_port: u16,
     peer_pubkey_hex: Option<String>,
@@ -2698,9 +2698,9 @@ pub async fn ember_dht_ping_peer(
 /// peer's **Noise** key; when omitted it is resolved from the KAD-fed
 /// cache.
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ember_dht_find_node(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     peer_ip: String,
     peer_port: u16,
     target_hex: Option<String>,
@@ -2807,9 +2807,9 @@ pub async fn ember_dht_find_node(
 /// is an optional 32-char (16-byte) node ID; blank ⇒ a random target
 /// (a self-style probe that broadens the routing table).
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ember_dht_iterative_find_node(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     target_hex: Option<String>,
     timeout_ms: Option<u64>,
 ) -> Result<EmberDhtFindResult, String> {
@@ -2881,9 +2881,9 @@ pub async fn ember_dht_iterative_find_node(
 /// dev-publishing distinct test records). Seed/ping at least one contact
 /// first or there will be no nodes to store on.
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ember_dht_publish_keyword(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     keyword: String,
     file_name: String,
     file_size: u64,
@@ -2976,9 +2976,9 @@ pub async fn ember_dht_publish_keyword(
 /// verifies. Seeds from the local routing table, so DHT-ping or seed at
 /// least one contact first.
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ember_dht_find_value(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     keyword: String,
     timeout_ms: Option<u64>,
 ) -> Result<EmberDhtFindValueResult, String> {
@@ -3073,9 +3073,9 @@ pub async fn ember_dht_find_value(
 /// cycle *initiated* — evictions and refresh results land asynchronously
 /// and surface in `get_ember_diagnostics`.
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ember_dht_run_maintenance(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<EmberDhtMaintenanceResult, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state

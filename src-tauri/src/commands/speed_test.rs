@@ -114,8 +114,8 @@ struct Sample {
     own_bytes: u64,
 }
 
-#[tauri::command]
-pub async fn run_speed_test(state: tauri::State<'_, AppState>) -> Result<SpeedTestResult, String> {
+#[ember_macros::command]
+pub async fn run_speed_test(state: crate::host::State<'_, AppState>) -> Result<SpeedTestResult, String> {
     let _single_flight = crate::security::try_begin_single_flight(&SPEED_TEST_IN_FLIGHT)
         .ok_or_else(|| {
             crate::commands::errors::coded(

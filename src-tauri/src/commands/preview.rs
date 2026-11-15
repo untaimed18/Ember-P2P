@@ -3,9 +3,9 @@ use crate::commands::errors::{coded, coded_ctx};
 
 static PREVIEW_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn preview_file(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<String, String> {
     // Handed to the network task rather than held here. The timeout below ends

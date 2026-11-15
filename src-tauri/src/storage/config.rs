@@ -227,7 +227,7 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn load(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
+    pub fn load(app_handle: &crate::host::AppHandle) -> anyhow::Result<Self> {
         let app_dir = paths::ensure_data_dir_with_app(app_handle)
             .map_err(|e| anyhow::anyhow!("Failed to prepare data dir: {e}"))?;
 

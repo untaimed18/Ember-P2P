@@ -12,7 +12,7 @@ pub(in crate::network) async fn on_bootstrap_tick(
     settings: &AppSettings,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     known_files: &KnownFileList,

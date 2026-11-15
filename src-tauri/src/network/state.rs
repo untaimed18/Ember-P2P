@@ -1564,7 +1564,7 @@ pub(super) struct NetworkState {
     /// See [`note_channel_delivery`].
     pub(super) channel_delivery_notes: VecDeque<([u8; 16], [u8; 16], i64)>,
     /// Where a full verdict buffer is flushed from outside the tick.
-    pub(super) channel_delivery_sink: (Arc<Database>, tauri::AppHandle),
+    pub(super) channel_delivery_sink: (Arc<Database>, crate::host::AppHandle),
     /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
     pub(super) channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
     /// Room row plus derived content keys, memoised for the packet paths.

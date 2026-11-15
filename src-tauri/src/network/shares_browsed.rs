@@ -59,7 +59,7 @@ pub(super) fn shares_browse_is_new(
 /// Report an ed2k client's request for our shared-file list.
 pub(super) fn report_ed2k_shares_browsed(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     peer_addr: SocketAddr,
     peer_name: &str,
     client_software: &str,
@@ -90,7 +90,7 @@ pub(super) fn report_ed2k_shares_browsed(
 /// friend browsing is off.
 pub(super) fn report_friend_shares_browsed(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     friend: [u8; 16],
     allowed: bool,
 ) {

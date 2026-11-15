@@ -1,11 +1,27 @@
 // @ts-nocheck
 import { createRequire } from "module";
+import { fileURLToPath } from "url";
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
 import { paraglideVitePlugin } from "@inlang/paraglide-js";
 
 const require = createRequire(import.meta.url);
 const pkg = require("./package.json");
+
+// The browser build `emberd` serves (`npm run build:web`): the Tauri packages
+// are replaced by their stand-ins in `src/lib/runtime/web`, which talk to
+// `emberd` over HTTP and a WebSocket instead of to a webview's IPC.
+const web = process.env.EMBER_WEB === "1";
+const webShim = (name) => fileURLToPath(new URL(`./src/lib/runtime/web/${name}.ts`, import.meta.url));
+const webAliases = web
+  ? [
+      { find: /^@tauri-apps\/api\/core$/, replacement: webShim("core") },
+      { find: /^@tauri-apps\/api\/event$/, replacement: webShim("event") },
+      { find: /^@tauri-apps\/api\/window$/, replacement: webShim("window") },
+      { find: /^@tauri-apps\/api\/webview$/, replacement: webShim("webview") },
+      { find: /^@tauri-apps\/plugin-process$/, replacement: webShim("process") },
+    ]
+  : [];
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
@@ -26,10 +42,14 @@ export default defineConfig(async () => ({
     }),
     sveltekit(),
   ],
+  resolve: {
+    alias: webAliases,
+  },
   define: {
     "import.meta.env.VITE_APP_VERSION": JSON.stringify(pkg.version ?? ""),
     "import.meta.env.VITE_APP_DESCRIPTION": JSON.stringify(pkg.description ?? ""),
     "import.meta.env.VITE_APP_LICENSE": JSON.stringify(pkg.license ?? "MIT"),
+    "import.meta.env.VITE_EMBER_WEB": JSON.stringify(web),
   },
 
   clearScreen: false,

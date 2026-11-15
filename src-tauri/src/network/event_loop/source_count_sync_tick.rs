@@ -7,7 +7,7 @@ pub(in crate::network) async fn on_source_count_sync_tick(
     state: &NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     known_files: &mut KnownFileList,
     shared_files: &Arc<RwLock<Vec<FileInfo>>>,
 ) {

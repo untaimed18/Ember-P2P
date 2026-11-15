@@ -470,6 +470,16 @@ fn drive_is_not_remote(letter: u8) -> bool {
 ///
 /// `configured_player` is `AppSettings::preview_player`, empty when the user
 /// has not chosen one.
+#[cfg(not(feature = "desktop"))]
+pub fn launch_preview(_file_path: &Path, _configured_player: &str) -> anyhow::Result<()> {
+    anyhow::bail!("emberd has no media player to open a preview in")
+}
+
+/// Launch the user's media player for the file, or the system default.
+///
+/// `configured_player` is `AppSettings::preview_player`, empty when the user
+/// has not chosen one.
+#[cfg(feature = "desktop")]
 pub fn launch_preview(file_path: &Path, configured_player: &str) -> anyhow::Result<()> {
     // Basename only — avoid logging the full local path (PII) at info level.
     info!(

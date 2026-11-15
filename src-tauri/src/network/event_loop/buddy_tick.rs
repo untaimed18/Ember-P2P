@@ -6,7 +6,7 @@ use super::*;
 pub(in crate::network) async fn on_buddy_tick(
     udp_socket: &Arc<UdpSocket>,
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
     let tcp_fw = state.firewall_checker.tcp_status();
     let udp_fw = state.firewall_checker.udp_status();

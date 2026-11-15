@@ -16,11 +16,11 @@ function deniedCommands() {
   return [...body.matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]);
 }
 
-/** Every command name registered with `generate_handler!`. */
+/** Every command name in the command table (`command_table.rs`). */
 function registeredCommands() {
-  const text = readFileSync(join(rustRoot, "lib.rs"), "utf8");
-  const start = text.indexOf("generate_handler![");
-  const body = text.slice(start, text.indexOf("]", start));
+  const text = readFileSync(join(rustRoot, "command_table.rs"), "utf8");
+  const start = text.indexOf("ember_macros::command_table! {");
+  const body = text.slice(start, text.indexOf("\n}", start));
   return new Set([...body.matchAll(/::([a-z][a-z0-9_]*)\s*,/g)].map((m) => m[1]));
 }
 

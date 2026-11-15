@@ -17,6 +17,7 @@
   import { toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
+  import { isServer } from '$lib/runtime';
 
   interface Props {
     attachment: ChatAttachment;
@@ -299,7 +300,7 @@
         {m.chat_attach_retry()}
       </button>
     </div>
-  {:else if attachment.has_file}
+  {:else if attachment.has_file && !isServer}
     <div class="attach-actions">
       <button
         type="button"

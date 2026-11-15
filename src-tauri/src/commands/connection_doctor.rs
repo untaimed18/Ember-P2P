@@ -577,8 +577,8 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
 }
 
 /// Run every check and say what they mean.
-#[tauri::command]
-pub async fn run_connection_check(state: tauri::State<'_, AppState>) -> Result<ConnectionReport, String> {
+#[ember_macros::command]
+pub async fn run_connection_check(state: crate::host::State<'_, AppState>) -> Result<ConnectionReport, String> {
     let mut gathered = gather(&state, true).await?;
     // The outside test reached the TCP port the server would test, so a LowID
     // is from before whatever opened it, and lasts until a login asks again.
@@ -602,10 +602,10 @@ pub async fn run_connection_check(state: tauri::State<'_, AppState>) -> Result<C
 
 /// Do one of the fixes a report offered. `move_ports` and `enable_upnp` are
 /// settings the page changes itself; these are the ones that need the backend.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn connection_doctor_action(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     action: String,
 ) -> Result<bool, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -631,7 +631,9 @@ pub async fn connection_doctor_action(
                 Err(e) => Err(e),
             }
         }
-        #[cfg(target_os = "windows")]
+        // Elevation needs a window to own its prompt, which only the
+        // desktop app has.
+        #[cfg(all(target_os = "windows", feature = "desktop"))]
         "add_firewall_rules" => {
             // The ports the check looked for: the ones this session listens on.
             let stats = network_stats(&state).await?;
@@ -658,7 +660,7 @@ pub async fn connection_doctor_action(
 /// Have the ports tested again once rules let peers in: Kad's firewall check
 /// answers within a minute, and an eD2K server that gave a LowID (`low_id`)
 /// only hands out another ID at a fresh login, so that one logs in again.
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "desktop"))]
 async fn retest_ports(state: &AppState, low_id: bool) {
     let (tx, _) = tokio::sync::oneshot::channel();
     let _ = state.network_tx.try_send(NetworkCommand::RecheckFirewall { tx });

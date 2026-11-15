@@ -8,7 +8,7 @@ pub(in crate::network) async fn on_ember_maintenance_tick(
     state: &mut NetworkState,
     settings: &AppSettings,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     identity: &Arc<crate::storage::identity::NodeIdentity>,
 ) {
     // Background health loop. `force = false`: honour the

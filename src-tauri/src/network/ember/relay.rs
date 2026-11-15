@@ -2262,7 +2262,7 @@ pub struct AttachServeContext {
     pub our_ed25519_seed: [u8; 32],
     /// For the sender's own progress bar: the friend reading the file is the
     /// only one who knows how far it has got, and this is where it is read.
-    pub app_handle: tauri::AppHandle,
+    pub app_handle: crate::host::AppHandle,
 }
 
 /// The grant table room transfers are served from. The event loop owns the

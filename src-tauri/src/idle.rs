@@ -6,8 +6,9 @@
 
 /// Whether this build can tell how long the user has been idle. The UI asks
 /// so it can disable the setting rather than offer one that never fires.
+/// Never in `emberd`: nobody sits at a server, so its user is not Away.
 pub const fn supported() -> bool {
-    cfg!(windows)
+    cfg!(all(windows, feature = "desktop"))
 }
 
 /// Whole seconds since the last keyboard or mouse input in this session, or
@@ -16,7 +17,7 @@ pub fn seconds_since_input() -> Option<u64> {
     imp::seconds_since_input()
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "desktop"))]
 mod imp {
     use windows_sys::Win32::System::SystemInformation::GetTickCount;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
@@ -39,7 +40,7 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(all(windows, feature = "desktop")))]
 mod imp {
     pub fn seconds_since_input() -> Option<u64> {
         None

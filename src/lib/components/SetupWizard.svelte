@@ -25,6 +25,7 @@
   } from '$lib/api/settings';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { isServer } from '$lib/runtime';
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { clampInputUtf8Bytes, formatSpeed, NICKNAME_MAX_BYTES } from '$lib/utils';
@@ -676,12 +677,14 @@
                 class="text-input folder-input"
                 readonly
               />
-              <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
+              {#if !isServer}
+                <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
+              {/if}
             </div>
             {#if folderFromEmule}
               <p class="step-hint from-emule">{m.wizard_folder_from_emule()}</p>
             {/if}
-            <p class="step-hint">{m.wizard_folder_picker_hint()}</p>
+            <p class="step-hint">{isServer ? m.server_download_folder_hint() : m.wizard_folder_picker_hint()}</p>
             {#if folderError}
               <p class="save-error">{folderError}</p>
             {/if}

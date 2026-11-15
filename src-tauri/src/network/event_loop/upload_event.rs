@@ -79,7 +79,7 @@ const SHARED_FILE_STATS_INTERVAL: std::time::Duration = std::time::Duration::fro
 static PENDING_SHARED_FILE_STATS: std::sync::Mutex<Option<HashMap<String, SharedFileStats>>> =
     std::sync::Mutex::new(None);
 
-fn queue_shared_file_stats(app_handle: &tauri::AppHandle, stats: SharedFileStats) {
+fn queue_shared_file_stats(app_handle: &crate::host::AppHandle, stats: SharedFileStats) {
     let key = stats.hash.to_ascii_lowercase();
     {
         let mut pending = PENDING_SHARED_FILE_STATS
@@ -92,7 +92,7 @@ fn queue_shared_file_stats(app_handle: &tauri::AppHandle, stats: SharedFileStats
         *pending = Some(HashMap::from([(key, stats)]));
     }
     let app_handle = app_handle.clone();
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         tokio::time::sleep(SHARED_FILE_STATS_INTERVAL).await;
         let batch = PENDING_SHARED_FILE_STATS
             .lock()
@@ -169,7 +169,7 @@ pub(in crate::network) async fn on_upload_event(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
@@ -965,7 +965,7 @@ pub(in crate::network) async fn on_upload_event(
                 // settings back to it and would wait on itself.
                 let clear_app = app_handle.clone();
                 tokio::spawn(async move {
-                    use tauri::Manager;
+                    use crate::host::Manager;
                     let Some(state) = clear_app.try_state::<crate::app_state::AppState>() else {
                         return;
                     };

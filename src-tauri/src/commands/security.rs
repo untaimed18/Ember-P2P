@@ -13,25 +13,26 @@ use crate::network::kad::ip_filter::{
     MAX_STATS_PAGE,
 };
 use crate::network::NetworkCommand;
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 
 const CMD_TIMEOUT: std::time::Duration = CMD_REPLY_TIMEOUT;
 const DEFAULT_IPFILTER_ARCHIVE_URL: &str = "https://upd.emule-security.org/ipfilter.zip";
 const MAX_RESPONSE_BYTES: usize = 50 * 1024 * 1024;
 
-#[tauri::command]
+#[ember_macros::command]
 pub fn get_security_policy_state(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<crate::security::policy::SecurityPolicyStatus, String> {
     Ok(state.security_policy.status())
 }
 
 /// Explicitly acknowledge a recovered/reset security-policy store. The
 /// acknowledgement is made durable before the network startup gate opens.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn acknowledge_security_policy_reset(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<(), String> {
     let db = state.db.clone();
     let gate = state.security_policy.clone();
@@ -52,7 +53,7 @@ pub async fn acknowledge_security_policy_reset(
         )
     })?
     .map_err(|error| coded_ctx("security_policy_reset_failed", "Policy reset failed", error))?;
-    let _ = tauri::Emitter::emit(&app, "security-policy-ready", ());
+    let _ = crate::host::Emitter::emit(&app, "security-policy-ready", ());
     Ok(())
 }
 
@@ -80,7 +81,7 @@ fn ipfilter_outcome_from_ack(ack: Option<Result<(), String>>) -> IpFilterApplyOu
 }
 
 pub(crate) async fn persist_ip_filter_enabled(
-    state: &tauri::State<'_, AppState>,
+    state: &crate::host::State<'_, AppState>,
 ) -> Result<crate::types::AppSettings, String> {
     let _settings_save_guard = state.settings_save_lock.lock().await;
     let (previous_settings, new_settings, save_data) = {
@@ -105,7 +106,7 @@ pub(crate) async fn persist_ip_filter_enabled(
 }
 
 async fn restore_settings_after_send_failure(
-    state: &tauri::State<'_, AppState>,
+    state: &crate::host::State<'_, AppState>,
     previous_settings: crate::types::AppSettings,
 ) -> Result<(), String> {
     let save_data = {
@@ -128,7 +129,7 @@ async fn restore_settings_after_send_failure(
 /// the filter on, as an install the user asked for does; an automatic update
 /// leaves the switch as the user set it.
 async fn apply_ipfilter_reload(
-    state: &tauri::State<'_, AppState>,
+    state: &crate::host::State<'_, AppState>,
     path: PathBuf,
     enable: bool,
 ) -> IpFilterApplyOutcome {
@@ -382,9 +383,9 @@ mod tests {
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_ip_filter_stats(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     query: Option<String>,
     sort: Option<String>,
     sort_asc: Option<bool>,
@@ -427,9 +428,9 @@ pub async fn get_ip_filter_stats(
         })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn add_ip_filter_range(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     start_ip: String,
     end_ip: String,
     description: String,
@@ -468,9 +469,9 @@ pub async fn add_ip_filter_range(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_ip_filter_range(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     start_ip: String,
     end_ip: String,
 ) -> Result<(), String> {
@@ -519,9 +520,9 @@ pub async fn remove_ip_filter_range(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_ip_filter_enabled(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
     let _settings_save_guard = state.settings_save_lock.lock().await;
@@ -583,10 +584,10 @@ pub struct IpFilterUpdateInfo {
     pub updated_at: i64,
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_ip_filter_update_info(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<IpFilterUpdateInfo, String> {
     let auto_update = state.config.read().await.settings.ip_filter_auto_update;
     let data_dir = crate::storage::paths::resolve_data_dir_with_app(&app);
@@ -602,10 +603,10 @@ pub async fn get_ip_filter_update_info(
 
 /// The Security page's Auto-update switch. Turning it on checks at once, so a
 /// list already a day old is updated now rather than at the next poll.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_ip_filter_auto_update(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
     {
@@ -629,16 +630,16 @@ pub async fn set_ip_filter_auto_update(
         state.config.write().await.settings = new_settings;
     }
     if enabled {
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             crate::ipfilter_update::maybe_update(&app).await;
         });
     }
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_block_private_ips(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     block_private: bool,
 ) -> Result<(), String> {
     let _settings_save_guard = state.settings_save_lock.lock().await;
@@ -681,10 +682,10 @@ pub async fn set_block_private_ips(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn download_and_load_ipfilter(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<IpFilterApplyResult, String> {
     install_default_ipfilter(&app, &state, true).await
 }
@@ -693,8 +694,8 @@ pub async fn download_and_load_ipfilter(
 /// filter on as well, which an install the user asked for does and an
 /// automatic update (`ipfilter_update`) does not.
 pub(crate) async fn install_default_ipfilter(
-    app: &tauri::AppHandle,
-    state: &tauri::State<'_, AppState>,
+    app: &crate::host::AppHandle,
+    state: &crate::host::State<'_, AppState>,
     enable: bool,
 ) -> Result<IpFilterApplyResult, String> {
     info!("Downloading ipfilter.zip from {DEFAULT_IPFILTER_ARCHIVE_URL}");
@@ -840,40 +841,37 @@ pub(crate) async fn note_ipfilter_installed(data_dir: &std::path::Path, from_def
 ///
 /// Returns false for a dismissed or closed dialog, so the working filter
 /// survives anything short of an explicit yes.
-async fn confirm_ipfilter_override(app: &tauri::AppHandle, url: &str) -> bool {
+async fn confirm_ipfilter_override(app: &crate::host::AppHandle, url: &str) -> bool {
     let filter_path = crate::storage::paths::resolve_data_dir_with_app(app).join("ipfilter.dat");
     let shown_url = crate::commands::settings::elide_for_dialog(url);
-    let confirm_app = app.clone();
-    // `blocking_show` parks this thread until the main thread pumps the
-    // dialog, which is why it runs here rather than on the command's task —
-    // the same reason `pick_and_import_ipfilter_file` wraps its picker.
-    tokio::task::spawn_blocking(move || {
-        // Best effort. An unreadable or absent ipfilter.dat means there is no
-        // working filter to lose, and saying so is more useful than hiding the
-        // line: it tells the user this prompt is not about a replacement.
-        let installed = std::fs::read(&filter_path)
+    // Best effort. An unreadable or absent ipfilter.dat means there is no
+    // working filter to lose, and saying so is more useful than hiding the
+    // line: it tells the user this prompt is not about a replacement.
+    let installed = tokio::task::spawn_blocking(move || {
+        std::fs::read(&filter_path)
             .ok()
             .map(|bytes| count_valid_entries(&bytes, "dat"))
-            .filter(|count| *count > 0);
-        let standing = match installed {
-            Some(count) => format!("This replaces the {count} blocked ranges you have now."),
-            None => "You have no working IP filter installed at the moment.".to_string(),
-        };
-        confirm_app
-            .dialog()
-            .message(format!(
-                "Ember will download an IP filter from:\n\n{shown_url}\n\n{standing}\n\nContinue only if you asked for this update. A list that is empty, or that quietly omits the ranges you rely on, removes the protection you have."
-            ))
-            .title("Replace your IP filter?")
-            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                "Download and replace".to_string(),
-                "Cancel".to_string(),
-            ))
-            .blocking_show()
+            .filter(|count| *count > 0)
     })
     .await
-    .unwrap_or(false)
+    .ok()
+    .flatten();
+    let standing = match installed {
+        Some(count) => format!("This replaces the {count} blocked ranges you have now."),
+        None => "You have no working IP filter installed at the moment.".to_string(),
+    };
+    crate::host::confirm(
+        app,
+        crate::host::Confirm::new(
+            "Replace your IP filter?",
+            format!(
+                "Ember will download an IP filter from:\n\n{shown_url}\n\n{standing}\n\nContinue only if you asked for this update. A list that is empty, or that quietly omits the ranges you rely on, removes the protection you have."
+            ),
+            "Download and replace",
+            "Cancel",
+        ),
+    )
+    .await
 }
 
 /// Download and load an ipfilter from a user-supplied URL.
@@ -889,10 +887,10 @@ async fn confirm_ipfilter_override(app: &tauri::AppHandle, url: &str) -> bool {
 /// dial, and the response is capped at 50 MiB. That stops the command being
 /// used to reach the local network; it does not make the *list* trustworthy,
 /// which is what `confirm_ipfilter_override` is for.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn update_ipfilter_from_url(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     url: String,
 ) -> Result<IpFilterApplyResult, String> {
     info!("Updating IP filter from a user-supplied URL");
@@ -1063,10 +1061,10 @@ pub async fn update_ipfilter_from_url(
 /// dialog runs here in the core, so no path crosses IPC inbound.
 ///
 /// `Ok(None)` means the user dismissed the picker.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_and_import_ipfilter_file(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Option<IpFilterApplyResult>, String> {
     let picker = app.clone();
     let selected = tokio::task::spawn_blocking(move || {
@@ -1091,9 +1089,10 @@ pub async fn pick_and_import_ipfilter_file(
 /// The shared import body. Deliberately not a `#[tauri::command]`: the picker
 /// above owns authorization, and the extension/system-directory checks below
 /// are a sanity pass on what the dialog returned, not a substitute for it.
+#[cfg(feature = "desktop")]
 async fn import_ipfilter_at_path(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_path: std::path::PathBuf,
 ) -> Result<IpFilterApplyResult, String> {
     let path = tokio::task::spawn_blocking(move || {
@@ -1377,9 +1376,9 @@ async fn import_ipfilter_at_path(
 // observed by an in-flight upload handshake.
 
 /// Snapshot the current pattern list for the Settings UI.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_antileech_patterns(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<crate::types::AntiLeechSnapshot, String> {
     let (tx, rx) = oneshot::channel();
     state
@@ -1398,9 +1397,9 @@ pub async fn get_antileech_patterns(
 /// Returns any per-pattern compile errors so the UI can show which
 /// rows were rejected (the rest still take effect — partial-success
 /// is intentional so a single typo doesn't wipe the whole list).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_antileech_patterns(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     patterns: Vec<String>,
 ) -> Result<crate::types::AntiLeechReplaceResult, String> {
     // Bound the pattern set so a runaway caller can't push an unbounded list
@@ -1433,9 +1432,9 @@ pub async fn set_antileech_patterns(
 /// Toggle the filter on or off without touching the pattern list.
 /// Persists the new state to AppSettings + the on-disk config so the
 /// choice survives restarts.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_antileech_enabled(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
     let _settings_save_guard = state.settings_save_lock.lock().await;
@@ -1523,9 +1522,9 @@ pub async fn set_antileech_enabled(
 /// Reset the pattern list to the built-in defaults — the small,
 /// well-vetted set of "always block" leech mods. Useful as a recovery
 /// path if the user edits the file manually and breaks something.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn reset_antileech_to_defaults(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<crate::types::AntiLeechSnapshot, String> {
     let (tx, rx) = oneshot::channel();
     state

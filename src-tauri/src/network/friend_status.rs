@@ -64,7 +64,7 @@ pub(super) async fn announce_friend_status(
 pub(super) fn refresh_idle_away(
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
     state.last_idle_check = Some(std::time::Instant::now());
     let idle_away = idle_long_enough(crate::idle::seconds_since_input(), settings.auto_away_minutes);
@@ -79,7 +79,7 @@ pub(super) fn refresh_idle_away(
 pub(super) async fn on_idle_check(
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ed25519_secret_key: &[u8; 32],
 ) {
     if state.last_idle_check.is_some_and(|last| {

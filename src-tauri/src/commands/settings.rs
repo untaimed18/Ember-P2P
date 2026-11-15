@@ -1,4 +1,5 @@
-use tauri::{Emitter, Manager};
+use crate::host::{Emitter, Manager};
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 use tracing::{info, warn};
 
@@ -301,7 +302,7 @@ fn preview_player_was_picked(path: &std::path::Path) -> bool {
 /// thread all leave the root revoked, which keeps downloads failing rather
 /// than granting the sandbox to an unverified object.
 async fn download_root_reapproval_authorized(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     registry: std::sync::Arc<crate::security::filesystem::ApprovedRootRegistry>,
     download_folder: &str,
 ) -> bool {
@@ -314,51 +315,38 @@ async fn download_root_reapproval_authorized(
     if download_root_was_picked(std::path::Path::new(download_folder)) {
         return true;
     }
-    let confirm_app = app.clone();
     let folder = download_folder.to_string();
     let prompt = format!(
         "Ember no longer recognises the folder at:\n\n{}\n\nRe-approve it only if you moved this folder or reconnected the drive yourself. If something else was put at this path, re-approving gives Ember's downloads access to whatever is there now.",
         elide_for_dialog(download_folder)
     );
-    // `None` means there is nothing to authorize, which is the ordinary case:
-    // almost every save that carries the flag finds the root intact.
-    let answer = tokio::task::spawn_blocking(move || {
+    // An absent root keeps its record (`build_next` retains it on `NotFound`)
+    // and a root whose identity still matches needs no grant, so neither is
+    // worth a prompt. That is the ordinary case: almost every save that
+    // carries the flag finds the root intact.
+    let pending = tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&folder);
-        // An absent root keeps its record (`build_next` retains it on
-        // `NotFound`) and a root whose identity still matches needs no grant,
-        // so neither is worth a prompt.
-        if std::fs::symlink_metadata(path).is_err() || registry.verify_root(path).is_ok() {
-            return None;
-        }
-        // `blocking_show` parks this thread until the main thread pumps the
-        // dialog, which is why every native dialog in this crate is reached
-        // through `spawn_blocking` instead of running on the command's task.
-        Some(
-            confirm_app
-                .dialog()
-                .message(prompt)
-                .title("Re-approve download folder?")
-                .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-                .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                    "Re-approve".to_string(),
-                    "Keep blocked".to_string(),
-                ))
-                .blocking_show(),
-        )
+        std::fs::symlink_metadata(path).is_ok() && registry.verify_root(path).is_err()
     })
     .await;
-    match answer {
-        Ok(Some(true)) => true,
+    match pending {
         // Withholding the grant rather than deferring to the persistence
         // closure's own repeat of the same test: if the path changes between
         // the two, "nothing was pending" would otherwise become a silent
         // re-approval of whatever appeared in between.
-        Ok(None) => false,
-        Ok(Some(false)) => {
-            warn!(
-                "Ignoring reapprove_download_root: the download folder was not chosen with the native picker this session and the re-approval prompt was declined"
-            );
-            false
+        Ok(false) => false,
+        Ok(true) => {
+            let approved = crate::host::confirm(
+                app,
+                crate::host::Confirm::new("Re-approve download folder?", prompt, "Re-approve", "Keep blocked"),
+            )
+            .await;
+            if !approved {
+                warn!(
+                    "Ignoring reapprove_download_root: the download folder was not chosen with the native picker this session and the re-approval prompt was declined"
+                );
+            }
+            approved
         }
         Err(error) => {
             warn!("Ignoring reapprove_download_root: confirmation task failed: {error}");
@@ -390,10 +378,10 @@ pub(crate) fn elide_for_dialog(value: &str) -> String {
 /// Mirrors `pick_shared_folder`: the renderer never gets to name the path that
 /// will be authorized. The selection is returned only so the Settings form and
 /// the setup wizard can display it before the user saves.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_download_folder(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
     title: Option<String>,
 ) -> Result<Option<String>, String> {
     let dialog_title = super::picker_title(title, "Choose where downloads are saved");
@@ -447,10 +435,10 @@ pub async fn pick_download_folder(
 /// gets authorized, and the selection is returned only so the Settings form
 /// can show it before the user saves. Restricted to the main window for the
 /// same reason.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_preview_player(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
     title: Option<String>,
 ) -> Result<Option<String>, String> {
     let dialog_title = super::picker_title(title, "Choose a media player for Preview");
@@ -803,28 +791,28 @@ fn prune_removed_shared_folder_state(
         .retain(|folder, _| !is_under_removed_root(folder));
 }
 
-#[tauri::command]
-pub async fn get_settings(state: tauri::State<'_, AppState>) -> Result<AppSettings, String> {
+#[ember_macros::command]
+pub async fn get_settings(state: crate::host::State<'_, AppState>) -> Result<AppSettings, String> {
     let config = state.config.read().await;
     Ok(config.settings.clone())
 }
 
-#[tauri::command]
-pub fn get_launch_settings(state: tauri::State<'_, AppState>) -> LaunchSettings {
+#[ember_macros::command]
+pub fn get_launch_settings(state: crate::host::State<'_, AppState>) -> LaunchSettings {
     state.launch_settings.clone()
 }
 
 /// This computer's network interfaces, for the one Settings keeps Ember on.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn list_network_interfaces() -> Vec<crate::net_bind::NetworkInterface> {
-    tauri::async_runtime::spawn_blocking(crate::net_bind::list)
+    crate::host::async_runtime::spawn_blocking(crate::net_bind::list)
         .await
         .unwrap_or_default()
 }
 
 /// Whether the interface Ember is kept on is there, for the main window's
 /// notice.
-#[tauri::command]
+#[ember_macros::command]
 pub fn get_network_binding() -> crate::net_bind::BindingStatus {
     crate::net_bind::status()
 }
@@ -1719,11 +1707,11 @@ fn settle_channel_languages(settings: &mut AppSettings, old_settings: &AppSettin
     Ok(primary_changed || secondary_changed)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn update_settings(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     settings: serde_json::Value,
     // Absent for every background/partial save; see the re-approval block below.
     reapprove_download_root: Option<bool>,
@@ -1941,9 +1929,17 @@ pub async fn update_settings(
     );
     settings.settings_revision = old_settings.settings_revision.saturating_add(1);
 
+    // `emberd` is started by its service manager, not by a sign-in, so the
+    // setting keeps whatever it was rather than claim an entry that is not
+    // there.
+    #[cfg(not(feature = "desktop"))]
+    {
+        settings.launch_at_login = old_settings.launch_at_login;
+    }
     // Before the write: a sign-in entry the OS refused must fail the save, not
     // leave a setting that claims otherwise. A write that fails after this
     // leaves the entry ahead of the file, which the next launch reconciles.
+    #[cfg(feature = "desktop")]
     if settings.launch_at_login != old_settings.launch_at_login {
         let enable = settings.launch_at_login;
         let entry_app = app.clone();
@@ -2174,7 +2170,7 @@ pub async fn update_settings(
         && !crate::sharing::feed_downloads::sharing_folders().is_empty()
     {
         let app = app.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             crate::sharing::feed_shares::reconcile(&app, &[]).await;
         });
     }
@@ -2320,10 +2316,10 @@ pub async fn update_settings(
     Ok(UpdateSettingsResult { outcome, settings })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn download_nodes_dat(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<NodesDatDownloadResult, String> {
     info!("Downloading nodes.dat from {NODES_DAT_URL}");
 
@@ -2458,7 +2454,7 @@ pub async fn download_nodes_dat(
             Err(_) => {
                 tracing::warn!("nodes.dat was saved, but live contact injection is still pending");
                 let app = app.clone();
-                tauri::async_runtime::spawn(async move {
+                crate::host::async_runtime::spawn(async move {
                     let Ok(applied_count) = rx.await else {
                         return;
                     };
@@ -2492,11 +2488,11 @@ pub async fn download_nodes_dat(
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn download_ipfilter(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<IpFilterDownloadResult, String> {
     crate::commands::chat_window::require_main_window(&window)?;
     info!("Downloading ipfilter.zip from {IPFILTER_ARCHIVE_URL}");
@@ -2629,7 +2625,7 @@ pub async fn download_ipfilter(
             Err(_) => {
                 tracing::warn!("ipfilter.dat was saved, but live reload is still pending");
                 let app = app.clone();
-                tauri::async_runtime::spawn(async move {
+                crate::host::async_runtime::spawn(async move {
                     let outcome = match rx.await {
                         Ok(Ok(())) => "applied",
                         Ok(Err(_)) => "failed",
@@ -2675,8 +2671,8 @@ pub async fn download_ipfilter(
 // the entire AppSettings struct just to change a single string.
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub fn hide_to_tray(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub fn hide_to_tray(app: crate::host::AppHandle, window: crate::host::WebviewWindow) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
     if !crate::tray::reachable() {
         // Hidden with no visible tray icon, the window could not be reached
@@ -2705,11 +2701,11 @@ pub fn hide_to_tray(app: tauri::AppHandle, window: tauri::WebviewWindow) -> Resu
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn quit_app(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
     // Mark the close as user-confirmed so the `WindowEvent::CloseRequested`
@@ -2733,8 +2729,8 @@ pub const QUIT_REQUESTED_EVENT: &str = "ember:quit-requested";
 /// How long an exit waits for the window to send what is pending.
 const PENDING_UNDO_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
 
-#[tauri::command]
-pub fn set_pending_undo(window: tauri::WebviewWindow, pending: bool) -> Result<(), String> {
+#[ember_macros::command]
+pub fn set_pending_undo(window: crate::host::WebviewWindow, pending: bool) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
     PENDING_UNDO.store(pending, std::sync::atomic::Ordering::Release);
     Ok(())
@@ -2744,8 +2740,8 @@ pub fn set_pending_undo(window: tauri::WebviewWindow, pending: bool) -> Result<(
 /// close behavior, "when downloads finish"). With an Undo pending, the window
 /// is asked to commit it and exit through `quit_app`; it gets a few seconds
 /// before Ember exits regardless.
-pub fn exit_app(app: &tauri::AppHandle) {
-    let confirm_and_exit = |app: &tauri::AppHandle| {
+pub fn exit_app(app: &crate::host::AppHandle) {
+    let confirm_and_exit = |app: &crate::host::AppHandle| {
         if let Some(state) = app.try_state::<AppState>() {
             state
                 .quit_confirmed
@@ -2768,7 +2764,7 @@ pub fn exit_app(app: &tauri::AppHandle) {
         return;
     }
     let app = app.clone();
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         tokio::time::sleep(PENDING_UNDO_FLUSH_WAIT).await;
         // The window's `quit_app` got there first, and the shutdown is under
         // way; a second exit could cut a slow one short.
@@ -2786,8 +2782,8 @@ pub fn exit_app(app: &tauri::AppHandle) {
 /// Whether an exit [`exit_app`] started is waiting on the window's pending
 /// Undo actions. Any window can emit [`QUIT_REQUESTED_EVENT`], so the main
 /// window asks this before committing them.
-#[tauri::command]
-pub fn quit_flush_pending(window: tauri::WebviewWindow) -> Result<bool, String> {
+#[ember_macros::command(desktop)]
+pub fn quit_flush_pending(window: crate::host::WebviewWindow) -> Result<bool, String> {
     crate::commands::chat_window::require_main_window(&window)?;
     let pending = QUIT_FLUSH_STARTED.load(std::sync::atomic::Ordering::Acquire);
     if !pending {
@@ -2802,11 +2798,11 @@ pub fn quit_flush_pending(window: tauri::WebviewWindow) -> Result<bool, String> 
 /// Separate from `quit_app` because any window can emit that event, the
 /// popped-out chat included, and the main window cannot tell who did. Only an
 /// exit already under way is finished here; anything else is ignored.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn finish_requested_quit(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
     if !QUIT_FLUSH_STARTED.load(std::sync::atomic::Ordering::Acquire) {
@@ -2823,8 +2819,8 @@ pub fn finish_requested_quit(
 /// Consume a close request that arrived before the frontend listener was
 /// ready. `swap(false)` makes the handoff one-shot while allowing a later
 /// native close to set the latch again.
-#[tauri::command]
-pub fn take_pending_close_request(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+#[ember_macros::command]
+pub fn take_pending_close_request(state: crate::host::State<'_, AppState>) -> Result<bool, String> {
     Ok(state
         .pending_close_request
         .swap(false, std::sync::atomic::Ordering::AcqRel))
@@ -2834,9 +2830,9 @@ pub fn take_pending_close_request(state: tauri::State<'_, AppState>) -> Result<b
 /// raised one. One-shot, like the close-request latch: the config migration
 /// behind it has already been written and never runs again, so the notice has
 /// exactly one chance to reach the user.
-#[tauri::command]
+#[ember_macros::command]
 pub fn take_pending_ember_default_on_notice(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<bool, String> {
     Ok(state
         .pending_ember_default_on_notice
@@ -2847,9 +2843,9 @@ pub fn take_pending_ember_default_on_notice(
 /// startup raised one. One-shot latch, same reason as the Ember-default-on
 /// notice: the condition is already on disk and an event fired before the
 /// webview is listening would never be shown.
-#[tauri::command]
+#[ember_macros::command]
 pub fn take_pending_restore_failed_notice(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<bool, String> {
     Ok(state
         .pending_restore_failed_notice
@@ -2858,9 +2854,9 @@ pub fn take_pending_restore_failed_notice(
 
 /// Consume the "a staged restore was too old and was discarded" notice, if
 /// startup raised one. One-shot for the same reason as the latch above.
-#[tauri::command]
+#[ember_macros::command]
 pub fn take_pending_restore_expired_notice(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<bool, String> {
     Ok(state
         .pending_restore_expired_notice
@@ -2869,9 +2865,9 @@ pub fn take_pending_restore_expired_notice(
 
 /// Consume the folder an applied restore put in place of a download folder on
 /// a network share, if it did. One-shot like the latches above.
-#[tauri::command]
+#[ember_macros::command]
 pub fn take_pending_restore_download_folder_notice(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     Ok(state.pending_restore_download_folder_notice.lock().take())
 }
@@ -2902,7 +2898,7 @@ pub(crate) fn raise_known_met_notice(reset: bool) {
 /// Consume the known.met notice, if the deferred catalog load raised one.
 /// Its event is emitted once, seconds into the session, and a webview still
 /// starting or reloading then would leave sharing failing closed unexplained.
-#[tauri::command]
+#[ember_macros::command]
 pub fn take_pending_known_met_notice() -> Result<Option<KnownMetNotice>, String> {
     let notice =
         PENDING_KNOWN_MET_NOTICE.swap(KNOWN_MET_NOTICE_NONE, std::sync::atomic::Ordering::AcqRel);
@@ -2913,11 +2909,11 @@ pub fn take_pending_known_met_notice() -> Result<Option<KnownMetNotice>, String>
     })
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn set_close_behavior(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     behavior: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -2987,7 +2983,7 @@ pub(crate) fn normalize_friend_overrides(
 /// loop and announced to every open view. `change` returns false when there is
 /// nothing to save.
 pub(crate) async fn save_settings_change(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     change: impl FnOnce(&mut AppSettings) -> Result<bool, String>,
 ) -> Result<AppSettings, String> {
@@ -3042,11 +3038,11 @@ pub(crate) async fn save_settings_change(
 /// Set one friend's exceptions to the friend settings, replacing what they
 /// had. Every field left unset follows the global setting; all of them unset
 /// removes the friend's entry.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_friend_overrides(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     overrides: crate::types::FriendOverrides,
 ) -> Result<AppSettings, String> {
@@ -3089,10 +3085,10 @@ pub async fn set_friend_overrides(
 
 /// Set the status friends see while we are online. Saved, so it is still
 /// ours after a restart, and sent at once to every friend connected now.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_friend_status(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     status: crate::types::FriendStatus,
 ) -> Result<AppSettings, String> {
     save_settings_change(&app, &state, move |settings| {
@@ -3106,7 +3102,7 @@ pub async fn set_friend_status(
 /// Forget a removed friend's overrides, so adding them again starts from the
 /// global settings rather than from choices made about the old friendship.
 pub(crate) async fn clear_friend_overrides(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     friend: &[u8; 16],
 ) -> Result<(), String> {
@@ -3164,7 +3160,7 @@ fn apply_quick_limits_patch(settings: &mut AppSettings, patch: &QuickLimitsPatch
 
 /// Persist `patch`, put the resulting limits in force, and tell the frontend.
 pub async fn apply_quick_limits(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     patch: QuickLimitsPatch,
 ) -> Result<AppSettings, String> {
@@ -3256,11 +3252,11 @@ fn validate_quick_limits(settings: &AppSettings) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_quick_limits(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     patch: QuickLimitsPatch,
 ) -> Result<AppSettings, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -3305,7 +3301,7 @@ fn release_notes_url(version: &str) -> Option<String> {
 }
 
 /// Open a release's notes on the website in the default browser.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_release_notes(version: String) -> Result<(), String> {
     let url = release_notes_url(&version)
         .ok_or_else(|| coded("settings_unknown_link", "Unknown link"))?;
@@ -3315,7 +3311,7 @@ pub async fn open_release_notes(version: String) -> Result<(), String> {
 
 /// Open one of the project's pages (website, GitHub, Reddit) in the default
 /// browser.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_ember_link(target: String) -> Result<(), String> {
     let url = ember_link_url(&target)
         .ok_or_else(|| coded("settings_unknown_link", "Unknown link"))?;
@@ -3328,7 +3324,7 @@ const EMBER_SUPPORT_URL: &str = "https://buymeacoffee.com/emberp2p";
 
 /// Open the support page in the user's default browser. Hardcoded for the
 /// same reason as [`open_ember_link`].
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_support_page() -> Result<(), String> {
     crate::security::filesystem::open_url_with_default_app(EMBER_SUPPORT_URL).map_err(|e| {
         coded_ctx(
@@ -3341,7 +3337,7 @@ pub async fn open_support_page() -> Result<(), String> {
 
 /// The official site, for copying. Same constant [`open_ember_link`] opens
 /// so the clipboard and the browser cannot drift.
-#[tauri::command]
+#[ember_macros::command]
 pub fn get_ember_website_url() -> String {
     EMBER_WEBSITE_URL.to_string()
 }
@@ -3518,7 +3514,7 @@ async fn reject_non_public_external_host(validated: &str) -> Result<(), String> 
 ///
 /// Returns false for a dismissed or closed dialog, so anything other than an
 /// explicit "open" leaves the browser untouched.
-async fn confirm_external_url(app: &tauri::AppHandle, validated: &str) -> bool {
+async fn confirm_external_url(app: &crate::host::AppHandle, validated: &str) -> bool {
     let host = url::Url::parse(validated)
         .ok()
         .and_then(|parsed| parsed.host_str().map(String::from))
@@ -3528,47 +3524,36 @@ async fn confirm_external_url(app: &tauri::AppHandle, validated: &str) -> bool {
         elide_for_dialog(validated),
         elide_for_dialog(&host)
     );
-    let confirm_app = app.clone();
-    // `blocking_show` waits on the main thread to pump the dialog, so it
-    // cannot run on the command's own task; see `pick_download_folder`.
-    tokio::task::spawn_blocking(move || {
-        confirm_app
-            .dialog()
-            .message(prompt)
-            .title("Open this link?")
-            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                "Open link".to_string(),
-                "Cancel".to_string(),
-            ))
-            .blocking_show()
-    })
+    crate::host::confirm(
+        app,
+        crate::host::Confirm::new("Open this link?", prompt, "Open link", "Cancel").opening(validated),
+    )
     .await
-    .unwrap_or(false)
+}
+
+/// Hand a checked, consented-to link to the browser. emberd's web page
+/// already opened it, as the confirmation's button was clicked.
+#[cfg(feature = "desktop")]
+fn hand_to_browser(url: &str) -> Result<(), String> {
+    crate::security::filesystem::open_url_with_default_app(url)
+        .map_err(|e| coded_ctx("settings_open_link_failed", "Failed to open the link", e))
+}
+
+#[cfg(not(feature = "desktop"))]
+fn hand_to_browser(_url: &str) -> Result<(), String> {
+    Ok(())
 }
 
 /// Ask, natively, before deleting files outright instead of to the Recycle
 /// Bin; see the gate in `update_settings`. False for a dismissed or closed
 /// dialog, so anything other than an explicit yes keeps the bin.
-async fn confirm_permanent_delete(app: &tauri::AppHandle) -> bool {
-    let prompt = "Files you delete from the Library, and finished downloads you cancel, will be deleted permanently instead of going to the Recycle Bin.\n\nThey cannot be recovered afterwards.".to_string();
-    let confirm_app = app.clone();
-    // `blocking_show` waits on the main thread to pump the dialog, so it
-    // cannot run on the command's own task; see `pick_download_folder`.
-    tokio::task::spawn_blocking(move || {
-        confirm_app
-            .dialog()
-            .message(prompt)
-            .title("Delete files permanently?")
-            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                "Delete permanently".to_string(),
-                "Keep using the Recycle Bin".to_string(),
-            ))
-            .blocking_show()
-    })
+async fn confirm_permanent_delete(app: &crate::host::AppHandle) -> bool {
+    let prompt = "Files you delete from the Library, and finished downloads you cancel, will be deleted permanently instead of going to the Recycle Bin.\n\nThey cannot be recovered afterwards.";
+    crate::host::confirm(
+        app,
+        crate::host::Confirm::new("Delete files permanently?", prompt, "Delete permanently", "Keep using the Recycle Bin"),
+    )
     .await
-    .unwrap_or(false)
 }
 
 /// Ask, natively, before a site joins the web-services list.
@@ -3587,7 +3572,7 @@ async fn confirm_permanent_delete(app: &tauri::AppHandle) -> bool {
 /// Returns false for a dismissed or closed dialog, so anything other than an
 /// explicit "add" leaves the stored list alone.
 async fn confirm_web_service_additions(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     added: &[crate::webservices::WebService],
 ) -> bool {
     let sites = added
@@ -3609,23 +3594,7 @@ async fn confirm_web_service_additions(
     } else {
         "Add these web services?"
     };
-    let confirm_app = app.clone();
-    // `blocking_show` waits on the main thread to pump the dialog, so it
-    // cannot run on the command's own task; see `pick_download_folder`.
-    tokio::task::spawn_blocking(move || {
-        confirm_app
-            .dialog()
-            .message(prompt)
-            .title(title)
-            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                "Add".to_string(),
-                "Cancel".to_string(),
-            ))
-            .blocking_show()
-    })
-    .await
-    .unwrap_or(false)
+    crate::host::confirm(app, crate::host::Confirm::new(title, prompt, "Add", "Cancel")).await
 }
 
 /// Open a link found in a message, in the default browser.
@@ -3636,8 +3605,8 @@ async fn confirm_web_service_additions(
 /// ([`validate_external_url`]), the destination is checked
 /// ([`reject_non_public_external_host`]), and the consent is collected
 /// natively ([`confirm_external_url`]) before anything is handed to the shell.
-#[tauri::command]
-pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+#[ember_macros::command]
+pub async fn open_external_url(app: crate::host::AppHandle, url: String) -> Result<(), String> {
     let safe = validate_external_url(&url)?;
     reject_non_public_external_host(&safe).await?;
     if !confirm_external_url(&app, &safe).await {
@@ -3648,13 +3617,7 @@ pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(),
         info!("External link was not opened: the native confirmation was declined");
         return Ok(());
     }
-    crate::security::filesystem::open_url_with_default_app(&safe).map_err(|e| {
-        coded_ctx(
-            "settings_open_link_failed",
-            "Failed to open the link",
-            e,
-        )
-    })
+    hand_to_browser(&safe)
 }
 
 /// Open a configured web service for one file.
@@ -3691,14 +3654,32 @@ pub async fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(),
 /// gives it none. `file_name` is peer-supplied text by design — it is the file's
 /// name — and reaches the URL percent-encoded, inside the length
 /// [`validate_external_url`] enforces.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_web_service(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     service_index: usize,
     file_hash: String,
     file_name: String,
     file_size: u64,
 ) -> Result<(), String> {
+    let safe = web_service_link(&state, service_index, &file_hash, &file_name, file_size).await?;
+    crate::security::filesystem::open_url_with_default_app(&safe).map_err(|e| {
+        coded_ctx(
+            "settings_open_link_failed",
+            "Failed to open the link",
+            e,
+        )
+    })
+}
+
+/// The address [`open_web_service`] opens, checked.
+async fn web_service_link(
+    state: &AppState,
+    service_index: usize,
+    file_hash: &str,
+    file_name: &str,
+    file_size: u64,
+) -> Result<String, String> {
     let file_hash = file_hash.trim();
     // Empty is ordinary: a file still being hashed, or a search hit that
     // arrived without one. Anything else has to be an eD2K hash.
@@ -3740,13 +3721,42 @@ pub async fn open_web_service(
     })?;
     let safe = validate_external_url(&filled)?;
     reject_non_public_external_host(&safe).await?;
-    crate::security::filesystem::open_url_with_default_app(&safe).map_err(|e| {
-        coded_ctx(
-            "settings_open_link_failed",
-            "Failed to open the link",
-            e,
-        )
-    })
+    Ok(safe)
+}
+
+/// emberd: the addresses the desktop app's link openers open, for the web
+/// page to open in a tab of its own.
+#[ember_macros::command(server)]
+pub fn ember_link_address(target: String) -> Result<String, String> {
+    ember_link_url(&target)
+        .map(str::to_string)
+        .ok_or_else(|| coded("settings_unknown_link", "Unknown link"))
+}
+
+#[ember_macros::command(server)]
+pub fn release_notes_address(version: String) -> Result<String, String> {
+    release_notes_url(&version).ok_or_else(|| coded("settings_unknown_link", "Unknown link"))
+}
+
+#[ember_macros::command(server)]
+pub fn support_page_address() -> String {
+    EMBER_SUPPORT_URL.to_string()
+}
+
+#[ember_macros::command(server)]
+pub fn ember_share_address(target: String, text: String) -> Result<String, String> {
+    ember_share_intent_url(&target, &text)
+}
+
+#[ember_macros::command(server)]
+pub async fn web_service_address(
+    state: crate::host::State<'_, AppState>,
+    service_index: usize,
+    file_hash: String,
+    file_name: String,
+    file_size: u64,
+) -> Result<String, String> {
+    web_service_link(&state, service_index, &file_hash, &file_name, file_size).await
 }
 
 /// Read an eMule `webservices.dat` the user picks, and return what it holds.
@@ -3762,9 +3772,9 @@ pub async fn open_web_service(
 /// user's authorization, and a path arriving over IPC is not.
 ///
 /// `Ok(None)` means the user dismissed the picker.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_and_import_webservices_file(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     title: Option<String>,
 ) -> Result<Option<Vec<crate::webservices::WebService>>, String> {
     let dialog_title = super::picker_title(title, "Choose an eMule webservices.dat");
@@ -3850,7 +3860,7 @@ pub async fn pick_and_import_webservices_file(
 /// Read from the core rather than typed into the renderer so the string that
 /// gets stored is the one that was reviewed, and so the offer and the validation
 /// cannot drift apart.
-#[tauri::command]
+#[ember_macros::command]
 pub fn get_example_web_service() -> crate::webservices::WebService {
     crate::webservices::WebService {
         name: crate::webservices::EXAMPLE_SERVICE_NAME.to_string(),
@@ -3864,7 +3874,7 @@ pub fn get_example_web_service() -> crate::webservices::WebService {
 /// [`open_log_folder`] can be pointed somewhere else. Shown as text as well as
 /// opened: a bug report needs the path even when the file manager will not
 /// launch, and a tester on a locked-down machine can still get there by hand.
-#[tauri::command]
+#[ember_macros::command]
 pub fn get_log_folder_path() -> String {
     crate::storage::paths::resolve_data_dir()
         .join("logs")
@@ -3878,7 +3888,7 @@ pub fn get_log_folder_path() -> String {
 /// with tokens — unless `EMBER_VERBOSE_DIAGNOSTICS` was set for the session,
 /// which stays env-only precisely so this button cannot produce a file that is
 /// unsafe to send anyone.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_log_folder() -> Result<(), String> {
     let dir = crate::storage::paths::resolve_data_dir().join("logs");
     // Created rather than reported missing: file logging makes this on startup,
@@ -3962,7 +3972,7 @@ fn ember_share_intent_url(target: &str, text: &str) -> Result<String, String> {
 /// `target` is a name (`x`, `facebook`, …), never a URL. The site itself is
 /// the same hardcoded constant [`open_ember_link`] uses, so a compromised
 /// renderer cannot point this at an arbitrary host.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_ember_share(target: String, text: String) -> Result<(), String> {
     let intent = ember_share_intent_url(&target, &text)?;
     crate::security::filesystem::open_url_with_default_app(&intent).map_err(|e| {

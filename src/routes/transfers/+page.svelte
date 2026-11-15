@@ -28,6 +28,8 @@
   import { distinctLinks, findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
   import { startRelatedSearch } from '$lib/relatedSearch';
   import { previewFile } from '$lib/api/preview';
+  import { isServer } from '$lib/runtime';
+  import { saveToThisComputer } from '$lib/runtime/web/files';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { beginFriendsListFetch, commitFriendsList } from '$lib/stores/friends';
   import { banPeer, getBannedPeers, unbanPeer } from '$lib/api/kad';
@@ -2635,9 +2637,16 @@
 
   /** Double-click or Enter on a row: a finished download opens its file, a
    *  running one shows its sources. */
+  /** A finished download's file: opened on the desktop; on emberd, which runs
+   *  on another computer, saved to the one this browser is on. */
+  async function openFinished(t: Transfer) {
+    if (!isServer) return openFile(t.id);
+    if (t.completed_path) return saveToThisComputer(t.completed_path);
+  }
+
   function activateDownloadRow(t: Transfer) {
     if (t.status === 'completed') {
-      void openFile(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); });
+      void openFinished(t).catch((e: unknown) => { transferError = toErrorMsg(e); });
     } else if (!isFinished(t)) {
       void toggleSourceDetail(t);
     }
@@ -3735,7 +3744,7 @@
           return;
         }
         case 'remove': discardWithUndo([], targets.filter(isFinished).map((x) => x.id)); break;
-        case 'open': await openFile(t.id); break;
+        case 'open': await openFinished(t); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'rename': openRename(t); return;
         case 'add_mirror': openAddMirror(t); return;
@@ -4130,7 +4139,7 @@
     if (!selectedTransfer || selectedActionBusy) return;
     selectedActionBusy = true;
     try {
-      if (action === 'open' && selectedTransfer.status === 'completed') await openFile(selectedTransfer.id);
+      if (action === 'open' && selectedTransfer.status === 'completed') await openFinished(selectedTransfer);
       if (action === 'pause' && canPause(selectedTransfer)) await pauseTransfer(selectedTransfer.id);
       if (action === 'resume' && canResume(selectedTransfer)) await resumeTransfer(selectedTransfer.id);
       if (action === 'stop' && canStop(selectedTransfer)) await stopTransfer(selectedTransfer.id);
@@ -6003,6 +6012,7 @@
         {/if}
       </span>
       <div class="toolbar-actions">
+        {#if !isServer}
         <label
           class="finish-action"
           class:armed={finishChoice !== 'none'}
@@ -6033,6 +6043,7 @@
           </select>
         </label>
         <span class="toolbar-sep"></span>
+        {/if}
         <div class="tb-segmented" role="group" aria-label={m.transfers_toggle_cols_title()} title={m.transfers_toggle_cols_title()}>
           <button type="button" class="tb-btn" aria-pressed={!showAdvancedDlCols} onclick={() => { if (showAdvancedDlCols) toggleAdvancedDlCols(); }}>{m.transfers_toggle_compact()}</button>
           <button type="button" class="tb-btn" aria-pressed={showAdvancedDlCols} onclick={() => { if (!showAdvancedDlCols) toggleAdvancedDlCols(); }}>{m.transfers_toggle_full()}</button>
@@ -6530,7 +6541,9 @@
           <span class="tb-btn-wrap" title={isFinished(selectedTransfer) ? m.transfers_action_cannot_find_sources() : undefined}>
             <button class="tb-btn" disabled={selectedActionBusy || isFinished(selectedTransfer)} onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
           </span>
-          <button class="tb-btn" disabled={selectedActionBusy || !canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
+          {#if !isServer}
+            <button class="tb-btn" disabled={selectedActionBusy || !canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
+          {/if}
           {#if selectedTransfer}
             {@const copyOne = selectedTransfer}
             <button class="tb-btn" disabled={copyingAllDownloadLinks || !copyOne.file_hash?.trim()} onclick={() => void copyDownloadLinks([copyOne])} title={m.transfers_ctx_copy_link()}>{m.transfers_copy_link_btn()}</button>
@@ -6538,7 +6551,7 @@
           {#if isFinished(selectedTransfer)}
             {@const finishedId = selectedTransfer.id}
             {#if selectedTransfer.status === 'completed'}
-              <button class="tb-btn" disabled={selectedActionBusy} onclick={() => runSelectedAction('open')}>{m.transfers_ctx_open_file()}</button>
+              <button class="tb-btn" disabled={selectedActionBusy} onclick={() => runSelectedAction('open')}>{isServer ? m.server_save_to_computer() : m.transfers_ctx_open_file()}</button>
             {/if}
             <button class="tb-btn" onclick={() => discardWithUndo([], [finishedId])} title={m.transfers_batch_remove_title()}>
               {m.transfers_ctx_remove_from_list()}
@@ -7591,7 +7604,9 @@
     <div class="ctx-sep" role="separator"></div>
     <button class="ctx-item" role="menuitem" disabled={copyingAllDownloadLinks || linkableVisibleDownloads.length === 0} onclick={() => { closePaneCtx(); void copyDownloadLinks(filteredActiveDownloads); }}>{m.transfers_copy_all_links()}</button>
     <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void pasteLinksFromClipboard(); }}>{m.transfers_ctx_paste_link()}</button>
-    <button class="ctx-item" role="menuitem" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
+    {#if !isServer}
+      <button class="ctx-item" role="menuitem" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
+    {/if}
     <div class="ctx-sep" role="separator"></div>
     <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); clearCompletedWithUndo(); }}>{m.transfers_clear_completed()}</button>
     <button class="ctx-item ctx-danger" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
@@ -7725,7 +7740,9 @@
         <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openRename(t); }}>{m.transfers_ctx_rename()}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
-      <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
+      {#if !isServer}
+        <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
+      {/if}
       <button
         class="ctx-item"
         role="menuitemcheckbox"
@@ -7737,7 +7754,9 @@
           {recoveringIds.has(ctxTransfer.id) ? m.transfers_ctx_recovering() : m.transfers_ctx_recover_archive()}
         </button>
       {/if}
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      {#if !isServer}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       <!-- `role="presentation"` on the wrapper, `role="menuitem"` on the button:
            a `role="menu"` may only own menuitems, so a plain div between the two
@@ -7809,10 +7828,16 @@
         <button class="ctx-item" role="menuitem" title={m.transfers_ctx_resume_failed_title()} onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
         <div class="ctx-sep" role="separator"></div>
       {/if}
-      {#if ctxTransfer.status === 'completed' || ctxTransfer.status === 'failed'}
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
+      {#if isServer}
+        {#if ctxTransfer.status === 'completed' && ctxTransfer.completed_path}
+          <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.server_save_to_computer()}</button>
+        {/if}
+      {:else}
+        {#if ctxTransfer.status === 'completed' || ctxTransfer.status === 'failed'}
+          <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
+        {/if}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       {/if}
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
       {#if canRename(ctxTransfer)}
@@ -8197,11 +8222,13 @@
           disabled={copyingAllDownloadLinks || !t.file_hash?.trim()}
           onclick={() => void copyDownloadLinks([t])}
         >{m.transfers_ctx_copy_link()}</button>
-        <button
-          type="button"
-          class="ghost"
-          onclick={() => void openTransferFileLocation(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); })}
-        >{m.transfers_ctx_open_location()}</button>
+        {#if !isServer}
+          <button
+            type="button"
+            class="ghost"
+            onclick={() => void openTransferFileLocation(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); })}
+          >{m.transfers_ctx_open_location()}</button>
+        {/if}
         <span class="dl-details-footer-spacer"></span>
         {#if canRename(t)}
           <button type="button" class="ghost" onclick={() => openRename(t)}>{m.transfers_ctx_rename()}</button>

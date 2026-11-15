@@ -278,7 +278,7 @@ pub(super) async fn publish_kad_completes_from_index(
 /// library. Call this from every promotion site.
 pub(super) async fn promote_kad_connected_and_first_publish(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     local_index: &Arc<RwLock<LocalIndex>>,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     known_files: &KnownFileList,

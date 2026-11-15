@@ -11,7 +11,7 @@ pub(in crate::network) async fn on_server_connect_result(
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     known_files: &KnownFileList,
@@ -512,7 +512,7 @@ pub(in crate::network) async fn on_server_connect_result(
 async fn follow_moved_server(
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     ip: &str,
     port: u16,

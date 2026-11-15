@@ -17,34 +17,44 @@
 //! limited. The per-event switches stay in the renderer, where the context
 //! needed to apply them already is.
 
+#[cfg(feature = "desktop")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "desktop")]
 use tauri_plugin_notification::NotificationExt;
 
 use crate::app_state::AppState;
+#[cfg(feature = "desktop")]
 use crate::commands::errors::{coded, coded_ctx};
 use crate::types::RuntimeStatus;
 
 /// Ceiling on a notification title, in characters.
+#[cfg(feature = "desktop")]
 const MAX_TITLE_CHARS: usize = 120;
 /// Ceiling on a notification body, in characters. Every desktop shell
 /// truncates well before this; the cap exists so a hostile peer cannot hand us
 /// a megabyte to copy through IPC and into the shell.
+#[cfg(feature = "desktop")]
 const MAX_BODY_CHARS: usize = 400;
 
 /// Burst allowance, and how fast it refills. Five at once covers a legitimate
 /// flurry — three downloads finishing as a friend comes online — and one every
 /// three seconds thereafter is far below what a person can read, so anything
 /// hitting this ceiling is a loop rather than a user's day.
+#[cfg(feature = "desktop")]
 const NOTIFY_BURST: u64 = 5;
+#[cfg(feature = "desktop")]
 const NOTIFY_REFILL_MILLIS: u64 = 3_000;
 
 /// Rate-limiter state, encoded as two atomics so the check needs no lock.
 /// `tokens` is in thousandths of a token to keep the refill arithmetic in
 /// integers.
+#[cfg(feature = "desktop")]
 static NOTIFY_TOKENS_MILLI: AtomicU64 = AtomicU64::new(NOTIFY_BURST * 1_000);
+#[cfg(feature = "desktop")]
 static NOTIFY_LAST_REFILL_MILLIS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "desktop")]
 fn monotonic_millis() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
@@ -66,6 +76,7 @@ fn monotonic_millis() -> u64 {
 /// atomics cannot be swapped together, and the consequence of losing the race
 /// on this one is that a concurrent caller's elapsed time reads as zero and
 /// refills nothing, which errs towards throttling.
+#[cfg(feature = "desktop")]
 fn take_notify_token() -> bool {
     let now = monotonic_millis();
     let last = NOTIFY_LAST_REFILL_MILLIS.swap(now, Ordering::Relaxed);
@@ -94,6 +105,7 @@ fn take_notify_token() -> bool {
 /// overrides go entirely — the same set `coded_ctx` strips, and for the same
 /// reason: a right-to-left override in a file name can make a notification read
 /// as text nobody sent.
+#[cfg(feature = "desktop")]
 pub(crate) fn sanitize(raw: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(raw.len().min(max_chars * 4));
     let mut chars = 0usize;
@@ -158,6 +170,7 @@ pub(crate) fn sanitize(raw: &str, max_chars: usize) -> String {
 /// because the spec defines it as plain text and no server parses it — escaping
 /// it would show `&amp;` in an ordinary title. `cfg!` rather than `#[cfg]` so
 /// the body stays type-checked on every platform.
+#[cfg(feature = "desktop")]
 fn escape_body_markup(body: String) -> String {
     if cfg!(unix) {
         escape_markup(&body)
@@ -168,6 +181,7 @@ fn escape_body_markup(body: String) -> String {
 
 /// The escaping itself, split out so it is compiled and tested on every
 /// platform rather than only on the one that applies it.
+#[cfg(feature = "desktop")]
 fn escape_markup(body: &str) -> String {
     let mut out = String::with_capacity(body.len());
     for ch in body.chars() {
@@ -182,10 +196,10 @@ fn escape_markup(body: &str) -> String {
 }
 
 /// Show a desktop notification.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn show_notification(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     title: String,
     body: String,
 ) -> Result<(), String> {
@@ -230,9 +244,9 @@ pub async fn show_notification(
 /// Snapshot of the schedule window in force and whether sleep is being
 /// deferred. Paired with the `ember:runtime-status` event, which carries the
 /// same shape whenever it changes.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_runtime_status(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<RuntimeStatus, String> {
     Ok(crate::background::snapshot(&state))
 }
@@ -249,6 +263,7 @@ pub async fn get_runtime_status(
 /// did not choose to put there, and the caller rejects an over-long paste on
 /// its own terms anyway. A write refuses, because silently copying a prefix
 /// hands the user a corrupted link they have no way to notice.
+#[cfg(feature = "desktop")]
 const MAX_CLIPBOARD_CHARS: usize = 1_000_000;
 
 /// Truncate on a character boundary, returning the text and whether anything
@@ -282,6 +297,7 @@ fn cap_chars(text: &str, max_chars: usize) -> (String, bool) {
 /// the ordinary X11 contract for any application, and paying a shutdown stall
 /// to improve on it is not worth it for a link the user has almost certainly
 /// already pasted.
+#[cfg(feature = "desktop")]
 static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mutex::new(None);
 
 /// Run `op` against the shared clipboard handle, opening it on first use.
@@ -292,6 +308,7 @@ static CLIPBOARD: std::sync::Mutex<Option<arboard::Clipboard>> = std::sync::Mute
 /// those round trips, which costs nothing for an action only a user click
 /// starts, and the default `arboard` write does not wait for a new owner, so
 /// no operation can park here holding the lock.
+#[cfg(feature = "desktop")]
 fn with_clipboard<T>(
     op: impl FnOnce(&mut arboard::Clipboard) -> Result<T, arboard::Error>,
 ) -> Result<T, arboard::Error> {
@@ -327,8 +344,8 @@ fn with_clipboard<T>(
 ///
 /// Main window only: the popped-out chat never pastes through here, and a chat
 /// webview that could read the clipboard could also send it as a message.
-#[tauri::command]
-pub async fn read_clipboard_text(window: tauri::WebviewWindow) -> Result<Option<String>, String> {
+#[ember_macros::command(desktop)]
+pub async fn read_clipboard_text(window: crate::host::WebviewWindow) -> Result<Option<String>, String> {
     crate::commands::chat_window::require_main_window(&window)?;
     // `spawn_blocking` because the read is a synchronous cross-process round
     // trip; see `with_clipboard`.
@@ -349,14 +366,20 @@ pub async fn read_clipboard_text(window: tauri::WebviewWindow) -> Result<Option<
 /// Whether a long-term secret (identity, SecIdent key, chat-history key) is
 /// sealed only under the machine-id fallback key because the system keyring
 /// could not be reached. Always false on Windows.
-#[tauri::command]
+#[ember_macros::command]
 pub fn identity_keyring_fallback() -> bool {
     crate::storage::secret_store::fallback_key_in_use()
 }
 
+/// A web page's answer to an `ember:confirm` question (`host::confirm`).
+#[ember_macros::command(server)]
+pub fn answer_confirm(app: crate::host::AppHandle, id: u64, accepted: bool) {
+    crate::host::answer_confirm(&app, id, accepted);
+}
+
 /// Answers at once: the main window times the round trip to tell its own
 /// thread being busy from the backend being slow to reply (`src/lib/uiStall.ts`).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ui_ping() {}
 
 /// Note in the log that the main window stopped answering: `kind` is
@@ -364,7 +387,7 @@ pub async fn ui_ping() {}
 /// `ipc` (a reply from here was slow), for `ms` milliseconds, on `route`.
 /// Only reported past a couple of seconds, so it is a handful a session at
 /// most; what is logged is capped all the same.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn log_ui_stall(kind: String, ms: u64, route: String, visible: bool, detail: String) {
     let (kind, _) = cap_chars(&kind, 16);
     let (route, _) = cap_chars(&route, 64);
@@ -379,7 +402,7 @@ pub async fn log_ui_stall(kind: String, ms: u64, route: String, visible: bool, d
 /// live user activation, so a copy triggered from a context menu or after an
 /// `await` can be refused. Routing it through here makes the affordance behave
 /// the same on every platform rather than depending on how the click arrived.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn write_clipboard_text(text: String) -> Result<(), String> {
     let (text, truncated) = cap_chars(&text, MAX_CLIPBOARD_CHARS);
     if truncated {
@@ -405,6 +428,7 @@ pub async fn write_clipboard_text(text: String) -> Result<(), String> {
     .map_err(|error| coded_ctx("clipboard_task_failed", "Clipboard write failed", error))?
 }
 
+#[cfg(feature = "desktop")]
 #[cfg(test)]
 mod tests {
     use super::*;

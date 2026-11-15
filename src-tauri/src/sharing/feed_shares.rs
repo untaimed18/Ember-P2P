@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tauri::Manager;
+use crate::host::Manager;
 
 use crate::app_state::AppState;
 use crate::security::path_within_dir;
@@ -90,7 +90,7 @@ fn reconcile_lock() -> &'static tokio::sync::Mutex<()> {
 /// folder holds, and take back each Ember added that none needs now. `rescan`
 /// names feed folders whose sharing changed, rescanned where a shared folder
 /// of the user's holds them.
-pub(crate) async fn reconcile(app: &tauri::AppHandle, rescan: &[String]) {
+pub(crate) async fn reconcile(app: &crate::host::AppHandle, rescan: &[String]) {
     let _one = reconcile_lock().lock().await;
     let state = app.state::<AppState>();
     let (roots, current, shared, managed) = {
