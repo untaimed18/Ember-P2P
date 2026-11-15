@@ -45,6 +45,15 @@ pub async fn pick_and_load_collection(app: crate::host::AppHandle) -> Result<Opt
         .map(Some)
 }
 
+/// emberd: open a collection sent from the browser's computer.
+#[ember_macros::command(server)]
+pub async fn load_collection_upload(upload: String) -> Result<Collection, String> {
+    let path = crate::server::uploads::uploaded(&upload)?;
+    let loaded = crate::commands::deeplink::open_collection_file(path.to_string_lossy().into_owned()).await;
+    crate::server::uploads::discard(&upload);
+    loaded
+}
+
 async fn create_collection_internal(
     name: String,
     author: String,

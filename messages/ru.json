@@ -5106,5 +5106,17 @@
   "error_server_upload_too_large": "Этот файл слишком большой для отправки.",
   "error_server_upload_failed": "Файл не дошёл. Попробуйте снова.",
   "error_sharing_folder_set_in_config": "Эту папку делает общей файл настроек emberd. Уберите её оттуда.",
-  "error_sharing_browse_under_unset": "В файле настроек emberd не указаны папки, из которых эта страница может добавлять общие папки. Перечислите их в browse_under в разделе [folders]."
+  "error_sharing_browse_under_unset": "В файле настроек emberd не указаны папки, из которых эта страница может добавлять общие папки. Перечислите их в browse_under в разделе [folders].",
+  "server_notifications_title": "Уведомления браузера",
+  "server_notifications_here": "В этом браузере",
+  "server_notifications_default": "Разрешите здесь уведомления, чтобы узнавать о завершённых загрузках, сообщениях и прочем, пока эта страница открыта.",
+  "server_notifications_allow": "Разрешить уведомления",
+  "server_notifications_granted": "Разрешены. Этот браузер показывает уведомления Ember, пока эта страница открыта.",
+  "server_notifications_denied": "Заблокированы в этом браузере. Чтобы получать их, разрешите уведомления для этого сайта в настройках браузера.",
+  "server_notifications_unsupported": "Браузеры показывают уведомления только для страниц, открытых по HTTPS или с этого компьютера (localhost), поэтому эта страница не может.",
+  "error_server_upload_unknown": "Этого файла больше нет на сервере. Отправьте его ещё раз.",
+  "error_server_busy": "emberd сейчас проверяет другие входы. Попробуйте ещё раз через минуту.",
+  "server_notifications_enabled_label": "Показывать уведомления",
+  "server_notifications_enabled_hint": "Их показывает любой браузер, в котором открыт Ember и которому это разрешено.",
+  "server_notifications_desc": "Уведомления в этом браузере и всплывающие сообщения Ember на его странице"
 }

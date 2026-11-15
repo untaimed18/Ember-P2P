@@ -188,15 +188,15 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   lets the user put anywhere, and for the tray and the `ed2k:` link handler.
   Pick it up when users ask for one, or if the `.deb` cannot leave 22.04 in
   time.
-- **Ship `emberd`,** the headless build for servers, NAS boxes and Docker.
-  It is built and tested in CI, with its web interface, and published as test
-  builds by `emberd-test-build.yml`. Left before it is released, as listed
-  under *Still to do* in [headless.md](headless.md): the release jobs (x86-64
-  and ARM64 tarballs, a `.deb`, the Docker image), `emberd ctl`, the uploads
-  the web interface does not offer yet, browser notifications, and a security
-  review by someone who did not write it. Its server-side host types also give
-  tests of the network loop an event sink without Tauri's `test` feature (see
-  *Split `NetworkState` per stack* below).
+- **`emberd`,** the headless build for servers, NAS boxes and Docker, ships
+  with 1.8.0: tarballs and `.deb`s for x86-64 and ARM64 and a Docker image,
+  with `emberd ctl`, uploads from the browser and browser notifications. Left,
+  as listed under *Still to do* in [headless.md](headless.md): a security
+  review by a person who did not write it, and importing from eMule's folder
+  and creating a collection from the browser. Then the desktop can offer the
+  same web interface behind a switch, as *Decisions* there describes. Its
+  server-side host types also give tests of the network loop an event sink
+  without Tauri's `test` feature (see *Split `NetworkState` per stack* below).
 
 ## 6. Code health
 

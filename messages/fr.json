@@ -5106,5 +5106,17 @@
   "error_server_upload_too_large": "Ce fichier est trop volumineux pour être envoyé.",
   "error_server_upload_failed": "Le fichier n'est pas arrivé. Réessayez.",
   "error_sharing_folder_set_in_config": "Le fichier de configuration d'emberd partage ce dossier. Retirez-le à cet endroit.",
-  "error_sharing_browse_under_unset": "Le fichier de configuration d'emberd n'indique aucun dossier depuis lequel cette page peut partager. Listez-les sous browse_under dans [folders]."
+  "error_sharing_browse_under_unset": "Le fichier de configuration d'emberd n'indique aucun dossier depuis lequel cette page peut partager. Listez-les sous browse_under dans [folders].",
+  "server_notifications_title": "Notifications du navigateur",
+  "server_notifications_here": "Dans ce navigateur",
+  "server_notifications_default": "Autorisez ici les notifications pour être averti des téléchargements terminés, des messages et du reste tant que cette page est ouverte.",
+  "server_notifications_allow": "Autoriser les notifications",
+  "server_notifications_granted": "Autorisées. Ce navigateur affiche les notifications d’Ember tant que cette page est ouverte.",
+  "server_notifications_denied": "Bloquées dans ce navigateur. Pour les recevoir, autorisez les notifications pour ce site dans les paramètres du navigateur.",
+  "server_notifications_unsupported": "Les navigateurs n’affichent de notifications que pour les pages servies en HTTPS ou depuis cet ordinateur (localhost) : cette page ne le peut donc pas.",
+  "error_server_upload_unknown": "Ce fichier n’est plus sur le serveur. Envoyez-le à nouveau.",
+  "error_server_busy": "emberd est occupé à vérifier d’autres connexions. Réessayez dans un instant.",
+  "server_notifications_enabled_label": "Afficher les notifications",
+  "server_notifications_enabled_hint": "Tout navigateur où Ember est ouvert et qui est autorisé à les afficher les affiche.",
+  "server_notifications_desc": "Les notifications dans ce navigateur, et les messages qu’Ember affiche dans sa page"
 }

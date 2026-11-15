@@ -6848,9 +6848,55 @@ pub async fn pick_and_offer_channel_transfer(
     title: Option<String>,
 ) -> Result<Option<String>, String> {
     let dialog_title = super::picker_title(title, "Choose a file to send");
-    require_ember(&state).await?;
-    let channel_id = parse_channel_id(&channel_id)?;
-    let peer = parse_member_pubkey(&member_pubkey)?;
+    let (channel_id, peer) = channel_transfer_recipient(&state, &channel_id, &member_pubkey).await?;
+
+    // Only prompt once the offer is known to have somewhere to go, so a
+    // dismissed dialog is the only reason this returns `Ok(None)`.
+    let picker = app.clone();
+    let picked = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .set_title(dialog_title)
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path()
+                    .map_err(|e| coded_ctx("channels_xfer_failed", "Invalid file path", e))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))??;
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    offer_channel_transfer_from(&state, channel_id, peer, picked).await.map(Some)
+}
+
+/// emberd: offer a room member a file sent from the browser's computer. It
+/// is kept on the server while the member may still take it.
+#[ember_macros::command(server)]
+pub async fn offer_channel_transfer_upload(
+    state: crate::host::State<'_, AppState>,
+    channel_id: String,
+    member_pubkey: String,
+    upload: String,
+) -> Result<String, String> {
+    let (channel_id, peer) = channel_transfer_recipient(&state, &channel_id, &member_pubkey).await?;
+    let path = crate::server::uploads::keep(&upload)?;
+    offer_channel_transfer_from(&state, channel_id, peer, path).await
+}
+
+/// The room and member a file may be offered to: Ember on, the room joined
+/// and not banned from, and the member someone else the room can see.
+async fn channel_transfer_recipient(
+    state: &AppState,
+    channel_id: &str,
+    member_pubkey: &str,
+) -> Result<(String, [u8; 32]), String> {
+    require_ember(state).await?;
+    let channel_id = parse_channel_id(channel_id)?;
+    let peer = parse_member_pubkey(member_pubkey)?;
     if peer == state.identity.ed25519_public_key {
         return Err(coded(
             "channels_xfer_self",
@@ -6858,8 +6904,8 @@ pub async fn pick_and_offer_channel_transfer(
         ));
     }
 
-    let row = load_joined_channel(&state, &channel_id).await?;
-    if self_banned_from(&state, &row, "channels_xfer_failed").await? {
+    let row = load_joined_channel(state, &channel_id).await?;
+    if self_banned_from(state, &row, "channels_xfer_failed").await? {
         return Err(coded(
             "channels_banned",
             "You are banned from this channel",
@@ -6882,28 +6928,16 @@ pub async fn pick_and_offer_channel_transfer(
             "That member is not in this channel",
         ));
     }
+    Ok((channel_id, peer))
+}
 
-    // Only prompt once the offer is known to have somewhere to go, so a
-    // dismissed dialog is the only reason this returns `Ok(None)`.
-    let picker = app.clone();
-    let picked = tokio::task::spawn_blocking(move || {
-        picker
-            .dialog()
-            .file()
-            .set_title(dialog_title)
-            .blocking_pick_file()
-            .map(|file| {
-                file.into_path()
-                    .map_err(|e| coded_ctx("channels_xfer_failed", "Invalid file path", e))
-            })
-            .transpose()
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))??;
-    let Some(picked) = picked else {
-        return Ok(None);
-    };
-
+/// Offer `peer` in `channel_id` the file at `picked`, chosen by the user.
+async fn offer_channel_transfer_from(
+    state: &AppState,
+    channel_id: String,
+    peer: [u8; 32],
+    picked: std::path::PathBuf,
+) -> Result<String, String> {
     let prepared = tokio::task::spawn_blocking(move || {
         let canonical = picked
             .canonicalize()
@@ -6976,7 +7010,7 @@ pub async fn pick_and_offer_channel_transfer(
         })
         .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
     await_reply(rx, "channels_xfer_failed", "No response from network").await??;
-    Ok(Some(hex::encode(xfer_id)))
+    Ok(hex::encode(xfer_id))
 }
 
 /// Accept or decline an offer someone made you.

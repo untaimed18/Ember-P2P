@@ -5106,5 +5106,17 @@
   "error_server_upload_too_large": "Esse arquivo é grande demais para enviar.",
   "error_server_upload_failed": "O arquivo não chegou. Tente de novo.",
   "error_sharing_folder_set_in_config": "O arquivo de configuração do emberd compartilha esta pasta. Remova-a de lá.",
-  "error_sharing_browse_under_unset": "O arquivo de configuração do emberd não indica pastas a partir das quais esta página pode compartilhar. Liste-as em browse_under, dentro de [folders]."
+  "error_sharing_browse_under_unset": "O arquivo de configuração do emberd não indica pastas a partir das quais esta página pode compartilhar. Liste-as em browse_under, dentro de [folders].",
+  "server_notifications_title": "Notificações do navegador",
+  "server_notifications_here": "Neste navegador",
+  "server_notifications_default": "Permita as notificações aqui para saber de downloads concluídos, mensagens e o resto enquanto esta página estiver aberta.",
+  "server_notifications_allow": "Permitir notificações",
+  "server_notifications_granted": "Permitidas. Este navegador mostra as notificações do Ember enquanto esta página estiver aberta.",
+  "server_notifications_denied": "Bloqueadas neste navegador. Para recebê-las, permita as notificações deste site nas configurações do navegador.",
+  "server_notifications_unsupported": "Os navegadores só mostram notificações de páginas servidas por HTTPS ou deste computador (localhost), então esta página não pode.",
+  "error_server_upload_unknown": "Esse arquivo não está mais no servidor. Envie-o de novo.",
+  "error_server_busy": "O emberd está ocupado verificando outros acessos. Tente de novo em instantes.",
+  "server_notifications_enabled_label": "Mostrar notificações",
+  "server_notifications_enabled_hint": "Qualquer navegador com o Ember aberto e com permissão para isso as mostra.",
+  "server_notifications_desc": "Notificações neste navegador e os avisos que o Ember mostra na sua página"
 }

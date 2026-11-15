@@ -3181,7 +3181,7 @@ pub(crate) fn sync_asset_protocol_scope(
 ) {
 }
 
-fn percent_decode_path(value: &str) -> Option<String> {
+pub(crate) fn percent_decode_path(value: &str) -> Option<String> {
     let mut out = Vec::with_capacity(value.len());
     let bytes = value.as_bytes();
     let mut i = 0;

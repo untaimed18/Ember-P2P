@@ -318,6 +318,16 @@ mod tests {
         assert!(parse_listen("somewhere").is_err());
     }
 
+    /// The file the tarball and the .deb install as /etc/emberd/emberd.toml: a
+    /// key it misspelled would stop every install that kept it.
+    #[test]
+    fn the_shipped_config_file_is_read_as_written() {
+        let shipped = file(include_str!("../../../packaging/emberd/emberd.toml"));
+        assert_eq!(shipped.data_dir, Some(PathBuf::from("/var/lib/emberd/data")));
+        #[cfg(unix)]
+        assert!(resolve(shipped, None, &with_env(&[])).is_ok());
+    }
+
     #[test]
     fn unknown_keys_and_half_a_tls_pair_are_refused() {
         assert!(toml::from_str::<FileConfig>("listen = \"x\"").is_err(), "listen belongs under [web]");

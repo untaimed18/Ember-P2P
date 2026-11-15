@@ -1,6 +1,8 @@
-# emberd as a systemd service. Install with emberd unpacked to /opt/emberd:
+# emberd as a systemd service. The .deb installs it, with the emberd user and
+# /usr/bin/emberd. From the tarball, unpacked to /opt/emberd:
 #
 #   sudo useradd --system --home-dir /var/lib/emberd --shell /usr/sbin/nologin emberd
+#   sudo ln -s /opt/emberd/emberd /usr/local/bin/emberd
 #   sudo install -Dm644 emberd.service /etc/systemd/system/emberd.service
 #   sudo install -Dm644 emberd.toml /etc/emberd/emberd.toml
 #   sudo systemctl enable --now emberd
@@ -33,6 +35,10 @@ Environment=HOME=/var/lib/emberd
 Environment=EMBER_DATA_DIR=/var/lib/emberd/data
 StateDirectory=emberd
 StateDirectoryMode=0700
+# The command line's socket, /run/emberd/emberd.sock, open to the emberd
+# group: `sudo usermod -aG emberd $USER` lets you run `emberd ctl` as yourself.
+RuntimeDirectory=emberd
+RuntimeDirectoryMode=0750
 UMask=0077
 LimitNOFILE=8192
 NoNewPrivileges=yes

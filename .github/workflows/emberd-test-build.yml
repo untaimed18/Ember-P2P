@@ -1,14 +1,12 @@
 name: emberd test build
 
-# Builds emberd, Ember without a window, on demand: a Linux tarball to hand to
-# a tester, and the Docker image, built to prove the Dockerfile still works.
-# Nothing is signed or published; release.yml stays the only thing that
-# publishes, and emberd joins it once its web interface has shipped.
+# Builds emberd, Ember without a window, on demand: the x86-64 tarball and
+# `.deb` to hand to a tester, packaged by the script release.yml uses, and the
+# Docker image from source, built to prove the Dockerfile still works. Nothing
+# is published; release.yml and emberd-image.yml do that for a release.
 #
-# The tarball is built on Ubuntu 22.04 for the same reason the desktop `.deb`
-# is: glibc is only forwards compatible, and 2.35 runs on every distro still
-# supported. Unpacked, it is the /opt/emberd that packaging/emberd/emberd.service
-# expects.
+# Built on Ubuntu 22.04 for the same reason the desktop `.deb` is: glibc is
+# only forwards compatible, and 2.35 runs on every distro still supported.
 
 on:
   workflow_dispatch:
@@ -22,7 +20,7 @@ concurrency:
 
 jobs:
   tarball:
-    name: Linux x86_64 tarball
+    name: Linux x86_64 tarball and .deb
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     permissions:
@@ -57,25 +55,19 @@ jobs:
       - name: Build emberd
         run: cargo build --locked --release --manifest-path src-tauri/Cargo.toml --no-default-features --features server --bin emberd
 
-      - name: Assemble the tarball
+      - name: Package the tarball and the .deb
         run: |
           version=$(node -p "require('./package.json').version")
-          name="emberd-${version}-linux-x86_64"
-          mkdir -p "out/${name}/resources"
-          cp src-tauri/target/release/emberd "out/${name}/"
-          cp -r build-web "out/${name}/web"
-          cp src-tauri/resources/dbip-country-lite.mmdb "out/${name}/resources/"
-          cp packaging/emberd/emberd.toml packaging/emberd/emberd.service "out/${name}/"
-          cp LICENSE "out/${name}/"
-          "out/${name}/emberd" --version
-          tar -C out -czf "out/${name}.tar.gz" "${name}"
-          echo "TARBALL=out/${name}.tar.gz" >> "$GITHUB_ENV"
+          bash packaging/emberd/package.sh "$version" out
+          bash packaging/emberd/check-packages.sh "$version" out
 
-      - name: Upload the tarball
+      - name: Upload the packages
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: emberd-linux-x86_64
-          path: ${{ env.TARBALL }}
+          path: |
+            out/*.tar.gz
+            out/*.deb
           if-no-files-found: error
           retention-days: 14
 

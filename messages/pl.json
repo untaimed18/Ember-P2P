@@ -5106,5 +5106,17 @@
   "error_server_upload_too_large": "Ten plik jest za duży, by go wysłać.",
   "error_server_upload_failed": "Plik nie dotarł. Spróbuj ponownie.",
   "error_sharing_folder_set_in_config": "Ten folder udostępnia plik konfiguracyjny emberd. Usuń go stamtąd.",
-  "error_sharing_browse_under_unset": "Plik konfiguracyjny emberd nie wskazuje folderów, z których ta strona może udostępniać. Wpisz je w browse_under w sekcji [folders]."
+  "error_sharing_browse_under_unset": "Plik konfiguracyjny emberd nie wskazuje folderów, z których ta strona może udostępniać. Wpisz je w browse_under w sekcji [folders].",
+  "server_notifications_title": "Powiadomienia przeglądarki",
+  "server_notifications_here": "W tej przeglądarce",
+  "server_notifications_default": "Zezwól tutaj na powiadomienia, aby dowiadywać się o ukończonych pobieraniach, wiadomościach i reszcie, gdy ta strona jest otwarta.",
+  "server_notifications_allow": "Zezwól na powiadomienia",
+  "server_notifications_granted": "Dozwolone. Ta przeglądarka pokazuje powiadomienia Ember, gdy ta strona jest otwarta.",
+  "server_notifications_denied": "Zablokowane w tej przeglądarce. Aby je otrzymywać, zezwól na powiadomienia dla tej witryny w ustawieniach przeglądarki.",
+  "server_notifications_unsupported": "Przeglądarki pokazują powiadomienia tylko dla stron serwowanych przez HTTPS lub z tego komputera (localhost), więc ta strona nie może.",
+  "error_server_upload_unknown": "Tego pliku nie ma już na serwerze. Wyślij go ponownie.",
+  "error_server_busy": "emberd sprawdza teraz inne logowania. Spróbuj ponownie za chwilę.",
+  "server_notifications_enabled_label": "Pokazuj powiadomienia",
+  "server_notifications_enabled_hint": "Pokazuje je każda przeglądarka, w której Ember jest otwarty i która ma na to zgodę.",
+  "server_notifications_desc": "Powiadomienia w tej przeglądarce i komunikaty, które Ember pokazuje na swojej stronie"
 }

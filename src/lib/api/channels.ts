@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
+import { isServer } from '$lib/runtime';
+import { pickAndUpload } from '$lib/runtime/web/files';
 
 export interface ChannelInfo {
   channel_id: string;
@@ -602,6 +604,10 @@ export async function pickAndOfferChannelTransfer(
   channelId: string,
   memberPubkey: string,
 ): Promise<string | null> {
+  if (isServer) {
+    const upload = await pickAndUpload();
+    return upload ? invoke('offer_channel_transfer_upload', { channelId, memberPubkey, upload }) : null;
+  }
   return invoke('pick_and_offer_channel_transfer', {
     channelId,
     memberPubkey,

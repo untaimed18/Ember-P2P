@@ -1146,7 +1146,42 @@ async fn import_ipfilter_at_path(
     })
     .await
     .map_err(|e| coded_ctx("security_task_failed", "Task failed", e))??;
+    import_ipfilter_from(app, state, path).await
+}
 
+/// emberd: import an IP filter sent from the browser's computer. The upload
+/// stays where it is until the next start, as a reload the network defers
+/// still reads it from there.
+#[ember_macros::command(server)]
+pub async fn import_ipfilter_upload(
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
+    upload: String,
+) -> Result<IpFilterApplyResult, String> {
+    let path = crate::server::uploads::uploaded(&upload)?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase());
+    if !matches!(
+        extension.as_deref(),
+        Some("dat" | "txt" | "gz" | "zip" | "p2p" | "p2b")
+    ) {
+        return Err(coded(
+            "security_invalid_ipfilter_file_type",
+            "IP filter file must be a .dat, .txt, .gz, .zip, .p2p, or .p2b file",
+        ));
+    }
+    import_ipfilter_from(app, state, path).await
+}
+
+/// The import itself, of a file already chosen: by the native picker on the
+/// desktop, by the browser's own on emberd.
+async fn import_ipfilter_from(
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
+    path: std::path::PathBuf,
+) -> Result<IpFilterApplyResult, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())

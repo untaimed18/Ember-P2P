@@ -1,6 +1,6 @@
 /**
- * Desktop notifications: one place that decides whether an event is worth
- * interrupting the user for.
+ * Desktop notifications, or on emberd the browser's: one place that decides
+ * whether an event is worth interrupting the user for.
  *
  * The events themselves are already handled — a finished download updates the
  * Transfers list, a chat message bumps an unread badge, a room message raises a
@@ -192,8 +192,9 @@ export async function notify(
   body = '',
   friendHash?: string,
 ): Promise<void> {
-  // emberd runs on a computer nobody is looking at.
-  if (isServer) return;
+  // emberd's computer has nobody at it: the browser shows them, while the
+  // page is open and the browser allows it.
+  if (isServer && browserNotificationState() !== 'granted') return;
   if (!shouldNotify(category, friendHash)) return;
   const trimmedTitle = title.trim();
   if (!trimmedTitle) return;
@@ -207,6 +208,10 @@ export async function notify(
   if (!withinRateLimit(now)) return;
   recordSignature(signature, now);
 
+  if (isServer) {
+    showInBrowser(trimmedTitle, body);
+    return;
+  }
   try {
     await showNotification(trimmedTitle, body);
   } catch (error) {
@@ -225,6 +230,42 @@ export async function notify(
       deliveryUnavailable = true;
       console.warn('Desktop notifications unavailable; suppressing further attempts:', error);
     }
+  }
+}
+
+/** Whether this browser shows emberd's notifications: `unsupported` where
+ *  it cannot, which is any page not served over HTTPS or from localhost. */
+export type BrowserNotificationState = 'granted' | 'denied' | 'default' | 'unsupported';
+
+export function browserNotificationState(): BrowserNotificationState {
+  if (typeof window === 'undefined' || !window.isSecureContext || typeof Notification === 'undefined') {
+    return 'unsupported';
+  }
+  return Notification.permission;
+}
+
+/** Ask the browser to allow them. Call it from a click: browsers ask for
+ *  nothing else. */
+export async function askForBrowserNotifications(): Promise<BrowserNotificationState> {
+  if (browserNotificationState() === 'unsupported') return 'unsupported';
+  try {
+    return await Notification.requestPermission();
+  } catch {
+    return browserNotificationState();
+  }
+}
+
+/** The browser's notification, cut to lengths a notification can show, as
+ *  the desktop's backend cuts them. Clicking it brings the page forward. */
+function showInBrowser(title: string, body: string): void {
+  try {
+    const shown = new Notification(title.slice(0, 120), { body: body.slice(0, 300), icon: '/icon.png' });
+    shown.onclick = () => {
+      window.focus();
+      shown.close();
+    };
+  } catch (error) {
+    console.warn('The browser did not show a notification:', error);
   }
 }
 

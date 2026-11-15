@@ -62,6 +62,25 @@ struct Failures {
     last: Instant,
 }
 
+/// The most addresses whose wrong passwords are counted at once.
+const MAX_TRACKED: usize = 4096;
+
+/// Whose wrong passwords count together: an IPv4 address, or an IPv6
+/// network's /64, which one connection usually has all of to choose from.
+fn throttle_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut octets = v6.octets();
+                octets[8..].fill(0);
+                IpAddr::V6(octets.into())
+            }
+        },
+    }
+}
+
 struct State {
     stored: Stored,
     /// When each session was last used, this run.
@@ -111,7 +130,7 @@ fn now() -> i64 {
 }
 
 /// The setup code as typed: case and the dash do not matter.
-fn normalize_code(code: &str) -> String {
+pub(super) fn normalize_code(code: &str) -> String {
     code.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect()
 }
 
@@ -200,7 +219,7 @@ impl Auth {
 
     /// How long `ip` must wait before trying again, if it must.
     fn wait_for(state: &State, ip: IpAddr) -> Option<Duration> {
-        let failures = state.failures.get(&ip)?;
+        let failures = state.failures.get(&throttle_key(ip))?;
         if failures.count < FREE_FAILURES {
             return None;
         }
@@ -210,12 +229,32 @@ impl Auth {
     }
 
     fn note_failure(state: &mut State, ip: IpAddr) {
-        let entry = state.failures.entry(ip).or_insert(Failures { count: 0, last: Instant::now() });
+        let entry = state.failures.entry(throttle_key(ip)).or_insert(Failures { count: 0, last: Instant::now() });
         entry.count = entry.count.saturating_add(1);
         entry.last = Instant::now();
-        // Bounded: an address that stopped trying is forgotten first.
-        if state.failures.len() > 4096 {
+        // Bounded: an address that stopped trying is forgotten first, then,
+        // under a flood from more addresses than that frees, the longest
+        // quiet of the rest.
+        if state.failures.len() > MAX_TRACKED {
             state.failures.retain(|_, f| f.last.elapsed() < MAX_WAIT);
+        }
+        if state.failures.len() > MAX_TRACKED {
+            // A quarter at a time, so a flood sorts once per thousand tries
+            // rather than once per try.
+            let mut by_age: Vec<(IpAddr, Instant)> = state.failures.iter().map(|(ip, f)| (*ip, f.last)).collect();
+            by_age.sort_by_key(|(_, last)| *last);
+            let excess = state.failures.len() - MAX_TRACKED * 3 / 4;
+            for (ip, _) in by_age.into_iter().take(excess) {
+                state.failures.remove(&ip);
+            }
+        }
+    }
+
+    /// A wrong password was found: its wait runs from now, not from when the
+    /// try was counted, since Argon2 took a moment in between.
+    fn failure_found(state: &mut State, ip: IpAddr) {
+        if let Some(entry) = state.failures.get_mut(&throttle_key(ip)) {
+            entry.last = Instant::now();
         }
     }
 
@@ -260,7 +299,7 @@ impl Auth {
         let hash = hash_password(password).map_err(|_| Refusal::Invalid("server_password_unusable"))?;
         state.stored.password = Some(hash);
         state.setup_code = None;
-        state.failures.remove(&ip);
+        state.failures.remove(&throttle_key(ip));
         let token = Self::new_session(&mut state);
         self.save(&state.stored).map_err(|_| Refusal::Invalid("server_auth_save_failed"))?;
         drop(state);
@@ -272,22 +311,25 @@ impl Auth {
     /// call it off the async runtime.
     pub fn log_in(&self, ip: IpAddr, password: &str) -> Result<String, Refusal> {
         let stored_hash = {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
             let Some(hash) = state.stored.password.clone() else {
                 return Err(Refusal::WrongStep);
             };
             if let Some(wait) = Self::wait_for(&state, ip) {
                 return Err(Refusal::Wait(wait));
             }
+            // Counted as it starts, so tries made at once wait as tries made
+            // one after another do; the right password clears the count.
+            Self::note_failure(&mut state, ip);
             hash
         };
         let matches = password.len() <= MAX_PASSWORD_BYTES && password_matches(&stored_hash, password);
         let mut state = self.state.lock();
         if !matches {
-            Self::note_failure(&mut state, ip);
+            Self::failure_found(&mut state, ip);
             return Err(Refusal::Wrong);
         }
-        state.failures.remove(&ip);
+        state.failures.remove(&throttle_key(ip));
         let token = Self::new_session(&mut state);
         self.save(&state.stored).map_err(|_| Refusal::Invalid("server_auth_save_failed"))?;
         Ok(token)
@@ -306,18 +348,22 @@ impl Auth {
     ) -> Result<Option<String>, Refusal> {
         check_new_password(new)?;
         let stored_hash = {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
             if let Some(wait) = Self::wait_for(&state, ip) {
                 return Err(Refusal::Wait(wait));
             }
-            state.stored.password.clone().ok_or(Refusal::WrongStep)?
+            let hash = state.stored.password.clone().ok_or(Refusal::WrongStep)?;
+            // Counted as it starts, as `log_in` counts.
+            Self::note_failure(&mut state, ip);
+            hash
         };
         if !password_matches(&stored_hash, current) {
-            Self::note_failure(&mut self.state.lock(), ip);
+            Self::failure_found(&mut self.state.lock(), ip);
             return Err(Refusal::Wrong);
         }
         let hash = hash_password(new).map_err(|_| Refusal::Invalid("server_password_unusable"))?;
         let mut state = self.state.lock();
+        state.failures.remove(&throttle_key(ip));
         state.stored.password = Some(hash);
         let kept = keep.map(token_hash).filter(|kept| state.stored.sessions.iter().any(|s| &s.hash == kept));
         state.stored.sessions.retain(|s| Some(&s.hash) == kept.as_ref());
@@ -403,6 +449,66 @@ mod tests {
     }
 
     const IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7));
+
+    /// One IPv6 connection has a /64 to choose its address from, so a new
+    /// address in it does not start the count again.
+    #[test]
+    fn an_ipv6_network_counts_as_one_address() {
+        let in_net = |last: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last));
+        let next_net = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1));
+        assert_eq!(throttle_key(in_net(1)), throttle_key(in_net(0xffff)));
+        assert_ne!(throttle_key(in_net(1)), throttle_key(next_net));
+        assert_eq!(throttle_key("::ffff:192.0.2.7".parse().unwrap()), IP, "a mapped IPv4 address is that address");
+
+        let dir = temp_dir();
+        let (auth, _) = Auth::load(&dir).unwrap();
+        auth.set_password("long enough").unwrap();
+        for last in 1..=FREE_FAILURES as u16 {
+            assert_eq!(auth.log_in(in_net(last), "nope"), Err(Refusal::Wrong));
+        }
+        assert!(matches!(auth.log_in(in_net(99), "long enough"), Err(Refusal::Wait(_))));
+        assert!(auth.log_in(next_net, "long enough").is_ok(), "the next network is not held up");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Tries made at once from one address are counted as they start, so
+    /// they wait as tries made one after another do.
+    #[test]
+    fn wrong_passwords_tried_at_once_still_slow_down() {
+        let dir = temp_dir();
+        let (auth, _) = Auth::load(&dir).unwrap();
+        auth.set_password("long enough").unwrap();
+        let auth = std::sync::Arc::new(auth);
+        let tries: Vec<_> = (0..8)
+            .map(|_| {
+                let auth = auth.clone();
+                std::thread::spawn(move || auth.log_in(IP, "nope"))
+            })
+            .collect();
+        let refused: Vec<Refusal> = tries.into_iter().map(|t| t.join().unwrap().unwrap_err()).collect();
+        let checked = refused.iter().filter(|r| **r == Refusal::Wrong).count();
+        assert!(checked <= FREE_FAILURES as usize, "only {FREE_FAILURES} free tries, at once or not; {checked} were checked");
+        assert!(matches!(auth.log_in(IP, "long enough"), Err(Refusal::Wait(_))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A flood from more addresses than are counted stays bounded, and keeps
+    /// counting the latest.
+    #[test]
+    fn a_flood_from_many_addresses_stays_bounded() {
+        let dir = temp_dir();
+        let (auth, _) = Auth::load(&dir).unwrap();
+        let mut state = auth.state.lock();
+        let address = |i: u32| IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+        let flood = MAX_TRACKED as u32 * 3;
+        for i in 0..flood {
+            Auth::note_failure(&mut state, address(i));
+            assert!(state.failures.len() <= MAX_TRACKED);
+        }
+        assert!(state.failures.contains_key(&address(flood - 1)));
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn the_first_password_takes_the_setup_code_and_then_logs_in() {

@@ -53,6 +53,35 @@ pub struct Web {
     tls: bool,
     /// Served over plain HTTP to more than this computer.
     exposed_plain: bool,
+    /// Turns at checking a password; see [`PASSWORD_WORK`].
+    password_work: Arc<tokio::sync::Semaphore>,
+}
+
+/// Password checks at once. Argon2 takes a moment and 19 MiB each time, so a
+/// flood of logins waits its turn rather than taking the server's memory.
+const PASSWORD_WORK: usize = 2;
+/// How long a login waits for its turn before it is told to try again.
+const PASSWORD_WAIT: Duration = Duration::from_secs(20);
+/// Largest login, setup or password change: a password is at most 1 KiB.
+const SMALL_BODY: usize = 16 * 1024;
+/// Connections to the web interface at once, so it cannot take the file
+/// handles Ember's networks need.
+const MAX_CONNECTIONS: usize = 256;
+/// The same for the control socket, which a script may hold open beside the
+/// pages; its own count, so neither can crowd the other out.
+#[cfg(unix)]
+const MAX_CONTROL_CONNECTIONS: usize = 64;
+/// How long a connection has to send its request's headers, and a TLS
+/// handshake to finish, so a client that never does lets its connection go.
+const HEADER_WAIT: Duration = Duration::from_secs(30);
+const TLS_WAIT: Duration = Duration::from_secs(15);
+
+async fn password_turn(web: &Web) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    tokio::time::timeout(PASSWORD_WAIT, web.password_work.clone().acquire_owned()).await.ok()?.ok()
+}
+
+fn busy() -> Response {
+    refuse(StatusCode::SERVICE_UNAVAILABLE, "server_busy", "emberd is busy; try again in a moment")
 }
 
 /// The web UI's `index.html` boots with an inline script, which a policy
@@ -92,6 +121,7 @@ impl Web {
             csp: content_security_policy(&config.web_root),
             tls: config.tls.is_some(),
             exposed_plain: config.tls.is_none() && !config.loopback_only(),
+            password_work: Arc::new(tokio::sync::Semaphore::new(PASSWORD_WORK)),
         }
     }
 }
@@ -106,16 +136,17 @@ pub fn router(web: Shared, web_root: &Path) -> Router {
     Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/session", get(session))
-        .route("/api/setup", post(set_up))
-        .route("/api/login", post(log_in))
+        .route("/api/setup", post(set_up).layer(DefaultBodyLimit::max(SMALL_BODY)))
+        .route("/api/login", post(log_in).layer(DefaultBodyLimit::max(SMALL_BODY)))
         .route("/api/logout", post(log_out))
-        .route("/api/password", post(change_password))
+        .route("/api/password", post(change_password).layer(DefaultBodyLimit::max(SMALL_BODY)))
         .route("/api/restart", post(restart))
         .route("/api/invoke/{command}", post(invoke))
         .route("/api/events", get(events))
         .route("/api/media/{*path}", get(media))
         .route("/api/file/{*path}", get(download))
         .route("/api/backup", get(download_backup).post(upload_backup))
+        .route("/api/upload", post(upload))
         .fallback_service(files)
         .layer(middleware::from_fn_with_state(web.clone(), guard))
         .layer(DefaultBodyLimit::max(MAX_BODY))
@@ -166,12 +197,19 @@ enum Caller {
     Token,
 }
 
+/// Marks a request that came in on the control socket (`emberd ctl`). Only
+/// emberd's own user, or its group under systemd, can open that socket, the
+/// same people who can read the API token, so it counts as the token.
+#[derive(Clone, Copy)]
+struct ControlSocket;
+
 /// Security headers on everything, the session or token on what needs one,
 /// and the same-site checks on what changes anything.
 async fn guard(State(web): State<Shared>, mut request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
     let api = path.starts_with("/api/");
     let public = matches!(path.as_str(), "/api/health" | "/api/session" | "/api/setup" | "/api/login");
+    let control = request.extensions().get::<ControlSocket>().is_some();
     let headers = request.headers();
     let changes = request.method() != Method::GET && request.method() != Method::HEAD;
     let bearer = bearer_token(headers);
@@ -179,6 +217,7 @@ async fn guard(State(web): State<Shared>, mut request: Request, next: Next) -> R
     if api {
         // A token is for scripts, which send no cookies a page could abuse.
         let caller = match (&bearer, cookie_token(headers)) {
+            _ if control => Some(Caller::Token),
             (Some(token), _) if web.auth.api_token_valid(token) => Some(Caller::Token),
             (Some(_), _) => None,
             (None, Some(token)) if web.auth.session_valid(&token) => Some(Caller::Session(token)),
@@ -283,7 +322,15 @@ struct SetUpBody {
 async fn set_up(State(web): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<SetUpBody>) -> Response {
     let ip = peer.ip();
     let auth = web.auth.clone();
-    match tokio::task::spawn_blocking(move || auth.set_up(ip, &body.code, &body.password)).await {
+    let Some(turn) = password_turn(&web).await else {
+        return busy();
+    };
+    match tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        auth.set_up(ip, &body.code, &body.password)
+    })
+    .await
+    {
         Ok(Ok(token)) => {
             tracing::info!("The web interface's password was set from {ip}");
             signed_in(&web, &token)
@@ -301,7 +348,15 @@ struct LogInBody {
 async fn log_in(State(web): State<Shared>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Json(body): Json<LogInBody>) -> Response {
     let ip = peer.ip();
     let auth = web.auth.clone();
-    match tokio::task::spawn_blocking(move || auth.log_in(ip, &body.password)).await {
+    let Some(turn) = password_turn(&web).await else {
+        return busy();
+    };
+    match tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        auth.log_in(ip, &body.password)
+    })
+    .await
+    {
         Ok(Ok(token)) => {
             tracing::info!("Logged in to the web interface from {ip}");
             signed_in(&web, &token)
@@ -343,7 +398,13 @@ async fn change_password(
         Caller::Session(token) => Some(token),
         Caller::Token => None,
     };
-    let changed = tokio::task::spawn_blocking(move || auth.change_password(ip, &body.current, &body.new, keep.as_deref()));
+    let Some(turn) = password_turn(&web).await else {
+        return busy();
+    };
+    let changed = tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        auth.change_password(ip, &body.current, &body.new, keep.as_deref())
+    });
     match changed.await {
         Ok(Ok(token)) => {
             tracing::info!("The web interface's password was changed from {ip}");
@@ -542,6 +603,25 @@ async fn upload_backup(State(web): State<Shared>, body: Body) -> Response {
     }
 }
 
+#[derive(Deserialize)]
+struct UploadName {
+    name: String,
+}
+
+/// A file from the browser's computer, for a command to use by the id this
+/// answers with (`super::uploads`).
+async fn upload(axum::extract::Query(file): axum::extract::Query<UploadName>, body: Body) -> Response {
+    match super::uploads::receive(body, &file.name).await {
+        Ok(id) => Json(json!({ "ok": id })).into_response(),
+        Err(super::uploads::Refused::TooLarge) => {
+            refuse(StatusCode::BAD_REQUEST, "server_upload_too_large", "That file is too large")
+        }
+        Err(super::uploads::Refused::Failed) => {
+            refuse(StatusCode::BAD_REQUEST, "server_upload_failed", "The upload did not finish")
+        }
+    }
+}
+
 enum Upload {
     TooLarge,
     Failed,
@@ -638,6 +718,13 @@ pub async fn serve(
     let router = router(web, &config.web_root);
     let scheme = if acceptor.is_some() { "https" } else { "http" };
     tracing::info!("Web interface at {scheme}://{}", display_address(config.listen));
+    #[cfg(unix)]
+    serve_control_socket(
+        router.clone(),
+        super::control_socket_path(&crate::storage::paths::resolve_data_dir()),
+        shutdown.clone(),
+    );
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -650,20 +737,33 @@ pub async fn serve(
             },
             _ = shutdown.changed() => return Ok(()),
         };
+        let Ok(held) = connections.clone().try_acquire_owned() else {
+            tracing::debug!("Web interface turned {peer} away: {MAX_CONNECTIONS} connections open");
+            continue;
+        };
         let router = router.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            let _held = held;
             let service = tower::ServiceExt::map_request(router, move |mut request: Request<hyper::body::Incoming>| {
                 request.extensions_mut().insert(ConnectInfo(peer));
                 request
             });
             let service = hyper_util::service::TowerToHyperService::new(service);
-            let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            builder
+                .http1()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(HEADER_WAIT);
             let result = match acceptor {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls) => builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), service).await,
-                    Err(e) => {
+                Some(acceptor) => match tokio::time::timeout(TLS_WAIT, acceptor.accept(stream)).await {
+                    Ok(Ok(tls)) => builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), service).await,
+                    Ok(Err(e)) => {
                         tracing::debug!("TLS handshake from {peer} failed: {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!("TLS handshake from {peer} took too long");
                         return;
                     }
                 },
@@ -674,6 +774,68 @@ pub async fn serve(
             }
         });
     }
+}
+
+/// The control socket for `emberd ctl`: the web interface's routes, reached
+/// as the API token reaches them, by whoever may open the socket. Without it
+/// emberd runs on, with no command line.
+#[cfg(unix)]
+fn serve_control_socket(router: Router, path: std::path::PathBuf, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    use std::os::unix::fs::PermissionsExt;
+    // Whatever is there is a socket an emberd before this one left: the
+    // instance lock lets only one run on this data folder.
+    let _ = std::fs::remove_file(&path);
+    let listener = match tokio::net::UnixListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::warn!("No command line: could not open {}: {e}", path.display());
+            return;
+        }
+    };
+    // systemd's runtime folder is shared with the service's group; the data
+    // folder is emberd's alone.
+    let mode = if std::env::var_os("RUNTIME_DIRECTORY").is_some() { 0o660 } else { 0o600 };
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)) {
+        tracing::warn!("No command line: could not restrict {}: {e}", path.display());
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    tracing::info!("Command line (emberd ctl) at {}", path.display());
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
+    tokio::spawn(async move {
+        loop {
+            let stream = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        tracing::debug!("Control socket accept failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                },
+                _ = shutdown.changed() => break,
+            };
+            let Ok(held) = connections.clone().try_acquire_owned() else {
+                tracing::debug!("Control socket turned a connection away: {MAX_CONTROL_CONNECTIONS} open");
+                continue;
+            };
+            let router = router.clone();
+            tokio::spawn(async move {
+                let _held = held;
+                let service = tower::ServiceExt::map_request(router, |mut request: Request<hyper::body::Incoming>| {
+                    request.extensions_mut().insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))));
+                    request.extensions_mut().insert(ControlSocket);
+                    request
+                });
+                let service = hyper_util::service::TowerToHyperService::new(service);
+                let builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+                if let Err(e) = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service).await {
+                    tracing::debug!("Control socket connection ended: {e}");
+                }
+            });
+        }
+        let _ = std::fs::remove_file(&path);
+    });
 }
 
 /// The address to type: `localhost` for this computer.
@@ -710,6 +872,49 @@ mod tests {
         assert!(!same_origin(&headers(&[("host", "box:4711"), ("origin", "http://evil.example")])));
         assert!(!same_origin(&headers(&[("host", "box:4711"), ("origin", "null")])));
         assert!(!same_origin(&headers(&[("origin", "http://box:4711")])), "no Host to match");
+    }
+
+    /// Text built from what headers and names are made of, the awkward
+    /// characters most of all.
+    fn fuzz_text(rng: &mut rand::rngs::StdRng) -> String {
+        use rand::Rng;
+        const PIECES: &[&str] = &[
+            ";", "=", ":", " ", "\"", "\\", "/", "%", "%2F", "%00", "\r\n", "\t", "\0", "é", "漢", "🙂", "\u{202e}",
+            "emberd_session=", "Bearer ", "http://", "://", "localhost:4711", "..",
+        ];
+        let mut text = String::new();
+        for _ in 0..rng.gen_range(0..24) {
+            if rng.gen_bool(0.6) {
+                text.push_str(PIECES[rng.gen_range(0..PIECES.len())]);
+            } else {
+                text.push(char::from_u32(rng.gen_range(0..0x3000)).unwrap_or('x'));
+            }
+        }
+        text
+    }
+
+    /// What a request with no session reaches: its cookies, its token, its
+    /// Origin, and the name a saved file goes by.
+    #[test]
+    fn request_parsing_fuzz_never_panics() {
+        let mut rng = crate::fuzz::rng(0xE3BE_D001);
+        for _ in 0..crate::fuzz::rounds(4_000) {
+            let text = fuzz_text(&mut rng);
+            let mut map = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_bytes(text.as_bytes()) {
+                for name in [header::COOKIE, header::AUTHORIZATION, header::ORIGIN, header::HOST] {
+                    map.insert(name, value.clone());
+                }
+            }
+            let _ = cookie_token(&map);
+            let _ = bearer_token(&map);
+            let _ = same_origin(&map);
+            assert!(HeaderValue::from_str(&attachment(&text)).is_ok(), "{text:?}");
+            let _ = super::super::auth::normalize_code(&text);
+            let name = super::super::uploads::safe_name(&text);
+            assert!(!name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != "..", "{text:?} -> {name:?}");
+            let _ = crate::commands::sharing::percent_decode_path(&text);
+        }
     }
 
     #[test]

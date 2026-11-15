@@ -1,0 +1,12 @@
+#!/bin/sh
+# Purging the package keeps Ember's data: /var/lib/emberd holds its identity,
+# its keys and its downloads, which a reinstall should find again. The emberd
+# user stays too, since it still owns them.
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if [ "$1" = purge ] && [ -d /var/lib/emberd ]; then
+    echo "emberd's data and downloads are left in /var/lib/emberd; delete it to remove them."
+fi

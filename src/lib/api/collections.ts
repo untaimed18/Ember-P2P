@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { takeBackPendingCancels } from '$lib/stores/pendingCancels';
+import { isServer } from '$lib/runtime';
+import { pickAndUpload } from '$lib/runtime/web/files';
 
 export interface CollectionFile {
   name: string;
@@ -28,6 +30,10 @@ export interface CollectionDownloadResult {
 
 /** Opens a native picker; files selected by the user may live outside Library roots. */
 export async function pickAndLoadCollection(): Promise<Collection | null> {
+  if (isServer) {
+    const upload = await pickAndUpload('.emulecollection,.txt');
+    return upload ? invoke('load_collection_upload', { upload }) : null;
+  }
   return invoke('pick_and_load_collection');
 }
 

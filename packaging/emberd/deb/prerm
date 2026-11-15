@@ -1,0 +1,9 @@
+#!/bin/sh
+# Stops emberd before its package is removed. An upgrade leaves it running on
+# the old files until postinst restarts it on the new ones.
+set -e
+
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl stop emberd.service || true
+    systemctl disable emberd.service >/dev/null 2>&1 || true
+fi

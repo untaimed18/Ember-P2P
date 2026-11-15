@@ -3807,8 +3807,26 @@ pub async fn pick_and_import_webservices_file(
     let Some(path) = selected.transpose()? else {
         return Ok(None);
     };
+    let services = read_webservices_file(path).await?;
+    info!(
+        "Imported {} web service(s) from a picked webservices.dat",
+        services.len()
+    );
+    Ok(Some(services))
+}
 
-    let services = tokio::task::spawn_blocking(move || -> Result<Vec<_>, String> {
+/// emberd: read a webservices.dat sent from the browser's computer.
+#[ember_macros::command(server)]
+pub async fn import_webservices_upload(upload: String) -> Result<Vec<crate::webservices::WebService>, String> {
+    let path = crate::server::uploads::uploaded(&upload)?;
+    let services = read_webservices_file(path).await;
+    crate::server::uploads::discard(&upload);
+    services
+}
+
+/// The services a webservices.dat lists, read off the async runtime.
+async fn read_webservices_file(path: std::path::PathBuf) -> Result<Vec<crate::webservices::WebService>, String> {
+    tokio::task::spawn_blocking(move || -> Result<Vec<_>, String> {
         let meta = std::fs::metadata(&path).map_err(|e| {
             coded_ctx(
                 "settings_webservices_import_failed",
@@ -3846,13 +3864,7 @@ pub async fn pick_and_import_webservices_file(
             "Could not read that file",
             e,
         )
-    })??;
-
-    info!(
-        "Imported {} web service(s) from a picked webservices.dat",
-        services.len()
-    );
-    Ok(Some(services))
+    })?
 }
 
 /// The example service offered in Settings, as `(name, url)`.

@@ -170,6 +170,7 @@
   import { isShortcutLetter } from '$lib/shortcutKey';
   import { isServer } from '$lib/runtime';
   import { changePassword, logOut } from '$lib/runtime/web/session';
+  import { askForBrowserNotifications, browserNotificationState } from '$lib/notifications';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const appLicense = import.meta.env.VITE_APP_LICENSE;
@@ -193,6 +194,8 @@
   let passwordBusy = $state(false);
   let passwordMessage = $state<{ text: string; error: boolean } | null>(null);
   let signingOut = $state(false);
+  /** Whether this browser shows emberd's notifications: its own permission. */
+  let browserNotify = $state(isServer ? browserNotificationState() : 'unsupported');
 
   onMount(() => {
     if (!isServer) return;
@@ -3544,6 +3547,7 @@
           </div>
           {/if}
 
+          {#if !isServer}
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_power()}</h4>
             <div class="field toggle-row">
@@ -3569,6 +3573,7 @@
               />
             </div>
           </div>
+          {/if}
         </div>
       </section>
 
@@ -3691,21 +3696,41 @@
           </span>
           <div>
             <h3>{m.settings_section_notifications()}</h3>
-            <p class="card-desc">{m.settings_notifications_desc()}</p>
+            <p class="card-desc">{isServer ? m.server_notifications_desc() : m.settings_notifications_desc()}</p>
           </div>
         </div>
         <div class="card-body">
           <!-- Two systems, kept apart: desktop notifications come from the
                operating system and reach the user outside the window; pop-ups
                are Ember's own, inside it. Neither group's switches govern the
-               other's. emberd runs on a computer nobody is looking at. -->
-          {#if !isServer}
+               other's. On emberd the browser shows them, once allowed. -->
           <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_desktop_notifications()}</h4>
+            <h4 class="subsection-title">{isServer ? m.server_notifications_title() : m.settings_group_desktop_notifications()}</h4>
+            {#if isServer}
+              <div class="field">
+                <span class="field-label">{m.server_notifications_here()}</span>
+                <span class="hint">
+                  {browserNotify === 'granted'
+                    ? m.server_notifications_granted()
+                    : browserNotify === 'denied'
+                      ? m.server_notifications_denied()
+                      : browserNotify === 'unsupported'
+                        ? m.server_notifications_unsupported()
+                        : m.server_notifications_default()}
+                </span>
+                {#if browserNotify === 'default'}
+                  <div class="action-row">
+                    <button type="button" class="action-btn" onclick={async () => (browserNotify = await askForBrowserNotifications())}>
+                      {m.server_notifications_allow()}
+                    </button>
+                  </div>
+                {/if}
+              </div>
+            {/if}
             <div class="field toggle-row">
               <div class="toggle-info">
-                <label class="toggle-title" id="notifications-enabled-label" for="notifications-enabled-switch">{m.settings_notifications_enabled_label()}</label>
-                <span class="hint" id="notifications-enabled-hint">{m.settings_notifications_enabled_hint()}</span>
+                <label class="toggle-title" id="notifications-enabled-label" for="notifications-enabled-switch">{isServer ? m.server_notifications_enabled_label() : m.settings_notifications_enabled_label()}</label>
+                <span class="hint" id="notifications-enabled-hint">{isServer ? m.server_notifications_enabled_hint() : m.settings_notifications_enabled_hint()}</span>
               </div>
               <ToggleSwitch
                 id="notifications-enabled-switch"
@@ -3765,7 +3790,6 @@
               {/each}
             </div>
           </div>
-          {/if}
 
           <div class="settings-group">
             <h4 class="subsection-title" id="popups-title">{m.settings_popups_title()}</h4>
@@ -4427,11 +4451,9 @@
                     {m.webservices_add_example()}
                   </button>
                 {/if}
-                {#if !isServer}
-                  <button class="action-btn ghost" onclick={handleImportWebServices}>
-                    {m.webservices_import()}
-                  </button>
-                {/if}
+                <button class="action-btn ghost" onclick={handleImportWebServices}>
+                  {m.webservices_import()}
+                </button>
               </div>
               {#if webServiceMessage}
                 <span class="feedback {webServiceMessage.kind === 'err' ? 'error' : 'success'}">
@@ -5367,6 +5389,7 @@
               <span id="chat-disappear-hint" class="hint">{m.settings_chat_disappear_hint()}</span>
             </div>
             <!-- Kept on this device, like whether the chat is popped out. -->
+            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="chat-reopen-label" for="chat-reopen-switch">{m.settings_chat_window_reopen_label()}</label>
@@ -5380,6 +5403,7 @@
                 ariaDescribedby="chat-reopen-hint"
               />
             </div>
+            {/if}
           </div>
 
           <div class="settings-group">
@@ -6177,6 +6201,7 @@
             </div>
             {/if}
 
+            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="share-installer-label" for="share-installer-switch">{m.settings_share_ember_installer()}</label>
@@ -6189,6 +6214,7 @@
                 ariaDescribedby="share-installer-hint"
               />
             </div>
+            {/if}
 
             <div class="field toggle-row">
               <div class="toggle-info">

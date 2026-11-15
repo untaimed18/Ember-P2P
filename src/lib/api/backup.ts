@@ -70,7 +70,7 @@ export async function exportBackup(
 /** emberd: send a backup from the browser's computer, chosen for restore as
  *  {@link pickBackupFile} chooses one. */
 export async function uploadBackupFile(file: File): Promise<void> {
-  return uploadFile('/api/backup', file);
+  await uploadFile('/api/backup', file);
 }
 
 /** The window preferences a restore applied at this launch brought back, once. */

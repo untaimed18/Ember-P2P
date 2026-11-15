@@ -42,6 +42,7 @@ const policyFiles = [
   "src-tauri/Cargo.toml",
   "src-tauri/Cargo.lock",
   ".github/workflows/release.yml",
+  ".github/workflows/emberd-image.yml",
   "src-tauri/src/commands/updater.rs",
   "src-tauri/src/network/ember/dht/mod.rs",
   "docs/index.html",
@@ -752,8 +753,8 @@ test("a release cannot be signed without the Linux packages it publishes", () =>
   // Windows built. It is the Linux half that disappears, from a release that
   // otherwise looks complete.
   const fixture = tamperedWorkflow(
-    "    needs: [verify, build, build-windows, build-linux-deb, build-linux-appimage]",
-    "    needs: [verify, build, build-windows]",
+    "    needs: [verify, build, build-windows, build-linux-deb, build-linux-appimage, build-emberd]",
+    "    needs: [verify, build, build-windows, build-emberd]",
   );
   try {
     assert.throws(
@@ -762,6 +763,132 @@ test("a release cannot be signed without the Linux packages it publishes", () =>
     );
   } finally {
     rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("emberd is attached to the release and kept out of its update", () => {
+  // Each of these still produces a release that looks complete. The first
+  // three put emberd's packages where a step that signs bundles with the
+  // updater key, or writes latest.json, would find them; the rest drop a
+  // machine, or the packages themselves.
+  for (const [from, to, expected] of [
+    [
+      "          pattern: emberd-linux-*\n          merge-multiple: true\n          path: ${{ env.EMBERD_OUT_DIR }}\n",
+      "          pattern: emberd-linux-*\n          merge-multiple: true\n          path: ${{ env.EMBER_LINUX_BUNDLE_DIR }}/emberd\n",
+      /download emberd's packages, and only them, to EMBERD_OUT_DIR, not emberd-linux-\* to/,
+    ],
+    [
+      "      EMBERD_OUT_DIR: emberd-out\n",
+      "      EMBERD_OUT_DIR: src-tauri/target/linux-bundles/emberd\n",
+      /keep emberd's packages in an EMBERD_OUT_DIR of their own/,
+    ],
+    [
+      `mapfile -d '' bundles < <(find "$EMBER_WINDOWS_BUNDLE_DIR" "$EMBER_LINUX_BUNDLE_DIR" \\`,
+      `mapfile -d '' bundles < <(find "$EMBER_WINDOWS_BUNDLE_DIR" "$EMBER_LINUX_BUNDLE_DIR" "$EMBERD_OUT_DIR" \\`,
+      /must not sign emberd's packages with the updater key/,
+    ],
+    [
+      "    needs: [verify, build, build-windows, build-linux-deb, build-linux-appimage, build-emberd]",
+      "    needs: [verify, build, build-windows, build-linux-deb, build-linux-appimage]",
+      /it is missing build-emberd/,
+    ],
+    [
+      "          - arch: aarch64\n            runner: ubuntu-22.04-arm\n",
+      "          - arch: aarch64\n            runner: ubuntu-24.04-arm\n",
+      /build-emberd must build aarch64 on ubuntu-22\.04-arm/,
+    ],
+    [
+      'find "$EMBER_WINDOWS_BUNDLE_DIR" "$EMBER_LINUX_BUNDLE_DIR" "$EMBERD_OUT_DIR" \\',
+      'find "$EMBER_WINDOWS_BUNDLE_DIR" "$EMBER_LINUX_BUNDLE_DIR" \\',
+      /attach emberd's packages to the release/,
+    ],
+    [
+      '          sha256sum -- "${packages[@]}" > "emberd-${version}-SHA256SUMS"\n',
+      "",
+      /list the SHA-256 of emberd's packages/,
+    ],
+    [
+      '        run: bash packaging/emberd/check-packages.sh "${GITHUB_REF_NAME#v}" out\n',
+      "        run: true\n",
+      /check the packages with check-packages\.sh/,
+    ],
+  ]) {
+    const fixture = tamperedWorkflow(from, to);
+    try {
+      assert.throws(() => verifyWorkflow({ root: fixture }), expected);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+});
+
+test("an emberd package in place of the desktop's never reaches latest.json", () => {
+  // One `.deb` is what the count check wants, so only the name gives it away.
+  const { fixture, bundleDir } = linuxReleaseFixture();
+  try {
+    rmSync(join(bundleDir, "deb", "Ember_1.2.3_amd64.deb"));
+    rmSync(join(bundleDir, "deb", "Ember_1.2.3_amd64.deb.sig"));
+    const emberd = join(bundleDir, "deb", "emberd_1.2.3_amd64.deb");
+    writeFileSync(emberd, "emberd bytes");
+    writeFileSync(`${emberd}.sig`, "signature for emberd\n");
+    assert.throws(
+      () => collectLinuxBundles({ directory: bundleDir }),
+      /emberd_1\.2\.3_amd64\.deb is emberd's, not the desktop app's/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+/** The policy fixture with emberd's image workflow changed. */
+function imageFixture(from, to) {
+  const fixture = policyFixture();
+  const path = join(fixture, ".github/workflows/emberd-image.yml");
+  const source = readFileSync(path, "utf8");
+  assert.ok(source.includes(from), `emberd-image.yml no longer contains: ${from}`);
+  writeFileSync(path, source.replace(from, to));
+  return fixture;
+}
+
+test("emberd's image is pushed only from a published release's tarball", () => {
+  for (const [from, to, expected] of [
+    [
+      "on:\n  release:\n    types: [published]\n",
+      'on:\n  push:\n    tags: ["v*"]\n',
+      /must be pushed when a release is published, and not before/,
+    ],
+    [
+      "  workflow_dispatch:\n",
+      '  push:\n    tags: ["v*"]\n  workflow_dispatch:\n',
+      /must be pushed when a release is published, and not before/,
+    ],
+    [
+      "            --build-arg EMBERD_FROM=release \\\n",
+      "",
+      /made from the release's tarball, checked against its SHA-256, and not compiled/,
+    ],
+    [
+      " | sha256sum --check --strict)",
+      ")",
+      /made from the release's tarball, checked against its SHA-256, and not compiled/,
+    ],
+    [
+      "      - name: Build the image\n",
+      "      - name: Build emberd\n        run: cargo build --release\n\n      - name: Build the image\n",
+      /emberd-image\.yml: image can write to the registry, so it must not run cargo/,
+    ],
+    [
+      "    timeout-minutes: 5\n    permissions:\n      contents: read\n",
+      "    timeout-minutes: 5\n    permissions:\n      contents: read\n      packages: write\n",
+      /emberd-image\.yml: find may request read permissions only, not packages: write/,
+    ],
+  ]) {
+    const fixture = imageFixture(from, to);
+    try {
+      assert.throws(() => verifyWorkflow({ root: fixture }), expected);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   }
 });
 
@@ -860,8 +987,8 @@ test("the Windows installers are built without the key and signed afterwards", (
       /only sign-publish may enter the release-signing environment, not build-windows/,
     ],
     [
-      "    needs: [verify, build, build-windows, build-linux-deb, build-linux-appimage]",
-      "    needs: [verify, build, build-linux-deb, build-linux-appimage]",
+      "    needs: [verify, build, build-windows, build-linux-deb, build-linux-appimage, build-emberd]",
+      "    needs: [verify, build, build-linux-deb, build-linux-appimage, build-emberd]",
       /it is missing build-windows/,
     ],
     [

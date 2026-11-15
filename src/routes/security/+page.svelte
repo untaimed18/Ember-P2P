@@ -22,7 +22,6 @@
   import { listen } from '@tauri-apps/api/event';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
-  import { isServer } from '$lib/runtime';
   import { plural } from '$lib/plural';
   import { getSettings } from '$lib/api/settings';
   import { appSettings, setAppSettings } from '$lib/stores/settings';
@@ -605,11 +604,9 @@
     <button onclick={handleDownload} disabled={downloading}>
       {downloading ? m.security_downloading() : m.security_download_ipfilter()}
     </button>
-    {#if !isServer}
-      <button class="ghost" onclick={handleImport} disabled={importing}>
-        {importing ? m.security_importing() : m.security_import_file()}
-      </button>
-    {/if}
+    <button class="ghost" onclick={handleImport} disabled={importing}>
+      {importing ? m.security_importing() : m.security_import_file()}
+    </button>
     <!--
       Toggle the custom-URL form. Kept as a collapsible row so the
       default/import actions stay visible without a second click, and

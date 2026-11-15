@@ -194,7 +194,7 @@
               </div>
               <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.8.0" target="_blank" rel="noopener"><code>v1.8.0</code></a></p>
               <div class="release-notes">
-                <p>Rooms finish their move to the formats fixed in 1.7.5, and private messages in rooms can now disappear on a timer and wait for a member who is offline. Friends can search every file a friend shares, see a friend&rsquo;s feeds from their card, and a friend waiting for a friends-only file gets it when their turn comes. Copied eD2K links carry the web mirrors a download proved good, and an eMule import can share folders the way eMule did.</p>
+                <p>Rooms finish their move to the formats fixed in 1.7.5, and private messages in rooms can now disappear on a timer and wait for a member who is offline. Friends can search every file a friend shares, see a friend&rsquo;s feeds from their card, and a friend waiting for a friends-only file gets it when their turn comes. Copied eD2K links carry the web mirrors a download proved good, and an eMule import can share folders the way eMule did. And Ember now runs on a server too: <code>emberd</code> is Ember without a window, driven from a web browser.</p>
 
                 <h4>Before you upgrade</h4>
 
@@ -208,6 +208,15 @@
                 </ul>
 
                 <h4>What&rsquo;s New</h4>
+
+                <h5>Ember on a server (emberd)</h5>
+                <ul>
+                  <li><strong>emberd is Ember without a window,</strong> for a home server, a NAS or a machine you reach over the network. It shares and downloads like the desktop app, on the same networks, and keeps running when nobody is logged in. Its pages are the desktop app&rsquo;s, in a web browser, behind a password chosen on the first visit with a setup code from its log. For Linux on x86-64 and ARM64, with glibc 2.35 or newer</li>
+                  <li><strong>Install it with a <code>.deb</code>, a tarball or Docker.</strong> The <code>.deb</code> makes an <code>emberd</code> user and a systemd service and leaves it stopped until you have set its folders in <code>/etc/emberd/emberd.toml</code>; the Docker image is <code>ghcr.io/untaimed18/emberd</code>. The desktop app is never offered emberd as an update, and emberd is updated the way it was installed</li>
+                  <li><strong>Everything but the window.</strong> Search, transfers, the library, friends, chat, rooms, feeds, the IP filter and statistics all work from the browser. Finished files save to the browser&rsquo;s computer and audio and video play in the page. A backup, an IP filter, a collection, a web services list or a file for a friend or a room is sent from the browser&rsquo;s computer, and the browser shows Ember&rsquo;s notifications while the page is open, once allowed in Settings</li>
+                  <li><strong><code>emberd ctl</code></strong> lists, adds, pauses, resumes, stops and cancels downloads and searches from a shell or a script</li>
+                  <li><strong>Safe on a network.</strong> Wrong passwords slow down, sign-in is checked two at a time so a flood cannot exhaust memory, and a browser&rsquo;s requests must come from Ember&rsquo;s own page. Over plain HTTP beyond this computer it still works and says so; give it a certificate, or put it behind a proxy with HTTPS. The folders it may download to and share are set in its config file, not from the browser</li>
+                </ul>
 
                 <h5>Rooms</h5>
                 <ul>

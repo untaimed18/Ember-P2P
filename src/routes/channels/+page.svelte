@@ -4530,7 +4530,6 @@
                         <!-- Unavailable items stay in the arrow-key walk with
                              their reason said beside them, not only on hover. -->
                         <div class="card-more-menu" role="menu">
-                          {#if !isServer}
                           <button
                             type="button"
                             role="menuitem"
@@ -4539,7 +4538,6 @@
                             aria-describedby={sendFileBlocked ? `member-file-why-${mem.member_pubkey}` : undefined}
                             onclick={(e) => { if (sendFileBlocked) return; closeCardMenu(e.currentTarget); handleSendFile(mem); }}
                           >{m.channels_send_file()}{#if sendFileBlocked}<span class="menu-reason" id="member-file-why-{mem.member_pubkey}" aria-hidden="true">{sendFileBlocked}</span>{/if}</button>
-                          {/if}
                           <button
                             type="button"
                             role="menuitem"

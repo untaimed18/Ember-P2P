@@ -112,6 +112,14 @@ export function collectLinuxBundles({ directory }) {
     throw new Error(`Linux bundle directory ${directory} does not exist`);
   }
   const paths = walkFiles(directory);
+  // emberd's `.deb` in place of the desktop's would pass the count below and
+  // hand every desktop install a server, as an update.
+  const emberd = paths.find((path) => /^emberd[-_]/i.test(basename(path)));
+  if (emberd) {
+    throw new Error(
+      `${basename(emberd)} is emberd's, not the desktop app's, and emberd never goes in latest.json`,
+    );
+  }
 
   return LINUX_TARGETS.map(({ target, extension, glibcGated }) => {
     const matches = paths.filter((path) =>

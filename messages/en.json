@@ -5106,5 +5106,17 @@
   "error_server_upload_too_large": "That file is too large to send.",
   "error_server_upload_failed": "The file did not arrive. Try again.",
   "error_sharing_folder_set_in_config": "emberd's config file shares this folder. Take it out there.",
-  "error_sharing_browse_under_unset": "emberd's config file names no folders this page may share from. List them under browse_under in [folders]."
+  "error_sharing_browse_under_unset": "emberd's config file names no folders this page may share from. List them under browse_under in [folders].",
+  "server_notifications_title": "Browser notifications",
+  "server_notifications_here": "In this browser",
+  "server_notifications_default": "Allow notifications here to hear about finished downloads, messages and the rest while this page is open.",
+  "server_notifications_allow": "Allow notifications",
+  "server_notifications_granted": "Allowed. This browser shows Ember’s notifications while this page is open.",
+  "server_notifications_denied": "Blocked in this browser. To have them, allow notifications for this site in the browser’s settings.",
+  "server_notifications_unsupported": "Browsers show notifications only for pages served over HTTPS or from this computer (localhost), so this page cannot.",
+  "error_server_upload_unknown": "That file is no longer on the server. Send it again.",
+  "error_server_busy": "emberd is busy checking other sign-ins. Try again in a moment.",
+  "server_notifications_enabled_label": "Show notifications",
+  "server_notifications_enabled_hint": "Shown by any browser that has Ember open and is allowed to show them.",
+  "server_notifications_desc": "Notifications in this browser, and the pop-ups Ember shows in its page"
 }

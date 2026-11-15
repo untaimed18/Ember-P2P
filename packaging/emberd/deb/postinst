@@ -1,0 +1,38 @@
+#!/bin/sh
+# emberd's .deb: the emberd user its service runs as, and systemd told of the
+# unit. A first install leaves the service stopped, so the folders in
+# /etc/emberd/emberd.toml can be set before Ember joins any network; an
+# upgrade restarts it if it was running.
+set -e
+
+if [ "$1" = configure ]; then
+    if ! getent group emberd >/dev/null; then
+        groupadd --system emberd
+    fi
+    if ! getent passwd emberd >/dev/null; then
+        useradd --system --gid emberd --home-dir /var/lib/emberd --no-create-home \
+            --shell /usr/sbin/nologin --comment "Ember P2P (emberd)" emberd
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        if [ -n "$2" ]; then
+            systemctl try-restart emberd.service || true
+        fi
+    fi
+    if [ -z "$2" ]; then
+        cat <<'EOF'
+
+emberd is installed, and not started. To start it:
+
+  1. Set the download and shared folders in /etc/emberd/emberd.toml, or leave
+     them: downloads then go to /var/lib/emberd/Downloads/Ember.
+  2. sudo systemctl enable --now emberd
+  3. journalctl -u emberd shows the web interface's address and the setup
+     code for its first visit.
+
+To use `emberd ctl` as yourself: sudo usermod -aG emberd "$USER", then log in
+again.
+
+EOF
+    fi
+fi

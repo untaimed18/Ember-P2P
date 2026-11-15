@@ -5106,5 +5106,17 @@
   "error_server_upload_too_large": "该文件太大，无法发送。",
   "error_server_upload_failed": "文件未能送达，请重试。",
   "error_sharing_folder_set_in_config": "此文件夹由 emberd 的配置文件共享。请在配置文件中将其移除。",
-  "error_sharing_browse_under_unset": "emberd 的配置文件没有列出此页面可从中共享的文件夹。请在 [folders] 的 browse_under 中列出它们。"
+  "error_sharing_browse_under_unset": "emberd 的配置文件没有列出此页面可从中共享的文件夹。请在 [folders] 的 browse_under 中列出它们。",
+  "server_notifications_title": "浏览器通知",
+  "server_notifications_here": "在此浏览器中",
+  "server_notifications_default": "在此允许通知，以便在此页面打开时得知下载完成、新消息等情况。",
+  "server_notifications_allow": "允许通知",
+  "server_notifications_granted": "已允许。此页面打开时，此浏览器会显示 Ember 的通知。",
+  "server_notifications_denied": "已在此浏览器中被阻止。如需接收，请在浏览器设置中允许此网站的通知。",
+  "server_notifications_unsupported": "浏览器只为通过 HTTPS 或从本机（localhost）提供的页面显示通知，因此此页面无法显示。",
+  "error_server_upload_unknown": "该文件已不在服务器上，请重新发送。",
+  "error_server_busy": "emberd 正忙于验证其他登录，请稍后再试。",
+  "server_notifications_enabled_label": "显示通知",
+  "server_notifications_enabled_hint": "任何打开了 Ember 并获准显示通知的浏览器都会显示它们。",
+  "server_notifications_desc": "此浏览器中的通知，以及 Ember 在其页面中显示的弹出消息"
 }

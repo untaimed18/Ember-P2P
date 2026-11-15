@@ -11,6 +11,17 @@
 # travels unencrypted, so publish it only to a network you trust, or put it
 # behind a reverse proxy with HTTPS. To share folders, mount them and name
 # them: -v /srv/music:/shared/music:ro -e EMBERD_SHARED_DIRS=/shared/music.
+#
+# The published image is this file built from a release's tarball rather than
+# from source, so it runs the same bytes as the tarball and the .deb:
+#
+#   docker build -f packaging/emberd/Dockerfile --build-arg EMBERD_FROM=release \
+#     --build-context tarball=emberd-1.8.0-linux-x86_64 .
+#
+# where emberd-1.8.0-linux-x86_64 is the tarball unpacked. Only the stages that
+# way needs are built.
+
+ARG EMBERD_FROM=source
 
 FROM node:24-bookworm AS web
 WORKDIR /src
@@ -28,6 +39,18 @@ COPY . .
 RUN cargo build --locked --release --manifest-path src-tauri/Cargo.toml \
       --no-default-features --features server --bin emberd
 
+FROM scratch AS source
+COPY --from=build /src/src-tauri/target/release/emberd /opt/emberd/emberd
+COPY --from=web /src/build-web /opt/emberd/web
+COPY src-tauri/resources/dbip-country-lite.mmdb /opt/emberd/resources/dbip-country-lite.mmdb
+
+FROM scratch AS release
+COPY --from=tarball emberd /opt/emberd/emberd
+COPY --from=tarball web /opt/emberd/web
+COPY --from=tarball resources/dbip-country-lite.mmdb /opt/emberd/resources/dbip-country-lite.mmdb
+
+FROM ${EMBERD_FROM} AS emberd
+
 FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tini \
@@ -35,9 +58,7 @@ RUN apt-get update \
  && useradd --uid 1000 --create-home --home-dir /home/emberd --shell /usr/sbin/nologin emberd \
  && mkdir -p /data /downloads \
  && chown emberd:emberd /data /downloads
-COPY --from=build /src/src-tauri/target/release/emberd /opt/emberd/emberd
-COPY --from=web /src/build-web /opt/emberd/web
-COPY src-tauri/resources/dbip-country-lite.mmdb /opt/emberd/resources/dbip-country-lite.mmdb
+COPY --from=emberd /opt/emberd /opt/emberd
 ENV EMBER_DATA_DIR=/data \
     EMBERD_DOWNLOAD_DIR=/downloads \
     EMBERD_LISTEN=0.0.0.0:4711 \

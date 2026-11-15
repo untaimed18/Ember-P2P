@@ -64,6 +64,7 @@ server = [
     "hyper-util/server-auto",
     "hyper-util/service",
     "hyper-util/tokio",
+    "dep:libdbus-sys",
 ]
 # Local multi-node harness build. Enables Tauri's runtime devtools so the
 # webview console (Ctrl+Shift+I) is available in a build that would not
@@ -252,6 +253,10 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
+# emberd builds the keyring's libdbus in rather than linking it: a server or a
+# slim container often has none, and emberd reaches the keyring only to open
+# what the desktop app sealed, so it needs nothing beyond glibc to start.
+libdbus-sys = { version = "0.2", features = ["vendored"], optional = true }
 # D-Bus for the sleep inhibitor (`src/power.rs`) and the tray-host probe
 # (`src/tray.rs`). The same crate and major version `notify-rust` already
 # links for desktop notifications, so this adds no second D-Bus stack.

@@ -7,8 +7,9 @@
 # desktop app.
 
 # Where Ember keeps its identity, settings, library and database (EMBER_DATA_DIR).
-# The systemd unit and the Docker image set this themselves.
-# data_dir = "/var/lib/emberd/data"
+# The systemd unit sets the same folder; it is here too so that `emberd passwd`,
+# run as the emberd user, finds it. The Docker image reads no file and uses /data.
+data_dir = "/var/lib/emberd/data"
 
 # The file Ember's identity and keys are sealed with (EMBERD_KEY_FILE). Made on
 # first start, readable by emberd alone. Keep it with the data folder in

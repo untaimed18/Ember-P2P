@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
 import type { FriendStatus } from '$lib/types';
+import { isServer } from '$lib/runtime';
+import { pickAndUpload } from '$lib/runtime/web/files';
 
 export interface FriendInfo {
   user_hash: string;
@@ -294,6 +296,10 @@ export function mergeChatAttachment(prev: ChatAttachment, next: ChatAttachment):
 export async function pickAndSendChatAttachment(
   userHashHex: string,
 ): Promise<ChatAttachment | null> {
+  if (isServer) {
+    const upload = await pickAndUpload();
+    return upload ? invoke('send_chat_attachment_upload', { userHashHex, upload }) : null;
+  }
   return invoke('pick_and_send_chat_attachment', { userHashHex, title: m.picker_file_to_send() });
 }
 

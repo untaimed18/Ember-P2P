@@ -4,10 +4,9 @@
 the desktop app and is driven from a web browser, as aMule's `amuled` is with
 `amuleweb`.
 
-**Status:** built, for Linux on x86-64, from the same code as the desktop app.
-It is published only as test builds, by `.github/workflows/emberd-test-build.yml`,
-until the release jobs under [Still to do](#still-to-do) are in place. CI
-checks, lints and tests it on every push.
+**Status:** built from the same code as the desktop app, for Linux on x86-64
+and ARM64, and released with it from 1.8.0: a tarball and a `.deb` for each,
+and a Docker image for both. CI checks, lints and tests it on every push.
 
 ## What the user gets
 
@@ -33,35 +32,59 @@ The desktop app gives up nothing, and is built from the same code.
 
 ## Installing and running
 
-### With systemd
+Each release carries `emberd_<version>_amd64.deb` and `_arm64.deb`,
+`emberd-<version>-linux-x86_64.tar.gz` and `-aarch64.tar.gz`, and
+`emberd-<version>-SHA256SUMS`. They need glibc 2.35 or later (Ubuntu 22.04,
+Debian 12, and anything newer) and the system's CA certificates, and no other
+library.
 
-Unpack the tarball (`emberd-<version>-linux-x86_64.tar.gz`) to `/opt/emberd`,
-so that `/opt/emberd/emberd` sits beside `web/` and `resources/`. Then:
+### With the .deb (Debian, Ubuntu)
+
+```sh
+sudo apt install ./emberd_1.8.0_amd64.deb
+sudo nano /etc/emberd/emberd.toml       # the folders, and where it listens
+sudo systemctl enable --now emberd
+journalctl -u emberd                    # the setup code for the first visit
+```
+
+The package makes the `emberd` user, installs the systemd unit and
+`/usr/bin/emberd`, and does not start the service, so the folders can be set
+before Ember joins any network. An upgrade restarts it if it was running.
+Removing the package stops it; purging it leaves Ember's data, identity and
+downloads in `/var/lib/emberd`.
+
+### With systemd, from the tarball
+
+Unpack the tarball to `/opt/emberd`, so that `/opt/emberd/emberd` sits beside
+`web/` and `resources/`. Then:
 
 ```sh
 sudo useradd --system --home-dir /var/lib/emberd --shell /usr/sbin/nologin emberd
+sudo ln -s /opt/emberd/emberd /usr/local/bin/emberd
 sudo install -Dm644 /opt/emberd/emberd.service /etc/systemd/system/emberd.service
 sudo install -Dm644 /opt/emberd/emberd.toml /etc/emberd/emberd.toml
 sudo systemctl enable --now emberd
 journalctl -u emberd
 ```
 
-Ember keeps its data in `/var/lib/emberd/data`. Unless the config names a
-download folder, downloads go to `/var/lib/emberd/Downloads/Ember`.
+Either way, Ember keeps its data in `/var/lib/emberd/data`. Unless the config
+names a download folder, downloads go to `/var/lib/emberd/Downloads/Ember`.
 
 ### With Docker
 
 ```sh
-docker build -f packaging/emberd/Dockerfile -t emberd .
 docker run -d --name emberd --restart unless-stopped \
   -p 4711:4711 -p 4662:4662/tcp -p 4662:4662/udp -p 4672:4672/udp \
-  -v emberd-data:/data -v /srv/downloads:/downloads emberd
+  -v emberd-data:/data -v /srv/downloads:/downloads ghcr.io/untaimed18/emberd
 docker logs emberd
 ```
 
-The data volume is `/data` and downloads go to `/downloads`. To share a
-folder, mount it and name it:
-`-v /srv/music:/shared/music:ro -e EMBERD_SHARED_DIRS=/shared/music`.
+The image is for x86-64 and ARM64 alike, tagged with each version, its
+`major.minor`, and `latest`. The data volume is `/data` and downloads go to
+`/downloads`. To share a folder, mount it and name it:
+`-v /srv/music:/shared/music:ro -e EMBERD_SHARED_DIRS=/shared/music`. To build
+the image from source instead:
+`docker build -f packaging/emberd/Dockerfile -t emberd .`
 
 ### The first visit
 
@@ -78,7 +101,33 @@ person choosing it can read the server's log, so nobody else on the network
 can claim a fresh install first. Case and the dash do not matter.
 
 To set the password from a shell instead, stop `emberd` and run
-`emberd passwd` (or `emberd passwd --stdin` to read it from a pipe).
+`emberd passwd` as the user it runs as (or `emberd passwd --stdin` to read it
+from a pipe):
+
+```sh
+sudo systemctl stop emberd
+sudo -u emberd emberd passwd
+sudo systemctl start emberd
+```
+
+### From a shell
+
+`emberd ctl` manages downloads and searches from a shell or a script:
+
+```text
+emberd ctl status                    Connections, speeds and downloads
+emberd ctl list                      Downloads, each with its id
+emberd ctl add LINK...               Download ed2k:// links (or read them from standard input)
+emberd ctl pause|resume|stop ID...|all
+emberd ctl cancel ID...              Cancel them and delete what arrived
+emberd ctl search [--type TYPE] [--method METHOD] [--limit N] WORDS...
+```
+
+An ID is the one `list` shows, or the start of it, or the start of the file's
+eD2K hash. `--json` prints what `emberd` answered. Run it as the `emberd` user
+(`sudo -u emberd emberd ctl status`), or as a member of its group
+(`sudo usermod -aG emberd $USER`, then log in again); in Docker,
+`docker exec emberd /opt/emberd/emberd ctl status`.
 
 ### Reaching it from another computer
 
@@ -175,8 +224,23 @@ into shared code fails to build there.
 - `GET /api/backup` downloads the backup `export_backup_for_download` just
   made, once; `POST /api/backup` receives one to restore, which Settings then
   inspects and restores as it would a picked file.
+- `POST /api/upload?name=` receives any other file the page sends (an IP
+  filter, a collection, a web services list, a file for a friend or a room)
+  into `<data>/emberd-uploads/<id>/`, and answers with the id. The page then
+  calls the command that takes it: `import_ipfilter_upload`,
+  `load_collection_upload`, `import_webservices_upload`,
+  `send_chat_attachment_upload` or `offer_channel_transfer_upload`, each
+  doing what its desktop twin does with a picked path. An id is 32 hex
+  digits and names nothing outside that folder. Uploads are cleared at each
+  start; a file sent to a friend or a room moves to `emberd-sent/` until it
+  has been offered for two weeks, as an attachment waits a week to be taken.
 - Sign-in: `/api/session`, `/api/setup`, `/api/login`, `/api/logout`,
   `/api/password`, and `/api/restart` for Settings' restart.
+- **The control socket** serves the same routes to `emberd ctl`, on a Unix
+  socket: `/run/emberd/emberd.sock` under systemd (its folder open to the
+  `emberd` group), `<data>/emberd.sock` otherwise (`emberd` alone), or where
+  `EMBERD_SOCKET` says. Who can open the socket can read the API token, so a
+  request on it counts as one made with the token.
 
 The pages are the desktop UI built a second time with `npm run build:web`
 (into `build-web/`). Vite points `@tauri-apps/api/core`, `/event`, `/window`,
@@ -198,7 +262,16 @@ do.
 - **Wrong passwords slow down:** three are free, then each address waits twice
   as long as the last time, up to five minutes, even for the right one. Behind
   a reverse proxy every browser comes from the proxy's address, so they share
-  one count.
+  one count. An attempt is counted as it starts, so many sent at once are
+  slowed like many sent one after another; an IPv6 address counts by its /64,
+  the block one machine is given; and the addresses remembered are capped, so
+  a flood from many of them cannot grow the list without end.
+- **Load has limits.** Two password checks run at once (Argon2 takes a moment
+  and 19 MiB each); more wait their turn, or are told after 20 seconds that
+  `emberd` is busy. Sign-in requests are at most 16 KiB, 256 connections are
+  served at once (and 64 more on the control socket, counted apart), and a
+  connection has 30 seconds to send its headers and 15 to finish a TLS
+  handshake.
 - **The API token** in `emberd-cli-token` lets scripts call the same interface
   with `Authorization: Bearer`, without the same-site checks a browser needs.
   Changing the password replaces it, so a token that leaked with the password
@@ -255,7 +328,9 @@ the desktop app, from opening the same data.
 - The tray, closing to the tray, starting minimized, the window's position,
   the splash screen and the popped-out chat window.
 - Starting at login: the systemd unit or Docker's restart policy.
-- Desktop notifications. In-app pop-ups stay.
+- Desktop notifications: the browser shows the same ones while the page is
+  open, once it is allowed to in Settings, which needs HTTPS or `localhost`.
+  In-app pop-ups stay.
 - Watching the clipboard for links, and `ed2k://` links from other programs:
   pasting into the page, which reads the browser's clipboard.
 - Keeping the computer awake, and *When downloads finish*.
@@ -263,9 +338,9 @@ the desktop app, from opening the same data.
   *Save to this computer*, the in-page player, and the log path shown in
   About.
 - Native pickers: the config file for folders, and a file sent from the
-  browser for a backup. The rest (an IP filter, a collection, a web services
-  list or eMule's folder from a file, and sending a file to a friend or a room)
-  is not offered yet.
+  browser for everything else that opens a file: a backup, an IP filter, a
+  collection, a web services list, and a file for a friend or a room.
+  Creating a collection, and importing from eMule's folder, are not offered.
 - Silent updates and the in-app installer: emberd is updated the way it was
   installed.
 - The Windows Firewall fix, the AppImage font workaround, and dragging files
@@ -278,30 +353,35 @@ the desktop app, from opening the same data.
 
 - **In this repository, on the same branches,** as one crate with the desktop
   app, so a change to shared code is built and tested for both at once.
-- **Built on every push, published when ready.** CI's `emberd` job checks,
-  lints and tests the server build on Ubuntu 22.04, and the desktop `check` job
-  builds the web interface. Until the release jobs exist, `emberd-test-build.yml`
-  builds a tarball and the Docker image on demand, unsigned and with no
-  release, as `linux-test-build.yml` does for the desktop packages.
+- **Built on every push.** CI's `emberd` job checks, lints and tests the
+  server build on Ubuntu 22.04, and the desktop `check` job builds the web
+  interface. `emberd-test-build.yml` builds the x86-64 packages and the Docker
+  image from source on demand, unsigned and with no release, as
+  `linux-test-build.yml` does for the desktop packages.
 - **Released with the desktop app, under the same version and tag.** It speaks
   the same network formats and its pages are the desktop UI, so one set of
-  release notes holds for both. `emberd` stays out of `latest.json`, so the
-  desktop updater never offers it.
-- **A fix only `emberd` needs** goes out as a patch release that publishes
-  `emberd` alone and leaves `latest.json` as it was.
+  release notes holds for both. In `release.yml`, `build-emberd` builds it on
+  Ubuntu 22.04 for x86-64 and ARM64 and packages it with
+  `packaging/emberd/package.sh`; `sign-publish` attaches the tarballs and
+  `.deb`s with their SHA-256 list, from a folder of their own, so nothing signs
+  them with the updater key and `emberd` stays out of `latest.json`: the
+  desktop updater never offers it. The release policy and its tests hold all
+  of that, and `add-linux-platforms.mjs` refuses an `emberd` package outright.
+- **The Docker image is pushed when the release is published,** by
+  `emberd-image.yml`: made from the release's own tarballs, checked against
+  their SHA-256, on an x86-64 and an ARM64 runner, and joined into one image on
+  `ghcr.io`. It waits for publishing, as `latest.json` does, so `latest` never
+  moves to a draft. The jobs that can push compile nothing.
+- **A fix only `emberd` needs** goes out with the next release. Every release
+  builds both, so the desktop gets the new version number too.
 
 ## Still to do
 
-1. **Release jobs** in `release.yml`: x86-64 and ARM64 tarballs, a `.deb` with
-   the systemd unit and the `emberd` user, the Docker image pushed, and the
-   release policy test holding `emberd` out of `latest.json`.
-2. **`emberd ctl`,** the command line over the same interface and the API
-   token: status, add a link, list, pause, resume and cancel downloads, search.
-3. **The remaining uploads:** an IP filter, a collection or a web services list
-   from a file, and a file for a friend or a room.
-4. **Browser notifications,** while the page is open and allowed.
-5. **Hardening:** a security review of the interface by someone who did not
-   write it, fuzzing its request parsing, and the rate limits under load.
+- **A security review by a person** who did not write the interface. It has
+  had an automated one, by a reviewer that was not its author, besides the
+  fuzzing and the tests under load below.
+- **Importing from eMule's folder** and **creating a collection** from the
+  browser, which both pick folders.
 
 ## Testing
 
@@ -318,6 +398,33 @@ the desktop app, from opening the same data.
 - A settings file reset because it cannot be read keeps the network interface
   it named, so a reset cannot send traffic out of another one, on the desktop
   as on `emberd`.
+- **Fuzzing:** what a request with no session reaches (its cookies, token and
+  `Origin`, the saved file's name, the setup code, upload names and the paths
+  of `/api/file` and `/api/media`) and `emberd ctl`'s reading of answers,
+  chunked or not, run through thousands of generated inputs each, which must
+  never panic and must keep their guarantees.
+- **Under load:** wrong passwords sent from eight threads at once are slowed
+  as if sent in turn, an IPv6 network counts as one address, and a flood from
+  thousands of addresses keeps the list of them bounded.
+- **`emberd ctl`:** its arguments, an ID by its start or its hash, adding a
+  link starts each file once and never trusts a digest the link claims, and a
+  refusal prints its reason.
+- **Packaging:** `package.sh` run on the release build, then the tarball and
+  the `.deb` read back: every file and its mode and owner, the control file's
+  dependencies (glibc and libgcc only, as `dpkg-shlibdeps` reads them), the
+  conffile, the checksums, the unit through `systemd-analyze verify`, and the
+  maintainer scripts run against stand-ins for a first install, an upgrade, a
+  removal and a purge. The config file it ships is read by `emberd`'s own
+  parser in the Rust suite. CI runs the same check on both machines' packages
+  before a release takes them.
+- **Offline, on Linux, for 1.8.0:** the release build packaged and checked as
+  above, then `emberd` run with the network held offline as below: every
+  `emberd ctl` command and its refusals, a collection, an IP filter and a web
+  services list sent as uploads, twelve wrong passwords at once (three
+  checked, nine told to wait), a 20 KB sign-in refused, 256 connections held
+  and the next turned away, half a request let go after 30 seconds, and a
+  clean stop on SIGTERM. In a browser, the notifications setting and the
+  upload buttons.
 - Before this landed, `emberd` was run on a scratch data folder with the
   network held offline by a network interface that does not exist, and every
   page was used from a browser: the first visit and its setup code, signing in

@@ -6,7 +6,9 @@
 
 mod auth;
 mod config;
+mod ctl;
 mod http;
+pub(crate) mod uploads;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -22,6 +24,8 @@ Usage:
   emberd [--config FILE]               Run Ember and its web interface
   emberd passwd [--config FILE] [--stdin]
                                        Set the web interface's password
+  emberd ctl COMMAND...                Downloads and search from a shell;
+                                       emberd ctl --help says more
   emberd --version                     Print the version
   emberd --help                        Print this
 
@@ -32,11 +36,16 @@ http://localhost:4711 and only this computer can reach it.";
 enum Command {
     Run { config: Option<PathBuf> },
     Passwd { config: Option<PathBuf>, stdin: bool },
+    Ctl(Vec<String>),
     Version,
     Help,
 }
 
 fn parse(args: &[String]) -> Result<Command, String> {
+    // Everything after `ctl` is its own.
+    if args.first().map(String::as_str) == Some("ctl") {
+        return Ok(Command::Ctl(args[1..].to_vec()));
+    }
     let mut config = None;
     let mut stdin = false;
     let mut subcommand: Option<&str> = None;
@@ -82,6 +91,7 @@ pub fn main() -> i32 {
         }
         Ok(Command::Run { config }) => run(config.as_deref()),
         Ok(Command::Passwd { config, stdin }) => passwd(config.as_deref(), stdin),
+        Ok(Command::Ctl(args)) => ctl::run(&args),
         Err(e) => {
             eprintln!("{e}\n\n{USAGE}");
             2
@@ -122,6 +132,25 @@ fn take_instance_lock(data_dir: &Path) -> Result<std::fs::File, String> {
 
 /// The exit status that asks for a restart rather than a stop.
 pub(crate) const RESTART: i32 = -75;
+
+/// The control socket `emberd ctl` talks to.
+const SOCKET_NAME: &str = "emberd.sock";
+
+/// Where emberd opens its control socket: `EMBERD_SOCKET`, else the runtime
+/// folder systemd gives the service (`RuntimeDirectory=`), else the data
+/// folder.
+#[cfg(unix)]
+fn control_socket_path(data_dir: &Path) -> PathBuf {
+    if let Some(socket) = std::env::var_os("EMBERD_SOCKET") {
+        return PathBuf::from(socket);
+    }
+    if let Some(runtime) = std::env::var_os("RUNTIME_DIRECTORY") {
+        if let Some(first) = std::env::split_paths(&runtime).next() {
+            return first.join(SOCKET_NAME);
+        }
+    }
+    data_dir.join(SOCKET_NAME)
+}
 
 fn run(config_path: Option<&Path>) -> i32 {
     let config = match prepare(config_path) {
@@ -191,6 +220,17 @@ async fn serve_until_stopped(config: config::Config) -> i32 {
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_file(file.with_extension("partial"));
     }
+    uploads::tidy(&data_dir);
+    let tidy_dir = data_dir.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+        every.tick().await;
+        loop {
+            every.tick().await;
+            let dir = tidy_dir.clone();
+            let _ = tokio::task::spawn_blocking(move || uploads::tidy_sent(&dir)).await;
+        }
+    });
     if let Some(path) = &config.path {
         info!("Config read from {}", path.display());
     }
@@ -549,6 +589,10 @@ mod tests {
         assert!(matches!(parse(&args(&["passwd", "--stdin"])), Ok(Command::Passwd { stdin: true, .. })));
         assert!(matches!(parse(&args(&["--version"])), Ok(Command::Version)));
         assert!(matches!(parse(&args(&["-h"])), Ok(Command::Help)));
+        assert!(
+            matches!(parse(&args(&["ctl", "--help"])), Ok(Command::Ctl(rest)) if rest == ["--help"]),
+            "everything after ctl is its own, --help included"
+        );
         assert!(parse(&args(&["--config"])).is_err());
         assert!(parse(&args(&["--stdin"])).is_err());
         assert!(parse(&args(&["frobnicate"])).is_err());

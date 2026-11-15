@@ -5,6 +5,7 @@ import { flushToastActionsBeforeExit } from '$lib/stores/toast';
 import { withTimeout } from '$lib/utils';
 import { isServer } from '$lib/runtime';
 import { openInNewTab } from '$lib/runtime/web/links';
+import { pickAndUpload } from '$lib/runtime/web/files';
 
 export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
 export type LiveApplyOutcome = 'applied' | 'deferred' | 'failed';
@@ -352,6 +353,10 @@ export async function openWebService(
  * would not be.
  */
 export async function importWebServicesFile(): Promise<WebService[] | null> {
+  if (isServer) {
+    const upload = await pickAndUpload('.dat,.txt');
+    return upload ? invoke('import_webservices_upload', { upload }) : null;
+  }
   return invoke('pick_and_import_webservices_file', { title: m.picker_webservices() });
 }
 

@@ -928,7 +928,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_punched_publisher_streams_its_downloads_that_have_none() {
-        let (key, id) = (key(), "punched-publisher-test");
+        // A publisher of its own: a punch reaches every download of its
+        // publisher's feeds, those of the tests running beside this one too.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]).verifying_key().to_bytes();
+        let id = "punched-publisher-test";
         assert!(begin(id, [0x51; 16], 1_000, Publisher { key, salt: SALT, friend_tcp: None }));
         assert_eq!(needs_publisher(id), None, "still held for a lookup");
         lookup_unavailable(id);
