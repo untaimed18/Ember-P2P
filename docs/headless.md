@@ -343,6 +343,30 @@ shared = ["/srv/ember/share"]
 Only what the operator owns is in this file. Every other setting is in
 `config.json` as on the desktop, and changed from the web UI.
 
+## Where it lives and how it ships
+
+- **In this repository, on the same branches.** `emberd` is built from the
+  same code as the desktop app, so a long-lived branch of its own would
+  collide with every desktop change in the files steps 1 to 5 touch. Each step
+  goes to `develop` on a short branch, as fixes do now, and ships in the next
+  desktop release. `emberd` itself is a crate beside `src-tauri` and
+  `rendezvous-server`, which already lives here with its own CI job and
+  Dockerfile.
+- **Built on every push, published only when ready.** CI checks, lints and
+  tests `emberd` like the other crates from the day it is added. Until the web
+  UI is done it is published only by a workflow run on demand, unsigned and
+  with no release, as `linux-test-build.yml` does for the desktop packages.
+- **Released with the desktop app, under the same version and tag.** It speaks
+  the same network formats and its web UI is the desktop UI, so `emberd` 1.9.0
+  is desktop 1.9.0 without the window, and one set of release notes, *Before
+  you upgrade* included, holds for both. `release.yml` gains jobs that build it
+  for x86-64 and ARM64, attach the binary and the `.deb` to the release, and
+  push the Docker image. `emberd` stays out of `latest.json`, so the desktop
+  updater never offers it, and the release policy test holds that.
+- **A fix only `emberd` needs** goes out as a patch release that publishes
+  `emberd` alone and leaves `latest.json` as it was, so desktop users are not
+  offered an update with nothing in it.
+
 ## Implementation order
 
 Steps 1 to 5 change no behavior, and each lands with the desktop tests passing.
