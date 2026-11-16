@@ -5118,5 +5118,6 @@
   "error_server_busy": "emberd est occupé à vérifier d’autres connexions. Réessayez dans un instant.",
   "server_notifications_enabled_label": "Afficher les notifications",
   "server_notifications_enabled_hint": "Tout navigateur où Ember est ouvert et qui est autorisé à les afficher les affiche.",
-  "server_notifications_desc": "Les notifications dans ce navigateur, et les messages qu’Ember affiche dans sa page"
+  "server_notifications_desc": "Les notifications dans ce navigateur, et les messages qu’Ember affiche dans sa page",
+  "transfers_failure_reason_download_folder_busy": "Un autre programme utilise le dossier de téléchargement. Ember réessaie tout seul."
 }

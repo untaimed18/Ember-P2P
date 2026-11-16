@@ -5118,5 +5118,6 @@
   "error_server_busy": "emberd sprawdza teraz inne logowania. Spróbuj ponownie za chwilę.",
   "server_notifications_enabled_label": "Pokazuj powiadomienia",
   "server_notifications_enabled_hint": "Pokazuje je każda przeglądarka, w której Ember jest otwarty i która ma na to zgodę.",
-  "server_notifications_desc": "Powiadomienia w tej przeglądarce i komunikaty, które Ember pokazuje na swojej stronie"
+  "server_notifications_desc": "Powiadomienia w tej przeglądarce i komunikaty, które Ember pokazuje na swojej stronie",
+  "transfers_failure_reason_download_folder_busy": "Inny program używa folderu pobierania. Ember sam spróbuje ponownie."
 }

@@ -285,6 +285,7 @@
                 <h4>What&rsquo;s Fixed</h4>
 
                 <ul>
+                  <li><strong>Downloads, on Windows:</strong> a program that has the download folder open, such as a console or a player started there, an Open dialog left on it, or antivirus, no longer stops downloads from starting with a warning to check your write permission (<a href="https://github.com/untaimed18/Ember-P2P/issues/179" target="_blank" rel="noopener">#179</a>). When another program is briefly using a file there, the download says so and tries again by itself</li>
                   <li><strong>Rooms:</strong> a file offer passed on by another member can no longer be replayed later to put the prompt up again: 1.8.0 dates each offer, and refuses one older than the time an offer waits</li>
                   <li><strong>Uploads:</strong> a waiting peer that cannot be reached when its turn comes is dropped, as eMule does, rather than kept at the head of the queue</li>
                   <li><strong>Ember network:</strong> when two nodes connect to each other at the same moment, a recorded handshake replayed by someone on the path can no longer swallow what one of them sends. Its messages wait until the other node has answered, and go again over a new connection if it has not within 3 seconds</li>

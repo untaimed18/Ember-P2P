@@ -5118,5 +5118,6 @@
   "error_server_busy": "emberd è occupato a verificare altri accessi. Riprova tra un momento.",
   "server_notifications_enabled_label": "Mostra notifiche",
   "server_notifications_enabled_hint": "Le mostra ogni browser che ha Ember aperto ed è autorizzato a mostrarle.",
-  "server_notifications_desc": "Le notifiche in questo browser e i messaggi che Ember mostra nella sua pagina"
+  "server_notifications_desc": "Le notifiche in questo browser e i messaggi che Ember mostra nella sua pagina",
+  "transfers_failure_reason_download_folder_busy": "Un altro programma sta usando la cartella download. Ember riprova da solo."
 }

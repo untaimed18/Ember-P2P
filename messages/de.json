@@ -5118,5 +5118,6 @@
   "error_server_busy": "emberd prüft gerade andere Anmeldungen. Versuchen Sie es gleich noch einmal.",
   "server_notifications_enabled_label": "Benachrichtigungen anzeigen",
   "server_notifications_enabled_hint": "Jeder Browser, in dem Ember geöffnet ist und der sie zeigen darf, zeigt sie an.",
-  "server_notifications_desc": "Benachrichtigungen in diesem Browser und die Hinweise, die Ember auf seiner Seite zeigt"
+  "server_notifications_desc": "Benachrichtigungen in diesem Browser und die Hinweise, die Ember auf seiner Seite zeigt",
+  "transfers_failure_reason_download_folder_busy": "Ein anderes Programm verwendet den Downloadordner. Ember versucht es von selbst erneut."
 }

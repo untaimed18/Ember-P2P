@@ -5118,5 +5118,6 @@
   "error_server_busy": "emberd 正忙於驗證其他登入，請稍後再試。",
   "server_notifications_enabled_label": "顯示通知",
   "server_notifications_enabled_hint": "任何開啟了 Ember 並獲准顯示通知的瀏覽器都會顯示它們。",
-  "server_notifications_desc": "此瀏覽器中的通知，以及 Ember 在其頁面中顯示的彈出訊息"
+  "server_notifications_desc": "此瀏覽器中的通知，以及 Ember 在其頁面中顯示的彈出訊息",
+  "transfers_failure_reason_download_folder_busy": "另一個程式正在使用下載資料夾。Ember 會自動重試。"
 }

@@ -5118,5 +5118,6 @@
   "error_server_busy": "emberd is busy checking other sign-ins. Try again in a moment.",
   "server_notifications_enabled_label": "Show notifications",
   "server_notifications_enabled_hint": "Shown by any browser that has Ember open and is allowed to show them.",
-  "server_notifications_desc": "Notifications in this browser, and the pop-ups Ember shows in its page"
+  "server_notifications_desc": "Notifications in this browser, and the pop-ups Ember shows in its page",
+  "transfers_failure_reason_download_folder_busy": "Another program is using the download folder. Ember tries again by itself."
 }

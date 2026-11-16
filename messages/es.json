@@ -5118,5 +5118,6 @@
   "error_server_busy": "emberd está ocupado comprobando otros inicios de sesión. Inténtalo de nuevo en un momento.",
   "server_notifications_enabled_label": "Mostrar notificaciones",
   "server_notifications_enabled_hint": "Las muestra cualquier navegador que tenga Ember abierto y permiso para mostrarlas.",
-  "server_notifications_desc": "Notificaciones en este navegador y los avisos que Ember muestra en su página"
+  "server_notifications_desc": "Notificaciones en este navegador y los avisos que Ember muestra en su página",
+  "transfers_failure_reason_download_folder_busy": "Otro programa está usando la carpeta de descargas. Ember lo vuelve a intentar por sí solo."
 }

@@ -2309,11 +2309,12 @@ fn prepare_approved_subdir_with(
             0,
         )
     };
+    // Attributes only: asking to delete it as well fails with a sharing
+    // violation while any program holds the folder as its working folder.
     #[cfg(windows)]
     let open_child = || {
         use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
-        const DELETE_ACCESS: u32 = 0x0001_0000;
-        open_windows_path(&candidate, FILE_READ_ATTRIBUTES | DELETE_ACCESS, true)
+        open_windows_path(&candidate, FILE_READ_ATTRIBUTES, true)
     };
 
     let directory = match open_child() {
@@ -3276,6 +3277,63 @@ mod tests {
             windows_wide_path(Path::new(&share)),
             wide(&format!("\\\\?\\UNC\\nas\\media\\{}\0", "d".repeat(260)))
         );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// A program whose working folder is Temp or Downloads, or an Open dialog
+    /// left there, holds the folder open without letting it be deleted.
+    /// Preparing the folders only reads them, so it goes ahead (issue 179).
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_another_program_holds_open_is_still_prepared() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        const FILE_LIST_DIRECTORY: u32 = 0x0001;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let _registry_guard = test_registry_lock();
+        let base = std::env::temp_dir().join(format!(
+            "ember-subdir-held-{}-{}",
+            std::process::id(),
+            random_hex()
+        ));
+        let (root, data) = (base.join("root"), base.join("data"));
+        for path in [root.join("Temp"), root.join("Downloads"), data.clone()] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let allowed = [root.to_string_lossy().into_owned()];
+        initialize_approved_roots(&data, &allowed).unwrap();
+
+        // As Windows holds a process's working folder: shared for reading and
+        // writing, not for deletion.
+        let held: Vec<_> = ["Temp", "Downloads"]
+            .iter()
+            .map(|name| {
+                let wide = windows_wide_path(&root.join(name));
+                let handle = unsafe {
+                    CreateFileW(
+                        wide.as_ptr(),
+                        FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS,
+                        std::ptr::null_mut(),
+                    )
+                };
+                assert_ne!(handle, INVALID_HANDLE_VALUE, "{name}");
+                handle
+            })
+            .collect();
+        let prepared = ["Temp", "Downloads"].map(|name| prepare_approved_subdir(&root, name, &allowed));
+        for handle in held {
+            unsafe { CloseHandle(handle) };
+        }
+        for (name, prepared) in ["Temp", "Downloads"].iter().zip(prepared) {
+            let made = prepared.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(made.ends_with(name) && made.is_dir(), "{name}: {}", made.display());
+        }
         let _ = std::fs::remove_dir_all(base);
     }
 

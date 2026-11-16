@@ -1078,6 +1078,7 @@ pub(in crate::network) async fn on_download_event(
         let is_folder_error = matches!(
             failure_code,
             ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable
+                | ed2k::transfer::TransferFailureCode::DownloadFolderBusy
                 | ed2k::transfer::TransferFailureCode::PartFolderOffline
         );
         if is_folder_error {

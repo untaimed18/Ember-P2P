@@ -97,6 +97,7 @@ fn persisted_failure_code(code: &str) -> Option<TransferFailureCode> {
         F::TransientFailure,
         F::NetworkChannelUnavailable,
         F::DownloadFolderUnavailable,
+        F::DownloadFolderBusy,
         F::PartFolderOffline,
         F::PartFilesRemoved,
         F::EmberPinCorrupt,

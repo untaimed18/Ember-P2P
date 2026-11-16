@@ -5118,5 +5118,6 @@
   "error_server_busy": "emberd сейчас проверяет другие входы. Попробуйте ещё раз через минуту.",
   "server_notifications_enabled_label": "Показывать уведомления",
   "server_notifications_enabled_hint": "Их показывает любой браузер, в котором открыт Ember и которому это разрешено.",
-  "server_notifications_desc": "Уведомления в этом браузере и всплывающие сообщения Ember на его странице"
+  "server_notifications_desc": "Уведомления в этом браузере и всплывающие сообщения Ember на его странице",
+  "transfers_failure_reason_download_folder_busy": "Папку загрузок использует другая программа. Ember сам повторит попытку."
 }
