@@ -3591,94 +3591,8 @@ async fn handle_command_inner(
                 )));
                 return;
             }
-            // Per peer *and* overall. Without the second bound, offering to
-            // one member each across many rooms would grow `xfer_send` — and
-            // the open file handle each entry holds — without limit.
-            let to_peer = state
-                .xfer_send
-                .values()
-                .filter(|send| send.peer == peer)
-                .count();
-            if to_peer >= ember::channel::XFER_MAX_ACTIVE
-                || state.xfer_send.len() >= ember::channel::XFER_MAX_ACTIVE * 4
-            {
-                let _ = tx.send(Err(coded(
-                    "channels_xfer_busy",
-                    "Too many transfers already running with this member",
-                )));
-                return;
-            }
-            let Some(key) = ember::channel::derive_xfer_key(
-                &state.local_ed25519_seed,
-                &peer,
-                &channel_id,
-                &xfer_id,
-            ) else {
-                // Only reachable if the member's key is not a usable Ed25519
-                // point, which membership records should already have caught.
-                let _ = tx.send(Err(coded("channels_member_invalid", "Invalid member key")));
-                return;
-            };
-            let offer = ember::channel::XferOffer {
-                sender: state.local_ed25519_pubkey,
-                target: peer,
-                xfer_id,
-                size,
-                root,
-                name: name.clone(),
-            };
-            // Sealed only, so the members it is forwarded through cannot read
-            // the file's name and size. A recipient on v1.6.x cannot read it
-            // either: from 1.7.1 to 1.7.8 the plain offer was kept for one not
-            // known to read sealed offers, and the user asked about it if that
-            // recipient stayed silent.
-            // The file as it stands now, which the block path checks before it
-            // serves a byte. Off this task: an open can stall on a scanner.
-            let stamp_path = path.clone();
-            let stamp = match tokio::task::spawn_blocking(move || {
-                ember::xfer::SourceStamp::of_path(&stamp_path)
-            })
-            .await
-            {
-                Ok(Ok(stamp)) if stamp.size() == size => stamp,
-                _ => {
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_source_changed",
-                        "The file changed or was moved before it could be offered",
-                    )));
-                    return;
-                }
-            };
-            let send =
-                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone())
-                    .with_source_stamp(stamp);
-            state.xfer_send.insert(xfer_id, send);
-            let sealed = ember::channel::encode_xfer_offer_sealed(&key, &offer);
-            let sent = send_xfer_frame(socket, state, db, channel_id, peer, &sealed).await;
-            if !sent {
-                state.xfer_send.remove(&xfer_id);
-                let _ = tx.send(Err(coded(
-                    "channels_xfer_unreachable",
-                    "Could not reach that member right now",
-                )));
-                return;
-            }
-            emit_xfer_update(
-                app_handle,
-                &xfer_id,
-                &channel_id,
-                &peer,
-                "send",
-                &name,
-                size,
-                0,
-                "offered",
-            );
-            let _ = tx.send(Ok(()));
-            // After the offer, so the recipient has the offer before the port
-            // it belongs to.
-            offer_xfer_stream(socket, state, db, channel_id, peer, xfer_id, key, path, size, root)
-                .await;
+            let offer = OutgoingXferOffer { channel_id, peer, xfer_id, path, name, size, root };
+            let _ = start_xfer_offer(socket, state, db, app_handle, offer, tx).await;
         }
 
         NetworkCommand::RespondChannelTransfer {
@@ -3714,6 +3628,11 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::CancelChannelTransfer { xfer_id, tx } => {
+            // A fetch from a room library still waiting for its offer.
+            if super::room_library::cancel_pull(state, app_handle, &xfer_id) {
+                let _ = tx.send(Ok(()));
+                return;
+            }
             let me = state.local_ed25519_pubkey;
             #[allow(clippy::type_complexity)]
             let mut target: Option<(
@@ -3854,7 +3773,44 @@ async fn handle_command_inner(
                     risky: crate::security::is_dangerous_extension(&send.name),
                 });
             }
+            out.extend(super::room_library::pull_snapshots(state));
             let _ = tx.send(out);
+        }
+
+        NetworkCommand::AskRoomLibrary {
+            channel_id,
+            peer,
+            request,
+            tx,
+        } => {
+            if !settings.ember_native_enabled {
+                let _ = tx.send(Err(coded(
+                    "channels_ember_disabled",
+                    "Channels require the Ember Network to be on",
+                )));
+                return;
+            }
+            super::room_library::ask(socket, state, db, channel_id, peer, request, tx).await;
+        }
+
+        NetworkCommand::PullRoomLibraryFile { request, tx } => {
+            if !settings.ember_native_enabled {
+                let _ = tx.send(Err(coded(
+                    "channels_ember_disabled",
+                    "Channels require the Ember Network to be on",
+                )));
+                return;
+            }
+            let _ = tx.send(super::room_library::queue_pull(state, app_handle, request));
+        }
+
+        NetworkCommand::RoomLibraryChanged { channel_id, tx } => {
+            super::room_library::library_changed(socket, state, db, app_handle, channel_id).await;
+            let _ = tx.send(());
+        }
+
+        NetworkCommand::ListRoomLibraries { channel_id, tx } => {
+            let _ = tx.send(super::room_library::open_members(state, channel_id));
         }
 
         #[cfg(debug_assertions)]

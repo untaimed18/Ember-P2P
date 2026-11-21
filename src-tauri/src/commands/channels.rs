@@ -696,7 +696,7 @@ fn truncate_bytes(s: String, max_bytes: usize) -> String {
     s[..end].to_string()
 }
 
-fn parse_member_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
+pub(crate) fn parse_member_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
     let canonical = hex_str.trim().to_ascii_lowercase();
     let bytes = hex::decode(&canonical).map_err(|_| {
         coded(
@@ -712,7 +712,7 @@ fn parse_member_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
     })
 }
 
-fn parse_channel_id(hex_str: &str) -> Result<String, String> {
+pub(crate) fn parse_channel_id(hex_str: &str) -> Result<String, String> {
     let canonical = hex_str.trim().to_ascii_lowercase();
     if canonical.len() != 32 || hex::decode(&canonical).map(|b| b.len()).unwrap_or(0) != 16 {
         return Err(coded(
@@ -1582,6 +1582,9 @@ pub async fn leave_channel(
 ) -> Result<(), String> {
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
+    // A library open to the room closes as we leave, said while we are still
+    // in the room to say it.
+    super::room_library::close_for_leave(&state, &channel_id).await;
     // Straight to the write. The room used to be read first for the key and the
     // visibility the tombstone was built from, and `set_channel_in_room` reports
     // a missing row on its own, so the read is only a second chance to race.
@@ -3503,7 +3506,7 @@ pub async fn dismiss_channel_newer_lines(
     channel_info_from_id(&state, &channel_id).await
 }
 
-async fn load_joined_channel(
+pub(crate) async fn load_joined_channel(
     state: &AppState,
     channel_id: &str,
 ) -> Result<StoredChannel, String> {
@@ -3562,7 +3565,7 @@ async fn you_are_moderator(state: &AppState, channel_id: &str) -> bool {
 /// and strip the moderation tools needed to undo it.
 ///
 /// `fail_code` lets the caller keep its own translated framing.
-async fn self_banned_from(
+pub(crate) async fn self_banned_from(
     state: &AppState,
     row: &StoredChannel,
     fail_code: &'static str,
@@ -6889,7 +6892,7 @@ pub async fn offer_channel_transfer_upload(
 
 /// The room and member a file may be offered to: Ember on, the room joined
 /// and not banned from, and the member someone else the room can see.
-async fn channel_transfer_recipient(
+pub(crate) async fn channel_transfer_recipient(
     state: &AppState,
     channel_id: &str,
     member_pubkey: &str,

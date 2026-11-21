@@ -510,7 +510,7 @@ pub fn is_excluded_share_location(path: &Path) -> bool {
 /// volume (recycle bins, restore points, desktop.ini). A shared drive root
 /// walks straight into them.
 #[cfg(target_os = "windows")]
-fn walk_skips_metadata(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn walk_skips_metadata(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
@@ -521,7 +521,7 @@ fn walk_skips_metadata(metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn walk_skips_metadata(_metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn walk_skips_metadata(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
@@ -627,12 +627,14 @@ fn private_receive_dir_on_the_way(below: &Path) -> bool {
 
 /// Whether the walk of the innermost of `roots` holding the file at `path`
 /// passes through a folder of private receives on the way, so would never
-/// find it. For records re-admitted without a walk.
+/// find it. For records re-admitted without a walk. A file in a room's
+/// library is never found, whatever holds it.
 pub fn under_private_receive_dir(roots: &[String], path: &Path) -> bool {
-    innermost_root(roots, &path.to_string_lossy()).is_some_and(|root| {
-        private_receive_dir_on_the_way(&components_below(root, path))
-            || crate::sharing::feed_downloads::walk_passes_feeds_dir(root, path)
-    })
+    crate::sharing::room_library::holds(path)
+        || innermost_root(roots, &path.to_string_lossy()).is_some_and(|root| {
+            private_receive_dir_on_the_way(&components_below(root, path))
+                || crate::sharing::feed_downloads::walk_passes_feeds_dir(root, path)
+        })
 }
 
 /// One path a filesystem event named, resolved for a scoped rescan.
@@ -769,6 +771,7 @@ impl FileIndexer {
         }
         if private_receive_dir_on_the_way(&below)
             || crate::sharing::feed_downloads::walk_passes_feeds_dir(root, path)
+            || crate::sharing::room_library::holds(path)
             || is_excluded_share_location(path)
         {
             return ScopedDiscovery::Removed;
@@ -883,7 +886,23 @@ impl FileIndexer {
         // shared, never walk into it (config, identity, known.met, …).
         let data_dir = crate::storage::paths::resolve_data_dir();
         let data_canon = data_dir.canonicalize().unwrap_or(data_dir);
-        if let Ok(root_canon) = path.canonicalize() {
+        let root_canon = path.canonicalize().ok();
+        // A folder in a room's library is the room's alone, however it came to
+        // be listed as shared.
+        if crate::sharing::room_library::holds(path)
+            || root_canon.as_deref().is_some_and(crate::sharing::room_library::holds)
+        {
+            warn!("Refusing to discover a folder in a room library: {dir}");
+            return DiscoveryResult {
+                files,
+                truncated: false,
+                partial: true,
+                frontier_trimmed: true,
+                next_cursor: None,
+                unreadable: Vec::new(),
+            };
+        }
+        if let Some(root_canon) = root_canon {
             if root_canon == data_canon || root_canon.starts_with(&data_canon) {
                 warn!("Refusing to discover the application data directory: {dir}");
                 // `partial`: this is a refusal, not an authoritative empty
@@ -996,8 +1015,14 @@ impl FileIndexer {
                         if scope.is_some_and(|scope| !scope.admits_dir(&key)) {
                             continue;
                         }
+                        if crate::sharing::room_library::holds(&entry_path) {
+                            continue;
+                        }
                         if let Ok(canonical) = entry_path.canonicalize() {
-                            if canonical == data_canon || canonical.starts_with(&data_canon) {
+                            if canonical == data_canon
+                                || canonical.starts_with(&data_canon)
+                                || crate::sharing::room_library::holds(&canonical)
+                            {
                                 continue;
                             }
                         }
@@ -1229,6 +1254,7 @@ impl FileIndexer {
                     let dir_name = entry.file_name().to_string_lossy().into_owned();
                     if crate::sharing::is_index_skip_dir_name(&dir_name)
                         || crate::sharing::is_private_receive_dir_name(&dir_name)
+                        || crate::sharing::room_library::holds(&entry_path)
                     {
                         continue;
                     }
@@ -2063,6 +2089,46 @@ mod tests {
             other => panic!("a rescan of the shared folder walks it, got {other:?}"),
         }
         assert!(!under_private_receive_dir(&shared_on_purpose, &chat.join("a.jpg")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A folder in a room's library is never walked for sharing: not below a
+    /// shared folder, not on an event, not on hydration, and not even when it
+    /// is listed as a shared folder itself, unlike the private receive
+    /// folders above.
+    #[test]
+    fn room_library_folders_are_never_walked_for_sharing() {
+        let root = scratch_tree("room-library");
+        let roots = vec![root.to_string_lossy().to_string()];
+        let no_lists = DiscoveryScopes::default();
+        let library = root.join("Kept");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("a.jpg"), b"x").unwrap();
+        std::fs::write(root.join("open.jpg"), b"x").unwrap();
+        let channel = "5e1f0000000000000000000000000001";
+        crate::sharing::room_library::set(
+            channel,
+            crate::sharing::room_library::RoomLibrary {
+                open: true,
+                folders: vec![library.to_string_lossy().to_string()],
+            },
+        );
+
+        let page = FileIndexer::discover_directory_page_in(&roots[0], None, None);
+        let names: Vec<&str> = page.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["open.jpg"]);
+        for path in [library.join("a.jpg"), library.clone()] {
+            assert!(matches!(
+                FileIndexer::discover_scoped_path(&roots, &no_lists, &path),
+                ScopedDiscovery::Removed
+            ));
+        }
+        assert!(under_private_receive_dir(&roots, &library.join("a.jpg")));
+        let listed = FileIndexer::discover_directory_page_in(&library.to_string_lossy(), None, None);
+        assert!(listed.files.is_empty() && listed.partial, "refused, not an empty listing");
+
+        crate::sharing::room_library::set(channel, crate::sharing::room_library::RoomLibrary::default());
+        assert!(!under_private_receive_dir(&roots, &library.join("a.jpg")));
         let _ = std::fs::remove_dir_all(&root);
     }
 

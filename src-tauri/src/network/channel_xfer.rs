@@ -181,6 +181,104 @@ enum StreamFetchResult {
     Corrupt,
 }
 
+/// A file to offer one member, already hashed by the caller so the network
+/// task never blocks on reading it.
+pub(super) struct OutgoingXferOffer {
+    pub(super) channel_id: [u8; 16],
+    pub(super) peer: [u8; 32],
+    pub(super) xfer_id: [u8; 16],
+    pub(super) path: std::path::PathBuf,
+    pub(super) name: String,
+    pub(super) size: u64,
+    pub(super) root: [u8; 32],
+}
+
+/// Offer a file to one member: register the send and put the sealed offer on
+/// the wire. `reply` hears how that went before the QUIC port follows, so the
+/// caller is not kept waiting on it.
+pub(super) async fn start_xfer_offer(
+    socket: &UdpSocket,
+    state: &mut NetworkState,
+    db: &Arc<Database>,
+    app_handle: &crate::host::AppHandle,
+    offer: OutgoingXferOffer,
+    reply: oneshot::Sender<Result<(), String>>,
+) -> Result<(), String> {
+    let OutgoingXferOffer { channel_id, peer, xfer_id, path, name, size, root } = offer;
+    let fail = |reply: oneshot::Sender<Result<(), String>>, error: String| {
+        let _ = reply.send(Err(error.clone()));
+        Err(error)
+    };
+    // Per peer *and* overall. Without the second bound, offering to
+    // one member each across many rooms would grow `xfer_send` — and
+    // the open file handle each entry holds — without limit.
+    let to_peer = state
+        .xfer_send
+        .values()
+        .filter(|send| send.peer == peer)
+        .count();
+    if to_peer >= ember::channel::XFER_MAX_ACTIVE
+        || state.xfer_send.len() >= ember::channel::XFER_MAX_ACTIVE * 4
+    {
+        return fail(
+            reply,
+            coded("channels_xfer_busy", "Too many transfers already running with this member"),
+        );
+    }
+    let Some(key) = ember::channel::derive_xfer_key(&state.local_ed25519_seed, &peer, &channel_id, &xfer_id)
+    else {
+        // Only reachable if the member's key is not a usable Ed25519
+        // point, which membership records should already have caught.
+        return fail(reply, coded("channels_member_invalid", "Invalid member key"));
+    };
+    let wire_offer = ember::channel::XferOffer {
+        sender: state.local_ed25519_pubkey,
+        target: peer,
+        xfer_id,
+        size,
+        root,
+        name: name.clone(),
+    };
+    // Sealed only, so the members it is forwarded through cannot read
+    // the file's name and size. A recipient on v1.6.x cannot read it
+    // either: from 1.7.1 to 1.7.8 the plain offer was kept for one not
+    // known to read sealed offers, and the user asked about it if that
+    // recipient stayed silent.
+    // The file as it stands now, which the block path checks before it
+    // serves a byte. Off this task: an open can stall on a scanner.
+    let stamp_path = path.clone();
+    let stamp = match tokio::task::spawn_blocking(move || ember::xfer::SourceStamp::of_path(&stamp_path)).await {
+        Ok(Ok(stamp)) if stamp.size() == size => stamp,
+        _ => {
+            return fail(
+                reply,
+                coded(
+                    "channels_xfer_source_changed",
+                    "The file changed or was moved before it could be offered",
+                ),
+            );
+        }
+    };
+    let send = ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone())
+        .with_source_stamp(stamp);
+    state.xfer_send.insert(xfer_id, send);
+    let sealed = ember::channel::encode_xfer_offer_sealed(&key, &wire_offer);
+    let sent = send_xfer_frame(socket, state, db, channel_id, peer, &sealed).await;
+    if !sent {
+        state.xfer_send.remove(&xfer_id);
+        return fail(
+            reply,
+            coded("channels_xfer_unreachable", "Could not reach that member right now"),
+        );
+    }
+    emit_xfer_update(app_handle, &xfer_id, &channel_id, &peer, "send", &name, size, 0, "offered");
+    let _ = reply.send(Ok(()));
+    // After the offer, so the recipient has the offer before the port
+    // it belongs to.
+    offer_xfer_stream(socket, state, db, channel_id, peer, xfer_id, key, path, size, root).await;
+    Ok(())
+}
+
 /// A member's address, when we hold a live direct session with them. A member
 /// reached only through a relay or the overlay has none worth dialling.
 fn member_direct_addr(state: &NetworkState, member: &[u8; 32]) -> Option<SocketAddr> {
@@ -941,6 +1039,7 @@ pub(super) fn drop_channel_transfers_for(
             status,
         );
     }
+    super::room_library::drop_pulls_for(state, app_handle, channel_id, member, status);
 }
 
 /// Hold "no transfer with a banned member" after a room's ban list changes.
@@ -1202,6 +1301,28 @@ pub(super) async fn apply_xfer_offer(
 ) {
     let sender_hex = hex::encode(offer.sender);
     let channel_id = gossip.channel_id;
+    // A file we fetched from a room library arrives under the id we gave
+    // the fetch, minted when it was queued: freshness is ours to know, and
+    // the fetch is consumed by the first offer, so a replay finds nothing.
+    match super::room_library::claim_offer(state, channel_id, &offer) {
+        super::room_library::OfferClaim::Pull(pull) => {
+            super::room_library::accept_pulled_offer(socket, state, db, app_handle, channel_id, offer, key, sealed, pull)
+                .await;
+            return;
+        }
+        super::room_library::OfferClaim::Cancelled => {
+            let plain = ember::channel::encode_xfer_reply(
+                &key,
+                &state.local_ed25519_pubkey,
+                &offer.sender,
+                &offer.xfer_id,
+                ember::channel::XferReply::Decline,
+            );
+            send_xfer_frame(socket, state, db, channel_id, offer.sender, &plain).await;
+            return;
+        }
+        super::room_library::OfferClaim::None => {}
+    }
     if !ember::channel::xfer_offer_fresh(&offer.xfer_id, chrono::Utc::now().timestamp()) {
         debug!(
             "Ember channel xfer: dropping an offer from {sender_hex} stamped outside the offer window \

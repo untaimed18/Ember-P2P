@@ -2087,6 +2087,15 @@ const ROOM_FRIEND_REQUEST_PLAIN_VERSION: u8 = 27;
 /// with it; the first offer under a transfer id wins, so a recipient that read
 /// both sees one prompt. v1.6.x and 1.7.0 drop the number.
 const XFER_SEEN_PLAIN_VERSION: u8 = 28;
+/// A request from one member of a private room to another's room library: a
+/// page of a folder, a search, or a file. See [`super::room_library`].
+/// Addressed and sealed to the two of them as transfer frames are, and never
+/// relayed on, which is why it is not an extension frame: one of those is
+/// passed on to the whole room under the chat rate. Builds before it drop the
+/// number, as they drop [`TYPING_PLAIN_VERSION`].
+pub const LIBRARY_REQUEST_PLAIN_VERSION: u8 = 30;
+/// The answer to a [`LIBRARY_REQUEST_PLAIN_VERSION`].
+pub const LIBRARY_ANSWER_PLAIN_VERSION: u8 = 31;
 
 /// Lowest leading byte of an extension frame. Every kind from here up is laid
 /// out as [`ChannelExtFrame`]: `kind || flags || sender || signature || body`.
@@ -2098,7 +2107,8 @@ const XFER_SEEN_PLAIN_VERSION: u8 = 28;
 /// newer member happened to be connected to. Builds that know this layout check
 /// an extension frame's author and pass it on whatever its kind, under the same
 /// rules a chat line meets, so a kind added later travels through them as far
-/// as chat does. Kinds 30 to 63 stay unassigned.
+/// as chat does. Kinds 32 to 63 stay unassigned; 30 and 31 are the room
+/// library's addressed frames, which nobody passes on.
 pub const EXT_KIND_MIN: u8 = 64;
 /// Set on an extension frame a person would have seen: a reader that does not
 /// know the kind tells its user something here needs a newer Ember, rather
@@ -2135,11 +2145,20 @@ pub const EXT_KIND_CHAT_EDIT: u8 = 65;
 /// for one, and saying a line needs a newer Ember would tell every member
 /// that a private message passed.
 pub const EXT_KIND_PRIVATE_MESSAGE: u8 = 66;
+/// A member's room library opening to a private room or closing: see
+/// [`super::room_library::encode_status`]. Never displayable: there is
+/// nothing to show for one, and an older build passes it on.
+pub const EXT_KIND_ROOM_LIBRARY: u8 = 67;
 
 /// Extension kinds this build reads. A kind is added here by the build that
 /// first gives it a meaning, and every build before that passes it on and, if
 /// it is displayable, says so.
-const UNDERSTOOD_EXT_KINDS: &[u8] = &[EXT_KIND_CHAT_LINE, EXT_KIND_CHAT_EDIT, EXT_KIND_PRIVATE_MESSAGE];
+const UNDERSTOOD_EXT_KINDS: &[u8] = &[
+    EXT_KIND_CHAT_LINE,
+    EXT_KIND_CHAT_EDIT,
+    EXT_KIND_PRIVATE_MESSAGE,
+    EXT_KIND_ROOM_LIBRARY,
+];
 
 /// The most an extension frame's body can hold and still go out in one
 /// datagram, inside a gossip envelope, wrapped for an overlay relay hop too:
@@ -10019,6 +10038,8 @@ mod tests {
             XFER_OFFER_SEALED_VERSION,
             ROOM_FRIEND_REQUEST_PLAIN_VERSION,
             XFER_SEEN_PLAIN_VERSION,
+            LIBRARY_REQUEST_PLAIN_VERSION,
+            LIBRARY_ANSWER_PLAIN_VERSION,
         ] {
             assert!(version < EXT_KIND_MIN, "{version} would be read as an extension frame");
         }
@@ -10026,7 +10047,8 @@ mod tests {
         assert!(ext_kind_understood(EXT_KIND_CHAT_LINE));
         assert!(ext_kind_understood(EXT_KIND_CHAT_EDIT));
         assert!(ext_kind_understood(EXT_KIND_PRIVATE_MESSAGE));
-        assert!(!ext_kind_understood(EXT_KIND_PRIVATE_MESSAGE + 1));
+        assert!(ext_kind_understood(EXT_KIND_ROOM_LIBRARY));
+        assert!(!ext_kind_understood(EXT_KIND_ROOM_LIBRARY + 1));
         assert!(!ext_kind_understood(u8::MAX));
     }
 
@@ -10500,6 +10522,22 @@ mod tests {
             v1_6_7_branch(&encode_xfer_offer_sealed(&[0x5Au8; 32], &sample_offer())),
             V167Branch::DroppedWithDebugLog
         );
+        // A room library frame too: addressed, and dropped by v1.6.7 unread.
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&LIBRARY_REQUEST_PLAIN_VERSION));
+        assert!(!V167_ASSIGNED_OR_RETIRED.contains(&LIBRARY_ANSWER_PLAIN_VERSION));
+        let bob = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let library_key =
+            super::super::room_library::LibraryKey::derive(&alice.to_bytes(), &bob, &CHAT_CHANNEL).unwrap();
+        let library_frame = super::super::room_library::seal_request(
+            &library_key,
+            &CHAT_CHANNEL,
+            &alice.verifying_key().to_bytes(),
+            &bob,
+            &[1u8; 16],
+            &super::super::room_library::LibraryRequest::Fetch { file: [2u8; 8], size: 3 },
+        )
+        .unwrap();
+        assert_eq!(v1_6_7_branch(&library_frame), V167Branch::DroppedWithDebugLog);
         let stream = encode_xfer_stream(
             &[0x5Au8; 32],
             &[1u8; 32],

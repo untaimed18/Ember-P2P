@@ -802,6 +802,31 @@ pub enum NetworkCommand {
         channel_id: [u8; 16],
         member: Option<[u8; 32]>,
     },
+    /// Ask a member of a private room for a page of their room library.
+    AskRoomLibrary {
+        channel_id: [u8; 16],
+        peer: [u8; 32],
+        request: crate::network::ember::room_library::LibraryRequest,
+        tx: oneshot::Sender<Result<crate::network::ember::room_library::LibraryAnswer, String>>,
+    },
+    /// Queue a file from a member's room library. Answers with the transfer
+    /// id it will arrive under, as a room transfer.
+    PullRoomLibraryFile {
+        request: super::room_library::PullRequest,
+        tx: oneshot::Sender<Result<[u8; 16], String>>,
+    },
+    /// Our room library in this room was opened, closed, or lost a folder:
+    /// tell the room, and stop sending what it no longer holds. `tx` hears
+    /// once that is done.
+    RoomLibraryChanged {
+        channel_id: [u8; 16],
+        tx: oneshot::Sender<()>,
+    },
+    /// Members of a room whose libraries are open to it, as last heard.
+    ListRoomLibraries {
+        channel_id: [u8; 16],
+        tx: oneshot::Sender<Vec<[u8; 32]>>,
+    },
     /// Run one Ember DHT maintenance cycle on demand (dev/harness): refresh
     /// stale buckets, liveness-ping stale contacts, and republish stored
     /// records. With the timer this happens automatically; the command

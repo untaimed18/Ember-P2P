@@ -37,6 +37,7 @@ pub(crate) mod reachability;
 pub mod rendezvous;
 pub(crate) mod room_dm;
 mod room_dm_mail;
+pub(crate) mod room_library;
 mod search;
 mod server;
 mod settings;
@@ -1330,6 +1331,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_upload_credit: 0,
         xfer_offer_policy: crate::types::channel_file_offers_in_force(&settings.channel_file_offers),
         xfer_friend_hashes: friend_hashes.clone(),
+        room_library: room_library::LibraryState::new(),
         attach_inbound: HashMap::new(),
         attach_held_sources: HashMap::new(),
         attach_waits_owed: HashMap::new(),

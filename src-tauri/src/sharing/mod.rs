@@ -6,6 +6,7 @@ pub mod indexer;
 pub mod manager;
 pub mod name_tag;
 pub mod paged_cycle;
+pub mod room_library;
 pub mod watcher;
 
 /// Directory basenames that must not be shared as roots and must be skipped

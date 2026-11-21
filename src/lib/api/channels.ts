@@ -579,7 +579,12 @@ export type ChannelTransferStatus =
   | 'busy'
   | 'too_large'
   | 'not_allowed'
-  | 'source_gone';
+  | 'source_gone'
+  // A file asked for from a member's room library: waiting for a free
+  // transfer, asked for, or one they could not send.
+  | 'queued'
+  | 'requested'
+  | 'unavailable';
 
 export interface ChannelTransferInfo {
   xfer_id: string;

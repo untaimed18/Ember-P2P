@@ -5330,6 +5330,18 @@ pub(crate) async fn add_shared_folder_approved(
         ));
     }
 
+    // A room library's folders are that room's alone. The walk would skip
+    // them anyway; refusing here says why nothing in them was shared.
+    if crate::sharing::room_library::all_folders()
+        .iter()
+        .any(|folder| super::settings::shared_paths_overlap(&canonical, std::path::Path::new(folder)))
+    {
+        return Err(coded(
+            "sharing_room_library_folder",
+            "That folder is in a room library, or holds or sits inside one",
+        ));
+    }
+
     let canonical_str = canonical.to_string_lossy().to_string();
     if drive_root == crate::sharing::DriveRootShare::NeedsConfirmation
         && matches!(approval, ShareApproval::Native)

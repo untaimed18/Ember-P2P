@@ -1148,6 +1148,13 @@ pub(super) async fn handle_inbound_channel_gossip(
         }
         return;
     }
+    // Room library frames are addressed and never relayed on, like transfer
+    // frames, and sealed to the pair they are between.
+    if super::room_library::on_library_frame(socket, state, db, app_handle, &ch, gossip.channel_id, &plain, opened)
+        .await
+    {
+        return;
+    }
     // Ahead of the rest because it is the frame this room sends most often once
     // nobody is talking, and every decoder below it would otherwise be tried
     // against each one first.
@@ -1537,6 +1544,7 @@ pub(super) async fn handle_inbound_channel_gossip(
                 // Relayed under the same rules as any extension frame first:
                 // whether it is to us must make no difference to that.
                 let private = (ext.kind == ember::channel::EXT_KIND_PRIVATE_MESSAGE).then(|| ext.clone());
+                let library = (ext.kind == ember::channel::EXT_KIND_ROOM_LIBRARY).then(|| ext.clone());
                 let passed = handle_inbound_channel_ext(
                     socket,
                     state,
@@ -1561,6 +1569,9 @@ pub(super) async fn handle_inbound_channel_gossip(
                         opened,
                     )
                     .await;
+                }
+                if let Some(ext) = library.filter(|_| passed) {
+                    super::room_library::on_library_status(state, db, app_handle, &ch, &gossip, &ext, opened);
                 }
             }
             None => debug!(

@@ -959,6 +959,7 @@ const TERMINAL_XFER: ReadonlyArray<ChannelTransferInfo['status']> = [
   'too_large',
   'not_allowed',
   'source_gone',
+  'unavailable',
 ];
 
 const xferClearTimers = new Map<string, ReturnType<typeof setTimeout>>();

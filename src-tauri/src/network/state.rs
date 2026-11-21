@@ -1825,6 +1825,8 @@ pub(super) struct NetworkState {
     pub(super) xfer_offer_policy: &'static str,
     /// Read-only view of the friends list, for the `"friends"` offer policy.
     pub(super) xfer_friend_hashes: crate::app_state::SharedFriendHashes,
+    /// Room libraries: ours answered, theirs asked, files fetched from them.
+    pub(super) room_library: super::room_library::LibraryState,
     /// Chat attachments a friend has offered us that nobody has answered yet,
     /// with what accepting one needs. What its row does not hold is kept
     /// beside it, sealed, so a restart can bring it back: see

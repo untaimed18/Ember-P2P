@@ -17,6 +17,7 @@ use crate::types::*;
 
 mod feeds;
 mod room_dm;
+mod room_library;
 pub use feeds::{
     DeletedFeed, DiscoveredFeed, DueListing, ElsewhereCopy, FeedItem, FollowedFeed, FollowedItem, OwnFeed,
     OwnPublish, TakenHead,
@@ -9755,10 +9756,12 @@ impl Database {
                 params![channel_id],
             )?;
             Self::clear_handoff_seeds_locked(&tx, channel_id)?;
+            Self::delete_room_library_locked(&tx, channel_id)?;
         }
         tx.commit()?;
         if n > 0 {
             bump_channel_roster_generation(channel_id);
+            crate::sharing::room_library::set(channel_id, Default::default());
         }
         Ok(n > 0)
     }
@@ -9905,12 +9908,14 @@ impl Database {
         // loop would drop it on its next pass for want of a row; going with the
         // row keeps who claimed it off the disk in between.
         Self::delete_channel_handoff_commit_locked(&tx, channel_id)?;
+        Self::delete_room_library_locked(&tx, channel_id)?;
         let n = tx.execute(
             "DELETE FROM channels WHERE channel_id = ?1",
             params![channel_id],
         )?;
         tx.commit()?;
         bump_channel_roster_generation(channel_id);
+        crate::sharing::room_library::set(channel_id, Default::default());
         Ok(n > 0)
     }
 

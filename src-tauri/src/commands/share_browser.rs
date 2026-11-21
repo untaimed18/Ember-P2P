@@ -697,7 +697,7 @@ fn browse_roots() -> Vec<PendingChild> {
 /// Outside every `browse_under` folder, for emberd; never, for the desktop
 /// app, which browses the whole computer.
 #[cfg(feature = "server")]
-fn outside_browse_roots(path: &Path) -> bool {
+pub(crate) fn outside_browse_roots(path: &Path) -> bool {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     !crate::server::browse_under().iter().any(|root| {
         let root = root.canonicalize().unwrap_or_else(|_| root.clone());
@@ -706,7 +706,7 @@ fn outside_browse_roots(path: &Path) -> bool {
 }
 
 #[cfg(not(feature = "server"))]
-fn outside_browse_roots(_path: &Path) -> bool {
+pub(crate) fn outside_browse_roots(_path: &Path) -> bool {
     false
 }
 

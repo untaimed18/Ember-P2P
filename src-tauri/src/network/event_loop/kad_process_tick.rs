@@ -54,6 +54,7 @@ pub(in crate::network) async fn on_kad_process_tick(
             bandwidth_limiter,
         )
         .await;
+        crate::network::room_library::drive_room_libraries(udp_socket, state, db, app_handle).await;
     }
     let now_bt = chrono::Utc::now().timestamp();
     if let Some(target) =

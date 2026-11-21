@@ -77,6 +77,7 @@ pub mod feeds;
 pub mod peers;
 pub mod preview;
 pub mod room_dm;
+pub mod room_library;
 pub mod search;
 pub mod security;
 pub mod server;

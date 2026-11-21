@@ -1184,6 +1184,12 @@ pub(crate) fn setup(app: &crate::host::AppHandle) -> Result<(), Box<dyn std::err
         Ok(folders) => sharing::feed_downloads::set_sharing(folders),
         Err(error) => tracing::error!("Could not read which feeds share their files: {error}"),
     }
+    // Before the library is scanned too: no walk of a shared folder may enter
+    // a folder kept for a room.
+    match db.room_libraries() {
+        Ok(rows) => sharing::room_library::load(rows),
+        Err(error) => tracing::error!("Could not read the room libraries: {error}"),
+    }
     match db.transfer_collection_folders() {
         Ok(rows) => storage::category_folders::load_collection_folders(rows),
         Err(error) => tracing::error!("Could not read which downloads came from collections: {error}"),
