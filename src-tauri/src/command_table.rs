@@ -38,6 +38,7 @@ ember_macros::command_table! {
     commands::search::rescore_search_results,
     commands::search::get_download_history,
     commands::search::get_download_history_stats,
+    commands::search::get_download_history_entries,
     commands::search::clear_download_history,
     commands::search::remove_download_history_entry,
     commands::transfers::start_download,

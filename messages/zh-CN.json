@@ -5119,5 +5119,11 @@
   "server_notifications_enabled_label": "显示通知",
   "server_notifications_enabled_hint": "任何打开了 Ember 并获准显示通知的浏览器都会显示它们。",
   "server_notifications_desc": "此浏览器中的通知，以及 Ember 在其页面中显示的弹出消息",
-  "transfers_failure_reason_download_folder_busy": "另一个程序正在使用下载文件夹。Ember 会自动重试。"
+  "transfers_failure_reason_download_folder_busy": "另一个程序正在使用下载文件夹。Ember 会自动重试。",
+  "settings_history_view": "查看历史",
+  "settings_history_tab_all": "全部",
+  "settings_history_data_search": "搜索名称和哈希",
+  "settings_history_data_load_failed": "无法加载下载历史。",
+  "settings_history_data_remove_aria": "从下载历史中移除 {name}",
+  "settings_history_data_removed": "已从下载历史中移除 {name}，搜索不再标记它。"
 }

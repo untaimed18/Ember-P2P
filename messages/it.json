@@ -5119,5 +5119,11 @@
   "server_notifications_enabled_label": "Mostra notifiche",
   "server_notifications_enabled_hint": "Le mostra ogni browser che ha Ember aperto ed è autorizzato a mostrarle.",
   "server_notifications_desc": "Le notifiche in questo browser e i messaggi che Ember mostra nella sua pagina",
-  "transfers_failure_reason_download_folder_busy": "Un altro programma sta usando la cartella download. Ember riprova da solo."
+  "transfers_failure_reason_download_folder_busy": "Un altro programma sta usando la cartella download. Ember riprova da solo.",
+  "settings_history_view": "Mostra cronologia",
+  "settings_history_tab_all": "Tutti",
+  "settings_history_data_search": "Cerca nomi e hash",
+  "settings_history_data_load_failed": "Impossibile caricare la cronologia download.",
+  "settings_history_data_remove_aria": "Rimuovi {name} dalla cronologia download",
+  "settings_history_data_removed": "{name} è stato rimosso dalla cronologia download. La ricerca non lo segnala più."
 }

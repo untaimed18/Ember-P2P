@@ -146,6 +146,7 @@
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
   import NavIcon from '$lib/components/NavIcon.svelte';
   import SpamDataDialog from '$lib/components/SpamDataDialog.svelte';
+  import DownloadHistoryDialog from '$lib/components/DownloadHistoryDialog.svelte';
   import PortTest from '$lib/components/PortTest.svelte';
   import ConnectionDoctor from '$lib/components/ConnectionDoctor.svelte';
   import { highlightMatches } from '$lib/stores/highlight';
@@ -749,6 +750,7 @@
   let showRestoreRestartPrompt = $state(false);
 
   let historyClearMsg: string | null = $state(null);
+  let historyDataOpen = $state(false);
   let historyStats: DownloadHistoryStats | null = $state(null);
   let historyStatsLoading = $state(false);
   let historyStatsError: string | null = $state(null);
@@ -4113,6 +4115,7 @@
                 </div>
               </div>
               <div class="action-row">
+                <button class="action-btn" onclick={() => (historyDataOpen = true)}>{m.settings_history_view()}</button>
                 <button class="action-btn danger" onclick={() => requestClearHistory('completed')}>{m.settings_clear_completed()}</button>
                 <button class="action-btn danger" onclick={() => requestClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
                 <button class="action-btn danger" onclick={() => requestClearHistory('all')}>{m.settings_clear_all_history()}</button>
@@ -6346,6 +6349,7 @@
 />
 
 <SpamDataDialog bind:open={spamDataOpen} onchange={() => void refreshSpamStats()} />
+<DownloadHistoryDialog bind:open={historyDataOpen} onchange={() => void refreshHistoryStats()} />
 
 <ConfirmDialog
   bind:open={antileechResetConfirmOpen}

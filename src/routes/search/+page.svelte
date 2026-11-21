@@ -1602,7 +1602,24 @@
     joinPoll = setInterval(() => recomputeEmberJoinState(), 1000);
 
     let unlistenHistory: (() => void) | undefined;
+    let unlistenHistoryRemoved: (() => void) | undefined;
     let historyListenMounted = true;
+    // One entry removed, from here or from Settings: its badge goes, and so
+    // does a fetch on its way for it, whose answer would put the badge back.
+    listen<{ hash: string }>('download-history-removed', (event) => {
+      const removed = event.payload?.hash?.toLowerCase();
+      if (!removed) return;
+      const known = [...Object.keys(downloadHistoryMap), ...historyHashGen.keys(), ...completedHandled];
+      for (const hash of new Set(known.filter((h) => h.toLowerCase() === removed))) {
+        delete downloadHistoryMap[hash];
+        invalidateHistory(hash);
+        completedHandled.delete(hash);
+      }
+    }).then((u) => {
+      if (historyListenMounted) unlistenHistoryRemoved = u; else u();
+    }).catch((e) => {
+      console.warn('search: download-history-removed listen failed', e);
+    });
     listen('download-history-cleared', () => {
       downloadHistoryMap = {};
       historyFetchedHashes.clear();
@@ -1620,6 +1637,7 @@
     return () => {
       historyListenMounted = false;
       unlistenHistory?.();
+      unlistenHistoryRemoved?.();
       cancelAnimationFrame(focusFrame);
       if (emberPoll) clearInterval(emberPoll);
       if (joinPoll) clearInterval(joinPoll);

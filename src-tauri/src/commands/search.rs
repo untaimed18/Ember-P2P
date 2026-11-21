@@ -2054,6 +2054,58 @@ pub async fn get_download_history_stats(
     })
 }
 
+/// The most entries [`get_download_history_entries`] returns at once.
+const MAX_HISTORY_PAGE: usize = 500;
+
+/// A page of the download history.
+#[derive(serde::Serialize)]
+pub struct DownloadHistoryPage {
+    pub entries: Vec<crate::storage::database::DownloadHistoryEntry>,
+    /// How many entries match the status and the query.
+    pub matched: usize,
+}
+
+/// The download history's entries of `status` ("completed", "cancelled" or
+/// "all") whose name or hash holds `query` (any case), newest first, `limit`
+/// of them from `offset`.
+#[ember_macros::command]
+pub async fn get_download_history_entries(
+    state: crate::host::State<'_, AppState>,
+    status: String,
+    query: String,
+    offset: usize,
+    limit: usize,
+) -> Result<DownloadHistoryPage, String> {
+    if !matches!(status.as_str(), "all" | "completed" | "cancelled") {
+        return Err(coded_ctx("search_history_fetch_failed", "Failed to fetch history", format!("status {status}")));
+    }
+    let db = state.db.clone();
+    let entries = tokio::task::spawn_blocking(move || db.download_history_entries())
+        .await
+        .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
+        .map_err(|e| coded_ctx("search_history_fetch_failed", "Failed to fetch history", e))?;
+    Ok(history_page(entries, &status, &query, offset, limit))
+}
+
+fn history_page(
+    mut entries: Vec<crate::storage::database::DownloadHistoryEntry>,
+    status: &str,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> DownloadHistoryPage {
+    let needle: String = query.trim().chars().take(MAX_SEARCH_FILTER_LEN).collect::<String>().to_lowercase();
+    entries.retain(|e| {
+        (status == "all" || e.status == status)
+            && (needle.is_empty()
+                || e.file_name.to_lowercase().contains(&needle)
+                || e.file_hash.to_lowercase().contains(&needle))
+    });
+    let matched = entries.len();
+    let entries = entries.into_iter().skip(offset).take(limit.clamp(1, MAX_HISTORY_PAGE)).collect();
+    DownloadHistoryPage { entries, matched }
+}
+
 /// Clear download history entries by status ("completed", "cancelled", or "all").
 #[ember_macros::command]
 pub async fn clear_download_history(
@@ -2100,12 +2152,14 @@ pub async fn clear_download_history(
 /// user has previously downloaded and wants re-surfaced as fresh).
 #[ember_macros::command]
 pub async fn remove_download_history_entry(
+    app: crate::host::AppHandle,
     state: crate::host::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
     let _ = parse_exact_file_hash(&file_hash)?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.remove_download_history(&file_hash))
+    let hash = file_hash.clone();
+    let removed = tokio::task::spawn_blocking(move || db.remove_download_history(&file_hash))
         .await
         .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
         .map_err(|e| {
@@ -2114,7 +2168,13 @@ pub async fn remove_download_history_entry(
                 "Failed to remove history entry",
                 e,
             )
-        })
+        })?;
+    // Search badges the file from its own copy of the history; Settings can
+    // remove one while Search is open.
+    if removed {
+        let _ = app.emit("download-history-removed", serde_json::json!({ "hash": hash }));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2466,5 +2526,59 @@ mod result_attribution_tests {
             results[0].origin_server_ip.as_deref(),
             Some("198.51.100.7")
         );
+    }
+}
+
+#[cfg(test)]
+mod download_history_page_tests {
+    use super::*;
+    use crate::storage::database::DownloadHistoryEntry;
+
+    fn entry(hash: &str, name: &str, status: &str, timestamp: i64) -> DownloadHistoryEntry {
+        DownloadHistoryEntry {
+            file_hash: hash.into(),
+            file_name: name.into(),
+            file_size: 1,
+            status: status.into(),
+            timestamp,
+        }
+    }
+
+    fn names(page: &DownloadHistoryPage) -> Vec<&str> {
+        page.entries.iter().map(|e| e.file_name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_page_takes_its_status_and_any_case_of_a_name_or_hash() {
+        let history = || {
+            vec![
+                entry("AA11", "Écran Noir.mkv", "completed", 3),
+                entry("BB22", "Album.flac", "cancelled", 2),
+                entry("CC33", "écran blanc.mkv", "cancelled", 1),
+            ]
+        };
+        let all = history_page(history(), "all", "", 0, 100);
+        assert_eq!((names(&all), all.matched), (vec!["Écran Noir.mkv", "Album.flac", "écran blanc.mkv"], 3));
+        let cancelled = history_page(history(), "cancelled", "", 0, 100);
+        assert_eq!(names(&cancelled), vec!["Album.flac", "écran blanc.mkv"]);
+        let by_name = history_page(history(), "all", "  ÉCRAN ", 0, 100);
+        assert_eq!(names(&by_name), vec!["Écran Noir.mkv", "écran blanc.mkv"], "accents, any case, trimmed");
+        let by_hash = history_page(history(), "all", "bb2", 0, 100);
+        assert_eq!(names(&by_hash), vec!["Album.flac"]);
+        let both = history_page(history(), "completed", "écran", 0, 100);
+        assert_eq!(names(&both), vec!["Écran Noir.mkv"]);
+    }
+
+    #[test]
+    fn pages_follow_on_and_say_how_many_matched() {
+        let history: Vec<_> = (0..1200).map(|i| entry(&format!("{i:032X}"), &format!("file {i}"), "completed", -i)).collect();
+        let first = history_page(history.clone(), "all", "", 0, 100);
+        assert_eq!((first.entries.len(), first.matched), (100, 1200));
+        let last = history_page(history.clone(), "all", "", 1150, 100);
+        assert_eq!(names(&last).first(), Some(&"file 1150"));
+        assert_eq!(last.entries.len(), 50);
+        assert_eq!(history_page(history.clone(), "all", "", 0, 10_000).entries.len(), MAX_HISTORY_PAGE);
+        assert_eq!(history_page(history.clone(), "all", "", 0, 0).entries.len(), 1, "a page is never empty by its limit");
+        assert!(history_page(history, "all", "", 5_000, 100).entries.is_empty());
     }
 }

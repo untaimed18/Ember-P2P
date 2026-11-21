@@ -395,3 +395,33 @@ export async function clearDownloadHistory(status: string): Promise<void> {
 export async function removeDownloadHistoryEntry(fileHash: string): Promise<void> {
   return invoke('remove_download_history_entry', { fileHash });
 }
+
+/** Which of the download history `getDownloadHistoryEntries` lists. */
+export type DownloadHistoryStatus = 'all' | 'completed' | 'cancelled';
+
+export interface DownloadHistoryEntry {
+  file_hash: string;
+  /** Empty for a file whose name was not known. */
+  file_name: string;
+  file_size: number;
+  status: 'completed' | 'cancelled';
+  /** When it was last recorded, in Unix seconds. */
+  timestamp: number;
+}
+
+export interface DownloadHistoryPage {
+  entries: DownloadHistoryEntry[];
+  /** How many entries match the status and the query. */
+  matched: number;
+}
+
+/** History entries of `status` whose name or hash holds `query`, newest
+ *  first, `limit` (at most 500) from `offset`. */
+export async function getDownloadHistoryEntries(
+  status: DownloadHistoryStatus,
+  query: string,
+  offset: number,
+  limit: number,
+): Promise<DownloadHistoryPage> {
+  return invoke('get_download_history_entries', { status, query, offset, limit });
+}

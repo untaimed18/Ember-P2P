@@ -5119,5 +5119,11 @@
   "server_notifications_enabled_label": "Показывать уведомления",
   "server_notifications_enabled_hint": "Их показывает любой браузер, в котором открыт Ember и которому это разрешено.",
   "server_notifications_desc": "Уведомления в этом браузере и всплывающие сообщения Ember на его странице",
-  "transfers_failure_reason_download_folder_busy": "Папку загрузок использует другая программа. Ember сам повторит попытку."
+  "transfers_failure_reason_download_folder_busy": "Папку загрузок использует другая программа. Ember сам повторит попытку.",
+  "settings_history_view": "Показать историю",
+  "settings_history_tab_all": "Все",
+  "settings_history_data_search": "Поиск по именам и хешам",
+  "settings_history_data_load_failed": "Не удалось загрузить историю загрузок.",
+  "settings_history_data_remove_aria": "Удалить {name} из истории загрузок",
+  "settings_history_data_removed": "{name} удалён из истории загрузок. Поиск больше не отмечает этот файл."
 }

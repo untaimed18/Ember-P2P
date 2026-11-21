@@ -5119,5 +5119,11 @@
   "server_notifications_enabled_label": "Show notifications",
   "server_notifications_enabled_hint": "Shown by any browser that has Ember open and is allowed to show them.",
   "server_notifications_desc": "Notifications in this browser, and the pop-ups Ember shows in its page",
-  "transfers_failure_reason_download_folder_busy": "Another program is using the download folder. Ember tries again by itself."
+  "transfers_failure_reason_download_folder_busy": "Another program is using the download folder. Ember tries again by itself.",
+  "settings_history_view": "View history",
+  "settings_history_tab_all": "All",
+  "settings_history_data_search": "Search names and hashes",
+  "settings_history_data_load_failed": "The download history could not be loaded.",
+  "settings_history_data_remove_aria": "Remove {name} from the download history",
+  "settings_history_data_removed": "{name} was removed from the download history. Search no longer marks it."
 }

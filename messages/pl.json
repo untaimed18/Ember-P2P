@@ -5119,5 +5119,11 @@
   "server_notifications_enabled_label": "Pokazuj powiadomienia",
   "server_notifications_enabled_hint": "Pokazuje je każda przeglądarka, w której Ember jest otwarty i która ma na to zgodę.",
   "server_notifications_desc": "Powiadomienia w tej przeglądarce i komunikaty, które Ember pokazuje na swojej stronie",
-  "transfers_failure_reason_download_folder_busy": "Inny program używa folderu pobierania. Ember sam spróbuje ponownie."
+  "transfers_failure_reason_download_folder_busy": "Inny program używa folderu pobierania. Ember sam spróbuje ponownie.",
+  "settings_history_view": "Pokaż historię",
+  "settings_history_tab_all": "Wszystkie",
+  "settings_history_data_search": "Szukaj nazw i hashy",
+  "settings_history_data_load_failed": "Nie udało się wczytać historii pobierania.",
+  "settings_history_data_remove_aria": "Usuń {name} z historii pobierania",
+  "settings_history_data_removed": "Usunięto {name} z historii pobierania. Wyszukiwanie już go nie oznacza."
 }

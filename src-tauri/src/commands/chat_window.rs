@@ -194,7 +194,8 @@ pub async fn close_chat_window(app: crate::host::AppHandle) -> Result<(), String
 /// Commands the chat window may not call. The capability files scope plugin
 /// permissions only; every app command is callable from every window unless
 /// refused here. These change what is shared or filtered, read what the spam
-/// filter learned or this computer's network interfaces, delete, open or run
+/// filter learned, the download history or this computer's network
+/// interfaces, delete, open or run
 /// files, restore backups, install updates or act on the whole machine, and
 /// none of them is reachable from the chat window's code
 /// (`scripts/chat-window-commands.test.mjs` holds that), so refusing them costs
@@ -221,6 +222,7 @@ pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "export_backup",
     "follow_feed",
     "forget_not_spam",
+    "get_download_history_entries",
     "get_learned_spam",
     "get_network_binding",
     "import_backup",
@@ -236,6 +238,7 @@ pub const CHAT_WINDOW_DENIED_COMMANDS: &[&str] = &[
     "publish_feed",
     "reapprove_shared_folder",
     "reapprove_shared_folders",
+    "remove_download_history_entry",
     "remove_ip_filter_range",
     "remove_missing_files",
     "remove_server",

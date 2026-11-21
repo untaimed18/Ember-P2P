@@ -354,14 +354,24 @@ fn execute(ctl: &Ctl, emberd: &impl Ask) -> Result<(), String> {
         Action::List => list(emberd, ctl.json),
         Action::Add(links) => add(emberd, links, ctl.json),
         // The Transfers page's own rules (`canPause`, `canResume`, `canStop`).
-        Action::Pause(ids) => act(emberd, ids, "pause_transfer", "Paused", |s| matches!(s, "active" | "queued" | "searching")),
-        Action::Resume(ids) => act(emberd, ids, "resume_transfer", "Resumed", |s| {
+        Action::Pause(ids) => act(emberd, ids, ("pause_transfer", one), "Paused", |s| {
+            matches!(s, "active" | "queued" | "searching")
+        }),
+        Action::Resume(ids) => act(emberd, ids, ("resume_transfer", one), "Resumed", |s| {
             matches!(s, "paused" | "stopped" | "insufficient" | "failed")
         }),
-        Action::Stop(ids) => act(emberd, ids, "stop_transfer", "Stopped", |s| {
+        Action::Stop(ids) => act(emberd, ids, ("stop_transfer", one), "Stopped", |s| {
             !matches!(s, "completed" | "failed" | "stopped" | "completing")
         }),
-        Action::Cancel(ids) => act(emberd, ids, "remove_transfer", "Cancelled", |s| !matches!(s, "completed" | "completing")),
+        // As the page's Cancel: the batch command, which records the file in
+        // the download history as cancelled.
+        Action::Cancel(ids) => act(
+            emberd,
+            ids,
+            ("cancel_transfers_batch", |id| json!({ "transferIds": [id] })),
+            "Cancelled",
+            |s| !matches!(s, "completed" | "completing"),
+        ),
         Action::Search { words, method, file_type, limit } => search(emberd, words, method, file_type.as_deref(), *limit, ctl.json),
     }
 }
@@ -602,7 +612,18 @@ fn resolve<'a>(rows: &'a [Value], ids: &[String], fits: &dyn Fn(&str) -> bool) -
     Ok(chosen)
 }
 
-fn act(emberd: &impl Ask, ids: &[String], command: &str, done: &str, fits: impl Fn(&str) -> bool) -> Result<(), String> {
+/// The arguments of a command that takes one download.
+fn one(id: &str) -> Value {
+    json!({ "transferId": id })
+}
+
+fn act(
+    emberd: &impl Ask,
+    ids: &[String],
+    (command, args): (&str, fn(&str) -> Value),
+    done: &str,
+    fits: impl Fn(&str) -> bool,
+) -> Result<(), String> {
     let rows = downloads(emberd)?;
     let chosen = resolve(&rows, ids, &fits)?;
     if chosen.is_empty() {
@@ -616,7 +637,7 @@ fn act(emberd: &impl Ask, ids: &[String], command: &str, done: &str, fits: impl 
             eprintln!("Left {name} as it is: it is {}", state_of(row));
             continue;
         }
-        match emberd.invoke(command, json!({ "transferId": field(row, "id") })) {
+        match emberd.invoke(command, args(field(row, "id"))) {
             Ok(_) => println!("{done} {name}"),
             Err(e) => {
                 failed += 1;
@@ -827,6 +848,29 @@ mod tests {
         assert_eq!(starts[0]["fileHash"], "aa");
         assert_eq!(starts[0]["expectedAich"], "AICH");
         assert!(starts[0]["emberFileHash"].is_null());
+    }
+
+    /// Cancel is the page's: one that the history records as cancelled, so
+    /// Search marks the file, and never a finished download.
+    #[test]
+    fn cancel_cancels_as_the_page_does() {
+        let fake = Fake {
+            asked: RefCell::new(Vec::new()),
+            answer: Box::new(|command, _| match command {
+                "get_transfers" => json!({ "ok": [
+                    { "id": "t1", "direction": "download", "status": "active", "file_name": "a.mkv", "file_hash": "AA11" },
+                    { "id": "t2", "direction": "download", "status": "completed", "file_name": "b.mkv", "file_hash": "BB22" },
+                ] }),
+                _ => json!({ "ok": null }),
+            }),
+        };
+        let ctl = Ctl { action: Action::Cancel(args(&["t1", "t2"])), config: None, socket: None, json: false };
+        execute(&ctl, &fake).unwrap();
+        let asked = fake.asked.borrow();
+        let cancels: Vec<&(String, Value)> = asked.iter().filter(|(c, _)| c != "get_transfers").collect();
+        assert_eq!(cancels.len(), 1, "a finished download is left as it is: {cancels:?}");
+        assert_eq!(cancels[0].0, "cancel_transfers_batch");
+        assert_eq!(cancels[0].1, json!({ "transferIds": ["t1"] }));
     }
 
     #[test]

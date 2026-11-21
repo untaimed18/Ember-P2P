@@ -5119,5 +5119,11 @@
   "server_notifications_enabled_label": "Afficher les notifications",
   "server_notifications_enabled_hint": "Tout navigateur où Ember est ouvert et qui est autorisé à les afficher les affiche.",
   "server_notifications_desc": "Les notifications dans ce navigateur, et les messages qu’Ember affiche dans sa page",
-  "transfers_failure_reason_download_folder_busy": "Un autre programme utilise le dossier de téléchargement. Ember réessaie tout seul."
+  "transfers_failure_reason_download_folder_busy": "Un autre programme utilise le dossier de téléchargement. Ember réessaie tout seul.",
+  "settings_history_view": "Voir l’historique",
+  "settings_history_tab_all": "Tout",
+  "settings_history_data_search": "Rechercher des noms et des hash",
+  "settings_history_data_load_failed": "L’historique des téléchargements n’a pas pu être chargé.",
+  "settings_history_data_remove_aria": "Retirer {name} de l’historique des téléchargements",
+  "settings_history_data_removed": "{name} a été retiré de l’historique des téléchargements. La recherche ne le signale plus."
 }

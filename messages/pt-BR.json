@@ -5119,5 +5119,11 @@
   "server_notifications_enabled_label": "Mostrar notificações",
   "server_notifications_enabled_hint": "Qualquer navegador com o Ember aberto e com permissão para isso as mostra.",
   "server_notifications_desc": "Notificações neste navegador e os avisos que o Ember mostra na sua página",
-  "transfers_failure_reason_download_folder_busy": "Outro programa está usando a pasta de downloads. O Ember tenta de novo sozinho."
+  "transfers_failure_reason_download_folder_busy": "Outro programa está usando a pasta de downloads. O Ember tenta de novo sozinho.",
+  "settings_history_view": "Ver histórico",
+  "settings_history_tab_all": "Todos",
+  "settings_history_data_search": "Pesquisar nomes e hashes",
+  "settings_history_data_load_failed": "Não foi possível carregar o histórico de downloads.",
+  "settings_history_data_remove_aria": "Remover {name} do histórico de downloads",
+  "settings_history_data_removed": "{name} foi removido do histórico de downloads. A pesquisa não o marca mais."
 }

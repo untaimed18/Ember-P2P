@@ -17241,14 +17241,35 @@ impl Database {
         Ok(result)
     }
 
-    /// Remove a specific file from download history (per-row user override).
-    pub fn remove_download_history(&self, file_hash: &str) -> anyhow::Result<()> {
+    /// Every download-history row, newest first. The table holds at most
+    /// [`MAX_DOWNLOAD_HISTORY_ROWS`], so it is read whole.
+    pub fn download_history_entries(&self) -> anyhow::Result<Vec<DownloadHistoryEntry>> {
         let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM download_history WHERE file_hash = ?1",
-            params![file_hash],
+        let mut stmt = conn.prepare(
+            "SELECT file_hash, file_name, file_size, status, timestamp FROM download_history
+             ORDER BY timestamp DESC, file_hash",
         )?;
-        Ok(())
+        let rows = stmt.query_map([], |row| {
+            Ok(DownloadHistoryEntry {
+                file_hash: row.get(0)?,
+                file_name: row.get(1)?,
+                file_size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                status: row.get(3)?,
+                timestamp: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Remove a specific file from download history (per-row user override),
+    /// in whatever case its hash was stored. Whether there was one.
+    pub fn remove_download_history(&self, file_hash: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let removed = conn.execute(
+            "DELETE FROM download_history WHERE file_hash IN (?1, ?2, ?3)",
+            params![file_hash, file_hash.to_ascii_lowercase(), file_hash.to_ascii_uppercase()],
+        )?;
+        Ok(removed > 0)
     }
 
     /// Clear all download history entries of a given status.
@@ -17276,6 +17297,18 @@ impl Database {
         )?;
         Ok((completed, cancelled))
     }
+}
+
+/// A download-history row, as Settings lists it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DownloadHistoryEntry {
+    pub file_hash: String,
+    pub file_name: String,
+    pub file_size: u64,
+    /// `completed` or `cancelled`.
+    pub status: String,
+    /// When it was last recorded, in Unix seconds.
+    pub timestamp: i64,
 }
 
 #[cfg(test)]
@@ -28354,6 +28387,51 @@ mod tests {
             .unwrap();
         assert_eq!(names.len(), 1);
         assert_eq!(names[&named.to_ascii_lowercase()], ("Big Buck Bunny.mkv".to_string(), 725_106_140));
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// Settings lists the history newest first, every row with what it was
+    /// recorded as, and a row removed is gone from the list.
+    #[test]
+    fn the_download_history_lists_newest_first() {
+        let path = std::env::temp_dir().join(format!("ember-history-list-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        let (old, new) = ("AB".repeat(16), "CD".repeat(16));
+        db.record_download_history_batch(&[
+            (old.clone(), "Old film.mkv".to_string(), 700, "completed"),
+            (new.clone(), "New album.flac".to_string(), 300, "cancelled"),
+        ])
+        .unwrap();
+        db.conn.lock().execute("UPDATE download_history SET timestamp = 100 WHERE file_hash = ?1", params![old]).unwrap();
+        db.conn.lock().execute("UPDATE download_history SET timestamp = 200 WHERE file_hash = ?1", params![new]).unwrap();
+
+        let listed = db.download_history_entries().unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                DownloadHistoryEntry {
+                    file_hash: new.clone(),
+                    file_name: "New album.flac".into(),
+                    file_size: 300,
+                    status: "cancelled".into(),
+                    timestamp: 200,
+                },
+                DownloadHistoryEntry {
+                    file_hash: old.clone(),
+                    file_name: "Old film.mkv".into(),
+                    file_size: 700,
+                    status: "completed".into(),
+                    timestamp: 100,
+                },
+            ]
+        );
+        assert!(db.remove_download_history(&new.to_ascii_lowercase()).unwrap(), "in any case");
+        assert!(!db.remove_download_history(&new).unwrap(), "only once");
+        assert_eq!(db.download_history_entries().unwrap().len(), 1);
 
         drop(db);
         for suffix in ["", "-wal", "-shm"] {
