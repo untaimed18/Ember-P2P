@@ -5,6 +5,7 @@ description = "A decentralized P2P file sharing application"
 authors = ["untaimed18"]
 license = "GPL-3.0-only"
 edition = "2021"
+default-run = "ember"
 # `str::floor_char_boundary` (used in the ed2k collection parser and the
 # comment store) was stabilized in Rust 1.91. `rusqlite` 0.40's bundled
 # `libsqlite3-sys` additionally needs `cfg_select` (stable in 1.94+).
