@@ -25,6 +25,10 @@ pub use room_dm::{DmIncoming, DmMessage, DmThread, DM_STATE_REQUEST};
 
 const MAX_PEERS_ROWS: i64 = 10_000;
 const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
+/// Finished downloads kept in `transfers` from one start to the next: those
+/// that finished last, the only ones a crash can have cut short. As many as
+/// the list keeps finished rows (`sharing::manager::MAX_FINISHED_ROWS`).
+const FINISHED_TRANSFER_ROWS_KEPT: i64 = 1_000;
 /// Rooms kept in the Discover cache. Far more than a browse can usefully show,
 /// and small enough that the table stays a rounding error on disk.
 const MAX_CHANNEL_CACHE_ROWS: i64 = 500;
@@ -5427,6 +5431,32 @@ impl Database {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    /// Delete the finished downloads past the [`FINISHED_TRANSFER_ROWS_KEPT`]
+    /// that finished last. After a restart the list shows none of them, so
+    /// nothing else would: they outlived every session. The latest stay
+    /// because a completion a crash cut short is finished at the next start
+    /// from its row ([`Self::finished_download_identity`]).
+    ///
+    /// When one finished is the time its download history entry was written,
+    /// in the same transaction that marked it finished (`complete_transfer`,
+    /// under the row's own hash); a row without one goes by when it started.
+    /// Ordering by the start alone could drop a download that ran for months
+    /// and finished as the app crashed. Returns how many went.
+    pub fn prune_finished_transfers(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let removed = conn.execute(
+            "DELETE FROM transfers WHERE id IN (
+                SELECT t.id FROM transfers t
+                  LEFT JOIN download_history h ON h.file_hash = t.file_hash
+                 WHERE t.direction = 'download' AND t.status IN ('completed', 'noneneeded')
+                 ORDER BY COALESCE(h.timestamp, t.started_at) DESC, t.rowid DESC
+                 LIMIT -1 OFFSET ?1
+             )",
+            params![FINISHED_TRANSFER_ROWS_KEPT],
+        )?;
+        Ok(removed)
     }
 
     pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
@@ -28460,6 +28490,55 @@ mod tests {
 
         assert_eq!(db.mark_messages_read(&friend).unwrap().len(), 1, "opening the chat starts it");
         assert!(db.mark_all_chats_read().unwrap().is_empty());
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn finished_downloads_past_the_newest_are_forgotten_with_their_web_sources() {
+        let path = std::env::temp_dir().join(format!("ember-finished-prune-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        let kept = FINISHED_TRANSFER_ROWS_KEPT as usize;
+        let hash = |i: usize| format!("{i:032x}");
+        {
+            let conn = db.conn.lock();
+            let tx = conn.unchecked_transaction().unwrap();
+            let insert = |id: &str, file_hash: &str, status: &str, started_at: i64| {
+                tx.execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority, category
+                     ) VALUES (?1, 'f.bin', ?2, '', '', 'download', ?3, 0, 0, 4, 0, ?4, 'normal', '')",
+                    params![id, file_hash, status, started_at],
+                )
+                .unwrap();
+            };
+            for i in 0..kept + 10 {
+                let status = if i % 2 == 0 { "completed" } else { "noneneeded" };
+                insert(&format!("done-{i}"), &hash(i), status, 100 + i as i64);
+            }
+            insert("old-paused", &"ab".repeat(16), "paused", 1);
+            insert("old-failed", &"cd".repeat(16), "failed", 2);
+            // Started before all the rest, finished after them.
+            insert("long-running", &"ef".repeat(16), "completed", 0);
+            tx.commit().unwrap();
+        }
+        db.record_download_history_batch(&[("ef".repeat(16), "f.bin".to_string(), 4, "completed")]).unwrap();
+        db.add_transfer_web_sources(&hash(0), &["http://example.invalid/old".into()]).unwrap();
+        db.add_transfer_web_sources(&hash(kept + 9), &["http://example.invalid/new".into()]).unwrap();
+
+        assert_eq!(db.prune_finished_transfers().unwrap(), 11);
+        assert_eq!(db.prune_finished_transfers().unwrap(), 0, "only the excess, once");
+        assert!((0..11).all(|i| !db.transfer_exists(&format!("done-{i}"))), "the oldest went");
+        assert!((11..kept + 10).all(|i| db.transfer_exists(&format!("done-{i}"))), "the newest stayed");
+        assert!(db.transfer_exists("long-running"), "finished last, so kept, however long ago it started");
+        assert!(db.transfer_exists("old-paused") && db.transfer_exists("old-failed"), "unfinished downloads stay");
+        let mut sources: Vec<String> = db.load_transfer_web_sources().unwrap().into_iter().map(|(h, _)| h).collect();
+        sources.sort();
+        assert_eq!(sources, vec![hash(kept + 9)], "a forgotten download's web sources go with it");
 
         drop(db);
         for suffix in ["", "-wal", "-shm"] {

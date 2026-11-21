@@ -1367,6 +1367,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // their rows: their senders hear of them when a session comes up.
         state.attach_inbound.extend(restored);
     }
+    // Finished downloads from sessions long past, which the list no longer
+    // shows. Before the web sources load, which forgets theirs with them.
+    {
+        let db = db.clone();
+        match tokio::task::spawn_blocking(move || db.prune_finished_transfers()).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(removed)) => info!("Forgot {removed} finished download(s) from earlier sessions"),
+            Ok(Err(e)) => warn!("Could not forget old finished downloads: {e}"),
+            Err(e) => warn!("Finished download prune task failed: {e}"),
+        }
+    }
     // Web sources downloads were added with, before any of them can start.
     ed2k::web_sources::set_enabled(settings.web_sources_enabled);
     {
