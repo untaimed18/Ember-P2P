@@ -5179,5 +5179,8 @@
   "error_room_library_folder_gone": "它已不在對方的資料庫中。",
   "error_room_library_no_answer": "對方沒有回應，可能已離線。",
   "error_room_library_busy": "等待下載的檔案已經太多了。",
-  "error_sharing_room_library_folder": "該資料夾屬於某個房間資料庫，或包含或位於其中。房間資料庫的資料夾絕不會被分享。"
+  "error_sharing_room_library_folder": "該資料夾屬於某個房間資料庫，或包含或位於其中。房間資料庫的資料夾絕不會被分享。",
+  "channels_deleted_by_owner_badge": "已被擁有者刪除",
+  "channels_deleted_by_owner_title": "擁有者已刪除此房間。無法加入，你可以將其從清單中移除。",
+  "channels_room_deleted_toast": "{name} 已被擁有者刪除"
 }

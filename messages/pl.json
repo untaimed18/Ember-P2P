@@ -5179,5 +5179,8 @@
   "error_room_library_folder_gone": "Tego nie ma już w jego bibliotece.",
   "error_room_library_no_answer": "Brak odpowiedzi. Ta osoba może być offline.",
   "error_room_library_busy": "Na pobranie czeka już zbyt wiele plików.",
-  "error_sharing_room_library_folder": "Ten folder jest w bibliotece pokoju, zawiera ją albo w niej leży. Foldery biblioteki pokoju nigdy nie są udostępniane."
+  "error_sharing_room_library_folder": "Ten folder jest w bibliotece pokoju, zawiera ją albo w niej leży. Foldery biblioteki pokoju nigdy nie są udostępniane.",
+  "channels_deleted_by_owner_badge": "Usunięty przez właściciela",
+  "channels_deleted_by_owner_title": "Właściciel usunął ten pokój. Nie można do niego dołączyć, ale możesz usunąć go ze swojej listy.",
+  "channels_room_deleted_toast": "Właściciel usunął pokój {name}"
 }

@@ -16,6 +16,7 @@ use crate::storage::paths;
 use crate::types::*;
 
 mod feeds;
+mod room_deletion;
 mod room_dm;
 mod room_library;
 pub use feeds::{
@@ -9764,40 +9765,6 @@ impl Database {
             crate::sharing::room_library::set(channel_id, Default::default());
         }
         Ok(n > 0)
-    }
-
-    /// Walk this device out of rooms the directory lists as deleted.
-    ///
-    /// Deliberately *not* a tombstone. The directory is an unsigned hint —
-    /// nothing in the response proves the room's owner asked for this — and
-    /// `deleted` is one-way: it hides the room, refuses re-entry, and there is
-    /// no way back from the UI. A directory bug or a compromised server could
-    /// therefore erase every room a user belongs to, private ones included,
-    /// whose ids the server has no authority over in the first place.
-    ///
-    /// Walking out is the recoverable half of the same action: the row, its
-    /// history and its join secret stay, the room reappears as a Join, and
-    /// re-entry is local so it works even while the directory still lies.
-    /// Owners are skipped — an owner's own delete goes through
-    /// [`Self::tombstone_channel`], so a row saying we own it and a directory
-    /// saying it is gone means the directory is the one that is wrong.
-    pub fn walk_out_deleted_channels(&self, deleted_ids: &[String]) -> anyhow::Result<Vec<String>> {
-        if deleted_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn.lock();
-        let mut walked = Vec::new();
-        for id in deleted_ids {
-            let n = conn.execute(
-                "UPDATE channels SET in_room = 0 \
-                 WHERE channel_id = ?1 AND deleted = 0 AND is_owner = 0 AND in_room = 1",
-                params![id],
-            )?;
-            if n > 0 {
-                walked.push(id.clone());
-            }
-        }
-        Ok(walked)
     }
 
     /// Forget a channel. A ban recorded against `keep_banned_member` survives,
@@ -25236,32 +25203,28 @@ mod tests {
             None,
         )
         .expect("insert other");
-        let walked = db
-            .walk_out_deleted_channels(std::slice::from_ref(&other_id))
+        db.note_registry_deleted(std::slice::from_ref(&other_id), true, 100)
             .unwrap();
-        assert_eq!(walked, vec![other_id.clone()]);
-        let hidden = db.get_channel(&other_id).unwrap().unwrap();
-        assert!(!hidden.in_room);
+        assert_eq!(db.rooms_listed_deleted_in().unwrap(), vec![other_id.clone()]);
+        let listed = db.get_channel(&other_id).unwrap().unwrap();
         assert!(
-            !hidden.deleted,
+            !listed.deleted,
             "the directory is an unsigned hint: it walks a device out, it does \
              not tombstone a room beyond recovery"
         );
-        assert!(
-            db.set_channel_in_room(&other_id, true).unwrap(),
-            "a room the directory was wrong about must be re-enterable"
-        );
+        // A complete list that no longer names it takes the mark off.
+        db.note_registry_deleted(&[], true, 200).unwrap();
+        assert!(!db.registry_lists_deleted(&other_id).unwrap());
 
         // A room of its own, not the tombstoned one above: reusing that id made
         // this a duplicate insert, so the owner case below was never reached.
         let owned_id = "99".repeat(16);
         db.insert_channel(&owned_id, &"34".repeat(32), "Mine", "public", true, None, None)
             .expect("insert owned");
-        let owned_walk = db
-            .walk_out_deleted_channels(std::slice::from_ref(&owned_id))
+        db.note_registry_deleted(std::slice::from_ref(&owned_id), true, 300)
             .unwrap();
         assert!(
-            owned_walk.is_empty(),
+            db.rooms_listed_deleted_in().unwrap().is_empty(),
             "a room we own is not walked out on the directory's say-so"
         );
         assert!(db.get_channel(&owned_id).unwrap().unwrap().in_room);

@@ -5179,5 +5179,8 @@
   "error_room_library_folder_gone": "Non è più nella sua biblioteca.",
   "error_room_library_no_answer": "Nessuna risposta. Potrebbe essere offline.",
   "error_room_library_busy": "Troppi file sono già in attesa di essere scaricati.",
-  "error_sharing_room_library_folder": "Quella cartella è in una biblioteca della stanza, oppure ne contiene una o vi si trova dentro. Le cartelle di una biblioteca della stanza non vengono mai condivise."
+  "error_sharing_room_library_folder": "Quella cartella è in una biblioteca della stanza, oppure ne contiene una o vi si trova dentro. Le cartelle di una biblioteca della stanza non vengono mai condivise.",
+  "channels_deleted_by_owner_badge": "Eliminata dal proprietario",
+  "channels_deleted_by_owner_title": "Il proprietario ha eliminato questa stanza. Non puoi entrarci, ma puoi toglierla dal tuo elenco.",
+  "channels_room_deleted_toast": "{name} è stata eliminata dal proprietario"
 }

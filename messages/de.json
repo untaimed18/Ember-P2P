@@ -5179,5 +5179,8 @@
   "error_room_library_folder_gone": "Das ist nicht mehr in der Bibliothek.",
   "error_room_library_no_answer": "Keine Antwort. Die Person ist vielleicht offline.",
   "error_room_library_busy": "Es warten schon zu viele Dateien auf den Download.",
-  "error_sharing_room_library_folder": "Dieser Ordner ist in einer Raumbibliothek, oder er enthält eine oder liegt darin. Ordner einer Raumbibliothek werden nie freigegeben."
+  "error_sharing_room_library_folder": "Dieser Ordner ist in einer Raumbibliothek, oder er enthält eine oder liegt darin. Ordner einer Raumbibliothek werden nie freigegeben.",
+  "channels_deleted_by_owner_badge": "Vom Inhaber gelöscht",
+  "channels_deleted_by_owner_title": "Der Inhaber hat diesen Raum gelöscht. Du kannst ihm nicht beitreten, aber ihn aus deiner Liste entfernen.",
+  "channels_room_deleted_toast": "{name} wurde vom Inhaber gelöscht"
 }

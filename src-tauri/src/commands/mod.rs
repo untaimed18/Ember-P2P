@@ -76,6 +76,7 @@ pub mod feed_discover;
 pub mod feeds;
 pub mod peers;
 pub mod preview;
+pub mod room_deletion;
 pub mod room_dm;
 pub mod room_library;
 pub mod search;

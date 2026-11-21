@@ -5,7 +5,7 @@
 //! keys, and author signatures stay on the clients.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -188,6 +188,27 @@ impl ChannelNameRecord {
     }
 }
 
+/// The owner's signed delete of a room, kept with its tombstone.
+///
+/// The tombstone list is this server's word, and a member's app will not
+/// destroy a room it holds on that alone: a server that lied could erase every
+/// room its users belong to. This it can check instead. `sig` is the room
+/// key's signature over the delete request (`build_channel_delete_v4_msg` in
+/// `main.rs`), verified before it is stored, and a member verifies it again
+/// against the room's key before removing the room.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteProof {
+    pub pubkey: String,
+    pub ts: i64,
+    pub sig: String,
+}
+
+/// Signed deletes `/v4/channels/deleted/proofs` pages through. At most one
+/// per tombstone, and tombstones are themselves bounded: by [`MAX_DELETED`]
+/// for rooms that never held a name, and by [`MAX_CHANNEL_NAMES`] for those
+/// that did.
+const MAX_DELETE_PROOFS: usize = MAX_DELETED + MAX_CHANNEL_NAMES;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DirectoryListing {
     pub channel_id: String,
@@ -262,6 +283,10 @@ struct RegistryFile {
     /// grandfathered on load.
     #[serde(default)]
     username_activity: HashMap<String, i64>,
+    /// Signed deletes by lowercase channel id. Empty in files written before
+    /// this field existed: those tombstones have no proof to serve.
+    #[serde(default)]
+    deleted_proofs: BTreeMap<String, DeleteProof>,
 }
 
 /// Borrowed mirror of [`RegistryFile`] used for writing.
@@ -280,6 +305,7 @@ struct RegistryFileRef<'a> {
     names: &'a HashMap<String, ChannelNameRecord>,
     deleted: &'a HashSet<String>,
     username_activity: &'a HashMap<String, i64>,
+    deleted_proofs: &'a BTreeMap<String, DeleteProof>,
 }
 
 #[derive(Debug)]
@@ -290,6 +316,8 @@ pub struct ChannelRegistry {
     names: HashMap<String, ChannelNameRecord>,
     deleted: HashSet<String>,
     username_activity: HashMap<String, i64>,
+    /// See [`DeleteProof`]. Ordered, so a page is a range rather than a sort.
+    deleted_proofs: BTreeMap<String, DeleteProof>,
     /// Lowercase channel id -> keys in `names` whose record names that id,
     /// deleted records included.
     by_channel: HashMap<String, Vec<String>>,
@@ -400,6 +428,7 @@ impl ChannelRegistry {
             names: HashMap::with_capacity(parsed.names.len()),
             deleted: parsed.deleted,
             username_activity: parsed.username_activity,
+            deleted_proofs: parsed.deleted_proofs,
             by_channel: HashMap::new(),
             by_skeleton: HashMap::new(),
             dirty: Arc::new(AtomicBool::new(false)),
@@ -560,6 +589,7 @@ impl ChannelRegistry {
             names: &self.names,
             deleted: &self.deleted,
             username_activity: &self.username_activity,
+            deleted_proofs: &self.deleted_proofs,
         };
         let bytes = match serde_json::to_vec(&file) {
             Ok(bytes) => bytes,
@@ -1182,6 +1212,41 @@ impl ChannelRegistry {
         self.deleted.insert(id);
         self.touch_durable();
         Ok(())
+    }
+
+    /// [`Self::delete_channel`], keeping the owner's signed delete with the
+    /// tombstone. The caller has verified `proof` against the room's key.
+    ///
+    /// A repeated delete of a room already tombstoned without a proof (one
+    /// deleted before proofs were kept) adds it: only the room's key can sign
+    /// one, so this is the owner either way.
+    pub fn delete_channel_signed(
+        &mut self,
+        channel_id: &str,
+        pubkey_hex: &str,
+        proof: DeleteProof,
+    ) -> Result<(), RegistryError> {
+        self.delete_channel(channel_id, pubkey_hex)?;
+        let id = channel_id.to_ascii_lowercase();
+        if !self.deleted_proofs.contains_key(&id) && self.deleted_proofs.len() < MAX_DELETE_PROOFS {
+            self.deleted_proofs.insert(id, proof);
+            self.touch_durable();
+        }
+        Ok(())
+    }
+
+    /// One page of signed deletes, by channel id, starting after `after`.
+    pub fn deleted_proofs_page(&self, after: Option<&str>, limit: usize) -> Vec<(String, DeleteProof)> {
+        use std::ops::Bound;
+        let start = match after {
+            Some(cursor) => Bound::Excluded(cursor.to_ascii_lowercase()),
+            None => Bound::Unbounded,
+        };
+        self.deleted_proofs
+            .range((start, Bound::Unbounded))
+            .take(limit)
+            .map(|(id, proof)| (id.clone(), proof.clone()))
+            .collect()
     }
 
     #[cfg(test)]
@@ -1965,6 +2030,7 @@ mod tests {
             names: &reg.names,
             deleted: &reg.deleted,
             username_activity: &reg.username_activity,
+            deleted_proofs: &reg.deleted_proofs,
         })
         .expect("borrowed form serialises");
         let owned = serde_json::to_vec(&RegistryFile {
@@ -1972,6 +2038,7 @@ mod tests {
             names: reg.names.clone(),
             deleted: reg.deleted.clone(),
             username_activity: reg.username_activity.clone(),
+            deleted_proofs: reg.deleted_proofs.clone(),
         })
         .expect("owned form serialises");
 
@@ -2080,6 +2147,63 @@ mod tests {
             reg.claim_channel_name(&id, &pk, "LOBBY", false).is_ok(),
             "re-casing is a refresh of the same normalised key"
         );
+    }
+
+    fn proof(n: u8) -> DeleteProof {
+        DeleteProof {
+            pubkey: format!("{n:02x}").repeat(32),
+            ts: 1_700_000_000 + i64::from(n),
+            sig: "ab".repeat(64),
+        }
+    }
+
+    #[test]
+    fn a_signed_delete_is_kept_once_survives_a_reload_and_pages_by_id() {
+        let dir = std::env::temp_dir().join(format!("rdv-delete-proofs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("registry.json");
+        let mut reg = ChannelRegistry::load(path.clone());
+        let named = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.claim_channel_name(&named, &pk, "Lobby", true).is_ok());
+        let first = DeleteProof { pubkey: pk.clone(), ..proof(1) };
+        assert!(reg.delete_channel_signed(&named, &pk, first.clone()).is_ok());
+        assert!(reg.is_deleted(&named));
+        // A repeat keeps the first proof rather than swapping in another.
+        let again = DeleteProof { pubkey: pk.clone(), ..proof(2) };
+        assert!(reg.delete_channel_signed(&named, &pk, again).is_ok());
+        // Wrong key: refused, and nothing is stored for it.
+        assert_eq!(
+            reg.delete_channel_signed(&named, &"99".repeat(32), proof(9)),
+            Err(RegistryError::Forbidden)
+        );
+        // A room that never held a name is tombstoned and proved too.
+        let unnamed = "33".repeat(16);
+        assert!(reg.delete_channel_signed(&unnamed, &"44".repeat(32), proof(3)).is_ok());
+
+        let page = reg.deleted_proofs_page(None, 10);
+        assert_eq!(page, vec![(named.clone(), first.clone()), (unnamed.clone(), proof(3))]);
+        assert_eq!(reg.deleted_proofs_page(Some(&named), 10), vec![(unnamed.clone(), proof(3))]);
+        assert_eq!(reg.deleted_proofs_page(None, 1).len(), 1);
+
+        let job = reg.take_persist_job().expect("dirty after deletes");
+        assert!(job.write());
+        let reloaded = ChannelRegistry::load(path);
+        assert_eq!(reloaded.deleted_proofs_page(None, 10), page);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tombstone_from_before_proofs_takes_one_from_a_repeat() {
+        let mut reg = ChannelRegistry::in_memory();
+        let id = "11".repeat(16);
+        let pk = "22".repeat(32);
+        assert!(reg.delete_channel(&id, &pk).is_ok());
+        assert!(reg.deleted_proofs_page(None, 10).is_empty());
+        let signed = DeleteProof { pubkey: pk.clone(), ..proof(1) };
+        assert!(reg.delete_channel_signed(&id, &pk, signed.clone()).is_ok());
+        assert_eq!(reg.deleted_proofs_page(None, 10), vec![(id, signed)]);
     }
 
     #[test]

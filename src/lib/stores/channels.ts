@@ -1517,6 +1517,18 @@ export async function initChannelsStore() {
         maybeToastChannelMessage(channelId, message, sender, mentionsMe, sentAt);
       }),
     );
+    // Rooms this device left, or removed, because their owners deleted them.
+    // Here rather than on the page, since a timer finds them too.
+    registered.push(
+      await listen<{ left?: { name?: string }[]; removed?: { name?: string }[] }>('ember:rooms-deleted', (event) => {
+        if (myEpoch !== storeEpoch) return;
+        const rooms = [...(event.payload?.left ?? []), ...(event.payload?.removed ?? [])];
+        for (const room of rooms) {
+          if (room?.name) toast(m.channels_room_deleted_toast({ name: room.name }));
+        }
+        refreshChannels().catch(() => {});
+      }),
+    );
     // The Channels page registers a handoff listener too, and when it is mounted
     // both fire — two `list_channels` for one event. Kept anyway: a handoff moves
     // rooms and ownership whether or not that page is on screen, and this is the

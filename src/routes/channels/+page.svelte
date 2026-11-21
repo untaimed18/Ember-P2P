@@ -2345,7 +2345,9 @@
    *  it closes by itself once the room is joined or drops out of it. */
   let previewId = $state<string | null>(null);
   let previewRoom = $derived(
-    previewId ? directoryList.find((c) => c.channel_id === previewId && !c.in_room) ?? null : null,
+    previewId
+      ? directoryList.find((c) => c.channel_id === previewId && !c.in_room && !c.deleted_by_owner) ?? null
+      : null,
   );
   let previewOverlayEl = $state<HTMLDivElement>();
   let previewEl = $state<HTMLDivElement>();
@@ -3712,10 +3714,10 @@
                     aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
                     aria-haspopup={ch.in_room ? undefined : 'dialog'}
                     aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
-                    disabled={!ch.in_room && joiningIds.includes(ch.channel_id)}
+                    disabled={!ch.in_room && (joiningIds.includes(ch.channel_id) || !!ch.deleted_by_owner)}
                     onclick={() => {
                       if (ch.in_room) void selectChannel(ch.channel_id);
-                      else previewId = ch.channel_id;
+                      else if (!ch.deleted_by_owner) previewId = ch.channel_id;
                     }}
                   >
                     <div
@@ -3754,6 +3756,9 @@
                            tooltip read as broken to anyone not hovering it. -->
                       {#if ch.successor_id}
                         <span class="badge sm tone-muted chan-moved-badge">{m.channels_transferred_badge()}</span>
+                      {/if}
+                      {#if !ch.in_room && ch.deleted_by_owner}
+                        <span class="badge sm tone-muted chan-moved-badge" title={m.channels_deleted_by_owner_title()}>{m.channels_deleted_by_owner_badge()}</span>
                       {/if}
                     </span>
                     {#if ch.in_room && favouriteSet.has(ch.channel_id)}
@@ -3858,6 +3863,23 @@
                           >{m.channels_leave()}</button>
                         </div>
                       </details>
+                    {:else if ch.deleted_by_owner}
+                      <!-- Nothing to join: its owner deleted it. Removing it is
+                           what is left to do here. -->
+                      <button
+                        type="button"
+                        class="chan-forget"
+                        title={m.channels_forget()}
+                        aria-label={m.channels_forget_aria({ name: ch.name })}
+                        disabled={forgettingIds.includes(ch.channel_id)}
+                        onclick={() => requestForget(ch.channel_id)}
+                      >
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M2.5 4.5h11"/>
+                          <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
+                          <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
+                        </svg>
+                      </button>
                     {:else}
                       <button
                         type="button"

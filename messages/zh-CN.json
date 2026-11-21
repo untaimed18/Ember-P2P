@@ -5179,5 +5179,8 @@
   "error_room_library_folder_gone": "它已不在对方的资料库中。",
   "error_room_library_no_answer": "对方没有回应，可能已离线。",
   "error_room_library_busy": "等待下载的文件已经太多了。",
-  "error_sharing_room_library_folder": "该文件夹属于某个房间资料库，或包含或位于其中。房间资料库的文件夹绝不会被共享。"
+  "error_sharing_room_library_folder": "该文件夹属于某个房间资料库，或包含或位于其中。房间资料库的文件夹绝不会被共享。",
+  "channels_deleted_by_owner_badge": "已被所有者删除",
+  "channels_deleted_by_owner_title": "所有者已删除此房间。无法加入，你可以将其从列表中移除。",
+  "channels_room_deleted_toast": "{name} 已被所有者删除"
 }

@@ -139,6 +139,10 @@ pub struct ChannelInfo {
     pub in_room: bool,
     /// Owner has permanently deleted this room.
     pub deleted: bool,
+    /// The registry lists this room, which we do not own, as deleted, and no
+    /// signed delete from its owner has been seen yet to remove it with. It
+    /// cannot be joined; it can be removed from the list.
+    pub deleted_by_owner: bool,
     /// Only the owner may hand out invites for this room.
     pub invites_owner_only: bool,
     /// Seconds a member must wait between messages; 0 when slow mode is off.
@@ -198,6 +202,7 @@ impl ChannelInfo {
             owner_pubkey: row.owner_pubkey,
             in_room: row.in_room,
             deleted: row.deleted,
+            deleted_by_owner: false,
             invites_owner_only: row.invites_owner_only,
             slow_mode_secs: row.slow_mode_secs,
             announce_only: row.announce_only,
@@ -824,8 +829,12 @@ pub async fn list_channels(state: crate::host::State<'_, AppState>) -> Result<Ve
         // A notice, not a gate, so a failed read shows none rather than
         // failing the list.
         let newer = db.channel_newer_status_all().unwrap_or_default();
+        // The same: what fails here is a label, and joining checks for itself.
+        let listed_deleted = db.registry_deleted_ids().unwrap_or_default();
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
+            let deleted_by_owner =
+                !row.is_owner && !row.deleted && listed_deleted.contains(&row.channel_id.to_ascii_lowercase());
             // No roster row in a room means neither flag is set there. That is
             // the absent entry, not a failure — the query above already spoke
             // for the whole table.
@@ -840,11 +849,11 @@ pub async fn list_channels(state: crate::host::State<'_, AppState>) -> Result<Ve
             let moderation_updated_at = row.moderation_updated_at;
             let moderation_checked_at = row.moderation_checked_at;
             let newer_status = newer.get(&row.channel_id).copied().unwrap_or_default();
-            out.push(
-                ChannelInfo::from_stored(row, you_are_banned, you_are_moderator)
-                    .with_viewer(&our_pk, moderation_updated_at, moderation_checked_at)
-                    .with_newer(newer_status),
-            );
+            let mut info = ChannelInfo::from_stored(row, you_are_banned, you_are_moderator)
+                .with_viewer(&our_pk, moderation_updated_at, moderation_checked_at)
+                .with_newer(newer_status);
+            info.deleted_by_owner = deleted_by_owner;
+            out.push(info);
         }
         Ok::<_, anyhow::Error>(out)
     })
@@ -1359,10 +1368,24 @@ async fn refuse_deleted_channel(
                 "This channel has been deleted",
             ))
         }
-        Ok(Ok(_)) => Ok(()),
         // Tombstones are a directory hint, not uniqueness. A private invite
-        // must still work when Rendezvous is unreachable or slow.
-        Ok(Err(_)) | Err(_) => Ok(()),
+        // must still work when Rendezvous is unreachable or slow, unless the
+        // list as last read here already named the room; and a list read now
+        // may have been cut short, so that is asked either way.
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+            let db = state.db.clone();
+            let id = channel_id.to_string();
+            let listed = tokio::task::spawn_blocking(move || db.registry_lists_deleted(&id))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+            if listed {
+                Err(coded("channels_deleted", "This channel has been deleted"))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1379,7 +1402,11 @@ pub(crate) async fn enter_stored_channel(
         move || {
             let row = db.get_channel(&id)?;
             if let Some(ref row) = row {
-                if row.deleted {
+                // Or listed as deleted by the registry, as last read: walking
+                // back in would only be walked out again, into a room whose
+                // owner has gone. An owner's own row is the owner's call, made
+                // through the deleted-elsewhere prompt.
+                if row.deleted || (!row.is_owner && db.registry_lists_deleted(&id)?) {
                     return Err(anyhow::anyhow!("deleted"));
                 }
                 db.set_channel_in_room(&id, true)?;
@@ -1582,9 +1609,19 @@ pub async fn leave_channel(
 ) -> Result<(), String> {
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
+    if !step_out_of_room(&state, &channel_id).await? {
+        return Err(coded("channels_not_found", "Channel not found"));
+    }
+    Ok(())
+}
+
+/// Leave a room: what Leave does, and what being walked out of a room its
+/// owner deleted does. `Ok(false)` when there is no such room.
+pub(crate) async fn step_out_of_room(state: &AppState, channel_id: &str) -> Result<bool, String> {
+    let channel_id = channel_id.to_string();
     // A library open to the room closes as we leave, said while we are still
     // in the room to say it.
-    super::room_library::close_for_leave(&state, &channel_id).await;
+    super::room_library::close_for_leave(state, &channel_id).await;
     // Straight to the write. The room used to be read first for the key and the
     // visibility the tombstone was built from, and `set_channel_in_room` reports
     // a missing row on its own, so the read is only a second chance to race.
@@ -1595,7 +1632,7 @@ pub async fn leave_channel(
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
     if !left {
-        return Err(coded("channels_not_found", "Channel not found"));
+        return Ok(false);
     }
     if let Ok(bytes) = hex::decode(&channel_id) {
         if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
@@ -1640,7 +1677,7 @@ pub async fn leave_channel(
         Ok(Err(e)) => tracing::warn!(channel_id = %channel_id, error = %e, "could not record the departure notice as owed"),
         Err(e) => tracing::warn!(channel_id = %channel_id, error = %e, "departure notice task failed"),
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Drop a room this device has left and does not own.
@@ -5834,9 +5871,9 @@ async fn probe_public_member_counts(
 ///
 /// Several storers can hold different generations of one room's record, so
 /// the same room can appear more than once; [`merge_signed_listing`] keeps the
-/// newest. Private rooms publish an index record too and are dropped here:
-/// theirs exists so a holder of the invite can confirm the room, not so a
-/// browse can find it.
+/// newest. An index record flagged private is dropped here: this build
+/// publishes none, but one from an older build, or from anyone holding a room
+/// key, must not put a private room in front of a browse.
 fn listings_from_blobs(
     blobs: Vec<Vec<u8>>,
     joined_ids: &std::collections::HashSet<String>,
@@ -6112,12 +6149,12 @@ pub async fn gather_channels(
         .collect();
 
     let url = rendezvous_url(&state).await;
+    // The registry's deleted rooms, acted on as well as read: rooms we are in
+    // are left, and those proved deleted removed. As last read here when the
+    // registry cannot be reached, so a slow server does not put them back.
     let (directory, deleted) = tokio::join!(
         crate::network::rendezvous::fetch_channel_directory(&url, DIRECTORY_FETCH_TIMEOUT),
-        tokio::time::timeout(
-            DIRECTORY_FETCH_TIMEOUT,
-            crate::network::rendezvous::fetch_deleted_channel_ids(&url),
-        ),
+        super::room_deletion::settle_deleted_rooms(&app, &state),
     );
     // A rendezvous that is down or slow degrades Discover to whatever the DHT
     // walks below turn up, which is the right behaviour — but it used to be
@@ -6131,42 +6168,6 @@ pub async fn gather_channels(
             Vec::new()
         }
     };
-    let deleted: std::collections::HashSet<String> = match deleted {
-        Ok(Ok(ids)) => ids,
-        Ok(Err(error)) => {
-            tracing::warn!(?error, "deleted-channel list fetch failed; tombstoned rooms may still be listed");
-            Vec::new()
-        }
-        Err(_) => {
-            tracing::warn!("deleted-channel list fetch timed out; tombstoned rooms may still be listed");
-            Vec::new()
-        }
-    }
-    .into_iter()
-    .map(|id| id.to_ascii_lowercase())
-    .collect();
-    if !deleted.is_empty() {
-        let db = state.db.clone();
-        let ids: Vec<String> = deleted.iter().cloned().collect();
-        let walked = tokio::task::spawn_blocking(move || db.walk_out_deleted_channels(&ids))
-            .await
-            .ok()
-            .and_then(|walked| walked.ok())
-            .unwrap_or_default();
-        // As leaving does: transfers in a room we just walked out of would keep
-        // serving, and offers from it stay acceptable, while every frame that
-        // could settle them is now dropped.
-        for id in walked {
-            if let Ok(channel_id) = <[u8; 16]>::try_from(hex::decode(&id).unwrap_or_default().as_slice()) {
-                let _ = crate::commands::errors::bounded_send(
-                    &state.network_tx,
-                    NetworkCommand::DropChannelTransfers { channel_id, member: None },
-                )
-                .await;
-            }
-        }
-    }
-
     let mut walks: futures::stream::FuturesUnordered<_> = channel::all_index_keys()
         .into_iter()
         .zip(0u8..)
@@ -6338,16 +6339,21 @@ pub async fn cached_channels(
     state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<GatheredChannelInfo>, String> {
     let db = state.db.clone();
-    let (joined, cached) = tokio::task::spawn_blocking(move || discover_room_lists(&db))
-        .await
-        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
-        .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
+    let ((joined, cached), listed_deleted) = tokio::task::spawn_blocking(move || {
+        // Rooms the registry was last seen to list as deleted stay out of the
+        // cache's answer too; it is what a slow walk shows first.
+        discover_room_lists(&db).map(|lists| (lists, db.registry_deleted_ids().unwrap_or_default()))
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
 
     let joined_ids = inside_ids(&joined);
     let hidden: std::collections::HashSet<String> = joined
         .iter()
         .filter(|c| c.deleted)
         .map(|c| c.channel_id.clone())
+        .chain(listed_deleted)
         .collect();
     Ok(cached
         .into_iter()

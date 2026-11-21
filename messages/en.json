@@ -5179,5 +5179,8 @@
   "error_room_library_folder_gone": "That is no longer in their library.",
   "error_room_library_no_answer": "They didn't answer. They may be offline.",
   "error_room_library_busy": "Too many files are already waiting to download.",
-  "error_sharing_room_library_folder": "That folder is in a room library, or holds or sits inside one. Room library folders are never shared."
+  "error_sharing_room_library_folder": "That folder is in a room library, or holds or sits inside one. Room library folders are never shared.",
+  "channels_deleted_by_owner_badge": "Deleted by its owner",
+  "channels_deleted_by_owner_title": "Its owner deleted this room. It can't be joined; you can remove it from your list.",
+  "channels_room_deleted_toast": "{name} was deleted by its owner"
 }

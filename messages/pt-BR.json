@@ -5179,5 +5179,8 @@
   "error_room_library_folder_gone": "Isso não está mais na biblioteca.",
   "error_room_library_no_answer": "Sem resposta. A pessoa pode estar offline.",
   "error_room_library_busy": "Já há arquivos demais aguardando para baixar.",
-  "error_sharing_room_library_folder": "Essa pasta está em uma biblioteca da sala, ou contém uma ou fica dentro de uma. As pastas de uma biblioteca da sala nunca são compartilhadas."
+  "error_sharing_room_library_folder": "Essa pasta está em uma biblioteca da sala, ou contém uma ou fica dentro de uma. As pastas de uma biblioteca da sala nunca são compartilhadas.",
+  "channels_deleted_by_owner_badge": "Excluída pelo dono",
+  "channels_deleted_by_owner_title": "O dono excluiu esta sala. Não dá para entrar; você pode removê-la da sua lista.",
+  "channels_room_deleted_toast": "{name} foi excluída pelo dono"
 }

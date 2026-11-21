@@ -1534,6 +1534,7 @@ pub(crate) fn setup(app: &crate::host::AppHandle) -> Result<(), Box<dyn std::err
     auto_update::scheduler::spawn(app_handle.clone());
     ipfilter_update::spawn(app_handle.clone());
     commands::channel_recovery::spawn_startup_scan(app_handle.clone());
+    commands::room_deletion::spawn_deleted_rooms_watch(app_handle.clone());
     commands::room_dm::spawn_resends(app_handle.clone());
     commands::feeds::spawn_feeds(app_handle.clone());
 

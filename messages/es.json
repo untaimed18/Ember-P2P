@@ -5179,5 +5179,8 @@
   "error_room_library_folder_gone": "Eso ya no está en su biblioteca.",
   "error_room_library_no_answer": "No respondió. Puede que no esté conectado.",
   "error_room_library_busy": "Ya hay demasiados archivos esperando para descargarse.",
-  "error_sharing_room_library_folder": "Esa carpeta está en una biblioteca de sala, o contiene una o está dentro de una. Las carpetas de una biblioteca de sala nunca se comparten."
+  "error_sharing_room_library_folder": "Esa carpeta está en una biblioteca de sala, o contiene una o está dentro de una. Las carpetas de una biblioteca de sala nunca se comparten.",
+  "channels_deleted_by_owner_badge": "Eliminada por su propietario",
+  "channels_deleted_by_owner_title": "Su propietario eliminó esta sala. No se puede entrar; puedes quitarla de tu lista.",
+  "channels_room_deleted_toast": "{name} fue eliminada por su propietario"
 }

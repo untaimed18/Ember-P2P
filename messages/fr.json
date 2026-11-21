@@ -5179,5 +5179,8 @@
   "error_room_library_folder_gone": "Ce n'est plus dans sa bibliothèque.",
   "error_room_library_no_answer": "Pas de réponse. Cette personne est peut-être hors ligne.",
   "error_room_library_busy": "Trop de fichiers attendent déjà d'être téléchargés.",
-  "error_sharing_room_library_folder": "Ce dossier est dans une bibliothèque de salon, ou en contient une, ou s'y trouve. Les dossiers d'une bibliothèque de salon ne sont jamais partagés."
+  "error_sharing_room_library_folder": "Ce dossier est dans une bibliothèque de salon, ou en contient une, ou s'y trouve. Les dossiers d'une bibliothèque de salon ne sont jamais partagés.",
+  "channels_deleted_by_owner_badge": "Supprimé par son propriétaire",
+  "channels_deleted_by_owner_title": "Son propriétaire a supprimé ce salon. Vous ne pouvez plus le rejoindre, mais vous pouvez le retirer de votre liste.",
+  "channels_room_deleted_toast": "{name} a été supprimé par son propriétaire"
 }

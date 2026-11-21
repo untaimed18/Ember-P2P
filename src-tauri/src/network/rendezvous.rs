@@ -4095,7 +4095,7 @@ pub(crate) async fn fetch_complete_deleted_channel_ids(
 }
 
 /// The ids, and whether the server said they were all of them.
-async fn fetch_deleted_channel_id_pages(
+pub(crate) async fn fetch_deleted_channel_id_pages(
     base_url: &str,
 ) -> Result<(Vec<String>, bool), ChannelRegistryError> {
     require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
@@ -4153,6 +4153,104 @@ async fn fetch_deleted_channel_id_pages(
         }
     }
     Ok((out, false))
+}
+
+/// An owner's signed delete of a room, as the registry keeps it with the
+/// room's tombstone. Not to be believed until [`delete_proof_valid`] says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteProof {
+    pub(crate) channel_id: [u8; 16],
+    pub(crate) pubkey: [u8; 32],
+    pub(crate) ts: i64,
+    pub(crate) sig: [u8; 64],
+}
+
+/// Pages of `/v4/channels/deleted/proofs` followed. The server serves 500 a
+/// page, so this reaches 50,000 deleted rooms; past it, a room is left marked
+/// deleted rather than removed.
+const MAX_DELETE_PROOF_PAGES: usize = 100;
+
+/// Whether `proof` is the room's own key deleting the room: the key is the one
+/// the room's id is the hash of, and it signed the delete request.
+pub(crate) fn delete_proof_valid(proof: &DeleteProof) -> bool {
+    if crate::network::ember::channel::channel_id_from_pubkey(&proof.pubkey) != proof.channel_id {
+        return false;
+    }
+    let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&proof.pubkey) else {
+        return false;
+    };
+    let signed = build_channel_delete_v4_msg(&proof.channel_id, &proof.pubkey, proof.ts);
+    key.verify_strict(&signed, &ed25519_dalek::Signature::from_bytes(&proof.sig))
+        .is_ok()
+}
+
+fn parse_delete_proof(entry: &serde_json::Value) -> Option<DeleteProof> {
+    let mut channel_id = [0u8; 16];
+    hex::decode_to_slice(entry.get("channel_id")?.as_str()?, &mut channel_id).ok()?;
+    let mut pubkey = [0u8; 32];
+    hex::decode_to_slice(entry.get("pubkey")?.as_str()?, &mut pubkey).ok()?;
+    let mut sig = [0u8; 64];
+    hex::decode_to_slice(entry.get("sig")?.as_str()?, &mut sig).ok()?;
+    Some(DeleteProof {
+        channel_id,
+        pubkey,
+        ts: entry.get("ts")?.as_i64()?,
+        sig,
+    })
+}
+
+/// Every signed delete the registry keeps, as far as
+/// [`MAX_DELETE_PROOF_PAGES`] reaches. Whole pages, never a lookup by id:
+/// asking for the rooms this device was in would tell the server which they
+/// are. A server that predates proofs answers 404, which reads as none.
+pub(crate) async fn fetch_delete_proofs(base_url: &str) -> Result<Vec<DeleteProof>, ChannelRegistryError> {
+    require_https(base_url).map_err(|_| ChannelRegistryError::Unavailable)?;
+    let base = base_url.trim_end_matches('/');
+    let http = client(base_url)
+        .await
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_DELETE_PROOF_PAGES {
+        let url = match &cursor {
+            Some(after) => format!("{base}/v4/channels/deleted/proofs?after={}", urlencoding_hex(after)),
+            None => format!("{base}/v4/channels/deleted/proofs"),
+        };
+        let resp = http
+            .get(url)
+            .send()
+            .await
+            .map_err(|_| ChannelRegistryError::Unavailable)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(out);
+        }
+        if !resp.status().is_success() {
+            return Err(map_registry_status(resp.status()));
+        }
+        let body: serde_json::Value = serde_json::from_slice(
+            &read_bounded_bytes(resp, MAX_DIRECTORY_RESPONSE_BYTES)
+                .await
+                .map_err(|_| ChannelRegistryError::Unavailable)?,
+        )
+        .map_err(|_| ChannelRegistryError::Unavailable)?;
+        let Some(page) = body.get("proofs").and_then(|v| v.as_array()) else {
+            return Ok(out);
+        };
+        let page_was_empty = page.is_empty();
+        out.extend(page.iter().filter_map(parse_delete_proof));
+        let next = body
+            .get("next")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .filter(|next| !next.is_empty());
+        match next {
+            Some(next) if !page_was_empty && cursor.as_deref().is_none_or(|c| next.as_str() > c) => {
+                cursor = Some(next);
+            }
+            _ => return Ok(out),
+        }
+    }
+    Ok(out)
 }
 
 /// Percent-encode a cursor for use in a query string.
@@ -4442,6 +4540,49 @@ mod relay_ticket_tests {
         assert!(!is_transient_relay_ticket_read_error(
             "relay ticket status: status 403 Forbidden"
         ));
+    }
+}
+
+#[cfg(test)]
+mod delete_proof_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    fn signed(seed: u8, ts: i64) -> (DeleteProof, ed25519_dalek::SigningKey) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+        let channel_id = crate::network::ember::channel::channel_id_from_pubkey(&pubkey);
+        let sig = key.sign(&build_channel_delete_v4_msg(&channel_id, &pubkey, ts)).to_bytes();
+        (DeleteProof { channel_id, pubkey, ts, sig }, key)
+    }
+
+    #[test]
+    fn a_delete_signed_by_the_rooms_own_key_checks_out() {
+        let (proof, _) = signed(7, 1_700_000_000);
+        assert!(delete_proof_valid(&proof));
+    }
+
+    #[test]
+    fn a_delete_the_server_could_make_up_does_not() {
+        let (proof, _) = signed(7, 1_700_000_000);
+        // Another key's signature, put under this room.
+        let (other, _) = signed(8, 1_700_000_000);
+        assert!(!delete_proof_valid(&DeleteProof { sig: other.sig, ..proof.clone() }));
+        // A real delete of another room, moved onto this one.
+        assert!(!delete_proof_valid(&DeleteProof { channel_id: other.channel_id, ..proof.clone() }));
+        // The right key, but not the one this room's id is the hash of.
+        assert!(!delete_proof_valid(&DeleteProof { pubkey: other.pubkey, ..proof.clone() }));
+        // The time it was signed at is part of what was signed.
+        assert!(!delete_proof_valid(&DeleteProof { ts: proof.ts + 1, ..proof.clone() }));
+        // The registry spells it in JSON; malformed entries are skipped.
+        let entry = serde_json::json!({
+            "channel_id": hex::encode(proof.channel_id),
+            "pubkey": hex::encode(proof.pubkey),
+            "ts": proof.ts,
+            "sig": hex::encode(proof.sig),
+        });
+        assert_eq!(parse_delete_proof(&entry), Some(proof));
+        assert_eq!(parse_delete_proof(&serde_json::json!({ "channel_id": "zz" })), None);
     }
 }
 

@@ -38,6 +38,10 @@ export interface ChannelInfo {
   in_room: boolean;
   /** Owner has permanently deleted this room. */
   deleted: boolean;
+  /** The registry lists this room, which we do not own, as deleted, and no
+   *  signed delete from its owner has been seen yet. It cannot be joined; it
+   *  can be removed from the list. Absent from older backends. */
+  deleted_by_owner?: boolean;
   /** Only the owner may hand out invites. A guard against a careless re-share,
    *  not against a member who patches their client — they hold the key too. */
   invites_owner_only: boolean;
