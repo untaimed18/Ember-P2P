@@ -5125,5 +5125,6 @@
   "settings_history_data_search": "Search names and hashes",
   "settings_history_data_load_failed": "The download history could not be loaded.",
   "settings_history_data_remove_aria": "Remove {name} from the download history",
-  "settings_history_data_removed": "{name} was removed from the download history. Search no longer marks it."
+  "settings_history_data_removed": "{name} was removed from the download history. Search no longer marks it.",
+  "settings_history_data_download_aria": "Download {name} again"
 }

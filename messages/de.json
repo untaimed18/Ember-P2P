@@ -5125,5 +5125,6 @@
   "settings_history_data_search": "Namen und Hashes durchsuchen",
   "settings_history_data_load_failed": "Der Downloadverlauf konnte nicht geladen werden.",
   "settings_history_data_remove_aria": "{name} aus dem Downloadverlauf entfernen",
-  "settings_history_data_removed": "{name} wurde aus dem Downloadverlauf entfernt. Die Suche markiert die Datei nicht mehr."
+  "settings_history_data_removed": "{name} wurde aus dem Downloadverlauf entfernt. Die Suche markiert die Datei nicht mehr.",
+  "settings_history_data_download_aria": "{name} erneut herunterladen"
 }

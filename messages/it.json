@@ -5125,5 +5125,6 @@
   "settings_history_data_search": "Cerca nomi e hash",
   "settings_history_data_load_failed": "Impossibile caricare la cronologia download.",
   "settings_history_data_remove_aria": "Rimuovi {name} dalla cronologia download",
-  "settings_history_data_removed": "{name} è stato rimosso dalla cronologia download. La ricerca non lo segnala più."
+  "settings_history_data_removed": "{name} è stato rimosso dalla cronologia download. La ricerca non lo segnala più.",
+  "settings_history_data_download_aria": "Scarica di nuovo {name}"
 }

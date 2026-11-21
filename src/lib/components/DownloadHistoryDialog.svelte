@@ -1,7 +1,8 @@
 <script lang="ts">
   // The download history as Settings > Transfers counts it: every file
   // downloaded or cancelled that Search and friends' shared files mark, any
-  // of which can be removed so it is no longer marked.
+  // of which can be removed so it is no longer marked, and a cancelled one
+  // downloaded again.
   import * as m from '$lib/paraglide/messages';
   import {
     getDownloadHistoryEntries,
@@ -10,6 +11,8 @@
     type DownloadHistoryEntry,
     type DownloadHistoryStatus,
   } from '$lib/api/search';
+  import { startDownload } from '$lib/api/transfers';
+  import { alreadyQueuedText } from '$lib/alreadyQueued';
   import type { DownloadHistoryStats } from '$lib/types';
   import { translateError } from '$lib/i18n';
   import { toastsFor } from '$lib/stores/toast';
@@ -21,7 +24,7 @@
   import { prefersReducedMotion } from 'svelte/motion';
   import { inertBackground, trapTabKey } from '$lib/a11y';
 
-  const { toastSuccess } = toastsFor('downloads');
+  const { toast, toastSuccess } = toastsFor('downloads');
 
   let { open = $bindable(false), onchange }: { open?: boolean; onchange?: () => void } = $props();
 
@@ -52,6 +55,8 @@
   let loadError = $state<string | null>(null);
   /** Files whose removal is on its way. */
   let removing = $state<string[]>([]);
+  /** Cancelled files being started again. */
+  let downloading = $state<string[]>([]);
   let error = $state<string | null>(null);
   let loadSeq = 0;
   /** Files removed since the dialog opened. */
@@ -269,6 +274,29 @@
     }
   }
 
+  /** A cancelled file can be started again from what the history kept of it,
+   *  as its eD2K link would be: a name and a size are needed for that. */
+  function canDownload(entry: DownloadHistoryEntry): boolean {
+    return entry.status === 'cancelled' && !!entry.file_name && entry.file_size > 0;
+  }
+
+  async function download(entry: DownloadHistoryEntry) {
+    const hash = entry.file_hash;
+    if (downloading.includes(hash)) return;
+    downloading = [...downloading, hash];
+    error = null;
+    try {
+      const res = await startDownload(hash, entry.file_name, entry.file_size, '', 0);
+      if (unmounted) return;
+      if (res.already_queued) toast(alreadyQueuedText(res, entry.file_name));
+      else toastSuccess(m.search_download_queued());
+    } catch (e: unknown) {
+      if (!unmounted) error = translateError(e, m.browse_download_failed());
+    } finally {
+      if (!unmounted) downloading = downloading.filter((h) => h !== hash);
+    }
+  }
+
   /** The button pressed leaves with its row, fading out first, which would
    *  drop focus out of the dialog. Hand it to the row that took that place. */
   function focusAfterRemoving(removedHash: string, nextHash: string | undefined) {
@@ -417,9 +445,23 @@
                     <span class="hash" title={entry.file_hash}>{entry.file_hash}</span>
                   </span>
                 </div>
+                {#if canDownload(entry)}
+                  <button
+                    type="button"
+                    class="secondary row-btn"
+                    onclick={() => void download(entry)}
+                    aria-disabled={downloading.includes(entry.file_hash)}
+                    aria-label={m.settings_history_data_download_aria({ name: fileName(entry) })}
+                  >
+                    {#if downloading.includes(entry.file_hash)}
+                      <span class="spinner xs current" aria-hidden="true"></span>
+                    {/if}
+                    {m.browse_download()}
+                  </button>
+                {/if}
                 <button
                   type="button"
-                  class="secondary remove-btn"
+                  class="secondary row-btn remove-btn"
                   data-hash={entry.file_hash}
                   onclick={() => void remove(entry)}
                   aria-disabled={removing.includes(entry.file_hash)}
@@ -698,7 +740,7 @@
     color: var(--text-secondary);
   }
 
-  .remove-btn {
+  .row-btn {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -707,7 +749,7 @@
     font-size: var(--font-size-sm);
   }
   /* Busy, not disabled: a disabled button drops focus out of the dialog. */
-  .remove-btn[aria-disabled='true'],
+  .row-btn[aria-disabled='true'],
   .history-more button[aria-disabled='true'] {
     cursor: wait;
     opacity: 0.65;

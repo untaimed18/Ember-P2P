@@ -5125,5 +5125,6 @@
   "settings_history_data_search": "Szukaj nazw i hashy",
   "settings_history_data_load_failed": "Nie udało się wczytać historii pobierania.",
   "settings_history_data_remove_aria": "Usuń {name} z historii pobierania",
-  "settings_history_data_removed": "Usunięto {name} z historii pobierania. Wyszukiwanie już go nie oznacza."
+  "settings_history_data_removed": "Usunięto {name} z historii pobierania. Wyszukiwanie już go nie oznacza.",
+  "settings_history_data_download_aria": "Pobierz ponownie {name}"
 }

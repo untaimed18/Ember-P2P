@@ -5125,5 +5125,6 @@
   "settings_history_data_search": "Поиск по именам и хешам",
   "settings_history_data_load_failed": "Не удалось загрузить историю загрузок.",
   "settings_history_data_remove_aria": "Удалить {name} из истории загрузок",
-  "settings_history_data_removed": "{name} удалён из истории загрузок. Поиск больше не отмечает этот файл."
+  "settings_history_data_removed": "{name} удалён из истории загрузок. Поиск больше не отмечает этот файл.",
+  "settings_history_data_download_aria": "Скачать {name} снова"
 }

@@ -5125,5 +5125,6 @@
   "settings_history_data_search": "Buscar nombres y hashes",
   "settings_history_data_load_failed": "No se pudo cargar el historial de descargas.",
   "settings_history_data_remove_aria": "Quitar {name} del historial de descargas",
-  "settings_history_data_removed": "Se quitó {name} del historial de descargas. La búsqueda ya no lo marca."
+  "settings_history_data_removed": "Se quitó {name} del historial de descargas. La búsqueda ya no lo marca.",
+  "settings_history_data_download_aria": "Volver a descargar {name}"
 }

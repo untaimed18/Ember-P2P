@@ -5125,5 +5125,6 @@
   "settings_history_data_search": "搜索名称和哈希",
   "settings_history_data_load_failed": "无法加载下载历史。",
   "settings_history_data_remove_aria": "从下载历史中移除 {name}",
-  "settings_history_data_removed": "已从下载历史中移除 {name}，搜索不再标记它。"
+  "settings_history_data_removed": "已从下载历史中移除 {name}，搜索不再标记它。",
+  "settings_history_data_download_aria": "重新下载 {name}"
 }
