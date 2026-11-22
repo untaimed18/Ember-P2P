@@ -197,6 +197,30 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   same web interface behind a switch, as *Decisions* there describes. Its
   server-side host types also give tests of the network loop an event sink
   without Tauri's `test` feature (see *Split `NetworkState` per stack* below).
+  Found by the 1.8.0 checks, and hidden in the browser for now rather than
+  built:
+  - *Save to this computer* for what emberd keeps outside the Library: feed
+    downloads (Feeds' Open, Show in folder and Open feed folder call
+    `#[desktop]` commands), received chat attachments and room-library
+    fetches. `/api/file` serves indexed files only, and these are never
+    indexed; extending `open_library_file_for_download` to the feed and
+    receive folders is the likely route.
+  - *Share every Ember release* (`seed_ember_releases`): `release_share.rs`
+    holds the setting and the seed folder, but the fetch is driven from
+    `commands/updater.rs`, which emberd does not build. A server that stays on
+    is what the switch is for, so move the release fetch out of the desktop
+    updater.
+  - *Watch the clipboard for ed2k links*: never started in the browser.
+  - The setup wizard still shows the eMule import step on emberd, where the
+    folder picker is hidden and `emule_import_none_found` says to choose one.
+  - Library Delete on emberd goes to the user's trash, which nothing on a
+    server empties. 1.8.0 stops walks entering `.Trash*` folders, so a file
+    deleted from a mount's top folder is no longer shared again, but the
+    space is not freed. Deleting outright on emberd (with its confirmation
+    saying so) is the likely answer.
+  - `get_security_policy_state` and the `security-policy-reset-required` event
+    still carry the backend's raw reason, which can hold a path; the page
+    only logs it now. Send a code instead.
 
 ## 6. Code health
 
@@ -204,8 +228,8 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   produced the original starvation bug, and it is still the most pressing
   architectural risk in the codebase. Each stack would get its own task with
   an explicit message boundary. It is a redesign rather than code motion, so it
-  needs integration testing against live peers. `command.rs` is separable and
-  `NetworkDeps` gives the entry point a real signature. Today only
+  needs integration testing against live peers. `network/command.rs` is
+  separable and `NetworkDeps` gives the entry point a real signature. Today only
   `start_network` builds a `NetworkState`, from live sockets and managers; a
   state tests can build comes with the split, and with it a test of private
   messages through two network loops for their routing (the wire, storage and
@@ -215,9 +239,39 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
 - **Overnight runs of Ember itself, and property tests for more of it.** The
   fuzz loops and the `*_invariants_hold` property tests (the Ember routing
   table, the batch publisher, private-message pacing) run 200 times longer
-  each night from a new seed (`soak.yml`, `src/fuzz.rs`). Still missing: a
+  each night from a new seed (`soak.yml`, `src-tauri/src/fuzz.rs`). Still missing: a
   build left running against the live network, and the same kind of test for
   the record store and the KAD routing table.
+- **Dependency advisories left open at 1.8.0** (`cargo audit --file
+  src-tauri/Cargo.lock`; the rendezvous server's lock was clean):
+  - *SQLite* (RUSTSEC-2026-0459): the SQLite `libsqlite3-sys` 0.38 bundles
+    returns stale page-cache memory for a crafted database opened beside a
+    `-wal` of another page size. Local only, a malicious backup being the way
+    in. Fixed by `rusqlite` 0.41 (`libsqlite3-sys` 0.39, SQLite 3.54); a minor
+    API bump across the database layer, so run both builds' full suites on
+    Windows and Linux after it. Decided at 1.8.0 to take it after the release.
+  - *`rsa` 0.9* (RUSTSEC-2023-0071, the Marvin timing attack): the SecIdent
+    signatures any eMule peer can ask for are made with it. Hard to use over
+    the internet's noise, and 0.10 is a new API (`crypto-bigint`), so it waits
+    for a release with room to test SecIdent against eMule again.
+  - *`zip` 4.6*, pulled in by `tauri-plugin-updater` 2.14.x, has six open
+    advisories. Four are in `ZipArchive::extract` (SUID bits, symlinks out of
+    the folder, permissions through symlinks, an abort on a large symlink
+    entry), the only `zip` call the plugin makes, and only on an update
+    archive whose minisign signature checked out, so only a signed release
+    could use them. The other two, `ZipStreamReader` names and AES entries
+    returned unchecked, are in APIs the plugin does not call.
+    `.cargo/audit.toml` accepts the first three; add RUSTSEC-2026-0429, -0545
+    and -0548 with the same reasoning, or `cargo audit` from `src-tauri`
+    fails. Take the plugin release that moves to `zip` 9, or turn off its
+    default `zip` feature once every platform's update artifact is known to
+    need none of it.
+  - Unmaintained, nothing to fix yet: `chrono`, `paste`, `proc-macro-error`,
+    `zbus_names` and `zvariant` (through the notification and single-instance
+    plugins), and `glib` 0.18 marked unsound (through WebKitGTK).
+    `async-executor` 1.14.0, through `zbus`, has been yanked; a lock update
+    moves it. `cargo audit` in `ci.yml` would catch the next one when it lands
+    rather than at a release.
 - **Find out why most known peers show verification as Needed.** SecureIdent is
   per session, which explains part of it. Run 30 to 60 minutes with
   `RUST_LOG=info,ember_lib::network::ed2k::transfer=debug` and compare each
@@ -232,6 +286,123 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   form for 2 to 4 and show the count in their singular, which serves 21, 31
   and so on; `channels_reactors_others_*` needed nothing, as `ещё {count}`
   takes no noun.
+- **A native speaker's read of the 1.8.0 rewrites in every language.** The
+  wording audit rewrote about 370 strings and renamed rooms to channels in
+  about 240, in all nine translations, by machine and checked by script only
+  (placeholders, completeness, no word for "room" left). Most at risk: the
+  grammatical gender every "channel" sentence changed in es, it, pt-BR, ru
+  and pl (`channels_deleted_elsewhere_body` and the `Transferred` badge
+  follow a name whose gender changed); Chinese, which calls the Library
+  文件库, 资源库 and 媒体库 in different places, and zh-TW's 共享 against 分享
+  for "share"; de `Kürzlich` and pl `Ugruntowany` for the KAD contact types
+  *Recent* and *Established*; and es and ru, whose word for a channel ban is
+  the one for blocking a friend.
+- **Missing `_few` plural forms.** `emule_import_servers_*`,
+  `emule_import_folder_subfolders_*` and `layout_channels_recovered_*` have
+  `_one` and `_other` only, so Russian and Polish show the wrong form for 2
+  to 4. Add the variant and pass it in the `plural()` call.
+- **`channels_deleted_elsewhere_body` is half a sentence** shown after the
+  channel's name in bold, which several languages cannot word that way. Give
+  it a `{name}` and draw the bold part inside it.
+
+## 8. Left from the 1.8.0 checks
+
+Found by the reviews of every area before 1.8.0 shipped, and left for after
+it: each is low in severity, needs unusual conditions, or needs more change
+than a release candidate should take. What was fixed then is in commit
+`929f0c57` and the wording pass in `2fccc83d`.
+
+**Channels** (rooms in the code):
+
+- **Two owning devices, past the ban cap.** 1.8.0 merges the bans of a
+  snapshot this device does not take (`take_owned_snapshot_bans_locked`) and
+  dates owner unbans. If the two devices' bans together pass the 12 a snapshot
+  carries, a republish drops the oldest and lifts them for the room. Refuse a
+  ban past the cap, or rotate and carry the newest.
+- **Two owning devices, the 6-hour republish.** An ordinary edit or a rotation
+  no longer goes ahead without an answered read, but the owner pass still
+  signs after `owner_republish_read_gate` has deferred for 6 hours. Owing a
+  rotation then, it could mint an epoch number the other device already used.
+  Apply the rotation rule (`owner_rotation_waits_for_first_read`) there too.
+  A ban lifted this way is now taken back once the device reads the other's
+  snapshot.
+- **Two owning devices, evicted rows.** In a room past 256 members an
+  unbanned member's row can be evicted, and an old cached snapshot that still
+  banned them would ban them again. It errs toward keeping someone banned.
+- **The unsigned deleted list blocks rejoining.** A room the rendezvous
+  server lists as deleted walks its members out and refuses re-entry and new
+  invites (`refuse_deleted_channel`, `enter_stored_channel`) until a complete
+  list no longer names it, though only a verified delete proof removes its
+  history. A buggy or compromised server could lock members out of a private
+  room this way. Chosen in 1.8.0 so a deleted room cannot come back; the
+  alternative keeps the walk-out and the *Deleted by its owner* label but
+  lets members back in until a proof removes the room.
+- **Library fetches and ordinary file offers share receive slots unevenly.**
+  The fetch scheduler counts requested fetches as holding a receive slot, but
+  `xfer_accept_refusal` (`channel_xfer.rs`) does not, so accepting ordinary
+  offers can take the slot a fetch is waiting with, and its file then fails
+  as busy. Count `room_library.held_receives()` there for ordinary accepts,
+  without the fetch's own accept counting itself.
+- **One member can stall room-mail collection.** Past the 120 stored an hour
+  from one sender, that member's entries come back `Later`, and `left_behind`
+  ends the batch; if the server's oldest 32 are all theirs, other
+  conversations' mail waits for the hour (`room_dm_mail.rs`, `collect`).
+  Fetch a member who is full apart, or leave their boxes out of the batch.
+- **The "Ember Network is off" branches are dead.** The network is always on
+  (`ember_native_enabled` is forced true on load and save), so `emberOff` on
+  the Channels and Feeds pages is never true, and `channels_disabled_*`,
+  `feeds_disabled_body`, `feeds_state_paused_off` and
+  `feeds_discover_off_body` are never shown. The same goes for the
+  `channels_ember_disabled` error the Rust side still returns
+  (`commands/channels.rs`, `channel_recovery.rs`, `network/command.rs`).
+  About twenty conditions on those two pages read it, with more in Search,
+  the sidebar and the Library; take them out with the keys.
+
+**Feeds and the Library:**
+
+- **A partly shared parent folder.** When a download folder, or a folder
+  holding it, is shared with only some files picked (or as an eMule flat
+  share), *Share files from this feed* adds nothing (`feed_shares::plan`
+  counts that share as covering the feed's folder) and the walk then refuses
+  `Feeds/<feed>`, so the feed's finished files are never offered. Adding the
+  folder as a root of its own breaks the no-overlap rule; add it to that
+  share's allowlist instead.
+
+**Network:**
+
+- **The interface flapping just after the wait.** If the chosen interface goes
+  away again between the wait ending (`hold_address`) and the upload listener
+  binding, the bind fails with `AddrNotAvailable`, is reported as "TCP port
+  already in use", and is never retried, so the session has no inbound TCP.
+  The separate QUIC socket has the same window. Wait for the interface and
+  retry when `net_bind` is configured, or at least say the interface is not
+  connected.
+- **Other commands sent during that wait are still dropped.** 1.8.0 keeps the
+  settings ones (`hold_settings_before_start`); the rest are answered or
+  failed as before. The shared-file reconcile at startup sends one
+  (`SharedFilesChangedAck`), so `reconcile_shared_files` logs "Startup
+  shared-file reconciliation failed" when Ember starts with its VPN down;
+  harmless, as the network reads the index when it starts.
+- **The KAD firewall tile says Firewalled before anything checked.** It does so
+  as soon as KAD connects whenever UPnP did not map, while the TCP tile beside
+  it still says Unknown (`NetworkStatusTiles.svelte`, `kad_firewall_*`). Show
+  *Checking…* until KAD's TCP check has answered.
+
+**Wording the 1.8.0 audit left:**
+
+- The native dialogs say "Recycle Bin" on Linux and macOS too
+  (`commands/sharing.rs` around 3497, `commands/settings.rs` around 3551),
+  where the rest of Ember says Trash.
+- The eD2K server log on the eD2K Servers page is English with raw OS errors,
+  and says "Added 1 servers" (`network/event_loop/server_connect_result.rs`
+  and `server_tick.rs`, through `emit_server_log` in `network/server.rs`). The eMule import's "cannot be Ember's download folder"
+  error is English too (`emule_import/mod.rs`).
+- Three file pickers have no translated title and English filter names: the
+  IP filter (`commands/security.rs`), the backup save and open
+  (`commands/backup.rs`) and the media player (`commands/settings.rs`).
+- Spellings still split across the English: "this computer" and "this
+  device", "your library" and "your Library", "checked" and "ticked",
+  British and American spellings, and "Failed to…" beside "Could not…".
 
 ## Considered and dropped
 
