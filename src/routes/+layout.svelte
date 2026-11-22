@@ -539,7 +539,9 @@
       void getSecurityPolicyState()
         .then((status) => {
           if (mounted && status.resetRequired) {
-            policyResetReason = status.reason || m.layout_policy_reset_unknown_reason();
+            // The backend's reason is untranslated diagnostic text.
+            if (status.reason) console.warn('Security policy reset required:', status.reason);
+            policyResetReason = m.layout_policy_reset_unknown_reason();
           }
         })
         .catch((e) => console.error('Failed to read security-policy state:', e));

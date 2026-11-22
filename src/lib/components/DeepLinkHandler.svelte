@@ -87,7 +87,7 @@
     if (preview.kind === 'server') return preview.endpoint ?? '';
     if (preview.kind === 'serverList') return preview.host ?? '';
     if (preview.kind === 'channel') {
-      return `${preview.name ?? m.nav_channels()}\n${preview.hash ?? ''}`;
+      return m.deeplink_channel_confirm({ name: preview.name ?? preview.hash ?? '' });
     }
     if (preview.kind === 'friend') {
       return m.deeplink_friend_confirm({ hash: preview.hash ?? '' });

@@ -44,6 +44,14 @@ describe('translateError', () => {
     expect(text).toContain('boom');
   });
 
+  it('drops the separator a message keeps for a detail the backend left out', () => {
+    const colon = translateError(coded('collections_load_failed', 'English fallback'));
+    expect(colon).toMatch(/collection$/i);
+    const aside = translateError(coded('collections_too_large', 'English fallback'));
+    expect(aside).toMatch(/large$/i);
+    expect(aside).not.toMatch(/[()]/);
+  });
+
   it('falls back to the embedded English for a code the catalog has no key for', () => {
     // A newer backend against an older UI must not produce a blank error.
     const text = translateError(coded('a_code_that_will_never_exist', 'Something went wrong'));

@@ -65,7 +65,7 @@
   import IconGear from '$lib/components/IconGear.svelte';
   import FriendSettingsDialog from '$lib/components/FriendSettingsDialog.svelte';
   import { OpenFriend } from '$lib/openFriend.svelte';
-  import { chatAllowedWith, friendNameTooLong, friendOverrides, FRIEND_NAME_MAX_CHARS } from '$lib/friendSettings';
+  import { chatAllowedWith, chatOffByFriendSetting, friendNameTooLong, friendOverrides, FRIEND_NAME_MAX_CHARS } from '$lib/friendSettings';
 
   let friends: FriendInfo[] = $derived($friendsListStore);
   function chatDisabledFor(hash: string): boolean {
@@ -1648,7 +1648,9 @@
             onclick={() => openChat(f)}
             disabled={chatDisabledFor(f.user_hash)}
             title={chatDisabledFor(f.user_hash)
-              ? m.chat_dock_chat_disabled()
+              ? chatOffByFriendSetting($appSettings, f.user_hash)
+                ? m.chat_dock_chat_disabled_friend()
+                : m.chat_dock_chat_disabled()
               : isOnline ? m.friends_encrypted_chat_title() : m.friends_action_chat()}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">

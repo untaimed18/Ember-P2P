@@ -500,7 +500,7 @@ fn passwd(config_path: Option<&Path>, stdin: bool) -> i32 {
         read_line_hidden(None)
     } else {
         let first = read_line_hidden(Some("New password: "));
-        let second = read_line_hidden(Some("Again: "));
+        let second = read_line_hidden(Some("Type the password again: "));
         match (first, second) {
             (Ok(a), Ok(b)) if a == b => Ok(a),
             (Ok(_), Ok(_)) => {

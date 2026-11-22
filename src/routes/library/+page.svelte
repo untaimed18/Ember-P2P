@@ -6402,7 +6402,9 @@
           onclick={() => ctxAction('friends_only')}
           title={m.library_friends_only_hint()}
         >{multi
-          ? m.library_ctx_friends_only_count({ count: formatNumber(ctxMenu.file.friends_only ? checkedUnrestrictCount : checkedRestrictCount) })
+          ? ctxMenu.file.friends_only
+            ? m.library_ctx_share_everyone_count({ count: formatNumber(checkedUnrestrictCount) })
+            : m.library_ctx_friends_only_count({ count: formatNumber(checkedRestrictCount) })
           : m.library_friends_only_toggle()}</button>
         <button class="ctx-item" role="menuitem" disabled={bulkLocked} onclick={() => ctxAction('unshare')}>
           {multi ? m.library_ctx_unshare_count({ count: formatNumber(checkedUnshareCount) }) : m.library_bulk_unshare()}

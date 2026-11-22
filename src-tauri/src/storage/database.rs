@@ -1058,7 +1058,8 @@ impl OpenFailure {
             ),
             Self::Other => format!(
                 "Ember could not open its database.\n\n{error:#}\n\n\
-                 The log files in the logs folder of {data_dir} have the details."
+                 Restart your computer and try again. If it still fails, report the \
+                 problem and include the log files from the logs folder in {data_dir}."
             ),
         }
     }

@@ -317,7 +317,7 @@ async fn download_root_reapproval_authorized(
     }
     let folder = download_folder.to_string();
     let prompt = format!(
-        "Ember no longer recognises the folder at:\n\n{}\n\nRe-approve it only if you moved this folder or reconnected the drive yourself. If something else was put at this path, re-approving gives Ember's downloads access to whatever is there now.",
+        "Ember no longer recognises the folder at:\n\n{}\n\nRe-approve it only if you moved this folder or reconnected the drive yourself. If something else was put at this path, re-approving gives Ember's downloads access to whatever is there now. If you keep it blocked, downloads can't be saved until you choose a download folder in Settings → Transfers.",
         elide_for_dialog(download_folder)
     );
     // An absent root keeps its record (`build_next` retains it on `NotFound`)

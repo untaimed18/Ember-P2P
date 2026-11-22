@@ -4,6 +4,7 @@
  * for it to answer, and reloads the page.
  */
 
+import * as m from '$lib/paraglide/messages';
 import { REQUEST_HEADER } from './session';
 
 const POLL_MS = 1_000;
@@ -25,7 +26,7 @@ export async function relaunch(): Promise<void> {
     credentials: 'same-origin',
     headers: { [REQUEST_HEADER]: '1' },
   });
-  if (!response.ok) throw new Error(`emberd answered ${response.status}`);
+  if (!response.ok) throw new Error(m.web_runtime_bad_status({ status: response.status }));
   const started = Date.now();
   // First the old process going away, then the new one answering.
   let down = false;
@@ -38,7 +39,7 @@ export async function relaunch(): Promise<void> {
       return;
     }
   }
-  throw new Error('emberd did not come back after restarting');
+  throw new Error(m.web_runtime_restart_lost());
 }
 
 export async function exit(_code?: number): Promise<void> {}

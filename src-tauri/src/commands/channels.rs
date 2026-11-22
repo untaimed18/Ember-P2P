@@ -476,31 +476,52 @@ fn username_claim_key(display: &str) -> String {
     display.to_lowercase()
 }
 
-fn registry_fail(err: crate::network::rendezvous::ChannelRegistryError, taken: &'static str) -> String {
+/// What a Rendezvous registry call was doing, so its refusal reads right.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistryOp {
+    /// Claiming the channel username.
+    Username,
+    /// Claiming or renaming a channel name.
+    Name,
+    /// Deleting a channel.
+    Delete,
+}
+
+fn registry_fail(err: crate::network::rendezvous::ChannelRegistryError, op: RegistryOp) -> String {
+    use crate::network::rendezvous::ChannelRegistryError as E;
     match err {
-        crate::network::rendezvous::ChannelRegistryError::Taken => coded(
-            taken,
+        E::Taken if op == RegistryOp::Username => coded(
+            "channels_username_taken",
             "That name is already taken",
         ),
-        crate::network::rendezvous::ChannelRegistryError::Forbidden => coded(
+        E::Taken => coded("channels_name_taken", "That name is already taken"),
+        E::Forbidden if op == RegistryOp::Delete => coded(
             "channels_delete_forbidden",
-            "Only the channel owner can delete this room",
+            "Only the channel owner can delete this channel",
         ),
-        crate::network::rendezvous::ChannelRegistryError::Invalid => coded(
-            "channels_name_invalid",
-            "Channel name must not be empty",
+        E::Forbidden => coded(
+            "channels_registry_forbidden",
+            "Ember Rendezvous refused this change: only the owner of this channel or name can make it",
         ),
-        crate::network::rendezvous::ChannelRegistryError::Unavailable => coded(
+        E::Invalid if op == RegistryOp::Delete => coded(
+            "channels_registry_rejected",
+            "Ember Rendezvous rejected this request",
+        ),
+        E::Invalid => coded(
+            "channels_registry_invalid",
+            "Ember Rendezvous didn't accept that name. Choose a different one",
+        ),
+        E::Unavailable => coded(
             "channels_registry_unavailable",
-            "The name registry is unreachable; try again when online",
+            "Ember Rendezvous can't be reached; try again when online",
         ),
-        crate::network::rendezvous::ChannelRegistryError::TooSoon => coded(
+        E::TooSoon => coded(
             "channels_rename_too_soon",
-            "A room can be renamed once a day",
+            "A channel can be renamed once a day",
         ),
-        crate::network::rendezvous::ChannelRegistryError::Unsupported => coded(
+        E::Unsupported => coded(
             "channels_rename_unsupported",
-            "Renaming rooms isn't available on this server yet",
+            "Renaming channels isn't available on this server yet",
         ),
     }
 }
@@ -644,7 +665,7 @@ pub(crate) async fn claim_username_on_registry(
         &key,
     ))
     .await
-    .map_err(|e| registry_fail(e, "channels_username_taken"))?;
+    .map_err(|e| registry_fail(e, RegistryOp::Username))?;
     Ok(display)
 }
 
@@ -988,7 +1009,7 @@ pub async fn create_channel(
     .await
     {
         discard_partial_channel(&state, &channel_id_hex).await;
-        return Err(registry_fail(e, "channels_name_taken"));
+        return Err(registry_fail(e, RegistryOp::Name));
     }
 
     let nickname = username;
@@ -1773,7 +1794,7 @@ pub async fn delete_owned_channel(
         &channel_seed,
     ))
     .await
-    .map_err(|e| registry_fail(e, "channels_name_taken"))?;
+    .map_err(|e| registry_fail(e, RegistryOp::Delete))?;
     retire_deleted_room(&state, &owned).await
 }
 
@@ -2156,7 +2177,7 @@ pub async fn edit_channel_message(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_edit_failed", "Failed to load message", e))?
-    .ok_or_else(|| coded("channels_not_found", "Message not found"))?;
+    .ok_or_else(|| coded("channels_message_not_found", "That message no longer exists"))?;
 
     if !target.sender_pubkey.eq_ignore_ascii_case(&sender) {
         return Err(coded(
@@ -2402,7 +2423,7 @@ pub async fn set_channel_message_reaction(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_reaction_failed", "Failed to load message", e))?
-    .ok_or_else(|| coded("channels_not_found", "Message not found"))?;
+    .ok_or_else(|| coded("channels_message_not_found", "That message no longer exists"))?;
 
     let join_secret = join_secret_for_channel(&state, &row)
         .await
@@ -2614,7 +2635,7 @@ pub async fn delete_channel_message(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_remove_message_failed", "Could not remove the message", e))?;
     if !removed {
-        return Err(coded("channels_not_found", "Message not found"));
+        return Err(coded("channels_message_not_found", "That message no longer exists"));
     }
     Ok(())
 }
@@ -4868,7 +4889,7 @@ pub async fn rename_channel(
         ))
         .await
     };
-    granted.map_err(|e| registry_fail(e, "channels_name_taken"))?;
+    granted.map_err(|e| registry_fail(e, RegistryOp::Name))?;
     // The name is ours now, so its snapshot must not be refused for a read
     // that lapsed or landed during the round trip: waited for, not refused.
     crate::network::channel_membership::wait_for_owner_read(&channel_id).await;
@@ -5363,8 +5384,8 @@ pub async fn set_channel_successor_nominee(
         .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
         if !ok {
             return Err(coded(
-                "channels_member_invalid",
-                "That member is not in this room",
+                "channels_member_not_in_channel",
+                "That person is no longer a member of this channel",
             ));
         }
     }
@@ -6593,8 +6614,8 @@ pub async fn transfer_channel_ownership(
     .map_err(|e| coded_ctx("channels_handoff_failed", "Could not start transfer", e))?;
     if !member_ok {
         return Err(coded(
-            "channels_member_invalid",
-            "That member is not in this room",
+            "channels_member_not_in_channel",
+            "That person is no longer a member of this channel",
         ));
     }
     let version = chrono::Utc::now().timestamp().max(1) as u64;

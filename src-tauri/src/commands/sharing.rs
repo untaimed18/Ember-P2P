@@ -7397,7 +7397,7 @@ pub async fn reapprove_shared_folders(
         );
         let approved = crate::host::confirm_blocking(
             &dialog_app,
-            crate::host::Confirm::new("Re-approve shared folders?", prompt, "Re-approve all", "Keep blocked"),
+            crate::host::Confirm::new("Re-approve shared folders?", prompt, "Re-approve all", "Keep unshared"),
         );
         Some((pending, approved))
     })
@@ -7489,7 +7489,7 @@ pub async fn reapprove_shared_folder(
         }
         Ok(Some(crate::host::confirm_blocking(
             &dialog_app,
-            crate::host::Confirm::new("Re-approve shared folder?", prompt, "Re-approve", "Keep blocked"),
+            crate::host::Confirm::new("Re-approve shared folder?", prompt, "Re-approve", "Keep unshared"),
         )))
     })
     .await

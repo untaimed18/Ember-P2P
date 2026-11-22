@@ -120,7 +120,7 @@
       {:else if $updater.phase === 'downloading'}
         {percent !== null ? m.updater_downloading_pct({ pct: percent }) : m.updater_downloading()}
       {:else if $updater.phase === 'error'}
-        {m.updater_error_body({ detail: $updater.error ?? '' })}
+        {$updater.error ? m.updater_error_body({ detail: $updater.error }) : m.updater_check_failed()}
       {:else if tooOld}
         {systemTooOldMessage(tooOld)}
       {:else}

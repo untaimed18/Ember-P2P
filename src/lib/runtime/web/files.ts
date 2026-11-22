@@ -1,3 +1,4 @@
+import * as m from '$lib/paraglide/messages';
 import { REQUEST_HEADER } from './session';
 
 /** Have the browser save what `url` answers with. */
@@ -45,7 +46,7 @@ export async function uploadFile(url: string, file: File): Promise<unknown> {
     // The status is all there is.
   }
   if (response.ok && reply && 'ok' in reply) return reply.ok;
-  throw reply?.error ?? `emberd answered ${response.status}`;
+  throw reply?.error ?? m.web_runtime_bad_status({ status: response.status });
 }
 
 /**

@@ -4,6 +4,7 @@
  * runs the same command the desktop app's IPC would.
  */
 
+import * as m from '$lib/paraglide/messages';
 import { loggedOut, REQUEST_HEADER } from './session';
 
 export type InvokeArgs = Record<string, unknown>;
@@ -22,7 +23,7 @@ export async function invoke<T>(cmd: string, args?: InvokeArgs): Promise<T> {
   try {
     body = await response.json();
   } catch {
-    throw `emberd answered ${response.status} without a reply`;
+    throw m.web_runtime_bad_status({ status: response.status });
   }
   if ('error' in body) throw body.error;
   return body.ok as T;

@@ -895,7 +895,9 @@
                 {needle
                   ? m.chat_dock_no_matches()
                   : chatDisabled
-                    ? m.chat_dock_chat_disabled()
+                    ? $appSettings?.friend_chat_disabled === true
+                      ? m.chat_dock_chat_disabled()
+                      : m.chat_dock_chat_disabled_all()
                     : m.chat_dock_no_friends()}
               </p>
             {/if}

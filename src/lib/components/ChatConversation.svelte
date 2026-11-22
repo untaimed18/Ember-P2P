@@ -95,7 +95,7 @@
   import { portal } from '$lib/actions/portal';
   import { rovingToolbar } from '$lib/actions/rovingToolbar';
   import { appSettings } from '$lib/stores/settings';
-  import { chatAllowedWith, disappearSecsFor, readReceiptsWith } from '$lib/friendSettings';
+  import { chatAllowedWith, chatOffByFriendSetting, disappearSecsFor, readReceiptsWith } from '$lib/friendSettings';
   import { getDraft, setDraft, clearDraft, registerDraftFlusher } from '$lib/stores/chatTabs';
   import { firstRowBelow, recalledScroll, rememberScroll, type ScrollSpot } from '$lib/chatScrollMemory';
   import { insertAtSelection } from '$lib/emojiPicker';
@@ -265,6 +265,9 @@
   // will be rejected.
   let chatDisabled = $derived(
     !isChannel && !!friendHash && !chatAllowedWith($appSettings, friendHash),
+  );
+  let chatOffForFriend = $derived(
+    chatDisabled && !!friendHash && chatOffByFriendSetting($appSettings, friendHash),
   );
   let showReadReceipts = $derived(
     !isChannel && !!friendHash && readReceiptsWith($appSettings, friendHash),
@@ -3883,7 +3886,7 @@
         {#if chatLocked}
           <p class="empty-title">{m.friends_chat_locked_title()}</p>
         {:else if chatDisabled}
-          <p class="empty-title">{m.chat_empty_disabled()}</p>
+          <p class="empty-title">{chatOffForFriend ? m.chat_empty_disabled_friend() : m.chat_empty_disabled()}</p>
         {:else if isChannel && youAreKeyBehind}
           <!-- Not "No messages yet": there may well be messages, just none
                this device can read. -->
@@ -4424,7 +4427,7 @@
   {:else if isChannel && announceOnly}
     <div class="conv-disabled" role="status">{m.channels_announce_only_notice()}</div>
   {:else if chatDisabled}
-    <div class="conv-disabled" role="status">{m.chat_disabled_notice()}</div>
+    <div class="conv-disabled" role="status">{chatOffForFriend ? m.chat_disabled_notice_friend() : m.chat_disabled_notice()}</div>
   {:else}
     {#if isChannel && replyTarget}
       {@const target = replyTarget}

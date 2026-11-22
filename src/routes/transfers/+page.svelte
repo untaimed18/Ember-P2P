@@ -788,7 +788,9 @@
     }
   }
 
-  function sourceStatusLabel(s: SourceInfo): string {
+  /** `paused`: the download is paused, which marks every known source failed. */
+  function sourceStatusLabel(s: SourceInfo, paused = false): string {
+    if (paused && s.status === 'failed') return m.transfer_status_paused();
     switch (s.status) {
       case 'connecting': return m.transfers_src_connecting();
       case 'wait_callback': return m.transfers_src_wait_callback();
@@ -2882,7 +2884,7 @@
           });
         }
         const connected = $networkStats.status === 'connected' || $networkStats.status === 'connecting';
-        return connected ? m.transfers_dl_status_searching() : m.transfers_dl_status_waiting();
+        return connected ? m.transfers_dl_status_searching() : m.transfers_dl_status_no_network();
       }
       case 'queued':
         if (t.sources === 0) return m.transfers_dl_status_searching();
@@ -6285,7 +6287,8 @@
                       {#if waitingSlotCount > 0}<span class="ss-chip ss-connect">{m.transfers_chip_waiting_for_slot({ count: waitingSlotCount })}</span>{/if}
                       {#if partsBusyCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_parts_busy({ count: partsBusyCount })}</span>{/if}
                       {#if otherCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_other({ count: otherCount })}</span>{/if}
-                      {#if failedCount > 0}<span class="ss-chip ss-failed">{m.transfers_chip_failed({ count: failedCount })}</span>{/if}
+                      {#if failedCount > 0 && transferPaused}<span class="ss-chip ss-other">{m.transfers_chip_paused({ count: failedCount })}</span>
+                      {:else if failedCount > 0}<span class="ss-chip ss-failed">{m.transfers_chip_failed({ count: failedCount })}</span>{/if}
                     </span>
                   </td>
                 </tr>
@@ -6293,7 +6296,7 @@
                   <tr class="source-child-row src-{src.status}" in:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}>
                     <td class="source-child-cell" colspan={dlColCount}>
                       <span class="source-fields">
-                        <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src)}></span>
+                        <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src, transferPaused)}></span>
                         <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
                         <span class="source-origin src-origin-{src.origin ?? 'unknown'}" title={sourceOriginTitle(src.origin)}>{sourceOriginLabel(src.origin)}</span>
                         <!-- No longer falls back to `client_software`: that is
@@ -6304,7 +6307,7 @@
                         <span class="source-software" title={src.client_software}><bdi dir="auto">{sourceClientLabel(src)}</bdi></span>
                         <span class="source-sep"></span>
                         <span class="source-addr" title="{src.ip}:{src.port}">{src.ip}:{src.port}</span>
-                        <span class="source-state src-st-{src.status}">{sourceStatusLabel(src)}</span>
+                        <span class="source-state src-st-{transferPaused && src.status === 'failed' ? 'paused' : src.status}">{sourceStatusLabel(src, transferPaused)}</span>
                         {#if src.available_parts != null && src.total_parts != null && src.total_parts > 0}
                           <span class="source-tag" title={m.transfers_parts_title()}>{m.transfers_parts({ have: src.available_parts, total: src.total_parts })}</span>
                         {/if}
@@ -7376,7 +7379,7 @@
                     {:else if column.key === 'parts'}
                       <td class="num-cell">{src.available_parts != null && src.total_parts ? `${src.available_parts}/${src.total_parts}` : '\u2014'}</td>
                     {:else if column.key === 'status'}
-                      <td class="src-st-{src.status}">{sourceStatusLabel(src)}</td>
+                      <td class="src-st-{clientPaused && src.status === 'failed' ? 'paused' : src.status}">{sourceStatusLabel(src, clientPaused)}</td>
                     {/if}
                   {/each}
                 </tr>

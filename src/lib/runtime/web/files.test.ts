@@ -87,6 +87,6 @@ describe('a file sent from the browser', () => {
 
   it('says what emberd answered when the answer is not its own', async () => {
     answering(502, '<html>Bad gateway</html>');
-    await expect(uploadFile('/api/upload?name=x', new File(['x'], 'x'))).rejects.toBe('emberd answered 502');
+    await expect(uploadFile('/api/upload?name=x', new File(['x'], 'x'))).rejects.toMatch(/502/);
   });
 });

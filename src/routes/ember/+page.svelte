@@ -321,7 +321,9 @@
         : $updater.phase === 'ready'
           ? m.updater_ready_body({ version: $updater.version ?? '' })
           : $updater.phase === 'error' || $updater.signatureMissing
-            ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
+            ? $updater.error || $updater.signatureMissing
+              ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
+              : m.updater_check_failed()
             : $updater.systemTooOld
               ? systemTooOldMessage($updater.systemTooOld)
               : '',

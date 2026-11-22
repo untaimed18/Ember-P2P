@@ -177,7 +177,7 @@
     sectionRooms,
   } from '$lib/channelSections';
   import { LIKELY_SPAM_SCORE, listingSpamScores } from '$lib/channelListingSpam';
-  import { isApplePlatform, shortcutModAria, shortcutModSymbol } from '$lib/platform';
+  import { isApplePlatform, shortcutAltSymbol, shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
@@ -1284,8 +1284,8 @@
   /** The room shortcuts, shown where a room would be while none is open. */
   const roomShortcutHints = [
     { keys: [shortcutModSymbol(), 'K'], label: () => m.shortcuts_channels_search() },
-    { keys: ['Alt', '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
-    { keys: ['Alt', m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
+    { keys: [shortcutAltSymbol(), '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
+    { keys: [shortcutAltSymbol(), m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
   ];
 
   /** Ctrl/⌘+F: opens the room's message search, or returns to it if open. */

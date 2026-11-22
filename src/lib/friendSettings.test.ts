@@ -4,6 +4,7 @@ import {
   autoAcceptMbFor,
   browseAllowedFor,
   chatAllowedWith,
+  chatOffByFriendSetting,
   compactOverrides,
   disappearSecsFor,
   filesAllowedFrom,
@@ -67,6 +68,13 @@ describe('friend settings', () => {
     expect(friendNotifies(s, ANA, 'online')).toBe(true);
     expect(friendNotifies(s, ANA, 'messages')).toBe(false);
     expect(friendNotifies(s, BEN, 'messages')).toBe(true);
+  });
+
+  it('tells a friend whose own setting turns chat off from the global switch', () => {
+    const s = settingsWith({ friend_chat_disabled: true }, { [ANA]: { chat: false }, [BEN]: { chat: true } });
+    expect(chatOffByFriendSetting(s, ANA)).toBe(true);
+    expect(chatOffByFriendSetting(s, BEN)).toBe(false);
+    expect(chatOffByFriendSetting(s, 'aa'.repeat(16))).toBe(false);
   });
 
   it('never allows files or read receipts while chat with the friend is off', () => {

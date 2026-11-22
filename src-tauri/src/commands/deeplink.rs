@@ -607,7 +607,7 @@ pub(crate) async fn open_collection_file(path: String) -> Result<Collection, Str
     }
     if meta.len() > MAX_COLLECTION_BYTES {
         return Err(coded(
-            "collections_too_large",
+            "collections_file_too_large",
             "Collection file is too large",
         ));
     }

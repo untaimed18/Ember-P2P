@@ -6163,7 +6163,9 @@
                     <span class="feedback error about-update-note">{m.updater_signature_missing()}</span>
                   {/if}
                 {:else if $updater.phase === 'error' || $updater.signatureMissing}
-                  <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })}</span>
+                  <span class="feedback error">{$updater.error || $updater.signatureMissing
+                    ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
+                    : m.updater_check_failed()}</span>
                 {:else if $updater.systemTooOld}
                   <span class="feedback error">{systemTooOldMessage($updater.systemTooOld)}</span>
                 {:else}

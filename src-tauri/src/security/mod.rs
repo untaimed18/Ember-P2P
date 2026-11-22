@@ -523,30 +523,26 @@ const DANGEROUS_EXTENSIONS: &[&str] = &[
 /// addresses, file paths, or deep error-chain diagnostics. The full error is
 /// still written to the tracing log for operators.
 ///
-/// Kept conservative: a single short phrase plus the root-cause kind.
+/// Kept conservative: a coded error naming only the causes the user can act
+/// on, so it reaches the UI translated.
 pub fn redact_fatal_error(err: &anyhow::Error) -> String {
-    // Walk the chain to find a recognisable category; fall back to a generic
-    // message if nothing matches.
-    let mut category: Option<&'static str> = None;
-    for cause in err.chain() {
-        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            use std::io::ErrorKind::*;
-            category = Some(match io.kind() {
-                PermissionDenied => "permission denied",
-                AddrInUse => "port already in use",
-                AddrNotAvailable => "address not available",
-                ConnectionRefused | ConnectionReset | ConnectionAborted => {
-                    "network connection lost"
-                }
-                NotFound => "required file missing",
-                TimedOut => "network timeout",
-                _ => "I/O error",
-            });
-            break;
-        }
+    use crate::commands::errors::coded;
+    // The first I/O error in the chain is the root cause worth naming.
+    let kind = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind);
+    match kind {
+        Some(std::io::ErrorKind::AddrInUse) => coded(
+            "network_stopped_port_in_use",
+            "Ember's port is already in use by another program",
+        ),
+        Some(std::io::ErrorKind::PermissionDenied) => coded(
+            "network_stopped_permission",
+            "The system refused Ember access to the network",
+        ),
+        _ => coded("network_stopped", "The network service stopped"),
     }
-    let tag = category.unwrap_or("unexpected error");
-    format!("The network service stopped ({tag}). See logs for details.")
 }
 
 /// Returns true if the file extension is potentially dangerous (executable).

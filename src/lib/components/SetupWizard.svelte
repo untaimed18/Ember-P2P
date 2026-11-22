@@ -769,10 +769,12 @@
             </div>
           </div>
           <p class="step-hint">{m.wizard_connect_hint()}</p>
-          <div class="toggle-row">
-            <ToggleSwitch bind:checked={launchAtLogin} label={m.wizard_launch_at_login_label()} />
-          </div>
-          <p class="step-hint toggle-hint">{m.wizard_launch_at_login_hint()}</p>
+          {#if !isServer}
+            <div class="toggle-row">
+              <ToggleSwitch bind:checked={launchAtLogin} label={m.wizard_launch_at_login_label()} />
+            </div>
+            <p class="step-hint toggle-hint">{m.wizard_launch_at_login_hint()}</p>
+          {/if}
         </div>
 
       {:else if step === 8}
@@ -850,10 +852,12 @@
               <span class="summary-label">{m.wizard_summary_theme()}</span>
               <span class="summary-value">{selectedTheme === 'dark' ? m.wizard_theme_dark() : m.wizard_theme_light()}</span>
             </div>
-            <div class="summary-row">
-              <span class="summary-label">{m.wizard_launch_at_login_label()}</span>
-              <span class="summary-value">{launchAtLogin ? m.common_yes() : m.common_no()}</span>
-            </div>
+            {#if !isServer}
+              <div class="summary-row">
+                <span class="summary-label">{m.wizard_launch_at_login_label()}</span>
+                <span class="summary-value">{launchAtLogin ? m.common_yes() : m.common_no()}</span>
+              </div>
+            {/if}
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_import()}</span>
               <span class="summary-value">{willImport ? m.wizard_summary_import_yes() : m.wizard_summary_import_no()}</span>

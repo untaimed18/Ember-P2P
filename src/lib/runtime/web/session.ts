@@ -20,7 +20,12 @@ export interface ServerSession {
 
 export async function readSession(): Promise<ServerSession> {
   const response = await fetch('/api/session', { credentials: 'same-origin', cache: 'no-store' });
-  if (!response.ok) throw new Error(`emberd answered ${response.status}`);
+  if (!response.ok) {
+    // Loaded only here: everything in the web runtime imports this module,
+    // and the message catalog is too heavy to load for the one failure.
+    const m = await import('$lib/paraglide/messages');
+    throw new Error(m.web_runtime_bad_status({ status: response.status }));
+  }
   return response.json();
 }
 
@@ -33,12 +38,16 @@ async function post(path: string, body: unknown): Promise<void> {
     body: JSON.stringify(body),
   });
   if (response.ok) return;
-  let error: unknown = `emberd answered ${response.status}`;
+  let error: unknown = null;
   try {
     const reply = await response.json();
     if (reply && 'error' in reply) error = reply.error;
   } catch {
     // The status is all there is.
+  }
+  if (error === null) {
+    const m = await import('$lib/paraglide/messages');
+    error = m.web_runtime_bad_status({ status: response.status });
   }
   throw error;
 }
