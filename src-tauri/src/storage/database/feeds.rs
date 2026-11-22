@@ -1440,8 +1440,15 @@ impl Database {
 
     /// The folder in `Feeds` the followed feed's files finish in: the one it
     /// was given by its first download, or, for that first, one named after
-    /// `title` and unlike every other feed's. `None` when it is not followed.
-    pub fn feed_followed_folder(&self, publisher: &str, salt: &str, title: &str) -> anyhow::Result<Option<String>> {
+    /// `title` and unlike every other feed's and every folder already in
+    /// `Feeds` (`on_disk`). `None` when it is not followed.
+    pub fn feed_followed_folder(
+        &self,
+        publisher: &str,
+        salt: &str,
+        title: &str,
+        on_disk: &[String],
+    ) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock();
         self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
@@ -1460,8 +1467,8 @@ impl Database {
         }
         let taken: Vec<String> = {
             let mut stmt = tx.prepare("SELECT folder FROM feeds_followed WHERE folder != ''")?;
-            let rows = stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
-            rows
+            let rows = stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            rows.into_iter().chain(on_disk.iter().cloned()).collect()
         };
         let folder = crate::sharing::feed_downloads::unique_folder_name(title, salt, &taken);
         tx.execute(
@@ -1705,7 +1712,7 @@ mod tests {
         assert!(db.feed_downloaded_elsewhere(PUB, SALT).unwrap().is_empty(), "nothing downloaded yet");
         db.feed_mark_downloaded(PUB, "other", "a").unwrap();
         assert!(db.feed_downloaded_elsewhere(PUB, SALT).unwrap().is_empty(), "no folder before the first");
-        let folder = db.feed_followed_folder(PUB, "other", "Other").unwrap().unwrap();
+        let folder = db.feed_followed_folder(PUB, "other", "Other", &[]).unwrap().unwrap();
         let found = db.feed_downloaded_elsewhere(PUB, SALT).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].ed2k.as_str(), found[0].folder.as_str(), found[0].name.as_str()), ("a", folder.as_str(), "A"));
@@ -1953,16 +1960,22 @@ mod tests {
     #[test]
     fn a_feed_keeps_the_folder_its_first_download_gave_it() {
         let (db, path) = db("folder");
-        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes").unwrap(), None, "not followed");
+        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes", &[]).unwrap(), None, "not followed");
         db.feed_follow(PUB, SALT, 1).unwrap();
         db.feed_follow(PUB, "other-salt", 1).unwrap();
         assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().folder, "");
-        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes").unwrap().as_deref(), Some("Mixes"));
-        assert_eq!(db.feed_followed_folder(PUB, SALT, "Renamed").unwrap().as_deref(), Some("Mixes"), "kept");
+        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes", &[]).unwrap().as_deref(), Some("Mixes"));
+        assert_eq!(db.feed_followed_folder(PUB, SALT, "Renamed", &[]).unwrap().as_deref(), Some("Mixes"), "kept");
         assert_eq!(
-            db.feed_followed_folder(PUB, "other-salt", "mixes").unwrap().as_deref(),
+            db.feed_followed_folder(PUB, "other-salt", "mixes", &[]).unwrap().as_deref(),
             Some("mixes (other-sa)"),
             "another feed of that name"
+        );
+        db.feed_follow(PUB, "third-salt", 1).unwrap();
+        assert_eq!(
+            db.feed_followed_folder(PUB, "third-salt", "Live", &["live".to_string()]).unwrap().as_deref(),
+            Some("Live (third-sa)"),
+            "a folder a feed no longer followed left in Feeds"
         );
         assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().folder, "Mixes");
         drop_db(db, path);
@@ -1974,7 +1987,7 @@ mod tests {
         db.feed_follow(PUB, SALT, 1).unwrap();
         db.feed_follow(PUB, "no-folder", 1).unwrap();
         assert!(!db.feed_followed(PUB, SALT).unwrap().unwrap().share_files, "off for a new follow");
-        db.feed_followed_folder(PUB, SALT, "Mixes").unwrap();
+        db.feed_followed_folder(PUB, SALT, "Mixes", &[]).unwrap();
         assert!(db.feed_sharing_folders().unwrap().is_empty());
 
         assert!(db.feed_set_share_files(PUB, SALT, true).unwrap());

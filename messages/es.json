@@ -4125,7 +4125,7 @@
   "channels_dm_policy_off": "Los mensajes privados están desactivados en Ajustes.",
   "channels_dm_peer_declined": "{name} no acepta mensajes privados tuyos.",
   "channels_dm_you_declined": "Has rechazado los mensajes privados de {name}.",
-  "channels_dm_no_shared_room": "Ya no estáis en un canal juntos, así que los mensajes no le llegan. Añádelo como amigo para seguir hablando.",
+  "channels_dm_no_shared_room": "Ya no estáis en un canal juntos, así que los mensajes no le llegan. Para seguir hablando, añadíos como amigos: esa persona también tiene que añadirte.",
   "channels_dm_friend_listed": "{name} está en tu lista de amigos: escríbele en Chat, en la página Amigos.",
   "channels_dm_status_sending": "Enviando…",
   "channels_dm_status_mailbox": "Esperando en su buzón",

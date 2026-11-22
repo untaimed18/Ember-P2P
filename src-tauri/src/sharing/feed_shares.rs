@@ -104,6 +104,7 @@ pub(crate) async fn reconcile(app: &crate::host::AppHandle, rescan: &[String]) {
         )
     };
     let folders = crate::sharing::feed_downloads::sharing_folders();
+    let still_sharing = folders.clone();
     let rescan = rescan.to_vec();
     let (wanted, rescan_dirs) = tokio::task::spawn_blocking({
         let roots = roots.clone();
@@ -123,7 +124,26 @@ pub(crate) async fn reconcile(app: &crate::host::AppHandle, rescan: &[String]) {
     .await
     .unwrap_or_default();
     let wanted: Vec<String> = wanted.iter().map(|dir| dir.to_string_lossy().into_owned()).collect();
-    let plan = plan(&wanted, &shared, &managed);
+    let mut plan = plan(&wanted, &shared, &managed);
+    // One whose drive is away is kept while its feed still shares, as a folder
+    // the user shared is kept while offline: taken off, it would stay unshared
+    // once the drive is back, the feed's switch still on.
+    let removable = std::mem::take(&mut plan.remove);
+    plan.remove = tokio::task::spawn_blocking(move || {
+        removable
+            .into_iter()
+            .filter(|entry| {
+                let path = Path::new(entry);
+                let feed_shares = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| still_sharing.iter().any(|folder| folder.eq_ignore_ascii_case(name)));
+                !feed_shares || path.parent().is_some_and(Path::is_dir)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
 
     for folder in plan.add {
         // Recorded before it is shared: one shared and not recorded would be,

@@ -663,6 +663,11 @@ export async function initFriendsStore() {
             ids.push(typeof p.id === 'number' && p.id > 0 ? p.id : NaN);
             seedLive.unreadIds.set(hash, ids);
           }
+          if (markAllBumps) {
+            const ids = markAllBumps.get(hash) ?? [];
+            ids.push(typeof p.id === 'number' && p.id > 0 ? p.id : NaN);
+            markAllBumps.set(hash, ids);
+          }
           unreadCounts.update((m) => {
             const next = new Map(m);
             next.set(hash, (next.get(hash) || 0) + 1);
@@ -1210,9 +1215,26 @@ function setUnread(hash: string, count: number) {
  *  in both windows. Returns how many friends still have unread messages,
  *  which are those. */
 export async function markAllFriendChatsRead(): Promise<number> {
-  const left = new Map(
-    (await markAllChatsRead()).map(([hash, count]) => [hash.toLowerCase(), count] as const),
-  );
+  const bumps = new Map<string, number[]>();
+  markAllBumps = bumps;
+  let rows: [string, number, number][];
+  try {
+    rows = await markAllChatsRead();
+  } finally {
+    if (markAllBumps === bumps) markAllBumps = null;
+  }
+  // What is left, plus the messages announced while it was being worked out
+  // that it does not hold: those with an id past its newest for a friend it
+  // lists, all of them for one it leaves out, as the startup count reckons.
+  const left = new Map<string, number>();
+  for (const [hash, count, newest] of rows) {
+    const key = hash.toLowerCase();
+    const ids = bumps.get(key) ?? [];
+    left.set(key, count + ids.filter((id) => !Number.isFinite(id) || id > (Number(newest) || 0)).length);
+  }
+  for (const [hash, ids] of bumps) {
+    if (!left.has(hash) && ids.length > 0) left.set(hash, ids.length);
+  }
   for (const hash of get(unreadCounts).keys()) {
     if (!left.has(hash.toLowerCase())) clearUnread(hash);
   }
@@ -1222,6 +1244,10 @@ export async function markAllFriendChatsRead(): Promise<number> {
   }
   return left.size;
 }
+
+/** Messages announced while `markAllFriendChatsRead` waits for the backend:
+ *  hash → their row ids, `NaN` for an event that carried none. */
+let markAllBumps: Map<string, number[]> | null = null;
 
 /**
  * Clear any in-progress search state (spinner) and its auto-clear timer for a

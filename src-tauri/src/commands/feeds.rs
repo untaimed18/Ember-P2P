@@ -2357,7 +2357,8 @@ pub async fn set_feed_share_files(
             // Its folder now, if no download has given it one, so the folder
             // is shared from before its first file.
             if let Some(feed) = db.feed_followed(&key_pub, &key_salt)?.filter(|feed| share && feed.folder.is_empty()) {
-                db.feed_followed_folder(&key_pub, &key_salt, &feed.title)?;
+                let on_disk = crate::sharing::feed_downloads::folders_on_disk();
+                db.feed_followed_folder(&key_pub, &key_salt, &feed.title, &on_disk)?;
             }
             let sharing = db.feed_sharing_folders()?;
             Ok(db.feed_followed(&key_pub, &key_salt)?.map(|feed| (feed, sharing)))
@@ -2480,7 +2481,10 @@ async fn start_item_download(app: &crate::host::AppHandle, feed: &FollowedFeed, 
     let db = state.db.clone();
     let (publisher, salt, title) = (feed.publisher.clone(), feed.salt.clone(), feed.title.clone());
     let folder = blocking(
-        move || db.feed_followed_folder(&publisher, &salt, &title),
+        move || {
+            let on_disk = crate::sharing::feed_downloads::folders_on_disk();
+            db.feed_followed_folder(&publisher, &salt, &title, &on_disk)
+        },
         "feeds_failed",
         "Could not read feeds",
     )

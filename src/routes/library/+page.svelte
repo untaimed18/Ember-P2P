@@ -5623,7 +5623,9 @@
           <button class="tb-btn" disabled={bulkBusy || checkedTaggableCount === 0} onclick={() => bulkEmberTag(true)} title={checkedTaggableCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_tag_title()}>{m.library_bulk_tag()}</button>
         {/if}
         <button class="tb-btn" disabled={checkedHashedCount === 0} onclick={bulkCopyLinks} title={checkedHashedCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
-        <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
+        {#if !isServer}
+          <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
+        {/if}
         <span class="bulk-spacer"></span>
         {#if bulkProgress}
           <span class="bulk-progress" role="status">

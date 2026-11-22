@@ -145,6 +145,19 @@ pub fn set_roots(download_roots: &[String]) {
         .collect();
 }
 
+/// The folders in every `Feeds` there is now. A feed no longer followed
+/// leaves its downloads in its folder, which another feed must not be given:
+/// sharing that feed's files would share them too. Blocking.
+pub fn folders_on_disk() -> Vec<String> {
+    let dirs = feeds_dirs().read().clone();
+    dirs.iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect()
+}
+
 /// The `Feeds` folder of the download folder `root`.
 pub fn feeds_dir(root: &Path) -> PathBuf {
     root.join(FEEDS_DIR)

@@ -109,25 +109,32 @@ fn prepare(config_path: Option<&Path>) -> Result<config::Config, String> {
     Ok(config)
 }
 
-/// Held while `emberd` runs: the same lock the desktop app takes, so the two
-/// can never use one data folder at once.
-fn take_instance_lock(data_dir: &Path) -> Result<std::fs::File, String> {
+/// Held while `emberd` runs: the same lock the desktop app takes, so emberd
+/// never starts on a folder the desktop app is using, and `emberd.lock`,
+/// which the desktop app checks before it starts.
+fn take_instance_lock(data_dir: &Path) -> Result<(std::fs::File, std::fs::File), String> {
     use fs2::FileExt;
-    let path = data_dir.join("instance.lock");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| format!("Could not open {}: {e}", path.display()))?;
-    file.try_lock_exclusive().map_err(|_| {
+    let open = |name: &str| {
+        let path = data_dir.join(name);
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("Could not open {}: {e}", path.display()))
+    };
+    let busy = || {
         format!(
             "Another Ember is using the data folder {} (emberd, or the desktop app). Stop it first.",
             data_dir.display()
         )
-    })?;
-    Ok(file)
+    };
+    let instance = open("instance.lock")?;
+    instance.try_lock_exclusive().map_err(|_| busy())?;
+    let emberd = open(crate::storage::paths::EMBERD_LOCK_FILE)?;
+    emberd.try_lock_exclusive().map_err(|_| busy())?;
+    Ok((instance, emberd))
 }
 
 /// The exit status that asks for a restart rather than a stop.
@@ -369,7 +376,7 @@ async fn wait_for_stop(app: &AppHandle) -> i32 {
 
 /// The key file Ember's identity is sealed with, in the data folder unless
 /// the config names one.
-const KEY_FILE: &str = "emberd-secret.key";
+const KEY_FILE: &str = crate::storage::secret_store::DEFAULT_KEY_FILE;
 
 /// The operator's folders, for the startup and the shared-folder commands.
 static OPERATOR: OnceLock<config::Folders> = OnceLock::new();
@@ -431,18 +438,20 @@ pub(crate) fn apply_operator_folders(config: &mut crate::storage::config::AppCon
         settings.download_folder = key.clone();
         approve.push(key);
     }
-    let named: Vec<String> = folders
-        .shared
-        .iter()
-        .filter(|folder| {
-            let there = folder.is_dir();
-            if !there {
-                warn!("The shared folder {} is not there; it is shared once it is", folder.display());
-            }
-            there
-        })
-        .map(|folder| folder_key(folder))
-        .collect();
+    // Every folder the config names stays shared, there or not: a mount that
+    // comes up after emberd must not be taken off the list. Only those there
+    // now can be approved.
+    let named: Vec<String> = folders.shared.iter().map(|folder| folder_key(folder)).collect();
+    for folder in &folders.shared {
+        if folder.is_dir() {
+            approve.push(folder_key(folder));
+        } else {
+            warn!(
+                "The shared folder {} is not there; once it is, restart emberd or re-approve it in the Library",
+                folder.display()
+            );
+        }
+    }
     let remembered_path = data_dir.join(OPERATOR_FOLDERS_FILE);
     let remembered: Vec<String> = std::fs::read(&remembered_path)
         .ok()
@@ -454,8 +463,11 @@ pub(crate) fn apply_operator_folders(config: &mut crate::storage::config::AppCon
         if !settings.shared_folders.contains(folder) {
             settings.shared_folders.push(folder.clone());
         }
-        approve.push(folder.clone());
     }
+    // A folder inside another, named in the config or shared from the
+    // Library beside one it names, would make every settings save refuse.
+    settings.shared_folders =
+        crate::commands::settings::dedupe_overlapping_shared_folders(std::mem::take(&mut settings.shared_folders)).0;
     if let Ok(text) = serde_json::to_vec(&named) {
         if let Err(e) = crate::security::atomic_write(&remembered_path, &text, true) {
             warn!("Could not write {}: {e}", remembered_path.display());

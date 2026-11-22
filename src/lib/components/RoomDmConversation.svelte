@@ -27,6 +27,7 @@
     setRoomDmDisappear,
     ROOM_DM_MESSAGE_EVENT,
     ROOM_DM_STATUS_EVENT,
+    ROOM_DM_THREAD_EVENT,
     type RoomDmMessage,
     type RoomDmMessageEvent,
     type RoomDmStatusEvent,
@@ -225,6 +226,31 @@
     }
   }
 
+  /** Rows put on screen from events or a send, so a refresh that read the
+   *  newest page before one was stored does not drop it. */
+  let shownLive = 0;
+
+  /** Read the newest page again for what it now says of the rows shown:
+   *  timers started on reading or delivery, and messages a timer deleted.
+   *  Rows older than that page and the scroll position stay as they are. */
+  async function refreshShown() {
+    const seq = loadSeq;
+    const live = shownLive;
+    try {
+      const rows = await getRoomDmMessages(who, undefined, PAGE_SIZE);
+      if (seq !== loadSeq) return;
+      if (live !== shownLive) {
+        void refreshShown();
+        return;
+      }
+      const fresh = new Set(rows.map(rowKey));
+      const pageStart = rows.length >= PAGE_SIZE ? Math.min(...rows.map((row) => row.timestamp)) : -Infinity;
+      messages = merged(rows, messages.filter((row) => !fresh.has(rowKey(row)) && row.timestamp < pageStart));
+    } catch {
+      // The next change tries again.
+    }
+  }
+
   /** Read the page before the oldest message shown, keeping the view where it
    *  was. Paged by that message's timestamp and stored row, since timestamps
    *  are the sender's and can repeat. One not read back from storage has no
@@ -271,6 +297,8 @@
     marking = true;
     try {
       await markRoomDmRead(who);
+      // Reading starts the timers of what came in.
+      void refreshShown();
       await refreshDmThreads();
     } catch (e) {
       console.warn('roomDm: could not mark read', e);
@@ -339,6 +367,7 @@
             expires_at: 0,
             mailboxed: false,
           };
+          shownLive += 1;
           messages = merged(messages, [row]);
           void scrollToEnd();
         }),
@@ -351,6 +380,12 @@
               : row,
           );
           if (update.status === 'failed') void announceFailed();
+          // Delivery starts the timer of one of ours.
+          if (update.status === 'delivered') void refreshShown();
+        }),
+        // A timer deleted messages, or the conversation changed.
+        listen<{ member_pubkey: string }>(ROOM_DM_THREAD_EVENT, (event) => {
+          if (event.payload.member_pubkey === who) void refreshShown();
         }),
       ]);
       if (alive) unlisten.push(...fns);
@@ -378,6 +413,7 @@
     clearDraft(tabKey);
     try {
       const sent = await sendRoomDm(who, text);
+      shownLive += 1;
       messages = merged(messages, [sent]);
       // Not what was typed since pressing Send.
       if (draft === raw) draft = '';

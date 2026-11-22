@@ -455,11 +455,15 @@ function rustFiles(dir) {
 test("every command that refuses other windows is listed as main-window-only", () => {
   const listed = new Set(MAIN_WINDOW_ONLY.map(({ command }) => command));
   const unlisted = [];
+  let scanned = 0;
   for (const file of rustFiles(rustRoot)) {
     const text = readFileSync(file, "utf8");
     const commands = [
-      ...text.matchAll(/#\[tauri::command[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?fn\s+([a-z][a-z0-9_]*)/g),
+      ...text.matchAll(
+        /#\[(?:tauri|ember_macros)::command[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?fn\s+([a-z][a-z0-9_]*)/g,
+      ),
     ];
+    scanned += commands.length;
     for (const [i, m] of commands.entries()) {
       const next = commands[i + 1]?.index ?? text.length;
       const end = text.indexOf("\n}\n", m.index);
@@ -469,6 +473,7 @@ test("every command that refuses other windows is listed as main-window-only", (
       }
     }
   }
+  assert.ok(scanned > 300, `only ${scanned} commands found: the pattern no longer matches how commands are declared`);
   assert.deepEqual(unlisted, [], "list these in MAIN_WINDOW_ONLY, so removing their guard fails this test");
 });
 

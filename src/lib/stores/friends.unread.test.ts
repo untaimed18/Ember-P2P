@@ -4,6 +4,8 @@ import { get } from 'svelte/store';
 const handlers = new Map<string, (event: { payload: unknown }) => void>();
 const emitted: { name: string; payload: unknown }[] = [];
 let leftUnread: [string, number, number][] = [];
+/** Runs while `markAllChatsRead` is waited on, as a message arriving then would. */
+let duringMarkAll: (() => void) | null = null;
 
 vi.mock('@tauri-apps/api/event', () => ({
   listen: async (name: string, handler: (event: { payload: unknown }) => void) => {
@@ -21,7 +23,10 @@ vi.mock('$lib/api/friends', () => ({
   getOnlineFriends: async () => [],
   getUnreadMessageCounts: async () => new Map(),
   isFriendDiscoverable: async () => false,
-  markAllChatsRead: async () => leftUnread,
+  markAllChatsRead: async () => {
+    duringMarkAll?.();
+    return leftUnread;
+  },
   parseChatAttachment: () => null,
 }));
 
@@ -52,6 +57,7 @@ beforeEach(async () => {
   handlers.clear();
   emitted.length = 0;
   leftUnread = [];
+  duringMarkAll = null;
   await initFriendsStore();
 });
 
@@ -92,6 +98,21 @@ describe('mark all as read', () => {
     expect(get(unreadCounts).has(OTHER)).toBe(false);
     expect(emitted).toContainEqual({ name: 'ember-ui:unread-set', payload: { user_hash: FRIEND, count: 1 } });
     expect(emitted).toContainEqual({ name: 'ember-ui:unread-cleared', payload: { user_hash: OTHER } });
+  });
+
+  it('keeps a message that arrived while everything was being marked read', async () => {
+    chat({ id: 7, message: 'hi', timestamp: 1000 });
+    leftUnread = [[FRIEND, 1, 8]];
+    duringMarkAll = () => {
+      chat({ id: 8, message: 'counted by the backend', timestamp: 1001 });
+      chat({ id: 9, message: 'after its count', timestamp: 1002 });
+      chat({ id: 3, message: 'nothing left for them', timestamp: 1003 }, OTHER);
+    };
+
+    expect(await markAllFriendChatsRead()).toBe(2);
+
+    expect(get(unreadCounts).get(FRIEND)).toBe(2);
+    expect(get(unreadCounts).get(OTHER)).toBe(1);
   });
 
   it('takes the count the other window set, and nothing malformed', () => {

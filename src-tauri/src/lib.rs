@@ -1005,6 +1005,17 @@ pub(crate) fn setup(app: &crate::host::AppHandle) -> Result<(), Box<dyn std::err
     {
         let lock_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
         if std::fs::create_dir_all(&lock_dir).is_ok() {
+            // Two Embers on one profile would share its identity, database
+            // and part files.
+            if storage::paths::emberd_running_on(&lock_dir) {
+                let message = format!(
+                    "emberd is running on Ember's data folder:\n\n{}\n\nStop emberd before starting the Ember app, \
+                     or give emberd a data folder of its own (data_dir in emberd.toml).",
+                    lock_dir.display()
+                );
+                show_fatal_startup_dialog(&message);
+                return Err(message.into());
+            }
             auto_update::watchdog::hold_instance_lock(&lock_dir);
         }
     }

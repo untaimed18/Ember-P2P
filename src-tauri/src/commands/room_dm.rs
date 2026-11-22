@@ -89,7 +89,7 @@ fn channel_key(channel_id: &str) -> Option<[u8; 16]> {
 
 /// A room both are in, `preferred` if it still is one: the room a
 /// conversation started in carries it while both remain.
-fn shared_room(db: &Database, member: &str, ours: &str, preferred: &str) -> Option<String> {
+pub(crate) fn shared_room(db: &Database, member: &str, ours: &str, preferred: &str) -> Option<String> {
     let rooms = db.rooms_shared_with(member, ours, DM_SHARED_ROOMS_LOOKED_AT).ok()?;
     rooms
         .iter()
@@ -592,7 +592,13 @@ pub fn spawn_resends(app: crate::host::AppHandle) {
                     .map(|resend| {
                         let room = shared_room(&db, &resend.member_pubkey, &ours, &resend.channel_id);
                         let channel = room.clone().unwrap_or_else(|| resend.channel_id.clone());
-                        let _ = db.dm_note_attempt(&resend.member_pubkey, &resend.message_id, &channel, next_attempt_at(now));
+                        let _ = db.dm_note_attempt(
+                            &resend.member_pubkey,
+                            &resend.message_id,
+                            &channel,
+                            next_attempt_at(now),
+                            now,
+                        );
                         (resend, room)
                     })
                     .collect::<Vec<_>>();

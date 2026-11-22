@@ -84,6 +84,20 @@ fn busy() -> Response {
     refuse(StatusCode::SERVICE_UNAVAILABLE, "server_busy", "emberd is busy; try again in a moment")
 }
 
+/// The whole of a login's, setup's or password change's small body within
+/// this long, read before anyone has signed in: a client trickling one in
+/// would hold its connection for good.
+const SMALL_BODY_WAIT: Duration = Duration::from_secs(20);
+
+async fn small_body_in_time(request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    match tokio::time::timeout(SMALL_BODY_WAIT, axum::body::to_bytes(body, SMALL_BODY)).await {
+        Ok(Ok(bytes)) => next.run(Request::from_parts(parts, Body::from(bytes))).await,
+        Ok(Err(_)) => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => busy(),
+    }
+}
+
 /// The web UI's `index.html` boots with an inline script, which a policy
 /// without its hash would block, as Tauri's own build adds it for the window.
 fn content_security_policy(web_root: &Path) -> HeaderValue {
@@ -136,10 +150,13 @@ pub fn router(web: Shared, web_root: &Path) -> Router {
     Router::new()
         .route("/api/health", get(|| async { "ok" }))
         .route("/api/session", get(session))
-        .route("/api/setup", post(set_up).layer(DefaultBodyLimit::max(SMALL_BODY)))
-        .route("/api/login", post(log_in).layer(DefaultBodyLimit::max(SMALL_BODY)))
+        .route("/api/setup", post(set_up).layer(DefaultBodyLimit::max(SMALL_BODY)).layer(middleware::from_fn(small_body_in_time)))
+        .route("/api/login", post(log_in).layer(DefaultBodyLimit::max(SMALL_BODY)).layer(middleware::from_fn(small_body_in_time)))
         .route("/api/logout", post(log_out))
-        .route("/api/password", post(change_password).layer(DefaultBodyLimit::max(SMALL_BODY)))
+        .route(
+            "/api/password",
+            post(change_password).layer(DefaultBodyLimit::max(SMALL_BODY)).layer(middleware::from_fn(small_body_in_time)),
+        )
         .route("/api/restart", post(restart))
         .route("/api/invoke/{command}", post(invoke))
         .route("/api/events", get(events))
@@ -174,16 +191,23 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Whether the request's `Origin`, if it has one, is this server.
-fn same_origin(headers: &HeaderMap) -> bool {
+/// Whether the request's `Origin`, if it has one, is this server: the `Host`
+/// it was sent to, or, from a proxy on this computer, the host the proxy says
+/// the browser asked for. nginx and Apache pass their own upstream address as
+/// `Host` unless told otherwise.
+fn same_origin(headers: &HeaderMap, via_local_proxy: bool) -> bool {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
         return true;
     };
-    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
-        return false;
-    };
     let authority = origin.split_once("://").map(|(_, rest)| rest).unwrap_or("");
-    authority.eq_ignore_ascii_case(host)
+    let names = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .is_some_and(|host| !authority.is_empty() && authority.eq_ignore_ascii_case(host.trim()))
+    };
+    names(header::HOST.as_str()) || (via_local_proxy && names("x-forwarded-host"))
 }
 
 fn refuse(status: StatusCode, code: &'static str, message: &str) -> Response {
@@ -224,7 +248,11 @@ async fn guard(State(web): State<Shared>, mut request: Request, next: Next) -> R
             _ => None,
         };
         let from_page = !matches!(caller, Some(Caller::Token));
-        if from_page && !same_origin(headers) {
+        let via_local_proxy = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|ConnectInfo(peer)| peer.ip().is_loopback());
+        if from_page && !same_origin(headers, via_local_proxy) {
             return refuse(StatusCode::FORBIDDEN, "server_cross_origin", "That request came from another site");
         }
         if from_page && changes && headers.get(REQUEST_HEADER).is_none() {
@@ -460,20 +488,36 @@ async fn invoke(State(web): State<Shared>, UrlPath(command): UrlPath<String>, bo
 
 /// Every event the backend emits, for as long as the page is open and its
 /// session holds.
-async fn events(State(web): State<Shared>, caller: axum::Extension<Caller>, upgrade: WebSocketUpgrade) -> Response {
+async fn events(
+    State(web): State<Shared>,
+    caller: axum::Extension<Caller>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     let receiver = web.app.subscribe();
-    let session = match caller.0 {
-        Caller::Session(token) => Some(token),
-        Caller::Token => None,
+    let held = match caller.0 {
+        Caller::Session(token) => StreamHolder::Session(token),
+        // Changing the password replaces the API token.
+        Caller::Token => match bearer_token(&headers) {
+            Some(token) => StreamHolder::Token(token),
+            None => StreamHolder::ControlSocket,
+        },
     };
-    upgrade.on_upgrade(move |socket| stream_events(web, socket, receiver, session))
+    upgrade.on_upgrade(move |socket| stream_events(web, socket, receiver, held))
+}
+
+/// What let an event stream in, checked again while it stays open.
+enum StreamHolder {
+    Session(String),
+    Token(String),
+    ControlSocket,
 }
 
 async fn stream_events(
     web: Shared,
     mut socket: WebSocket,
     mut receiver: tokio::sync::broadcast::Receiver<Arc<crate::host::Event>>,
-    session: Option<String>,
+    held: StreamHolder,
 ) {
     let mut recheck = tokio::time::interval(SESSION_RECHECK);
     recheck.tick().await;
@@ -498,7 +542,12 @@ async fn stream_events(
                 Some(Ok(_)) => {}
             },
             _ = recheck.tick() => {
-                if session.as_deref().is_some_and(|token| !web.auth.session_valid(token)) {
+                let gone = match &held {
+                    StreamHolder::Session(token) => !web.auth.session_valid(token),
+                    StreamHolder::Token(token) => !web.auth.api_token_valid(token),
+                    StreamHolder::ControlSocket => false,
+                };
+                if gone {
                     let _ = socket.send(close(CLOSE_LOGGED_OUT, "logged out")).await;
                     return;
                 }
@@ -750,14 +799,16 @@ pub async fn serve(
                 request
             });
             let service = hyper_util::service::TowerToHyperService::new(service);
-            let mut builder = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-            builder
-                .http1()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(HEADER_WAIT);
+            // HTTP/1 alone, as the pages speak it: the auto builder reads the
+            // protocol's first bytes with no timer, so a connection that sent
+            // nothing held its slot for good.
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder.timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(HEADER_WAIT);
             let result = match acceptor {
                 Some(acceptor) => match tokio::time::timeout(TLS_WAIT, acceptor.accept(stream)).await {
-                    Ok(Ok(tls)) => builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), service).await,
+                    Ok(Ok(tls)) => {
+                        builder.serve_connection(hyper_util::rt::TokioIo::new(tls), service).with_upgrades().await
+                    }
                     Ok(Err(e)) => {
                         tracing::debug!("TLS handshake from {peer} failed: {e}");
                         return;
@@ -767,7 +818,15 @@ pub async fn serve(
                         return;
                     }
                 },
-                None => builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), service).await,
+                None => {
+                    // A request's first byte within the header wait, whenever
+                    // hyper's own timer starts.
+                    let mut first = [0u8; 1];
+                    if !matches!(tokio::time::timeout(HEADER_WAIT, stream.peek(&mut first)).await, Ok(Ok(n)) if n > 0) {
+                        return;
+                    }
+                    builder.serve_connection(hyper_util::rt::TokioIo::new(stream), service).with_upgrades().await
+                }
             };
             if let Err(e) = result {
                 tracing::debug!("Web interface connection from {peer} ended: {e}");
@@ -866,12 +925,29 @@ mod tests {
 
     #[test]
     fn only_a_page_from_this_server_counts_as_the_same_site() {
-        assert!(same_origin(&headers(&[("host", "box:4711")])), "no Origin is a script or a same-site GET");
-        assert!(same_origin(&headers(&[("host", "box:4711"), ("origin", "http://box:4711")])));
-        assert!(same_origin(&headers(&[("host", "BOX:4711"), ("origin", "https://box:4711")])));
-        assert!(!same_origin(&headers(&[("host", "box:4711"), ("origin", "http://evil.example")])));
-        assert!(!same_origin(&headers(&[("host", "box:4711"), ("origin", "null")])));
-        assert!(!same_origin(&headers(&[("origin", "http://box:4711")])), "no Host to match");
+        assert!(same_origin(&headers(&[("host", "box:4711")]), false), "no Origin is a script or a same-site GET");
+        assert!(same_origin(&headers(&[("host", "box:4711"), ("origin", "http://box:4711")]), false));
+        assert!(same_origin(&headers(&[("host", "BOX:4711"), ("origin", "https://box:4711")]), false));
+        assert!(!same_origin(&headers(&[("host", "box:4711"), ("origin", "http://evil.example")]), false));
+        assert!(!same_origin(&headers(&[("host", "box:4711"), ("origin", "null")]), false));
+        assert!(!same_origin(&headers(&[("origin", "http://box:4711")]), false), "no Host to match");
+    }
+
+    #[test]
+    fn a_proxy_on_this_computer_may_name_the_host_the_browser_asked_for() {
+        let proxied = headers(&[
+            ("host", "127.0.0.1:4711"),
+            ("origin", "https://ember.example.com"),
+            ("x-forwarded-host", "ember.example.com"),
+        ]);
+        assert!(same_origin(&proxied, true));
+        assert!(!same_origin(&proxied, false), "only from loopback, where the proxy is");
+        let evil = headers(&[
+            ("host", "127.0.0.1:4711"),
+            ("origin", "https://evil.example"),
+            ("x-forwarded-host", "ember.example.com"),
+        ]);
+        assert!(!same_origin(&evil, true));
     }
 
     /// Text built from what headers and names are made of, the awkward
@@ -908,7 +984,7 @@ mod tests {
             }
             let _ = cookie_token(&map);
             let _ = bearer_token(&map);
-            let _ = same_origin(&map);
+            let _ = same_origin(&map, true);
             assert!(HeaderValue::from_str(&attachment(&text)).is_ok(), "{text:?}");
             let _ = super::super::auth::normalize_code(&text);
             let name = super::super::uploads::safe_name(&text);

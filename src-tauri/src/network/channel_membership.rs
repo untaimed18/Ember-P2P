@@ -816,6 +816,37 @@ mod membership_record_v2_tests {
         assert!(!owner_edit_waits_for_first_read("not a room", now), "nothing to wait for");
     }
 
+    /// A commit that rotates the key waits for an answered look however long
+    /// that takes, asking for one meanwhile: neither the two minutes that let
+    /// other edits through nor the span they then go ahead for lets it
+    /// through, and its waiting holds no other edit back longer.
+    #[test]
+    fn an_owner_rotation_never_goes_ahead_without_an_answered_look() {
+        use super::{
+            note_channel_moderation_read, owner_edit_waits_for_first_read, owner_rotation_waits_for_first_read,
+            OWNER_EDIT_READ_WAIT_SECS,
+        };
+
+        let now = 1_800_000_000;
+        let room = ChannelIdentity::generate();
+        let id_hex = hex::encode(room.channel_id);
+        let wanted = || super::moderation_reads().wanted.contains(&room.channel_id);
+        assert!(owner_rotation_waits_for_first_read(&id_hex, now));
+        assert!(wanted());
+        note_channel_moderation_read(room.channel_id, false, now + 5);
+        let through = now + OWNER_EDIT_READ_WAIT_SECS;
+        assert!(owner_rotation_waits_for_first_read(&id_hex, through), "no two-minute fallback");
+        assert!(owner_rotation_waits_for_first_read(&id_hex, through + 600));
+        assert!(!owner_edit_waits_for_first_read(&id_hex, through + 601), "timed from the first refused");
+        assert!(owner_rotation_waits_for_first_read(&id_hex, through + 602), "nor an edit's fallback");
+        assert!(!owner_edit_waits_for_first_read(&id_hex, through + 603));
+        super::moderation_reads().wanted.remove(&room.channel_id);
+        assert!(owner_rotation_waits_for_first_read(&id_hex, through + 604));
+        assert!(wanted(), "still asking");
+        note_channel_moderation_read(room.channel_id, true, through + 610);
+        assert!(!owner_rotation_waits_for_first_read(&id_hex, through + 611));
+    }
+
     /// A member whose copy of a rotation was never published opens the
     /// owner's renewal, and one unbanned after rotations it was left out of
     /// opens the re-seal: neither needs any epoch it does not hold.
@@ -5997,9 +6028,12 @@ pub(crate) const OWNER_EDIT_READ_WAIT_SECS: i64 = 120;
 #[derive(Debug, Clone, Copy)]
 enum ModerationRead {
     /// Since then edits go ahead, for [`OWNER_EDIT_READ_FRESH_SECS`]: a look
-    /// some peer answered was written, the room was made here, or an edit
-    /// waited [`OWNER_EDIT_READ_WAIT_SECS`] for one in vain.
+    /// some peer answered was written, or the room was made here.
     Current(i64),
+    /// An edit waited [`OWNER_EDIT_READ_WAIT_SECS`] for one in vain then:
+    /// [`Self::Current`] for every edit but one that rotates the key
+    /// ([`owner_rotation_waits_for_first_read`]).
+    WaitedOut(i64),
     /// An edit was first refused then, waiting for one.
     Waiting(i64),
 }
@@ -6065,10 +6099,24 @@ pub(super) fn return_owner_reads_wanted(rooms: impl IntoIterator<Item = [u8; 16]
 /// woken, and a room the moderation poll does not cover (one we are not in),
 /// are where that happens. One whose fetched snapshot is still being written
 /// waits for that too. Held back at most [`OWNER_EDIT_READ_WAIT_SECS`] from
-/// the first edit refused, after which edits go ahead as if it had been read.
+/// the first edit refused, after which edits go ahead as if it had been read,
+/// save one that rotates the key ([`owner_rotation_waits_for_first_read`]).
 /// The owner pass reads afresh on its own before it republishes
 /// ([`owner_republish_read_gate`]).
 pub(crate) fn owner_edit_waits_for_first_read(channel_id: &str, now: i64) -> bool {
+    owner_commit_waits_for_read(channel_id, now, false)
+}
+
+/// [`owner_edit_waits_for_first_read`] for a commit that rotates the key,
+/// which no wait running out lets through: minted from a view of the room
+/// older than another device of this identity's rotation, its epoch would be
+/// that device's again, the same key, sealed to whoever that rotation left
+/// out.
+pub(crate) fn owner_rotation_waits_for_first_read(channel_id: &str, now: i64) -> bool {
+    owner_commit_waits_for_read(channel_id, now, true)
+}
+
+fn owner_commit_waits_for_read(channel_id: &str, now: i64, rotates: bool) -> bool {
     let Some(id) = hex::decode(channel_id)
         .ok()
         .and_then(|b| <[u8; 16]>::try_from(b).ok())
@@ -6077,20 +6125,20 @@ pub(crate) fn owner_edit_waits_for_first_read(channel_id: &str, now: i64) -> boo
     };
     let mut reads = moderation_reads();
     let unwritten = reads.unwritten.contains(&id);
+    let fresh = |at: i64| !unwritten && (0..OWNER_EDIT_READ_FRESH_SECS).contains(&now.saturating_sub(at));
     let since = match reads.rooms.get(&id).copied() {
-        Some(ModerationRead::Current(at))
-            if !unwritten && (0..OWNER_EDIT_READ_FRESH_SECS).contains(&now.saturating_sub(at)) =>
-        {
-            return false;
-        }
+        Some(ModerationRead::Current(at)) if fresh(at) => return false,
+        Some(ModerationRead::WaitedOut(at)) if fresh(at) && !rotates => return false,
+        // Kept, so a rotation waiting holds no other edit back again.
+        Some(ModerationRead::WaitedOut(at)) if fresh(at) => at,
         Some(ModerationRead::Waiting(since)) if since <= now => since,
         _ => {
             reads.rooms.insert(id, ModerationRead::Waiting(now));
             now
         }
     };
-    if now.saturating_sub(since) >= OWNER_EDIT_READ_WAIT_SECS {
-        reads.rooms.insert(id, ModerationRead::Current(now));
+    if !rotates && now.saturating_sub(since) >= OWNER_EDIT_READ_WAIT_SECS {
+        reads.rooms.insert(id, ModerationRead::WaitedOut(now));
         return false;
     }
     if !unwritten {

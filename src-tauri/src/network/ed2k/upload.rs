@@ -9165,8 +9165,11 @@ impl UploadHandler {
                 // dial (`EMBER_FEATURE_SECURE_PUSH_GRANT`): the Path B adoption
                 // below, which cannot take a secure stream, matched as there on
                 // the address and user hash, and only for a peer Noise proved is
-                // a friend. A relayed stream's address is the relay's.
-                let secure_grant_file = match peer_addr.ip() {
+                // a friend. A relayed stream's address is the relay's. Every
+                // connection that friend opens matches that way, its friend
+                // session included, so only the granter's `OP_ACCEPTUPLOADREQ`
+                // diverts the stream.
+                let mut secure_grant_file = match peer_addr.ip() {
                     std::net::IpAddr::V4(peer_v4)
                         if !relayed && self.friend_hashes.read().await.contains(&peer.ember_hash) =>
                     {
@@ -9179,6 +9182,18 @@ impl UploadHandler {
                     }
                     _ => None,
                 };
+                if let (Some(_), StreamReader::Boxed(secure_reader)) =
+                    (secure_grant_file, &mut reader)
+                {
+                    // Bounded like the first read after the Hello below.
+                    let pre_request = std::time::Duration::from_secs(PRE_REQUEST_TIMEOUT_SECS);
+                    let idle_until = tokio::time::Instant::now() + pre_request;
+                    let deadline =
+                        preauth_deadline.map_or(idle_until, |deadline| deadline.min(idle_until));
+                    if !read_secure_slot_grant(secure_reader, deadline, pre_request).await? {
+                        secure_grant_file = None;
+                    }
+                }
                 if let Some((peer_v4, file_hash)) = secure_grant_file {
                     let (StreamReader::Boxed(dyn_reader), StreamWriter::Boxed(dyn_writer)) =
                         (reader, writer)
@@ -16092,6 +16107,68 @@ async fn read_packet_if_started<R: AsyncReadExt + Unpin>(
         .map(Some)
 }
 
+/// What `run_session` may send a waiter between the Hello and the
+/// `OP_ACCEPTUPLOADREQ` that opens a push-grant's serve loop: its SecIdent
+/// challenge, and on a secure friend dial its friend request.
+fn sent_ahead_of_slot_grant(proto: u8, opcode: u8) -> bool {
+    proto == OP_EMULEPROT && matches!(opcode, OP_SECIDENTSTATE | OP_EMBER_FRIEND_REQ)
+}
+
+/// Read a friend's secure connection past its Hello up to the
+/// `OP_ACCEPTUPLOADREQ` of a slot grant, or to the first packet that rules
+/// one out, and say whether it was a grant. Either way `reader` is rewound:
+/// the bytes read here come out of it again first.
+///
+/// Only what a granter sends ahead of its accept is read past, and only until
+/// `deadline`, so a connection that is no grant waits no longer than its own
+/// first read would: a friend session opens with `OP_EMULEINFO`, which ends
+/// the read at once.
+async fn read_secure_slot_grant(
+    reader: &mut Box<dyn AsyncRead + Unpin + Send>,
+    deadline: tokio::time::Instant,
+    frame: std::time::Duration,
+) -> io::Result<bool> {
+    let mut recording = RecordingReader {
+        inner: std::mem::replace(reader, Box::new(tokio::io::empty())),
+        seen: Vec::new(),
+    };
+    // A granter sends each of those once at most: more is no grant, and is
+    // not held here as it comes.
+    let mut ahead = 0;
+    let granted = loop {
+        let idle = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match read_packet_if_started(&mut recording, idle, frame).await {
+            Ok(Some((OP_EDONKEYHEADER, OP_ACCEPTUPLOADREQ, _))) => break Ok(true),
+            Ok(Some((proto, opcode, _))) if sent_ahead_of_slot_grant(proto, opcode) && ahead < 2 => ahead += 1,
+            Ok(_) => break Ok(false),
+            Err(e) => break Err(e),
+        }
+    };
+    let RecordingReader { inner, seen } = recording;
+    *reader = Box::new(AsyncReadExt::chain(std::io::Cursor::new(seen), inner));
+    granted
+}
+
+/// Keeps every byte read through it, so they can be read again.
+struct RecordingReader<R> {
+    inner: R,
+    seen: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for RecordingReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        this.seen.extend_from_slice(&buf.filled()[before..]);
+        polled
+    }
+}
+
 async fn read_packet_async_inner<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<(u8, u8, Vec<u8>)> {
@@ -17742,6 +17819,132 @@ mod handshake_read_and_identity_tests {
         .await
         .unwrap()
         .expect("frame after an idle timeout parses from its first byte");
+        assert_eq!((protocol, opcode), (OP_EMULEPROT, OP_EMULEINFO));
+        assert_eq!(payload, [0xAB, 0xCD]);
+    }
+
+    fn frame(protocol: u8, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![protocol];
+        frame.extend_from_slice(&(1 + payload.len() as u32).to_le_bytes());
+        frame.push(opcode);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    async fn read_bytes(reader: &mut Box<dyn AsyncRead + Unpin + Send>, len: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        reader.read_exact(&mut bytes).await.unwrap();
+        bytes
+    }
+
+    /// A friend we are queued on matches the reconnect index on every
+    /// connection it opens, so its friend session, which opens as
+    /// `run_friend_session_over_transport` does, must not be taken for a slot
+    /// grant, and must keep every byte for the session that serves it.
+    #[tokio::test]
+    async fn a_friend_session_from_a_friend_we_queue_on_is_not_a_slot_grant() {
+        let file_hash = [0x5A; 16];
+        let friend_user_hash = [0x17; 16];
+        assert_eq!(
+            path_b_divert_file(&[(file_hash, Some(friend_user_hash))], friend_user_hash),
+            Some(file_hash)
+        );
+
+        let opening = [
+            frame(OP_EMULEPROT, OP_EMULEINFO, &[0xAB, 0xCD]),
+            frame(OP_EMULEPROT, OP_EMBER_FRIEND_REQ, b"nick"),
+        ]
+        .concat();
+        let (mut peer, ours) = tokio::io::duplex(1024);
+        peer.write_all(&opening).await.unwrap();
+        let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(ours);
+        let granted = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_secure_slot_grant(
+                &mut reader,
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the first packet settles it")
+        .unwrap();
+        assert!(!granted);
+        assert_eq!(read_bytes(&mut reader, opening.len()).await, opening);
+    }
+
+    /// A secure push-grant's serve loop opens with the accept, behind what
+    /// `run_session` sends first; the download worker reads it all as sent.
+    #[tokio::test]
+    async fn a_secure_slot_grant_is_taken_at_its_accept_and_loses_nothing() {
+        let sent = [
+            frame(OP_EMULEPROT, OP_SECIDENTSTATE, &[2, 1, 2, 3, 4]),
+            frame(OP_EMULEPROT, OP_EMBER_FRIEND_REQ, b"nick"),
+            frame(OP_EDONKEYHEADER, OP_ACCEPTUPLOADREQ, &[]),
+        ]
+        .concat();
+        let (mut peer, ours) = tokio::io::duplex(1024);
+        peer.write_all(&sent).await.unwrap();
+        let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(ours);
+        assert!(read_secure_slot_grant(
+            &mut reader,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap());
+        assert_eq!(read_bytes(&mut reader, sent.len()).await, sent);
+    }
+
+    /// More than a granter ever sends ahead of its accept is no grant, and
+    /// reading stops there rather than holding every packet that comes.
+    #[tokio::test]
+    async fn packets_past_what_a_granter_sends_first_are_not_a_slot_grant() {
+        let challenge = frame(OP_EMULEPROT, OP_SECIDENTSTATE, &[2, 1, 2, 3, 4]);
+        let sent = [
+            challenge.clone(),
+            challenge.clone(),
+            challenge,
+            frame(OP_EDONKEYHEADER, OP_ACCEPTUPLOADREQ, &[]),
+        ]
+        .concat();
+        let (mut peer, ours) = tokio::io::duplex(1024);
+        peer.write_all(&sent).await.unwrap();
+        let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(ours);
+        assert!(!read_secure_slot_grant(
+            &mut reader,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap());
+        assert_eq!(read_bytes(&mut reader, sent.len()).await, sent, "nothing lost");
+    }
+
+    /// A peer that waits for us to speak is waited on only until the deadline,
+    /// and what it sent and sends next still parses from the start.
+    #[tokio::test]
+    async fn a_peer_that_goes_quiet_is_not_a_slot_grant_once_the_deadline_passes() {
+        let challenge = frame(OP_EMULEPROT, OP_SECIDENTSTATE, &[2, 1, 2, 3, 4]);
+        let (mut peer, ours) = tokio::io::duplex(1024);
+        peer.write_all(&challenge).await.unwrap();
+        let mut reader: Box<dyn AsyncRead + Unpin + Send> = Box::new(ours);
+        let granted = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_secure_slot_grant(
+                &mut reader,
+                tokio::time::Instant::now() + Duration::from_millis(30),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("bounded by the deadline")
+        .unwrap();
+        assert!(!granted);
+
+        peer.write_all(&emule_info_frame()).await.unwrap();
+        assert_eq!(read_bytes(&mut reader, challenge.len()).await, challenge);
+        let (protocol, opcode, payload) = read_packet_async_inner(&mut reader).await.unwrap();
         assert_eq!((protocol, opcode), (OP_EMULEPROT, OP_EMULEINFO));
         assert_eq!(payload, [0xAB, 0xCD]);
     }

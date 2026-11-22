@@ -6,7 +6,8 @@
 //! Only within conversations that exist: a member collects from those it has
 //! a thread with, so a stranger's first message still needs them online. Only
 //! to members who said they collect (`DmPayload::Collects`), since an older
-//! build never would. A message left there is no longer resent live, and
+//! build never would. A message left there is resent live only now and then
+//! (`DM_MAILED_RESEND_SECS`), in case the member stopped collecting, and
 //! waits for its receipt, or a decline, for as long as the server keeps it.
 //! Runs inside the chat mailbox's round, so it shares its schedule and its
 //! setting.
@@ -151,7 +152,7 @@ async fn collect(
                 let member = &members[index];
                 match open_mailbox_payload(seed, &member.key, &item.mailbox, &item.blob) {
                     Some(MailboxPayload::Message { msg_id, ttl_secs, text }) => {
-                        match receive(db, app_handle, member, msg_id, ttl_secs, &text, now).await {
+                        match receive(db, app_handle, member, our_pubkey, msg_id, ttl_secs, &text, now).await {
                             Received::Kept => {
                                 taken.entry(index).or_default().push((msg_id, item.mailbox, item.id));
                                 continue;
@@ -227,10 +228,12 @@ enum Received {
 }
 
 /// Keep a message a member left for us, on the terms a live one is kept on.
+#[allow(clippy::too_many_arguments)]
 async fn receive(
     db: &Arc<Database>,
     app_handle: &crate::host::AppHandle,
     member: &MailMember,
+    our_pubkey: &[u8; 32],
     msg_id: [u8; 16],
     ttl_secs: u32,
     text: &str,
@@ -244,9 +247,23 @@ async fn receive(
     }
     let policy = dm_policy_now();
     let task_db = db.clone();
-    let (from, channel, mid, body) = (member.hex.clone(), member.channel.clone(), hex::encode(msg_id), text.to_string());
+    let (from, preferred, ours, mid, body) = (
+        member.hex.clone(),
+        member.channel.clone(),
+        hex::encode(our_pubkey),
+        hex::encode(msg_id),
+        text.to_string(),
+    );
     let outcome = tokio::task::spawn_blocking(move || {
-        // Only from a member still in the room unbanned, as live.
+        // Only from a member still in a room with us unbanned, as live: the
+        // conversation's room while both remain, else another both are in,
+        // as the sender picks one.
+        let Some(channel) = crate::commands::room_dm::shared_room(&task_db, &from, &ours, &preferred) else {
+            return Ok(None);
+        };
+        if dm_ignored(&from, &channel) {
+            return Ok(None);
+        }
         let Some(name) = task_db.dm_member_in_room(&channel, &from)? else {
             return Ok(None);
         };

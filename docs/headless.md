@@ -135,7 +135,11 @@ By default the web interface listens on `127.0.0.1:4711`, this computer only.
 To use it from elsewhere, set `listen = "0.0.0.0:4711"` and either:
 
 - give it a certificate and key (`tls_cert`, `tls_key`) to serve HTTPS, or
-- put it behind a reverse proxy that serves HTTPS, listening on loopback.
+- put it behind a reverse proxy that serves HTTPS, listening on loopback. The
+  proxy must pass the host the browser asked for, as `Host` or
+  `X-Forwarded-Host` (nginx: `proxy_set_header Host $host;`, Apache:
+  `ProxyPreserveHost On`), and forward WebSocket upgrades for `/api/events`:
+  emberd checks a request's `Origin` against it.
 
 Over plain HTTP from another computer it still works, and says so: the log
 warns at every start and the sign-in page shows that the password would travel

@@ -264,7 +264,8 @@ export async function initChatPopoutMain(): Promise<() => void> {
       await listen<{ path?: unknown; add?: unknown; name?: unknown; follow?: unknown }>(NAVIGATE_EVENT, (e) => {
         const path = e.payload?.path;
         if (typeof path !== 'string' || !NAVIGABLE.has(path)) return;
-        // Only fills the Add form: adding stays a click in this window.
+        // Only fills the Add or Follow form: adding a friend or following a
+        // feed stays a click in this window.
         const add = e.payload?.add;
         const name = typeof e.payload?.name === 'string' ? e.payload.name : '';
         const follow = typeof e.payload?.follow === 'string' ? feedLinksIn(e.payload.follow) : [];
@@ -272,7 +273,7 @@ export async function initChatPopoutMain(): Promise<() => void> {
           path === '/friends' && typeof add === 'string' && isAcceptedFriendInput(add)
             ? friendsAddPath(add, name)
             : path === '/feeds' && follow.length === 1
-              ? feedsFollowPath(follow[0])
+              ? feedsPrefillPath(follow[0])
               : path;
         void goto(target).catch((err) => console.warn('chat window: navigation failed', err));
       }),
@@ -344,6 +345,12 @@ export function addFriendInMainWindow(code: string, name: string) {
  *  followed already or one of ours. */
 export function feedsFollowPath(link: string): string {
   return `/feeds?follow=${encodeURIComponent(link)}`;
+}
+
+/** The Feeds page with its Follow box filled with `link`, for what the chat
+ *  window asks: following stays a click in the main window. */
+export function feedsPrefillPath(link: string): string {
+  return `/feeds?prefill=${encodeURIComponent(link)}`;
 }
 
 /** Follow or open the feed a link in a message names, in the main window:

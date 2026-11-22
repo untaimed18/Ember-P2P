@@ -14,6 +14,13 @@ pub const DM_REQUESTS_PER_ROOM_HOUR: i64 = 5;
 /// How long someone declined cannot ask again, and how long their decline
 /// keeps us from writing to them.
 pub const DM_DECLINE_MEMORY_SECS: i64 = 7 * 86_400;
+/// How often one of ours left in the mailbox is still tried live: the
+/// recipient may have stopped collecting since it said it does.
+pub const DM_MAILED_RESEND_SECS: i64 = 30 * 60;
+/// How long the id of a message we stored is remembered after its row is
+/// gone (a timer, a deleted conversation, pruning): a resend or a mailbox
+/// copy, which can come for a week, must not bring it back.
+const DM_SEEN_KEEP_SECS: i64 = 8 * 86_400;
 /// Messages a request holds before the user answers it. Past this, more are
 /// dropped unanswered: someone not yet accepted gets a few lines, not a disk.
 pub const DM_REQUEST_MESSAGES_MAX: i64 = 20;
@@ -174,7 +181,14 @@ impl Database {
                 item_id TEXT NOT NULL,
                 deposited_at INTEGER NOT NULL,
                 PRIMARY KEY (member_pubkey, message_id)
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS room_dm_seen (
+                member_pubkey TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                seen_at INTEGER NOT NULL,
+                PRIMARY KEY (member_pubkey, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_room_dm_seen_at ON room_dm_seen(seen_at);",
         )?;
         Ok(())
     }
@@ -198,6 +212,11 @@ impl Database {
         let key = self.chat_key.as_deref();
         let conn = self.conn.lock();
         Self::ensure_room_dm_locked(&conn)?;
+        // A word that ran out counts for nothing; any member can leave one.
+        conn.execute(
+            "DELETE FROM room_dm_mail_peers WHERE collects_at < ?1",
+            params![now - collects_within],
+        )?;
         let mut stmt = conn.prepare(
             "SELECT m.message_id, m.member_pubkey, m.body, m.ts, m.channel_id, m.attempts, COALESCE(t.ttl_secs, 0)
              FROM room_dm_messages m
@@ -252,9 +271,9 @@ impl Database {
             params![member, message_id, mailbox, item_id, now],
         )?;
         tx.execute(
-            "UPDATE room_dm_messages SET next_attempt_at = 0, give_up_at = MAX(give_up_at, ?3)
+            "UPDATE room_dm_messages SET next_attempt_at = ?4, give_up_at = MAX(give_up_at, ?3)
              WHERE member_pubkey = ?1 AND direction = 'out' AND message_id = ?2 AND status = 'sending'",
-            params![member, message_id, give_up_at],
+            params![member, message_id, give_up_at, now + DM_MAILED_RESEND_SECS],
         )?;
         tx.commit()?;
         Ok(())
@@ -436,6 +455,10 @@ impl Database {
                    AND m.message_id = room_dm_timers.message_id)",
             params![now],
         )?;
+        tx.execute(
+            "DELETE FROM room_dm_seen WHERE seen_at < ?1",
+            params![now.saturating_sub(DM_SEEN_KEEP_SECS)],
+        )?;
         tx.commit()?;
         Ok(members)
     }
@@ -564,6 +587,19 @@ impl Database {
             )
             .optional()?;
         let declined_lately = |at: i64| now.saturating_sub(at) < DM_DECLINE_MEMORY_SECS;
+        // Stored before and since deleted. A decline still answers as one.
+        let declined = matches!(&thread, Some((state, at)) if state == DM_STATE_DECLINED && declined_lately(*at));
+        let stored_before = tx
+            .query_row(
+                "SELECT 1 FROM room_dm_seen WHERE member_pubkey = ?1 AND message_id = ?2",
+                params![member, message_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if stored_before && !declined {
+            return Ok(DmIncoming::Duplicate);
+        }
         let stored_lately: i64 = tx.query_row(
             "SELECT COUNT(*) FROM room_dm_messages
              WHERE member_pubkey = ?1 AND direction = 'in' AND received_at > ?2",
@@ -634,6 +670,10 @@ impl Database {
             "INSERT INTO room_dm_messages (message_id, member_pubkey, direction, body, ts, status, channel_id, received_at)
              VALUES (?1, ?2, 'in', ?3, ?4, 'received', ?5, ?6)",
             params![message_id, member, body, timestamp, channel_id, now],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO room_dm_seen (member_pubkey, message_id, seen_at) VALUES (?1, ?2, ?3)",
+            params![member, message_id, now],
         )?;
         Self::prune_dm_thread_locked(&tx, &member)?;
         tx.commit()?;
@@ -849,14 +889,26 @@ impl Database {
         Ok(due)
     }
 
-    /// One more attempt went out; the next is due at `next_attempt_at`.
-    pub fn dm_note_attempt(&self, member: &str, message_id: &str, channel_id: &str, next_attempt_at: i64) -> anyhow::Result<()> {
+    /// One more attempt went out at `now`; the next is due at
+    /// `next_attempt_at`, or [`DM_MAILED_RESEND_SECS`] on for one in the
+    /// mailbox.
+    pub fn dm_note_attempt(
+        &self,
+        member: &str,
+        message_id: &str,
+        channel_id: &str,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         Self::ensure_room_dm_locked(&conn)?;
         conn.execute(
-            "UPDATE room_dm_messages SET attempts = attempts + 1, next_attempt_at = ?3, channel_id = ?4
+            "UPDATE room_dm_messages SET attempts = attempts + 1, channel_id = ?4,
+                next_attempt_at = CASE WHEN EXISTS (
+                    SELECT 1 FROM room_dm_mail_sent s WHERE s.member_pubkey = ?1 AND s.message_id = ?2
+                ) THEN ?5 ELSE ?3 END
              WHERE member_pubkey = ?1 AND direction = 'out' AND message_id = ?2 AND status = 'sending'",
-            params![member, message_id, next_attempt_at, channel_id],
+            params![member, message_id, next_attempt_at, channel_id, now + DM_MAILED_RESEND_SECS],
         )?;
         Ok(())
     }
@@ -1244,7 +1296,7 @@ mod tests {
         assert!(db.dm_due_resends(150).unwrap().is_empty());
         let due = db.dm_due_resends(160).unwrap();
         assert_eq!(due.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), vec!["ping", "pong"]);
-        db.dm_note_attempt(ANN, "o1", ROOM, 280).unwrap();
+        db.dm_note_attempt(ANN, "o1", ROOM, 280, 160).unwrap();
         assert!(db.dm_mark_delivered(ANN, "o2").unwrap());
         assert!(!db.dm_mark_delivered(ANN, "o2").unwrap(), "once");
         assert_eq!(db.dm_due_resends(200).unwrap().len(), 0);
@@ -1290,6 +1342,12 @@ mod tests {
         assert!(ours(&db).is_none() && theirs(&db).is_some());
         assert_eq!(db.dm_expire_due(900).unwrap(), vec![ANN.to_string()]);
         assert!(db.dm_messages(ANN, 10, None, None).unwrap().is_empty());
+        assert_eq!(
+            db.dm_record_incoming(ANN, "Ann", ROOM, "i1", "theirs", 150, ROOM_DM_POLICY_ANYONE, 901).unwrap(),
+            DmIncoming::Duplicate,
+            "a resend of a message its timer deleted stays deleted",
+        );
+        assert!(db.dm_messages(ANN, 10, None, None).unwrap().is_empty());
 
         // Read already when the timer comes: it runs from then.
         db.dm_record_incoming(ANN, "Ann", ROOM, "i2", "later", 950, ROOM_DM_POLICY_ANYONE, 950).unwrap();
@@ -1323,7 +1381,17 @@ mod tests {
 
         db.dm_note_mailed(ANN, "o1", "aa", "bb", 220, 220 + 7 * 86_400).unwrap();
         assert!(db.dm_mail_due(300, 120, 1_000).unwrap().is_empty(), "left once");
-        assert!(db.dm_due_resends(220).unwrap().iter().all(|r| r.message_id != "o1"), "no more live resends");
+        assert!(
+            db.dm_due_resends(220 + DM_MAILED_RESEND_SECS - 1).unwrap().iter().all(|r| r.message_id != "o1"),
+            "resent live only now and then"
+        );
+        assert!(db.dm_due_resends(220 + DM_MAILED_RESEND_SECS).unwrap().iter().any(|r| r.message_id == "o1"));
+        db.dm_note_attempt(ANN, "o1", ROOM, 2_000 + 150, 2_000).unwrap();
+        assert!(
+            db.dm_due_resends(2_000 + 150).unwrap().iter().all(|r| r.message_id != "o1"),
+            "and stays slow after a resend"
+        );
+        assert!(db.dm_due_resends(2_000 + DM_MAILED_RESEND_SECS).unwrap().iter().any(|r| r.message_id == "o1"));
         assert!(db.dm_fail_unanswered(1_300).unwrap().iter().all(|(_, id)| id != "o1"), "it waits its week");
         let mailboxed = db.dm_messages(ANN, 10, None, None).unwrap()[0].mailboxed;
         assert!(mailboxed);
@@ -1387,7 +1455,7 @@ mod tests {
         assert_eq!(db.dm_thread(ANN, day8).unwrap().unwrap().peer_state, "", "the first has run out");
         db.dm_record_outgoing(ANN, "Ann", ROOM, "o2", "hello again", day8, day8 + 120, day8 + 1_200).unwrap();
         db.dm_record_outgoing(ANN, "Ann", ROOM, "o3", "still there?", day8, day8 + 120, day8 + 1_200).unwrap();
-        db.dm_note_attempt(ANN, "o3", ROOM, day8 + 120).unwrap();
+        db.dm_note_attempt(ANN, "o3", ROOM, day8 + 120, day8).unwrap();
         let (moved, mut stopped) = db.dm_note_peer_answer(ANN, false, day8 + 10).unwrap();
         stopped.sort();
         assert_eq!((moved, stopped), (true, vec!["o2".to_string(), "o3".to_string()]));

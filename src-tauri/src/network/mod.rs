@@ -338,6 +338,20 @@ pub struct NetworkDeps {
     pub comment_manager: Arc<RwLock<CommentManager>>,
 }
 
+/// A command that arrived while [`start_network`] waits to go online, taken
+/// into the settings it then starts on. Its caller saved the change and has
+/// been answered, so dropping it would leave the network on the old value
+/// while Settings shows the new one. Returns whether it was one of those.
+fn hold_settings_before_start(settings: &mut AppSettings, command: NetworkCommand) -> bool {
+    match command {
+        NetworkCommand::UpdateSettings { settings: new_settings } => *settings = *new_settings,
+        NetworkCommand::SetIpFilterEnabled { enabled } => settings.ip_filter_enabled = enabled,
+        NetworkCommand::SetBlockPrivateIps { block_private } => settings.block_private_ips = block_private,
+        _ => return false,
+    }
+    true
+}
+
 pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let NetworkDeps {
         app_handle,
@@ -378,8 +392,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 match command {
                     Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
                     Some(NetworkCommand::StartupLibraryIndexed) => library_indexed_during_gate = true,
-                    Some(_) => {
-                        warn!("Dropping network command while security policy reset is unacknowledged");
+                    Some(command) => {
+                        if !hold_settings_before_start(&mut settings, command) {
+                            warn!("Dropping network command while security policy reset is unacknowledged");
+                        }
                     }
                 }
             }
@@ -400,8 +416,10 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 match command {
                     Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
                     Some(NetworkCommand::StartupLibraryIndexed) => library_indexed_during_gate = true,
-                    Some(_) => {
-                        debug!("Dropping network command while the chosen network interface is not connected");
+                    Some(command) => {
+                        if !hold_settings_before_start(&mut settings, command) {
+                            debug!("Dropping network command while the chosen network interface is not connected");
+                        }
                     }
                 }
             }

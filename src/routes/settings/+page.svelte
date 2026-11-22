@@ -4020,6 +4020,8 @@
                 ariaDescribedby="delete-permanently-hint"
               />
             </div>
+            <!-- emberd's pages do not watch the clipboard (+layout.svelte). -->
+            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="watch-clipboard-label" for="watch-clipboard-switch">{m.settings_watch_clipboard_label()}</label>
@@ -4032,6 +4034,7 @@
                 ariaDescribedby="watch-clipboard-hint"
               />
             </div>
+            {/if}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="web-sources-label" for="web-sources-switch">{m.settings_web_sources_label()}</label>
@@ -6221,6 +6224,9 @@
             </div>
             {/if}
 
+            <!-- Releases are fetched by the desktop app's updater, which emberd
+                 does not have. -->
+            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="seed-releases-label" for="seed-releases-switch">{m.settings_seed_ember_releases()}</label>
@@ -6233,6 +6239,7 @@
                 ariaDescribedby="seed-releases-hint"
               />
             </div>
+            {/if}
           </div>
         </div>
       </section>

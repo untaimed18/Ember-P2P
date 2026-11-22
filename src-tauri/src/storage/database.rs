@@ -14221,6 +14221,7 @@ impl Database {
             bump_channel_roster_generation(channel_id);
         } else if Self::note_owned_snapshot_not_taken_locked(&tx, channel_id, snapshot, timestamp)? {
             tx.commit()?;
+            bump_channel_roster_generation(channel_id);
         }
         Ok(applied)
     }
@@ -14238,6 +14239,7 @@ impl Database {
         let tx = conn.unchecked_transaction()?;
         if Self::note_owned_snapshot_not_taken_locked(&tx, channel_id, snapshot, timestamp)? {
             tx.commit()?;
+            bump_channel_roster_generation(channel_id);
         }
         Ok(())
     }
@@ -14255,6 +14257,9 @@ impl Database {
     /// it did so not knowing of that ban and may have sealed this very key to
     /// them: the room owes a rotation. This device's own snapshots carry every
     /// such ban, so they owe none.
+    ///
+    /// And whoever it bans is banned here unless this device has decided
+    /// otherwise since ([`Self::take_owned_snapshot_bans_locked`]).
     fn note_owned_snapshot_not_taken_locked(
         tx: &Connection,
         channel_id: &str,
@@ -14295,7 +14300,73 @@ impl Database {
                 params![channel_id, epoch],
             )? > 0;
         }
+        changed |= Self::take_owned_snapshot_bans_locked(tx, channel_id, snapshot, timestamp, epoch)?;
         Ok(changed)
+    }
+
+    /// Ban here, as the owner's word, whoever a room-signed snapshot stamped
+    /// `timestamp` that this device did not take bans, on a room it owns,
+    /// where this device holds no ban decision on them dated at or after it;
+    /// whether anyone was. Left unbanned, this device's next snapshot, stamped
+    /// later and applied whole by every member, would lift those bans for the
+    /// room, and its re-seal hand them the key. An owner's unban is dated
+    /// ([`Self::apply_channel_moderation_locked`]), so one made since stands.
+    ///
+    /// Owes a rotation when this device holds the epoch the snapshot names or
+    /// a later one, as [`Self::owe_rotation_for_unseen_bans_locked`] does: it
+    /// may have sealed that key to them.
+    fn take_owned_snapshot_bans_locked(
+        tx: &Connection,
+        channel_id: &str,
+        snapshot: &ModerationSnapshot<'_>,
+        timestamp: i64,
+        epoch: i64,
+    ) -> anyhow::Result<bool> {
+        let owned = tx
+            .query_row(
+                "SELECT is_owner FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|is_owner| is_owner != 0);
+        if !owned {
+            return Ok(false);
+        }
+        Self::ensure_channel_owner_bans_locked(tx)?;
+        let mut banned = false;
+        for pk in snapshot.banned_pubkeys.iter().take(32) {
+            if snapshot.owner_pubkey == Some(pk) {
+                continue;
+            }
+            let hex_pk = hex::encode(pk);
+            let n = tx.execute(
+                "INSERT INTO channel_members
+                    (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
+                 VALUES (?1, ?2, '', 0, 1, 0, ?3)
+                 ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
+                    banned = 1,
+                    ban_revised_at = excluded.ban_revised_at
+                 WHERE channel_members.banned = 0
+                   AND channel_members.ban_revised_at < excluded.ban_revised_at",
+                params![channel_id, hex_pk, timestamp],
+            )?;
+            if n > 0 {
+                tx.execute(
+                    "INSERT OR IGNORE INTO channel_owner_bans (channel_id, member_pubkey) VALUES (?1, ?2)",
+                    params![channel_id, hex_pk],
+                )?;
+                banned = true;
+            }
+        }
+        if banned {
+            tx.execute(
+                "UPDATE channels SET rotate_pending = 1
+                 WHERE channel_id = ?1 AND visibility = 'private' AND key_epoch >= ?2",
+                params![channel_id, epoch],
+            )?;
+        }
+        Ok(banned)
     }
 
     fn banned_channel_members_locked(
@@ -14588,10 +14659,15 @@ impl Database {
         if n == 0 {
             return Ok(false);
         }
+        // On a room this device owns a ban lifted here is an unban made at
+        // `timestamp`, and dated so: a snapshot of this identity's signed
+        // before it that still bans them must not ban them here again
+        // (`take_owned_snapshot_bans_locked`).
         tx.execute(
-            "UPDATE channel_members SET banned = 0
+            "UPDATE channel_members SET banned = 0,
+                ban_revised_at = CASE WHEN ?3 AND banned = 1 THEN ?2 ELSE ban_revised_at END
              WHERE channel_id = ?1 AND ban_revised_at <= ?2",
-            params![channel_id, timestamp],
+            params![channel_id, timestamp, is_owner],
         )?;
         tx.execute(
             "UPDATE channel_members SET moderator = 0 WHERE channel_id = ?1",
@@ -20945,6 +21021,107 @@ mod tests {
             .unwrap();
         db.note_owned_snapshot_seen(&id, &banning(&[], 2), 800).unwrap();
         assert!(!pending(), "behind");
+        drop_handoff_test_db(db, path);
+    }
+
+    /// A snapshot of this identity's other device that this device does not
+    /// take, being stamped before one it signed, still bans here whoever it
+    /// bans that this device has no later ban decision on: as the owner's
+    /// word, carried by this device's next snapshot, and owing a rotation when
+    /// this device holds the epoch it names, since it may have sealed that key
+    /// to them. Never the owner's own key.
+    #[test]
+    fn an_owned_channel_takes_the_bans_of_a_snapshot_it_does_not_take() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("merge-bans");
+        let room = ChannelIdentity::generate();
+        let id = hex::encode(room.channel_id);
+        db.insert_channel(&id, &hex::encode(room.pubkey), "Ours", "private", true, Some(&room.seed()), Some(&[7; 32]))
+            .unwrap();
+        db.insert_channel_key_epoch(&id, 2, &[2; 32]).unwrap();
+        let (x, owner) = ([0x58u8; 32], [0x0Au8; 32]);
+        db.upsert_channel_member(&id, &hex::encode(x), "x", 100, None).unwrap();
+        let at = 1_700_000_000i64;
+        db.commit_owner_channel_moderation(&id, &topic_only("signed here later"), &NO_POLICY, at + 60)
+            .unwrap()
+            .unwrap();
+        db.clear_channel_rotate_pending(&id).unwrap();
+
+        let bans = [x, owner];
+        let theirs = ModerationSnapshot {
+            banned_pubkeys: &bans,
+            owner_pubkey: Some(&owner),
+            key_epoch: Some(2),
+            ..topic_only("theirs")
+        };
+        assert!(!db.ingest_channel_moderation(&id, &theirs, at, &[1; 64]).unwrap());
+        assert_eq!(ban_state(&db, &id, &hex::encode(x)), (true, at));
+        assert_eq!(db.list_banned_channel_pubkeys(&id).unwrap(), vec![x], "never the owner's key");
+        assert!(db.channel_ban_target_protected(&id, &hex::encode(x)).unwrap(), "the owner's word");
+        assert!(db.channel_rotate_is_pending(&id).unwrap(), "the key held here may have reached them");
+        assert_eq!(db.get_channel(&id).unwrap().unwrap().topic, "signed here later");
+
+        // Seen beside the newest and naming a later epoch: banned, owing no
+        // rotation, since the device that minted that epoch left them out.
+        db.clear_channel_rotate_pending(&id).unwrap();
+        let y = [0x59u8; 32];
+        let later = ModerationSnapshot {
+            banned_pubkeys: std::slice::from_ref(&y),
+            key_epoch: Some(3),
+            ..topic_only("")
+        };
+        db.note_owned_snapshot_seen(&id, &later, at + 1).unwrap();
+        assert_eq!(ban_state(&db, &id, &hex::encode(y)), (true, at + 1));
+        assert!(!db.channel_rotate_is_pending(&id).unwrap());
+        drop_handoff_test_db(db, path);
+    }
+
+    /// An owner's unban is dated on a room this device owns, so a snapshot of
+    /// this identity's signed before it that still bans them, from the other
+    /// device or this one, does not ban them here again; one the other device
+    /// signed after it does.
+    #[test]
+    fn an_owner_unban_in_a_channel_outlasts_an_older_snapshot_banning_them() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("dated-unban");
+        let room = ChannelIdentity::generate();
+        let id = hex::encode(room.channel_id);
+        db.insert_channel(&id, &hex::encode(room.pubkey), "Ours", "private", true, Some(&room.seed()), Some(&[7; 32]))
+            .unwrap();
+        db.insert_channel_key_epoch(&id, 2, &[2; 32]).unwrap();
+        let x = [0x58u8; 32];
+        let x_hex = hex::encode(x);
+        let banning = ModerationSnapshot {
+            banned_pubkeys: std::slice::from_ref(&x),
+            key_epoch: Some(2),
+            ..topic_only("")
+        };
+        let lifting = ModerationSnapshot {
+            key_epoch: Some(2),
+            ..topic_only("")
+        };
+        let at = 1_700_000_000i64;
+        let banned_at = db.commit_owner_channel_moderation(&id, &banning, &NO_POLICY, at).unwrap().unwrap();
+        let unbanned_at = db
+            .commit_owner_channel_moderation(&id, &lifting, &NO_POLICY, at + 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ban_state(&db, &id, &x_hex), (false, unbanned_at));
+        db.commit_owner_channel_moderation(&id, &topic_only("later"), &NO_POLICY, at + 200)
+            .unwrap()
+            .unwrap();
+        db.clear_channel_rotate_pending(&id).unwrap();
+
+        db.note_owned_snapshot_seen(&id, &banning, banned_at).unwrap();
+        assert!(!db.ingest_channel_moderation(&id, &banning, at + 50, &[1; 64]).unwrap());
+        assert_eq!(ban_state(&db, &id, &x_hex), (false, unbanned_at), "unbanned since");
+        assert!(db.list_banned_channel_pubkeys(&id).unwrap().is_empty());
+        assert!(!db.channel_rotate_is_pending(&id).unwrap());
+
+        assert!(!db.ingest_channel_moderation(&id, &banning, at + 150, &[1; 64]).unwrap());
+        assert_eq!(ban_state(&db, &id, &x_hex), (true, at + 150), "banned again since");
         drop_handoff_test_db(db, path);
     }
 

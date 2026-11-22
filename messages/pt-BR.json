@@ -4125,7 +4125,7 @@
   "channels_dm_policy_off": "As mensagens privadas estão desativadas nas Configurações.",
   "channels_dm_peer_declined": "{name} não aceita mensagens privadas suas.",
   "channels_dm_you_declined": "Você recusou as mensagens privadas de {name}.",
-  "channels_dm_no_shared_room": "Vocês não estão mais num canal juntos, então as mensagens não chegam. Adicione a pessoa como amiga para continuar conversando.",
+  "channels_dm_no_shared_room": "Vocês não estão mais num canal juntos, então as mensagens não chegam. Para continuar conversando, adicionem um ao outro como amigos: a pessoa também precisa adicionar você.",
   "channels_dm_friend_listed": "{name} está na sua lista de amigos: escreva para a pessoa em Chat, na página Amigos.",
   "channels_dm_status_sending": "Enviando…",
   "channels_dm_status_mailbox": "Aguardando na caixa da pessoa",

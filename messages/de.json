@@ -4146,7 +4146,7 @@
   "channels_dm_policy_off": "Private Nachrichten sind in den Einstellungen ausgeschaltet.",
   "channels_dm_peer_declined": "{name} nimmt keine privaten Nachrichten von Ihnen an.",
   "channels_dm_you_declined": "Sie haben die privaten Nachrichten von {name} abgelehnt.",
-  "channels_dm_no_shared_room": "Sie sind in keinem gemeinsamen Kanal mehr, daher erreichen Nachrichten die Person nicht. Fügen Sie sie als Freund hinzu, um weiterzuschreiben.",
+  "channels_dm_no_shared_room": "Sie sind in keinem gemeinsamen Kanal mehr, daher erreichen Nachrichten die Person nicht. Um weiterzuschreiben, fügen Sie sich gegenseitig als Freunde hinzu: Die Person muss Sie ebenfalls hinzufügen.",
   "channels_dm_friend_listed": "{name} steht auf Ihrer Freundesliste: Schreiben Sie der Person im Chat auf der Freunde-Seite.",
   "channels_dm_status_sending": "Wird gesendet…",
   "channels_dm_status_mailbox": "Wartet in ihrem Postfach",

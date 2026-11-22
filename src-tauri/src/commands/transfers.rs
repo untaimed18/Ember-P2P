@@ -3569,6 +3569,12 @@ pub async fn move_transfers_in_queue(
 pub(crate) async fn persist_download_order(state: &AppState) {
     let order: Vec<String> = {
         let manager = state.transfer_manager.read().await;
+        // Until last session's downloads are back in the manager (the network
+        // may still be waiting for its interface), its list is not the order:
+        // saving it would clear the order every row has.
+        if !manager.restored {
+            return;
+        }
         let mut running: Vec<&Transfer> = manager
             .active
             .values()

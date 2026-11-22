@@ -50,6 +50,10 @@ const KEY_SRC_FILE: u8 = 2;
 /// machine-id key; mounted apart from it, it is stronger.
 static KEY_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// The key file `emberd` makes in its data folder when its config names none.
+#[cfg_attr(all(windows, not(feature = "server")), allow(dead_code))]
+pub const DEFAULT_KEY_FILE: &str = "emberd-secret.key";
+
 /// Seal secrets with the 32-byte key in `path` (64 hex digits), made there on
 /// first use. Set once, before anything is sealed or opened.
 #[cfg_attr(not(feature = "server"), allow(dead_code))]
@@ -102,6 +106,11 @@ pub fn needs_rewrap(stored: &[u8]) -> bool {
         // Given a key file, everything moves under it.
         if KEY_FILE.get().is_some() {
             return stored.len() > 8 && &stored[..8] == MAGIC_V4 && stored[8] != KEY_SRC_FILE;
+        }
+        // Sealed by emberd on this data folder; the desktop app keeps its own
+        // under the keyring.
+        if stored.len() > 8 && &stored[..8] == MAGIC_V4 && stored[8] == KEY_SRC_FILE {
+            return true;
         }
         if stored.len() > 8 && &stored[..8] == MAGIC_V4 && stored[8] == KEY_SRC_HKDF {
             return unix::keyring_reachable();
@@ -681,9 +690,14 @@ mod unix {
                 KEY_SRC_HKDF => hkdf_key_uid(HKDF_SALT_V4, HKDF_INFO_V4)?,
                 KEY_SRC_FILE => match KEY_FILE.get() {
                     Some(path) => key_file_key(path, false)?,
-                    None => anyhow::bail!(
-                        "this secret was sealed by emberd with its key file; run emberd with that key file"
-                    ),
+                    // The desktop app on a data folder emberd ran on: its
+                    // default key file is beside what it sealed.
+                    None => key_file_key(&crate::storage::paths::resolve_data_dir().join(super::DEFAULT_KEY_FILE), false)
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "this secret was sealed by emberd with its key file; run emberd with that key file"
+                            )
+                        })?,
                 },
                 _ => anyhow::bail!("unknown {label} key source"),
             };

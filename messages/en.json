@@ -4146,7 +4146,7 @@
   "channels_dm_policy_off": "Private messages are turned off in Settings.",
   "channels_dm_peer_declined": "{name} does not take private messages from you.",
   "channels_dm_you_declined": "You declined {name}'s private messages.",
-  "channels_dm_no_shared_room": "You are no longer in a channel together, so messages cannot reach them. Add them as a friend to keep talking.",
+  "channels_dm_no_shared_room": "You are no longer in a channel together, so messages cannot reach them. To keep talking, add each other as friends: they need to add you too.",
   "channels_dm_friend_listed": "{name} is on your friends list: write to them in Chat on the Friends page.",
   "channels_dm_status_sending": "Sending…",
   "channels_dm_status_mailbox": "Waiting in their mailbox",

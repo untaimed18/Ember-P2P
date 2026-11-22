@@ -3,6 +3,27 @@
 use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
 use super::*;
 
+/// Settings saved while the network waits to go online (its policy gate, or
+/// the chosen interface not yet connected) are what it then starts on.
+#[test]
+fn settings_saved_while_the_network_waits_to_start_are_kept() {
+    let mut settings = AppSettings::default();
+    let filter_on = !settings.ip_filter_enabled;
+    assert!(hold_settings_before_start(&mut settings, NetworkCommand::SetIpFilterEnabled { enabled: filter_on }));
+    assert_eq!(settings.ip_filter_enabled, filter_on);
+    let block = !settings.block_private_ips;
+    assert!(hold_settings_before_start(&mut settings, NetworkCommand::SetBlockPrivateIps { block_private: block }));
+    assert_eq!(settings.block_private_ips, block);
+    let mut changed = settings.clone();
+    changed.nickname = "saved while waiting".into();
+    assert!(hold_settings_before_start(
+        &mut settings,
+        NetworkCommand::UpdateSettings { settings: Box::new(changed) }
+    ));
+    assert_eq!(settings.nickname, "saved while waiting");
+    assert!(!hold_settings_before_start(&mut settings, NetworkCommand::StartupLibraryIndexed));
+}
+
 /// The server log is held here so the frontend can ask for it back. It has
 /// to survive a reload of the webview, which wipes the store that used to
 /// be the only copy — and the uploads pane was offering the webview's own

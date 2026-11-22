@@ -49,6 +49,19 @@ pub struct RoomLibrary {
     pub folders: Vec<String>,
 }
 
+impl RoomLibrary {
+    /// Whether the library is open and `path`, already resolved to its real
+    /// path, lies in one of its folders.
+    pub fn serves(&self, path: &Path) -> bool {
+        self.open
+            && self
+                .folders
+                .iter()
+                .filter_map(|folder| Path::new(folder).canonicalize().ok())
+                .any(|folder| path.starts_with(folder))
+    }
+}
+
 fn libraries() -> &'static RwLock<BTreeMap<String, RoomLibrary>> {
     static LIBRARIES: OnceLock<RwLock<BTreeMap<String, RoomLibrary>>> = OnceLock::new();
     LIBRARIES.get_or_init(|| RwLock::new(BTreeMap::new()))
@@ -667,6 +680,25 @@ mod tests {
 
     fn names(page: &LibraryPage) -> Vec<&str> {
         page.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_library_serves_only_files_in_its_folders_while_open() {
+        let dir = Scratch::new();
+        let kept = dir.path().join("Kept");
+        let dropped = dir.path().join("Dropped");
+        write(&kept.join("a.txt"), 1);
+        write(&dropped.join("b.txt"), 1);
+        let kept_file = kept.join("a.txt").canonicalize().unwrap();
+        let dropped_file = dropped.join("b.txt").canonicalize().unwrap();
+        let mut library = RoomLibrary {
+            open: true,
+            folders: vec![kept.canonicalize().unwrap().to_string_lossy().into_owned()],
+        };
+        assert!(library.serves(&kept_file));
+        assert!(!library.serves(&dropped_file), "a folder taken out of the library");
+        library.open = false;
+        assert!(!library.serves(&kept_file), "a closed library serves nothing");
     }
 
     #[test]

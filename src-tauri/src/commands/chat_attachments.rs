@@ -109,7 +109,13 @@ pub async fn send_chat_attachment_upload(
     user_hash_hex: String,
     upload: String,
 ) -> Result<ChatAttachmentInfo, String> {
-    let friend = attachment_friend(&state, &user_hash_hex).await?;
+    let friend = match attachment_friend(&state, &user_hash_hex).await {
+        Ok(friend) => friend,
+        Err(e) => {
+            crate::server::uploads::discard(&upload);
+            return Err(e);
+        }
+    };
     let path = crate::server::uploads::keep(&upload)?;
     send_chat_attachment_from(&state, friend, path).await
 }

@@ -1485,14 +1485,27 @@ struct ShortWords {
 
 impl ShortWords {
     fn parse(query: &str) -> Option<Self> {
+        // Words that must all be there, and words that must not: a query with
+        // OR or a group asks for something else, and would be answered as if
+        // every word were needed.
+        if query.contains(['(', ')']) || query.split_whitespace().any(|raw| raw == "OR") {
+            return None;
+        }
         let mut include = Vec::new();
         let mut exclude = Vec::new();
+        let mut not = false;
         for raw in query.split_whitespace() {
-            if matches!(raw, "AND" | "OR" | "NOT") {
-                continue;
+            match raw {
+                "AND" => continue,
+                "NOT" => {
+                    not = true;
+                    continue;
+                }
+                _ => {}
             }
             let (words, raw) = match raw.strip_prefix('-') {
                 Some(rest) => (&mut exclude, rest),
+                None if std::mem::take(&mut not) => (&mut exclude, raw),
                 None => (&mut include, raw),
             };
             words.extend(
@@ -2636,6 +2649,9 @@ mod local_index_tests {
         assert_eq!(names("U2", None), ["U2 - One.mp3", "U2 Live TV.mp3"]);
         assert_eq!(names("u2", Some("Audio")), ["U2 - One.mp3", "U2 Live TV.mp3"]);
         assert_eq!(names("u2 -tv", Some("Audio")), ["U2 - One.mp3"]);
+        assert_eq!(names("U2 NOT TV", None), ["U2 - One.mp3"], "NOT leaves the word out, as - does");
+        assert_eq!(names("U2 AND TV", None), ["U2 Live TV.mp3"]);
+        assert!(names("U2 OR TV", None).is_empty(), "not answered as AND");
         assert_eq!(names("", Some("Audio")).len(), 4, "a filter alone still lists");
     }
 

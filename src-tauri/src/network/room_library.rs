@@ -789,18 +789,11 @@ pub(super) async fn library_changed(
     if library.open {
         state.room_library.note_announced(channel_id, sent, Instant::now());
     }
-    let folders: Vec<std::path::PathBuf> = library
-        .folders
-        .iter()
-        .filter_map(|folder| std::path::Path::new(folder).canonicalize().ok())
-        .collect();
     let stopped: Vec<[u8; 16]> = state
         .room_library
         .serving
         .iter()
-        .filter(|(_, (room, path))| {
-            *room == channel_id && (!library.open || !folders.iter().any(|folder| path.starts_with(folder)))
-        })
+        .filter(|(_, (room, path))| *room == channel_id && !library.serves(path))
         .map(|(xfer_id, _)| *xfer_id)
         .collect();
     for xfer_id in stopped {
@@ -1090,9 +1083,10 @@ async fn apply_work(
             let (channel_id, peer, xfer_id) = (offer.channel_id, offer.peer, offer.xfer_id);
             state.room_library.preparing.remove(&xfer_id);
             // Asked again now the file is ready: the library may have closed,
-            // the member been banned, or we left, while it was hashed.
+            // lost the file's folder, the member been banned, or we left,
+            // while it was hashed.
             let room = cached_channel_view(state, db, channel_id).map(|view| view.row);
-            let still = crate::sharing::room_library::is_open(&channel_id)
+            let still = crate::sharing::room_library::get(&hex::encode(channel_id)).serves(&offer.path)
                 && room.is_some_and(|row| room_allows_library(state, db, &row, channel_id))
                 && channel_member_on_roster(state, db, channel_id, &peer);
             if !still {

@@ -8411,9 +8411,13 @@ fn readmit_keys(
         if allowlist_permits(allowed, key) {
             continue;
         }
-        let was_withheld = withheld
-            .get(&folder)
-            .is_some_and(|entries| entries.iter().any(|entry| path_key_covers(entry, key)));
+        // A flat entry (an eMule share of one folder's own files) is withheld
+        // whole by Unshare folder, and names the folder rather than the file.
+        let was_withheld = withheld.get(&folder).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| path_key_covers(entry, key) || crate::sharing::indexer::flat_entry_offers(entry, key))
+        });
         if !was_withheld {
             continue;
         }
@@ -12074,6 +12078,20 @@ mod tests {
         assert!(offers(&allowlists, &withheld).offers(&renamed));
         assert!(tidy_withheld(&allowlists, &mut withheld));
         assert!(withheld.is_empty(), "listed by name, so no longer withheld");
+    }
+
+    /// Unshare folder on a flat share withholds its flat entry whole; Share
+    /// on one of its files then lists that file by name again.
+    #[test]
+    fn a_file_of_a_flat_share_unshared_whole_can_be_shared_again() {
+        let key = crate::search::index::normalize_path_key;
+        let (root, inner) = (sep("C:/music"), sep("C:/music/live"));
+        let file = sep("C:/music/live/one.mp3");
+        let flat = crate::sharing::indexer::flat_entry(&inner);
+        let mut allowlists = std::collections::HashMap::from([(key(&root), Vec::<String>::new())]);
+        let withheld = std::collections::HashMap::from([(key(&root), vec![flat])]);
+        assert_eq!(readmit_keys(&mut allowlists, &withheld, &[key(&file)]), vec![key(&file)]);
+        assert!(crate::sharing::indexer::AllowlistOffers::with_withheld(&allowlists, &withheld).offers(&file));
     }
 
     /// known.met keeps one flag per content hash: a limited add must not

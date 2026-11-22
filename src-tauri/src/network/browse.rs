@@ -552,7 +552,7 @@ pub(crate) fn browse_folder_of(path: &str, roots: &[String]) -> String {
     let name = root_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.trim_end_matches(['\\', '/']).to_string());
+        .unwrap_or_else(|| unnamed_root_label(root_path));
     let mut below = match std::path::Path::new(&file).parent() {
         Some(parent) => parent.components(),
         None => return name,
@@ -569,6 +569,21 @@ pub(crate) fn browse_folder_of(path: &str, roots: &[String]) -> String {
         .chain(below.map(|part| part.as_os_str().to_string_lossy().into_owned()))
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// What a shared folder with no name of its own is shown as: a drive's letter
+/// (`D:`), a network share's name (`media` for `\\nas\media`), never the
+/// machine it is on.
+fn unnamed_root_label(root: &std::path::Path) -> String {
+    use std::path::{Component, Prefix};
+    match root.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::UNC(_, share) | Prefix::VerbatimUNC(_, share) => share.to_string_lossy().into_owned(),
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => format!("{}:", char::from(letter)),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    }
 }
 
 /// A folder a friend's browse answer named, made safe to show: each part
@@ -731,6 +746,12 @@ mod scope_tests {
         assert_eq!(browse_folder_of(&sep("/data/Films/c.mkv"), &roots), "Films");
         assert_eq!(browse_folder_of(&sep("/elsewhere/d.mkv"), &roots), "");
         assert_eq!(browse_folder_of(&sep("/home/ann/Music/a.mp3"), &[]), "", "folders not shown");
+        #[cfg(windows)]
+        {
+            let unc = vec![r"\\nas\media".to_string(), r"D:\".to_string()];
+            assert_eq!(browse_folder_of(r"\\nas\media\Movies\a.mkv", &unc), "media/Movies", "not the machine's name");
+            assert_eq!(browse_folder_of(r"D:\Films\b.mkv", &unc), "D:/Films");
+        }
 
         assert_eq!(clean_browse_folder("Music/../Rock/./\u{202E}gpj.exe/"), "Music/Rock/gpj.exe");
         assert_eq!(clean_browse_folder(""), "");

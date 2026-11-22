@@ -48,6 +48,7 @@
     type LookupOutcome,
     type OwnFeed,
   } from '$lib/api/feeds';
+  import { isServer } from '$lib/runtime';
   import {
     AUTO_MIB_MAX,
     capMib,
@@ -455,6 +456,23 @@
       else if (linked.trim() !== followingLink && !queuedLinks.includes(linked)) queuedLinks.push(linked);
       const next = new URL(page.url);
       next.searchParams.delete('follow');
+      void goto(`${next.pathname}${next.search}${next.hash}`, { replaceState: true, keepFocus: true, noScroll: true }).catch(
+        () => {},
+      );
+    });
+  });
+
+  // A link the chat window asked about: the Follow box filled, following
+  // left to a click here.
+  $effect(() => {
+    const offered = page.url.searchParams.get('prefill');
+    if (!offered) return;
+    untrack(() => {
+      setTab('following');
+      compose = 'follow';
+      followLink = offered;
+      const next = new URL(page.url);
+      next.searchParams.delete('prefill');
       void goto(`${next.pathname}${next.search}${next.hash}`, { replaceState: true, keepFocus: true, noScroll: true }).catch(
         () => {},
       );
@@ -2326,11 +2344,13 @@
                           </svg>
                         </button>
                       {/if}
-                      <button type="button" class="icon-btn" title={m.feeds_open_folder()} aria-label={m.feeds_open_folder()} onclick={() => void openFolder()}>
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
-                        </svg>
-                      </button>
+                      {#if !isServer}
+                        <button type="button" class="icon-btn" title={m.feeds_open_folder()} aria-label={m.feeds_open_folder()} onclick={() => void openFolder()}>
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
+                          </svg>
+                        </button>
+                      {/if}
                       <button type="button" class="icon-btn" title={m.feeds_copy_link()} aria-label={m.feeds_copy_link()} onclick={() => void copy(selected!.link)}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                           <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
@@ -2576,28 +2596,30 @@
                               </svg>
                               <span>{item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}</span>
                             </span>
-                            <button
-                              type="button"
-                              class="icon-btn"
-                              title={m.feeds_item_open()}
-                              aria-label={m.feeds_item_open_named({ name: item.name })}
-                              onclick={() => void openItem(item, openFeedItem)}
-                            >
-                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                <path d="M9.5 2.5h4v4"/><path d="M13.5 2.5 7.5 8.5"/><path d="M12 9.5v4H2.5V4h4"/>
-                              </svg>
-                            </button>
-                            <button
-                              type="button"
-                              class="icon-btn"
-                              title={m.feeds_item_show()}
-                              aria-label={m.feeds_item_show_named({ name: item.name })}
-                              onclick={() => void openItem(item, showFeedItem)}
-                            >
-                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
-                                <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
-                              </svg>
-                            </button>
+                            {#if !isServer}
+                              <button
+                                type="button"
+                                class="icon-btn"
+                                title={m.feeds_item_open()}
+                                aria-label={m.feeds_item_open_named({ name: item.name })}
+                                onclick={() => void openItem(item, openFeedItem)}
+                              >
+                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                  <path d="M9.5 2.5h4v4"/><path d="M13.5 2.5 7.5 8.5"/><path d="M12 9.5v4H2.5V4h4"/>
+                                </svg>
+                              </button>
+                              <button
+                                type="button"
+                                class="icon-btn"
+                                title={m.feeds_item_show()}
+                                aria-label={m.feeds_item_show_named({ name: item.name })}
+                                onclick={() => void openItem(item, showFeedItem)}
+                              >
+                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+                                  <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
+                                </svg>
+                              </button>
+                            {/if}
                           </div>
                         {:else if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
                           {@const stateText =

@@ -3332,9 +3332,11 @@ fn owner_pins_fit(
 /// Refuse an owner edit while the room waits for a claim lookup
 /// ([`crate::network::channel_membership::owner_edit_waits_for_claims`]), or
 /// for a recent answered look at its snapshot
-/// ([`crate::network::channel_membership::owner_edit_waits_for_first_read`]).
+/// ([`crate::network::channel_membership::owner_edit_waits_for_first_read`]),
+/// which one that `rotates` the key waits for however long it takes
+/// ([`crate::network::channel_membership::owner_rotation_waits_for_first_read`]).
 /// Every commit of an owner snapshot comes through here, not only the UI's.
-async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str) -> Result<(), String> {
+async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str, rotates: bool) -> Result<(), String> {
     let db = state.db.clone();
     let id = channel_id.to_string();
     let waits = tokio::task::spawn_blocking(move || {
@@ -3354,10 +3356,13 @@ async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str) -> 
         ));
     }
     crate::network::channel_membership::wait_for_unwritten_read(channel_id).await;
-    if crate::network::channel_membership::owner_edit_waits_for_first_read(
-        channel_id,
-        chrono::Utc::now().timestamp(),
-    ) {
+    let now = chrono::Utc::now().timestamp();
+    let unread = if rotates {
+        crate::network::channel_membership::owner_rotation_waits_for_first_read(channel_id, now)
+    } else {
+        crate::network::channel_membership::owner_edit_waits_for_first_read(channel_id, now)
+    };
+    if unread {
         return Err(coded(
             "channels_owner_reading",
             "Ember is still loading this room's latest state from the network. Try again in a moment.",
@@ -3375,7 +3380,7 @@ async fn commit_channel_moderation_with(
     mods: &[[u8; 32]],
     pin_fit: PinFit,
 ) -> Result<(), String> {
-    refuse_owner_edit_during_return(state, &owned.row.channel_id).await?;
+    refuse_owner_edit_during_return(state, &owned.row.channel_id, false).await?;
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     let our_pk = state.identity.ed25519_public_key;
     let tail = owner_moderation_tail(state, owned).await;
@@ -3972,9 +3977,9 @@ async fn rotate_and_commit(
     bans: &[[u8; 32]],
     mods: &[[u8; 32]],
 ) -> Result<(), String> {
-    // Before a key is minted, which the commit refusing would take back.
-    refuse_owner_edit_during_return(state, &owned.row.channel_id).await?;
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
+    // Before a key is minted, which the commit refusing would take back.
+    refuse_owner_edit_during_return(state, &owned.row.channel_id, private).await?;
     if private {
         // The snapshot the commit will sign, naming the epoch about to be
         // minted, refused for size before the key is stored rather than after.
@@ -4856,7 +4861,7 @@ pub async fn rename_channel(
     }
     // Before the registry grants the name: past it the snapshot's refusal
     // would leave members on the old one.
-    refuse_owner_edit_during_return(&state, &channel_id).await?;
+    refuse_owner_edit_during_return(&state, &channel_id, false).await?;
 
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     let url = rendezvous_url(&state).await;
@@ -6912,7 +6917,13 @@ pub async fn offer_channel_transfer_upload(
     member_pubkey: String,
     upload: String,
 ) -> Result<String, String> {
-    let (channel_id, peer) = channel_transfer_recipient(&state, &channel_id, &member_pubkey).await?;
+    let (channel_id, peer) = match channel_transfer_recipient(&state, &channel_id, &member_pubkey).await {
+        Ok(recipient) => recipient,
+        Err(e) => {
+            crate::server::uploads::discard(&upload);
+            return Err(e);
+        }
+    };
     let path = crate::server::uploads::keep(&upload)?;
     offer_channel_transfer_from(&state, channel_id, peer, path).await
 }

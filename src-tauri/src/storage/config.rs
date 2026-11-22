@@ -244,6 +244,9 @@ impl AppConfig {
         let mut config_missing_during_read = false;
         let mut config_changed = false;
         let mut settings = if config_existed {
+            // What an unreadable file still says of its network interface, so
+            // the reset keeps Ember off any other route.
+            let mut unreadable: Option<String> = None;
             let data = match std::fs::read_to_string(&config_path) {
                 Ok(data) => Some(data),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -255,6 +258,9 @@ impl AppConfig {
                     None
                 }
                 Err(e) => {
+                    unreadable = std::fs::read(&config_path)
+                        .ok()
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
                     let backup =
                         backup_corrupt_config(&config_path, &format!("could not be read ({e})"))?;
                     corrupt_backup = Some(backup);
@@ -263,7 +269,7 @@ impl AppConfig {
                 }
             };
             match data.as_deref().map(parse_settings) {
-                None => AppSettings::default(),
+                None => unreadable.as_deref().map(defaults_on_its_interface).unwrap_or_default(),
                 // Parsed cleanly. Soft-repair out-of-range numerics / invalid
                 // enums first so a hand-edited or downgraded config.json does
                 // not wipe every setting. Overlapping shared folders from older
@@ -567,6 +573,9 @@ mod ember_default_on_tests {
         let reset = defaults_on_its_interface(&strange.to_string());
         assert!(reset.bind_interface.starts_with("tunx") && reset.bind_interface.len() == 256);
         crate::commands::settings::validate_settings(&reset).expect("a reset config can be saved");
+
+        let not_utf8 = String::from_utf8_lossy(b"{\"nickname\": \"\xff\xfe\", \"bind_interface\": \"tun0\"}");
+        assert_eq!(defaults_on_its_interface(&not_utf8).bind_interface, "tun0", "a file that is not UTF-8");
 
         let unbound = defaults_on_its_interface("not json at all");
         assert!(unbound.bind_interface.is_empty());

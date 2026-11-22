@@ -4125,7 +4125,7 @@
   "channels_dm_policy_off": "私信已在设置中关闭。",
   "channels_dm_peer_declined": "{name} 不接受你的私信。",
   "channels_dm_you_declined": "你已拒绝 {name} 的私信。",
-  "channels_dm_no_shared_room": "你们已不在同一个频道，消息无法送达。添加对方为好友即可继续聊天。",
+  "channels_dm_no_shared_room": "你们已不在同一个频道，消息无法送达。要继续聊天，请互相添加为好友：对方也需要添加你。",
   "channels_dm_friend_listed": "{name} 已在你的好友列表中：请在“好友”页面的“聊天”中给对方发消息。",
   "channels_dm_status_sending": "正在发送…",
   "channels_dm_status_mailbox": "在对方的信箱中等待",

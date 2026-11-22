@@ -1357,10 +1357,11 @@ pub(crate) fn validate_settings(settings: &AppSettings) -> Result<(), String> {
         ));
     }
     // Both come from `list_network_interfaces`, which reports nothing longer
-    // or stranger than this.
+    // or stranger than this. Counted in characters: an adapter's name is
+    // limited by characters, and one in CJK runs past 256 bytes well before.
     if [&settings.bind_interface, &settings.bind_interface_name]
         .iter()
-        .any(|text| text.len() > 256 || text.chars().any(char::is_control))
+        .any(|text| text.chars().count() > 256 || text.chars().any(char::is_control))
     {
         return Err(coded(
             "settings_bind_interface_invalid",

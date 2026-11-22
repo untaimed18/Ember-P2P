@@ -159,9 +159,20 @@ pub fn tidy(data_dir: &Path) {
     tidy_sent(data_dir);
 }
 
-/// Files sent from the browser older than [`KEEP_SENT`] go.
+/// Files sent from the browser older than [`KEEP_SENT`] go, and uploads no
+/// command took within [`KEEP_UNCLAIMED`]: one the command refused, or one
+/// a page sent and never named.
 pub fn tidy_sent(data_dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(data_dir.join(SENT_DIR)) else {
+    remove_older(&data_dir.join(SENT_DIR), KEEP_SENT);
+    remove_older(&data_dir.join(UPLOADS_DIR), KEEP_UNCLAIMED);
+}
+
+/// How long an upload waits for the command that reads or sends it. A page
+/// names it in the request right after it arrives.
+const KEEP_UNCLAIMED: Duration = Duration::from_secs(60 * 60);
+
+fn remove_older(dir: &Path, keep: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -170,7 +181,7 @@ pub fn tidy_sent(data_dir: &Path) {
             .and_then(|meta| meta.modified())
             .ok()
             .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age > KEEP_SENT);
+            .is_some_and(|age| age > keep);
         if old {
             let _ = std::fs::remove_dir_all(entry.path());
         }

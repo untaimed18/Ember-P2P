@@ -913,6 +913,23 @@ export const continuedSearchRequests = new Set<number>();
 export const stoppingSearchRequests = new Set<number>();
 
 /**
+ * Searches a newer one replaced as the one the network may continue. A
+ * `search-complete` for one of them, from a stop that landed after the new
+ * search opened, cannot offer Search More again. The newest few are enough:
+ * an older id's events have long been heard.
+ */
+const replacedSearchRequests = new Set<number>();
+const REPLACED_SEARCHES_KEPT = 256;
+
+function notContinuable(requestId: number) {
+  replacedSearchRequests.add(requestId);
+  if (replacedSearchRequests.size > REPLACED_SEARCHES_KEPT) {
+    const oldest = replacedSearchRequests.values().next().value;
+    if (oldest !== undefined) replacedSearchRequests.delete(oldest);
+  }
+}
+
+/**
  * Cancel a search, retrying briefly when the network task is busy.
  *
  * A tab's request id is rotated the moment it stops being the active search,
@@ -985,6 +1002,7 @@ export function openSearchTab(
     const next = tabs.map((t) => {
       // The network keeps only the latest search to continue; a new one
       // replaces it, so no older tab can offer Search More any longer.
+      notContinuable(t.requestId);
       if (!t.isSearching) return t.canSearchMore ? { ...t, canSearchMore: false } : t;
       stoppedOthers = true;
       return { ...t, isSearching: false, progress: null, requestId: newSearchNonce() };
@@ -1400,7 +1418,7 @@ export async function initSearchStore() {
       const requestId = validRequestId(event.payload?.request_id);
       if (requestId === null) return;
       stoppingSearchRequests.delete(requestId);
-      const canSearchMore = event.payload?.can_search_more === true;
+      const canSearchMore = event.payload?.can_search_more === true && !replacedSearchRequests.has(requestId);
       // Flush any buffered `search-results` for this request synchronously
       // before flipping `isSearching` off — otherwise the spinner could
       // disappear while the last batch of results is still queued for the
