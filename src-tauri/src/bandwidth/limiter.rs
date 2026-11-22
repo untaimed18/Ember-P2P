@@ -242,6 +242,9 @@ impl BandwidthLimiter {
         }
         if owed > 0 {
             let cap = max.saturating_mul(2);
+            // Rust 1.99 deprecates `fetch_update` for `try_update`, which is
+            // newer than this crate's `rust-version`.
+            #[allow(deprecated)]
             let _ = self
                 .upload_debt
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |debt| {
@@ -348,6 +351,8 @@ impl BandwidthLimiter {
             let add = numer / divisor;
             self.upload_refill_rem
                 .store(numer % divisor, Ordering::Relaxed);
+            // `fetch_update`: see its use in `charge_upload`.
+            #[allow(deprecated)]
             let add = match self
                 .upload_debt
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |debt| {

@@ -307,18 +307,13 @@ fn apply_credits(pending: &Path, db: &Database) -> anyhow::Result<u64> {
             }
         }
     }
-    let ember = db.load_ember_credits()?;
     let refs: Vec<crate::storage::database::CreditRowRef<'_>> = rows
         .iter()
         .map(|(h, u, d, l, p, ip, st, eh, cv, name, software, seen)| {
             (h, *u, *d, *l, p.as_slice(), *ip, *st, eh.as_ref(), *cv, name.as_str(), software.as_str(), *seen)
         })
         .collect();
-    let ember_refs: Vec<(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)> = ember
-        .iter()
-        .map(|(pk, u, d, lu, ld, c, t, s, ls, v)| (pk, *u, *d, *lu, *ld, *c, *t, *s, *ls, *v))
-        .collect();
-    db.save_all_credits_with_ember(&refs, &ember_refs)?;
+    db.save_all_credits(&refs)?;
     Ok(imported.len() as u64)
 }
 
@@ -464,6 +459,13 @@ fn apply_settings(
             continue;
         }
         settings.shared_folders.push(folder.clone());
+        let flat = manifest.flat_shares.iter().find(|share| share.folder == *folder);
+        let limit = flat.map(|share| (flat_share_entries(share), Vec::new()));
+        crate::commands::sharing::set_added_folder_allowlist(
+            &mut settings.pending_folder_allowlists,
+            folder,
+            limit.as_ref(),
+        );
         new_roots.push(folder.clone());
     }
     // eMule's values come in from its own ranges: an unlimited upload with
@@ -477,6 +479,27 @@ fn apply_settings(
     *current = settings;
     applied.new_roots = new_roots;
     Ok(())
+}
+
+/// A flat share's list: a flat entry for its folder and for each folder eMule
+/// listed inside it, spelled as discovery records them, so the files directly
+/// in each are offered, those added later too, and nothing in their other
+/// subfolders.
+fn flat_share_entries(share: &super::FlatShare) -> Vec<String> {
+    let folder = Path::new(&share.folder);
+    std::iter::once(folder.to_path_buf())
+        .chain(
+            share
+                .listed_inside
+                .iter()
+                .map(PathBuf::from)
+                .filter(|dir| dir.starts_with(folder)),
+        )
+        .map(|dir| {
+            let dir = dir.canonicalize().unwrap_or(dir);
+            crate::sharing::indexer::flat_entry(&crate::commands::share_browser::display_fs_path(&dir))
+        })
+        .collect()
 }
 
 /// Give each staged download its transfer row, then its real name. The row
@@ -641,6 +664,53 @@ mod tests {
             .chunks(72)
             .flat_map(|line| line.iter().copied().chain(*b"\n"))
             .collect()
+    }
+
+    /// A folder shared the eMule way offers its own files and those of the
+    /// folders eMule listed inside it, those added later too, and nothing
+    /// from the rest of its tree.
+    #[test]
+    fn a_flat_share_offers_only_the_files_emule_shared() {
+        let root = scratch("flat").canonicalize().unwrap();
+        let listed = root.join("Listed");
+        let unlisted = root.join("Unlisted");
+        for dir in [&listed.join("Deeper"), &unlisted] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for file in [
+            root.join("top.mkv"),
+            listed.join("listed.mkv"),
+            listed.join("Deeper").join("deeper.mkv"),
+            unlisted.join("unlisted.mkv"),
+        ] {
+            std::fs::write(file, b"x").unwrap();
+        }
+        let share = FlatShare {
+            folder: root.to_string_lossy().into_owned(),
+            listed_inside: vec![listed.to_string_lossy().into_owned()],
+        };
+        let entries = flat_share_entries(&share);
+        assert_eq!(entries.len(), 2, "one for the folder and one for the folder listed inside it");
+
+        let key = crate::search::index::normalize_path_key;
+        let spelled = |p: PathBuf| crate::commands::share_browser::display_fs_path(&p);
+        let mut settings = crate::types::AppSettings::default();
+        let folder = share.folder.clone();
+        crate::commands::sharing::set_added_folder_allowlist(
+            &mut settings.pending_folder_allowlists,
+            &folder,
+            Some(&(entries, Vec::new())),
+        );
+        let offers = crate::sharing::indexer::AllowlistOffers::new(&settings.pending_folder_allowlists);
+        assert!(offers.offers(&spelled(root.join("top.mkv"))));
+        assert!(offers.offers(&spelled(listed.join("listed.mkv"))));
+        assert!(offers.offers(&spelled(root.join("added-later.mkv"))), "a file added since");
+        assert!(offers.offers(&spelled(listed.join("added-later.mkv"))));
+        assert!(!offers.offers(&spelled(listed.join("Deeper").join("deeper.mkv"))));
+        assert!(!offers.offers(&spelled(unlisted.join("unlisted.mkv"))));
+        assert!(!offers.offers_folder(&spelled(unlisted.clone())), "a subfolder is not offered");
+        assert!(settings.pending_folder_allowlists.contains_key(&key(&folder)));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn known_met_with_one_file(hash: [u8; 16], name: &str, size: u32) -> Vec<u8> {

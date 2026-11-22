@@ -3,6 +3,7 @@ node_modules/
 
 # Build outputs
 build/
+build-web/
 dist/
 .svelte-kit/
 out/

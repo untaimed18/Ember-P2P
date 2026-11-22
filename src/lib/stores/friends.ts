@@ -9,6 +9,7 @@ import {
   getIdleAway,
   getOnlineFriends,
   getUnreadMessageCounts,
+  markAllChatsRead,
   isFriendDiscoverable,
   parseChatAttachment,
   type FriendInfo,
@@ -662,6 +663,11 @@ export async function initFriendsStore() {
             ids.push(typeof p.id === 'number' && p.id > 0 ? p.id : NaN);
             seedLive.unreadIds.set(hash, ids);
           }
+          if (markAllBumps) {
+            const ids = markAllBumps.get(hash) ?? [];
+            ids.push(typeof p.id === 'number' && p.id > 0 ? p.id : NaN);
+            markAllBumps.set(hash, ids);
+          }
           unreadCounts.update((m) => {
             const next = new Map(m);
             next.set(hash, (next.get(hash) || 0) + 1);
@@ -700,6 +706,13 @@ export async function initFriendsStore() {
       await listen<{ user_hash: string }>(UNREAD_CLEARED_EVENT, (event) => {
         const hash = validFriendHash(event.payload?.user_hash);
         if (hash) dropUnread(hash);
+      }),
+    );
+    registered.push(
+      await listen<{ user_hash: string; count: number }>(UNREAD_SET_EVENT, (event) => {
+        const hash = validFriendHash(event.payload?.user_hash);
+        const count = event.payload?.count;
+        if (hash && Number.isSafeInteger(count) && count > 0) setUnread(hash, count);
       }),
     );
     registered.push(
@@ -1183,6 +1196,58 @@ export function clearUnread(friendHash: string) {
   dropUnread(friendHash);
   void emit(UNREAD_CLEARED_EVENT, { user_hash: friendHash.toLowerCase() }).catch(() => {});
 }
+
+/** Frontend-only: a window set a friend's unread count to what the backend
+ *  left unread, as `markAllFriendChatsRead` does. */
+const UNREAD_SET_EVENT = 'ember-ui:unread-set';
+
+function setUnread(hash: string, count: number) {
+  unreadCounts.update((current) => {
+    if (current.get(hash) === count) return current;
+    const next = new Map(current);
+    next.set(hash, count);
+    return next;
+  });
+}
+
+/** Mark every friend conversation read but for disappearing messages not yet
+ *  opened (see `markAllChatsRead`), and bring the counts down to what is left,
+ *  in both windows. Returns how many friends still have unread messages,
+ *  which are those. */
+export async function markAllFriendChatsRead(): Promise<number> {
+  const bumps = new Map<string, number[]>();
+  markAllBumps = bumps;
+  let rows: [string, number, number][];
+  try {
+    rows = await markAllChatsRead();
+  } finally {
+    if (markAllBumps === bumps) markAllBumps = null;
+  }
+  // What is left, plus the messages announced while it was being worked out
+  // that it does not hold: those with an id past its newest for a friend it
+  // lists, all of them for one it leaves out, as the startup count reckons.
+  const left = new Map<string, number>();
+  for (const [hash, count, newest] of rows) {
+    const key = hash.toLowerCase();
+    const ids = bumps.get(key) ?? [];
+    left.set(key, count + ids.filter((id) => !Number.isFinite(id) || id > (Number(newest) || 0)).length);
+  }
+  for (const [hash, ids] of bumps) {
+    if (!left.has(hash) && ids.length > 0) left.set(hash, ids.length);
+  }
+  for (const hash of get(unreadCounts).keys()) {
+    if (!left.has(hash.toLowerCase())) clearUnread(hash);
+  }
+  for (const [hash, count] of left) {
+    setUnread(hash, count);
+    void emit(UNREAD_SET_EVENT, { user_hash: hash, count }).catch(() => {});
+  }
+  return left.size;
+}
+
+/** Messages announced while `markAllFriendChatsRead` waits for the backend:
+ *  hash → their row ids, `NaN` for an event that carried none. */
+let markAllBumps: Map<string, number[]> | null = null;
 
 /**
  * Clear any in-progress search state (spinner) and its auto-clear timer for a

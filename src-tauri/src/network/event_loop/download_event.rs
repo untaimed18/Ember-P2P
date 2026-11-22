@@ -10,7 +10,7 @@ use super::*;
 /// each retry, and one notice says everything the next hundred would.
 const DOWNLOAD_FOLDER_NOTICE_INTERVAL_SECS: i64 = 300;
 
-fn emit_download_folder_unavailable(app_handle: &tauri::AppHandle) {
+fn emit_download_folder_unavailable(app_handle: &crate::host::AppHandle) {
     static LAST_NOTICE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let now = chrono::Utc::now().timestamp();
     let last = LAST_NOTICE.load(std::sync::atomic::Ordering::Relaxed);
@@ -345,7 +345,7 @@ pub(in crate::network) async fn on_download_event(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
@@ -581,8 +581,9 @@ pub(in crate::network) async fn on_download_event(
                 .unwrap_or(now)
             };
 
-            // A feed's download is private: it goes in no index, known.met,
-            // KAD or server list (see `sharing::feed_downloads`).
+            // A feed's download is private, unless its feed shares its files:
+            // it goes in no index, known.met, KAD or server list (see
+            // `sharing::feed_downloads`).
             let private = crate::sharing::feed_downloads::is_private(transfer_id);
             if private {
                 info!("Completed download {transfer_id} is from a feed: kept private, out of the library");
@@ -1077,6 +1078,7 @@ pub(in crate::network) async fn on_download_event(
         let is_folder_error = matches!(
             failure_code,
             ed2k::transfer::TransferFailureCode::DownloadFolderUnavailable
+                | ed2k::transfer::TransferFailureCode::DownloadFolderBusy
                 | ed2k::transfer::TransferFailureCode::PartFolderOffline
         );
         if is_folder_error {
@@ -1193,7 +1195,7 @@ pub(in crate::network) async fn on_download_event(
                 &mut state.ember_content_hashes,
                 &mut *transfer_manager.write().await,
                 transfer_id,
-                crate::sharing::feed_downloads::is_private(transfer_id)
+                crate::sharing::feed_downloads::is_feed_download(transfer_id)
                     || crate::sharing::feed_files::is_internal_fetch(transfer_id),
             );
         if remote_pin_dropped {
@@ -1576,106 +1578,6 @@ pub(in crate::network) async fn on_download_event(
         .await;
     }
 
-    if let DownloadEvent::FriendSeen { ember_hash: friend_eh, ip, port } = event {
-        // FriendSeen is only emitted post-PoP for a peer that was a
-        // friend at emit time, but a concurrent removal can race the
-        // event. Don't resurrect a just-removed friend as "online"
-        // or proactively re-dial them.
-        if !friend_hashes.read().await.contains(&friend_eh) {
-            return;
-        }
-        // The inbound counterpart to the ask on `EmberFriendConnected`:
-        // a friend that dialled us never raises that event, and a
-        // starved node should not wait out a 60s tick for the one
-        // bootstrap path that does not need their UDP port.
-        if settings.ember_native_enabled {
-            ask_friends_for_ember_contacts(state).await;
-        }
-        let hash_hex = hex::encode(friend_eh);
-        let now = chrono::Utc::now().timestamp();
-        state.online_friends.insert(friend_eh, now);
-        state.friend_reconnect_last.remove(&friend_eh);
-        let ip_str = match ip { std::net::IpAddr::V4(v4) => v4.to_string(), std::net::IpAddr::V6(v6) => v6.to_string() };
-        let db2 = db.clone();
-        let h2 = hash_hex.clone();
-        let ip2 = ip_str.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = db2.update_friend_address(&h2, &ip2, port) {
-                warn!("Failed to persist friend {h2} address {ip2}:{port}: {e}");
-            }
-        });
-        // `FriendSeen` now carries the peer's Hello listen port
-        // (not the connection's ephemeral socket port — see the
-        // emission sites in multi_source.rs/transfer.rs), so it's
-        // safe to reseed download sources from it too.
-        if let std::net::IpAddr::V4(v4) = ip {
-            reseed_friend_endpoint(
-                state,
-                source_manager,
-                credit_manager,
-                transfer_manager,
-                friend_hashes,
-                friend_eh,
-                None,
-                v4,
-                port,
-            )
-            .await;
-        }
-        let _ = app_handle.emit("ember:friend-online", serde_json::json!({
-            "user_hash": hash_hex,
-            "ip": ip_str,
-            "port": port,
-        }));
-        if !state.ember_sessions.read().await.get(&friend_eh).is_some_and(|h| h.is_fresh())
-            && !state.outbound_session_tasks.contains_key(&friend_eh)
-        {
-            if let std::net::IpAddr::V4(v4) = ip {
-                let reserved_at = std::time::Instant::now();
-                state.outbound_session_tasks.insert(friend_eh, reserved_at);
-                let our_uh = state.user_hash;
-                let our_eh = ember_hash;
-                let nick = settings.nickname.clone();
-                let cid = state.external_ip.map(|eip| u32::from_le_bytes(eip.octets())).unwrap_or(0);
-                let tcp = advertised_tcp_port(state);
-                let udp = advertised_udp_port(state);
-                let obfs = settings.friend_session_encryption;
-                let sess = state.ember_sessions.clone();
-                let offline = state.user_offline.clone();
-                let ultx = ul_event_tx.clone();
-                let fh = friend_hashes.clone();
-                let friend_addr = SocketAddr::new(v4.into(), port);
-                info!("Proactively opening friend session to {} at {}", hex::encode(friend_eh), friend_addr);
-                let ultx2 = ul_event_tx.clone();
-                // NAT-fallback context — see `spawn_rendezvous_friend_lookup`'s
-                // identical capture for why a plain TCP-only dial isn't enough.
-                let rv_url = settings.rendezvous_url.clone();
-                let nat_ctx = state.friend_nat_context.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = ed2k::friend_connect::connect_friend_with_fallback(
-                        friend_addr, friend_eh, our_uh, our_eh, nick,
-                        cid, tcp, udp, obfs, sess, offline, ultx, fh,
-                        Some(ed25519_pubkey), Some(ed25519_secret_key),
-                        rv_url, nat_ctx,
-                    ).await {
-                        info!("Proactive friend session to {} failed: {e}", hex::encode(friend_eh));
-                    }
-                    // Always release the outbound-task slot (success or
-                    // failure). On Ok the live session lives in ember_sessions;
-                    // the slot only gated this connect attempt.
-                    let _ = ultx2.send(upload_server::UploadEvent {
-                        transfer_id: String::new(),
-                        kind: upload_server::UploadEventKind::EmberFriendSearchFailed {
-                            ember_hash: friend_eh,
-                            reserved_at: Some(reserved_at),
-                        },
-                    }).await;
-                });
-            }
-        }
-        return;
-    }
-
     if let DownloadEvent::EmberFriendRequest {
         ember_hash,
         pubkey,
@@ -1689,10 +1591,12 @@ pub(in crate::network) async fn on_download_event(
         // upload) are how Add Friend on the uploads pane
         // delivers `OP_EMBER_FRIEND_REQ` when the peer is
         // firewalled and FindFriendAndConnect cannot dial
-        // back. `verified` is PoP/Noise; unverified *strangers*
-        // still queue with the unverified badge. Reciprocal
-        // accepts from someone we already added auto-confirm
-        // when verified and are ignored when not.
+        // back. `verified` is true only on a friend's connect-back
+        // for a friend transfer, which rides a secure-v2 session; a
+        // plain eD2K socket never proves the peer's key, so there
+        // strangers queue with the unverified badge, and a
+        // reciprocal accept from someone we already added is
+        // ignored rather than auto-confirmed.
         process_inbound_friend_request(
             db,
             app_handle,
@@ -1706,31 +1610,6 @@ pub(in crate::network) async fn on_download_event(
             verified,
         )
         .await;
-        return;
-    }
-
-    if let DownloadEvent::EmberChatMessage { ember_hash, .. } = event {
-        debug!(
-            "Dropping unbound chat event from generic download connection for {}",
-            hex::encode(ember_hash)
-        );
-        return;
-    }
-
-    if let DownloadEvent::EmberBrowseResponse {
-        ember_hash,
-        ref entries,
-    } = event
-    {
-        // Browse requests are dispatched only over a canonical
-        // friend session. A generic download connection has no
-        // session generation, so accepting its response could
-        // reintroduce cross-reconnect mis-correlation.
-        debug!(
-            "Ignoring unbound browse response from download connection for {} ({} entries)",
-            hex::encode(ember_hash),
-            entries.len()
-        );
         return;
     }
 
@@ -2169,13 +2048,19 @@ pub(in crate::network) async fn on_download_event(
         let mut sf = spam_filter.write().await;
         sf.auto_mark_not_spam(file_hash);
         drop(sf);
-        // Its mirrors have nothing left to give.
-        if let Some(hash) = parse_ed2k_hash16(file_hash) {
+        // Its mirrors have nothing left to give this download. Those the file
+        // proved stay with it, for a copied link to carry.
+        let proven = parse_ed2k_hash16(file_hash).map_or_else(Vec::new, |hash| {
+            let proven = ed2k::web_sources::proven(&hash);
             ed2k::web_sources::forget(&hash);
-        }
+            proven
+        });
         let db_web = db.clone();
         let fh = file_hash.clone();
         tokio::task::spawn_blocking(move || {
+            if let Err(e) = db_web.keep_library_web_mirrors(&fh, &proven) {
+                debug!("Could not keep the mirrors {fh} proved: {e}");
+            }
             if let Err(e) = db_web.delete_transfer_web_sources(&fh) {
                 debug!("Could not forget the web sources of {fh}: {e}");
             }

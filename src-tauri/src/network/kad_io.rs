@@ -580,8 +580,8 @@ pub(super) fn adopt_stun_mapped_external_ip(state: &mut NetworkState, ip: Ipv4Ad
 /// `earned_under` still holds once the address becomes `new_ip`.
 ///
 /// Only a move to a different known address invalidates it. An address that
-/// is merely unknown for a while has not moved: KAD disconnect clears it until
-/// STUN reports the same one again.
+/// is merely unknown for a while, as it is at startup until STUN reports it,
+/// has not moved.
 pub(super) fn reach_evidence_survives(
     earned_under: Option<Ipv4Addr>,
     new_ip: Option<Ipv4Addr>,
@@ -612,9 +612,9 @@ pub(super) fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
         // a DHCP lease change or an ISP reconnection every record we had placed
         // would send downloaders to whoever holds the old address for up to two
         // hours. Measured against the address those records were published
-        // under, not against `external_ip`: that starts out unknown and is
-        // cleared by a KAD disconnect, and an address that is unknown for a
-        // while has not moved. Keyword records carry no address, so their
+        // under, not against `external_ip`: that starts out unknown, and an
+        // address that is unknown for a while has not moved. Keyword records
+        // carry no address, so their
         // schedule is deliberately untouched.
         if let Some(new_ip) = ip {
             note_ember_source_address(state, new_ip);
@@ -630,7 +630,7 @@ pub(super) fn set_external_ip(state: &mut NetworkState, ip: Option<Ipv4Addr>) {
         }
         // Rendezvous failures earned on the old address say nothing about the
         // new one, and presence has to be re-announced from it promptly. A
-        // transient `None` keeps the backoff; the disconnect path covers that.
+        // `None` names no new address, so it keeps the backoff.
         if ip.is_some() {
             state.rendezvous_register_fail_streak = 0;
             state.rendezvous_last_attempt = None;
@@ -764,7 +764,7 @@ pub(super) const UDP_FW_CANDIDATE_POOL_MAX: usize = 64;
 
 pub(super) fn dispatch_udp_firewall_probe_requests(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
 ) {
     if !state.firewall_checker.needs_udp_firewall_probes() {
@@ -932,7 +932,7 @@ pub(super) async fn send_udp_firewall_probe_request(
     obfuscation_enabled: bool,
 ) -> anyhow::Result<()> {
     let addr = SocketAddr::new(contact.ip.into(), contact.tcp_port);
-    let stream = tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr))
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(10), crate::net_bind::tcp_connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("TCP connect timeout to {addr}"))??;
     let (reader, writer) = stream.into_split();
@@ -1160,8 +1160,9 @@ mod reach_evidence_tests {
     }
 
     /// Issue #124: disconnecting KAD showed a reachable node as relayed. KAD
-    /// disconnect drops the external address until STUN reports it again, and
-    /// that round trip wiped Ember's proof that the port is open.
+    /// disconnect dropped the external address until STUN reported it again,
+    /// and that round trip wiped Ember's proof that the port is open. An
+    /// address that is unknown for a while must still not cost the proof.
     #[test]
     fn a_kad_disconnect_round_trip_keeps_the_node_reachable() {
         let now = 1_000_000i64;

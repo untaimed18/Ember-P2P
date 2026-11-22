@@ -12,15 +12,22 @@
    */
   import { onMount, tick, untrack } from 'svelte';
   import { get } from 'svelte/store';
+  import { goto } from '$app/navigation';
+  import FeedLinkCard from '$lib/components/FeedLinkCard.svelte';
+  import { feedLinksIn } from '$lib/feedLinks';
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+  import { CHAT_DISAPPEAR_CHOICES, disappearLabel, disappearsIn } from '$lib/chatDisappear';
   import {
     answerRoomDmRequest,
+    getRoomDmDisappear,
     getRoomDmMessages,
     markRoomDmRead,
     retryRoomDm,
     sendRoomDm,
+    setRoomDmDisappear,
     ROOM_DM_MESSAGE_EVENT,
     ROOM_DM_STATUS_EVENT,
+    ROOM_DM_THREAD_EVENT,
     type RoomDmMessage,
     type RoomDmMessageEvent,
     type RoomDmStatusEvent,
@@ -35,8 +42,11 @@
     refreshDmThreads,
     viewingDm,
   } from '$lib/stores/roomDm';
-  import { activeChatHash } from '$lib/stores/friends';
+  import { activeChatHash, friendRequests, friendsList } from '$lib/stores/friends';
   import { clearDraft, getDraft, registerDraftFlusher, setDraft } from '$lib/stores/chatTabs';
+  import { addFriendInMainWindow, friendsAddPath, showInMainWindow } from '$lib/chatPopout';
+  import { friendHashFromCode } from '$lib/friendCode';
+  import { isChatWindow } from '$lib/windowRole';
   import { appSettings } from '$lib/stores/settings';
   import { toastError } from '$lib/stores/toast';
   import { translateError } from '$lib/i18n';
@@ -89,21 +99,83 @@
    *  another window: answered as far as this view goes. */
   let heldAnswer = $derived(thread?.state === 'request' ? ($dmAnswersHeld.get(who) ?? null) : null);
 
-  /** Why nothing can be written here, or null when something can. */
-  let blocked = $derived.by((): string | null => {
-    if (heldAnswer === 'decline') return m.channels_dm_you_declined({ name: shownName });
-    if (heldAnswer === 'ignore') return m.channels_dm_ignoring_toast({ name: shownName });
+  /** Where they stand as a friend, for a conversation no room carries: only
+   *  friend chat can take it on. */
+  let friendHash = $derived(thread?.friend_code ? friendHashFromCode(thread.friend_code) : null);
+  let friendRelation = $derived.by((): 'mutual' | 'listed' | 'incoming' | 'none' => {
+    if (!friendHash) return 'none';
+    const row = $friendsList.find((f) => f.user_hash.toLowerCase() === friendHash);
+    if (row) return row.mutual ? 'mutual' : 'listed';
+    if ($friendRequests.some((r) => r.sender_hash.toLowerCase() === friendHash)) return 'incoming';
+    return 'none';
+  });
+
+  /** Why nothing can be written here, or null when something can, and what
+   *  it offers instead. */
+  let blockedBy = $derived.by((): { text: string; offers?: 'befriend' | 'friends_page' } | null => {
+    const say = (text: string) => ({ text });
+    if (heldAnswer === 'decline') return say(m.channels_dm_you_declined({ name: shownName }));
+    if (heldAnswer === 'ignore') return say(m.channels_dm_ignoring_toast({ name: shownName }));
     if (thread?.state === 'request') return null;
-    if (justDeclined) return m.channels_dm_you_declined({ name: shownName });
-    if (thread?.is_friend) return m.channels_dm_is_friend();
-    if (policyOff) return m.channels_dm_policy_off();
-    if (thread?.peer_state === 'declined') return m.channels_dm_peer_declined({ name: shownName });
-    if (thread && !thread.can_send) return m.channels_dm_no_shared_room();
+    if (justDeclined) return say(m.channels_dm_you_declined({ name: shownName }));
+    if (thread?.is_friend || friendRelation === 'mutual') return say(m.channels_dm_is_friend());
+    if (policyOff) return say(m.channels_dm_policy_off());
+    if (thread?.peer_state === 'declined') return say(m.channels_dm_peer_declined({ name: shownName }));
+    if (thread && !thread.can_send) {
+      if (friendRelation === 'listed') return say(m.channels_dm_friend_listed({ name: shownName }));
+      if (friendRelation === 'incoming') {
+        return { text: m.channels_friend_they_asked({ name: shownName }), offers: 'friends_page' };
+      }
+      return { text: m.channels_dm_no_shared_room(), offers: thread.friend_code ? 'befriend' : undefined };
+    }
     return null;
   });
+  let blocked = $derived(blockedBy?.text ?? null);
+
+  /** The Friends page with their code in its Add form; the add is the user's
+   *  click there, in the main window. */
+  function addAsFriend() {
+    const code = thread?.friend_code;
+    if (!code) return;
+    const theirName = name.trim() || thread?.name || '';
+    if (isChatWindow()) addFriendInMainWindow(code, theirName);
+    else void goto(friendsAddPath(code, theirName)).catch((e) => console.warn('Failed to open Friends page:', e));
+  }
+
+  function openFriendsPage() {
+    if (isChatWindow()) showInMainWindow('/friends');
+    else void goto('/friends').catch((e) => console.warn('Failed to open Friends page:', e));
+  }
 
   function rowKey(row: RoomDmMessage): string {
     return `${row.direction}:${row.message_id}`;
+  }
+
+  /** The timer what is sent from now on goes with; 0 for none. */
+  let disappearSecs = $state(0);
+  /** Moves on each half-minute, for the time a timed message has left. */
+  let nowMs = $state(Date.now());
+
+  async function chooseDisappear(secs: number) {
+    const before = disappearSecs;
+    disappearSecs = secs;
+    try {
+      await setRoomDmDisappear(who, secs);
+    } catch (e) {
+      disappearSecs = before;
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
+
+  /** What a timed message's clock says: how long it has left, or the timer
+   *  it will run once delivered (ours) or read (theirs). */
+  function timerText(row: RoomDmMessage): string | null {
+    if (row.expires_at > 0) return disappearsIn(row.expires_at, nowMs);
+    if (row.ttl_secs <= 0) return null;
+    const time = disappearLabel(row.ttl_secs);
+    return row.direction === 'out'
+      ? m.channels_dm_disappear_after_delivery({ time })
+      : m.channels_dm_disappear_after_read({ time });
   }
 
   /** Rows from storage, with any that arrived or were sent while they were
@@ -154,6 +226,31 @@
     }
   }
 
+  /** Rows put on screen from events or a send, so a refresh that read the
+   *  newest page before one was stored does not drop it. */
+  let shownLive = 0;
+
+  /** Read the newest page again for what it now says of the rows shown:
+   *  timers started on reading or delivery, and messages a timer deleted.
+   *  Rows older than that page and the scroll position stay as they are. */
+  async function refreshShown() {
+    const seq = loadSeq;
+    const live = shownLive;
+    try {
+      const rows = await getRoomDmMessages(who, undefined, PAGE_SIZE);
+      if (seq !== loadSeq) return;
+      if (live !== shownLive) {
+        void refreshShown();
+        return;
+      }
+      const fresh = new Set(rows.map(rowKey));
+      const pageStart = rows.length >= PAGE_SIZE ? Math.min(...rows.map((row) => row.timestamp)) : -Infinity;
+      messages = merged(rows, messages.filter((row) => !fresh.has(rowKey(row)) && row.timestamp < pageStart));
+    } catch {
+      // The next change tries again.
+    }
+  }
+
   /** Read the page before the oldest message shown, keeping the view where it
    *  was. Paged by that message's timestamp and stored row, since timestamps
    *  are the sender's and can repeat. One not read back from storage has no
@@ -200,6 +297,8 @@
     marking = true;
     try {
       await markRoomDmRead(who);
+      // Reading starts the timers of what came in.
+      void refreshShown();
       await refreshDmThreads();
     } catch (e) {
       console.warn('roomDm: could not mark read', e);
@@ -231,6 +330,17 @@
 
   onMount(() => {
     void load();
+    getRoomDmDisappear(who)
+      .then((secs) => { if (mounted) disappearSecs = secs; })
+      .catch(() => {});
+    // An open conversation drops a message at its time; the sweep deletes it.
+    const clock = setInterval(() => {
+      nowMs = Date.now();
+      const now = Math.floor(nowMs / 1000);
+      if (messages.some((row) => row.expires_at > 0 && row.expires_at <= now)) {
+        messages = messages.filter((row) => !(row.expires_at > 0 && row.expires_at <= now));
+      }
+    }, 30_000);
     // Tells the chat window's presence report, and through it the main
     // window, which conversation is on screen.
     activeChatHash.set(tabKey);
@@ -253,7 +363,11 @@
             timestamp: msg.timestamp,
             status: 'received',
             seq: 0,
+            ttl_secs: 0,
+            expires_at: 0,
+            mailboxed: false,
           };
+          shownLive += 1;
           messages = merged(messages, [row]);
           void scrollToEnd();
         }),
@@ -261,9 +375,17 @@
           const update = event.payload;
           if (update.member_pubkey !== who) return;
           messages = messages.map((row) =>
-            row.direction === 'out' && row.message_id === update.message_id ? { ...row, status: update.status } : row,
+            row.direction === 'out' && row.message_id === update.message_id
+              ? { ...row, status: update.status, mailboxed: update.mailboxed ?? row.mailboxed }
+              : row,
           );
           if (update.status === 'failed') void announceFailed();
+          // Delivery starts the timer of one of ours.
+          if (update.status === 'delivered') void refreshShown();
+        }),
+        // A timer deleted messages, or the conversation changed.
+        listen<{ member_pubkey: string }>(ROOM_DM_THREAD_EVENT, (event) => {
+          if (event.payload.member_pubkey === who) void refreshShown();
         }),
       ]);
       if (alive) unlisten.push(...fns);
@@ -272,6 +394,7 @@
     return () => {
       alive = false;
       mounted = false;
+      clearInterval(clock);
       unlisten.forEach((fn) => fn());
       document.removeEventListener('visibilitychange', onSeen);
       window.removeEventListener('focus', onSeen);
@@ -290,6 +413,7 @@
     clearDraft(tabKey);
     try {
       const sent = await sendRoomDm(who, text);
+      shownLive += 1;
       messages = merged(messages, [sent]);
       // Not what was typed since pressing Send.
       if (draft === raw) draft = '';
@@ -363,6 +487,7 @@
   }
 
   function statusLabel(row: RoomDmMessage): string {
+    if (row.status === 'sending' && row.mailboxed) return m.channels_dm_status_mailbox();
     if (row.status === 'sending') return m.channels_dm_status_sending();
     if (row.status === 'delivered') return m.channels_dm_status_delivered();
     if (row.status === 'failed') return m.channels_dm_status_failed();
@@ -410,13 +535,25 @@
     {/if}
     {#each messages as row (rowKey(row))}
       {@const failed = row.direction === 'out' && row.status === 'failed'}
+      {@const timer = timerText(row)}
       <div class="dm-row" class:out={row.direction === 'out'}>
         <div class="dm-bubble" class:failed>
           <p class="dm-text"><bdi dir="auto">{row.text}</bdi></p>
+          {#each feedLinksIn(row.text) as link (link)}
+            <FeedLinkCard {link} />
+          {/each}
           <span class="dm-meta">
             {timeOf(row.timestamp)}
             {#if row.direction === 'out' && row.status !== 'received' && !failed}
               · <span>{statusLabel(row)}</span>
+            {/if}
+            {#if timer}
+              <span class="dm-timer" role="img" title={timer} aria-label={timer}>
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" width="10" height="10" aria-hidden="true">
+                  <circle cx="8" cy="9" r="5.5"/>
+                  <path d="M8 6.2V9l1.8 1.2M6.5 1.8h3"/>
+                </svg>
+              </span>
             {/if}
           </span>
           {#if failed}
@@ -445,6 +582,15 @@
 
   {#if blocked}
     <p class="dm-blocked" role="status">{blocked}</p>
+    {#if blockedBy?.offers === 'befriend'}
+      <div class="dm-blocked-actions">
+        <button type="button" class="primary" onclick={addAsFriend}>{m.channels_add_friend()}</button>
+      </div>
+    {:else if blockedBy?.offers === 'friends_page'}
+      <div class="dm-blocked-actions">
+        <button type="button" class="secondary" onclick={openFriendsPage}>{m.chat_dock_empty_cta()}</button>
+      </div>
+    {/if}
   {:else if thread?.state !== 'request'}
     <div class="dm-compose">
       <textarea
@@ -463,6 +609,18 @@
     {#if tooLong}
       <p class="dm-too-long" id={TOO_LONG_ID} role="alert">{m.channels_dm_too_long()}</p>
     {/if}
+    <label class="dm-disappear" title={m.channels_dm_disappear_title()}>
+      <span>{m.channels_dm_disappear_label()}</span>
+      <select
+        value={disappearSecs}
+        onchange={(e) => void chooseDisappear(Number(e.currentTarget.value))}
+      >
+        <option value={0}>{m.chat_disappear_off()}</option>
+        {#each CHAT_DISAPPEAR_CHOICES as secs (secs)}
+          <option value={secs}>{disappearLabel(secs)}</option>
+        {/each}
+      </select>
+    </label>
   {/if}
   <p class="dm-privacy">{m.channels_dm_privacy_hint()}</p>
 </div>
@@ -633,9 +791,35 @@
     font-size: var(--font-size-sm);
   }
 
+  .dm-blocked-actions {
+    display: flex;
+    gap: 8px;
+    margin: 8px 12px 0;
+  }
+
   .dm-privacy {
     margin: 6px 12px 10px;
     color: var(--text-muted);
     font-size: var(--font-size-2xs);
+  }
+
+  .dm-timer {
+    display: inline-flex;
+    margin-left: 4px;
+    vertical-align: -1px;
+  }
+
+  .dm-disappear {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 12px 0;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+  }
+
+  .dm-disappear select {
+    font: inherit;
+    font-size: var(--font-size-xs);
   }
 </style>

@@ -64,8 +64,14 @@ export interface FollowedFeed {
   followed_at: number;
   checked_at: number;
   auto_download: boolean;
+  /** "Share files from this feed": its downloads are offered to others as
+   *  any shared file is. Off by default. */
+  share_files: boolean;
   auto_max_item_mib: number;
   auto_max_day_mib: number;
+  /** The file types auto-download takes, as eD2K type terms (`Video`,
+   *  `Audio`, `Image`, `Doc`, `Arc`) joined by commas; empty for every type. */
+  auto_types: string;
   /** When auto-download was last turned on; it takes files first seen since. */
   auto_since: number;
   /** When a head of the feed was last found on the network, newer or not;
@@ -132,7 +138,7 @@ export interface FollowedItem extends FeedItem {
   /** 0 to 100, for one on its way. */
   progress: number;
   /** Why auto-download has not started it. */
-  held: 'risky' | 'too_large' | 'day_limit' | 'disk' | 'spam' | null;
+  held: 'risky' | 'type' | 'too_large' | 'day_limit' | 'disk' | 'spam' | null;
   /** Its download, while it is in the transfer list. */
   transfer: FeedItemTransfer | null;
   /** For one held in another followed feed's folder: that feed's title. */
@@ -229,6 +235,11 @@ export const addFeedItems = (
 export const publishFeed = (salt: string): Promise<OwnFeed> => invoke('publish_feed', { salt });
 export const deleteFeed = (salt: string): Promise<void> => invoke('delete_feed', { salt });
 
+/** Each friend whose key this device holds, by friend hash: their key, which
+ *  Discover filters a publisher by, and how many of their feeds are known
+ *  here, followed or found by Discover. */
+export const friendsFeeds = (): Promise<Record<string, { publisher: string; known: number }>> =>
+  invoke('friends_feeds');
 export const listFollowedFeeds = (): Promise<FollowedFeed[]> => invoke('list_followed_feeds');
 export const followFeed = (link: string): Promise<FollowedFeed> => invoke('follow_feed', { link });
 /** Look again now, and fetch its list now if owed one. */
@@ -238,14 +249,20 @@ export const getFeedItems = (publisher: string, salt: string): Promise<FollowedI
   invoke('get_feed_items', { publisher, salt });
 export const markFeedRead = (publisher: string, salt: string): Promise<void> =>
   invoke('mark_feed_read', { publisher, salt });
+/** `types` limits it to those eD2K type terms; empty takes every type. */
 export const setFeedAutoDownload = (
   publisher: string,
   salt: string,
   enabled: boolean,
   maxItemMib: number,
   maxDayMib: number,
+  types: string[],
 ): Promise<FollowedFeed> =>
-  invoke('set_feed_auto_download', { publisher, salt, enabled, maxItemMib, maxDayMib });
+  invoke('set_feed_auto_download', { publisher, salt, enabled, maxItemMib, maxDayMib, types });
+/** Share a followed feed's files, partial and finished, from its folder, or
+ *  keep them private again. */
+export const setFeedShareFiles = (publisher: string, salt: string, share: boolean): Promise<FollowedFeed> =>
+  invoke('set_feed_share_files', { publisher, salt, share });
 export const downloadFeedItems = (publisher: string, salt: string, ed2ks: string[]): Promise<number> =>
   invoke('download_feed_items', { publisher, salt, ed2ks });
 /** Cancel the feed's download of a file: what has arrived is deleted. */

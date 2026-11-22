@@ -64,6 +64,14 @@ const TYPE_MESSAGE: u8 = 1;
 const TYPE_RECEIPT: u8 = 2;
 const TYPE_ACCEPT: u8 = 3;
 const TYPE_DECLINE: u8 = 4;
+/// From 1.8.0. A build before it opens the frame, finds a type it does not
+/// read, and drops it: the message it follows arrives as before and is kept
+/// for good there, as an older friend keeps a friend chat message.
+const TYPE_EXPIRE: u8 = 5;
+/// From 1.8.0: the sender collects room mail from us, so what it is not
+/// online to take may be left for it on the rendezvous server. Dropped by an
+/// older build the same way.
+const TYPE_COLLECTS: u8 = 6;
 
 /// What one private-message frame says. Its `Debug` leaves the text out, so a
 /// logged command never carries a message.
@@ -78,6 +86,12 @@ pub enum DmPayload {
     Accept,
     /// The recipient does not.
     Decline,
+    /// The sender's disappearing-message timer for the message with this id:
+    /// a frame of its own after the message, since a message's fields are
+    /// its text and nothing else.
+    Expire { id: [u8; 16], ttl_secs: u32 },
+    /// The sender collects what is left for it in the room-mail boxes.
+    Collects,
 }
 
 impl std::fmt::Debug for DmPayload {
@@ -89,6 +103,10 @@ impl std::fmt::Debug for DmPayload {
             DmPayload::Receipt { id } => write!(f, "Receipt {{ id: {} }}", hex::encode(id)),
             DmPayload::Accept => f.write_str("Accept"),
             DmPayload::Decline => f.write_str("Decline"),
+            DmPayload::Expire { id, ttl_secs } => {
+                write!(f, "Expire {{ id: {}, ttl_secs: {ttl_secs} }}", hex::encode(id))
+            }
+            DmPayload::Collects => f.write_str("Collects"),
         }
     }
 }
@@ -108,6 +126,13 @@ impl DmPayload {
             DmPayload::Receipt { id } => (TYPE_RECEIPT, Zeroizing::new(id.to_vec())),
             DmPayload::Accept => (TYPE_ACCEPT, Zeroizing::new(Vec::new())),
             DmPayload::Decline => (TYPE_DECLINE, Zeroizing::new(Vec::new())),
+            DmPayload::Expire { id, ttl_secs } => {
+                let mut fields = Zeroizing::new(Vec::with_capacity(20));
+                fields.extend_from_slice(id);
+                fields.extend_from_slice(&ttl_secs.to_le_bytes());
+                (TYPE_EXPIRE, fields)
+            }
+            DmPayload::Collects => (TYPE_COLLECTS, Zeroizing::new(Vec::new())),
         };
         let used = PLAIN_HEADER_LEN + fields.len();
         let bucket = *DM_BUCKETS.iter().find(|&&size| size >= used)?;
@@ -139,6 +164,11 @@ impl DmPayload {
             TYPE_RECEIPT if fields.len() == 16 => Some(DmPayload::Receipt { id: id()? }),
             TYPE_ACCEPT if fields.is_empty() => Some(DmPayload::Accept),
             TYPE_DECLINE if fields.is_empty() => Some(DmPayload::Decline),
+            TYPE_EXPIRE if fields.len() == 20 => Some(DmPayload::Expire {
+                id: id()?,
+                ttl_secs: u32::from_le_bytes(fields[16..20].try_into().ok()?),
+            }),
+            TYPE_COLLECTS if fields.is_empty() => Some(DmPayload::Collects),
             _ => None,
         }
     }
@@ -354,6 +384,8 @@ mod tests {
             DmPayload::Receipt { id: [2; 16] },
             DmPayload::Accept,
             DmPayload::Decline,
+            DmPayload::Expire { id: [3; 16], ttl_secs: 3_600 },
+            DmPayload::Collects,
         ];
         let mut sizes = Vec::new();
         for payload in cases {
@@ -362,9 +394,31 @@ mod tests {
             assert_eq!(open.open(&ROOM, &[4; 16], 9, &sender, &body), Some(payload));
         }
         let small = BODY_OVERHEAD + DM_BUCKETS[0];
-        assert_eq!(sizes, vec![small, BODY_OVERHEAD + DM_BUCKETS[1], BODY_OVERHEAD + DM_TOP_BUCKET, small, small, small]);
+        assert_eq!(
+            sizes,
+            vec![small, BODY_OVERHEAD + DM_BUCKETS[1], BODY_OVERHEAD + DM_TOP_BUCKET, small, small, small, small, small]
+        );
         let too_long = DmPayload::Message { id: [1; 16], text: "z".repeat(DM_TEXT_MAX_BYTES + 1) };
         assert!(base.seal(&ROOM, &[4; 16], 9, &sender, &too_long).is_none());
+    }
+
+    /// A timer frame is the same size as a receipt to anyone relaying it, and
+    /// a build before 1.8.0, which reads only types 1 to 4, opens it to
+    /// nothing rather than to something else.
+    #[test]
+    fn a_timer_frame_reads_as_nothing_to_a_build_that_predates_it() {
+        let base = PairwiseBase::derive(&member(1).seed, &member(2).pubkey, &ROOM).unwrap();
+        let sender = member(1).pubkey;
+        let timer = base.seal(&ROOM, &[4; 16], 9, &sender, &DmPayload::Expire { id: [3; 16], ttl_secs: 60 }).unwrap();
+        let receipt = base.seal(&ROOM, &[5; 16], 9, &sender, &DmPayload::Receipt { id: [3; 16] }).unwrap();
+        assert_eq!(timer.len(), receipt.len());
+
+        let plain = DmPayload::Expire { id: [3; 16], ttl_secs: 60 }.encode().unwrap();
+        let v1_7 = |plain: &[u8]| matches!(plain[0], TYPE_MESSAGE..=TYPE_DECLINE).then(|| DmPayload::decode(plain));
+        assert_eq!(v1_7(&plain), None);
+        let mut short = plain.clone();
+        short[1] = 16;
+        assert_eq!(DmPayload::decode(&short), None, "a timer needs all 20 bytes");
     }
 
     /// The largest message still goes out in one datagram, as an extension

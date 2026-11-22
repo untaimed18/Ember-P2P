@@ -19,6 +19,9 @@ export interface RoomDmThread {
   can_send: boolean;
   /** They are a friend: friend chat is the place to talk. */
   is_friend: boolean;
+  /** Their `ember2:` friend code, for Add friend once no room carries the
+   *  conversation; empty if their key has none. */
+  friend_code: string;
 }
 
 export interface RoomDmMessage {
@@ -32,6 +35,13 @@ export interface RoomDmMessage {
   /** Its stored row, which orders messages sharing a timestamp; 0 for one
    *  not read back from storage. */
   seq: number;
+  /** Its disappearing-message timer in seconds; 0 for none. */
+  ttl_secs: number;
+  /** When it goes, in seconds; 0 until its timer starts (delivery for ours,
+   *  reading for theirs). */
+  expires_at: number;
+  /** Ours, left in their mailbox on the Rendezvous server to collect. */
+  mailboxed: boolean;
 }
 
 export const ROOM_DM_MESSAGE_EVENT = 'ember:dm-message';
@@ -52,6 +62,8 @@ export interface RoomDmStatusEvent {
   member_pubkey: string;
   message_id: string;
   status: RoomDmMessage['status'];
+  /** Set when one still sending was left in their mailbox. */
+  mailboxed?: boolean;
 }
 
 export function listRoomDmThreads(): Promise<RoomDmThread[]> {
@@ -98,4 +110,14 @@ export function dropRoomDmRequest(member: string): Promise<void> {
 
 export function retryRoomDm(member: string, messageId: string): Promise<void> {
   return invoke('retry_room_dm', { member, messageId });
+}
+
+/** The timer what is sent to `member` goes with, in seconds; 0 for none. */
+export function getRoomDmDisappear(member: string): Promise<number> {
+  return invoke('get_room_dm_disappear', { member });
+}
+
+/** Choose the timer for what is sent to `member` from now on. */
+export function setRoomDmDisappear(member: string, ttlSecs: number): Promise<void> {
+  return invoke('set_room_dm_disappear', { member, ttlSecs });
 }

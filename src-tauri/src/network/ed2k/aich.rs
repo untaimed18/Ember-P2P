@@ -949,14 +949,7 @@ impl Known2Store {
         file.seek(SeekFrom::Start(leaves_at))?;
         let mut bytes = vec![0u8; count as usize * 20];
         file.read_exact(&mut bytes)?;
-        Ok(bytes
-            .chunks_exact(20)
-            .map(|chunk| {
-                let mut leaf = [0u8; 20];
-                leaf.copy_from_slice(chunk);
-                leaf
-            })
-            .collect())
+        Ok(bytes.as_chunks::<20>().0.to_vec())
     }
 
     /// The recovery set for a file of `file_size` bytes whose AICH master is

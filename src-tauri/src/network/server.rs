@@ -54,8 +54,13 @@ pub(super) fn record_server_log(message: &str) -> ServerLogLine {
     line
 }
 
-pub(super) fn emit_server_log(app: &tauri::AppHandle, message: &str) {
+pub(super) fn emit_server_log(app: &crate::host::AppHandle, message: &str) {
     let _ = app.emit("server-log", record_server_log(message));
+}
+
+/// The log line for servers taken from a server's list.
+pub(super) fn added_servers_line(added: usize, from: &str) -> String {
+    format!("Added {added} {} from {from}", if added == 1 { "server" } else { "servers" })
 }
 
 /// The retained log, oldest first.
@@ -91,7 +96,7 @@ pub(super) async fn try_connect_server(
     ip: &str,
     port: u16,
     obf_port: u16,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     force_plain: bool,
     obfuscation_enabled: bool,
 ) -> anyhow::Result<(Ed2kServerConnection, SocketAddr)> {
@@ -123,7 +128,7 @@ pub(super) async fn try_connect_server(
     };
     if !force_plain {
         if let Some(enc_port) = enc_port {
-            let enc_addr = tokio::net::lookup_host((ip, enc_port))
+            let enc_addr = crate::net_bind::lookup_host((ip, enc_port))
                 .await?
                 .find(|addr| addr.is_ipv4())
                 .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for {ip}:{enc_port}"))?;
@@ -152,7 +157,7 @@ pub(super) async fn try_connect_server(
     } else {
         info!("Skipping encryption (force_plain) for server {ip}:{port}");
     }
-    let addr = tokio::net::lookup_host((ip, port))
+    let addr = crate::net_bind::lookup_host((ip, port))
         .await?
         .find(|addr| addr.is_ipv4())
         .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for {ip}:{port}"))?;
@@ -164,7 +169,7 @@ pub(super) async fn try_connect_server(
 
 /// Clear per-session eD2K identity and in-flight search state. Does not touch
 /// the connection fields.
-pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &crate::host::AppHandle) {
     // No session means no server capabilities; leaving the mirror set would
     // have a related search keep planning around a co-share request that can no
     // longer be sent.
@@ -235,7 +240,7 @@ pub(super) fn reset_ed2k_server_session(state: &mut NetworkState, app_handle: &t
 pub(super) async fn handle_server_disconnect(
     state: &mut NetworkState,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     reason: &str,
 ) {
     debug!("Server connection lost: {reason}");
@@ -274,14 +279,14 @@ pub(super) async fn handle_server_disconnect(
     // decided the fate of eD2K uploads, so a server-only session lost every
     // upload on the first transient drop — the 120 s activity watchdog, a
     // server-side disconnect, a failed reconnect — and nothing cleared it again,
-    // because only `initiate_server_connect` and `KadConnect` do. Keying off
-    // `user_offline` then quietly undid the KAD-disconnect exemption instead:
-    // `KadDisconnect` sets that flag and then calls this function to drop the
-    // server itself, so the gate came straight back up and uploads stopped
-    // anyway.
+    // because only `initiate_server_connect` and `KadConnect` did. Keying off
+    // the user's offline flag then quietly undid the KAD-disconnect exemption
+    // instead: the KAD Disconnect command raised that flag and then called
+    // this function to drop the server itself, so the gate came straight back
+    // up and uploads stopped anyway.
     //
-    // eMule raises no such gate on any disconnect — see the note in
-    // `NetworkCommand::KadDisconnect`. The upload listener now comes down for
+    // eMule raises no such gate on any disconnect: `CemuleDlg::CloseConnection`
+    // never touches its listen socket. The upload listener comes down for
     // shutdown alone.
 }
 
@@ -294,7 +299,7 @@ pub(super) async fn handle_server_disconnect(
 pub(super) async fn disconnect_connected_server_if_ip_filtered(
     state: &mut NetworkState,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     filter_servers_by_ip: bool,
 ) {
     if !filter_servers_by_ip {
@@ -347,7 +352,7 @@ pub(super) async fn disconnect_connected_server_if_ip_filtered(
 pub(super) async fn apply_server_ip_filter(
     state: &mut NetworkState,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     filter_servers_by_ip: bool,
 ) {
     if !filter_servers_by_ip {
@@ -487,7 +492,7 @@ fn server_retry_log_line(error: &str, attempt: u32, wait_secs: u64, network_down
 pub(super) fn record_server_connect_failure(
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ip: &str,
     port: u16,
     error: &str,
@@ -526,7 +531,7 @@ pub(super) fn record_server_connect_failure(
     network_down
 }
 
-pub(super) fn emit_server_auto_connect_failed(app_handle: &tauri::AppHandle, detail: &str) {
+pub(super) fn emit_server_auto_connect_failed(app_handle: &crate::host::AppHandle, detail: &str) {
     warn!("eD2K auto-connect abandoned: {detail}");
     emit_server_log(
         app_handle,
@@ -540,7 +545,7 @@ pub(super) fn emit_server_auto_connect_failed(app_handle: &tauri::AppHandle, det
 
 pub(super) fn abandon_server_auto_reconnect(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     detail: &str,
 ) {
     state.server_auto_reconnect = false;
@@ -553,7 +558,7 @@ pub(super) fn abandon_server_auto_reconnect(
 /// to a new login picks the port the same way.
 pub(super) fn capture_advertised_tcp_port_then_reset_ed2k_session(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) -> u16 {
     reset_ed2k_server_session(state, app_handle);
     login_tcp_port(state)
@@ -571,7 +576,7 @@ pub(super) fn capture_advertised_tcp_port_then_reset_ed2k_session(
 pub(super) async fn initiate_server_connect(
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     ip: String,
     port: u16,
@@ -589,14 +594,9 @@ pub(super) async fn initiate_server_connect(
     state.server_last_attempt_failed = false;
     state.server_last_connect_attempt = Some(std::time::Instant::now());
     state.preferred_ed2k_server = Some((ip.clone(), port));
-    // Joining a server is a deliberate "come back online", so it lifts the
-    // outbound stop the same way `KadConnect` does. The upload listener needs
-    // nothing here — it was never taken down. It used to be, which is what made
-    // joining a server after disconnecting KAD reject the server's own HighID
-    // TCP port-test and stick the node on LowID.
-    state
-        .user_offline
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // The upload listener needs nothing here — it was never taken down. It
+    // used to be, which is what made joining a server after disconnecting KAD
+    // reject the server's own HighID TCP port-test and stick the node on LowID.
     // Explicit Connect should be allowed to retry a server that recently
     // failed auto-reconnect — keep fail counts for sort preference.
     state.server_list.clear_connect_cooldowns();
@@ -678,7 +678,7 @@ pub(super) async fn initiate_server_connect(
                         &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
                     );
                     drop(conn);
-                    let plain_addr = tokio::net::lookup_host((ip_clone.as_str(), port))
+                    let plain_addr = crate::net_bind::lookup_host((ip_clone.as_str(), port))
                         .await
                         .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
                         .find(|addr| addr.is_ipv4())
@@ -729,7 +729,7 @@ pub(super) async fn resolve_moved_server(dyn_host: &str, ip: &str, port: u16) ->
     if dyn_host.is_empty() {
         return None;
     }
-    let addrs: Vec<IpAddr> = tokio::time::timeout(DYN_HOST_LOOKUP_TIMEOUT, tokio::net::lookup_host((dyn_host, port)))
+    let addrs: Vec<IpAddr> = tokio::time::timeout(DYN_HOST_LOOKUP_TIMEOUT, crate::net_bind::lookup_host((dyn_host, port)))
         .await
         .ok()?
         .ok()?
@@ -804,7 +804,7 @@ pub(super) fn login_tcp_port(state: &NetworkState) -> u16 {
 /// live session with it carries on until it ends.
 pub(super) async fn forget_removed_server_as_target(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     ip: &str,
     port: u16,
@@ -905,6 +905,12 @@ pub(super) fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> 
 #[cfg(test)]
 mod reconnect_backoff_tests {
     use super::*;
+
+    #[test]
+    fn one_added_server_is_not_servers() {
+        assert_eq!(added_servers_line(1, "connected server"), "Added 1 server from connected server");
+        assert_eq!(added_servers_line(3, "server list update"), "Added 3 servers from server list update");
+    }
 
     /// A server that accepts the login and kicks us 20 s later: each redial
     /// has to wait longer than the last, and auto-reconnect gives up after

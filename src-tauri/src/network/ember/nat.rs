@@ -273,7 +273,7 @@ fn local_probe_ip(local_socket: &UdpSocket, reflector: Option<SocketAddr>) -> Op
         _ => {}
     }
     let reflector = reflector?;
-    let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    let probe = crate::net_bind::std_udp(0).ok()?;
     probe.connect(reflector).ok()?;
     let addr = probe.local_addr().ok()?;
     (!addr.ip().is_unspecified()).then_some(addr.ip())
@@ -284,7 +284,7 @@ fn local_probe_ip(local_socket: &UdpSocket, reflector: Option<SocketAddr>) -> Op
 /// NAT probe watchdog, and the probe would be abandoned without trying the
 /// reflectors after it.
 async fn resolve_stun_server(server: &str) -> Result<SocketAddr, String> {
-    tokio::time::timeout(STUN_TIMEOUT, tokio::net::lookup_host(server))
+    tokio::time::timeout(STUN_TIMEOUT, crate::net_bind::lookup_host(server))
         .await
         .map_err(|_| format!("DNS resolve {server}: timed out"))?
         .map_err(|e| format!("DNS resolve {server}: {e}"))?

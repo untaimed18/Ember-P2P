@@ -83,6 +83,51 @@ pub(crate) struct EmberPublishPassStats {
     pub(crate) flush: EmberFlushStats,
 }
 
+/// The storer's session counters as of the previous store heartbeat, so that
+/// line can report what each minute brought beside the session total, as the
+/// publish heartbeat does for acks. Refusals are grouped by what they say
+/// about the network rather than listed one counter each.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EmberStoreBeat {
+    /// Records taken into the store, counted per record as acks are.
+    pub(crate) accepted: u64,
+    /// `FIND_VALUE` queries answered, and of those, the ones we held records for.
+    pub(crate) lookups: u64,
+    pub(crate) hits: u64,
+    pub(crate) republished: u64,
+    /// Refused because closer nodes to the key are known.
+    pub(crate) refused_not_closest: u64,
+    /// Refused because the key, or the whole store, was full.
+    pub(crate) refused_full: u64,
+    /// Refused by a per-publisher or per-address share.
+    pub(crate) refused_share: u64,
+    /// Refused as unparseable, badly signed, out of date, or naming an
+    /// address that is not the sender's.
+    pub(crate) refused_invalid: u64,
+}
+
+impl EmberStoreBeat {
+    pub(crate) fn delta(self, since: EmberStoreBeat) -> EmberStoreBeat {
+        EmberStoreBeat {
+            accepted: self.accepted.saturating_sub(since.accepted),
+            lookups: self.lookups.saturating_sub(since.lookups),
+            hits: self.hits.saturating_sub(since.hits),
+            republished: self.republished.saturating_sub(since.republished),
+            refused_not_closest: self.refused_not_closest.saturating_sub(since.refused_not_closest),
+            refused_full: self.refused_full.saturating_sub(since.refused_full),
+            refused_share: self.refused_share.saturating_sub(since.refused_share),
+            refused_invalid: self.refused_invalid.saturating_sub(since.refused_invalid),
+        }
+    }
+
+    pub(crate) fn refused(self) -> u64 {
+        self.refused_not_closest
+            .saturating_add(self.refused_full)
+            .saturating_add(self.refused_share)
+            .saturating_add(self.refused_invalid)
+    }
+}
+
 /// What one `flush_ember_batch_publish` pass actually managed to do.
 ///
 /// Reported by the publish heartbeat: without it there is no way to tell a
@@ -927,6 +972,37 @@ impl EmberProxyBuddyPacer {
 mod tests {
     use super::*;
 
+    #[test]
+    fn store_beat_reports_the_minute_and_never_goes_negative() {
+        let before = EmberStoreBeat {
+            accepted: 10,
+            lookups: 4,
+            hits: 1,
+            republished: 2,
+            refused_not_closest: 3,
+            refused_full: 0,
+            refused_share: 1,
+            refused_invalid: 0,
+        };
+        let now = EmberStoreBeat {
+            accepted: 25,
+            lookups: 9,
+            hits: 3,
+            republished: 2,
+            refused_not_closest: 5,
+            refused_full: 1,
+            refused_share: 1,
+            refused_invalid: 4,
+        };
+        let beat = now.delta(before);
+        assert_eq!((beat.accepted, beat.lookups, beat.hits, beat.republished), (15, 5, 2, 0));
+        assert_eq!(beat.refused(), 2 + 1 + 4);
+        assert_eq!(now.refused(), 11);
+        // A counter that went backwards (a store rebuilt mid-session) reads as
+        // nothing new, not as a huge wrapped number.
+        assert_eq!(before.delta(now), EmberStoreBeat::default());
+    }
+
     fn contact(id: u8) -> ember::dht::EmberContact {
         let ip = std::net::Ipv4Addr::new(10, 0, 0, id);
         ember::dht::EmberContact {
@@ -1342,5 +1418,204 @@ mod tests {
 
         assert!(publisher.drop_destinations(|_| false).is_empty());
         assert_eq!(publisher.queued_count, 4);
+    }
+
+    /// The batch publisher against a plain model of it, through any sequence
+    /// of what a tick, a flush, acks and timeouts do: each destination holds
+    /// exactly the records the model says, in its order; the running count is
+    /// the sum; nothing is left queued empty; and what is outstanding is the
+    /// queued records with the live ones in flight. Flushes are done the way
+    /// `flush_ember_batch_publish` does them, on the same fields.
+    #[test]
+    fn batch_publisher_invariants_hold() {
+        use rand::Rng;
+        type Model = HashMap<ember::dht::EmberNodeId, Vec<EmberRecordRef>>;
+        const KINDS: [EmberPublishKind; 3] =
+            [EmberPublishKind::Keyword, EmberPublishKind::Source, EmberPublishKind::Replication];
+        let mut rng = crate::fuzz::rng(0xBA7C_4ED0);
+        let pick_ref = |rng: &mut rand::rngs::StdRng| {
+            reference(rng.gen_range(0..6), KINDS[rng.gen_range(0..3)], rng.gen_range(0..4))
+        };
+        for round in 0..crate::fuzz::rounds(40) {
+            let start = std::time::Instant::now();
+            let mut publisher = EmberBatchPublisher::default();
+            let mut queued: Model = HashMap::new();
+            let mut in_flight: HashMap<u32, (ember::dht::EmberNodeId, Vec<EmberRecordRef>, u64, std::time::Instant)> =
+                HashMap::new();
+            let mut next_request = 0u32;
+            let live = |records: &[EmberRecordRef], voided: u64| {
+                records
+                    .iter()
+                    .enumerate()
+                    .filter(move |(i, _)| voided & (1u64 << i) == 0)
+                    .map(|(_, r)| *r)
+                    .collect::<Vec<_>>()
+            };
+            for step in 0..300 {
+                match rng.gen_range(0..10) {
+                    0..=3 => {
+                        let mut ids: Vec<u8> = (1..=6).collect();
+                        ids.retain(|_| rng.gen_bool(0.4));
+                        let targets: Vec<_> = ids.iter().map(|id| contact(*id)).collect();
+                        let r = pick_ref(&mut rng);
+                        let fits = !targets.is_empty()
+                            && queued.values().map(Vec::len).sum::<usize>() + targets.len() <= EMBER_BATCH_QUEUE_MAX;
+                        assert_eq!(publisher.enqueue(&targets, r, record(r.key[0])), fits);
+                        if fits {
+                            for t in &targets {
+                                queued.entry(t.node_id).or_default().push(r);
+                            }
+                        }
+                    }
+                    4 => {
+                        let Some(node) = queued.keys().nth(rng.gen_range(0..queued.len().max(1))).copied() else {
+                            continue;
+                        };
+                        let (held_contact, mut held) = publisher.queued.remove(&node).expect("queued");
+                        publisher.queued_count -= held.len();
+                        let model = queued.remove(&node).unwrap();
+                        let sent = rng.gen_range(0..=held.len().min(64));
+                        let tail = held.split_off(sent);
+                        if !held.is_empty() {
+                            let records: Vec<_> = held.iter().map(|q| q.reference).collect();
+                            let deadline = start + std::time::Duration::from_secs(rng.gen_range(1..90));
+                            publisher.in_flight.insert(
+                                next_request,
+                                EmberBatchInFlight { node_id: node, records: records.clone(), deadline, voided: 0 },
+                            );
+                            in_flight.insert(next_request, (node, records, 0, deadline));
+                            next_request += 1;
+                        }
+                        // Work queued for it while the flush held its records.
+                        for _ in 0..rng.gen_range(0..3) {
+                            let r = pick_ref(&mut rng);
+                            assert!(publisher.enqueue(std::slice::from_ref(&held_contact), r, record(r.key[0])));
+                            queued.entry(node).or_default().push(r);
+                        }
+                        let since = queued.remove(&node).unwrap_or_default();
+                        let room = EMBER_MAX_CARRY_OVER_PER_PEER.saturating_sub(since.len());
+                        let mut kept = model[sent..].to_vec();
+                        let expect_dropped = kept.split_off(kept.len().min(room));
+                        let dropped = publisher.carry_over(node, &held_contact, tail);
+                        assert_eq!(dropped.iter().map(|q| q.reference).collect::<Vec<_>>(), expect_dropped);
+                        kept.extend(since);
+                        if !kept.is_empty() {
+                            queued.insert(node, kept);
+                        }
+                    }
+                    5 => {
+                        let request = rng.gen_range(0..next_request.max(1));
+                        let accepted: u64 = rng.r#gen();
+                        let truthful = rng.gen_bool(0.8);
+                        let from = match in_flight.get(&request) {
+                            Some((node, ..)) if truthful => *node,
+                            _ => contact(rng.gen_range(1..=6)).node_id,
+                        };
+                        let outcome = publisher.note_ack(request, accepted, from);
+                        let (mut placed, mut refused) = (Vec::new(), Vec::new());
+                        if in_flight.get(&request).is_some_and(|(node, ..)| *node == from) {
+                            let (_, records, voided, _) = in_flight.remove(&request).unwrap();
+                            for (i, r) in records.iter().enumerate() {
+                                if voided & (1u64 << i) != 0 {
+                                    continue;
+                                }
+                                if accepted & (1u64 << i) != 0 { placed.push(*r) } else { refused.push(*r) }
+                            }
+                        }
+                        assert_eq!((outcome.placed, outcome.refused.clone()), (placed, refused.clone()));
+                        assert_eq!(outcome.refusals.len(), refused.len());
+                    }
+                    6 => {
+                        let now = start + std::time::Duration::from_secs(rng.gen_range(0..100));
+                        let mut abandoned = publisher.expire(now);
+                        let mut expected = Vec::new();
+                        in_flight.retain(|_, (_, records, voided, deadline)| {
+                            let keep = now < *deadline;
+                            if !keep {
+                                expected.extend(live(records, *voided));
+                            }
+                            keep
+                        });
+                        abandoned.sort_by_key(|r| (r.file_hash, r.key, r.kind as u8));
+                        expected.sort_by_key(|r| (r.file_hash, r.key, r.kind as u8));
+                        assert_eq!(abandoned, expected);
+                    }
+                    7 => {
+                        let kind = KINDS[rng.gen_range(0..3)];
+                        if rng.gen_bool(0.5) {
+                            publisher.void_in_flight_kind(kind);
+                            for (_, records, voided, _) in in_flight.values_mut() {
+                                for (i, r) in records.iter().enumerate() {
+                                    if r.kind == kind {
+                                        *voided |= 1u64 << i;
+                                    }
+                                }
+                            }
+                        } else {
+                            let before: usize = queued.values().map(Vec::len).sum();
+                            queued.values_mut().for_each(|records| records.retain(|r| r.kind != kind));
+                            queued.retain(|_, records| !records.is_empty());
+                            let after: usize = queued.values().map(Vec::len).sum();
+                            assert_eq!(publisher.drop_kind(kind), before - after);
+                        }
+                    }
+                    8 => {
+                        let files: HashSet<[u8; 16]> = (0..rng.gen_range(0..3)).map(|_| [rng.gen_range(0..6u8); 16]).collect();
+                        let before: usize = queued.values().map(Vec::len).sum();
+                        queued.values_mut().for_each(|records| records.retain(|r| !files.contains(&r.file_hash)));
+                        queued.retain(|_, records| !records.is_empty());
+                        let after: usize = queued.values().map(Vec::len).sum();
+                        assert_eq!(publisher.drop_files(&files), before - after);
+                    }
+                    _ => {
+                        if rng.gen_bool(0.5) {
+                            let blocked: HashSet<u8> = (0..rng.gen_range(0..3)).map(|_| rng.gen_range(1..=6)).collect();
+                            let mut dropped: Vec<_> = publisher
+                                .drop_destinations(|c| blocked.iter().any(|id| c.node_id == contact(*id).node_id))
+                                .into_iter()
+                                .map(|q| q.reference)
+                                .collect();
+                            let mut expected: Vec<_> = blocked
+                                .iter()
+                                .filter_map(|id| queued.remove(&contact(*id).node_id))
+                                .flatten()
+                                .collect();
+                            dropped.sort_by_key(|r| (r.file_hash, r.key, r.kind as u8));
+                            expected.sort_by_key(|r| (r.file_hash, r.key, r.kind as u8));
+                            assert_eq!(dropped, expected);
+                        } else if rng.gen_bool(0.2) {
+                            let all: usize = queued.values().map(Vec::len).sum();
+                            let gone = publisher.expire_queued(std::time::Instant::now() + EMBER_QUEUED_RECORD_TTL);
+                            assert_eq!(gone.len(), all, "everything queued is a whole TTL old by then");
+                            queued.clear();
+                        } else {
+                            assert!(publisher.expire_queued(std::time::Instant::now()).is_empty());
+                        }
+                    }
+                }
+
+                let at = |what: &str| format!("round {round}, step {step}: {what}");
+                assert_eq!(publisher.queued_count, queued.values().map(Vec::len).sum::<usize>(), "{}", at("count"));
+                assert!(publisher.queued.values().all(|(_, records)| !records.is_empty()), "{}", at("an empty destination"));
+                let held: Model = publisher
+                    .queued
+                    .iter()
+                    .map(|(node, (_, records))| (*node, records.iter().map(|q| q.reference).collect()))
+                    .collect();
+                assert_eq!(held, queued, "{}", at("what each destination holds"));
+                let flying: HashMap<u32, Vec<EmberRecordRef>> =
+                    publisher.in_flight.iter().map(|(id, b)| (*id, live(&b.records, b.voided))).collect();
+                let modelled: HashMap<u32, Vec<EmberRecordRef>> =
+                    in_flight.iter().map(|(id, (_, records, voided, _))| (*id, live(records, *voided))).collect();
+                assert_eq!(flying, modelled, "{}", at("what is in flight"));
+                let outstanding: HashSet<EmberRecordRef> =
+                    queued.values().flatten().copied().chain(modelled.values().flatten().copied()).collect();
+                assert_eq!(publisher.outstanding_records(), outstanding, "{}", at("what is outstanding"));
+                for _ in 0..4 {
+                    let r = pick_ref(&mut rng);
+                    assert_eq!(publisher.record_still_outstanding(r), outstanding.contains(&r), "{}", at("one record"));
+                }
+            }
+        }
     }
 }

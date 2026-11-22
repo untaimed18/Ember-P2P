@@ -19,7 +19,7 @@
 use std::time::Duration;
 
 use futures::FutureExt;
-use tauri::{AppHandle, Emitter, Manager};
+use crate::host::{AppHandle, Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::commands::updater::{run_check, SecureUpdateCheckResult, UpdaterService};
@@ -51,7 +51,7 @@ pub fn spawn(app: AppHandle) {
         tracing::debug!("Automatic update checks are disabled in development builds");
         return;
     }
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         let mut launch = true;
         loop {
             let result = std::panic::AssertUnwindSafe(run(app.clone(), launch))

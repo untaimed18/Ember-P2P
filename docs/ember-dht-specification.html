@@ -641,7 +641,8 @@ footer.doc-end {
     lists and <code>FOUND_VALUE</code>, and v4 bound a frame signature to the
     session it arrives on. Both are marked in place. Everything added since
     without a bump — query constraints, record media, the callback and
-    endorsement pair, channel records, and the advertised version range — is
+    endorsement pair, channel records, the advertised version range, and from
+    1.7.7 the UDP reachability claim and the store refusal reasons — is
     marked <span class="badge">additive</span>, meaning a peer that does not
     speak it parses the frame correctly and ignores the addition. Remaining
     work, including the dormant native transfer path, is called out where it
@@ -806,7 +807,7 @@ footer.doc-end {
   peer holds the private key. Anyone who observed a legitimate public key on
   the wire can replay the pair. Frame and record signatures are the
   proof-of-possession for DHT work. Friend-level privileges use a separate
-  challenge-response over a fresh nonce and are out of scope here.
+  Noise IK friend stream and are out of scope here.
 </div>
 
 <h3>3.3 Frame signature</h3>
@@ -907,10 +908,22 @@ footer.doc-end {
   handshake timeout. The node with the lower static key stays initiator and
   refuses the inbound <code>IK_INIT</code>. The node with the higher key answers
   it as responder, and when that handshake is from the identity it was dialling,
-  it drops its own initiator and re-sends that initiator's first message and
-  queued payloads over the resulting session. Each side decides from its own key
-  and the key it dialled, so both reach the same answer. A pending XX initiator
-  still refuses an inbound <code>IK_INIT</code>.
+  it drops its own initiator. Each side decides from its own key and the key it
+  dialled, so both reach the same answer. A pending XX initiator still refuses
+  an inbound <code>IK_INIT</code>.
+</p>
+<p>
+  The higher key holds that initiator's first message and queued payloads, and
+  anything it sends the peer meanwhile, until the resulting session decrypts a
+  frame from the peer, and always sends the return-routability probe so one
+  comes promptly. A captured <code>IK_INIT</code> replayed past the replay
+  window builds a session the real peer cannot read, so nothing is sealed into
+  it before that proof. A session not proven within 3 seconds is given up on,
+  and what was held goes out behind a fresh <code>IK_INIT</code>, which the real
+  peer answers and a replayer cannot. Sends wait rather than dial at once
+  because a dial's answer would replace the session the peer is about to send
+  on. Nothing changes on the wire; the lower key sees only its first message
+  answered one round trip later.
 </p>
 
 <h3>4.3 Session lifecycle</h3>
@@ -1158,8 +1171,8 @@ footer.doc-end {
 <table class="data">
   <thead><tr><th>ID</th><th>Name</th><th>Direction</th><th>Payload</th></tr></thead>
   <tbody>
-    <tr><td>0x01</td><td>PING</td><td>→</td><td>optional advertised version range</td></tr>
-    <tr><td>0x02</td><td>PONG</td><td>←</td><td>optional observed SocketAddr, then optional advertised version range</td></tr>
+    <tr><td>0x01</td><td>PING</td><td>→</td><td>optional advertised version range and UDP reachability claim</td></tr>
+    <tr><td>0x02</td><td>PONG</td><td>←</td><td>optional observed SocketAddr, then optional advertised version range and UDP reachability claim</td></tr>
     <tr><td>0x03</td><td>FIND_NODE</td><td>→</td><td>target node ID (16)</td></tr>
     <tr><td>0x04</td><td>FOUND_NODE</td><td>←</td><td>contact list</td></tr>
     <tr><td>0x05</td><td>STORE_RECORD</td><td>→</td><td>key + record + record signature</td></tr>
@@ -1171,7 +1184,7 @@ footer.doc-end {
     <tr><td>0x0B</td><td>PROXY_STORE</td><td>→</td><td>same body as STORE_RECORD</td></tr>
     <tr><td>0x0C</td><td>PROXY_STORE_ACK</td><td>←</td><td>key (16) — buddy accepted, not a DHT STORE_ACK</td></tr>
     <tr><td>0x0D</td><td>STORE_BATCH</td><td>→</td><td>up to 64 records for one destination</td></tr>
-    <tr><td>0x0E</td><td>STORE_BATCH_ACK</td><td>←</td><td>u64 bitmap of accepted positions</td></tr>
+    <tr><td>0x0E</td><td>STORE_BATCH_ACK</td><td>←</td><td>u64 bitmap of accepted positions, then optional per-record refusal reasons</td></tr>
     <tr><td>0x0F</td><td>CALLBACK_REQ</td><td>→</td><td>publisher id (16) + file hash (16) + searcher TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Searcher → HighID buddy. The searcher's IP is the UDP source, not in the payload.</td></tr>
     <tr><td>0x10</td><td>CALLBACK</td><td>→</td><td>file hash (16) + searcher IPv4 (4) + TCP port (2 LE) + crypt options (1) + searcher user hash (16) + callback token (16). Buddy → firewalled publisher: connect-and-serve this searcher.</td></tr>
     <tr><td>0x11</td><td>CHANNEL_MSG</td><td>→</td><td>AEAD channel gossip body for overlay rooms. <span class="badge">additive</span></td></tr>
@@ -1274,6 +1287,42 @@ footer.doc-end {
   leaves the routing table — it is worth what the session that proved it is
   worth, and one ping relearns it.
 </p>
+<p>
+  After the range, the same block may carry the sender’s claim about its own
+  UDP port: whether a datagram from a host it never contacted reaches it.
+  <span class="badge">additive</span>
+</p>
+<div class="wire">
+  <div class="cap">UDP reachability (trailing block, after the range)</div>
+  tag       u8     0x02 = UDP reachability<br>
+  len       u8     1<br>
+  value     u8     1 = open, 2 = firewalled
+</div>
+<p>
+  Only the node itself can answer this. A peer that answers <em>our</em>
+  queries has proved nothing to third parties: behind a NAT it answers through
+  a mapping its own traffic to us opened, so a contact list built on “answered
+  us” kept handing out NATed peers that every asker then probed in vain. The
+  claim comes from the node’s own evidence: open once its firewall check passed,
+  its NAT probe found no NAT, or a stranger’s ping reached it within the hour;
+  firewalled only when its
+  check concluded the port is filtered and nothing says otherwise. A node with
+  neither sends none, and a false “open” buys a liar nothing it could not get
+  by answering anyway.
+</p>
+<p>
+  The claim follows the range, so a build that knows only the range reads that
+  first and stops there. Absent, truncated, a length other than 1, or a value
+  other than 1 or 2 all read as no claim. Unlike the range,
+  an absent claim <em>replaces</em> a held one: every build that knows the
+  claim sends it on every frame while it has an answer, so a frame without it
+  means that answer has lapsed. A contact that claims firewalled is left out of
+  the contact lists this node hands out from its table (<code>FOUND_NODE</code>,
+  <code>PEER_LIST</code>, outbound <code>ANNOUNCE_PEER</code>, a friend’s
+  contact answer). A <code>FOUND_NODE</code> or <code>PEER_LIST</code> reply is
+  filled first with contacts that have answered us, then the rest; within each
+  group, those claiming open come before those that say nothing, nearest first.
+</p>
 
 <h3>6.6 FIND_NODE / FOUND_NODE</h3>
 <div class="wire">
@@ -1326,7 +1375,11 @@ footer.doc-end {
 </div>
 <div class="wire">
   <div class="cap">STORE_BATCH_ACK payload</div>
-  accepted  u64 LE   bit i set ⇒ record i was stored
+  accepted  u64 LE   bit i set ⇒ record i was stored<br>
+  <span class="c-muted">then, optionally:</span><br>
+  tag       u8     0x01 = refusal reasons<br>
+  len       u8     ≤ 64, one code per record of the batch<br>
+  codes     len B  code i is record i’s outcome
 </div>
 <p>
   Acceptance is per record: the storer re-evaluates proximity and capacity.
@@ -1334,6 +1387,41 @@ footer.doc-end {
   and retire files that were never stored. The datagram budget caps a real
   batch at roughly twenty minimum-size records; 64 is a decode-side bound
   matching the width of the ack bitmap.
+</p>
+<p>
+  <strong>Refusal reasons.</strong> <span class="badge">additive</span>
+  The bitmap says a record was refused but not why, so a publisher retried a
+  refusal as it would a lost datagram — several rounds an interval for one,
+  like “over your 150 under this word”, that every storer would repeat. The
+  trailing block names why each record was turned away.
+</p>
+<table class="data">
+  <thead><tr><th>Code</th><th>Meaning</th><th>Permanent</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>Stored</td><td>—</td></tr>
+    <tr><td>1</td><td>Invalid: parsing, signature, key binding or the source-address bind failed</td><td>Yes</td></tr>
+    <tr><td>2</td><td>Stale: creation time outside the window, or older than the copy held</td><td>Yes</td></tr>
+    <tr><td>3</td><td>Not responsible: the storer knows k nodes closer to the key</td><td>No — the publisher’s view of who is closest moves with its next lookup</td></tr>
+    <tr><td>4</td><td>Publisher full: this publisher already holds its share under the key (§7.5)</td><td>Yes</td></tr>
+    <tr><td>5</td><td>Key full</td><td>Yes</td></tr>
+    <tr><td>6</td><td>Store full: no room for another key</td><td>Yes</td></tr>
+    <tr><td>7</td><td>Other, and any code this build does not know</td><td>No</td></tr>
+  </tbody>
+</table>
+<p>
+  A record that every storer refused permanently gets no short retry. If a
+  round placed none of a file’s keys and every key it lost was refused that
+  way, the file waits out the full republish interval instead of its short
+  retries (§9.1). A key lost to a retryable refusal, or to a batch that went
+  unanswered, keeps the ordinary retry schedule.
+</p>
+<p>
+  Additive because the ack decoder has always read the bitmap and ignored what
+  follows, so a storer that sends the block costs an older publisher nothing,
+  and a publisher reading an older storer simply has no reasons and behaves as
+  it always has. The block is advisory: one that is absent, carries the wrong
+  tag, claims more than 64 codes or runs past the end of the payload is ignored
+  and the bitmap stands on its own.
 </p>
 
 <h3>6.9 FIND_VALUE / FOUND_VALUE</h3>
@@ -1692,6 +1780,19 @@ footer.doc-end {
   raising what the process may hold resident.
 </p>
 <p>
+  <strong>Publishers hold themselves to the cap.</strong> Since every storer
+  refuses a publisher’s records past 150 under one key, a library with more
+  files than that under a common word used to send the excess every round only
+  to be refused everywhere, and which files each storer kept was whichever
+  arrived first. A publisher now publishes at most 150 files under any one
+  keyword: the 150 whose eD2K file hash is XOR-closest to the keyword hash. That is a
+  fixed choice, so the same files hold their slots round after round, and adding
+  a file to the library moves at most one out. The allowance is recomputed when
+  the publishable file count changes and every 30 minutes otherwise, which is
+  what catches a rename. This is publisher behaviour only; nothing on the wire
+  changes.
+</p>
+<p>
   <code>MAX_KEYS</code> is not a hard admission freeze. When the map is full,
   expired keys are dropped first; otherwise the furthest key from this node
   (XOR-distance) is given up, and only when the incoming key is closer than
@@ -1735,7 +1836,7 @@ footer.doc-end {
   <li>A FOUND_VALUE carries no contacts, and a node holding even one record under the key answers with records alone, so a walk whose nearest hops all hold something would never learn of the replicas closer still. A node that answers a first FIND_VALUE with records, and is among the k closest entries that have not failed, is therefore also sent one <code>FIND_NODE</code> for the target — a <em>referral</em> — and the contacts it names join the shortlist as from any FOUND_NODE. Every version answers FIND_NODE, so this needs nothing of the responder. A referral is not retried, and losing one is not held against the node, which has just answered.</li>
   <li>A timed-out first query is charged to the routing table only when the table holds that node at the address and Noise key the search dialled. A FOUND_NODE may pair a real node’s id with an address that goes nowhere; charging the id alone let its sender evict honest contacts.</li>
   <li>FIND_NODE converges once the k closest entries that have not failed have all answered, α consecutive responses have brought nothing closer, and at least k/2 nodes have answered. FIND_VALUE does <em>not</em> use this rule: every extra node is another chance at a record the closer ones did not hold. The walk continues until the shortlist is exhausted, the 300-result budget is full, or 60 seconds elapse.</li>
-  <li>A user keyword search also ends once the k closest entries that have not failed have all answered, every pinned session peer has answered or failed, no page or referral is owed, and no new record has been taken for 5 seconds. Records live on the k nodes closest to their key, so what is left past that point is farther nodes — mostly verified seeds the trim keeps — that seldom hold anything, and walking them to exhaustion can take most of the 60 seconds, holding the search’s completion that long. Source, channel and other value lookups still exhaust their shortlist.</li>
+  <li>A user keyword search also ends once the k closest entries that have not failed have all answered, every pinned session peer has answered or failed, no page or referral is owed, and no new record has been taken for 5 seconds. Records live on the k nodes closest to their key, so what is left past that point is farther nodes — mostly verified seeds the trim keeps — that seldom hold anything, and walking them to exhaustion can take most of the 60 seconds, holding the search’s completion that long. A file’s source lookup and a room’s presence lookup end by the same rule. Lookups whose empty answer is read as “there is none” (a room’s moderation, settings, handoff or claim) still exhaust their shortlist, as do the other value lookups.</li>
   <li>A FIND_VALUE carries the search’s extra keys (§8.2) and its constraints to every pinned session peer, and to every other node that is among the k closest entries that have not failed when it is first asked — which includes the whole opening round and every hop of the descent. A node outside them when first asked, typically a far seed the trim kept and asked once the neighbourhood is done, is sent the primary key alone, and its page follow-ups are too, since their offsets count records of that first query. The primary key is the walk’s target and goes to every hop either way; the rest of the query does not. A pinned peer is asked in full wherever it sorts, because it is asked for records of its own. Every version answers a one-key FIND_VALUE.</li>
   <li>A user keyword search drops any record under its key that is not a keyword record as it arrives, before it is charged to the 300-result budget or earns a page. The other value lookups take every record type.</li>
   <li>A walk left with unasked entries and nothing outstanding — its driver gives up after a run of batches it could not dial — is driven again on the next 1-second sweep, rather than idling until its timeout.</li>
@@ -1752,13 +1853,18 @@ footer.doc-end {
     <tr><td>MAX_RESULTS_PER_NODE</td><td>75 (quarter of the budget)</td></tr>
     <tr><td>MAX_QUERY_ATTEMPTS</td><td>2</td></tr>
     <tr><td>Queued-query timeout (cold handshake)</td><td>12 s</td></tr>
+    <tr><td>Handshake deadline within it</td><td>6 s</td></tr>
   </tbody>
 </table>
 <p>
   The 12-second queued-query timeout covers a Noise_XX 2-RTT setup plus the
   query round trip. Charging a first-contact hop the ordinary budget failed
   the contact before it could answer — and on a cold table every contact is a
-  first contact.
+  first contact. The handshake itself must complete within 6 seconds, past both
+  resends of message 1 and a slow round trip; a query whose handshake has not
+  completed by then fails at once, since most first contacts in a lookup that
+  stay silent never answer the handshake at all. Once it completes, the query
+  keeps the rest of its 12 seconds.
 </p>
 
 <h3>8.2 Multi-keyword search</h3>
@@ -2547,12 +2653,14 @@ footer.doc-end {
     <tr><td>EMBER_RENDEZVOUS_REPUBLISH_SECS</td><td>5 h</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_RENDEZVOUS_LOOKUP_INTERVAL_SECS</td><td>10 min</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_SEARCH_QUEUED_QUERY_TIMEOUT</td><td>12 s</td><td>network/mod.rs</td></tr>
+    <tr><td>EMBER_SEARCH_HANDSHAKE_TIMEOUT</td><td>6 s</td><td>network/ember_dht.rs</td></tr>
     <tr><td>EMBER_SELF_LOOKUP_FIRST_DELAY_SECS</td><td>180 s (20 s if ≥ 10 verified)</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_SELF_LOOKUP_REPEAT_SECS</td><td>4 h</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_DISCONNECT_SECS</td><td>20 min</td><td>network/mod.rs</td></tr>
     <tr><td>EMBER_CONTACT_STALE_SECS</td><td>2 h</td><td>network/mod.rs</td></tr>
     <tr><td>SESSION_TIMEOUT</td><td>900 s</td><td>transport.rs</td></tr>
     <tr><td>MAX_SESSIONS_PER_ADDR</td><td>4</td><td>transport.rs</td></tr>
+    <tr><td>CROSSING_HOLD</td><td>3 s</td><td>transport.rs</td></tr>
     <tr><td>STORE_SIG_REPLAY_TTL</td><td>60 s</td><td>dht/engine.rs</td></tr>
     <tr><td>MIN_OBSERVED_IP_VOTES</td><td>3 / 15 min</td><td>dht/observed.rs</td></tr>
   </tbody>

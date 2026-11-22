@@ -45,7 +45,7 @@ pub(in crate::network) async fn on_source_retry_tick(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,

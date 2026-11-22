@@ -224,21 +224,15 @@ pub(super) fn search_legs(
     method: SearchMethod,
     has_keyword_query: bool,
     has_keywords: bool,
-    user_offline: bool,
 ) -> SearchLegs {
     SearchLegs {
         server: matches!(method, SearchMethod::Global | SearchMethod::Server),
-        // Global's UDP leg does not need a server *session*, so it kept
-        // spraying `OP_GLOBSEARCH` at the whole server list after the user had
-        // gone offline. Ember still answers a Global query, which is the
-        // documented offline fallback; talking to eD2K servers is not.
-        //
         // `has_keyword_query` is what stops a co-share-only related search
         // here: the search expression is empty in that case, and this leg
         // would queue a keywordless `OP_GLOBSEARCH` to every server in the
         // list. Only the one connected server can answer a co-share request,
         // and it is asked over TCP.
-        udp: has_keyword_query && matches!(method, SearchMethod::Global) && !user_offline,
+        udp: has_keyword_query && matches!(method, SearchMethod::Global),
         kad: has_keywords && matches!(method, SearchMethod::Global | SearchMethod::Kad),
         // Gated on `has_keywords` for the same reason Kad is: the Ember DHT
         // walks to a keyword hash, so with no lookupable term there is no walk
@@ -260,7 +254,7 @@ mod search_legs_tests {
     #[test]
     fn server_asks_the_server_and_nothing_else() {
         assert_eq!(
-            search_legs(SearchMethod::Server, true, true, false),
+            search_legs(SearchMethod::Server, true, true),
             SearchLegs {
                 server: true,
                 udp: false,
@@ -273,7 +267,7 @@ mod search_legs_tests {
     #[test]
     fn global_asks_every_leg_it_can() {
         assert_eq!(
-            search_legs(SearchMethod::Global, true, true, false),
+            search_legs(SearchMethod::Global, true, true),
             SearchLegs {
                 server: true,
                 udp: true,
@@ -286,7 +280,7 @@ mod search_legs_tests {
     #[test]
     fn kad_and_ember_methods_stay_on_their_own_network() {
         assert_eq!(
-            search_legs(SearchMethod::Kad, true, true, false),
+            search_legs(SearchMethod::Kad, true, true),
             SearchLegs {
                 server: false,
                 udp: false,
@@ -295,7 +289,7 @@ mod search_legs_tests {
             },
         );
         assert_eq!(
-            search_legs(SearchMethod::Ember, true, true, false),
+            search_legs(SearchMethod::Ember, true, true),
             SearchLegs {
                 server: false,
                 udp: false,
@@ -305,19 +299,12 @@ mod search_legs_tests {
         );
     }
 
-    #[test]
-    fn going_offline_stops_the_ed2k_udp_spray_and_leaves_ember() {
-        let legs = search_legs(SearchMethod::Global, true, true, true);
-        assert!(!legs.udp, "no OP_GLOBSEARCH at the server list while offline");
-        assert!(legs.ember, "Ember is the documented offline fallback");
-    }
-
     /// A co-share-only related search: the seed's name yielded no searchable
     /// word, so there is nothing to put on a keyword leg and the hashes go to
     /// the server on their own.
     #[test]
     fn a_search_with_no_keywords_asks_no_keyword_leg() {
-        let legs = search_legs(SearchMethod::Global, false, false, false);
+        let legs = search_legs(SearchMethod::Global, false, false);
         assert!(!legs.udp, "a keywordless OP_GLOBSEARCH is not a search");
         assert!(!legs.kad);
         assert!(!legs.ember, "the Ember DHT walk needs a keyword hash");
@@ -330,7 +317,7 @@ mod search_legs_tests {
     /// was never published.
     #[test]
     fn a_server_directive_query_asks_no_dht_leg() {
-        let legs = search_legs(SearchMethod::Global, true, false, false);
+        let legs = search_legs(SearchMethod::Global, true, false);
         assert!(legs.server, "the directive goes to the connected server");
         assert!(legs.udp, "the rest of the server list can resolve it too");
         assert!(
@@ -771,7 +758,7 @@ pub(super) fn note_ed2k_batch_availability(
 /// the cap map and carry **absolute** summed/max availability for the UI
 /// (frontend takes max). Kad rows only refresh availability/sources/origin.
 pub(super) fn emit_search_resight_updates(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     request_id: u64,
     mut updates: Vec<SearchResult>,
     active: &mut ActiveSearchRequest,
@@ -788,7 +775,7 @@ pub(super) fn emit_search_resight_updates(
     emit_search_results_event(app_handle, request_id, &updates);
 }
 
-pub(super) fn stop_ed2k_udp_search_if_capped(state: &mut NetworkState, app_handle: &tauri::AppHandle) {
+pub(super) fn stop_ed2k_udp_search_if_capped(state: &mut NetworkState, app_handle: &crate::host::AppHandle) {
     let Some(active) = state.active_search_request.as_mut() else {
         return;
     };
@@ -955,6 +942,10 @@ pub(super) struct ActiveSearchRequest {
     /// search had no UDP leg, which is also what keeps Search More from adding
     /// one.
     pub(super) udp_search_expr: Vec<u8>,
+    /// The same question for a server that cannot read a 64-bit size: the
+    /// limit cut to 32 bits, which leaves out nothing it can index. `None` when
+    /// the search sends no 64-bit size, or wants only files past 4 GiB.
+    pub(super) udp_search_expr_32: Option<Vec<u8>>,
     /// The connected server ended this search's leg while still flagging more
     /// results — the page cap or the result cap stopped it, not the server —
     /// so Search More can ask it for further pages.
@@ -995,6 +986,7 @@ impl ActiveSearchRequest {
             exclude_hashes: HashSet::new(),
             batch_spam: crate::search::spam::BatchSpamContext::default(),
             udp_search_expr: Vec::new(),
+            udp_search_expr_32: None,
             server_has_more: false,
             continued: false,
         }
@@ -1048,27 +1040,54 @@ pub(super) fn unasked_udp_search_packets(
     state: &NetworkState,
     request: &ActiveSearchRequest,
 ) -> Vec<(Vec<u8>, std::net::SocketAddr)> {
-    if request.udp_search_expr.is_empty()
-        || state.user_offline.load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if request.udp_search_expr.is_empty() {
         return Vec::new();
     }
-    let uses_64bit_search = kad::messages::search_expression_uses_64bit(&request.udp_search_expr);
-    let connected_addr = state.server_addr;
-    state
-        .server_list
-        .servers()
-        .iter()
-        .filter(|server| is_eligible_udp_server(server, connected_addr))
-        .filter_map(|server| {
-            ServerUdpSocket::build_global_search_packet(server, &request.udp_search_expr, uses_64bit_search)
-        })
+    udp_search_packets(state, &request.udp_search_expr, request.udp_search_expr_32.as_deref())
+        .into_iter()
         .filter(|(_, addr)| match addr.ip() {
             std::net::IpAddr::V4(ip) => !request.udp_search_sent_ips.contains(&ip),
             std::net::IpAddr::V6(_) => false,
         })
         .take(MAX_UDP_SEARCH_QUEUE)
         .collect()
+}
+
+/// A global-search packet for every eligible server in the list, starting
+/// after the one the last sweep reached, so its caps (the queue, the source
+/// backstop, the deadline) do not spend every sweep on the top of the list.
+///
+/// A server that cannot read a 64-bit size gets `expr_32`: eMule skips it,
+/// but it cannot index a file past 4 GiB, so a limit cut to 32 bits leaves out
+/// nothing it holds — and a server whose flags are not known yet is one.
+pub(super) fn udp_search_packets(
+    state: &NetworkState,
+    expr: &[u8],
+    expr_32: Option<&[u8]>,
+) -> Vec<(Vec<u8>, std::net::SocketAddr)> {
+    let uses_64bit = kad::messages::search_expression_uses_64bit(expr);
+    let connected_addr = state.server_addr;
+    let mut packets: Vec<(Vec<u8>, std::net::SocketAddr)> = state
+        .server_list
+        .servers()
+        .iter()
+        .filter(|server| is_eligible_udp_server(server, connected_addr))
+        .filter_map(|server| {
+            let large = server.udp_flags & ed2k::server_udp::SRV_UDPFLG_LARGEFILES != 0;
+            if uses_64bit && !large {
+                ServerUdpSocket::build_global_search_packet(server, expr_32?, false)
+            } else {
+                ServerUdpSocket::build_global_search_packet(server, expr, uses_64bit)
+            }
+        })
+        .collect();
+    if let Some(at) = state
+        .udp_sweep_last_sent
+        .and_then(|last| packets.iter().position(|(_, addr)| *addr == last))
+    {
+        packets.rotate_left(at + 1);
+    }
+    packets
 }
 
 /// Whether the connected server can still give `request` more pages: it said
@@ -1159,6 +1178,18 @@ pub(super) fn start_search_more(
 /// per-batch tags are, and a Sybil cannot rank a file by asserting millions.
 pub(super) const MAX_KAD_AVAILABILITY: u32 = 5_000;
 
+/// A source count a KAD keyword answer gives a file. Past 65,500 it is no
+/// count, as eMule reads it (`CSearch::ProcessResultKeyword`), and unknown
+/// rather than held to the ceiling, where a node making it up ranked its file
+/// above every honest one.
+pub(super) fn kad_source_count(claimed: u64) -> u32 {
+    if claimed > 65_500 {
+        0
+    } else {
+        claimed.min(MAX_KAD_AVAILABILITY.into()) as u32
+    }
+}
+
 /// Soft cap on `ActiveSearchRequest::streamed_hashes`. Once reached, the set
 /// stops growing (bounding memory for a pathological all-servers global
 /// search) but dedup itself doesn't stop: hashes already tracked before the
@@ -1236,11 +1267,11 @@ pub(super) struct SearchNoticeEvent {
 }
 
 pub(super) fn emit_search_notice(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     request_id: u64,
     notice: &'static str,
 ) {
-    use tauri::Emitter;
+    use crate::host::Emitter;
     let _ = app_handle.emit("search-notice", SearchNoticeEvent { request_id, notice });
 }
 
@@ -1283,6 +1314,24 @@ pub(super) struct PendingNotePublish {
     pub(super) message: KadMessage,
 }
 
+/// eMule's `MAXFILECOMMENTLEN`, in the UTF-16 units it counts. Its KAD readers
+/// drop a longer description (`Search.cpp`), and a storing node that holds one
+/// past about 2,000 bytes fails to serialize it and so answers no note request
+/// for that file at all (`CIndexed::SendValidNoteResult`).
+pub(crate) const MAX_NOTE_COMMENT_UNITS: usize = 128;
+
+/// `comment` cut to what an eMule note can carry.
+pub(crate) fn clip_note_comment(comment: &str) -> &str {
+    let mut units = 0;
+    for (at, c) in comment.char_indices() {
+        units += c.len_utf16();
+        if units > MAX_NOTE_COMMENT_UNITS {
+            return &comment[..at];
+        }
+    }
+    comment
+}
+
 pub(super) fn build_publish_notes_message(
     local_id: KadId,
     file_hash: KadId,
@@ -1316,6 +1365,7 @@ pub(super) fn build_publish_notes_message(
             });
         }
     }
+    let comment = clip_note_comment(comment);
     if !comment.is_empty() {
         tags.push(KadTag {
             name: TagName::Id(TAG_DESCRIPTION),
@@ -1470,7 +1520,7 @@ pub(super) fn related_search_flag_set(server_flags: u32) -> bool {
 }
 
 pub(super) fn emit_search_results_event(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     request_id: u64,
     results: &[SearchResult],
 ) {
@@ -1558,7 +1608,7 @@ pub(super) fn is_search_source_safe(state: &NetworkState, ip: Ipv4Addr) -> bool 
 /// count the same publishers a second time.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn enrich_and_emit_search_results(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     spam_filter: &Arc<RwLock<crate::search::spam::SpamFilter>>,
     comment_manager: &Arc<RwLock<CommentManager>>,
     settings: &AppSettings,
@@ -1817,7 +1867,7 @@ pub(super) fn note_dht_recall_sample(state: &mut NetworkState) {
 
 pub(super) fn maybe_finish_active_search(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     request_id: u64,
 ) {
     let should_complete = state.active_search_request.as_ref().is_some_and(|active| {
@@ -1859,7 +1909,7 @@ pub(super) fn maybe_finish_active_search(
 /// removal.
 pub(super) fn finalize_removed_searches(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     removed_sids: &[SearchId],
     released_in_use: &[KadId],
     rendezvous_target: Option<KadId>,
@@ -1893,7 +1943,7 @@ pub(super) fn rendezvous_search_target(state: &NetworkState) -> Option<KadId> {
 /// [`ember_rendezvous_id_reused`].
 pub(super) fn finalize_removed_searches_with_keyword_results(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     removed_sids: &[SearchId],
     released_in_use: &[KadId],
     preserved_results: &HashMap<SearchId, (KadId, Vec<kad::messages::SearchResultEntry>)>,
@@ -1971,6 +2021,7 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
                 peers.len(),
                 ember_rendezvous_converted_contacts(state, &peers),
             );
+            note_rendezvous_adverts(state, &peers, &established);
         }
         if let Some((_, tx)) = state.pending_notes_searches.remove(sid) {
             if let Some((target, entries)) = preserved_results.get(sid) {
@@ -2070,7 +2121,7 @@ pub(super) fn finalize_removed_searches_with_keyword_results(
 /// `download_source_searches` / store maps orphaned until their own timeouts.
 pub(super) fn start_kad_search(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     target: KadId,
     search_type: SearchType,
     initial_contacts: Vec<KadContact>,
@@ -2157,7 +2208,7 @@ pub(super) fn drop_running_ember_companion(state: &mut NetworkState, search_id: 
 /// into the abandoned caller's map.
 pub(super) fn release_ember_search_state(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     search_id: u32,
 ) {
     // A given id is either a node- or a value-lookup; draining both maps
@@ -2195,7 +2246,7 @@ pub(super) fn release_ember_search_state(
     );
     state.ember_channel_handoff_searches.remove(&search_id);
     if let Some((channel_id, epoch)) = state.ember_channel_epoch_searches.remove(&search_id) {
-        flush_channel_epoch_if_idle(state, channel_id, epoch);
+        abandon_channel_epoch_lookup(state, channel_id, epoch);
     }
     state.ember_channel_claim_searches.remove(&search_id);
     // A publish-target lookup can end here rather than through
@@ -2229,7 +2280,7 @@ fn settle_stopped_continuation(request: &mut ActiveSearchRequest) {
     request.ember_pending = false;
 }
 
-pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri::AppHandle, request_id: u64) {
+pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &crate::host::AppHandle, request_id: u64) {
     // Drop in-flight Ember DHT keyword lookups for this request so a
     // cancelled search stops walking (not just unmapping bookkeeping while
     // FIND_VALUE continues until the 60s expiry).
@@ -2349,6 +2400,25 @@ pub(super) fn cancel_search_request(state: &mut NetworkState, app_handle: &tauri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_absurd_kad_source_count_is_unknown() {
+        assert_eq!(kad_source_count(42), 42);
+        assert_eq!(kad_source_count(20_000), MAX_KAD_AVAILABILITY);
+        assert_eq!(kad_source_count(65_500), MAX_KAD_AVAILABILITY);
+        assert_eq!(kad_source_count(65_501), 0);
+        assert_eq!(kad_source_count(u64::MAX), 0);
+    }
+
+    /// A note's description is cut to the 128 UTF-16 units eMule reads, on a
+    /// character boundary.
+    #[test]
+    fn a_note_comment_is_cut_to_what_emule_reads() {
+        assert_eq!(clip_note_comment(&"a".repeat(300)).len(), 128);
+        assert_eq!(clip_note_comment(&"あ".repeat(300)).chars().count(), 128);
+        assert_eq!(clip_note_comment(&"😀".repeat(100)).chars().count(), 64);
+        assert_eq!(clip_note_comment("short"), "short");
+    }
 
     fn row(hash: &str, name: &str) -> SearchResult {
         SearchResult {

@@ -564,14 +564,7 @@ fn load_feed_tree(stamp: &FileStamp) -> Option<std::sync::Arc<HashTree>> {
         let _ = std::fs::remove_file(&path);
         return None;
     }
-    let chunk_hashes: Vec<[u8; 32]> = body[header.len()..]
-        .chunks_exact(32)
-        .map(|value| {
-            let mut out = [0u8; 32];
-            out.copy_from_slice(value);
-            out
-        })
-        .collect();
+    let chunk_hashes: Vec<[u8; 32]> = body[header.len()..].as_chunks::<32>().0.to_vec();
     let root_hash = crate::network::ember::feed::root_of_chunk_values(&chunk_hashes)
         .unwrap_or(*blake3::hash(&[]).as_bytes());
     // Its modified time is when it was last used, which is what

@@ -29,6 +29,11 @@ export function chatAllowedWith(settings: Settings, friendHash: string): boolean
   return friendOverrides(settings, friendHash).chat ?? settings?.friend_chat_disabled !== true;
 }
 
+/** Chat with this friend is off by their own setting, which the global one can't undo. */
+export function chatOffByFriendSetting(settings: Settings, friendHash: string): boolean {
+  return friendOverrides(settings, friendHash).chat === false;
+}
+
 /** Files from this friend. Never while chat with them is off. */
 export function filesAllowedFrom(settings: Settings, friendHash: string): boolean {
   return (

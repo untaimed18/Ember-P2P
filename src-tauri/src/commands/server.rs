@@ -2,7 +2,6 @@ use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, coded, coded_ctx};
 use crate::network::NetworkCommand;
 use crate::types::ServerInfo;
-use tauri_plugin_dialog::DialogExt;
 use tracing::info;
 
 const MAX_SERVER_NAME_LEN: usize = 256;
@@ -77,7 +76,7 @@ async fn resolve_server_host(input: &str, port: u16) -> Result<String, String> {
         }
         return Ok(input.to_string());
     }
-    let addr = tokio::net::lookup_host((input, port))
+    let addr = crate::net_bind::lookup_host((input, port))
         .await
         .map_err(|_| coded("server_resolve_failed", "Failed to resolve server address"))?
         .find(|addr| addr.is_ipv4())
@@ -109,7 +108,7 @@ async fn resolve_server_host(input: &str, port: u16) -> Result<String, String> {
 ///
 /// Asked once, on the addition, rather than on each connect, so routine
 /// reconnects to a server the user already chose stay prompt-free.
-async fn confirm_server_addition(app: &tauri::AppHandle, hosts: &[String]) -> bool {
+async fn confirm_server_addition(app: &crate::host::AppHandle, hosts: &[String]) -> bool {
     let listed = hosts
         .iter()
         .map(|host| crate::commands::settings::elide_for_dialog(host))
@@ -125,28 +124,12 @@ async fn confirm_server_addition(app: &tauri::AppHandle, hosts: &[String]) -> bo
     } else {
         "Add these eD2K servers?"
     };
-    let confirm_app = app.clone();
-    // `blocking_show` pumps the dialog on the main thread, so it cannot run on
-    // the command's own task. Same shape as `confirm_web_service_additions`.
-    tokio::task::spawn_blocking(move || {
-        confirm_app
-            .dialog()
-            .message(prompt)
-            .title(title)
-            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
-                "Add".to_string(),
-                "Cancel".to_string(),
-            ))
-            .blocking_show()
-    })
-    .await
-    .unwrap_or(false)
+    crate::host::confirm(app, crate::host::Confirm::new(title, prompt, "Add", "Cancel")).await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn connect_to_server(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     ip: String,
     port: u16,
 ) -> Result<String, String> {
@@ -189,8 +172,8 @@ pub async fn connect_to_server(
     Ok(format!("Connecting to ed2k server {resolved_ip}:{port}..."))
 }
 
-#[tauri::command]
-pub async fn disconnect_server(state: tauri::State<'_, AppState>) -> Result<String, String> {
+#[ember_macros::command]
+pub async fn disconnect_server(state: crate::host::State<'_, AppState>) -> Result<String, String> {
     state
         .network_tx
         .try_send(NetworkCommand::DisconnectServer)
@@ -199,10 +182,10 @@ pub async fn disconnect_server(state: tauri::State<'_, AppState>) -> Result<Stri
     Ok("Disconnected from ed2k server".into())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn add_server(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     ip: String,
     port: u16,
     name: String,
@@ -257,9 +240,9 @@ pub async fn add_server(
     await_reply(rx, "server_add_failed", "Failed to add server").await?
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_server(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     ip: String,
     port: u16,
 ) -> Result<String, String> {
@@ -297,9 +280,9 @@ pub async fn remove_server(
 /// changes the standing of one already in the list — it cannot name a new
 /// destination, because [`crate::network::ed2k::server_list::ServerList::set_static`]
 /// fails on an address that is not there.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_server_static(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     ip: String,
     port: u16,
     is_static: bool,
@@ -324,9 +307,9 @@ pub async fn set_server_static(
 ///
 /// The name is validated in the network task rather than here, so the one
 /// accepted set lives next to the enum it maps onto.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_server_priority(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     ip: String,
     port: u16,
     priority: String,
@@ -352,8 +335,8 @@ pub async fn set_server_priority(
     .await?
 }
 
-#[tauri::command]
-pub async fn get_server_list(state: tauri::State<'_, AppState>) -> Result<Vec<ServerInfo>, String> {
+#[ember_macros::command]
+pub async fn get_server_list(state: crate::host::State<'_, AppState>) -> Result<Vec<ServerInfo>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
         .network_tx
@@ -373,9 +356,9 @@ async fn server_list_snapshot(state: &AppState) -> Result<Vec<ServerInfo>, Strin
     await_reply(rx, "server_list_failed", "Failed to get server list").await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_connected_server(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Option<ServerInfo>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -392,7 +375,7 @@ pub async fn get_connected_server(
 
 /// The server last logged in to, which startup auto-connect tries first and
 /// "Connect to best server" prefers too. `None` when none is on record.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_last_server() -> Option<crate::network::ed2k::server_list::LastEd2kServer> {
     let path = crate::storage::paths::resolve_data_dir().join("last_ed2k_server.json");
     crate::network::ed2k::server_list::LastEd2kServer::load(&path)
@@ -403,22 +386,22 @@ pub async fn get_last_server() -> Option<crate::network::ed2k::server_list::Last
 /// Read straight out of the replay buffer rather than through the network
 /// task: it is an in-memory list behind a short lock, and the caller is a
 /// page that has just loaded and wants its history back.
-#[tauri::command]
+#[ember_macros::command]
 pub fn get_server_log() -> Vec<crate::network::ServerLogLine> {
     crate::network::server_log_history()
 }
 
 /// Discard the retained log, so that clearing the view clears it for good
 /// rather than until the next reload replays it back into place.
-#[tauri::command]
+#[ember_macros::command]
 pub fn clear_server_log() {
     crate::network::clear_server_log_history();
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn download_server_met(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
     info!("Downloading server.met");

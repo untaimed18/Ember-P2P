@@ -3,6 +3,7 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { isServer } from '$lib/runtime';
   import { plural } from '$lib/plural';
   import { formatDateTime, formatSize } from '$lib/utils';
   import ToggleSwitch from './ToggleSwitch.svelte';
@@ -64,6 +65,8 @@
   let wantNodes = $state(true);
   let wantIpfilter = $state(false);
   let folderChoice: boolean[] = $state([]);
+  /** Shared as eMule shared it: off, so a folder is shared whole as before. */
+  let folderFlat: boolean[] = $state([]);
   let downloadChoice: boolean[] = $state([]);
 
   /** Wizard: bring this eMule profile along. On by default once one is found;
@@ -161,6 +164,7 @@
       // A whole drive is left for the user to tick, knowing what it means;
       // ticking it also brings up the native confirmation when staging.
       folderChoice = result.shared_folders.map((f) => f.status === 'ready');
+      folderFlat = result.shared_folders.map(() => false);
       downloadChoice = result.downloads.map((d) => d.status === 'ready');
       wantIpfilter = result.ipfilter;
       importChosen = mode === 'wizard' && !declined;
@@ -193,6 +197,7 @@
       incoming_as_download_folder: mode === 'settings' && wantIncoming,
       library: wantLibrary,
       shared_folders: folderChoice.flatMap((on, i) => (on ? [i] : [])),
+      shared_folders_flat: folderChoice.flatMap((on, i) => (on && folderFlat[i] ? [i] : [])),
       identity: wantIdentity && preview.identity,
       credits: wantCredits,
       downloads: downloadChoice.flatMap((on, i) => (on ? [i] : [])),
@@ -347,9 +352,11 @@
             placeholder={detecting ? m.emule_import_detecting() : ''}
             aria-label={m.emule_import_folder_label()}
           />
-          <button type="button" class="folder-btn" onclick={pickFolder} disabled={reading || staging}>
-            {m.settings_browse()}
-          </button>
+          {#if !isServer}
+            <button type="button" class="folder-btn" onclick={pickFolder} disabled={reading || staging}>
+              {m.settings_browse()}
+            </button>
+          {/if}
         </div>
         {#if reading}
           <span class="hint">{m.emule_import_reading()}</span>
@@ -358,7 +365,7 @@
             {m.emule_import_found({ client: preview.source.client === 'amule' ? 'aMule' : 'eMule' })}
           </span>
         {:else if !detecting && installs.length === 0}
-          <span class="hint">{m.emule_import_none_found()}</span>
+          <span class="hint">{isServer ? m.emule_import_none_found_server() : m.emule_import_none_found()}</span>
         {/if}
       </div>
       {#if preview && emuleRunning}
@@ -390,7 +397,7 @@
     <p class="hint">{m.emule_import_detecting()}</p>
   {:else}
     {#if installs.length === 0}
-      <p class="hint">{m.emule_import_none_found()}</p>
+      <p class="hint">{isServer ? m.emule_import_none_found_server() : m.emule_import_none_found()}</p>
     {/if}
     <div class="sources">
       {#if installs.length > 1 || (installs.length === 1 && !preview)}
@@ -407,7 +414,7 @@
           </button>
         {/each}
       {/if}
-      {#if !preview}
+      {#if !preview && !isServer}
         <button type="button" class="ghost" onclick={pickFolder} disabled={reading || staging}>
           {m.emule_import_choose()}
         </button>
@@ -480,7 +487,9 @@
                       {#if folderNote(folder.status)}
                         <span class="item-meta" class:warn={folder.status === 'drive_root'}>{folderNote(folder.status)}</span>
                       {/if}
-                      {#if folder.newly_shared_subfolders > 0}
+                      {#if folder.newly_shared_subfolders > 0 && folderFlat[i] && folderChoice[i]}
+                        <span class="item-meta">{m.emule_import_folder_flat_hint()}</span>
+                      {:else if folder.newly_shared_subfolders > 0}
                         <span class="item-meta warn">
                           {folder.subfolder_count_capped
                             ? m.emule_import_folder_subfolders_capped({ count: folder.newly_shared_subfolders })
@@ -493,6 +502,12 @@
                       {/if}
                     </span>
                   </label>
+                  {#if folder.newly_shared_subfolders > 0 && importableFolder(folder.status)}
+                    <label class="flat-choice">
+                      <input type="checkbox" bind:checked={folderFlat[i]} disabled={!folderChoice[i]} />
+                      <span class="item-meta">{m.emule_import_folder_flat()}</span>
+                    </label>
+                  {/if}
                 </li>
               {/each}
             </ul>
@@ -648,9 +663,11 @@
           <strong>{m.emule_import_found({ client: preview.source.client === 'amule' ? 'aMule' : 'eMule' })}</strong>
           <span class="source-path mono">{preview.source.path}</span>
         </div>
-        <button type="button" class="link" onclick={pickFolder} disabled={staging}>
-          {m.emule_import_choose_other()}
-        </button>
+        {#if !isServer}
+          <button type="button" class="link" onclick={pickFolder} disabled={staging}>
+            {m.emule_import_choose_other()}
+          </button>
+        {/if}
       </div>
       <ul class="stats">
         {#if preview.known_files > 0}
@@ -877,6 +894,11 @@
   }
   .item-list li.disabled label {
     cursor: default;
+  }
+  /* Under the folder's own checkbox, lined up with its path. */
+  .item-list label.flat-choice {
+    padding: 0 10px 7px 33px;
+    align-items: center;
   }
   .item-list input {
     margin: 2px 0 0;

@@ -1,0 +1,175 @@
+name: emberd image
+
+# Pushes emberd's Docker image to the GitHub Container Registry as soon as a
+# release is published, as `website.yml` points the website at it. It is
+# built from the tarballs release.yml attached, checked against the SHA-256
+# list beside them, so the image runs the same bytes as the tarball and the
+# `.deb`; and it waits for publishing so that `latest` moves when latest.json
+# does, never from a draft nobody has reviewed yet.
+#
+# Each machine's image is built on a runner of its own kind, so nothing runs
+# under emulation, and pushed as `X.Y.Z-amd64` and `X.Y.Z-arm64`; the last job
+# joins them as `X.Y.Z`, and as `X.Y` and `latest` if this is the newest
+# release. Nothing here compiles: the jobs that can write to the registry run
+# only Docker, on files the release already holds.
+#
+# The first push makes the package private. Make it public once, in the
+# package's settings on GitHub, so `docker pull` works without signing in.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release to push emberd's image for (vX.Y.Z)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emberd-image
+  cancel-in-progress: false
+
+jobs:
+  find:
+    name: Find emberd in the release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      packaged: ${{ steps.release.outputs.packaged }}
+      newest: ${{ steps.release.outputs.newest }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      # A release from before emberd shipped has nothing to build, which is
+      # not a failure. `newest` is compared by version, not read from GitHub's
+      # "latest" flag, which publishing any release sets.
+      - name: Read the release
+        id: release
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "not a release tag: $TAG" >&2
+            exit 1
+          fi
+          version="${TAG#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qxF "emberd-${version}-SHA256SUMS"; then
+            echo "packaged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$TAG has no emberd packages, so there is no image to push"
+            echo "packaged=false" >> "$GITHUB_OUTPUT"
+          fi
+          newest=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          if [ "$newest" = "$TAG" ]; then
+            echo "newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "newest=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  image:
+    name: Image for ${{ matrix.platform }}
+    needs: find
+    if: needs.find.outputs.packaged == 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            platform: amd64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            platform: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      VERSION: ${{ needs.find.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      # The Dockerfile as it was at the release.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      - name: Fetch the release's tarball and check it
+        run: |
+          name="emberd-${VERSION}-linux-${ARCH}"
+          dir="$RUNNER_TEMP/release"
+          gh release download "$TAG" --dir "$dir" \
+            --pattern "${name}.tar.gz" --pattern "emberd-${VERSION}-SHA256SUMS"
+          (cd "$dir" && grep -F "  ${name}.tar.gz" "emberd-${VERSION}-SHA256SUMS" | sha256sum --check --strict)
+          tar -C "$dir" -xzf "$dir/${name}.tar.gz"
+          echo "TARBALL=$dir/$name" >> "$GITHUB_ENV"
+
+      # `--version` only: a running emberd joins the P2P network, which a CI
+      # runner has no business doing.
+      - name: Build the image
+        run: |
+          docker build -f packaging/emberd/Dockerfile \
+            --build-arg EMBERD_FROM=release \
+            --build-context tarball="$TARBALL" \
+            --label "org.opencontainers.image.source=https://github.com/$GH_REPO" \
+            --label "org.opencontainers.image.title=emberd" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --tag "emberd:$VERSION" .
+          said=$(docker run --rm "emberd:$VERSION" --version)
+          if [ "$said" != "emberd $VERSION" ]; then
+            echo "the image says \"$said\", not emberd $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Push it for this machine
+        run: |
+          image="ghcr.io/${OWNER,,}/emberd"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker tag "emberd:$VERSION" "$image:$VERSION-$PLATFORM"
+          docker push "$image:$VERSION-$PLATFORM"
+          docker logout ghcr.io
+
+  publish:
+    name: Join both machines into one image
+    needs: [find, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+      VERSION: ${{ needs.find.outputs.version }}
+      NEWEST: ${{ needs.find.outputs.newest }}
+    steps:
+      # `X.Y` and `latest` move only to the newest release, so republishing an
+      # older one leaves them where they are.
+      - name: Tag the image
+        run: |
+          image="ghcr.io/${OWNER,,}/emberd"
+          tags=(--tag "$image:$VERSION")
+          if [ "$NEWEST" = "true" ]; then
+            tags+=(--tag "$image:${VERSION%.*}" --tag "$image:latest")
+          fi
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create "${tags[@]}" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/$GH_REPO" \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            "$image:$VERSION-amd64" "$image:$VERSION-arm64"
+          docker logout ghcr.io

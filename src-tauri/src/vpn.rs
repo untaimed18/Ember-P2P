@@ -48,7 +48,7 @@ fn ras_says_vpn(description: &str, connections: &[(String, String)]) -> Option<b
     }
 }
 
-fn is_vpn_interface(if_type: u32, description: &str) -> bool {
+pub(crate) fn is_vpn_interface(if_type: u32, description: &str) -> bool {
     let description = description.to_lowercase();
     if if_type == PPP_INTERFACE_TYPE && description.contains("pppoe") {
         return false;

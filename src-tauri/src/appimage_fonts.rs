@@ -1,14 +1,19 @@
 //! The AppImage's emoji, kept away from a crash in its bundled WebKit.
 //!
-//! The AppImage carries WebKitGTK from the distro it is built on (Ubuntu
-//! 22.04), compiled against that distro's FreeType 2.11, but not FreeType
-//! itself: WebKit loads the host's. FreeType 2.13 added a field to
-//! `FT_ColorStopIterator`, so on a host with 2.13 or newer (Fedora 40 and
-//! later, Debian 13, Arch) the two disagree on its layout. The first gradient
-//! drawn from a COLRv1 colour font, which Fedora's default emoji font is, then
-//! aborts the web process in Skia's `colrv1_configure_skpaint`. The backend
-//! keeps running; the window dies at the first emoji, which in practice is a
-//! room's older messages.
+//! The AppImage carries WebKitGTK from the distro it is built on, compiled
+//! against that distro's FreeType, but not FreeType itself: WebKit loads the
+//! host's. FreeType 2.13 added a field to `FT_ColorStopIterator`, so a WebKit
+//! built on one side of 2.13 and a host on the other disagree on its layout.
+//! The first gradient drawn from a COLRv1 colour font, which Fedora's default
+//! emoji font is, then aborts the web process in Skia's
+//! `colrv1_configure_skpaint`. The backend keeps running; the window dies at
+//! the first emoji, which in practice is a room's older messages.
+//!
+//! Through 1.7.8 the AppImage was built on Ubuntu 22.04 (FreeType 2.11) and
+//! hosts with 2.13 or newer (Fedora 40 and later, Debian 13, Arch) hit this.
+//! From 1.8.0 it is built on Ubuntu 24.04 (2.13), whose glibc floor (2.39)
+//! leaves out nearly every host older than 2.13; `build.rs` reads the build
+//! distro's version, so this keeps up with wherever the build goes next.
 //!
 //! On such a host, before anything else starts, fontconfig is pointed at a
 //! configuration of Ember's own: the host's, minus every colour font except
@@ -34,8 +39,13 @@ use std::path::{Path, PathBuf};
 pub const OVERRIDE_MARKER: &str = "EMBER_FONTCONFIG_FILE";
 
 /// The FreeType the bundled WebKit was compiled against: the build distro's
-/// (`build-linux` in `.github/workflows/release.yml`). Moves with it.
-const BUILT_AGAINST_FREETYPE: (i32, i32) = (2, 11);
+/// (`build-linux-appimage` in `.github/workflows/release.yml`), as `build.rs`
+/// read it from that distro's header. `None` when it found none.
+#[cfg(target_os = "linux")]
+fn built_against_freetype() -> Option<(i32, i32)> {
+    let (major, minor) = option_env!("EMBER_BUILT_AGAINST_FREETYPE")?.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
 
 /// The release that changed `FT_ColorStopIterator`.
 const COLOR_STOP_LAYOUT_CHANGED_IN: (i32, i32) = (2, 13);
@@ -51,12 +61,12 @@ const BUNDLED_FONT_DIR: &str = "usr/share/ember/fonts";
 #[cfg(target_os = "linux")]
 const SYSTEM_CONFIG: &str = "/etc/fonts/fonts.conf";
 
-/// Whether a host with FreeType `host` disagrees with the bundled WebKit on
-/// the colour-stop layout.
-fn layouts_differ(host: (i32, i32, i32)) -> bool {
-    let built_new = BUILT_AGAINST_FREETYPE >= COLOR_STOP_LAYOUT_CHANGED_IN;
+/// Whether a host with FreeType `host` disagrees with a WebKit built against
+/// `built` on the colour-stop layout. A build that does not know is taken to
+/// disagree: the override costs only the host's own emoji font.
+fn layouts_differ(built: Option<(i32, i32)>, host: (i32, i32, i32)) -> bool {
     let host_new = (host.0, host.1) >= COLOR_STOP_LAYOUT_CHANGED_IN;
-    built_new != host_new
+    built.is_none_or(|built| (built >= COLOR_STOP_LAYOUT_CHANGED_IN) != host_new)
 }
 
 fn xml_escape(value: &str) -> String {
@@ -154,7 +164,7 @@ impl Outcome {
                 freetype,
                 font_error: None,
             } => tracing::info!(
-                "AppImage fonts: host FreeType {} is newer than the bundled WebKit expects; colour \
+                "AppImage fonts: host FreeType {} does not match the bundled WebKit's; colour \
                  emoji come from Ember's own Noto Color Emoji",
                 version(freetype)
             ),
@@ -162,12 +172,12 @@ impl Outcome {
                 freetype,
                 font_error: Some(error),
             } => tracing::warn!(
-                "AppImage fonts: host FreeType {} is newer than the bundled WebKit expects, and \
+                "AppImage fonts: host FreeType {} does not match the bundled WebKit's, and \
                  Ember's emoji font could not be used ({error}); emoji are drawn without colour",
                 version(freetype)
             ),
             Outcome::Failed { freetype, error } => tracing::warn!(
-                "AppImage fonts: host FreeType {} is newer than the bundled WebKit expects, and \
+                "AppImage fonts: host FreeType {} does not match the bundled WebKit's, and \
                  Ember's font configuration could not be written ({error}); an emoji in a COLRv1 \
                  font can stop the window",
                 version(freetype)
@@ -207,7 +217,7 @@ pub fn prepare() -> Outcome {
     let Some(freetype) = host_freetype_version() else {
         return Outcome::FreetypeUnknown;
     };
-    if !layouts_differ(freetype) {
+    if !layouts_differ(built_against_freetype(), freetype) {
         return Outcome::HostMatches(freetype);
     }
     if !Path::new(SYSTEM_CONFIG).is_file() {
@@ -320,12 +330,27 @@ mod tests {
 
     #[test]
     fn only_a_host_across_the_layout_change_from_the_build_is_overridden() {
-        assert!(!layouts_differ((2, 11, 1)), "Ubuntu 22.04, the build distro");
-        assert!(!layouts_differ((2, 12, 1)), "Debian 12");
-        assert!(layouts_differ((2, 13, 0)));
-        assert!(layouts_differ((2, 13, 3)), "Fedora 44, Debian 13");
-        assert!(layouts_differ((2, 14, 1)));
-        assert!(layouts_differ((3, 0, 0)));
+        let jammy = Some((2, 11));
+        assert!(!layouts_differ(jammy, (2, 11, 1)), "Ubuntu 22.04, the build distro through 1.7.8");
+        assert!(!layouts_differ(jammy, (2, 12, 1)), "Debian 12");
+        assert!(layouts_differ(jammy, (2, 13, 0)));
+        assert!(layouts_differ(jammy, (2, 13, 3)), "Fedora 44, Debian 13");
+        assert!(layouts_differ(jammy, (3, 0, 0)));
+
+        let noble = Some((2, 13));
+        assert!(!layouts_differ(noble, (2, 13, 2)), "Ubuntu 24.04, the build distro from 1.8.0");
+        assert!(!layouts_differ(noble, (2, 14, 1)));
+        assert!(layouts_differ(noble, (2, 12, 1)), "older than the build, the other way round");
+
+        assert!(layouts_differ(None, (2, 13, 2)), "a build that does not know overrides");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_build_knows_the_freetype_it_was_built_against() {
+        let (major, minor) = built_against_freetype().expect("build.rs read the FreeType header");
+        assert_eq!(major, 2);
+        assert!(minor >= 10, "got 2.{minor}");
     }
 
     #[test]

@@ -9,7 +9,7 @@ pub(in crate::network) async fn on_kad_process_tick(
     settings: &AppSettings,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     credit_manager: &Arc<RwLock<CreditManager>>,
     xfer_finish_rx: &mut mpsc::UnboundedReceiver<XferFinishResult>,
 ) {
@@ -43,11 +43,8 @@ pub(in crate::network) async fn on_kad_process_tick(
     }
     // Ember Transfer pacing shares this 100ms tick rather than
     // taking its own arm — `tokio::select!` tops out at 64
-    // branches and this loop is already at the limit. It runs
-    // ahead of the KAD status gate below because Ember is a
-    // separate overlay: a room transfer has no reason to stop
-    // because the eMule network is disconnected. Returns straight
-    // away when nothing is in flight.
+    // branches and this loop is already at the limit. Returns
+    // straight away when nothing is in flight.
     if settings.ember_native_enabled {
         drive_channel_transfers(
             udp_socket,
@@ -57,8 +54,8 @@ pub(in crate::network) async fn on_kad_process_tick(
             bandwidth_limiter,
         )
         .await;
+        crate::network::room_library::drive_room_libraries(udp_socket, state, db, app_handle).await;
     }
-    if state.stats.status == NetworkStatus::Disconnected { return; }
     let now_bt = chrono::Utc::now().timestamp();
     if let Some(target) =
         state

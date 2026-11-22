@@ -6,13 +6,14 @@
   import * as m from '$lib/paraglide/messages';
   import { NAV_SHORTCUT_LIMIT, navShortcutDigit, visibleNavItems } from '$lib/navItems';
   import { appSettings } from '$lib/stores/settings';
-  import { shortcutModSymbol } from '$lib/platform';
+  import { shortcutAltSymbol, shortcutModSymbol } from '$lib/platform';
   import IconX from './IconX.svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
   import { inertBackground, trapTabKey } from '$lib/a11y';
 
   const modifierKey = shortcutModSymbol();
+  const altKey = shortcutAltSymbol();
   type Shortcut = { keys: string[]; label: () => string };
   type Group = { title: () => string; shortcuts: Shortcut[] };
 
@@ -69,7 +70,7 @@
     visibleNavItems($appSettings?.ember_native_enabled)
       .slice(0, NAV_SHORTCUT_LIMIT)
       .map((item, i) => ({
-        keys: ['Alt', navShortcutDigit(i) ?? String(i + 1)],
+        keys: [altKey, navShortcutDigit(i) ?? String(i + 1)],
         label: () => m.shortcuts_jump_to({ page: item.label() }),
       })),
   );
@@ -193,8 +194,8 @@
     {
       title: () => m.shortcuts_section_channels(),
       shortcuts: [
-        { keys: ['Alt', '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
-        { keys: ['Alt', m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
+        { keys: [altKey, '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
+        { keys: [altKey, m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
         { keys: [modifierKey, 'K'], label: () => m.shortcuts_channels_search() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_channels_search_navigate() },
         { keys: [m.shortcuts_key_enter()], label: () => m.shortcuts_channels_search_open() },

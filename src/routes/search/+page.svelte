@@ -8,12 +8,15 @@
     RELATED_SEARCH_METHOD,
   } from '$lib/relatedSearch';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
+  import SpamDataDialog from '$lib/components/SpamDataDialog.svelte';
   import { getSettings } from '$lib/api/settings';
   import { libraryHashesAmong } from '$lib/api/sharing';
   import { isUploadCounterPhase } from '$lib/sharedFileStats';
   import { getEmberDiagnostics } from '$lib/api/ember';
   import { startDownload } from '$lib/api/transfers';
   import { transfers } from '$lib/stores/transfers';
+  import { revealDownloadRequested } from '$lib/stores/transfersView';
+  import { goto } from '$app/navigation';
   import type { Transfer } from '$lib/types';
   import { appSettings } from '$lib/stores/settings';
   import {
@@ -28,6 +31,9 @@
     patchSearchTabByRequestId,
     patchSpamFlagByHash,
     rescoreTabAfterSpamMark,
+    rescoreTabsAfterSpamUnmark,
+    continuedSearchRequests,
+    stoppingSearchRequests,
     searchRowPatchEpoch,
     searchTabs,
     setActiveSearchTab,
@@ -482,10 +488,14 @@
   // Destructive-action confirmation state. Shared by "Clear Results" and
   // "Close Tab". Skip confirmation for empty / non-destructive cases.
   type ConfirmAction =
-    | { kind: 'clear-results' }
+    | { kind: 'clear-results'; tabId: string }
     | { kind: 'close-tab'; tab: SearchTab }
     | { kind: 'copy-all-links'; results: SearchResult[] };
-  let pendingConfirm: ConfirmAction | null = $state(null);
+  // Raw: only ever replaced, and a copy-all holds thousands of rows.
+  let pendingConfirm: ConfirmAction | null = $state.raw(null);
+  /** What the dialog asks, kept past the answer so its buttons do not change
+   *  while it fades out. */
+  let confirmKind = $state<ConfirmAction['kind']>('clear-results');
   let confirmOpen = $state(false);
   let confirmTitle = $state('');
   let confirmMessage = $state('');
@@ -569,9 +579,10 @@
     }
     spamExplainCache[key] = val;
   }
+  const visibleByKey = $derived(new Map(visibleResults.map((r) => [resultKey(r), r] as const)));
   let selectedResult = $derived.by(() => {
     if (!selectedResultKey) return null;
-    return visibleResults.find((r) => resultKey(r) === selectedResultKey) ?? null;
+    return visibleByKey.get(selectedResultKey) ?? null;
   });
   let notes: SearchResult[] = $state([]);
   let loadingNotes = $state(false);
@@ -709,6 +720,7 @@
       ?? 'balanced',
   );
   let showSpamHelp = $state(false);
+  let spamDataOpen = $state(false);
   let contextMenu: { x: number; y: number; result: SearchResult } | null = $state(null);
   let ctxWebSub = $state(false);
   // Opens on hover and on click, as the Library's submenus do; see `hoverSubmenus`.
@@ -1590,7 +1602,24 @@
     joinPoll = setInterval(() => recomputeEmberJoinState(), 1000);
 
     let unlistenHistory: (() => void) | undefined;
+    let unlistenHistoryRemoved: (() => void) | undefined;
     let historyListenMounted = true;
+    // One entry removed, from here or from Settings: its badge goes, and so
+    // does a fetch on its way for it, whose answer would put the badge back.
+    listen<{ hash: string }>('download-history-removed', (event) => {
+      const removed = event.payload?.hash?.toLowerCase();
+      if (!removed) return;
+      const known = [...Object.keys(downloadHistoryMap), ...historyHashGen.keys(), ...completedHandled];
+      for (const hash of new Set(known.filter((h) => h.toLowerCase() === removed))) {
+        delete downloadHistoryMap[hash];
+        invalidateHistory(hash);
+        completedHandled.delete(hash);
+      }
+    }).then((u) => {
+      if (historyListenMounted) unlistenHistoryRemoved = u; else u();
+    }).catch((e) => {
+      console.warn('search: download-history-removed listen failed', e);
+    });
     listen('download-history-cleared', () => {
       downloadHistoryMap = {};
       historyFetchedHashes.clear();
@@ -1608,6 +1637,7 @@
     return () => {
       historyListenMounted = false;
       unlistenHistory?.();
+      unlistenHistoryRemoved?.();
       cancelAnimationFrame(focusFrame);
       if (emberPoll) clearInterval(emberPoll);
       if (joinPoll) clearInterval(joinPoll);
@@ -1767,6 +1797,12 @@
     const t = getDownloadTransfer(result);
     if (!t) return undefined;
     return BLOCKING_DOWNLOAD_STATUSES.has(t.status) ? t : undefined;
+  }
+
+  /** Open Transfers on the download this result is already part of. */
+  function showInTransfers(t: Transfer) {
+    revealDownloadRequested.set(t.id);
+    void goto('/transfers');
   }
 
   function dlBadgeLabel(t: Transfer): string {
@@ -2127,7 +2163,7 @@
       if (generation === ownedCacheGeneration) ownedCache = new Map();
     }
     // A check discarded by the generation bump left its hashes unasked.
-    if (generation === ownedCacheGeneration) scheduleOwnedCheck();
+    if (generation === ownedCacheGeneration && !destroyed) scheduleOwnedCheck();
   }
 
   // Results stream in and the filter can be switched on at any time; checked
@@ -2617,10 +2653,11 @@
     // accumulated results. A closed, empty tab is always one click to drop.
     const hasResults = tab.results.length > 0;
     if (!tab.isSearching && !hasResults) {
-      void performCloseSearchTab(tab);
+      performCloseSearchTab(tab);
       return;
     }
     pendingConfirm = { kind: 'close-tab', tab };
+    confirmKind = 'close-tab';
     confirmTitle = tab.isSearching ? m.search_confirm_stop_close() : m.search_confirm_close_tab();
     const preview = tab.query.length > 60 ? `${tab.query.slice(0, 59)}…` : tab.query;
     confirmMessage = tab.isSearching
@@ -2633,10 +2670,15 @@
     confirmOpen = true;
   }
 
-  async function performCloseSearchTab(tab: SearchTab) {
+  function performCloseSearchTab(tab: SearchTab) {
     clearSearchTimeoutForRequest(tab.requestId);
     const wasActive = get(activeSearchTabId) === tab.id;
-    await closeSearchTab(tab.id);
+    closeSearchTab(tab.id);
+    // Its × went with it.
+    refocusIfLost(() => {
+      const id = get(activeSearchTabId);
+      return id ? document.querySelector<HTMLElement>(`[data-search-tab-id="${CSS.escape(id)}"]`) : null;
+    });
     // The closed tab's result hashes are no longer referenced; drop their
     // history bookkeeping so it doesn't accumulate across the session.
     pruneHistoryToVisible();
@@ -3025,9 +3067,7 @@
    * the ones it already has; Stop works on it as on any search.
    */
   let searchMoreBusy = $state(false);
-  /** Search More runs Stop leaves resumable: the backend sets them aside under
-   *  the same id, so Stop keeps it instead of rotating it. */
-  const continuedRequestIds = new Set<number>();
+  const continuedRequestIds = continuedSearchRequests;
   async function continueSearch() {
     const t = activeTab;
     if (!t || t.isSearching || !t.canSearchMore || searchMoreBusy) return;
@@ -3088,39 +3128,51 @@
     if (!t?.isSearching) return;
     const stoppedId = t.requestId;
     clearSearchTimeoutForRequest(stoppedId);
+    // The tab stops now; the cancel, which a busy network can hold for ten
+    // seconds, is waited on only to say whether it got through.
+    const continued = continuedRequestIds.delete(stoppedId);
+    flushPendingSearchResults(stoppedId);
+    if (continued) {
+      // No `search_files` answer is left to discard, so the id stays and the
+      // `search-complete` the cancel emits says whether Search More can
+      // carry on. Until then its rows wait outside the tab.
+      stoppingSearchRequests.add(stoppedId);
+      patchSearchTabByRequestId(stoppedId, (tab) => ({ ...tab, isSearching: false, progress: null }));
+    } else {
+      // Same discard protocol as `performClearResults`: the backend answers a
+      // cancel by resolving the pending `search_files` oneshot with everything
+      // it collected so far, so without rotating the id that payload merges
+      // into the tab the user just stopped. Results already shown are kept —
+      // this is Stop, not Clear. Nor is there anything left to continue: the
+      // backend forgets a search stopped this way.
+      searchInvokeSettled.add(stoppedId);
+      patchSearchTabByRequestId(stoppedId, (tab) => ({
+        ...tab,
+        requestId: newSearchNonce(),
+        isSearching: false,
+        progress: null,
+        canSearchMore: false,
+      }));
+    }
+    forgetSettledRequest(stoppedId);
     try {
       await cancelSearch(stoppedId);
     } catch (e) {
       console.error('Failed to cancel search:', e);
-      // The backend `try_send`s the cancel, so a full command channel drops it.
-      // Since we rotate the requestId below regardless, a silently-failed cancel
-      // means the search keeps running server-side while every result it finds
+      // The backend `try_send`s the cancel, so a full command channel drops it,
+      // and the search keeps running server-side while every result it finds
       // is discarded — the user should know the stop didn't reach the network.
       addToast('warning', m.search_stop_failed());
+      // A continued search kept its id, and its rows would go on landing.
+      if (continued) {
+        stoppingSearchRequests.delete(stoppedId);
+        patchSearchTabByRequestId(stoppedId, (tab) => ({
+          ...tab,
+          requestId: newSearchNonce(),
+          canSearchMore: false,
+        }));
+      }
     }
-    if (continuedRequestIds.delete(stoppedId)) {
-      // No `search_files` answer is left to discard, so the id stays and the
-      // `search-complete` the cancel emits says whether Search More can
-      // carry on.
-      flushPendingSearchResults(stoppedId);
-      patchSearchTabByRequestId(stoppedId, (tab) => ({ ...tab, isSearching: false, progress: null }));
-      forgetSettledRequest(stoppedId);
-      return;
-    }
-    // Same discard protocol as `performClearResults`: the backend answers a
-    // cancel by resolving the pending `search_files` oneshot with everything it
-    // collected so far, so without rotating the id that payload merges into the
-    // tab the user just stopped. Results already shown are kept — this is Stop,
-    // not Clear.
-    searchInvokeSettled.add(stoppedId);
-    flushPendingSearchResults(stoppedId);
-    patchSearchTabByRequestId(stoppedId, (tab) => ({
-      ...tab,
-      requestId: newSearchNonce(),
-      isSearching: false,
-      progress: null,
-    }));
-    forgetSettledRequest(stoppedId);
   }
 
   function dismissTabError() {
@@ -3141,6 +3193,7 @@
   /** The query bar, so the `/` shortcut can hand it focus. */
   let searchBar: SearchBar | undefined = $state();
   let detailsOverlayEl: HTMLDivElement | undefined = $state();
+  let detailsPressOnBackdrop = false;
   let detailsModalEl: HTMLDivElement | undefined = $state();
   let detailsCloseBtn: HTMLButtonElement | undefined = $state();
   let detailsReturnFocusEl: HTMLElement | null = null;
@@ -3208,7 +3261,9 @@
 
   async function showFileDetails(result: SearchResult) {
     const active = typeof document !== 'undefined' ? document.activeElement : null;
-    detailsReturnFocusEl = active instanceof HTMLElement && active !== document.body ? active : null;
+    // Opened from the context menu, whose item goes with it: back to the row.
+    const opener = ctxMenuEl?.contains(active) ? ctxReturnFocus : active;
+    detailsReturnFocusEl = opener instanceof HTMLElement && opener !== document.body ? opener : null;
     selectedResultKey = resultKey(result);
     loadingNotes = true;
     spamExplainLoading = true;
@@ -3486,6 +3541,11 @@
     return { ip: addr, port: 0 };
   }
 
+  /** Files started a moment ago, for the time until the transfer list, which
+   *  refreshes at most every 400 ms, has them and the row says so. */
+  const justStarted = new Set<string>();
+  const JUST_STARTED_MS = 1500;
+
   async function download(result: SearchResult) {
     const key = resultKey(result);
     if (downloadPending[key]) return;
@@ -3506,15 +3566,17 @@
       (a) => a && a !== 'local'
     );
 
+    // Before the hash, which a library file still being hashed has not got.
+    if (isInLibraryOnly(result)) {
+      addToast('info', m.search_already_in_library());
+      return;
+    }
+
     if (!result.file.hash?.trim()) {
       addToast('error', m.error_transfers_invalid_file_hash());
       return;
     }
-
-    if (networkAddresses.length === 0 && result.result_origin?.includes('Local')) {
-      addToast('info', m.search_already_in_library());
-      return;
-    }
+    if (justStarted.has(result.file.hash)) return;
 
     // Empty `source_addresses` is fine when we have a hash: KAD/server
     // results often report availability without embedding peer IPs. The
@@ -3552,6 +3614,9 @@
         result.file.aich_hash,
       );
       addToast('success', res.already_queued ? alreadyQueuedText(res) : m.search_download_queued());
+      const hash = result.file.hash;
+      justStarted.add(hash);
+      safeTimeout(() => justStarted.delete(hash), JUST_STARTED_MS);
     } catch (e: unknown) {
       console.error('Download failed:', e);
       const msg = translateError(e, m.browse_download_failed());
@@ -3612,12 +3677,32 @@
   }
 
   let ctxMenuEl: HTMLDivElement | undefined = $state(undefined);
-  /** Where focus was when the menu opened, handed back when Escape closes it.
-   *  Not on other closes: a click elsewhere has put focus where it wants. */
+  /** Where focus was when the menu opened, handed back when Escape closes it
+   *  and when one of its items does. Not when a click elsewhere closes it:
+   *  that has put focus where it wants. */
   let ctxReturnFocus: HTMLElement | null = null;
 
   function closeContextMenu() {
+    const fromMenu = !!ctxMenuEl && ctxMenuEl.contains(document.activeElement);
     contextMenu = null;
+    if (fromMenu) {
+      const back = ctxReturnFocus;
+      refocusIfLost(() => (back && document.contains(back) ? back : resultsTableEl));
+    }
+  }
+
+  /** The control that had focus went with what it acted on (a menu item, a
+   *  closed tab's ×): put focus on `target` rather than leave it on the page,
+   *  once any dialog closing over it has had its turn to hand focus back. */
+  function refocusIfLost(target: () => HTMLElement | null | undefined) {
+    const attempt = () => {
+      if (destroyed) return;
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && active !== document.body && document.contains(active)) return;
+      target()?.focus();
+    };
+    requestAnimationFrame(() => requestAnimationFrame(attempt));
+    safeTimeout(attempt, 300);
   }
 
   function clearSpamExplainForResult(result: SearchResult) {
@@ -3728,7 +3813,7 @@
           stopWatching();
           // Marked or unmarked again since: that choice stands.
           if (spamToggleGen.get(hash) !== gen) return;
-          void undoSpamMark(hash, prior, tabId, undoPatch);
+          void undoSpamMark(hash, prior, undoPatch);
         },
       },
       () => stopWatching(),
@@ -3744,18 +3829,13 @@
     });
   }
 
-  async function undoSpamMark(
-    hash: string,
-    prior: PriorSpamVerdict,
-    tabId: string | null,
-    undoPatch: () => void,
-  ) {
+  async function undoSpamMark(hash: string, prior: PriorSpamVerdict, undoPatch: () => void) {
     const gen = nextSpamToggleGen(hash);
     undoPatch();
     try {
       await undoMarkSpam(hash, prior);
       if (spamToggleGen.get(hash) !== gen) return;
-      if (tabId) rescoreTabAfterSpamMark(tabId, 'not-spam');
+      rescoreTabsAfterSpamUnmark();
     } catch (e) {
       console.error('Failed to undo spam mark:', e);
       if (spamToggleGen.get(hash) === gen) {
@@ -3769,7 +3849,6 @@
     const hash = result.file.hash;
     if (!hash || spamMarkBlockedReason(result)) return;
     const gen = nextSpamToggleGen(hash);
-    const markedTabId = activeTab?.id ?? null;
     contextMenu = null;
     await new Promise<void>((r) => requestAnimationFrame(() => r()));
     const undoPatch = patchSpamFlagByHash(hash, false, 0, [m.search_spam_reason_manual_not_spam()]);
@@ -3779,7 +3858,7 @@
       if (spamToggleGen.get(hash) !== gen) return;
       // Unmarking drops the collateral the mark taught — the filename, the
       // size, the IPs — so rows flagged only by those are clean again.
-      if (markedTabId) rescoreTabAfterSpamMark(markedTabId, 'not-spam');
+      rescoreTabsAfterSpamUnmark();
     } catch (e) {
       console.error('Failed to unmark spam:', e);
       if (spamToggleGen.get(hash) === gen) {
@@ -3801,6 +3880,10 @@
    */
   async function handleRemoveFromHistory(result: SearchResult) {
     const hash = result.file.hash;
+    // First, as the other items do: left open over the request, the item
+    // could be pressed twice, and the close would then shut whatever menu
+    // was open by the time it returned.
+    closeContextMenu();
     try {
       await removeDownloadHistoryEntry(hash);
       delete downloadHistoryMap[hash];
@@ -3814,7 +3897,6 @@
       console.error('Failed to remove from history:', e);
       addToast('error', m.search_failed_remove_history());
     }
-    contextMenu = null;
   }
 
   function historyStatusLabel(status: string | undefined): string {
@@ -3826,7 +3908,8 @@
   function requestClearResults() {
     const tab = activeTab;
     if (!tab || tab.results.length === 0) return;
-    pendingConfirm = { kind: 'clear-results' };
+    pendingConfirm = { kind: 'clear-results', tabId: tab.id };
+    confirmKind = 'clear-results';
     confirmTitle = m.search_confirm_clear_title();
     confirmMessage = plural(tab.results.length, {
       one: () => m.search_confirm_clear_message_one({ count: formatNumber(tab.results.length) }),
@@ -3859,12 +3942,14 @@
     for (const h of [...historyHashGen.keys()]) if (!live.has(h)) historyHashGen.delete(h);
   }
 
-  function performClearResults() {
-    const tabId = get(activeSearchTabId);
-    if (!tabId) return;
+  /** Empty `tabId`, the tab the confirmation named: another can have come
+   *  on screen while it was up, a related search opening behind it. */
+  function performClearResults(tabId: string) {
     const tab = get(searchTabs).find((t) => t.id === tabId);
-    const oldRequestId = tab?.requestId;
-    if (tab?.isSearching && oldRequestId != null) {
+    if (!tab) return;
+    const oldRequestId = tab.requestId;
+    continuedRequestIds.delete(oldRequestId);
+    if (tab.isSearching) {
       clearSearchTimeoutForRequest(oldRequestId);
       searchInvokeSettled.add(oldRequestId);
       void cancelSearch(oldRequestId).catch(() => { /* best effort */ });
@@ -3873,10 +3958,8 @@
     // search-results / flush cannot refill the cleared tab (SF9).
     const discardedId = oldRequestId;
     const freshId = newSearchNonce();
-    if (discardedId != null) {
-      clearPendingSearchResults(discardedId);
-      searchInvokeSettled.add(discardedId);
-    }
+    clearPendingSearchResults(discardedId);
+    searchInvokeSettled.add(discardedId);
     searchTabs.update((tabs) =>
       tabs.map((t) =>
         t.id === tabId
@@ -3896,7 +3979,11 @@
           : t,
       ),
     );
-    if (discardedId != null) forgetSettledRequest(discardedId);
+    forgetSettledRequest(discardedId);
+    pruneHistoryToVisible();
+    // What the page holds about the list on screen goes with it, and only then.
+    if (get(activeSearchTabId) !== tabId) return;
+    closeContextMenu();
     selectedResultKey = null;
     notes = [];
     spamExplainLoading = false;
@@ -3907,8 +3994,6 @@
     spamExplainCache = {};
     spamTooltipKey = null;
     clearChecked();
-    pruneHistoryToVisible();
-    if (discardedId != null) forgetSettledRequest(discardedId);
   }
 
   function handleConfirm() {
@@ -3916,9 +4001,9 @@
     pendingConfirm = null;
     if (!action) return;
     if (action.kind === 'clear-results') {
-      performClearResults();
+      performClearResults(action.tabId);
     } else if (action.kind === 'close-tab') {
-      void performCloseSearchTab(action.tab);
+      performCloseSearchTab(action.tab);
     } else if (action.kind === 'copy-all-links') {
       void copyLinksFor(action.results, 'all');
     }
@@ -3932,9 +4017,11 @@
    *  downloads it. Kept by key, so a re-sort or new results arriving leave
    *  it on the same file. */
   let cursorKey = $state<string | null>(null);
-  let cursorIndex = $derived(
-    cursorKey ? filteredResults.findIndex((r) => resultKey(r) === cursorKey) : -1,
-  );
+  /** Each listed row's position by key, built once per list for every lookup
+   *  that would otherwise scan it: the cursor, the details row, a Shift-click
+   *  range. Only built while something asks. */
+  const filteredIndexByKey = $derived(new Map(filteredResults.map((r, i) => [resultKey(r), i] as const)));
+  let cursorIndex = $derived(cursorKey ? (filteredIndexByKey.get(cursorKey) ?? -1) : -1);
   /** Where the cursor last was, for when a filter hides its row. */
   let lastCursorIndex = -1;
   // Another tab is another list; the cursor does not carry over by position.
@@ -4122,6 +4209,9 @@
     }
     if (isActivationTarget(e.target)) return false;
     const cursor = current >= 0 ? filteredResults[current] : null;
+    // A held key repeats: Space would flicker the tick, and Enter start
+    // downloads again before the transfer list shows the first.
+    if (e.repeat && (e.key === ' ' || e.key === 'Enter')) return cursor !== null;
     if (e.key === ' ' && cursor) {
       toggleCheck(resultKey(cursor), current, e.shiftKey);
       return true;
@@ -4141,9 +4231,7 @@
 
   function toggleCheck(key: string, index: number, shiftKey: boolean) {
     const next = new Set(checkedKeys);
-    const lastIdx = lastCheckedKey
-      ? filteredResults.findIndex(r => resultKey(r) === lastCheckedKey)
-      : -1;
+    const lastIdx = lastCheckedKey ? (filteredIndexByKey.get(lastCheckedKey) ?? -1) : -1;
     if (shiftKey && lastIdx >= 0 && lastIdx !== index) {
       const lo = Math.min(lastIdx, index);
       const hi = Math.max(lastIdx, index);
@@ -4190,18 +4278,24 @@
   const COPY_ALL_LINKS_CONFIRM_AT = 5_000;
   let copyingLinks = $state<'all' | 'checked' | null>(null);
 
-  /** Results that can actually produce a link, deduplicated by hash. A hit
-   *  still waiting on its hash has nothing to copy. */
+  /** Results that can actually produce a link, one per hash in the order
+   *  they are listed. A hit still waiting on its hash has nothing to copy, and
+   *  a size variant gives way to its file's own row: its link would pair the
+   *  hash with a size the file does not have. */
   function linkableResults(results: SearchResult[]): SearchResult[] {
-    const seen = new Set<string>();
-    const out: SearchResult[] = [];
+    const byHash = new Map<string, SearchResult>();
     for (const r of results) {
       const h = r.file.hash?.trim();
-      if (!h || seen.has(h)) continue;
-      seen.add(h);
-      out.push(r);
+      if (!h) continue;
+      const have = byHash.get(h);
+      if (!have || (have.size_variant && !r.size_variant)) byHash.set(h, r);
     }
-    return out;
+    return [...byHash.values()];
+  }
+
+  async function copyHash(hash: string) {
+    if (await copyToClipboard(hash)) addToast('success', m.library_copied_hash());
+    else addToast('error', m.search_copy_failed());
   }
 
   async function copyResultLink(result: SearchResult) {
@@ -4280,6 +4374,7 @@
       return;
     }
     pendingConfirm = { kind: 'copy-all-links', results: targets };
+    confirmKind = 'copy-all-links';
     confirmTitle = m.search_copy_all_confirm_title();
     confirmMessage = m.search_copy_all_confirm({ count: formatNumber(targets.length) });
     confirmOpen = true;
@@ -4309,13 +4404,15 @@
         if (idx >= toDownload.length) return;
         const result = toDownload[idx];
         const networkAddrs = (result.source_addresses ?? []).filter((a) => a && a !== 'local');
+        // Before the hash: a library file still being hashed has none yet,
+        // and is in the library all the same.
+        if (isInLibraryOnly(result)) {
+          skippedLocal++;
+          continue;
+        }
         if (!result.file.hash?.trim()) {
           failed++;
           failures.push(`${displayName(result)}: ${m.error_transfers_invalid_file_hash()}`);
-          continue;
-        }
-        if (networkAddrs.length === 0 && isInLibraryOnly(result)) {
-          skippedLocal++;
           continue;
         }
         if (getBlockingDownloadTransfer(result)) {
@@ -4489,6 +4586,9 @@
     }
   }}
   onkeydown={(e) => {
+  // The spam data dialog takes its own keys; Ctrl+C there must not copy a
+  // result's link from behind it.
+  if (spamDataOpen) return;
   if (e.key === 'Escape') {
     const openHelp = [syntaxHelpEl, tableHelpEl].find((help) => help?.open);
     if (openHelp) {
@@ -4499,6 +4599,12 @@
     }
     if (showColumnMenu) {
       showColumnMenu = false;
+      e.preventDefault();
+      e.stopPropagation();
+    } else if (spamTooltipKey || showSpamHelp) {
+      // Shown on hover or focus, so dismissed without moving either.
+      closeSpamTooltip();
+      showSpamHelp = false;
       e.preventDefault();
       e.stopPropagation();
     } else if (contextMenu) {
@@ -4528,6 +4634,9 @@
     }
     return;
   }
+  // Keys meant for another dialog, or for the chat dock, are not the results'.
+  const keyTarget = e.target instanceof Element ? e.target : null;
+  if (keyTarget?.closest('.chat-dock') || document.querySelector('[aria-modal="true"]')) return;
   // Ctrl/Cmd+F is find-in-results: the result filter, not the query box `/`
   // goes to.
   if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && isShortcutLetter(e, 'f')) {
@@ -4563,7 +4672,8 @@
       return;
     }
     const cursorRow = cursorIndex >= 0 ? filteredResults[cursorIndex] : undefined;
-    if (!cursorRow) return;
+    // A library file still being hashed has no link yet.
+    if (!cursorRow?.file.hash?.trim()) return;
     e.preventDefault();
     void copyResultLink(cursorRow);
     return;
@@ -4577,7 +4687,6 @@
     target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable
   );
   if (typing || confirmOpen || networkAlertOpen || selectedResult || contextMenu || showColumnMenu) return;
-  if (target?.closest('.chat-dock') || document.querySelector('[aria-modal="true"]')) return;
   // Non-modal overlays too: the status bar's speed limits, the syntax help.
   if (target?.closest('[role="dialog"]') || syntaxHelpEl?.open || tableHelpEl?.open) return;
   if (handleResultsKeydown(e)) e.preventDefault();
@@ -4866,6 +4975,7 @@
             </div>
           </span>
         </label>
+        <button type="button" class="filter-link" onclick={() => (spamDataOpen = true)}>{m.settings_spam_data_view()}</button>
         <label class="filter-toggle" title={m.search_hide_owned_title()}>
           <input type="checkbox" bind:checked={hideOwned} />
           <span>{m.search_hide_owned()}</span>
@@ -5411,7 +5521,11 @@
                 {/if}
               </div>
             </td>
-            <td class="col-size">{formatSize(result.file.size)}</td>
+            <td
+              class="col-size"
+              class:size-variant={result.size_variant}
+              title={result.size_variant ? m.search_size_variant_title() : undefined}
+            >{formatSize(result.file.size)}</td>
             <td class="col-type">{resultTypeLabel(result) || result.file.extension || '\u2014'}</td>
             <td class="col-origin" title={originText}>
               {#if originChips.length > 0}
@@ -5490,9 +5604,9 @@
                 <button
                   class="row-dl-btn"
                   type="button"
-                  disabled
-                  title={m.search_action_already_downloading_title()}
-                  aria-label={m.search_action_already_downloading_aria({ name: displayName(result) })}
+                  onclick={(e) => { e.stopPropagation(); showInTransfers(blockingDl); }}
+                  title={m.search_action_show_in_transfers_title()}
+                  aria-label={m.search_action_show_in_transfers_aria({ name: displayName(result) })}
                 >
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <circle cx="8" cy="8" r="6.5"/>
@@ -5595,11 +5709,22 @@
             : getBlockingDownloadTransfer(contextMenu.result) ? m.search_action_already_downloading_title() : undefined}
           onclick={() => { if (contextMenu) download(contextMenu.result); closeContextMenu(); }}
         >{m.search_ctx_download()}</button>
+        {#if getBlockingDownloadTransfer(contextMenu.result)}
+          <button
+            class="ctx-item"
+            role="menuitem"
+            onclick={() => {
+              const t = contextMenu && getBlockingDownloadTransfer(contextMenu.result);
+              closeContextMenu();
+              if (t) showInTransfers(t);
+            }}
+          >{m.search_show_in_transfers()}</button>
+        {/if}
         {#if checkedCount > 1}
           <button class="ctx-item" role="menuitem" onclick={() => { downloadChecked(); closeContextMenu(); }}>{m.search_ctx_download_selected({ count: formatNumber(checkedCount) })}</button>
         {/if}
         <div class="ctx-sep" role="separator"></div>
-        <button class="ctx-item" role="menuitem" onclick={() => { if (contextMenu) void copyResultLink(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_copy_link()}</button>
+        <button class="ctx-item" role="menuitem" disabled={!contextMenu.result.file.hash?.trim()} onclick={() => { if (contextMenu) void copyResultLink(contextMenu.result); closeContextMenu(); }}>{m.search_ctx_copy_link()}</button>
         {#if checkedCount > 1}
           <button class="ctx-item" role="menuitem" onclick={() => { copyCheckedLinks(); closeContextMenu(); }}>{m.search_ctx_copy_selected_links({ count: formatNumber(checkedCount) })}</button>
         {/if}
@@ -5710,7 +5835,13 @@
         aria-modal="true"
         aria-labelledby="file-details-title"
         tabindex="-1"
-        onclick={(e) => { if (e.target === e.currentTarget) closeFileDetails(); }}
+        onmousedown={(e) => (detailsPressOnBackdrop = e.target === e.currentTarget)}
+        onclick={(e) => {
+          // A click that began and ended on the backdrop. Not a drag that
+          // selected text in the dialog and let go outside it, nor the second
+          // click of a double-click on the name that opened the dialog.
+          if (e.target === e.currentTarget && detailsPressOnBackdrop && e.detail <= 1) closeFileDetails();
+        }}
         onkeydown={handleDetailsKeydown}
         transition:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}
       >
@@ -5747,7 +5878,15 @@
             <dt>{m.search_detail_size()}</dt>
             <dd>{formatSize(selectedResult.file.size)}</dd>
             <dt>{m.search_detail_hash()}</dt>
-            <dd><code>{selectedResult.file.hash}</code></dd>
+            <dd class="detail-hash">
+              <code>{selectedResult.file.hash}</code>
+              {#if selectedResult.file.hash}
+                <span class="detail-copy">
+                  <button type="button" onclick={() => selectedResult && void copyHash(selectedResult.file.hash)}>{m.library_meta_copy_hash()}</button>
+                  <button type="button" onclick={() => selectedResult && void copyResultLink(selectedResult)}>{m.search_ctx_copy_link()}</button>
+                </span>
+              {/if}
+            </dd>
             <dt>{m.search_detail_sources()}</dt>
                 <dd>{formatNumber(selectedResult.availability)}</dd>
             {#if selectedResult.result_origin}
@@ -5879,7 +6018,7 @@
                 {/each}
               </select>
               <label for="note-comment">{m.search_comment_label()}</label>
-              <input id="note-comment" type="text" maxlength="4096" bind:value={noteComment} placeholder={m.search_comment_placeholder()} />
+              <input id="note-comment" type="text" maxlength="128" bind:value={noteComment} placeholder={m.search_comment_placeholder()} />
               <button onclick={handlePublishNote} disabled={publishingNote || !selectedResult.file.hash}>{publishingNote ? m.search_publishing() : m.search_publish_note()}</button>
               {#if publishMessage}
                 <span class={publishSuccess ? 'success-msg' : 'error-msg'}>{publishMessage}</span>
@@ -5889,6 +6028,17 @@
         </div>
         <div class="modal-footer">
           <button type="button" class="ghost" onclick={closeFileDetails}>{m.common_close()}</button>
+          {#if getBlockingDownloadTransfer(selectedResult)}
+            <button
+              type="button"
+              class="ghost"
+              onclick={() => {
+                const t = selectedResult && getBlockingDownloadTransfer(selectedResult);
+                closeFileDetails();
+                if (t) showInTransfers(t);
+              }}
+            >{m.search_show_in_transfers()}</button>
+          {/if}
           <button
             type="button"
             disabled={isInLibraryOnly(selectedResult) || !!getBlockingDownloadTransfer(selectedResult) || !!downloadPending[resultKey(selectedResult)]}
@@ -5904,17 +6054,19 @@
   {/if}
 </div>
 
+<SpamDataDialog bind:open={spamDataOpen} />
+
 <ConfirmDialog
   bind:open={confirmOpen}
   title={confirmTitle}
   message={confirmMessage}
-  confirmLabel={pendingConfirm?.kind === 'close-tab'
+  confirmLabel={confirmKind === 'close-tab'
     ? m.search_confirm_close_tab_btn()
-    : pendingConfirm?.kind === 'copy-all-links'
+    : confirmKind === 'copy-all-links'
       ? m.search_copy_all_confirm_btn()
       : m.search_confirm_clear_btn()}
-  cancelLabel={pendingConfirm?.kind === 'copy-all-links' ? m.common_cancel() : m.search_confirm_keep()}
-  danger={pendingConfirm?.kind !== 'copy-all-links'}
+  cancelLabel={confirmKind === 'copy-all-links' ? m.common_cancel() : m.search_confirm_keep()}
+  danger={confirmKind !== 'copy-all-links'}
   onconfirm={handleConfirm}
   oncancel={handleConfirmCancel}
 />
@@ -6681,6 +6833,13 @@
     font-variant-numeric: tabular-nums;
   }
 
+  .col-size.size-variant {
+    color: var(--warning);
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+    cursor: help;
+  }
+
   .col-type {
     width: 9%;
   }
@@ -7097,6 +7256,31 @@
     overflow-wrap: anywhere;
   }
 
+  .detail-hash {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 12px;
+  }
+
+  .detail-copy {
+    display: inline-flex;
+    gap: 12px;
+  }
+
+  .detail-copy button {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    font-size: var(--font-size-xs);
+    cursor: pointer;
+  }
+
+  .detail-copy button:hover {
+    text-decoration: underline;
+  }
+
   .detail-grid code {
     font-family: var(--font-mono);
     font-size: var(--font-size-sm);
@@ -7317,6 +7501,20 @@
   .filter-count {
     font-size: var(--font-size-xs);
     color: var(--text-muted);
+  }
+
+  /* Beside Hide spam: what the filter has learned from your marks. */
+  .filter-link {
+    padding: 5px 4px;
+    border: none;
+    background: none;
+    color: var(--text-accent);
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+  }
+
+  .filter-link:hover {
+    text-decoration: underline;
   }
 
   .filter-help-wrap {

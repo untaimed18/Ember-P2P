@@ -248,6 +248,9 @@ export function codedErrorOf(input: unknown): { code: string; context?: string }
 type MessageFn = (inputs?: Record<string, unknown>, options?: unknown) => string;
 const messageFns = m as unknown as Record<string, MessageFn | undefined>;
 
+/** Stands in for a `{detail}` the backend left empty, so its slot can be cut out. */
+const EMPTY_DETAIL = '\u{E000}';
+
 function translateCode(code: string, context: string | undefined): string | undefined {
   const fn = messageFns[`error_${code}`];
   if (typeof fn !== 'function') return undefined;
@@ -255,7 +258,22 @@ function translateCode(code: string, context: string | undefined): string | unde
   // `${i?.detail}` with no default for its inputs parameter, so calling it bare
   // renders the literal string "undefined" — and a handful of backend sites
   // emit these codes through the context-free `coded()`.
-  return fn({ detail: context ?? '' });
+  if (context) return fn({ detail: context });
+  return withoutEmptyDetail(fn({ detail: EMPTY_DETAIL }));
+}
+
+/**
+ * Remove an empty `{detail}` together with the punctuation that only exists to
+ * introduce it — the "Could not save: " colon, or a "(max {detail} files)"
+ * aside — so a context-free error doesn't end on a dangling separator.
+ */
+function withoutEmptyDetail(text: string): string {
+  return text
+    .replace(/\s*[(（][^()（）]*\u{E000}[^()（）]*[)）]/gu, '')
+    .replace(/\s*[:：]\s*\u{E000}/gu, '')
+    .replace(/\u{E000}/gu, '')
+    .replace(/ {2,}/g, ' ')
+    .trim();
 }
 
 /**
@@ -328,6 +346,7 @@ const TRANSFER_FAILURE_CODES = new Map<string, () => string>([
   ['transient_failure', m.transfers_failure_reason_transient],
   ['network_channel_unavailable', m.transfers_failure_reason_no_channel],
   ['download_folder_unavailable', m.transfers_failure_reason_download_folder],
+  ['download_folder_busy', m.transfers_failure_reason_download_folder_busy],
   ['part_folder_offline', m.transfers_failure_reason_part_folder_offline],
   ['part_files_removed', m.transfers_failure_reason_part_files_removed],
   ['ember_pin_corrupt', m.transfers_failure_reason_ember_pin_corrupt],

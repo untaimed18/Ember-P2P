@@ -7,7 +7,6 @@ pub mod comments;
 pub mod corruption_blackbox;
 pub mod credits;
 pub mod dead_sources;
-pub mod ember_auth;
 pub mod friend_connect;
 pub mod hash;
 pub mod key_link;
@@ -29,10 +28,6 @@ pub mod upload;
 pub mod upload_queue_store;
 pub mod web_sources;
 pub mod write_coordinator;
-
-/// Legacy Ember PoP/friend opcodes remain parseable for compatibility tests,
-/// but are never a live authorization or signing path.
-pub(crate) const LEGACY_FRIEND_AUTH_ENABLED: bool = false;
 
 /// Prefer the listen port advertised in Hello/EmuleInfo over the TCP
 /// source port. Inbound `peer_addr.port()` is the client's ephemeral

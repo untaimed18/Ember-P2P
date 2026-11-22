@@ -4,7 +4,8 @@
 
 use std::collections::HashSet;
 
-use tauri::Emitter;
+use crate::host::Emitter;
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 
 use crate::app_state::AppState;
@@ -19,7 +20,7 @@ fn task_failed(e: impl std::fmt::Display) -> String {
 }
 
 /// eMule and aMule folders in their default places.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn detect_emule_installs() -> Result<Vec<EmuleInstall>, String> {
     tokio::task::spawn_blocking(emule_import::detect)
         .await
@@ -28,10 +29,10 @@ pub async fn detect_emule_installs() -> Result<Vec<EmuleInstall>, String> {
 
 /// Choose an eMule folder (its install folder or its `config` folder) in a
 /// native dialog. The renderer gets back an id, never a path to hand back.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_emule_folder(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
     title: Option<String>,
 ) -> Result<Option<EmuleInstall>, String> {
     let dialog_title = super::picker_title(title, "Choose your eMule or aMule folder");
@@ -70,9 +71,9 @@ fn parse_hash(hex_hash: &str) -> Option<[u8; 16]> {
 }
 
 /// Read an eMule folder and describe what importing it would bring.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn preview_emule_import(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     source_id: u32,
 ) -> Result<EmulePreview, String> {
     let (shared_folders, download_folder) = {
@@ -114,10 +115,10 @@ pub async fn preview_emule_import(
 
 /// Convert and place what `selection` chose, ready for the next launch.
 /// Streams `emule-import-progress` while it copies.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn stage_emule_import(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     mut selection: EmuleImportSelection,
 ) -> Result<StageSummary, String> {
     // A whole drive is confirmed natively, as adding one in the Library is:
@@ -144,7 +145,7 @@ pub async fn stage_emule_import(
 }
 
 /// Undo a staged import before it is applied, putting moved downloads back.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn discard_emule_import() -> Result<(), String> {
     let data_dir = crate::storage::paths::resolve_data_dir();
     tokio::task::spawn_blocking(move || emule_import::discard(&data_dir))
@@ -154,7 +155,7 @@ pub async fn discard_emule_import() -> Result<(), String> {
 }
 
 /// Whether an import is staged and waiting for a restart.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn pending_emule_import() -> Result<bool, String> {
     let data_dir = crate::storage::paths::resolve_data_dir();
     tokio::task::spawn_blocking(move || emule_import::read_manifest(&data_dir).is_some())
@@ -164,7 +165,7 @@ pub async fn pending_emule_import() -> Result<bool, String> {
 
 /// The report of the last applied import. `mark_seen` records that the
 /// post-launch notice was shown, so it appears once.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_emule_import_report(mark_seen: bool) -> Result<Option<ImportReport>, String> {
     let data_dir = crate::storage::paths::resolve_data_dir();
     tokio::task::spawn_blocking(move || {

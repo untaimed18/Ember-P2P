@@ -7,14 +7,14 @@ pub(in crate::network) async fn on_kad_publish_tick(
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
     const KADEMLIA_TOTAL_STORE_SRC: usize = 4;
     const KADEMLIA_TOTAL_STORE_KEY: usize = 3;
     const KADEMLIA_TOTAL_STORE_NOTES: usize = 1;
     const REPUBLISH_NOTE_SECS: i64 = 24 * 3600;
 
-    if state.stats.status == NetworkStatus::Disconnected || state.routing_table.is_empty() {
+    if state.routing_table.is_empty() {
         return;
     }
 
@@ -229,7 +229,9 @@ pub(in crate::network) async fn on_kad_publish_tick(
                     );
                     let local_note_file = {
                         let index = local_index.read().await;
-                        index.get_by_hash(&file_hash.to_hex()).cloned()
+                        index
+                            .get_by_hash(&hex::encode(kad::publish::kad_id_to_md4_bytes(&file_hash)))
+                            .cloned()
                     };
                     let message = build_publish_notes_message(
                         state.local_id,

@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tauri::Manager;
+use crate::host::Manager;
 
 /// Environment variable that overrides the resolved data directory for
 /// every Ember subsystem (config, identity, database, sharing, network,
@@ -49,13 +49,34 @@ fn env_override() -> Option<PathBuf> {
     }
 }
 
+/// Held by `emberd` for as long as it runs on a data folder. The desktop app
+/// does not start on a folder whose lock is held: its own instance lock is
+/// best-effort, for the update watchdog, and would not stop it.
+pub const EMBERD_LOCK_FILE: &str = "emberd.lock";
+
+/// Whether an `emberd` is running on `data_dir` right now.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+pub fn emberd_running_on(data_dir: &Path) -> bool {
+    use fs2::FileExt;
+    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(data_dir.join(EMBERD_LOCK_FILE)) else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(error) => error.raw_os_error() == fs2::lock_contended_error().raw_os_error(),
+    }
+}
+
 /// Resolve the data directory using the same policy as [`resolve_data_dir`].
 ///
 /// The `AppHandle` is accepted for API compatibility with call sites that
 /// already have one, but it intentionally does not affect the returned path.
 /// This keeps frontend commands, startup tasks, and the network task on the
 /// same on-disk state.
-pub fn resolve_data_dir_with_app(_app: &tauri::AppHandle) -> PathBuf {
+pub fn resolve_data_dir_with_app(_app: &crate::host::AppHandle) -> PathBuf {
     resolve_data_dir()
 }
 
@@ -100,7 +121,7 @@ fn project_dirs_fallback() -> PathBuf {
 /// `app_data_dir()` into the canonical `ProjectDirs` location. Harness runs
 /// set `EMBER_DATA_DIR`, which skips this migration so isolated node
 /// directories stay isolated.
-pub fn ensure_data_dir_with_app(app: &tauri::AppHandle) -> std::io::Result<PathBuf> {
+pub fn ensure_data_dir_with_app(app: &crate::host::AppHandle) -> std::io::Result<PathBuf> {
     let dir = resolve_data_dir();
     std::fs::create_dir_all(&dir)?;
     if env_override().is_none() {
@@ -423,6 +444,27 @@ fn metadata_is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn the_desktop_app_sees_an_emberd_on_its_data_folder() {
+        use fs2::FileExt;
+        let dir = std::env::temp_dir().join(format!("ember-emberd-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!emberd_running_on(&dir), "no emberd has run here");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(EMBERD_LOCK_FILE))
+            .unwrap();
+        held.try_lock_exclusive().unwrap();
+        assert!(emberd_running_on(&dir));
+        FileExt::unlock(&held).unwrap();
+        assert!(!emberd_running_on(&dir), "emberd stopped, its lock file left behind");
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Serializes tests that mutate the process-global `EMBER_DATA_DIR_ENV`.
     /// Cargo runs tests on parallel threads in one process, so without this a

@@ -82,6 +82,9 @@ export interface EmuleImportSelection {
   incoming_as_download_folder: boolean;
   library: boolean;
   shared_folders: number[];
+  /** Of `shared_folders`, the ones shared as eMule did, without the
+   *  subfolders eMule did not list. */
+  shared_folders_flat: number[];
   identity: boolean;
   credits: boolean;
   downloads: number[];

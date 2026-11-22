@@ -20,13 +20,13 @@ use sha2::{Digest, Sha256};
 use tauri::{ipc::Channel, AppHandle, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::{
-    net::lookup_host,
     sync::Mutex,
     time::{timeout, Instant},
 };
 use url::{Host, Url};
 
 use crate::commands::errors::coded;
+use crate::net_bind::lookup_host;
 
 const MANIFEST_MAX_BYTES: usize = 512 * 1024;
 const SIGNATURE_MAX_BYTES: usize = 16 * 1024;
@@ -89,9 +89,10 @@ fn is_missing_updater_resource(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<UpdaterResourceMissing>().is_some())
 }
 
-/// A newer release exists, but its AppImage needs a newer glibc than this
-/// system has. Not a failure: the check worked, and the answer is that this
-/// install cannot take it. Reported as [`SystemTooOld`], never as an error.
+/// A newer release exists, but its package for this install needs a newer
+/// glibc than this system has. Not a failure: the check worked, and the answer
+/// is that this install cannot take it. Reported as [`SystemTooOld`], never as
+/// an error.
 #[derive(Debug)]
 struct UpdaterSystemTooOld(SystemTooOld);
 
@@ -99,8 +100,10 @@ impl std::fmt::Display for UpdaterSystemTooOld {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Ember {} needs glibc {} or newer to run as an AppImage",
-            self.0.version, self.0.glibc
+            "Ember {} needs glibc {} or newer to run as {}",
+            self.0.version,
+            self.0.glibc,
+            self.0.package.described()
         )
     }
 }
@@ -186,8 +189,8 @@ struct SignedPlatform {
     signature: String,
     sha256: String,
     size: u64,
-    /// The oldest glibc the artifact runs on (`"2.39"`), for an AppImage built
-    /// on a newer distro than the last one. See [`choose_appimage_target`].
+    /// The oldest glibc the artifact runs on (`"2.39"`), for a Linux package
+    /// built on a newer distro than the last one. See [`choose_glibc_target`].
     #[serde(default)]
     min_glibc: Option<String>,
 }
@@ -212,18 +215,20 @@ pub struct SecureUpdateCheckResult {
     error: Option<String>,
     #[serde(default)]
     signature_missing: bool,
-    /// The release this AppImage cannot run, when that is why nothing is
+    /// The release this Linux package cannot run, when that is why nothing is
     /// offered.
     #[serde(skip_serializing_if = "Option::is_none")]
     system_too_old: Option<SystemTooOld>,
 }
 
-/// A release whose AppImage needs a newer glibc than this system has.
+/// A release whose package for this install needs a newer glibc than this
+/// system has.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemTooOld {
     version: String,
     glibc: String,
+    package: LinuxPackage,
 }
 
 impl SecureUpdateCheckResult {
@@ -472,8 +477,8 @@ fn validate_manifest(
         {
             bail!("signed updater glibc requirement is invalid");
         }
-        if target.ends_with(GLIBC_GATED_APPIMAGE_SUFFIX) && platform.min_glibc.is_none() {
-            bail!("signed updater glibc-gated AppImage states no glibc requirement");
+        if target.ends_with(GLIBC_GATED_SUFFIX) && platform.min_glibc.is_none() {
+            bail!("signed updater glibc-gated entry states no glibc requirement");
         }
         // Parse now so a malformed signed artifact signature is rejected at
         // check time, before the user downloads a potentially large bundle.
@@ -641,7 +646,7 @@ async fn client_for_url(
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("updater URL has no port"))?;
-    let builder = Client::builder()
+    let builder = crate::net_bind::http_client()?
         .user_agent(concat!("ember-secure-updater/", env!("CARGO_PKG_VERSION")))
         .redirect(RedirectPolicy::none())
         .connect_timeout(CONNECT_TIMEOUT)
@@ -1457,50 +1462,92 @@ fn missing_updater_targets(error: &tauri_plugin_updater::Error) -> Option<String
     }
 }
 
-/// Suffix of the AppImage entry that states the glibc it needs
-/// (`linux-x86_64-appimage-glibc`).
+/// Suffix of a Linux entry that states the glibc it needs
+/// (`linux-x86_64-appimage-glibc`, `linux-x86_64-deb-glibc`).
 ///
-/// The AppImage's glibc floor is the distro it is built on. Moving that build
-/// to a newer distro would hand every install on an older one an AppImage that
-/// cannot start, and since it rewrites itself in place, one it cannot update
-/// its way out of. So a build with a higher floor is published under this
-/// entry, with `min_glibc`, and the plain `linux-{arch}-appimage` entry keeps
-/// one that runs wherever earlier releases did, if it is published at all:
-/// releases before 1.7.7 read only the plain entry and check no glibc.
-const GLIBC_GATED_APPIMAGE_SUFFIX: &str = "-appimage-glibc";
+/// Neither package carries glibc, so each one's glibc floor is the distro it
+/// is built on. Moving a build to a newer distro would hand every install on
+/// an older one a package that cannot start, and so one it cannot update its
+/// way out of. So a build with a higher floor is published under the gated
+/// entry, with `min_glibc`, and the plain `linux-{arch}-{installer}` entry
+/// keeps one that runs wherever earlier releases did, if it is published at
+/// all: an AppImage before 1.7.7 and a `.deb` before 1.8.0 read only the plain
+/// entry and check no glibc. From 1.8.0 the AppImage is built on Ubuntu 24.04
+/// and published under its gated entry alone; the `.deb` is still built on
+/// 22.04 and published under the plain one.
+const GLIBC_GATED_SUFFIX: &str = "-glibc";
 
-/// Which manifest entry an AppImage install takes its update from.
+/// The Linux packages Ember publishes, each of which updates from the entry
+/// its system's glibc can run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum LinuxPackage {
+    AppImage,
+    Deb,
+}
+
+impl LinuxPackage {
+    /// What the running install is, from the marker the bundler writes into
+    /// each package, the same one the plugin names its target from.
+    fn of_this_install() -> Option<Self> {
+        match tauri::utils::platform::bundle_type() {
+            Some(tauri::utils::config::BundleType::AppImage) => Some(Self::AppImage),
+            Some(tauri::utils::config::BundleType::Deb) => Some(Self::Deb),
+            _ => None,
+        }
+    }
+
+    /// The `{installer}` of its manifest entries.
+    fn installer(self) -> &'static str {
+        match self {
+            Self::AppImage => "appimage",
+            Self::Deb => "deb",
+        }
+    }
+
+    fn described(self) -> &'static str {
+        match self {
+            Self::AppImage => "an AppImage",
+            Self::Deb => "a .deb",
+        }
+    }
+}
+
+/// Which manifest entry a Linux package takes its update from.
 #[derive(Debug, PartialEq, Eq)]
-enum AppImageTarget {
-    /// The plugin's own lookup: not an AppImage, or nothing here applies.
+enum GlibcTarget {
+    /// The plugin's own lookup: nothing here applies.
     Default,
     /// This entry, which runs on this system.
     Use(String),
-    /// Every AppImage entry needs a newer glibc than this; the lowest of them.
+    /// Every entry for the package needs a newer glibc than this; the lowest of
+    /// them.
     TooOld(String),
 }
 
-/// The entry an AppImage on `arch` with `host_glibc` should update from: the
+/// The entry `package` on `arch` with `host_glibc` should update from: the
 /// glibc-gated one when this system meets it, else the plain one when it
 /// states nothing or this system meets what it states. A system whose glibc is
 /// unknown meets no stated requirement.
-fn choose_appimage_target(
+fn choose_glibc_target(
     platforms: &BTreeMap<String, SignedPlatform>,
     arch: &str,
+    package: LinuxPackage,
     host_glibc: Option<(u32, u32)>,
-) -> AppImageTarget {
+) -> GlibcTarget {
+    let installer = package.installer();
     let mut lowest_unmet: Option<(u32, u32)> = None;
     for target in [
-        format!("linux-{arch}{GLIBC_GATED_APPIMAGE_SUFFIX}"),
-        format!("linux-{arch}-appimage"),
+        format!("linux-{arch}-{installer}{GLIBC_GATED_SUFFIX}"),
+        format!("linux-{arch}-{installer}"),
     ] {
         let Some(platform) = platforms.get(&target) else {
             continue;
         };
         match platform.min_glibc.as_deref().and_then(parse_glibc) {
-            None => return AppImageTarget::Use(target),
+            None => return GlibcTarget::Use(target),
             Some(min) if host_glibc.is_some_and(|host| host >= min) => {
-                return AppImageTarget::Use(target)
+                return GlibcTarget::Use(target)
             }
             Some(min) => {
                 lowest_unmet = Some(lowest_unmet.map_or(min, |lowest| lowest.min(min)));
@@ -1508,8 +1555,8 @@ fn choose_appimage_target(
         }
     }
     match lowest_unmet {
-        Some((major, minor)) => AppImageTarget::TooOld(format!("{major}.{minor}")),
-        None => AppImageTarget::Default,
+        Some((major, minor)) => GlibcTarget::TooOld(format!("{major}.{minor}")),
+        None => GlibcTarget::Default,
     }
 }
 
@@ -1664,38 +1711,40 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     // The signed release as it stands, whether or not this install takes it.
     spawn_seed(app, &manifest, &config.public_key);
 
-    // An AppImage updates from the entry this system can run, and when no
+    // A Linux package updates from the entry this system can run, and when no
     // entry is one it can, the user is told so rather than offered nothing.
-    let appimage_target = if matches!(
-        tauri::utils::platform::bundle_type(),
-        Some(tauri::utils::config::BundleType::AppImage)
-    ) {
-        choose_appimage_target(&manifest.platforms, std::env::consts::ARCH, host_glibc())
-    } else {
-        AppImageTarget::Default
-    };
-    let appimage_target = match appimage_target {
-        AppImageTarget::Default => None,
-        AppImageTarget::Use(target) => Some(target),
-        AppImageTarget::TooOld(glibc) => {
-            if !should_offer_update(
-                CURRENT_SECURITY_EPOCH,
-                &current_version,
-                manifest.security_epoch,
-                &manifest_version,
-            ) {
-                return Ok(None);
+    let pinned_target = match LinuxPackage::of_this_install() {
+        None => None,
+        Some(package) => match choose_glibc_target(
+            &manifest.platforms,
+            std::env::consts::ARCH,
+            package,
+            host_glibc(),
+        ) {
+            GlibcTarget::Default => None,
+            GlibcTarget::Use(target) => Some(target),
+            GlibcTarget::TooOld(glibc) => {
+                if !should_offer_update(
+                    CURRENT_SECURITY_EPOCH,
+                    &current_version,
+                    manifest.security_epoch,
+                    &manifest_version,
+                ) {
+                    return Ok(None);
+                }
+                tracing::info!(
+                    "Ember {} is out, but as {} it needs glibc {glibc} or newer; this system cannot run it",
+                    manifest.version,
+                    package.described()
+                );
+                return Err(UpdaterSystemTooOld(SystemTooOld {
+                    version: manifest.version.clone(),
+                    glibc,
+                    package,
+                })
+                .into());
             }
-            tracing::info!(
-                "Ember {} is out, but its AppImage needs glibc {glibc} or newer; this system cannot run it",
-                manifest.version
-            );
-            return Err(UpdaterSystemTooOld(SystemTooOld {
-                version: manifest.version.clone(),
-                glibc,
-            })
-            .into());
-        }
+        },
     };
 
     // The plugin is still responsible for constructing the platform-specific
@@ -1719,8 +1768,10 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
     // `configure_client` rather than the plugin's own `proxy`, which logs the
     // proxy URL and with it any credentials the proxy carries.
     let final_proxy = system_proxy_for(&manifest_response.final_url)?;
+    // Read here, where it can fail: the plugin's client builder cannot.
+    let local_ip = crate::net_bind::local_addr(0)?.ip();
     let builder = app.updater_builder();
-    let builder = match appimage_target {
+    let builder = match pinned_target {
         Some(target) => builder.target(target),
         None => builder,
     };
@@ -1744,6 +1795,7 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
                 .redirect(RedirectPolicy::none())
                 .connect_timeout(CONNECT_TIMEOUT)
                 .read_timeout(READ_TIMEOUT);
+            let builder = if local_ip.is_unspecified() { builder } else { builder.local_address(local_ip) };
             match &final_proxy {
                 Some(proxy) => builder.proxy(proxy.clone()),
                 None => builder.resolve_to_addrs(&final_host, &final_addresses),
@@ -1755,8 +1807,8 @@ async fn secure_check(app: &AppHandle) -> Result<Option<(UpdateInfo, PendingUpda
         Ok(update) => update,
         Err(error) => {
             // A signed, otherwise valid manifest carrying no artifact for the
-            // running install. Ember publishes `linux-x86_64-appimage` and
-            // `linux-x86_64-deb` for Linux and nothing else, so an install that
+            // running install. Ember publishes `linux-x86_64-appimage-glibc`
+            // and `linux-x86_64-deb` for Linux and nothing else, so an install that
             // is neither — an RPM, a tarball, a local `cargo build` — reaches
             // this legitimately, and calling it a failure would tell that user
             // their update check is broken when there is simply nothing
@@ -1872,7 +1924,7 @@ fn spawn_seed(app: &AppHandle, manifest: &SignedManifest, public_key: &str) {
         }
         queue.0 = true;
     }
-    tauri::async_runtime::spawn(async {
+    crate::host::async_runtime::spawn(async {
         // Only a panic reaches this with the task still marked running; an
         // ordinary end clears it under the lock, together with the check that
         // nothing is waiting, so no check can fall between the two.
@@ -2011,7 +2063,7 @@ async fn seed_release(job: &SeedJob) {
     };
     if wrote > 0 || pruned > 0 {
         tracing::info!("Release sharing: {wrote} file(s) of Ember {version} kept to share, {pruned} older removed");
-        use tauri::Manager;
+        use crate::host::Manager;
         if let Some(watcher) = app.state::<crate::app_state::AppState>().shared_folder_watcher.clone() {
             watcher.queue_rescan_after(vec![folder.clone()], Duration::from_secs(2));
         }
@@ -2516,7 +2568,7 @@ async fn install_locked(
 /// database closed cleanly, but this process keeps running and writing to it
 /// until the user restarts, and a crash meanwhile must still be unclean.
 fn mark_session_running(app: &AppHandle) {
-    if let Some(state) = tauri::Manager::try_state::<crate::app_state::AppState>(app) {
+    if let Some(state) = crate::host::Manager::try_state::<crate::app_state::AppState>(app) {
         state.db.mark_session_running();
     }
 }
@@ -2628,7 +2680,7 @@ fn public_failure(operation: UpdaterOperation, error: anyhow::Error) -> String {
     envelope
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn secure_updater_check(
     app: AppHandle,
     service: State<'_, UpdaterService>,
@@ -2657,7 +2709,7 @@ pub(crate) async fn run_check(
 /// The last update check's result as it applies now, or nothing before the
 /// first check. For a webview that was not listening when the scheduler's
 /// result was emitted: one still starting up, or one reloaded since.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub fn get_last_update_check_result(
     service: State<'_, UpdaterService>,
 ) -> Option<SecureUpdateCheckResult> {
@@ -2815,7 +2867,7 @@ pub(crate) async fn install_prepared_update(
     install_locked(app, &mut pending, &config.public_key, reason).await
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn secure_updater_install(
     app: AppHandle,
     service: State<'_, UpdaterService>,
@@ -2881,7 +2933,7 @@ pub async fn secure_updater_install(
 /// The only thing a rewritten one buys is keeping an offer alive that every other
 /// check here already has to pass, or discarding it early, which the attacker
 /// could do by deleting the file anyway.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn secure_updater_handoff_status(
     app: AppHandle,
     service: State<'_, UpdaterService>,
@@ -3022,7 +3074,7 @@ pub async fn secure_updater_handoff_status(
 /// Deliberately interactive: no silent or passive flags. The first attempt was
 /// the invisible one, and if something is going to refuse this binary the user
 /// should be able to see it happen and answer whatever prompt appears.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn secure_updater_run_saved_installer(
     app: AppHandle,
     service: State<'_, UpdaterService>,
@@ -3265,7 +3317,7 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         }
     }
 
-    fn appimage_platforms(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, SignedPlatform> {
+    fn linux_platforms(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, SignedPlatform> {
         entries
             .iter()
             .map(|(target, min_glibc)| {
@@ -3283,59 +3335,129 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
 
     #[test]
     fn an_appimage_updates_only_from_an_entry_its_glibc_can_run() {
-        let legacy_only = appimage_platforms(&[("linux-x86_64-appimage", None)]);
+        let choose = |platforms: &BTreeMap<String, SignedPlatform>, arch: &str, host: Option<(u32, u32)>| {
+            choose_glibc_target(platforms, arch, LinuxPackage::AppImage, host)
+        };
+        let legacy_only = linux_platforms(&[("linux-x86_64-appimage", None)]);
         assert_eq!(
-            choose_appimage_target(&legacy_only, "x86_64", Some((2, 35))),
-            AppImageTarget::Use("linux-x86_64-appimage".into()),
-            "today's manifests: the plain entry, as before"
+            choose(&legacy_only, "x86_64", Some((2, 35))),
+            GlibcTarget::Use("linux-x86_64-appimage".into()),
+            "manifests through 1.7.8: the plain entry, as before"
         );
         assert_eq!(
-            choose_appimage_target(&legacy_only, "x86_64", None),
-            AppImageTarget::Use("linux-x86_64-appimage".into()),
+            choose(&legacy_only, "x86_64", None),
+            GlibcTarget::Use("linux-x86_64-appimage".into()),
             "a plain entry states nothing, so an unknown glibc takes it"
         );
 
-        let both = appimage_platforms(&[
+        let both = linux_platforms(&[
             ("linux-x86_64-appimage-glibc", Some("2.39")),
             ("linux-x86_64-appimage", None),
         ]);
         assert_eq!(
-            choose_appimage_target(&both, "x86_64", Some((2, 41))),
-            AppImageTarget::Use("linux-x86_64-appimage-glibc".into()),
+            choose(&both, "x86_64", Some((2, 41))),
+            GlibcTarget::Use("linux-x86_64-appimage-glibc".into()),
             "a newer system takes the newer build"
         );
         assert_eq!(
-            choose_appimage_target(&both, "x86_64", Some((2, 35))),
-            AppImageTarget::Use("linux-x86_64-appimage".into()),
+            choose(&both, "x86_64", Some((2, 35))),
+            GlibcTarget::Use("linux-x86_64-appimage".into()),
             "an older one keeps the build it can run"
         );
 
-        let gated_only = appimage_platforms(&[
+        let gated_only = linux_platforms(&[
             ("linux-x86_64-appimage-glibc", Some("2.39")),
             ("linux-x86_64-deb", None),
         ]);
         assert_eq!(
-            choose_appimage_target(&gated_only, "x86_64", Some((2, 39))),
-            AppImageTarget::Use("linux-x86_64-appimage-glibc".into())
+            choose(&gated_only, "x86_64", Some((2, 39))),
+            GlibcTarget::Use("linux-x86_64-appimage-glibc".into()),
+            "manifests from 1.8.0"
         );
         assert_eq!(
-            choose_appimage_target(&gated_only, "x86_64", Some((2, 35))),
-            AppImageTarget::TooOld("2.39".into()),
+            choose(&gated_only, "x86_64", Some((2, 35))),
+            GlibcTarget::TooOld("2.39".into()),
             "never handed a build that cannot start"
         );
         assert_eq!(
-            choose_appimage_target(&gated_only, "x86_64", None),
-            AppImageTarget::TooOld("2.39".into()),
+            choose(&gated_only, "x86_64", None),
+            GlibcTarget::TooOld("2.39".into()),
             "an unknown glibc meets no stated requirement"
         );
         assert_eq!(
-            choose_appimage_target(&gated_only, "aarch64", Some((2, 41))),
-            AppImageTarget::Default,
+            choose(&gated_only, "aarch64", Some((2, 41))),
+            GlibcTarget::Default,
             "another architecture's entries are not ours"
         );
         assert_eq!(
-            choose_appimage_target(&appimage_platforms(&[("linux-x86_64-deb", None)]), "x86_64", Some((2, 41))),
-            AppImageTarget::Default
+            choose(&linux_platforms(&[("linux-x86_64-deb", None)]), "x86_64", Some((2, 41))),
+            GlibcTarget::Default,
+            "a .deb's entry is not an AppImage's"
+        );
+    }
+
+    #[test]
+    fn a_deb_updates_only_from_an_entry_its_glibc_can_run() {
+        let choose = |platforms: &BTreeMap<String, SignedPlatform>, host: Option<(u32, u32)>| {
+            choose_glibc_target(platforms, "x86_64", LinuxPackage::Deb, host)
+        };
+        let from_1_8 = linux_platforms(&[
+            ("linux-x86_64-appimage-glibc", Some("2.39")),
+            ("linux-x86_64-deb", None),
+        ]);
+        assert_eq!(
+            choose(&from_1_8, Some((2, 35))),
+            GlibcTarget::Use("linux-x86_64-deb".into()),
+            "the plain entry, which every .deb before 1.8.0 reads too; the AppImage's floor is not the .deb's"
+        );
+
+        let both = linux_platforms(&[
+            ("linux-x86_64-deb-glibc", Some("2.39")),
+            ("linux-x86_64-deb", None),
+        ]);
+        assert_eq!(
+            choose(&both, Some((2, 39))),
+            GlibcTarget::Use("linux-x86_64-deb-glibc".into()),
+            "a newer system takes the newer build"
+        );
+        assert_eq!(
+            choose(&both, Some((2, 35))),
+            GlibcTarget::Use("linux-x86_64-deb".into()),
+            "an older one keeps the build it can run"
+        );
+
+        let gated_only = linux_platforms(&[("linux-x86_64-deb-glibc", Some("2.39"))]);
+        assert_eq!(
+            choose(&gated_only, Some((2, 35))),
+            GlibcTarget::TooOld("2.39".into()),
+            "never handed a package that installs and cannot start"
+        );
+        assert_eq!(choose(&gated_only, None), GlibcTarget::TooOld("2.39".into()));
+        assert_eq!(
+            choose(&linux_platforms(&[("linux-x86_64-appimage-glibc", Some("2.39"))]), Some((2, 41))),
+            GlibcTarget::Default,
+            "an AppImage's entry is not a .deb's"
+        );
+    }
+
+    #[test]
+    fn a_system_too_old_says_which_package_it_cannot_run() {
+        let too_old = SystemTooOld {
+            version: "9.9.9".into(),
+            glibc: "2.39".into(),
+            package: LinuxPackage::Deb,
+        };
+        assert_eq!(
+            serde_json::to_value(&too_old).unwrap(),
+            serde_json::json!({ "version": "9.9.9", "glibc": "2.39", "package": "deb" })
+        );
+        assert_eq!(
+            serde_json::to_value(LinuxPackage::AppImage).unwrap(),
+            serde_json::json!("appimage")
+        );
+        assert_eq!(
+            UpdaterSystemTooOld(too_old).to_string(),
+            "Ember 9.9.9 needs glibc 2.39 or newer to run as a .deb"
         );
     }
 
@@ -3386,6 +3508,8 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
         assert!(validate_manifest(manifest(entry("linux-x86_64-appimage", None)), key).is_ok());
         assert!(validate_manifest(manifest(entry("linux-x86_64-appimage-glibc", None)), key).is_err());
         assert!(validate_manifest(manifest(entry("linux-x86_64-appimage", Some("latest"))), key).is_err());
+        assert!(validate_manifest(manifest(entry("linux-x86_64-deb-glibc", Some("2.39"))), key).is_ok());
+        assert!(validate_manifest(manifest(entry("linux-x86_64-deb-glibc", None)), key).is_err());
     }
 
     #[test]

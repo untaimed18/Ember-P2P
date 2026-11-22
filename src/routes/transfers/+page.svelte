@@ -15,7 +15,7 @@
   import { removeToast, setToastMessage, toastsFor } from '$lib/stores/toast';
   const { addActionToast, toastError, toastSuccess, toastWarning } = toastsFor('downloads');
   import { holdPendingCancel, releasePendingCancel } from '$lib/stores/pendingCancels';
-  import { completedFirst as completedFirstPref } from '$lib/stores/transfersView';
+  import { completedFirst as completedFirstPref, revealDownloadRequested } from '$lib/stores/transfersView';
   import { finishAction, setFinishAction, type FinishAction } from '$lib/stores/finishAction';
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
   import {
@@ -28,6 +28,8 @@
   import { distinctLinks, findSources, parseEd2kLinks, formatEd2kLink, formatEd2kLinks } from '$lib/api/search';
   import { startRelatedSearch } from '$lib/relatedSearch';
   import { previewFile } from '$lib/api/preview';
+  import { isServer } from '$lib/runtime';
+  import { saveToThisComputer } from '$lib/runtime/web/files';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { beginFriendsListFetch, commitFriendsList } from '$lib/stores/friends';
   import { banPeer, getBannedPeers, unbanPeer } from '$lib/api/kad';
@@ -786,7 +788,9 @@
     }
   }
 
-  function sourceStatusLabel(s: SourceInfo): string {
+  /** `paused`: the download is paused, which marks every known source failed. */
+  function sourceStatusLabel(s: SourceInfo, paused = false): string {
+    if (paused && s.status === 'failed') return m.transfer_status_paused();
     switch (s.status) {
       case 'connecting': return m.transfers_src_connecting();
       case 'wait_callback': return m.transfers_src_wait_callback();
@@ -2635,9 +2639,16 @@
 
   /** Double-click or Enter on a row: a finished download opens its file, a
    *  running one shows its sources. */
+  /** A finished download's file: opened on the desktop; on emberd, which runs
+   *  on another computer, saved to the one this browser is on. */
+  async function openFinished(t: Transfer) {
+    if (!isServer) return openFile(t.id);
+    if (t.completed_path) return saveToThisComputer(t.completed_path);
+  }
+
   function activateDownloadRow(t: Transfer) {
     if (t.status === 'completed') {
-      void openFile(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); });
+      void openFinished(t).catch((e: unknown) => { transferError = toErrorMsg(e); });
     } else if (!isFinished(t)) {
       void toggleSourceDetail(t);
     }
@@ -2873,7 +2884,7 @@
           });
         }
         const connected = $networkStats.status === 'connected' || $networkStats.status === 'connecting';
-        return connected ? m.transfers_dl_status_searching() : m.transfers_dl_status_waiting();
+        return connected ? m.transfers_dl_status_searching() : m.transfers_dl_status_no_network();
       }
       case 'queued':
         if (t.sources === 0) return m.transfers_dl_status_searching();
@@ -3735,7 +3746,7 @@
           return;
         }
         case 'remove': discardWithUndo([], targets.filter(isFinished).map((x) => x.id)); break;
-        case 'open': await openFile(t.id); break;
+        case 'open': await openFinished(t); break;
         case 'open_location': await openTransferFileLocation(t.id); break;
         case 'rename': openRename(t); return;
         case 'add_mirror': openAddMirror(t); return;
@@ -4040,6 +4051,31 @@
     if (!addLinksOpen) addLinksText = null;
   });
 
+  // "Show in Transfers" from another page: select the download and scroll to
+  // it, clearing a filter or category that would hide it. Waits for the list
+  // to load; a download gone by then is let go of.
+  $effect(() => {
+    const id = $revealDownloadRequested;
+    if (id === null) return;
+    const row = allDownloads.find((t) => t.id === id);
+    if (!row) {
+      if ($transfersLoaded) revealDownloadRequested.set(null);
+      return;
+    }
+    revealDownloadRequested.set(null);
+    untrack(() => {
+      const shown = (t: Transfer) => t.id === id;
+      if (!filteredActiveDownloads.some(shown) && !filteredCompletedDownloads.some(shown)) {
+        transferFilter = '';
+        categoryFilter = '';
+      }
+      if (row.status === 'completed') completedCollapsed = false;
+      focusedDlId = id;
+      lastClickedDlId = id;
+    });
+    void tick().then(() => requestAnimationFrame(() => revealDownloadRow(id)));
+  });
+
   async function queueLinksFromDialog(text: string) {
     if (pasteLinkBusy) return;
     pasteLinkBusy = true;
@@ -4105,7 +4141,7 @@
     if (!selectedTransfer || selectedActionBusy) return;
     selectedActionBusy = true;
     try {
-      if (action === 'open' && selectedTransfer.status === 'completed') await openFile(selectedTransfer.id);
+      if (action === 'open' && selectedTransfer.status === 'completed') await openFinished(selectedTransfer);
       if (action === 'pause' && canPause(selectedTransfer)) await pauseTransfer(selectedTransfer.id);
       if (action === 'resume' && canResume(selectedTransfer)) await resumeTransfer(selectedTransfer.id);
       if (action === 'stop' && canStop(selectedTransfer)) await stopTransfer(selectedTransfer.id);
@@ -4646,12 +4682,15 @@
   function batchCancelMixedMessage(count: number, removed: number): string {
     return plural(count, {
       one: () => plural(removed, {
-        one: m.transfers_confirm_batch_cancel_mixed_one_one,
+        one: () => m.transfers_confirm_batch_cancel_mixed_one_one({ removed }),
+        oneShowsCount: true,
+        few: () => m.transfers_confirm_batch_cancel_mixed_one_few({ removed }),
         other: () => m.transfers_confirm_batch_cancel_mixed_one_other({ removed }),
       }),
       other: () => plural(removed, {
         one: () => m.transfers_confirm_batch_cancel_mixed_other_one({ count, removed }),
         oneShowsCount: true,
+        few: () => m.transfers_confirm_batch_cancel_mixed_other_few({ count, removed }),
         other: () => m.transfers_confirm_batch_cancel_mixed_other_other({ count, removed }),
       }),
     });
@@ -5975,6 +6014,7 @@
         {/if}
       </span>
       <div class="toolbar-actions">
+        {#if !isServer}
         <label
           class="finish-action"
           class:armed={finishChoice !== 'none'}
@@ -6005,6 +6045,7 @@
           </select>
         </label>
         <span class="toolbar-sep"></span>
+        {/if}
         <div class="tb-segmented" role="group" aria-label={m.transfers_toggle_cols_title()} title={m.transfers_toggle_cols_title()}>
           <button type="button" class="tb-btn" aria-pressed={!showAdvancedDlCols} onclick={() => { if (showAdvancedDlCols) toggleAdvancedDlCols(); }}>{m.transfers_toggle_compact()}</button>
           <button type="button" class="tb-btn" aria-pressed={showAdvancedDlCols} onclick={() => { if (!showAdvancedDlCols) toggleAdvancedDlCols(); }}>{m.transfers_toggle_full()}</button>
@@ -6246,7 +6287,8 @@
                       {#if waitingSlotCount > 0}<span class="ss-chip ss-connect">{m.transfers_chip_waiting_for_slot({ count: waitingSlotCount })}</span>{/if}
                       {#if partsBusyCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_parts_busy({ count: partsBusyCount })}</span>{/if}
                       {#if otherCount > 0}<span class="ss-chip ss-other">{m.transfers_chip_other({ count: otherCount })}</span>{/if}
-                      {#if failedCount > 0}<span class="ss-chip ss-failed">{m.transfers_chip_failed({ count: failedCount })}</span>{/if}
+                      {#if failedCount > 0 && transferPaused}<span class="ss-chip ss-other">{m.transfers_chip_paused({ count: failedCount })}</span>
+                      {:else if failedCount > 0}<span class="ss-chip ss-failed">{m.transfers_chip_failed({ count: failedCount })}</span>{/if}
                     </span>
                   </td>
                 </tr>
@@ -6254,7 +6296,7 @@
                   <tr class="source-child-row src-{src.status}" in:fade={{ duration: prefersReducedMotion.current ? 0 : 150 }}>
                     <td class="source-child-cell" colspan={dlColCount}>
                       <span class="source-fields">
-                        <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src)}></span>
+                        <span class="source-status-dot src-dot-{src.status}" title={sourceStatusLabel(src, transferPaused)}></span>
                         <span class="source-flag" title={src.country_code ?? ''}>{#if countryFlagSrc(src.country_code)}<img src={countryFlagSrc(src.country_code)} alt={src.country_code ?? ''} class="flag-img" />{/if}</span>
                         <span class="source-origin src-origin-{src.origin ?? 'unknown'}" title={sourceOriginTitle(src.origin)}>{sourceOriginLabel(src.origin)}</span>
                         <!-- No longer falls back to `client_software`: that is
@@ -6265,7 +6307,7 @@
                         <span class="source-software" title={src.client_software}><bdi dir="auto">{sourceClientLabel(src)}</bdi></span>
                         <span class="source-sep"></span>
                         <span class="source-addr" title="{src.ip}:{src.port}">{src.ip}:{src.port}</span>
-                        <span class="source-state src-st-{src.status}">{sourceStatusLabel(src)}</span>
+                        <span class="source-state src-st-{transferPaused && src.status === 'failed' ? 'paused' : src.status}">{sourceStatusLabel(src, transferPaused)}</span>
                         {#if src.available_parts != null && src.total_parts != null && src.total_parts > 0}
                           <span class="source-tag" title={m.transfers_parts_title()}>{m.transfers_parts({ have: src.available_parts, total: src.total_parts })}</span>
                         {/if}
@@ -6502,7 +6544,9 @@
           <span class="tb-btn-wrap" title={isFinished(selectedTransfer) ? m.transfers_action_cannot_find_sources() : undefined}>
             <button class="tb-btn" disabled={selectedActionBusy || isFinished(selectedTransfer)} onclick={() => runSelectedAction('sources')}>{m.transfers_find_sources()}</button>
           </span>
-          <button class="tb-btn" disabled={selectedActionBusy || !canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
+          {#if !isServer}
+            <button class="tb-btn" disabled={selectedActionBusy || !canPreview(selectedTransfer)} title={canPreview(selectedTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => runSelectedAction('preview')}>{m.transfers_preview()}</button>
+          {/if}
           {#if selectedTransfer}
             {@const copyOne = selectedTransfer}
             <button class="tb-btn" disabled={copyingAllDownloadLinks || !copyOne.file_hash?.trim()} onclick={() => void copyDownloadLinks([copyOne])} title={m.transfers_ctx_copy_link()}>{m.transfers_copy_link_btn()}</button>
@@ -6510,7 +6554,7 @@
           {#if isFinished(selectedTransfer)}
             {@const finishedId = selectedTransfer.id}
             {#if selectedTransfer.status === 'completed'}
-              <button class="tb-btn" disabled={selectedActionBusy} onclick={() => runSelectedAction('open')}>{m.transfers_ctx_open_file()}</button>
+              <button class="tb-btn" disabled={selectedActionBusy} onclick={() => runSelectedAction('open')}>{isServer ? m.server_save_to_computer() : m.transfers_ctx_open_file()}</button>
             {/if}
             <button class="tb-btn" onclick={() => discardWithUndo([], [finishedId])} title={m.transfers_batch_remove_title()}>
               {m.transfers_ctx_remove_from_list()}
@@ -7335,7 +7379,7 @@
                     {:else if column.key === 'parts'}
                       <td class="num-cell">{src.available_parts != null && src.total_parts ? `${src.available_parts}/${src.total_parts}` : '\u2014'}</td>
                     {:else if column.key === 'status'}
-                      <td class="src-st-{src.status}">{sourceStatusLabel(src)}</td>
+                      <td class="src-st-{clientPaused && src.status === 'failed' ? 'paused' : src.status}">{sourceStatusLabel(src, clientPaused)}</td>
                     {/if}
                   {/each}
                 </tr>
@@ -7563,7 +7607,9 @@
     <div class="ctx-sep" role="separator"></div>
     <button class="ctx-item" role="menuitem" disabled={copyingAllDownloadLinks || linkableVisibleDownloads.length === 0} onclick={() => { closePaneCtx(); void copyDownloadLinks(filteredActiveDownloads); }}>{m.transfers_copy_all_links()}</button>
     <button class="ctx-item" role="menuitem" disabled={pasteLinkBusy} onclick={() => { closePaneCtx(); void pasteLinksFromClipboard(); }}>{m.transfers_ctx_paste_link()}</button>
-    <button class="ctx-item" role="menuitem" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
+    {#if !isServer}
+      <button class="ctx-item" role="menuitem" onclick={() => { closePaneCtx(); void handleOpenDownloadsFolder(); }}>{m.transfers_open_downloads_folder()}</button>
+    {/if}
     <div class="ctx-sep" role="separator"></div>
     <button class="ctx-item" role="menuitem" disabled={clearCompletedTargets().length === 0} onclick={() => { closePaneCtx(); clearCompletedWithUndo(); }}>{m.transfers_clear_completed()}</button>
     <button class="ctx-item ctx-danger" role="menuitem" disabled={filteredActiveDownloads.length === 0} onclick={() => { closePaneCtx(); handleCancelAll(); }}>{m.transfers_cancel_all()}</button>
@@ -7697,7 +7743,9 @@
         <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openRename(t); }}>{m.transfers_ctx_rename()}</button>
       {/if}
       <div class="ctx-sep" role="separator"></div>
-      <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
+      {#if !isServer}
+        <button class="ctx-item" role="menuitem" disabled={!canPreview(ctxTransfer)} title={canPreview(ctxTransfer) ? undefined : m.transfers_preview_not_ready()} onclick={() => ctxAction('preview')}>{m.transfers_preview()}</button>
+      {/if}
       <button
         class="ctx-item"
         role="menuitemcheckbox"
@@ -7709,7 +7757,9 @@
           {recoveringIds.has(ctxTransfer.id) ? m.transfers_ctx_recovering() : m.transfers_ctx_recover_archive()}
         </button>
       {/if}
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      {#if !isServer}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
+      {/if}
       <div class="ctx-sep" role="separator"></div>
       <!-- `role="presentation"` on the wrapper, `role="menuitem"` on the button:
            a `role="menu"` may only own menuitems, so a plain div between the two
@@ -7781,10 +7831,16 @@
         <button class="ctx-item" role="menuitem" title={m.transfers_ctx_resume_failed_title()} onclick={() => ctxAction('resume')}>{m.common_resume()}</button>
         <div class="ctx-sep" role="separator"></div>
       {/if}
-      {#if ctxTransfer.status === 'completed' || ctxTransfer.status === 'failed'}
-        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
+      {#if isServer}
+        {#if ctxTransfer.status === 'completed' && ctxTransfer.completed_path}
+          <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.server_save_to_computer()}</button>
+        {/if}
+      {:else}
+        {#if ctxTransfer.status === 'completed' || ctxTransfer.status === 'failed'}
+          <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open')}>{m.transfers_ctx_open_file()}</button>
+        {/if}
+        <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       {/if}
-      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_location')}>{m.transfers_ctx_open_location()}</button>
       <div class="ctx-sep" role="separator"></div>
       <button class="ctx-item" role="menuitem" onclick={() => { const t = ctxTransfer!; closeCtx(); openFileDetails(t); }}>{m.transfers_ctx_file_details()}</button>
       {#if canRename(ctxTransfer)}
@@ -8169,11 +8225,13 @@
           disabled={copyingAllDownloadLinks || !t.file_hash?.trim()}
           onclick={() => void copyDownloadLinks([t])}
         >{m.transfers_ctx_copy_link()}</button>
-        <button
-          type="button"
-          class="ghost"
-          onclick={() => void openTransferFileLocation(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); })}
-        >{m.transfers_ctx_open_location()}</button>
+        {#if !isServer}
+          <button
+            type="button"
+            class="ghost"
+            onclick={() => void openTransferFileLocation(t.id).catch((e: unknown) => { transferError = toErrorMsg(e); })}
+          >{m.transfers_ctx_open_location()}</button>
+        {/if}
         <span class="dl-details-footer-spacer"></span>
         {#if canRename(t)}
           <button type="button" class="ghost" onclick={() => openRename(t)}>{m.transfers_ctx_rename()}</button>

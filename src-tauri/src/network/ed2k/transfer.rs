@@ -954,23 +954,6 @@ pub enum DownloadEvent {
         peer_port: u16,
         verified: bool,
     },
-    /// An Ember friend was seen on a download connection (EmuleInfo exchange completed).
-    FriendSeen {
-        ember_hash: [u8; 16],
-        ip: std::net::IpAddr,
-        port: u16,
-    },
-    /// Legacy parser-only chat event. Generic download chat is dropped.
-    #[allow(dead_code)]
-    EmberChatMessage {
-        ember_hash: [u8; 16],
-        message: String,
-    },
-    /// Incoming Ember browse response from a friend on a download connection.
-    EmberBrowseResponse {
-        ember_hash: [u8; 16],
-        entries: Vec<(String, u64, String, Option<String>, Option<String>)>,
-    },
     /// The .part file has been created on disk, signalling the network loop to
     /// offer this partial to the server and publish to KAD so other peers can
     /// discover us as a source.
@@ -1129,6 +1112,15 @@ pub(crate) const DOWNLOAD_FOLDER_STAGE: &str = "stage:download_folder";
 
 pub(crate) fn is_download_folder_error(error: &str) -> bool {
     error.contains(DOWNLOAD_FOLDER_STAGE)
+}
+
+/// Windows refused because another program has the file or folder open in a
+/// way that excludes this use (ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION):
+/// a player or antivirus holding a `.part`, say. It passes, and is no
+/// permission the user has to fix. Matched by number, as the message is in
+/// the system's language; on Linux the same numbers are EPIPE and EDOM.
+fn is_sharing_violation(lower: &str) -> bool {
+    cfg!(windows) && (lower.contains("(os error 32)") || lower.contains("(os error 33)"))
 }
 
 pub(crate) fn download_folder_error(
@@ -1520,6 +1512,8 @@ transfer_failure_codes! {
     NetworkChannelUnavailable => "network_channel_unavailable", "Network channel unavailable";
     DownloadFolderUnavailable => "download_folder_unavailable",
         "The download folder cannot be written; check it in Settings";
+    DownloadFolderBusy => "download_folder_busy",
+        "Another program is using the download folder; Ember tries again by itself";
     PartFolderOffline => "part_folder_offline",
         "The drive holding this download's progress is not connected; Resume starts it over";
     PartFilesRemoved => "part_files_removed",
@@ -1555,6 +1549,9 @@ pub(crate) fn classify_failure(error: &str, kind: &SourceFailureKind) -> Transfe
         // not a folder the user has to fix in Settings.
         if matches!(kind, SourceFailureKind::InsufficientDisk) || is_disk_full_error(error) {
             return TransferFailureCode::InsufficientDisk;
+        }
+        if is_sharing_violation(&lower) {
+            return TransferFailureCode::DownloadFolderBusy;
         }
         return TransferFailureCode::DownloadFolderUnavailable;
     }
@@ -1850,6 +1847,11 @@ mod tests {
                 C::InsufficientDisk,
             ),
             (
+                "stage:download_folder: preparing Temp and Downloads in /x: in use (os error 32)",
+                Transient,
+                if cfg!(windows) { C::DownloadFolderBusy } else { C::DownloadFolderUnavailable },
+            ),
+            (
                 "stage:download_folder: stage:part_folder_offline: /x cannot be reached",
                 Transient,
                 C::PartFolderOffline,
@@ -1886,11 +1888,15 @@ mod tests {
             C::NetworkChannelUnavailable,
             C::PartFilesRemoved,
         ];
+        // Windows alone raises sharing violations.
+        let windows_only = [C::DownloadFolderBusy];
         let produced: std::collections::HashSet<_> =
             cases.iter().map(|(_, _, code)| *code).collect();
         for failure in TransferFailureCode::ALL {
             assert!(
-                produced.contains(failure) || assigned_elsewhere.contains(failure),
+                produced.contains(failure)
+                    || assigned_elsewhere.contains(failure)
+                    || (!cfg!(windows) && windows_only.contains(failure)),
                 "{failure:?} has no producer"
             );
         }
@@ -2175,6 +2181,49 @@ mod tests {
         let failure = classify_failure("peer does not have the file", &kind);
         assert_eq!(failure, TransferFailureCode::RemoteMissingFile);
         assert_eq!(failure.message(), "Remote missing file");
+    }
+
+    /// Another program holding the folder or a `.part` open is not a folder
+    /// the user can fix in Settings (issue 179). The message is in the
+    /// system's language; the number is not.
+    #[test]
+    fn a_file_in_use_is_not_reported_as_a_folder_that_cannot_be_written() {
+        let expected = if cfg!(windows) {
+            TransferFailureCode::DownloadFolderBusy
+        } else {
+            TransferFailureCode::DownloadFolderUnavailable
+        };
+        for os_error in [
+            "The process cannot access the file because it is being used by another process. (os error 32)",
+            "Il file è utilizzato da un altro processo. (os error 32)",
+            "The process cannot access the file because another process has locked a portion of the file. (os error 33)",
+        ] {
+            let raw = download_folder_error(
+                "preparing Temp and Downloads",
+                std::path::Path::new(r"C:\Users\someone\Downloads\Ember"),
+                os_error,
+            )
+            .to_string();
+            let kind = classify_error(&raw);
+            assert_eq!(kind, SourceFailureKind::Transient, "it still re-queues");
+            assert_eq!(classify_failure(&raw, &kind), expected, "{os_error}");
+        }
+        let denied = download_folder_error(
+            "preparing Temp and Downloads",
+            std::path::Path::new(r"C:\Ember"),
+            "Access is denied. (os error 5)",
+        )
+        .to_string();
+        assert_eq!(
+            classify_failure(&denied, &classify_error(&denied)),
+            TransferFailureCode::DownloadFolderUnavailable
+        );
+        let not_a_share = download_folder_error("opening the part file", std::path::Path::new("/x"), "(os error 320)")
+            .to_string();
+        assert_eq!(
+            classify_failure(&not_a_share, &classify_error(&not_a_share)),
+            TransferFailureCode::DownloadFolderUnavailable
+        );
     }
 
     /// The raw error names a path and an OS error, and the path must not reach

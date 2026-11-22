@@ -1,23 +1,72 @@
 [package]
 name = "ember"
-version = "1.7.8"
+version = "1.8.0"
 description = "A decentralized P2P file sharing application"
 authors = ["untaimed18"]
 license = "GPL-3.0-only"
 edition = "2021"
+default-run = "ember"
 # `str::floor_char_boundary` (used in the ed2k collection parser and the
 # comment store) was stabilized in Rust 1.91. `rusqlite` 0.40's bundled
 # `libsqlite3-sys` additionally needs `cfg_select` (stable in 1.94+).
 rust-version = "1.94"
 
+[workspace]
+members = ["macros"]
+
 [lib]
 name = "ember_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "ember"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "emberd"
+path = "src/bin/emberd.rs"
+required-features = ["server"]
+
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [features]
+default = ["desktop"]
+# The desktop app: Tauri's window, tray, dialogs, notifications and updater.
+desktop = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-single-instance",
+    "dep:tauri-plugin-deep-link",
+    "dep:tauri-plugin-process",
+    "dep:tauri-plugin-notification",
+    "dep:tauri-plugin-updater",
+    "dep:auto-launch",
+    "dep:arboard",
+    "dep:opener",
+    "dep:rfd",
+    "dep:zbus",
+]
+# emberd: the same Ember with no window, driven over HTTP (docs/headless.md).
+# Built with `--no-default-features --features server`.
+server = [
+    "dep:axum",
+    "dep:hyper",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:toml",
+    "dep:tokio-rustls",
+    "dep:rustls-pki-types",
+    "dep:subtle",
+    "hyper-util/http1",
+    "hyper-util/server",
+    "hyper-util/server-auto",
+    "hyper-util/service",
+    "hyper-util/tokio",
+    "dep:libdbus-sys",
+]
 # Local multi-node harness build. Enables Tauri's runtime devtools so the
 # webview console (Ctrl+Shift+I) is available in a build that would not
 # otherwise have it.
@@ -28,15 +77,26 @@ tauri-build = { version = "2", features = [] }
 # nothing to invoke from them. Gating them on this feature instead was
 # considered and rejected: a release build that carries peer-dialing IPC is
 # exactly what the gate is for, and a feature flag is too easy to turn on.
-harness = ["tauri/devtools"]
+harness = ["desktop", "tauri/devtools"]
 
 [dependencies]
+ember-macros = { path = "macros" }
+# emberd's web interface, `server` feature only: the HTTP and WebSocket
+# routes, the files of the web UI, its config file and its TLS.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"], optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+tower-http = { version = "0.6", default-features = false, features = ["fs"], optional = true }
+toml = { version = "0.8", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
+subtle = { version = "2", optional = true }
 # `tray-icon` enables the `tauri::tray` and `tauri::menu` APIs we use to
 # render the "Ember is still running in the system tray" icon when the
 # user closes the window with the close-to-tray behavior selected.
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon"], optional = true }
 
-tauri-plugin-dialog = "2"
+tauri-plugin-dialog = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -74,23 +134,23 @@ url = "2"
 igd-next = { version = "0.17", features = ["aio_tokio"] }
 socket2 = "0.6"
 tracing-appender = "0.2"
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = { version = "2", optional = true }
 # Registers the `ed2k://` URI scheme with the OS so browser/forum links
 # launch (or focus) Ember. Combined with single-instance, a link clicked
 # while Ember is already running is delivered to the existing instance as
 # a command-line argument rather than spawning a second copy.
-tauri-plugin-deep-link = "2"
+tauri-plugin-deep-link = { version = "2", optional = true }
 
-tauri-plugin-process = "2"
+tauri-plugin-process = { version = "2", optional = true }
 # Desktop notifications for the events that happen while nobody is looking at
 # the window: a download finishing, a friend coming online, a chat message.
 # Only ever reached through our own `show_notification` command — the plugin's
 # JS API is not exposed to the webview, so the text is composed (and localized)
 # in the frontend and the OS call is made here.
-tauri-plugin-notification = "2"
+tauri-plugin-notification = { version = "2", optional = true }
 # Launch at sign-in, driven by the `launch_at_login` setting. Used directly
 # rather than through `tauri-plugin-autostart`; see `login_launch.rs`.
-auto-launch = "0.6"
+auto-launch = { version = "0.6", optional = true }
 # Clipboard access for the copy/paste affordances (eD2K links, Ember IDs,
 # channel invites). The webview's own `navigator.clipboard` is not a
 # substitute — WebKitGTK, the Linux webview, refuses programmatic reads
@@ -110,14 +170,14 @@ auto-launch = "0.6"
 # `wayland-data-control` is kept: without it the Linux backend is X11 only, so
 # a Wayland session with no XWayland — a plausible AppImage host, and the very
 # platform this was reported on — would be right back to having no clipboard.
-arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"], optional = true }
 # In-app auto-update: fetches the signed `latest.json` manifest from
 # GitHub Releases, verifies the bundle against the minisign `pubkey` in
 # tauri.conf.json, downloads, and relaunches via tauri-plugin-process.
-tauri-plugin-updater = "2"
+tauri-plugin-updater = { version = "2", optional = true }
 rsa = "0.9"
 num-bigint-dig = "0.8"
-opener = "0.9"
+opener = { version = "0.9", optional = true }
 crc32fast = "1"
 zeroize = { version = "1", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
@@ -151,11 +211,12 @@ parking_lot = "0.12"
 # EventKind, and Linux inotify OPEN/ATTRIB from our own directory walk would
 # otherwise look like a user change and rescan in a loop.
 notify = "8"
-# Used by the AntiLeech filter to compile the user-editable pattern list
-# into matchable regex automata. `default-features = false` strips the
-# Unicode tables we don't need (we match ASCII-only client-software
-# strings) — saves ~250 KiB binary and ~50 ms startup compile time.
-regex = { version = "1", default-features = false, features = ["std", "perf"] }
+# The AntiLeech filter's user-editable patterns, related search's title rules
+# and the log's privacy filter. `unicode` is named rather than inherited: the
+# patterns use `(?i)`, `\d`, `\s` and `\b`, which fail to compile without
+# its tables, and the desktop build only had them because Tauri's own
+# dependencies turn them on. emberd has no Tauri.
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 lofty = "0.25"
 # Friend-chat E2E encryption (`network::ember::crypto`): converts our
 # existing Ed25519 identity keys to X25519 for ECDH, then HKDF-stretches
@@ -186,17 +247,21 @@ libc = "0.2"
 # Linux, where its GTK dialog would wait on the main context the event loop
 # already holds.
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"] }
+rfd = { version = "0.16", default-features = false, features = ["common-controls-v6"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
+# emberd builds the keyring's libdbus in rather than linking it: a server or a
+# slim container often has none, and emberd reaches the keyring only to open
+# what the desktop app sealed, so it needs nothing beyond glibc to start.
+libdbus-sys = { version = "0.2", features = ["vendored"], optional = true }
 # D-Bus for the sleep inhibitor (`src/power.rs`) and the tray-host probe
 # (`src/tray.rs`). The same crate and major version `notify-rust` already
 # links for desktop notifications, so this adds no second D-Bus stack.
-zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

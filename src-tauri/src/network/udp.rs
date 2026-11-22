@@ -305,7 +305,7 @@ pub(super) async fn handle_udp_packet(
     data: &[u8],
     from: SocketAddr,
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
     db: &Arc<Database>,
@@ -371,7 +371,7 @@ pub(super) async fn handle_udp_packet_inner(
     data: &[u8],
     from: SocketAddr,
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
     db: &Arc<Database>,
@@ -982,17 +982,7 @@ pub(super) async fn handle_udp_packet_inner(
 
     // Everything above serves eD2K *peer* UDP — port test, queue reasks and
     // their acks, buddy reask relay — none of which involves KAD. Everything
-    // below is KAD's, and an unsolicited KAD packet must not be parsed or folded
-    // into the routing table while KAD is disconnected, so the gate belongs here
-    // rather than around the whole handler. It used to sit at the call site,
-    // which meant a session with KAD disconnected — eD2K-only, but still
-    // transferring — discarded every inbound peer datagram while still sending
-    // reasks, so queue ranks never updated, peers queued on us never got an
-    // ack, and the UDP port test always failed.
-    if state.stats.status == NetworkStatus::Disconnected {
-        debug!("Dropping KAD UDP packet from {from}: KAD is not connected");
-        return;
-    }
+    // below is KAD's.
 
     // Canonicalize IPv6-mapped-IPv4 addresses so all downstream handlers see IpAddr::V4
     let from = match from.ip() {
@@ -2271,6 +2261,9 @@ pub(super) async fn handle_udp_packet_inner(
             });
             if let Some((key, publish_file_hash, is_source_publish)) = matched_pending {
                 state.publish_confirmed += 1;
+                state
+                    .publish_last_ack
+                    .insert((publish_file_hash, is_source_publish), chrono::Utc::now().timestamp());
                 debug!(
                     "Publish confirmed for {target} from {from} (orig_key={:?}, load={load}, total_confirmed={})",
                     key, state.publish_confirmed
@@ -2938,7 +2931,7 @@ pub(super) async fn handle_udp_packet_inner(
                     let _permit = permit;
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        tokio::net::TcpStream::connect(tcp_addr),
+                        crate::net_bind::tcp_connect(tcp_addr),
                     )
                     .await;
                     match result {
@@ -3105,7 +3098,7 @@ pub(super) async fn handle_udp_packet_inner(
                     let _permit = permit;
                     let connect_result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
-                        tokio::net::TcpStream::connect(tcp_addr),
+                        crate::net_bind::tcp_connect(tcp_addr),
                     )
                     .await;
                     match connect_result {
@@ -3138,7 +3131,7 @@ pub(super) async fn handle_udp_packet_inner(
                                         drop(reader);
                                         match tokio::time::timeout(
                                             std::time::Duration::from_secs(5),
-                                            tokio::net::TcpStream::connect(tcp_addr),
+                                            crate::net_bind::tcp_connect(tcp_addr),
                                         )
                                         .await
                                         {

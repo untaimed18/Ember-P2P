@@ -280,8 +280,52 @@ export async function undoMarkSpam(fileHash: string, prior: PriorSpamVerdict): P
   return invoke('undo_mark_spam', { fileHash, prior });
 }
 
+/** Take back a spam mark, with what it taught, however long ago it was made. */
+export async function unmarkSpam(fileHash: string): Promise<void> {
+  return invoke('unmark_spam', { fileHash });
+}
+
+/** Stop trusting a file marked not spam, or a finished download. */
+export async function forgetNotSpam(fileHash: string): Promise<void> {
+  return invoke('forget_not_spam', { fileHash });
+}
+
 export async function getSpamStats(): Promise<SpamStats> {
   return invoke('get_spam_stats');
+}
+
+/** One of the learned lists `SpamStats` counts. */
+export type LearnedSpamList = 'spam' | 'not_spam' | 'names' | 'source_ips';
+
+export interface LearnedSpamEntry {
+  /** The file's eD2K hash, for the file lists. */
+  hash: string | null;
+  /** A file's name, a learned name, or an address; empty for a file whose
+   *  name is not known. */
+  text: string;
+  /** A file's size, when it is known. */
+  size: number | null;
+  /** A not-spam file trusted because it finished downloading, not marked. */
+  downloaded: boolean;
+}
+
+export interface LearnedSpamPage {
+  entries: LearnedSpamEntry[];
+  /** How many entries match the query. */
+  matched: number;
+  /** How many entries the list holds. */
+  total: number;
+}
+
+/** Entries of `list` whose name, address or hash holds `query`, newest
+ *  first, `limit` (at most 500) from `offset`. */
+export async function getLearnedSpam(
+  list: LearnedSpamList,
+  query: string,
+  offset: number,
+  limit: number,
+): Promise<LearnedSpamPage> {
+  return invoke('get_learned_spam', { list, query, offset, limit });
 }
 
 export async function explainSpamResult(
@@ -350,4 +394,34 @@ export async function clearDownloadHistory(status: string): Promise<void> {
  */
 export async function removeDownloadHistoryEntry(fileHash: string): Promise<void> {
   return invoke('remove_download_history_entry', { fileHash });
+}
+
+/** Which of the download history `getDownloadHistoryEntries` lists. */
+export type DownloadHistoryStatus = 'all' | 'completed' | 'cancelled';
+
+export interface DownloadHistoryEntry {
+  file_hash: string;
+  /** Empty for a file whose name was not known. */
+  file_name: string;
+  file_size: number;
+  status: 'completed' | 'cancelled';
+  /** When it was last recorded, in Unix seconds. */
+  timestamp: number;
+}
+
+export interface DownloadHistoryPage {
+  entries: DownloadHistoryEntry[];
+  /** How many entries match the status and the query. */
+  matched: number;
+}
+
+/** History entries of `status` whose name or hash holds `query`, newest
+ *  first, `limit` (at most 500) from `offset`. */
+export async function getDownloadHistoryEntries(
+  status: DownloadHistoryStatus,
+  query: string,
+  offset: number,
+  limit: number,
+): Promise<DownloadHistoryPage> {
+  return invoke('get_download_history_entries', { status, query, offset, limit });
 }

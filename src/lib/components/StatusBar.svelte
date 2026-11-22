@@ -238,12 +238,15 @@
     const s = stats.epx_sources_received;
     return plural(p, {
       one: () => plural(s, {
-        one: m.statusbar_epx_title_active_one_one,
+        one: () => m.statusbar_epx_title_active_one_one({ sources: s }),
+        oneShowsCount: true,
+        few: () => m.statusbar_epx_title_active_one_few({ sources: s }),
         other: () => m.statusbar_epx_title_active_one_other({ sources: s }),
       }),
       other: () => plural(s, {
         one: () => m.statusbar_epx_title_active_other_one({ peers: p, sources: s }),
         oneShowsCount: true,
+        few: () => m.statusbar_epx_title_active_other_few({ peers: p, sources: s }),
         other: () => m.statusbar_epx_title_active_other_other({ peers: p, sources: s }),
       }),
     });

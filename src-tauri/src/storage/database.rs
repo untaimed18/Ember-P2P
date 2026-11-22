@@ -16,15 +16,21 @@ use crate::storage::paths;
 use crate::types::*;
 
 mod feeds;
+mod room_deletion;
 mod room_dm;
+mod room_library;
 pub use feeds::{
     DeletedFeed, DiscoveredFeed, DueListing, ElsewhereCopy, FeedItem, FollowedFeed, FollowedItem, OwnFeed,
     OwnPublish, TakenHead,
 };
-pub use room_dm::{DmIncoming, DmMessage, DmThread};
+pub use room_dm::{DmIncoming, DmMessage, DmThread, DM_STATE_REQUEST};
 
 const MAX_PEERS_ROWS: i64 = 10_000;
 const MAX_DOWNLOAD_HISTORY_ROWS: i64 = 5_000;
+/// Finished downloads kept in `transfers` from one start to the next: those
+/// that finished last, the only ones a crash can have cut short. As many as
+/// the list keeps finished rows (`sharing::manager::MAX_FINISHED_ROWS`).
+const FINISHED_TRANSFER_ROWS_KEPT: i64 = 1_000;
 /// Rooms kept in the Discover cache. Far more than a browse can usefully show,
 /// and small enough that the table stays a rounding error on disk.
 const MAX_CHANNEL_CACHE_ROWS: i64 = 500;
@@ -97,6 +103,7 @@ fn persisted_failure_code(code: &str) -> Option<TransferFailureCode> {
         F::TransientFailure,
         F::NetworkChannelUnavailable,
         F::DownloadFolderUnavailable,
+        F::DownloadFolderBusy,
         F::PartFolderOffline,
         F::PartFilesRemoved,
         F::EmberPinCorrupt,
@@ -459,9 +466,6 @@ pub type CreditRowRef<'a> = (
 /// One `credit_key_links` row: user hash, the Ember node id its key-link
 /// proof named, and the SecIdent key the user hash was proven under then.
 pub type CreditKeyLink = ([u8; 16], [u8; 16], Vec<u8>);
-
-/// Borrowed `ember_credits` row, in `load_ember_credits` column order.
-pub type EmberCreditRowRef<'a> = (&'a [u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool);
 
 /// One public room remembered from an earlier Discover walk.
 ///
@@ -1054,14 +1058,15 @@ impl OpenFailure {
             ),
             Self::Other => format!(
                 "Ember could not open its database.\n\n{error:#}\n\n\
-                 The log files in the logs folder of {data_dir} have the details."
+                 Restart your computer and try again. If it still fails, report the \
+                 problem and include the log files from the logs folder in {data_dir}."
             ),
         }
     }
 }
 
 impl Database {
-    pub fn new(app_handle: &tauri::AppHandle) -> anyhow::Result<Self> {
+    pub fn new(app_handle: &crate::host::AppHandle) -> anyhow::Result<Self> {
         let app_dir =
             paths::ensure_data_dir_with_app(app_handle).context("Failed to prepare data dir")?;
 
@@ -1252,6 +1257,21 @@ impl Database {
             }
             Self::shape_channel_settings_locked(&conn)?;
             Self::shape_channel_messages_v2_locked(&conn)?;
+            // Members 1.7.x saw read sealed offers, kept only to decide whether
+            // to hold a plain one. Not a numbered migration: 1.7.x makes the
+            // table again on first use after a downgrade, so the name is never
+            // to be reused. Only tidying, so a failure leaves it for next time.
+            if let Err(e) = conn.execute_batch("DROP TABLE IF EXISTS sealed_offer_readers;") {
+                warn!("Could not drop the retired sealed_offer_readers table: {e}");
+            }
+            // The Ember credit ledger, retired in 1.8.0: nothing read it. The
+            // table stays, since 1.7.x saves its credits through it, but its
+            // rows (peers' keys and what we uploaded to each) go.
+            if let Err(e) = conn.execute_batch(
+                "DELETE FROM ember_credits WHERE EXISTS (SELECT 1 FROM ember_credits);",
+            ) {
+                warn!("Could not empty the retired ember_credits table: {e}");
+            }
         }
 
         info!("Database initialized");
@@ -2326,9 +2346,9 @@ impl Database {
             // Sits alongside the existing eMule `credits` table rather
             // than replacing it — wire-compatible eMule peers continue
             // using the `credits` table via user_hash, and Ember peers
-            // that completed PoP get a second higher-fidelity record
-            // here that feeds decayed-ratio + reliability + speed
-            // scoring.
+            // that proved their key on a secure-v2 session got a second
+            // record here. Retired in 1.8.0, which empties it on open; the
+            // table stays because 1.7.x saves its credits through it.
             //
             // The pubkey column is `BLOB` (32 bytes) and acts as the
             // identity anchor — unlike user_hash it's cryptographically
@@ -3258,7 +3278,7 @@ impl Database {
             //
             // Columns on `credits` rather than a side table: they are keyed by
             // the same `user_hash`, they are written and pruned on exactly the
-            // same schedule, and `save_all_credits_with_ember` replaces the table
+            // same schedule, and `save_all_credits` replaces the table
             // wholesale, so a separate table would only add a second thing to
             // keep in step with that replacement.
             let tx = conn.unchecked_transaction()?;
@@ -5416,6 +5436,32 @@ impl Database {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Delete the finished downloads past the [`FINISHED_TRANSFER_ROWS_KEPT`]
+    /// that finished last. After a restart the list shows none of them, so
+    /// nothing else would: they outlived every session. The latest stay
+    /// because a completion a crash cut short is finished at the next start
+    /// from its row ([`Self::finished_download_identity`]).
+    ///
+    /// When one finished is the time its download history entry was written,
+    /// in the same transaction that marked it finished (`complete_transfer`,
+    /// under the row's own hash); a row without one goes by when it started.
+    /// Ordering by the start alone could drop a download that ran for months
+    /// and finished as the app crashed. Returns how many went.
+    pub fn prune_finished_transfers(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock();
+        let removed = conn.execute(
+            "DELETE FROM transfers WHERE id IN (
+                SELECT t.id FROM transfers t
+                  LEFT JOIN download_history h ON h.file_hash = t.file_hash
+                 WHERE t.direction = 'download' AND t.status IN ('completed', 'noneneeded')
+                 ORDER BY COALESCE(h.timestamp, t.started_at) DESC, t.rowid DESC
+                 LIMIT -1 OFFSET ?1
+             )",
+            params![FINISHED_TRANSFER_ROWS_KEPT],
+        )?;
+        Ok(removed)
+    }
+
     pub fn remove_transfer(&self, transfer_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM transfers WHERE id = ?1", params![transfer_id])?;
@@ -5947,8 +5993,7 @@ impl Database {
         let records = stmt
             .query_map([], |row| {
                 let hash_blob: Vec<u8> = row.get(0)?;
-                // Exactly 16, not "at least 16", for the reason `load_ember_credits`
-                // spells out for its 32-byte key: a longer blob silently truncated
+                // Exactly 16, not "at least 16": a longer blob silently truncated
                 // to the first 16 bytes would alias two distinct user hashes onto a
                 // single credit account. Short blobs were already refused; long ones
                 // are now refused too, so the row is skipped rather than merged into
@@ -6353,84 +6398,12 @@ impl Database {
         Ok(())
     }
 
-    /// Load persisted Ember credit records. Returns raw field tuples so
-    /// the caller can rehydrate `EmberCreditRecord` without this layer
-    /// depending on the credit types — same pattern as
-    /// `load_credits`.
-    ///
-    /// Field order matches the v15 schema and the
-    /// `save_all_credits_with_ember` INSERT statement: pubkey, uploaded,
-    /// downloaded, last_upload_time, last_download_time,
-    /// completed_sessions, total_sessions, avg_upload_speed, last_seen,
-    /// ident_verified.
-    #[allow(clippy::type_complexity)]
-    pub fn load_ember_credits(
-        &self,
-    ) -> anyhow::Result<Vec<([u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT pub_key, uploaded, downloaded, last_upload_time, last_download_time, \
-                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified \
-             FROM ember_credits",
-        )?;
-        let records = stmt
-            .query_map([], |row| {
-                let pk_blob: Vec<u8> = row.get(0)?;
-                // M10: strict 32-byte pub_key. Previously a row with
-                // a >32 byte blob silently truncated to the first 32
-                // bytes, which would alias two distinct Ed25519 keys
-                // onto a single credit account if any non-conformant
-                // row ever appeared. We now reject anything that
-                // isn't exactly 32 bytes; the row is logged + skipped
-                // by the `filter_map` below rather than being merged
-                // into the wrong account.
-                if pk_blob.len() != 32 {
-                    return Err(rusqlite::Error::InvalidColumnType(
-                        0,
-                        format!("pub_key must be 32 bytes, got {}", pk_blob.len()),
-                        rusqlite::types::Type::Blob,
-                    ));
-                }
-                let mut pk = [0u8; 32];
-                pk.copy_from_slice(&pk_blob);
-                Ok((
-                    pk,
-                    row.get::<_, i64>(1)?.max(0) as u64,
-                    row.get::<_, i64>(2)?.max(0) as u64,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?.clamp(0, i64::from(u32::MAX)) as u32,
-                    row.get::<_, i64>(6)?.clamp(0, i64::from(u32::MAX)) as u32,
-                    row.get::<_, i64>(7)?.max(0) as u64,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)? != 0,
-                ))
-            })?
-            .filter_map(|r| match r {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!("Skipping malformed ember_credits row: {e}");
-                    None
-                }
-            })
-            .collect();
-        Ok(records)
-    }
-
-    /// Full-replacement save of BOTH credit tables inside a SINGLE
-    /// transaction, so the `credits` and `ember_credits` tables can never
-    /// diverge across a crash or a partial failure: both DELETE+INSERT pairs
-    /// share one `tx`.
+    /// Full-replacement save of the credit table in one transaction.
     ///
     /// A replacement rather than per-row `INSERT OR REPLACE`, so rows pruned
     /// in memory by `CreditManager::cleanup_stale` do not survive on disk and
     /// get resurrected by the loader on the next launch.
-    #[allow(clippy::type_complexity)]
-    pub fn save_all_credits_with_ember(
-        &self,
-        credits: &[CreditRowRef<'_>],
-        ember_credits: &[(&[u8; 32], u64, u64, i64, i64, u32, u32, u64, i64, bool)],
-    ) -> anyhow::Result<()> {
+    pub fn save_all_credits(&self, credits: &[CreditRowRef<'_>]) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM credits", [])?;
@@ -6469,41 +6442,6 @@ impl Database {
                 ])?;
             }
         }
-        tx.execute("DELETE FROM ember_credits", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO ember_credits (\
-                    pub_key, uploaded, downloaded, last_upload_time, last_download_time, \
-                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified\
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )?;
-            for (
-                pk,
-                up,
-                down,
-                last_up,
-                last_down,
-                completed,
-                total,
-                avg_speed,
-                last_seen,
-                verified,
-            ) in ember_credits
-            {
-                stmt.execute(params![
-                    &pk[..],
-                    i64::try_from(*up).unwrap_or(i64::MAX),
-                    i64::try_from(*down).unwrap_or(i64::MAX),
-                    *last_up,
-                    *last_down,
-                    i64::from(*completed),
-                    i64::from(*total),
-                    i64::try_from(*avg_speed).unwrap_or(i64::MAX),
-                    *last_seen,
-                    i64::from(*verified),
-                ])?;
-            }
-        }
         tx.commit()?;
         Ok(())
     }
@@ -6519,18 +6457,6 @@ impl Database {
          ident_state = excluded.ident_state, ember_hash = excluded.ember_hash, \
          crypto_verified_once = excluded.crypto_verified_once, peer_name = excluded.peer_name, \
          client_software = excluded.client_software, seen_ip = excluded.seen_ip";
-    const EMBER_CREDIT_COLUMNS: &'static str = "pub_key, uploaded, downloaded, last_upload_time, \
-         last_download_time, completed_sessions, total_sessions, avg_upload_speed, last_seen, \
-         ident_verified";
-    const EMBER_CREDIT_UPSERT_SQL: &'static str = "INSERT INTO ember_credits (pub_key, uploaded, \
-         downloaded, last_upload_time, last_download_time, completed_sessions, total_sessions, \
-         avg_upload_speed, last_seen, ident_verified) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-         ON CONFLICT(pub_key) DO UPDATE SET uploaded = excluded.uploaded, \
-         downloaded = excluded.downloaded, last_upload_time = excluded.last_upload_time, \
-         last_download_time = excluded.last_download_time, \
-         completed_sessions = excluded.completed_sessions, total_sessions = excluded.total_sessions, \
-         avg_upload_speed = excluded.avg_upload_speed, last_seen = excluded.last_seen, \
-         ident_verified = excluded.ident_verified";
 
     /// Column values exactly as the credit saves store them, in
     /// `CREDIT_COLUMNS` order, so a stored row can be compared for equality.
@@ -6566,51 +6492,22 @@ impl Database {
         ]
     }
 
-    fn ember_credit_row_values(row: &EmberCreditRowRef<'_>) -> [rusqlite::types::Value; 10] {
-        use rusqlite::types::Value;
-        let (pk, up, down, last_up, last_down, completed, total, avg_speed, last_seen, verified) =
-            *row;
-        [
-            Value::Blob(pk.to_vec()),
-            Value::Integer(i64::try_from(up).unwrap_or(i64::MAX)),
-            Value::Integer(i64::try_from(down).unwrap_or(i64::MAX)),
-            Value::Integer(last_up),
-            Value::Integer(last_down),
-            Value::Integer(i64::from(completed)),
-            Value::Integer(i64::from(total)),
-            Value::Integer(i64::try_from(avg_speed).unwrap_or(i64::MAX)),
-            Value::Integer(last_seen),
-            Value::Integer(i64::from(verified)),
-        ]
-    }
-
     fn credit_row_key<'r>(row: &'r CreditRowRef<'_>) -> &'r [u8] {
         &row.0[..]
     }
 
-    fn ember_credit_row_key<'r>(row: &'r EmberCreditRowRef<'_>) -> &'r [u8] {
-        &row.0[..]
-    }
-
     /// Persist only the credit rows a flush found changed: an upsert for each
-    /// live record and a delete for each evicted key, both tables in one
-    /// transaction.
+    /// live record and a delete for each evicted key, in one transaction.
     ///
-    /// The full-replacement saves rewrite every row, and with `secure_delete`
-    /// and `synchronous=FULL` that pushed the whole ledger (up to 50k rows per
-    /// table) through the WAL under the connection mutex every minute.
+    /// The full-replacement save rewrites every row, and with `secure_delete`
+    /// and `synchronous=FULL` that pushed the whole ledger (up to 50k rows)
+    /// through the WAL under the connection mutex every minute.
     pub fn save_credit_changes(
         &self,
         credits: &[CreditRowRef<'_>],
         removed_credits: &[[u8; 16]],
-        ember_credits: &[EmberCreditRowRef<'_>],
-        removed_ember_credits: &[[u8; 32]],
     ) -> anyhow::Result<()> {
-        if credits.is_empty()
-            && removed_credits.is_empty()
-            && ember_credits.is_empty()
-            && removed_ember_credits.is_empty()
-        {
+        if credits.is_empty() && removed_credits.is_empty() {
             return Ok(());
         }
         let conn = self.conn.lock();
@@ -6625,33 +6522,19 @@ impl Database {
                 delete.execute(params![&hash[..]])?;
             }
         }
-        {
-            let mut upsert = tx.prepare(Self::EMBER_CREDIT_UPSERT_SQL)?;
-            for row in ember_credits {
-                upsert.execute(rusqlite::params_from_iter(Self::ember_credit_row_values(row)))?;
-            }
-            let mut delete = tx.prepare("DELETE FROM ember_credits WHERE pub_key = ?1")?;
-            for pk in removed_ember_credits {
-                delete.execute(params![&pk[..]])?;
-            }
-        }
         tx.commit()?;
         Ok(())
     }
 
-    /// Make both credit tables equal a full snapshot while writing only the
+    /// Make the credit table equal a full snapshot while writing only the
     /// rows that differ, in one transaction. Same end state as
-    /// [`Self::save_all_credits_with_ember`], including dropping rows the
-    /// snapshot lacks or that `load_credits` would skip as malformed.
+    /// [`Self::save_all_credits`], including dropping rows the snapshot lacks
+    /// or that `load_credits` would skip as malformed.
     ///
     /// For a session's first flush: startup loads every record through the
     /// mutating accessor, so all of them are marked even though nearly all
     /// already match disk. Reading the table is far cheaper than rewriting it.
-    pub fn sync_all_credits_with_ember(
-        &self,
-        credits: &[CreditRowRef<'_>],
-        ember_credits: &[EmberCreditRowRef<'_>],
-    ) -> anyhow::Result<()> {
+    pub fn sync_all_credits(&self, credits: &[CreditRowRef<'_>]) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
         Self::reconcile_rows(
@@ -6662,15 +6545,6 @@ impl Database {
             credits,
             Self::credit_row_key,
             Self::credit_row_values,
-        )?;
-        Self::reconcile_rows(
-            &tx,
-            "ember_credits",
-            Self::EMBER_CREDIT_COLUMNS,
-            Self::EMBER_CREDIT_UPSERT_SQL,
-            ember_credits,
-            Self::ember_credit_row_key,
-            Self::ember_credit_row_values,
         )?;
         tx.commit()?;
         Ok(())
@@ -9366,6 +9240,28 @@ impl Database {
     /// already holds.
     pub fn unread_message_counts(&self) -> anyhow::Result<Vec<(String, i64, i64)>> {
         let conn = self.conn.lock();
+        Self::unread_message_counts_in(&conn)
+    }
+
+    /// Mark every conversation read but for the disappearing messages nobody
+    /// has opened: a received message's timer starts when it is read, so
+    /// marking it read unseen would start the countdown on words the user has
+    /// not seen. Returns what is left unread, as [`Self::unread_message_counts`]
+    /// does.
+    pub fn mark_all_chats_read(&self) -> anyhow::Result<Vec<(String, i64, i64)>> {
+        let conn = self.conn.lock();
+        Self::ensure_chat_timers_locked(&conn)?;
+        conn.execute(
+            "UPDATE chat_messages SET read = 1 \
+             WHERE read = 0 AND direction = 'received' \
+               AND id NOT IN (SELECT message_id FROM chat_message_timers \
+                   WHERE ttl_secs > 0 AND expires_at IS NULL)",
+            [],
+        )?;
+        Self::unread_message_counts_in(&conn)
+    }
+
+    fn unread_message_counts_in(conn: &Connection) -> anyhow::Result<Vec<(String, i64, i64)>> {
         // `direction = 'received'` for the same reason the channel tally in
         // `list_channels` carries it: unread means "they said something I have
         // not read", and a sent row has no business in that count. The insert
@@ -9851,6 +9747,7 @@ impl Database {
                 "DELETE FROM channel_settings WHERE channel_id = ?1",
                 params![channel_id],
             )?;
+            Self::purge_owned_key_upkeep_locked(&tx, channel_id)?;
             // The forget-list goes too. It exists to stop a deleted line being
             // re-inserted by the next gossip replay, and with the room itself
             // destroyed there is no ingest path left to refuse — so every row
@@ -9861,46 +9758,14 @@ impl Database {
                 params![channel_id],
             )?;
             Self::clear_handoff_seeds_locked(&tx, channel_id)?;
+            Self::delete_room_library_locked(&tx, channel_id)?;
         }
         tx.commit()?;
         if n > 0 {
             bump_channel_roster_generation(channel_id);
+            crate::sharing::room_library::set(channel_id, Default::default());
         }
         Ok(n > 0)
-    }
-
-    /// Walk this device out of rooms the directory lists as deleted.
-    ///
-    /// Deliberately *not* a tombstone. The directory is an unsigned hint —
-    /// nothing in the response proves the room's owner asked for this — and
-    /// `deleted` is one-way: it hides the room, refuses re-entry, and there is
-    /// no way back from the UI. A directory bug or a compromised server could
-    /// therefore erase every room a user belongs to, private ones included,
-    /// whose ids the server has no authority over in the first place.
-    ///
-    /// Walking out is the recoverable half of the same action: the row, its
-    /// history and its join secret stay, the room reappears as a Join, and
-    /// re-entry is local so it works even while the directory still lies.
-    /// Owners are skipped — an owner's own delete goes through
-    /// [`Self::tombstone_channel`], so a row saying we own it and a directory
-    /// saying it is gone means the directory is the one that is wrong.
-    pub fn walk_out_deleted_channels(&self, deleted_ids: &[String]) -> anyhow::Result<Vec<String>> {
-        if deleted_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let conn = self.conn.lock();
-        let mut walked = Vec::new();
-        for id in deleted_ids {
-            let n = conn.execute(
-                "UPDATE channels SET in_room = 0 \
-                 WHERE channel_id = ?1 AND deleted = 0 AND is_owner = 0 AND in_room = 1",
-                params![id],
-            )?;
-            if n > 0 {
-                walked.push(id.clone());
-            }
-        }
-        Ok(walked)
     }
 
     /// Forget a channel. A ban recorded against `keep_banned_member` survives,
@@ -10006,16 +9871,19 @@ impl Database {
             "DELETE FROM channel_drafts WHERE channel_id = ?1",
             params![channel_id],
         )?;
+        Self::purge_owned_key_upkeep_locked(&tx, channel_id)?;
         // A claim followed in this room is about this room alone. The handoff
         // loop would drop it on its next pass for want of a row; going with the
         // row keeps who claimed it off the disk in between.
         Self::delete_channel_handoff_commit_locked(&tx, channel_id)?;
+        Self::delete_room_library_locked(&tx, channel_id)?;
         let n = tx.execute(
             "DELETE FROM channels WHERE channel_id = ?1",
             params![channel_id],
         )?;
         tx.commit()?;
         bump_channel_roster_generation(channel_id);
+        crate::sharing::room_library::set(channel_id, Default::default());
         Ok(n > 0)
     }
 
@@ -10871,6 +10739,18 @@ impl Database {
                 )?;
             }
         }
+        // The device the room is recovered from published its v1 membership
+        // records, and a cut-over already taken here marked only the rooms
+        // this database held then.
+        if matches!(outcome, RecoveredChannel::Adopted | RecoveredChannel::Inserted) {
+            Self::ensure_channel_cut_overs_locked(&tx)?;
+            tx.execute(
+                "UPDATE channels SET rotate_pending = 1
+                 WHERE channel_id = ?1 AND visibility = 'private'
+                   AND EXISTS(SELECT 1 FROM channel_cut_overs WHERE name = ?2)",
+                params![channel_id, crate::network::ember::channel::V1_CUT_OVER],
+            )?;
+        }
         tx.commit()?;
         drop(conn);
         if matches!(outcome, RecoveredChannel::Adopted | RecoveredChannel::Inserted) {
@@ -11085,11 +10965,57 @@ impl Database {
         epoch: i64,
         secret: &[u8; 32],
     ) -> anyhow::Result<()> {
+        self.store_channel_key_epoch(channel_id, epoch, secret, false).map(|_| ())
+    }
+
+    /// [`Self::insert_channel_key_epoch`] for a key fetched from the network:
+    /// whether the room still holds it afterwards. Not when it is older than
+    /// every epoch the retention window keeps, which drops it on arrival.
+    pub fn store_fetched_channel_key_epoch(
+        &self,
+        channel_id: &str,
+        epoch: i64,
+        secret: &[u8; 32],
+    ) -> anyhow::Result<bool> {
+        self.store_channel_key_epoch(channel_id, epoch, secret, false)
+    }
+
+    /// [`Self::insert_channel_key_epoch`] for a rotation minting `epoch`:
+    /// whether it minted it. Not when this room already holds that epoch or a
+    /// later one, or has been told of one (`key_epoch_wanted`), which another
+    /// device of this identity minted. Every owner rotation derives its key
+    /// from the room's seed, so a second mint of an epoch carries the same
+    /// secret and the plain insert would take it as a re-fetch; a rotation that
+    /// took it so would announce an epoch that left out nobody new, and its
+    /// undo would take back the key the first one handed out.
+    pub fn mint_channel_key_epoch(&self, channel_id: &str, epoch: i64, secret: &[u8; 32]) -> anyhow::Result<bool> {
+        self.store_channel_key_epoch(channel_id, epoch, secret, true)
+    }
+
+    fn store_channel_key_epoch(
+        &self,
+        channel_id: &str,
+        epoch: i64,
+        secret: &[u8; 32],
+        mint: bool,
+    ) -> anyhow::Result<bool> {
         let chat_key = self.require_chat_key()?;
         let label = format!("epoch{epoch}");
         let enc = Self::encrypt_channel_secret(chat_key, channel_id, &label, secret)?;
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        if mint {
+            let ahead: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM channels
+                               WHERE channel_id = ?1 AND (key_epoch >= ?2 OR key_epoch_wanted >= ?2))
+                     OR EXISTS(SELECT 1 FROM channel_key_epochs WHERE channel_id = ?1 AND epoch >= ?2)",
+                params![channel_id, epoch],
+                |row| row.get(0),
+            )?;
+            if ahead {
+                return Ok(false);
+            }
+        }
         let held: Option<String> = tx
             .query_row(
                 "SELECT secret_enc FROM channel_key_epochs WHERE channel_id = ?1 AND epoch = ?2",
@@ -11128,10 +11054,16 @@ impl Database {
             params![channel_id, epoch],
         )?;
         // A recovered room this device owns can run again once it holds the
-        // key it was waiting on.
+        // key it was waiting on, and one behind another device of ours has
+        // stopped looking for it.
         Self::ensure_channel_owner_key_pending_locked(&tx)?;
         tx.execute(
             "DELETE FROM channel_owner_key_pending WHERE channel_id = ?1 AND epoch <= ?2",
+            params![channel_id, epoch],
+        )?;
+        Self::ensure_channel_owner_behind_locked(&tx)?;
+        tx.execute(
+            "DELETE FROM channel_owner_behind WHERE channel_id = ?1 AND epoch <= ?2",
             params![channel_id, epoch],
         )?;
         tx.execute(
@@ -11141,10 +11073,155 @@ impl Database {
              )",
             params![channel_id, Self::CHANNEL_KEY_EPOCHS_KEPT as i64],
         )?;
+        let kept: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channel_key_epochs WHERE channel_id = ?1 AND epoch = ?2)",
+            params![channel_id, epoch],
+            |row| row.get(0),
+        )?;
         tx.commit()?;
         drop(conn);
         bump_channel_key_generation(channel_id);
+        Ok(kept)
+    }
+
+    /// Drop what an owner keeps about a room's keys and snapshots beside the
+    /// room itself, for a room deleted or forgotten: a room added again under
+    /// the same id starts clean.
+    fn purge_owned_key_upkeep_locked(tx: &Connection, channel_id: &str) -> anyhow::Result<()> {
+        Self::ensure_channel_relinks_locked(tx)?;
+        Self::ensure_channel_epoch_renewals_locked(tx)?;
+        Self::ensure_channel_owner_snapshot_sigs_locked(tx)?;
+        Self::ensure_channel_owner_behind_locked(tx)?;
+        for table in [
+            "channel_v1_sightings",
+            "channel_relink_rotations",
+            "channel_epoch_renewals",
+            "channel_owner_snapshot_sigs",
+            "channel_owner_behind",
+        ] {
+            tx.execute(&format!("DELETE FROM {table} WHERE channel_id = ?1"), params![channel_id])?;
+        }
         Ok(())
+    }
+
+    /// Created on first use: per room we own, the announced epoch this device
+    /// has been looking for and not finding, when an answered lookup last
+    /// missed it, and how long such lookups have kept missing it.
+    fn ensure_channel_owner_behind_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owner_behind (
+                channel_id TEXT PRIMARY KEY,
+                epoch INTEGER NOT NULL,
+                last_miss_at INTEGER NOT NULL,
+                missed_secs INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Note that an answered lookup of `epoch` found nothing, for a private
+    /// room we own that has announced `epoch` and does not hold it: another
+    /// device of this identity minted it. Each miss adds the time since the
+    /// one before, at most `gap_cap`, so time this device was off or offline
+    /// counts for little; once that reaches `give_up_secs` the room owes a
+    /// rotation past the epoch, marked in the same transaction, and this
+    /// returns true. Kept in the database, so the count holds across restarts.
+    /// Not for a recovered room waiting on its key, which re-keys on its own
+    /// (`commands::channels::rekey_recovered_room`).
+    pub fn note_owner_epoch_missed(
+        &self,
+        channel_id: &str,
+        epoch: i64,
+        now: i64,
+        gap_cap: i64,
+        give_up_secs: i64,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_behind_locked(&conn)?;
+        Self::ensure_channel_owner_key_pending_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let behind: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels
+                           WHERE channel_id = ?1 AND is_owner = 1 AND visibility = 'private' AND deleted = 0
+                             AND key_epoch_wanted = ?2 AND key_epoch < ?2)
+                 AND NOT EXISTS(SELECT 1 FROM channel_key_epochs WHERE channel_id = ?1 AND epoch = ?2)
+                 AND NOT EXISTS(SELECT 1 FROM channel_owner_key_pending WHERE channel_id = ?1)",
+            params![channel_id, epoch],
+            |row| row.get(0),
+        )?;
+        if !behind {
+            tx.execute("DELETE FROM channel_owner_behind WHERE channel_id = ?1", params![channel_id])?;
+            tx.commit()?;
+            return Ok(false);
+        }
+        let missed: i64 = tx.query_row(
+            "INSERT INTO channel_owner_behind (channel_id, epoch, last_miss_at, missed_secs)
+             VALUES (?1, ?2, ?3, 0)
+             ON CONFLICT(channel_id) DO UPDATE SET
+                missed_secs = CASE WHEN epoch = excluded.epoch
+                                   THEN missed_secs + MIN(MAX(excluded.last_miss_at - last_miss_at, 0), ?4)
+                                   ELSE 0 END,
+                epoch = excluded.epoch,
+                last_miss_at = excluded.last_miss_at
+             RETURNING missed_secs",
+            params![channel_id, epoch, now, gap_cap.max(0)],
+            |row| row.get(0),
+        )?;
+        let gives_up = missed >= give_up_secs;
+        if gives_up {
+            tx.execute("UPDATE channels SET rotate_pending = 1 WHERE channel_id = ?1", params![channel_id])?;
+            tx.execute("DELETE FROM channel_owner_behind WHERE channel_id = ?1", params![channel_id])?;
+        }
+        tx.commit()?;
+        Ok(gives_up)
+    }
+
+    /// Created on first use: when the owner last renewed the key records of
+    /// each epoch of a room it owns.
+    fn ensure_channel_epoch_renewals_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_epoch_renewals (
+                channel_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL,
+                at INTEGER NOT NULL,
+                PRIMARY KEY (channel_id, epoch)
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Note that every key record of `epoch` of a room we own went out at `at`.
+    pub fn note_channel_epoch_renewed(&self, channel_id: &str, epoch: i64, at: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_epoch_renewals_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO channel_epoch_renewals (channel_id, epoch, at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(channel_id, epoch) DO UPDATE SET at = excluded.at",
+            params![channel_id, epoch, at],
+        )?;
+        Ok(())
+    }
+
+    /// Each epoch a room holds, oldest first, with when its key records were
+    /// last renewed (`None` when never on record). Epoch numbers only, nothing
+    /// decrypted. Renewals of epochs no room holds any more are dropped.
+    pub fn channel_epoch_renewals(&self, channel_id: &str) -> anyhow::Result<Vec<(i64, Option<i64>)>> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_epoch_renewals_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM channel_epoch_renewals
+             WHERE NOT EXISTS(SELECT 1 FROM channel_key_epochs k
+                              WHERE k.channel_id = channel_epoch_renewals.channel_id
+                                AND k.epoch = channel_epoch_renewals.epoch)",
+            [],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT k.epoch, r.at FROM channel_key_epochs k
+             LEFT JOIN channel_epoch_renewals r ON r.channel_id = k.channel_id AND r.epoch = k.epoch
+             WHERE k.channel_id = ?1 ORDER BY k.epoch",
+        )?;
+        let rows = stmt.query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// See [`bump_channel_key_generation`]: read this, then the epochs, and the
@@ -11218,7 +11295,8 @@ impl Database {
     }
 
     /// The newest content-key epoch in `floor..=wanted` this device does not
-    /// hold, if any.
+    /// hold, if any. `floor` is the oldest the retention window keeps, counted
+    /// from the newer of `wanted` and the newest epoch held.
     ///
     /// Chasing only the epoch the owner currently advertises left a hole. A
     /// member offline across two rotations learns about the newest one and
@@ -11229,12 +11307,14 @@ impl Database {
     /// member send again; the older ones only restore readability.
     ///
     /// Bounded to the retention window, since [`Self::insert_channel_key_epoch`]
-    /// drops anything past it on arrival anyway.
+    /// drops anything past it on arrival anyway. Epochs in `skip` are passed
+    /// over, but never `wanted`, the one a member needs to read anything new.
     pub fn newest_missing_channel_key_epoch(
         &self,
         channel_id: &str,
         floor: i64,
         wanted: i64,
+        skip: &[i64],
     ) -> anyhow::Result<Option<i64>> {
         if wanted < floor {
             return Ok(None);
@@ -11248,7 +11328,9 @@ impl Database {
             let rows = stmt.query_map(params![channel_id, floor, wanted], |row| row.get(0))?;
             rows.collect::<Result<_, _>>()?
         };
-        Ok((floor..=wanted).rev().find(|epoch| !held.contains(epoch)))
+        Ok((floor..=wanted)
+            .rev()
+            .find(|epoch| !held.contains(epoch) && (*epoch == wanted || !skip.contains(epoch))))
     }
 
     /// Undo a rotation whose moderation snapshot never got committed.
@@ -13028,10 +13110,6 @@ impl Database {
         Self::delete_channel_handoff_commit_locked(&conn, channel_id)
     }
 
-    /// The download folder each download's `.part` was last recorded in, kept
-    /// beside `transfers` rather than as a column of it for the same reason as
-    /// [`Self::ensure_sealed_offer_readers_locked`]: a numbered migration would
-    /// stop 1.7.0 from opening the database after a downgrade.
     /// Web sources (`s=` URLs) of downloads, by file hash, in a table of its
     /// own for the reason [`Self::ensure_transfer_part_folders_locked`] gives.
     fn ensure_transfer_web_sources_locked(conn: &Connection) -> anyhow::Result<()> {
@@ -13108,6 +13186,93 @@ impl Database {
         Ok(())
     }
 
+    /// Mirrors a finished download proved, kept with the file so a copied
+    /// eD2K link carries them. A table of its own for the reason
+    /// [`Self::ensure_transfer_part_folders_locked`] gives.
+    fn ensure_library_web_mirrors_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS library_web_mirrors (
+                file_hash TEXT NOT NULL,
+                url TEXT NOT NULL,
+                kept_at INTEGER NOT NULL,
+                PRIMARY KEY (file_hash, url)
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Keep `urls` with the finished file `file_hash`, after any it already
+    /// has, up to the web sources a file holds
+    /// ([`crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE`]).
+    pub fn keep_library_web_mirrors(&self, file_hash: &str, urls: &[String]) -> anyhow::Result<()> {
+        if urls.is_empty() {
+            return Ok(());
+        }
+        let file_hash = file_hash.to_ascii_lowercase();
+        let conn = self.conn.lock();
+        Self::ensure_library_web_mirrors_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        let held: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM library_web_mirrors WHERE file_hash = ?1",
+            params![file_hash],
+            |row| row.get(0),
+        )?;
+        let mut room = crate::network::ed2k::web_sources::MAX_WEB_SOURCES_PER_FILE
+            .saturating_sub(held.max(0) as usize);
+        for url in urls {
+            if room == 0 {
+                break;
+            }
+            room -= tx.execute(
+                "INSERT OR IGNORE INTO library_web_mirrors (file_hash, url, kept_at) VALUES (?1, ?2, ?3)",
+                params![file_hash, url, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The mirrors kept for each of `file_hashes` that has any, oldest first.
+    pub fn library_web_mirrors_for(
+        &self,
+        file_hashes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<String>>> {
+        let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        if file_hashes.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.conn.lock();
+        Self::ensure_library_web_mirrors_locked(&conn)?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT url FROM library_web_mirrors WHERE file_hash = ?1 ORDER BY kept_at, rowid",
+        )?;
+        for hash in file_hashes {
+            let hash = hash.to_ascii_lowercase();
+            if out.contains_key(&hash) {
+                continue;
+            }
+            let urls = stmt
+                .query_map(params![hash], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if !urls.is_empty() {
+                out.insert(hash, urls);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget the mirrors kept for `file_hash`: the file left the Library.
+    pub fn delete_library_web_mirrors(&self, file_hash: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_library_web_mirrors_locked(&conn)?;
+        conn.execute(
+            "DELETE FROM library_web_mirrors WHERE file_hash = ?1",
+            params![file_hash.to_ascii_lowercase()],
+        )?;
+        Ok(())
+    }
+
     /// Disappearing-message timers, in tables of their own for the reason
     /// [`Self::ensure_transfer_part_folders_locked`] gives: columns on
     /// `chat_messages` would raise the schema version 1.7.0 checks.
@@ -13146,6 +13311,9 @@ impl Database {
         Ok(())
     }
 
+    /// The download folder each download's `.part` was last recorded in, kept
+    /// beside `transfers` rather than as a column of it: a numbered migration
+    /// would stop 1.7.0 from opening the database after a downgrade.
     fn ensure_transfer_part_folders_locked(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS transfer_part_folders (
@@ -13203,91 +13371,6 @@ impl Database {
             );",
         )?;
         Ok(())
-    }
-
-    /// Created on first use rather than by a numbered migration, like
-    /// `channel_handoff_commits`: nothing refers to it, and a numbered one
-    /// would stop 1.7.0 from opening the database after a downgrade.
-    fn ensure_sealed_offer_readers_locked(conn: &Connection) -> anyhow::Result<()> {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sealed_offer_readers (
-                member_pubkey TEXT PRIMARY KEY,
-                last_seen INTEGER NOT NULL
-            );",
-        )?;
-        Ok(())
-    }
-
-    /// Record that the room member with Ed25519 key `member_pubkey` (hex)
-    /// proved at `now` that it reads sealed transfer offers. Forget every
-    /// member last proven before `forget_before` or too far after `now` (a
-    /// proof written while our clock was wrong), and all but the
-    /// `keep_at_most` most recently proven.
-    #[cfg(test)]
-    pub fn note_sealed_offer_reader(
-        &self,
-        member_pubkey: &str,
-        now: i64,
-        forget_before: i64,
-        keep_at_most: usize,
-    ) -> anyhow::Result<()> {
-        self.note_sealed_offer_readers(&[(member_pubkey, now)], now, forget_before, keep_at_most)
-    }
-
-    /// [`Self::note_sealed_offer_reader`] for several members in one
-    /// transaction, each proven at its own time; `now` bounds them all.
-    pub fn note_sealed_offer_readers(
-        &self,
-        proofs: &[(&str, i64)],
-        now: i64,
-        forget_before: i64,
-        keep_at_most: usize,
-    ) -> anyhow::Result<()> {
-        let future_after = now.saturating_add(
-            crate::network::ember::xfer::SEALED_OFFER_READER_MAX_FUTURE_SECS,
-        );
-        let conn = self.conn.lock();
-        Self::ensure_sealed_offer_readers_locked(&conn)?;
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut upsert = tx.prepare(
-                "INSERT INTO sealed_offer_readers (member_pubkey, last_seen) VALUES (?1, ?2)
-                 ON CONFLICT(member_pubkey) DO UPDATE SET last_seen =
-                    CASE WHEN last_seen > ?3 THEN excluded.last_seen
-                         ELSE MAX(last_seen, excluded.last_seen) END",
-            )?;
-            for (member_pubkey, seen_at) in proofs {
-                upsert.execute(params![member_pubkey.to_ascii_lowercase(), seen_at, future_after])?;
-            }
-        }
-        tx.execute(
-            "DELETE FROM sealed_offer_readers WHERE last_seen < ?1 OR last_seen > ?2",
-            params![forget_before, future_after],
-        )?;
-        tx.execute(
-            "DELETE FROM sealed_offer_readers WHERE member_pubkey IN (
-                SELECT member_pubkey FROM sealed_offer_readers
-                 ORDER BY last_seen DESC, member_pubkey ASC
-                 LIMIT -1 OFFSET ?1
-             )",
-            params![keep_at_most as i64],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// When the member with Ed25519 key `member_pubkey` (hex) last proved it
-    /// reads sealed transfer offers, if it ever did.
-    pub fn sealed_offer_reader_seen_at(&self, member_pubkey: &str) -> anyhow::Result<Option<i64>> {
-        let conn = self.conn.lock();
-        Self::ensure_sealed_offer_readers_locked(&conn)?;
-        Ok(conn
-            .query_row(
-                "SELECT last_seen FROM sealed_offer_readers WHERE member_pubkey = ?1",
-                params![member_pubkey.to_ascii_lowercase()],
-                |row| row.get(0),
-            )
-            .optional()?)
     }
 
     /// Hand a room we own to its confirmed successor, if that is still the
@@ -13738,6 +13821,19 @@ impl Database {
         Self::channel_member_banned_locked(&conn, channel_id, member_pubkey)
     }
 
+    /// Whether `member_pubkey` is on the room's roster and not banned.
+    pub fn channel_member_unbanned(&self, channel_id: &str, member_pubkey: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let banned: Option<i64> = conn
+            .query_row(
+                "SELECT banned FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, member_pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(banned == Some(0))
+    }
+
     fn channel_member_banned_locked(
         conn: &Connection,
         channel_id: &str,
@@ -14095,9 +14191,13 @@ impl Database {
     /// network, which is ordered by its signature as well as its stamp.
     ///
     /// On a room this device owns, only a snapshot stamped after everything it
-    /// has signed or applied itself is taken. Anything else is its own earlier
-    /// work coming back, and applying it would roll back whatever the owner
-    /// changed since.
+    /// has signed or applied itself is taken, or one of the same second that
+    /// orders after its own ([`Self::owner_takes_fetched_locked`]). Anything
+    /// else is its own earlier work coming back, or an older one of the other
+    /// device's, and applying it would roll back whatever the owner changed
+    /// since. One that is taken was signed by this identity's other device,
+    /// and owes a rotation as [`Self::owe_rotation_for_unseen_bans_locked`]
+    /// says.
     pub fn ingest_channel_moderation(
         &self,
         channel_id: &str,
@@ -14107,6 +14207,7 @@ impl Database {
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let tx = conn.unchecked_transaction()?;
+        let banned_before = Self::banned_channel_members_locked(&tx, channel_id)?;
         let applied = Self::apply_channel_moderation_locked(
             &tx,
             channel_id,
@@ -14115,10 +14216,199 @@ impl Database {
             ModerationOrder::Fetched(signature),
         )?;
         if applied {
+            Self::owe_rotation_for_unseen_bans_locked(&tx, channel_id, snapshot, &banned_before)?;
+            tx.commit()?;
+            bump_channel_roster_generation(channel_id);
+        } else if Self::note_owned_snapshot_not_taken_locked(&tx, channel_id, snapshot, timestamp)? {
             tx.commit()?;
             bump_channel_roster_generation(channel_id);
         }
         Ok(applied)
+    }
+
+    /// [`Self::note_owned_snapshot_not_taken_locked`] for a snapshot of a room
+    /// we own, stamped `timestamp`, that a lookup returned beside the newest
+    /// one, which is the only one [`Self::ingest_channel_moderation`] is given.
+    pub fn note_owned_snapshot_seen(
+        &self,
+        channel_id: &str,
+        snapshot: &ModerationSnapshot<'_>,
+        timestamp: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        if Self::note_owned_snapshot_not_taken_locked(&tx, channel_id, snapshot, timestamp)? {
+            tx.commit()?;
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(())
+    }
+
+    /// What a room-signed snapshot stamped `timestamp` that this device did
+    /// not take still says, on a room it owns; whether that changed anything.
+    /// Another device of this identity signed it, or this one did earlier.
+    ///
+    /// The epoch it names was minted: left untold, this device would mint it
+    /// again, the same key, for a ban whose member that device sealed it to;
+    /// told, it rotates past it and fetches it back. And if it names the epoch
+    /// this device is on and the newest the room has announced, and leaves out
+    /// someone this device's own snapshots ban (the newest the record carries,
+    /// never the owner's key) and banned before it was signed, whoever signed
+    /// it did so not knowing of that ban and may have sealed this very key to
+    /// them: the room owes a rotation. This device's own snapshots carry every
+    /// such ban, so they owe none.
+    ///
+    /// And whoever it bans is banned here unless this device has decided
+    /// otherwise since ([`Self::take_owned_snapshot_bans_locked`]).
+    fn note_owned_snapshot_not_taken_locked(
+        tx: &Connection,
+        channel_id: &str,
+        snapshot: &ModerationSnapshot<'_>,
+        timestamp: i64,
+    ) -> anyhow::Result<bool> {
+        let Some(epoch) = snapshot.key_epoch.map(|epoch| epoch as i64) else {
+            return Ok(false);
+        };
+        let mut changed = tx.execute(
+            "UPDATE channels SET key_epoch_wanted = ?2
+             WHERE channel_id = ?1 AND is_owner = 1 AND key_epoch_wanted < ?2",
+            params![channel_id, epoch],
+        )? > 0;
+        let mut stmt = tx.prepare(&format!(
+            "SELECT member_pubkey FROM (
+                 SELECT member_pubkey, ban_revised_at FROM channel_members
+                 WHERE channel_id = ?1 AND banned = 1
+                 ORDER BY ban_revised_at DESC, member_pubkey
+                 LIMIT {}
+             ) WHERE ban_revised_at < ?2",
+            crate::network::ember::dht::publish::CHANNEL_BAN_LIST_MAX
+        ))?;
+        let published: Vec<String> = stmt
+            .query_map(params![channel_id, timestamp], |row| row.get::<_, String>(0))?
+            .collect::<Result<_, _>>()?;
+        drop(stmt);
+        let theirs: std::collections::HashSet<String> = snapshot.banned_pubkeys.iter().map(hex::encode).collect();
+        let owner = snapshot.owner_pubkey.map(hex::encode);
+        let left_out = published.iter().map(|pk| pk.to_ascii_lowercase()).any(|pk| {
+            owner.as_deref() != Some(pk.as_str()) && !theirs.contains(&pk)
+        });
+        if left_out {
+            changed |= tx.execute(
+                "UPDATE channels SET rotate_pending = 1
+                 WHERE channel_id = ?1 AND is_owner = 1 AND visibility = 'private'
+                   AND key_epoch = ?2 AND key_epoch_wanted = ?2 AND rotate_pending = 0",
+                params![channel_id, epoch],
+            )? > 0;
+        }
+        changed |= Self::take_owned_snapshot_bans_locked(tx, channel_id, snapshot, timestamp, epoch)?;
+        Ok(changed)
+    }
+
+    /// Ban here, as the owner's word, whoever a room-signed snapshot stamped
+    /// `timestamp` that this device did not take bans, on a room it owns,
+    /// where this device holds no ban decision on them dated at or after it;
+    /// whether anyone was. Left unbanned, this device's next snapshot, stamped
+    /// later and applied whole by every member, would lift those bans for the
+    /// room, and its re-seal hand them the key. An owner's unban is dated
+    /// ([`Self::apply_channel_moderation_locked`]), so one made since stands.
+    ///
+    /// Owes a rotation when this device holds the epoch the snapshot names or
+    /// a later one, as [`Self::owe_rotation_for_unseen_bans_locked`] does: it
+    /// may have sealed that key to them.
+    fn take_owned_snapshot_bans_locked(
+        tx: &Connection,
+        channel_id: &str,
+        snapshot: &ModerationSnapshot<'_>,
+        timestamp: i64,
+        epoch: i64,
+    ) -> anyhow::Result<bool> {
+        let owned = tx
+            .query_row(
+                "SELECT is_owner FROM channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some_and(|is_owner| is_owner != 0);
+        if !owned {
+            return Ok(false);
+        }
+        Self::ensure_channel_owner_bans_locked(tx)?;
+        let mut banned = false;
+        for pk in snapshot.banned_pubkeys.iter().take(32) {
+            if snapshot.owner_pubkey == Some(pk) {
+                continue;
+            }
+            let hex_pk = hex::encode(pk);
+            let n = tx.execute(
+                "INSERT INTO channel_members
+                    (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
+                 VALUES (?1, ?2, '', 0, 1, 0, ?3)
+                 ON CONFLICT(channel_id, member_pubkey) DO UPDATE SET
+                    banned = 1,
+                    ban_revised_at = excluded.ban_revised_at
+                 WHERE channel_members.banned = 0
+                   AND channel_members.ban_revised_at < excluded.ban_revised_at",
+                params![channel_id, hex_pk, timestamp],
+            )?;
+            if n > 0 {
+                tx.execute(
+                    "INSERT OR IGNORE INTO channel_owner_bans (channel_id, member_pubkey) VALUES (?1, ?2)",
+                    params![channel_id, hex_pk],
+                )?;
+                banned = true;
+            }
+        }
+        if banned {
+            tx.execute(
+                "UPDATE channels SET rotate_pending = 1
+                 WHERE channel_id = ?1 AND visibility = 'private' AND key_epoch >= ?2",
+                params![channel_id, epoch],
+            )?;
+        }
+        Ok(banned)
+    }
+
+    fn banned_channel_members_locked(
+        conn: &Connection,
+        channel_id: &str,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let mut stmt =
+            conn.prepare("SELECT member_pubkey FROM channel_members WHERE channel_id = ?1 AND banned = 1")?;
+        let rows = stmt.query_map(params![channel_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// A fetched snapshot of a private room this device owns is this identity's
+    /// other device speaking. When it bans someone this device had not banned,
+    /// and this device already holds the epoch it names or a later one, this
+    /// device minted or renewed that key before it knew of the ban and may have
+    /// sealed it to them: the room owes a rotation past it. One that names a
+    /// later epoch needs none, since this device has not held that key and the
+    /// device that minted it already left the member out.
+    fn owe_rotation_for_unseen_bans_locked(
+        tx: &Connection,
+        channel_id: &str,
+        snapshot: &ModerationSnapshot<'_>,
+        banned_before: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let Some(epoch) = snapshot.key_epoch else {
+            return Ok(());
+        };
+        let banned_after = Self::banned_channel_members_locked(tx, channel_id)?;
+        let unseen = snapshot
+            .banned_pubkeys
+            .iter()
+            .map(hex::encode)
+            .any(|pk| banned_after.contains(&pk) && !banned_before.contains(&pk));
+        if unseen {
+            tx.execute(
+                "UPDATE channels SET rotate_pending = 1
+                 WHERE channel_id = ?1 AND is_owner = 1 AND visibility = 'private' AND key_epoch >= ?2",
+                params![channel_id, epoch.min(i64::MAX as u64) as i64],
+            )?;
+        }
+        Ok(())
     }
 
     /// Stamp and apply an owner's edit to a room it owns in one step, with the
@@ -14249,6 +14539,65 @@ impl Database {
         Ok(stamp)
     }
 
+    /// Created on first use: the signature of the newest snapshot this device
+    /// signed for each room it owns, and its stamp.
+    fn ensure_channel_owner_snapshot_sigs_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_owner_snapshot_sigs (
+                channel_id TEXT PRIMARY KEY,
+                stamp INTEGER NOT NULL,
+                signature BLOB NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Record the signature of the snapshot this device signed for a room it
+    /// owns at `stamp`, so one another device of this identity signed in the
+    /// same second is ordered against it ([`Self::owner_takes_fetched_locked`]).
+    pub fn note_owner_snapshot_signed(&self, channel_id: &str, stamp: i64, signature: &[u8; 64]) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_owner_snapshot_sigs_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO channel_owner_snapshot_sigs (channel_id, stamp, signature) VALUES (?1, ?2, ?3)
+             ON CONFLICT(channel_id) DO UPDATE SET stamp = excluded.stamp, signature = excluded.signature
+             WHERE excluded.stamp >= channel_owner_snapshot_sigs.stamp",
+            params![channel_id, stamp, signature.as_slice()],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a room this device owns takes a fetched snapshot stamped
+    /// `timestamp` and signed `signature`, `own` being the newest stamp it has
+    /// signed or applied. One stamped later, or in the same second with a
+    /// signature that orders after the one this device signed then, as every
+    /// member and storer orders the two (`moderation_supersedes`): either is
+    /// another device of this identity's, and the room settles on it, so this
+    /// device has to as well or its next republish would undo it. Anything
+    /// else is this device's own earlier work coming back.
+    fn owner_takes_fetched_locked(
+        tx: &Connection,
+        channel_id: &str,
+        timestamp: i64,
+        signature: &[u8; 64],
+        own: i64,
+    ) -> anyhow::Result<bool> {
+        if timestamp != own {
+            return Ok(timestamp > own);
+        }
+        Self::ensure_channel_owner_snapshot_sigs_locked(tx)?;
+        let ours: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT signature FROM channel_owner_snapshot_sigs WHERE channel_id = ?1 AND stamp = ?2",
+                params![channel_id, own],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(ours
+            .and_then(|ours| <[u8; 64]>::try_from(ours).ok())
+            .is_some_and(|ours| *signature > ours))
+    }
+
     /// Everything [`Self::apply_channel_moderation`] writes, inside the
     /// caller's transaction. The caller commits and bumps the roster.
     fn apply_channel_moderation_locked(
@@ -14290,7 +14639,8 @@ impl Database {
                     sig,
                     current,
                     held_sig.as_ref(),
-                ) && !(is_owner && timestamp <= current.max(owner_signed_at)),
+                ) && (!is_owner
+                    || Self::owner_takes_fetched_locked(tx, channel_id, timestamp, sig, current.max(owner_signed_at))?),
                 Some(sig),
             ),
             ModerationOrder::OwnerEdit => (true, None),
@@ -14309,10 +14659,15 @@ impl Database {
         if n == 0 {
             return Ok(false);
         }
+        // On a room this device owns a ban lifted here is an unban made at
+        // `timestamp`, and dated so: a snapshot of this identity's signed
+        // before it that still bans them must not ban them here again
+        // (`take_owned_snapshot_bans_locked`).
         tx.execute(
-            "UPDATE channel_members SET banned = 0
+            "UPDATE channel_members SET banned = 0,
+                ban_revised_at = CASE WHEN ?3 AND banned = 1 THEN ?2 ELSE ban_revised_at END
              WHERE channel_id = ?1 AND ban_revised_at <= ?2",
-            params![channel_id, timestamp],
+            params![channel_id, timestamp, is_owner],
         )?;
         tx.execute(
             "UPDATE channel_members SET moderator = 0 WHERE channel_id = ?1",
@@ -14445,6 +14800,45 @@ impl Database {
             "UPDATE channels SET name = ?2 WHERE channel_id = ?1 AND name <> ?2",
             params![channel_id, name],
         )?;
+        drop(conn);
+        if changed > 0 {
+            bump_channel_roster_generation(channel_id);
+        }
+        Ok(changed > 0)
+    }
+
+    /// [`Self::apply_owner_room_name`] for a room this device owns, from a
+    /// snapshot stamped `stamp` that another device of this identity signed
+    /// after any of this one's: the name it renamed the room to, which also
+    /// stands in for any name a recovery could only guess. Not over a rename
+    /// made here since `stamp`, whose own snapshot may not have gone out. The
+    /// once-a-day clock (`renamed_at`) stays this device's own: the registry
+    /// keeps the room's, and refuses a rename too soon after the other's.
+    pub fn apply_own_room_name(&self, channel_id: &str, name: &str, stamp: i64) -> anyhow::Result<bool> {
+        let name = crate::security::sanitize_remote_text(name, ROOM_NAME_MAX_CHARS);
+        if name.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE channels SET name = ?2
+             WHERE channel_id = ?1 AND name <> ?2 AND renamed_at < ?3",
+            params![channel_id, name, stamp],
+        )?;
+        let named: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channels WHERE channel_id = ?1 AND name = ?2)",
+            params![channel_id, name],
+            |row| row.get(0),
+        )?;
+        if named {
+            Self::ensure_channel_name_unconfirmed_locked(&tx)?;
+            tx.execute(
+                "DELETE FROM channel_name_unconfirmed WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+        }
+        tx.commit()?;
         drop(conn);
         if changed > 0 {
             bump_channel_roster_generation(channel_id);
@@ -14735,6 +15129,181 @@ impl Database {
             params![channel_id],
         )?;
         Ok(())
+    }
+
+    /// Created on first use rather than by a numbered migration, like
+    /// `transfer_part_folders`: a numbered one would stop 1.7.x from opening
+    /// the database after a downgrade.
+    fn ensure_channel_cut_overs_locked(conn: &Connection) -> anyhow::Result<()> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_cut_overs (
+                name TEXT PRIMARY KEY,
+                at INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// The first time `cut_over` is taken, owe a key rotation to every private
+    /// room this identity owns, and never again: how many rooms that marked,
+    /// 0 once taken. The marks and the record of having made them are one
+    /// transaction, so a crash between them cannot rotate a room twice or not
+    /// at all. A room created later needs none: it never had a record the
+    /// cut-over retires. One taken over is owed its rotation by the takeover,
+    /// and one recovered onto this device by `adopt_recovered_owned_channel`.
+    pub fn take_channel_cut_over_rotations(&self, cut_over: &str, now: i64) -> anyhow::Result<usize> {
+        let mut conn = self.conn.lock();
+        Self::ensure_channel_cut_overs_locked(&conn)?;
+        let tx = conn.transaction()?;
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM channel_cut_overs WHERE name = ?1)",
+            params![cut_over],
+            |row| row.get(0),
+        )?;
+        if taken {
+            return Ok(0);
+        }
+        let marked = tx.execute(
+            "UPDATE channels SET rotate_pending = 1
+             WHERE is_owner = 1 AND visibility = 'private' AND deleted = 0",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO channel_cut_overs (name, at) VALUES (?1, ?2)",
+            params![cut_over, now],
+        )?;
+        tx.commit()?;
+        Ok(marked)
+    }
+
+    /// Created on first use, like `channel_cut_overs`. `channel_v1_sightings`
+    /// holds, per owned private room, the epoch its sightings are for, when
+    /// they began, when this device last walked the room's presence, and how
+    /// long its walks have watched since the last sighting;
+    /// `channel_relink_rotations` the rooms that have had the second rotation,
+    /// which each gets once. Both per database: a second device of ours keeps
+    /// its own and may rotate the room once more itself, which costs only
+    /// that rotation.
+    fn ensure_channel_relinks_locked(conn: &Connection) -> anyhow::Result<()> {
+        Self::ensure_channel_cut_overs_locked(conn)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS channel_v1_sightings (
+                channel_id TEXT PRIMARY KEY,
+                epoch INTEGER NOT NULL,
+                first_at INTEGER NOT NULL,
+                walked_at INTEGER NOT NULL,
+                quiet_secs INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS channel_relink_rotations (
+                channel_id TEXT PRIMARY KEY,
+                at INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    /// Note a walk of the presence of a private room we own, in its current
+    /// epoch `epoch`, that `saw_v1` or not: whether a roster member published a
+    /// v1 copy under the room's current key. One that did is on 1.7.5 to
+    /// 1.7.8, so storers can link its ids for this epoch
+    /// ([`crate::network::ember::channel::V1_RELINK_QUIET_SECS`]).
+    ///
+    /// A sighting counts only once `cut_over` is taken and its rotation made,
+    /// since every member published both forms before it, and only until the
+    /// room has had its second rotation. A walk without one adds the time
+    /// since the previous walk to the quiet span, at most `gap_cap`: the span
+    /// a walk speaks for, so time this device was off or out of the room
+    /// counts for no more than that. The sightings follow the room into a
+    /// later epoch, its quiet span starting over: a member seen on 1.7.x took
+    /// that epoch's key too, and may have published v1 under it before
+    /// updating, unseen.
+    pub fn note_channel_v1_walk(
+        &self,
+        channel_id: &str,
+        cut_over: &str,
+        epoch: i64,
+        saw_v1: bool,
+        now: i64,
+        gap_cap: i64,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_channel_relinks_locked(&conn)?;
+        if saw_v1 {
+            conn.execute(
+                "INSERT INTO channel_v1_sightings (channel_id, epoch, first_at, walked_at, quiet_secs)
+                 SELECT ?1, ?2, ?3, ?3, 0
+                 WHERE EXISTS(SELECT 1 FROM channel_cut_overs WHERE name = ?4)
+                   AND NOT EXISTS(SELECT 1 FROM channel_relink_rotations WHERE channel_id = ?1)
+                   AND EXISTS(SELECT 1 FROM channels
+                              WHERE channel_id = ?1 AND is_owner = 1 AND visibility = 'private'
+                                AND deleted = 0 AND rotate_pending = 0 AND key_epoch = ?2)
+                 ON CONFLICT(channel_id) DO UPDATE SET
+                    walked_at = excluded.walked_at,
+                    quiet_secs = 0,
+                    epoch = MAX(epoch, excluded.epoch)",
+                params![channel_id, epoch, now, cut_over],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE channel_v1_sightings
+                 SET quiet_secs = CASE WHEN epoch = ?2
+                                       THEN quiet_secs + MIN(MAX(?3 - walked_at, 0), ?4)
+                                       ELSE 0 END,
+                     epoch = ?2,
+                     walked_at = ?3
+                 WHERE channel_id = ?1 AND epoch <= ?2
+                   AND EXISTS(SELECT 1 FROM channels WHERE channel_id = ?1 AND key_epoch = ?2)",
+                params![channel_id, epoch, now, gap_cap.max(0)],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Owe a private room we own its second rotation when this device's walks
+    /// have watched its current epoch for `quiet_secs` without a v1 sighting,
+    /// or the first came `grace_secs` ago, whatever epoch the room has moved to
+    /// since and whether or not it has been walked there: whether it was owed.
+    /// Recorded in the same transaction, so it is owed once. A room never seen
+    /// with one is owed nothing: the cut-over's rotation already unlinked
+    /// everyone in it.
+    pub fn take_channel_relink_rotation(
+        &self,
+        channel_id: &str,
+        now: i64,
+        quiet_secs: i64,
+        grace_secs: i64,
+    ) -> anyhow::Result<bool> {
+        let mut conn = self.conn.lock();
+        Self::ensure_channel_relinks_locked(&conn)?;
+        let tx = conn.transaction()?;
+        let sighting: Option<(i64, i64, i64, i64)> = tx
+            .query_row(
+                "SELECT s.epoch, s.first_at, s.quiet_secs, c.key_epoch
+                 FROM channel_v1_sightings s JOIN channels c ON c.channel_id = s.channel_id
+                 WHERE s.channel_id = ?1 AND c.is_owner = 1 AND c.visibility = 'private' AND c.deleted = 0
+                   AND NOT EXISTS(SELECT 1 FROM channel_relink_rotations r WHERE r.channel_id = ?1)",
+                params![channel_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((epoch, first_at, quiet, key_epoch)) = sighting else {
+            return Ok(false);
+        };
+        let due = (epoch == key_epoch && quiet >= quiet_secs) || now.saturating_sub(first_at) >= grace_secs;
+        if !due {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE channels SET rotate_pending = 1 WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        tx.execute(
+            "INSERT INTO channel_relink_rotations (channel_id, at) VALUES (?1, ?2)",
+            params![channel_id, now],
+        )?;
+        tx.execute("DELETE FROM channel_v1_sightings WHERE channel_id = ?1", params![channel_id])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Clear it, once the snapshot announcing the new epoch is on its way.
@@ -16084,8 +16653,8 @@ impl Database {
     }
 
     /// `apply_channel_message_edit`, above, for either form of a revision, or
-    /// both at once as this device sends them: `edit_sig` is the edit frame's
-    /// (19) signature or empty, and `v2` the revision's v2 frame (65). With a
+    /// both at once as 1.7.5 to 1.7.8 send them: `edit_sig` is the edit
+    /// frame's (19) signature or empty, and `v2` the revision's v2 frame (65). With a
     /// v2 frame `text` is its body and trailer, and `edit_sig` covers its
     /// legacy text.
     ///
@@ -16712,14 +17281,74 @@ impl Database {
         Ok(result)
     }
 
-    /// Remove a specific file from download history (per-row user override).
-    pub fn remove_download_history(&self, file_hash: &str) -> anyhow::Result<()> {
+    /// The names and sizes the download history holds for `hashes`, keyed by
+    /// the hash in lower case, whatever case either side is in. A row with no
+    /// name is left out.
+    pub fn download_history_names(
+        &self,
+        hashes: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, (String, u64)>> {
+        let mut result = std::collections::HashMap::new();
+        if hashes.is_empty() {
+            return Ok(result);
+        }
+        // Each hash in both cases, rather than `lower(file_hash)`, so the
+        // primary key's index answers each one.
+        let forms: Vec<String> = hashes
+            .iter()
+            .flat_map(|h| [h.to_ascii_lowercase(), h.to_ascii_uppercase()])
+            .collect();
         let conn = self.conn.lock();
-        conn.execute(
-            "DELETE FROM download_history WHERE file_hash = ?1",
-            params![file_hash],
+        const CHUNK_SIZE: usize = 900;
+        for chunk in forms.chunks(CHUNK_SIZE) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT lower(file_hash), file_name, file_size FROM download_history
+                 WHERE file_hash IN ({}) AND file_name != ''",
+                placeholders.join(",")
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params.as_slice(), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            })?;
+            for (hash, name, size) in rows.filter_map(|r| r.ok()) {
+                result.insert(hash, (name, u64::try_from(size).unwrap_or(0)));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Every download-history row, newest first. The table holds at most
+    /// [`MAX_DOWNLOAD_HISTORY_ROWS`], so it is read whole.
+    pub fn download_history_entries(&self) -> anyhow::Result<Vec<DownloadHistoryEntry>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT file_hash, file_name, file_size, status, timestamp FROM download_history
+             ORDER BY timestamp DESC, file_hash",
         )?;
-        Ok(())
+        let rows = stmt.query_map([], |row| {
+            Ok(DownloadHistoryEntry {
+                file_hash: row.get(0)?,
+                file_name: row.get(1)?,
+                file_size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                status: row.get(3)?,
+                timestamp: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Remove a specific file from download history (per-row user override),
+    /// in whatever case its hash was stored. Whether there was one.
+    pub fn remove_download_history(&self, file_hash: &str) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        let removed = conn.execute(
+            "DELETE FROM download_history WHERE file_hash IN (?1, ?2, ?3)",
+            params![file_hash, file_hash.to_ascii_lowercase(), file_hash.to_ascii_uppercase()],
+        )?;
+        Ok(removed > 0)
     }
 
     /// Clear all download history entries of a given status.
@@ -16749,6 +17378,18 @@ impl Database {
     }
 }
 
+/// A download-history row, as Settings lists it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DownloadHistoryEntry {
+    pub file_hash: String,
+    pub file_name: String,
+    pub file_size: u64,
+    /// `completed` or `cancelled`.
+    pub status: String,
+    /// When it was last recorded, in Unix seconds.
+    pub timestamp: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -16772,34 +17413,6 @@ mod tests {
                 peer_name TEXT NOT NULL DEFAULT '',
                 client_software TEXT NOT NULL DEFAULT '',
                 seen_ip INTEGER NOT NULL DEFAULT 0
-            );",
-        )
-        .expect("create schema");
-        Database {
-            conn: Mutex::new(conn),
-            path: std::path::PathBuf::from(":memory:"),
-            chat_key: Some(Zeroizing::new([0xA5; 32])),
-            corrupt_backup: None,
-            feeds_ready: Default::default(),
-        }
-    }
-
-    /// Minimal schema for testing the defensive SQLite-to-memory conversion
-    /// used by `load_ember_credits`.
-    fn ember_credits_only_db() -> Database {
-        let conn = Connection::open_in_memory().expect("open in-memory");
-        conn.execute_batch(
-            "CREATE TABLE ember_credits (
-                pub_key BLOB PRIMARY KEY,
-                uploaded INTEGER NOT NULL DEFAULT 0,
-                downloaded INTEGER NOT NULL DEFAULT 0,
-                last_upload_time INTEGER NOT NULL DEFAULT 0,
-                last_download_time INTEGER NOT NULL DEFAULT 0,
-                completed_sessions INTEGER NOT NULL DEFAULT 0,
-                total_sessions INTEGER NOT NULL DEFAULT 0,
-                avg_upload_speed INTEGER NOT NULL DEFAULT 0,
-                last_seen INTEGER NOT NULL DEFAULT 0,
-                ident_verified INTEGER NOT NULL DEFAULT 0
             );",
         )
         .expect("create schema");
@@ -16907,26 +17520,6 @@ mod tests {
             .lock()
             .query_row(sql, [], |r| r.get(0))
             .expect("count")
-    }
-
-    #[test]
-    fn load_ember_credits_clamps_corrupt_session_counters() {
-        let db = ember_credits_only_db();
-        db.conn
-            .lock()
-            .execute(
-                "INSERT INTO ember_credits (
-                    pub_key, uploaded, downloaded, last_upload_time, last_download_time,
-                    completed_sessions, total_sessions, avg_upload_speed, last_seen, ident_verified
-                ) VALUES (?1, 0, 0, 0, 0, ?2, ?3, 0, 0, 0)",
-                params![vec![0xA5u8; 32], 5_000_000_000i64, -1i64],
-            )
-            .expect("insert corrupt counters");
-
-        let records = db.load_ember_credits().expect("load credits");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].5, u32::MAX);
-        assert_eq!(records[0].6, 0);
     }
 
     /// The point of a block is that it outlives the friendship it ended.
@@ -18330,7 +18923,7 @@ mod tests {
         assert_eq!(blocked[0].1, "Mallory");
     }
 
-    /// Regression: `save_all_credits_with_ember` MUST act as a full
+    /// Regression: `save_all_credits` MUST act as a full
     /// replacement so records pruned in memory by
     /// `CreditManager::cleanup_stale` are also dropped from the persisted
     /// table. Before this was a bare `INSERT OR REPLACE`, the database
@@ -18346,14 +18939,11 @@ mod tests {
         let pk: &[u8] = &[0xAA; 4];
 
         // Seed three records.
-        db.save_all_credits_with_ember(
-            &[
-                (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false, "", "", 0),
-                (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true, "", "", 0),
-                (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false, "", "", 0),
-            ],
-            &[],
-        )
+        db.save_all_credits(&[
+            (&h1, 100, 200, 1_700_000_000, pk, 0, 0, None, false, "", "", 0),
+            (&h2, 300, 400, 1_700_000_001, pk, 0x0102_0304, 1, None, true, "", "", 0),
+            (&h3, 500, 600, 1_700_000_002, pk, 0, 0, None, false, "", "", 0),
+        ])
         .expect("seed");
         let loaded = db.load_credits().expect("reload after seed");
         assert_eq!(loaded.len(), 3, "seed must persist three records");
@@ -18361,10 +18951,20 @@ mod tests {
         // Re-save with only one of the three. The other two represent
         // stale records the in-memory pruner has just dropped — they
         // must NOT survive in the database.
-        db.save_all_credits_with_ember(
-            &[(&h2, 999, 888, 1_700_000_999, pk, 0x0102_0304, 1, None, true, "Nia", "eMule 0.60a", 0x0506_0708)],
-            &[],
-        )
+        db.save_all_credits(&[(
+            &h2,
+            999,
+            888,
+            1_700_000_999,
+            pk,
+            0x0102_0304,
+            1,
+            None,
+            true,
+            "Nia",
+            "eMule 0.60a",
+            0x0506_0708,
+        )])
         .expect("replace");
         let after = db.load_credits().expect("reload after replace");
         assert_eq!(after.len(), 1, "stale records must not persist");
@@ -18397,11 +18997,11 @@ mod tests {
     fn save_all_credits_with_empty_input_clears_table() {
         let (db, path) = migrated_credits_db("empty");
         let h1 = [0x01u8; 16];
-        db.save_all_credits_with_ember(&[(&h1, 1, 1, 0, &[], 0, 0, None, false, "", "", 0)], &[])
+        db.save_all_credits(&[(&h1, 1, 1, 0, &[], 0, 0, None, false, "", "", 0)])
             .expect("seed");
         assert_eq!(db.load_credits().expect("reload").len(), 1);
 
-        db.save_all_credits_with_ember(&[], &[]).expect("empty save");
+        db.save_all_credits(&[]).expect("empty save");
         assert!(db.load_credits().expect("reload empty").is_empty());
         remove_db_files(db, &path);
     }
@@ -18428,18 +19028,11 @@ mod tests {
     fn save_credit_changes_upserts_touched_rows_and_deletes_evicted_ones() {
         let (db, path) = migrated_credits_db("changes");
         let (h1, h2, h3) = ([0x01u8; 16], [0x02u8; 16], [0x03u8; 16]);
-        let (pk1, pk2) = ([0x11u8; 32], [0x12u8; 32]);
         let key: &[u8] = &[0xAA; 4];
-        db.save_all_credits_with_ember(
-            &[
-                (&h1, 1, 1, 100, key, 0, 0, None, false, "", "", 0),
-                (&h2, 2, 2, 200, key, 0, 0, None, false, "", "", 0),
-            ],
-            &[
-                (&pk1, 1, 1, 0, 0, 0, 0, 0, 100, false),
-                (&pk2, 2, 2, 0, 0, 0, 0, 0, 200, false),
-            ],
-        )
+        db.save_all_credits(&[
+            (&h1, 1, 1, 100, key, 0, 0, None, false, "", "", 0),
+            (&h2, 2, 2, 200, key, 0, 0, None, false, "", "", 0),
+        ])
         .expect("seed");
 
         db.save_credit_changes(
@@ -18448,8 +19041,6 @@ mod tests {
                 (&h3, 3, 3, 300, &[], 0, 0, None, false, "", "", 0),
             ],
             &[h2],
-            &[(&pk1, 5, 6, 7, 8, 1, 2, 3, 300, true)],
-            &[pk2],
         )
         .expect("incremental save");
 
@@ -18462,10 +19053,6 @@ mod tests {
             "an existing row must take every new column value"
         );
         assert_eq!(credits[1].0, h3, "a new record must be inserted");
-        assert_eq!(
-            db.load_ember_credits().expect("reload ember"),
-            vec![(pk1, 5, 6, 7, 8, 1, 2, 3, 300, true)]
-        );
         remove_db_files(db, &path);
     }
 
@@ -18475,18 +19062,11 @@ mod tests {
     fn sync_all_credits_writes_only_differences_and_drops_unknown_rows() {
         let (db, path) = migrated_credits_db("sync");
         let (h1, h2, h3) = ([0x01u8; 16], [0x02u8; 16], [0x03u8; 16]);
-        let (pk1, pk2) = ([0x11u8; 32], [0x12u8; 32]);
         let key: &[u8] = &[0xAA; 4];
-        db.save_all_credits_with_ember(
-            &[
-                (&h1, 1, 1, 100, key, 0, 0, None, false, "a", "b", 0),
-                (&h2, 2, 2, 200, key, 0, 0, None, false, "", "", 0),
-            ],
-            &[
-                (&pk1, 1, 1, 0, 0, 0, 0, 0, 100, false),
-                (&pk2, 2, 2, 0, 0, 0, 0, 0, 200, false),
-            ],
-        )
+        db.save_all_credits(&[
+            (&h1, 1, 1, 100, key, 0, 0, None, false, "a", "b", 0),
+            (&h2, 2, 2, 200, key, 0, 0, None, false, "", "", 0),
+        ])
         .expect("seed");
         db.conn
             .lock()
@@ -18500,9 +19080,7 @@ mod tests {
             (&h1, 1, 1, 100, key, 0, 0, None, false, "a", "b", 0),
             (&h3, 3, 3, 300, key, 0, 0, None, false, "", "", 0),
         ];
-        let ember_snapshot: [EmberCreditRowRef<'_>; 1] = [(&pk1, 9, 9, 0, 0, 0, 0, 0, 100, true)];
-        db.sync_all_credits_with_ember(&snapshot, &ember_snapshot)
-            .expect("sync");
+        db.sync_all_credits(&snapshot).expect("sync");
 
         let raw_rows: i64 = db
             .conn
@@ -18513,10 +19091,6 @@ mod tests {
         let mut credits = db.load_credits().expect("reload");
         credits.sort_by_key(|row| row.0);
         assert_eq!(credits.iter().map(|r| r.0).collect::<Vec<_>>(), vec![h1, h3]);
-        assert_eq!(
-            db.load_ember_credits().expect("reload ember"),
-            vec![(pk1, 9, 9, 0, 0, 0, 0, 0, 100, true)]
-        );
 
         db.conn
             .lock()
@@ -18524,14 +19098,10 @@ mod tests {
                 "CREATE TEMP TABLE credit_writes (n INTEGER);
                  CREATE TEMP TRIGGER cw_ins AFTER INSERT ON main.credits BEGIN INSERT INTO credit_writes VALUES (1); END;
                  CREATE TEMP TRIGGER cw_upd AFTER UPDATE ON main.credits BEGIN INSERT INTO credit_writes VALUES (1); END;
-                 CREATE TEMP TRIGGER cw_del AFTER DELETE ON main.credits BEGIN INSERT INTO credit_writes VALUES (1); END;
-                 CREATE TEMP TRIGGER ew_ins AFTER INSERT ON main.ember_credits BEGIN INSERT INTO credit_writes VALUES (1); END;
-                 CREATE TEMP TRIGGER ew_upd AFTER UPDATE ON main.ember_credits BEGIN INSERT INTO credit_writes VALUES (1); END;
-                 CREATE TEMP TRIGGER ew_del AFTER DELETE ON main.ember_credits BEGIN INSERT INTO credit_writes VALUES (1); END;",
+                 CREATE TEMP TRIGGER cw_del AFTER DELETE ON main.credits BEGIN INSERT INTO credit_writes VALUES (1); END;",
             )
             .expect("write counters");
-        db.sync_all_credits_with_ember(&snapshot, &ember_snapshot)
-            .expect("second sync");
+        db.sync_all_credits(&snapshot).expect("second sync");
         let writes: i64 = db
             .conn
             .lock()
@@ -18600,15 +19170,12 @@ mod tests {
         let fresh = [0x22u8; 16];
         let pk: &[u8] = &[0xAA; 4];
 
-        db.save_all_credits_with_ember(
-            &[
-                (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true, "", "", 0),
-                // Persisted `Failed` (2) with no anchor: exactly the state a
-                // stranger can force by failing one challenge under this hash.
-                (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false, "", "", 0),
-            ],
-            &[],
-        )
+        db.save_all_credits(&[
+            (&anchored, 10, 20, 1_700_000_000, pk, 0, 1, None, true, "", "", 0),
+            // Persisted `Failed` (2) with no anchor: exactly the state a
+            // stranger can force by failing one challenge under this hash.
+            (&fresh, 30, 40, 1_700_000_001, pk, 0, 2, None, false, "", "", 0),
+        ])
         .expect("seed");
 
         let loaded = db.load_credits().expect("reload");
@@ -18666,11 +19233,8 @@ mod tests {
         let (db, path) = migrated_credits_db("banned-list");
         let named = [0x0Au8; 16];
         let unnamed = [0x0Bu8; 16];
-        db.save_all_credits_with_ember(
-            &[(&named, 1, 1, 0, &[], 0, 0, None, false, "Nia", "eMule 0.60a", 0)],
-            &[],
-        )
-        .expect("seed credits");
+        db.save_all_credits(&[(&named, 1, 1, 0, &[], 0, 0, None, false, "Nia", "eMule 0.60a", 0)])
+            .expect("seed credits");
         db.ban_peer(&hex::encode(named)).expect("ban named");
         db.ban_peer(&hex::encode(unnamed)).expect("ban unnamed");
 
@@ -20331,6 +20895,319 @@ mod tests {
             .commit_owner_channel_moderation(&"ee".repeat(16), &topic_only("x"), &policy, 1)
             .unwrap()
             .is_none());
+        drop_db(db, &path);
+    }
+
+    /// A snapshot from this identity's other device that bans a member this
+    /// device had not banned owes a rotation when this device already holds
+    /// the epoch it names, since it may have sealed that key to them, and none
+    /// when it names a later epoch or bans nobody new.
+    #[test]
+    fn another_devices_ban_owes_a_rotation_only_past_a_key_held_here() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let path = std::env::temp_dir().join(format!(
+            "ember-moderation-unseen-ban-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open_at(&path).expect("open db");
+        let owned_room = |epoch: i64| {
+            let room = ChannelIdentity::generate();
+            let id = hex::encode(room.channel_id);
+            db.insert_channel(&id, &hex::encode(room.pubkey), "Ours", "private", true, Some(&room.seed()), Some(&[7; 32]))
+                .unwrap();
+            db.insert_channel_key_epoch(&id, epoch, &[epoch as u8; 32]).unwrap();
+            id
+        };
+        fn banning(bans: &[[u8; 32]], epoch: u64) -> ModerationSnapshot<'_> {
+            ModerationSnapshot {
+                banned_pubkeys: bans,
+                key_epoch: Some(epoch),
+                ..topic_only("")
+            }
+        }
+        let x = [[0x77u8; 32]];
+        let at = 1_700_000_000i64;
+
+        let held = owned_room(2);
+        assert!(db.ingest_channel_moderation(&held, &banning(&x, 2), at, &[1; 64]).unwrap());
+        assert!(db.channel_rotate_is_pending(&held).unwrap(), "the key held here may have reached them");
+        db.clear_channel_rotate_pending(&held).unwrap();
+        assert!(db.ingest_channel_moderation(&held, &banning(&x, 2), at + 1, &[1; 64]).unwrap());
+        assert!(!db.channel_rotate_is_pending(&held).unwrap(), "a ban already known owes nothing");
+
+        let behind = owned_room(1);
+        assert!(db.ingest_channel_moderation(&behind, &banning(&x, 2), at, &[1; 64]).unwrap());
+        assert!(!db.channel_rotate_is_pending(&behind).unwrap(), "the later key left them out already");
+
+        // Refused as older than this device's own, a snapshot still tells it
+        // of the epoch the other device minted.
+        let edited = owned_room(2);
+        let own = db.stamp_owner_snapshot(&edited, at).unwrap().unwrap();
+        assert!(!db.ingest_channel_moderation(&edited, &banning(&x, 3), own - 1, &[1; 64]).unwrap());
+        let row = db.get_channel(&edited).unwrap().unwrap();
+        assert_eq!((row.key_epoch, row.key_epoch_wanted), (2, 3));
+        assert!(!db.mint_channel_key_epoch(&edited, 3, &[3; 32]).unwrap(), "the other device's epoch");
+        drop_db(db, &path);
+    }
+
+    /// A snapshot of a room this device owns that it did not take, naming the
+    /// epoch this device is on and leaving out someone banned here, owes a
+    /// rotation: the device that signed it may have sealed this very key to
+    /// them. One naming another epoch, or banning them too, owes none.
+    #[test]
+    fn a_snapshot_not_taken_that_leaves_out_a_ban_here_owes_a_rotation() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("mirror");
+        fn banning(bans: &[[u8; 32]], epoch: u64) -> ModerationSnapshot<'_> {
+            ModerationSnapshot {
+                banned_pubkeys: bans,
+                key_epoch: Some(epoch),
+                ..topic_only("")
+            }
+        }
+        let room = ChannelIdentity::generate();
+        let id = hex::encode(room.channel_id);
+        db.insert_channel(&id, &hex::encode(room.pubkey), "Ours", "private", true, Some(&room.seed()), Some(&[7; 32]))
+            .unwrap();
+        db.insert_channel_key_epoch(&id, 2, &[2; 32]).unwrap();
+        let y = [0x59u8; 32];
+        db.apply_channel_moderation(&id, "", "", 500, &[y], &[], None, None, None, Some(2), None, None)
+            .unwrap();
+        db.clear_channel_rotate_pending(&id).unwrap();
+        let pending = || db.channel_rotate_is_pending(&id).unwrap();
+
+        db.note_owned_snapshot_seen(&id, &banning(&[], 2), 400).unwrap();
+        assert!(!pending(), "signed before the ban");
+        db.note_owned_snapshot_seen(&id, &banning(&[], 1), 600).unwrap();
+        assert!(!pending(), "another epoch than this device's");
+        db.note_owned_snapshot_seen(&id, &banning(&[y], 2), 600).unwrap();
+        assert!(!pending(), "banned there too");
+        let naming_y_owner = ModerationSnapshot {
+            owner_pubkey: Some(&y),
+            ..banning(&[], 2)
+        };
+        db.note_owned_snapshot_seen(&id, &naming_y_owner, 600).unwrap();
+        assert!(!pending(), "the owner's own key is never in its ban list");
+        db.note_owned_snapshot_seen(&id, &banning(&[], 2), 600).unwrap();
+        assert!(pending());
+
+        // More bans than a snapshot carries: one past the newest it can hold
+        // is left out of this device's own snapshots too, so it owes nothing.
+        db.clear_channel_rotate_pending(&id).unwrap();
+        let newer: Vec<[u8; 32]> = (1..=crate::network::ember::dht::publish::CHANNEL_BAN_LIST_MAX as u8)
+            .map(|n| [n; 32])
+            .collect();
+        for (n, pk) in newer.iter().enumerate() {
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO channel_members
+                         (channel_id, member_pubkey, nickname, last_seen, banned, moderator, ban_revised_at)
+                     VALUES (?1, ?2, '', 0, 1, 0, ?3)",
+                    params![id, hex::encode(pk), 501 + n as i64],
+                )
+                .unwrap();
+        }
+        db.note_owned_snapshot_seen(&id, &banning(&newer, 2), 600).unwrap();
+        assert!(!pending(), "beyond what the record carries");
+
+        // Behind the room's announcement, the epoch named is not this
+        // device's to rotate past: whoever minted the newer one left them out.
+        db.apply_channel_moderation(&id, "", "", 700, &[y], &[], None, None, None, Some(3), None, None)
+            .unwrap();
+        db.note_owned_snapshot_seen(&id, &banning(&[], 2), 800).unwrap();
+        assert!(!pending(), "behind");
+        drop_handoff_test_db(db, path);
+    }
+
+    /// A snapshot of this identity's other device that this device does not
+    /// take, being stamped before one it signed, still bans here whoever it
+    /// bans that this device has no later ban decision on: as the owner's
+    /// word, carried by this device's next snapshot, and owing a rotation when
+    /// this device holds the epoch it names, since it may have sealed that key
+    /// to them. Never the owner's own key.
+    #[test]
+    fn an_owned_channel_takes_the_bans_of_a_snapshot_it_does_not_take() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("merge-bans");
+        let room = ChannelIdentity::generate();
+        let id = hex::encode(room.channel_id);
+        db.insert_channel(&id, &hex::encode(room.pubkey), "Ours", "private", true, Some(&room.seed()), Some(&[7; 32]))
+            .unwrap();
+        db.insert_channel_key_epoch(&id, 2, &[2; 32]).unwrap();
+        let (x, owner) = ([0x58u8; 32], [0x0Au8; 32]);
+        db.upsert_channel_member(&id, &hex::encode(x), "x", 100, None).unwrap();
+        let at = 1_700_000_000i64;
+        db.commit_owner_channel_moderation(&id, &topic_only("signed here later"), &NO_POLICY, at + 60)
+            .unwrap()
+            .unwrap();
+        db.clear_channel_rotate_pending(&id).unwrap();
+
+        let bans = [x, owner];
+        let theirs = ModerationSnapshot {
+            banned_pubkeys: &bans,
+            owner_pubkey: Some(&owner),
+            key_epoch: Some(2),
+            ..topic_only("theirs")
+        };
+        assert!(!db.ingest_channel_moderation(&id, &theirs, at, &[1; 64]).unwrap());
+        assert_eq!(ban_state(&db, &id, &hex::encode(x)), (true, at));
+        assert_eq!(db.list_banned_channel_pubkeys(&id).unwrap(), vec![x], "never the owner's key");
+        assert!(db.channel_ban_target_protected(&id, &hex::encode(x)).unwrap(), "the owner's word");
+        assert!(db.channel_rotate_is_pending(&id).unwrap(), "the key held here may have reached them");
+        assert_eq!(db.get_channel(&id).unwrap().unwrap().topic, "signed here later");
+
+        // Seen beside the newest and naming a later epoch: banned, owing no
+        // rotation, since the device that minted that epoch left them out.
+        db.clear_channel_rotate_pending(&id).unwrap();
+        let y = [0x59u8; 32];
+        let later = ModerationSnapshot {
+            banned_pubkeys: std::slice::from_ref(&y),
+            key_epoch: Some(3),
+            ..topic_only("")
+        };
+        db.note_owned_snapshot_seen(&id, &later, at + 1).unwrap();
+        assert_eq!(ban_state(&db, &id, &hex::encode(y)), (true, at + 1));
+        assert!(!db.channel_rotate_is_pending(&id).unwrap());
+        drop_handoff_test_db(db, path);
+    }
+
+    /// An owner's unban is dated on a room this device owns, so a snapshot of
+    /// this identity's signed before it that still bans them, from the other
+    /// device or this one, does not ban them here again; one the other device
+    /// signed after it does.
+    #[test]
+    fn an_owner_unban_in_a_channel_outlasts_an_older_snapshot_banning_them() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("dated-unban");
+        let room = ChannelIdentity::generate();
+        let id = hex::encode(room.channel_id);
+        db.insert_channel(&id, &hex::encode(room.pubkey), "Ours", "private", true, Some(&room.seed()), Some(&[7; 32]))
+            .unwrap();
+        db.insert_channel_key_epoch(&id, 2, &[2; 32]).unwrap();
+        let x = [0x58u8; 32];
+        let x_hex = hex::encode(x);
+        let banning = ModerationSnapshot {
+            banned_pubkeys: std::slice::from_ref(&x),
+            key_epoch: Some(2),
+            ..topic_only("")
+        };
+        let lifting = ModerationSnapshot {
+            key_epoch: Some(2),
+            ..topic_only("")
+        };
+        let at = 1_700_000_000i64;
+        let banned_at = db.commit_owner_channel_moderation(&id, &banning, &NO_POLICY, at).unwrap().unwrap();
+        let unbanned_at = db
+            .commit_owner_channel_moderation(&id, &lifting, &NO_POLICY, at + 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ban_state(&db, &id, &x_hex), (false, unbanned_at));
+        db.commit_owner_channel_moderation(&id, &topic_only("later"), &NO_POLICY, at + 200)
+            .unwrap()
+            .unwrap();
+        db.clear_channel_rotate_pending(&id).unwrap();
+
+        db.note_owned_snapshot_seen(&id, &banning, banned_at).unwrap();
+        assert!(!db.ingest_channel_moderation(&id, &banning, at + 50, &[1; 64]).unwrap());
+        assert_eq!(ban_state(&db, &id, &x_hex), (false, unbanned_at), "unbanned since");
+        assert!(db.list_banned_channel_pubkeys(&id).unwrap().is_empty());
+        assert!(!db.channel_rotate_is_pending(&id).unwrap());
+
+        assert!(!db.ingest_channel_moderation(&id, &banning, at + 150, &[1; 64]).unwrap());
+        assert_eq!(ban_state(&db, &id, &x_hex), (true, at + 150), "banned again since");
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Answered lookups of an epoch another device of ours announced and this
+    /// one cannot find owe a rotation past it once they have gone on missing
+    /// it long enough, each gap counting at most the cap; finding the key, a
+    /// room not ours, and a recovered room waiting on its key owe nothing.
+    #[test]
+    fn an_owned_epoch_never_found_owes_a_rotation_past_it() {
+        use crate::network::ember::channel::ChannelIdentity;
+
+        let (db, path) = handoff_test_db("behind");
+        let (gap, give_up) = (60, 300);
+        let room = |owner: bool| {
+            let room = ChannelIdentity::generate();
+            let id = hex::encode(room.channel_id);
+            db.insert_channel(&id, &hex::encode(room.pubkey), "Room", "private", owner, Some(&room.seed()), Some(&[7; 32]))
+                .unwrap();
+            db.insert_channel_key_epoch(&id, 1, &[1; 32]).unwrap();
+            db.apply_channel_moderation(&id, "", "", 1_000, &[], &[], None, None, None, Some(2), None, None)
+                .unwrap();
+            id
+        };
+        let ours = room(true);
+        let missed = |id: &str, at: i64| db.note_owner_epoch_missed(id, 2, at, gap, give_up).unwrap();
+        for at in [0, 60, 120, 180] {
+            assert!(!missed(&ours, at));
+        }
+        assert!(!missed(&ours, 10_000), "time no lookup was answered counts at most the cap");
+        assert!(missed(&ours, 10_060), "five minutes of answered misses");
+        assert!(db.channel_rotate_is_pending(&ours).unwrap());
+
+        let found = room(true);
+        assert!(!missed(&found, 0));
+        db.insert_channel_key_epoch(&found, 2, &[2; 32]).unwrap();
+        assert!(!missed(&found, 10_000));
+        assert!(!db.channel_rotate_is_pending(&found).unwrap());
+
+        let theirs = room(false);
+        for at in (0..=1_000).step_by(60) {
+            assert!(!missed(&theirs, at));
+        }
+        let recovered = room(true);
+        db.mark_channel_owner_key_pending(&recovered, 2).unwrap();
+        for at in (0..=1_000).step_by(60) {
+            assert!(!missed(&recovered, at));
+        }
+        drop_handoff_test_db(db, path);
+    }
+
+    /// On a room this device owns, a snapshot stamped the same second as one
+    /// it signed is taken only when its signature orders after that one's, as
+    /// members settle the two: never its own coming back, nor one of a second
+    /// whose signature this device kept no record of.
+    #[test]
+    fn an_owner_device_settles_a_same_second_snapshot_as_members_do() {
+        let (db, path, id) = owned_room_db("owner-tie", true);
+        let at = 1_700_000_000i64;
+        let stamp = db.stamp_owner_snapshot(&id, at).unwrap().unwrap();
+        assert!(!db.ingest_channel_moderation(&id, &topic_only("theirs"), stamp, &[0x30; 64]).unwrap(), "no record of ours");
+        db.note_owner_snapshot_signed(&id, stamp, &[0x20; 64]).unwrap();
+        assert!(!db.ingest_channel_moderation(&id, &topic_only("theirs"), stamp - 1, &[0xFF; 64]).unwrap());
+        assert!(!db.ingest_channel_moderation(&id, &topic_only("ours"), stamp, &[0x20; 64]).unwrap(), "our own");
+        assert!(!db.ingest_channel_moderation(&id, &topic_only("theirs"), stamp, &[0x10; 64]).unwrap(), "orders before ours");
+        assert!(db.ingest_channel_moderation(&id, &topic_only("theirs"), stamp, &[0x30; 64]).unwrap());
+        assert_eq!(db.get_channel(&id).unwrap().unwrap().topic, "theirs");
+        assert!(db.ingest_channel_moderation(&id, &topic_only("later"), stamp + 1, &[0x01; 64]).unwrap());
+        drop_db(db, &path);
+    }
+
+    /// A room this device owns takes the name another device of this identity
+    /// renamed it to, keeping its own rename clock, but not over a rename made
+    /// here since that snapshot was signed; a name it confirms is no longer a
+    /// recovery's guess.
+    #[test]
+    fn an_owner_device_takes_the_other_devices_rename() {
+        let (db, path, id) = owned_room_db("owner-name", true);
+        db.rename_owned_channel(&id, "Mine", 500).unwrap();
+        assert!(!db.apply_own_room_name(&id, "Theirs", 400).unwrap(), "renamed here since");
+        assert_eq!(db.get_channel(&id).unwrap().unwrap().name, "Mine");
+        assert!(db.apply_own_room_name(&id, "Theirs", 600).unwrap());
+        let row = db.get_channel(&id).unwrap().unwrap();
+        assert_eq!((row.name.as_str(), row.renamed_at), ("Theirs", 500));
+        db.mark_channel_name_unconfirmed(&id).unwrap();
+        assert!(!db.apply_own_room_name(&id, "Theirs", 700).unwrap());
+        assert!(!db.channel_name_unconfirmed(&id).unwrap(), "the name is the owner's own");
         drop_db(db, &path);
     }
 
@@ -22569,97 +23446,63 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
-    /// A member proven to read sealed offers is remembered across a restart
-    /// under its newest proof, and forgotten once that proof is too old.
+    /// The Ember credit ledger 1.7.x wrote is emptied on open, and its table
+    /// kept for a 1.7.x that saves its credits through it after a downgrade.
     #[test]
-    fn sealed_offer_readers_survive_a_restart_and_age_out() {
-        let path = temp_db_path("sealed-readers");
-        let (alice, bob) = ("A1".repeat(32), "b0".repeat(32));
+    fn a_1_7_ember_credit_ledger_is_emptied_on_open() {
+        let path = temp_db_path("ember-credits");
         {
             let db = Database::open_at(&path).expect("open db");
-            assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), None);
-            db.note_sealed_offer_reader(&alice, 1_000, 0, 16).unwrap();
-            db.note_sealed_offer_reader(&alice, 900, 0, 16).unwrap();
-            db.note_sealed_offer_reader(&bob, 500, 0, 16).unwrap();
-            assert_eq!(
-                db.sealed_offer_reader_seen_at(&alice.to_ascii_lowercase()).unwrap(),
-                Some(1_000),
-                "an older proof does not move it back, and case does not matter"
-            );
+            db.conn
+                .lock()
+                .execute(
+                    "INSERT INTO ember_credits (pub_key, uploaded, last_seen) VALUES (?1, 5, 100)",
+                    params![vec![0xA5u8; 32]],
+                )
+                .expect("1.7.x row");
         }
         let db = Database::open_at(&path).expect("reopen db");
-        assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(1_000));
-        assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), Some(500));
-        db.note_sealed_offer_reader(&alice, 2_000, 600, 16).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), None, "aged out");
-        assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(2_000));
+        let rows: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM ember_credits", [], |row| row.get(0))
+            .expect("the table is still there");
+        assert_eq!(rows, 0);
         drop(db);
         remove_temp_db(&path);
     }
 
-    /// A proof written while the clock ran far ahead gives way to the next
-    /// proof, and one nobody renews is forgotten, rather than either counting
-    /// until that date plus the keep time. A little ahead still wins.
+    /// The list 1.7.x kept of members that read sealed offers is dropped on
+    /// open, whatever it held, and the schema stays where 1.7.x can open it.
     #[test]
-    fn a_sealed_offer_reader_proven_under_a_fast_clock_is_not_kept() {
-        use crate::network::ember::xfer::SEALED_OFFER_READER_MAX_FUTURE_SECS as AHEAD;
-        let path = temp_db_path("sealed-readers-future");
-        let db = Database::open_at(&path).expect("open db");
-        let (alice, bob, carol) = ("a1".repeat(32), "b0".repeat(32), "c2".repeat(32));
-        let now = 1_000_000;
-        db.note_sealed_offer_reader(&alice, now + AHEAD + 1, 0, 16).unwrap();
-        db.note_sealed_offer_reader(&bob, now + AHEAD + 1, 0, 16).unwrap();
-        db.note_sealed_offer_reader(&carol, now + 60, 0, 16).unwrap();
-
-        db.note_sealed_offer_reader(&alice, now, 0, 16).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&alice).unwrap(), Some(now), "overwritten");
-        assert_eq!(db.sealed_offer_reader_seen_at(&bob).unwrap(), None, "forgotten");
-        db.note_sealed_offer_reader(&carol, now, 0, 16).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&carol).unwrap(), Some(now + 60));
-        drop(db);
-        remove_temp_db(&path);
-    }
-
-    /// However many identities prove themselves, only the most recently
-    /// proven are kept.
-    #[test]
-    fn sealed_offer_readers_are_capped_newest_first() {
-        let path = temp_db_path("sealed-readers-cap");
-        let db = Database::open_at(&path).expect("open db");
-        let member = |i: u8| format!("{i:02x}").repeat(32);
-        for i in 0..6u8 {
-            db.note_sealed_offer_reader(&member(i), 1_000 + i as i64, 0, 4).unwrap();
-        }
-        for i in 0..2u8 {
-            assert_eq!(db.sealed_offer_reader_seen_at(&member(i)).unwrap(), None, "oldest {i} made way");
-        }
-        for i in 2..6u8 {
-            assert_eq!(db.sealed_offer_reader_seen_at(&member(i)).unwrap(), Some(1_000 + i as i64));
-        }
-        db.note_sealed_offer_reader(&member(2), 2_000, 0, 4).unwrap();
-        db.note_sealed_offer_reader(&member(9), 2_001, 0, 4).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&member(2)).unwrap(), Some(2_000), "renewed, so kept");
-        assert_eq!(db.sealed_offer_reader_seen_at(&member(3)).unwrap(), None);
-        drop(db);
-        remove_temp_db(&path);
-    }
-
-    /// A batch keeps each member's own proof time and is capped and aged as a
-    /// whole, the same as writing its members one at a time.
-    #[test]
-    fn a_batch_of_sealed_offer_readers_is_written_as_one() {
-        let path = temp_db_path("sealed-readers-batch");
-        let db = Database::open_at(&path).expect("open db");
-        let member = |i: u8| format!("{i:02x}").repeat(32);
-        db.note_sealed_offer_reader(&member(0), 500, 0, 4).unwrap();
-        let proofs: Vec<(String, i64)> = (1..6u8).map(|i| (member(i), 1_000 + i as i64)).collect();
-        let proofs: Vec<(&str, i64)> = proofs.iter().map(|(m, at)| (m.as_str(), *at)).collect();
-        db.note_sealed_offer_readers(&proofs, 1_010, 600, 4).unwrap();
-        assert_eq!(db.sealed_offer_reader_seen_at(&member(0)).unwrap(), None, "aged out");
-        assert_eq!(db.sealed_offer_reader_seen_at(&member(1)).unwrap(), None, "the oldest made way");
-        for i in 2..6u8 {
-            assert_eq!(db.sealed_offer_reader_seen_at(&member(i)).unwrap(), Some(1_000 + i as i64));
-        }
+    fn a_1_7_list_of_sealed_offer_readers_is_dropped_on_open() {
+        let path = temp_db_path("sealed-readers");
+        let version = {
+            let db = Database::open_at(&path).expect("open db");
+            let version = db.schema_version();
+            let conn = db.conn.lock();
+            conn.execute_batch(
+                "CREATE TABLE sealed_offer_readers (
+                    member_pubkey TEXT PRIMARY KEY,
+                    last_seen INTEGER NOT NULL
+                 );
+                 INSERT INTO sealed_offer_readers VALUES ('a1', 1000);",
+            )
+            .expect("1.7.x table");
+            version
+        };
+        let db = Database::open_at(&path).expect("reopen db");
+        assert_eq!(db.schema_version(), version);
+        let tables: i64 = db
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sealed_offer_readers'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
         drop(db);
         remove_temp_db(&path);
     }
@@ -22945,7 +23788,7 @@ mod tests {
         id
     }
 
-    /// A member who sends both forms of each line, as 1.7.5 does.
+    /// A member who sends both forms of each line, as 1.7.5 to 1.7.8 do.
     struct V2Author {
         key: ed25519_dalek::SigningKey,
         hex: String,
@@ -22964,13 +23807,13 @@ mod tests {
             channel_id: &str,
             sent: i64,
             typed: &str,
-        ) -> (String, String, crate::network::ember::channel::OutgoingChat) {
+        ) -> (String, String, crate::network::ember::channel::OutgoingChat17) {
             use crate::network::ember::channel as ch;
             let channel: [u8; 16] = hex::decode(channel_id).unwrap().try_into().unwrap();
             let line_id = ch::new_chat_msg_id(&channel, &self.key.verifying_key().to_bytes(), sent);
             let legacy = crate::security::sanitize_outgoing_message_text(typed).unwrap();
             let v2 = ch::chat_v2_outgoing_text(typed, &legacy, None);
-            let chat = ch::outgoing_chat_line(&self.key, &channel, &line_id, sent, &legacy, &v2, None).unwrap();
+            let chat = ch::outgoing_chat_line_1_7(&self.key, &channel, &line_id, sent, &legacy, &v2, None).unwrap();
             (hex::encode(line_id), legacy, chat)
         }
 
@@ -22981,20 +23824,20 @@ mod tests {
             sent: i64,
             edited_at: i64,
             typed: &str,
-        ) -> (String, crate::network::ember::channel::OutgoingChat) {
+        ) -> (String, crate::network::ember::channel::OutgoingChat17) {
             use crate::network::ember::channel as ch;
             let channel: [u8; 16] = hex::decode(channel_id).unwrap().try_into().unwrap();
             let target: [u8; 16] = hex::decode(line_id).unwrap().try_into().unwrap();
             let legacy = crate::security::sanitize_outgoing_message_text(typed).unwrap();
             let v2 = ch::chat_v2_outgoing_text(typed, &legacy, None);
             let chat =
-                ch::outgoing_chat_edit(&self.key, &channel, &target, sent, edited_at, &legacy, &v2, None).unwrap();
+                ch::outgoing_chat_edit_1_7(&self.key, &channel, &target, sent, edited_at, &legacy, &v2, None).unwrap();
             (legacy, chat)
         }
     }
 
-    fn legacy_sig(chat: &crate::network::ember::channel::OutgoingChat) -> String {
-        hex::encode(chat.legacy.as_ref().unwrap().1)
+    fn legacy_sig(chat: &crate::network::ember::channel::OutgoingChat17) -> String {
+        hex::encode(chat.legacy.1)
     }
 
     const JOINED: &str = "\u{2764}\u{FE0F} see you \u{1F468}\u{200D}\u{1F469}";
@@ -24538,32 +25381,28 @@ mod tests {
             None,
         )
         .expect("insert other");
-        let walked = db
-            .walk_out_deleted_channels(std::slice::from_ref(&other_id))
+        db.note_registry_deleted(std::slice::from_ref(&other_id), true, 100)
             .unwrap();
-        assert_eq!(walked, vec![other_id.clone()]);
-        let hidden = db.get_channel(&other_id).unwrap().unwrap();
-        assert!(!hidden.in_room);
+        assert_eq!(db.rooms_listed_deleted_in().unwrap(), vec![other_id.clone()]);
+        let listed = db.get_channel(&other_id).unwrap().unwrap();
         assert!(
-            !hidden.deleted,
+            !listed.deleted,
             "the directory is an unsigned hint: it walks a device out, it does \
              not tombstone a room beyond recovery"
         );
-        assert!(
-            db.set_channel_in_room(&other_id, true).unwrap(),
-            "a room the directory was wrong about must be re-enterable"
-        );
+        // A complete list that no longer names it takes the mark off.
+        db.note_registry_deleted(&[], true, 200).unwrap();
+        assert!(!db.registry_lists_deleted(&other_id).unwrap());
 
         // A room of its own, not the tombstoned one above: reusing that id made
         // this a duplicate insert, so the owner case below was never reached.
         let owned_id = "99".repeat(16);
         db.insert_channel(&owned_id, &"34".repeat(32), "Mine", "public", true, None, None)
             .expect("insert owned");
-        let owned_walk = db
-            .walk_out_deleted_channels(std::slice::from_ref(&owned_id))
+        db.note_registry_deleted(std::slice::from_ref(&owned_id), true, 300)
             .unwrap();
         assert!(
-            owned_walk.is_empty(),
+            db.rooms_listed_deleted_in().unwrap().is_empty(),
             "a room we own is not walked out on the directory's say-so"
         );
         assert!(db.get_channel(&owned_id).unwrap().unwrap().in_room);
@@ -25153,27 +25992,37 @@ mod tests {
         db.insert_channel_key_epoch(&channel_id, 4, &[4u8; 32]).unwrap();
         db.insert_channel_key_epoch(&channel_id, 6, &[6u8; 32]).unwrap();
         assert_eq!(
-            db.newest_missing_channel_key_epoch(&channel_id, 3, 6).unwrap(),
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 6, &[]).unwrap(),
             Some(5),
             "the gap has to be visible even though the newest epoch is held"
+        );
+        assert_eq!(
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 6, &[5]).unwrap(),
+            Some(3),
+            "an older epoch a lookup did not find is passed over for a while"
         );
 
         db.insert_channel_key_epoch(&channel_id, 5, &[5u8; 32]).unwrap();
         assert_eq!(
-            db.newest_missing_channel_key_epoch(&channel_id, 3, 6).unwrap(),
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 6, &[]).unwrap(),
             Some(3),
             "and then the next one down"
         );
         db.insert_channel_key_epoch(&channel_id, 3, &[3u8; 32]).unwrap();
         assert_eq!(
-            db.newest_missing_channel_key_epoch(&channel_id, 3, 6).unwrap(),
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 6, &[]).unwrap(),
             None,
             "nothing left to chase"
         );
         // Newest first, because holding the current epoch is what unblocks sending.
         assert_eq!(
-            db.newest_missing_channel_key_epoch(&channel_id, 3, 8).unwrap(),
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 8, &[]).unwrap(),
             Some(8)
+        );
+        assert_eq!(
+            db.newest_missing_channel_key_epoch(&channel_id, 3, 8, &[8, 7]).unwrap(),
+            Some(8),
+            "the current epoch is never passed over"
         );
 
         drop(db);
@@ -25792,6 +26641,272 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// The cut-over owes each private room we own one rotation, the first
+    /// time it is taken, and no room we only belong to, that is public or that
+    /// we deleted. A private room recovered onto the device afterwards is owed
+    /// its own.
+    #[test]
+    fn the_cut_over_owes_each_owned_private_room_one_rotation() {
+        use crate::network::ember::channel::{ChannelIdentity, V1_CUT_OVER};
+
+        let (db, path) = handoff_test_db("cut-over");
+        let owned_private = ChannelIdentity::generate();
+        let owned_public = ChannelIdentity::generate();
+        let joined_private = ChannelIdentity::generate();
+        let deleted_private = ChannelIdentity::generate();
+        for (room, visibility, owner) in [
+            (&owned_private, "private", true),
+            (&owned_public, "public", true),
+            (&joined_private, "private", false),
+            (&deleted_private, "private", true),
+        ] {
+            let seed = room.seed();
+            db.insert_channel(
+                &hex::encode(room.channel_id),
+                &hex::encode(room.pubkey),
+                "Room",
+                visibility,
+                owner,
+                owner.then_some(&seed),
+                Some(&[0x31; 32]),
+            )
+            .unwrap();
+        }
+        db.tombstone_channel(&hex::encode(deleted_private.channel_id)).unwrap();
+
+        // A room recovered before the cut-over is taken is marked by the take.
+        let early = ChannelIdentity::generate();
+        let early_id = hex::encode(early.channel_id);
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&early_id, &hex::encode(early.pubkey), "Early", "private", &early.seed(), None, &[0x41; 16])
+                .unwrap(),
+            RecoveredChannel::Inserted
+        );
+        assert!(!db.channel_rotate_is_pending(&early_id).unwrap(), "not owed before the take");
+
+        assert_eq!(db.take_channel_cut_over_rotations(V1_CUT_OVER, 100).unwrap(), 2);
+        assert!(db.channel_rotate_is_pending(&hex::encode(owned_private.channel_id)).unwrap());
+        assert!(db.channel_rotate_is_pending(&early_id).unwrap());
+        assert!(!db.channel_rotate_is_pending(&hex::encode(owned_public.channel_id)).unwrap());
+        assert!(!db.channel_rotate_is_pending(&hex::encode(joined_private.channel_id)).unwrap());
+        assert!(!db.channel_rotate_is_pending(&hex::encode(deleted_private.channel_id)).unwrap());
+
+        // Rotated, then started again: it is owed nothing more.
+        db.clear_channel_rotate_pending(&hex::encode(owned_private.channel_id)).unwrap();
+        db.clear_channel_rotate_pending(&early_id).unwrap();
+        assert_eq!(db.take_channel_cut_over_rotations(V1_CUT_OVER, 200).unwrap(), 0);
+        assert!(!db.channel_rotate_is_pending(&hex::encode(owned_private.channel_id)).unwrap());
+
+        // Recovered after the take: private rooms are owed their rotation,
+        // public ones nothing, and one already held with its seed nothing more.
+        let late_private = ChannelIdentity::generate();
+        let late_public = ChannelIdentity::generate();
+        for (room, visibility) in [(&late_private, "private"), (&late_public, "public")] {
+            assert_eq!(
+                db.adopt_recovered_owned_channel(
+                    &hex::encode(room.channel_id),
+                    &hex::encode(room.pubkey),
+                    "Late",
+                    visibility,
+                    &room.seed(),
+                    None,
+                    &[0x42; 16],
+                )
+                .unwrap(),
+                RecoveredChannel::Inserted
+            );
+        }
+        assert!(db.channel_rotate_is_pending(&hex::encode(late_private.channel_id)).unwrap());
+        assert!(!db.channel_rotate_is_pending(&hex::encode(late_public.channel_id)).unwrap());
+        assert_eq!(
+            db.adopt_recovered_owned_channel(&early_id, &hex::encode(early.pubkey), "Early", "private", &early.seed(), None, &[0x41; 16])
+                .unwrap(),
+            RecoveredChannel::AlreadyOwned
+        );
+        assert!(!db.channel_rotate_is_pending(&early_id).unwrap());
+        drop_handoff_test_db(db, path);
+    }
+
+    /// A rotation mints an epoch only while the room holds neither it nor a
+    /// later one and has not been told of one, though the same secret again is
+    /// still taken as a re-fetch. A fetched key older than every epoch kept is
+    /// reported as not kept.
+    #[test]
+    fn a_rotation_mints_an_epoch_once() {
+        let (db, path) = handoff_test_db("mint");
+        let id = "7d".repeat(16);
+        db.insert_channel(&id, &"8e".repeat(32), "Room", "private", true, Some(&[0x33; 32]), Some(&[7; 32]))
+            .unwrap();
+        assert!(db.mint_channel_key_epoch(&id, 1, &[1; 32]).unwrap());
+        assert!(!db.mint_channel_key_epoch(&id, 1, &[1; 32]).unwrap(), "already minted");
+        db.insert_channel_key_epoch(&id, 1, &[1; 32]).unwrap();
+        assert!(db.insert_channel_key_epoch(&id, 1, &[2; 32]).is_err(), "nor replaced");
+        db.insert_channel_key_epoch(&id, 3, &[3; 32]).unwrap();
+        assert!(!db.mint_channel_key_epoch(&id, 2, &[2; 32]).unwrap(), "behind what is held");
+        assert!(db.mint_channel_key_epoch(&id, 4, &[4; 32]).unwrap());
+        assert_eq!(db.get_channel(&id).unwrap().unwrap().key_epoch, 4);
+
+        // Another device of this identity announced epoch 6.
+        db.apply_channel_moderation(&id, "", "", 1_000, &[], &[], None, None, None, Some(6), None, None)
+            .unwrap();
+        assert!(!db.mint_channel_key_epoch(&id, 5, &[5; 32]).unwrap(), "behind what was announced");
+        assert!(!db.mint_channel_key_epoch(&id, 6, &[6; 32]).unwrap(), "the other device's");
+        assert!(db.mint_channel_key_epoch(&id, 7, &[7; 32]).unwrap());
+
+        // Held now: 7, 4, 3, 1. Epoch 0 would be the oldest of five.
+        assert!(!db.store_fetched_channel_key_epoch(&id, 0, &[0; 32]).unwrap(), "dropped on arrival");
+        assert!(db.store_fetched_channel_key_epoch(&id, 6, &[6; 32]).unwrap());
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Renewals are kept per held epoch, oldest first, with nothing on record
+    /// for one never renewed; one for an epoch no longer held goes.
+    #[test]
+    fn epoch_renewals_follow_the_epochs_held() {
+        let (db, path) = handoff_test_db("renewals");
+        let id = "6c".repeat(16);
+        db.insert_channel(&id, &"8e".repeat(32), "Room", "private", true, Some(&[0x33; 32]), Some(&[7; 32]))
+            .unwrap();
+        for epoch in 1..=3 {
+            db.insert_channel_key_epoch(&id, epoch, &[epoch as u8; 32]).unwrap();
+        }
+        db.note_channel_epoch_renewed(&id, 2, 100).unwrap();
+        db.note_channel_epoch_renewed(&id, 2, 200).unwrap();
+        db.note_channel_epoch_renewed(&id, 1, 50).unwrap();
+        assert_eq!(db.channel_epoch_renewals(&id).unwrap(), vec![(1, Some(50)), (2, Some(200)), (3, None)]);
+        for epoch in 4..=5 {
+            db.insert_channel_key_epoch(&id, epoch, &[epoch as u8; 32]).unwrap();
+        }
+        assert_eq!(
+            db.channel_epoch_renewals(&id).unwrap(),
+            vec![(2, Some(200)), (3, None), (4, None), (5, None)],
+            "epoch 1 dropped by the retention, and its renewal with it"
+        );
+        let held: i64 = db
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM channel_epoch_renewals WHERE channel_id = ?1", params![id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(held, 1);
+        drop_handoff_test_db(db, path);
+    }
+
+    /// v1 sightings count only past the cut-over's rotation and in the current
+    /// epoch, and a room that had them rotates a second time once walks have
+    /// watched it for the quiet span without one, or once the grace span from
+    /// the first has passed, and never a third. A gap between walks counts
+    /// only up to the span one walk covers.
+    #[test]
+    fn v1_sightings_owe_one_second_rotation_once_they_stop() {
+        use crate::network::ember::channel::{ChannelIdentity, V1_CUT_OVER};
+
+        let (db, path) = handoff_test_db("relink");
+        let (quiet, grace, gap_cap) = (100, 1_000, 30);
+        let owned = |name: &str| {
+            let room = ChannelIdentity::generate();
+            let id = hex::encode(room.channel_id);
+            db.insert_channel(&id, &hex::encode(room.pubkey), name, "private", true, Some(&room.seed()), Some(&[7; 32]))
+                .unwrap();
+            db.insert_channel_key_epoch(&id, 1, &[1; 32]).unwrap();
+            id
+        };
+        let room = owned("Quiet");
+        let busy = owned("Busy");
+        let silent = owned("Silent");
+        let sighted = |id: &str| {
+            db.conn
+                .lock()
+                .query_row("SELECT epoch, first_at, quiet_secs FROM channel_v1_sightings WHERE channel_id = ?1", params![id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                })
+                .optional()
+                .unwrap()
+        };
+        let walk = |id: &str, epoch: i64, saw_v1: bool, at: i64| {
+            db.note_channel_v1_walk(id, V1_CUT_OVER, epoch, saw_v1, at, gap_cap).unwrap();
+        };
+
+        // Before the cut-over, and while its rotation is pending, every member
+        // published both forms: nothing counts.
+        walk(&room, 1, true, 10);
+        assert_eq!(sighted(&room), None);
+        db.take_channel_cut_over_rotations(V1_CUT_OVER, 10).unwrap();
+        walk(&room, 1, true, 20);
+        assert_eq!(sighted(&room), None, "the cut-over's rotation is still owed");
+        for id in [&room, &busy, &silent] {
+            db.clear_channel_rotate_pending(id).unwrap();
+        }
+
+        walk(&room, 2, true, 30);
+        assert_eq!(sighted(&room), None, "not the room's current epoch");
+        walk(&room, 1, true, 30);
+        walk(&room, 1, true, 40);
+        assert_eq!(sighted(&room), Some((1, 30, 0)));
+        walk(&room, 1, false, 60);
+        walk(&room, 1, false, 70);
+        assert_eq!(sighted(&room), Some((1, 30, 30)));
+        walk(&room, 2, false, 90);
+        assert_eq!(sighted(&room), Some((1, 30, 30)), "a walk of another epoch says nothing");
+        walk(&room, 1, false, 500);
+        assert_eq!(sighted(&room), Some((1, 30, 30 + gap_cap)), "time no walk covered is not quiet");
+        assert!(!db.take_channel_relink_rotation(&room, 500, quiet, grace).unwrap());
+        walk(&room, 1, true, 510);
+        assert_eq!(sighted(&room), Some((1, 30, 0)), "a sighting starts the quiet span over");
+        for at in [540, 570, 600] {
+            walk(&room, 1, false, at);
+        }
+        assert!(!db.take_channel_relink_rotation(&room, 600, quiet, grace).unwrap());
+        walk(&room, 1, false, 610);
+        assert!(db.take_channel_relink_rotation(&room, 610, quiet, grace).unwrap());
+        assert!(db.channel_rotate_is_pending(&room).unwrap());
+        db.clear_channel_rotate_pending(&room).unwrap();
+        walk(&room, 1, true, 700);
+        assert_eq!(sighted(&room), None, "a room gets the second rotation once");
+        assert!(!db.take_channel_relink_rotation(&room, 5_000, quiet, grace).unwrap());
+
+        // Sightings that never stop still rotate once the grace span is up.
+        for at in (30..=1_030).step_by(50) {
+            walk(&busy, 1, true, at);
+        }
+        assert!(db.take_channel_relink_rotation(&busy, 1_030, quiet, grace).unwrap());
+
+        // A rotation between sightings carries them into the new epoch, whose
+        // quiet span starts over and whose grace still counts from the first.
+        let carried = owned("Carried");
+        db.clear_channel_rotate_pending(&carried).unwrap();
+        walk(&carried, 1, true, 30);
+        walk(&carried, 1, false, 50);
+        db.insert_channel_key_epoch(&carried, 2, &[2; 32]).unwrap();
+        walk(&carried, 1, false, 60);
+        assert_eq!(sighted(&carried), Some((1, 30, 20)), "a walk of the epoch before says nothing");
+        walk(&carried, 2, false, 70);
+        assert_eq!(sighted(&carried), Some((2, 30, 0)));
+        for at in [100, 130, 160] {
+            walk(&carried, 2, false, at);
+        }
+        assert!(!db.take_channel_relink_rotation(&carried, 160, quiet, grace).unwrap());
+        walk(&carried, 2, false, 170);
+        assert!(db.take_channel_relink_rotation(&carried, 170, quiet, grace).unwrap());
+
+        // The grace span holds however the room moved since, walked or not.
+        let left = owned("Left");
+        db.clear_channel_rotate_pending(&left).unwrap();
+        walk(&left, 1, true, 30);
+        db.insert_channel_key_epoch(&left, 2, &[2; 32]).unwrap();
+        assert!(!db.take_channel_relink_rotation(&left, 30 + grace - 1, quiet, grace).unwrap());
+        assert!(db.take_channel_relink_rotation(&left, 30 + grace, quiet, grace).unwrap());
+
+        // No sighting: the cut-over's rotation was enough, however long the
+        // walks watch.
+        for at in (30..=5_000).step_by(20) {
+            walk(&silent, 1, false, at);
+        }
+        assert_eq!(sighted(&silent), None);
+        assert!(!db.take_channel_relink_rotation(&silent, 5_000, quiet, grace).unwrap());
+        assert!(!db.channel_rotate_is_pending(&silent).unwrap());
+        drop_handoff_test_db(db, path);
     }
 
     /// Each member builds the successor's key from whichever epoch of the old
@@ -27430,6 +28545,153 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The download history names a file by its hash in any case, with its
+    /// size; a row without a name gives nothing.
+    #[test]
+    fn the_download_history_names_files_whatever_the_hash_case() {
+        let path = std::env::temp_dir().join(format!("ember-history-names-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        let (named, unnamed) = ("AB".repeat(16), "cd".repeat(16));
+        db.record_download_history_batch(&[
+            (named.clone(), "Big Buck Bunny.mkv".to_string(), 725_106_140, "completed"),
+            (unnamed.clone(), String::new(), 10, "completed"),
+        ])
+        .unwrap();
+
+        let names = db
+            .download_history_names(&[named.to_ascii_lowercase(), unnamed.to_ascii_uppercase(), "ef".repeat(16)])
+            .unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[&named.to_ascii_lowercase()], ("Big Buck Bunny.mkv".to_string(), 725_106_140));
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// Settings lists the history newest first, every row with what it was
+    /// recorded as, and a row removed is gone from the list.
+    #[test]
+    fn the_download_history_lists_newest_first() {
+        let path = std::env::temp_dir().join(format!("ember-history-list-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        let (old, new) = ("AB".repeat(16), "CD".repeat(16));
+        db.record_download_history_batch(&[
+            (old.clone(), "Old film.mkv".to_string(), 700, "completed"),
+            (new.clone(), "New album.flac".to_string(), 300, "cancelled"),
+        ])
+        .unwrap();
+        db.conn.lock().execute("UPDATE download_history SET timestamp = 100 WHERE file_hash = ?1", params![old]).unwrap();
+        db.conn.lock().execute("UPDATE download_history SET timestamp = 200 WHERE file_hash = ?1", params![new]).unwrap();
+
+        let listed = db.download_history_entries().unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                DownloadHistoryEntry {
+                    file_hash: new.clone(),
+                    file_name: "New album.flac".into(),
+                    file_size: 300,
+                    status: "cancelled".into(),
+                    timestamp: 200,
+                },
+                DownloadHistoryEntry {
+                    file_hash: old.clone(),
+                    file_name: "Old film.mkv".into(),
+                    file_size: 700,
+                    status: "completed".into(),
+                    timestamp: 100,
+                },
+            ]
+        );
+        assert!(db.remove_download_history(&new.to_ascii_lowercase()).unwrap(), "in any case");
+        assert!(!db.remove_download_history(&new).unwrap(), "only once");
+        assert_eq!(db.download_history_entries().unwrap().len(), 1);
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// Marking every chat read leaves the disappearing messages nobody has
+    /// opened unread, their timers not started: reading is what starts them.
+    #[test]
+    fn marking_every_chat_read_leaves_unopened_disappearing_messages() {
+        let path = std::env::temp_dir().join(format!("ember-mark-all-read-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        let (friend, other) = ("ab".repeat(16), "cd".repeat(16));
+        db.insert_chat_message_ttl(&friend, "received", "plain", CHAT_DELIVERED, 0).unwrap();
+        let fleeting = db
+            .insert_chat_message_ttl(&friend, "received", "fleeting", CHAT_DELIVERED, 0)
+            .unwrap();
+        let hash = Database::friend_chat_body_hash_hex("fleeting");
+        assert_eq!(db.apply_peer_chat_ttl(&friend, &hash, 3_600).unwrap(), Some((fleeting, None)));
+        db.insert_chat_message_ttl(&other, "received", "hi", CHAT_DELIVERED, 0).unwrap();
+
+        let left = db.mark_all_chats_read().unwrap();
+        assert_eq!(left, vec![(friend.clone(), 1, fleeting)]);
+        assert!(db.chat_expiries(&friend, &[fleeting]).unwrap().is_empty(), "its timer has not started");
+
+        assert_eq!(db.mark_messages_read(&friend).unwrap().len(), 1, "opening the chat starts it");
+        assert!(db.mark_all_chats_read().unwrap().is_empty());
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn finished_downloads_past_the_newest_are_forgotten_with_their_web_sources() {
+        let path = std::env::temp_dir().join(format!("ember-finished-prune-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        let kept = FINISHED_TRANSFER_ROWS_KEPT as usize;
+        let hash = |i: usize| format!("{i:032x}");
+        {
+            let conn = db.conn.lock();
+            let tx = conn.unchecked_transaction().unwrap();
+            let insert = |id: &str, file_hash: &str, status: &str, started_at: i64| {
+                tx.execute(
+                    "INSERT INTO transfers (
+                        id, file_name, file_hash, peer_id, peer_name, direction, status,
+                        progress, speed, total_size, transferred, started_at, priority, category
+                     ) VALUES (?1, 'f.bin', ?2, '', '', 'download', ?3, 0, 0, 4, 0, ?4, 'normal', '')",
+                    params![id, file_hash, status, started_at],
+                )
+                .unwrap();
+            };
+            for i in 0..kept + 10 {
+                let status = if i % 2 == 0 { "completed" } else { "noneneeded" };
+                insert(&format!("done-{i}"), &hash(i), status, 100 + i as i64);
+            }
+            insert("old-paused", &"ab".repeat(16), "paused", 1);
+            insert("old-failed", &"cd".repeat(16), "failed", 2);
+            // Started before all the rest, finished after them.
+            insert("long-running", &"ef".repeat(16), "completed", 0);
+            tx.commit().unwrap();
+        }
+        db.record_download_history_batch(&[("ef".repeat(16), "f.bin".to_string(), 4, "completed")]).unwrap();
+        db.add_transfer_web_sources(&hash(0), &["http://example.invalid/old".into()]).unwrap();
+        db.add_transfer_web_sources(&hash(kept + 9), &["http://example.invalid/new".into()]).unwrap();
+
+        assert_eq!(db.prune_finished_transfers().unwrap(), 11);
+        assert_eq!(db.prune_finished_transfers().unwrap(), 0, "only the excess, once");
+        assert!((0..11).all(|i| !db.transfer_exists(&format!("done-{i}"))), "the oldest went");
+        assert!((11..kept + 10).all(|i| db.transfer_exists(&format!("done-{i}"))), "the newest stayed");
+        assert!(db.transfer_exists("long-running"), "finished last, so kept, however long ago it started");
+        assert!(db.transfer_exists("old-paused") && db.transfer_exists("old-failed"), "unfinished downloads stay");
+        let mut sources: Vec<String> = db.load_transfer_web_sources().unwrap().into_iter().map(|(h, _)| h).collect();
+        sources.sort();
+        assert_eq!(sources, vec![hash(kept + 9)], "a forgotten download's web sources go with it");
+
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
     #[test]
     fn web_sources_are_kept_per_file_and_pruned_with_their_download() {
         let path = std::env::temp_dir().join(format!(
@@ -27464,6 +28726,38 @@ mod tests {
         );
         db.delete_transfer_web_sources(&kept).unwrap();
         assert!(db.load_transfer_web_sources().unwrap().is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mirrors_kept_with_a_finished_file_are_capped_and_go_with_it() {
+        let path = std::env::temp_dir().join(format!(
+            "ember-library-mirrors-{}-{}.db",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let db = Database::open_at(&path).expect("open db");
+        let file = "AB".repeat(16);
+        let other = "cd".repeat(16);
+        let first: Vec<String> = (0..3).map(|i| format!("https://m{i}.example/f")).collect();
+        db.keep_library_web_mirrors(&file, &first).unwrap();
+        // Downloaded again: what it already kept stays, the rest fill the cap.
+        let again: Vec<String> = (2..9).map(|i| format!("https://m{i}.example/f")).collect();
+        db.keep_library_web_mirrors(&file, &again).unwrap();
+        db.keep_library_web_mirrors(&other, &first[..1]).unwrap();
+
+        let held = db.library_web_mirrors_for(&[file.clone(), other.clone(), "ef".repeat(16)]).unwrap();
+        let expected: Vec<String> = (0..5).map(|i| format!("https://m{i}.example/f")).collect();
+        assert_eq!(held.get(&file.to_ascii_lowercase()), Some(&expected));
+        assert_eq!(held.get(&other), Some(&first[..1].to_vec()));
+        assert_eq!(held.len(), 2, "a file with none is left out");
+
+        db.delete_library_web_mirrors(&file).unwrap();
+        let held = db.library_web_mirrors_for(&[file.clone(), other.clone()]).unwrap();
+        assert!(!held.contains_key(&file.to_ascii_lowercase()));
+        assert!(held.contains_key(&other));
 
         drop(db);
         let _ = std::fs::remove_file(&path);

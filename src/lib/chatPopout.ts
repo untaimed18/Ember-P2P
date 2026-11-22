@@ -20,10 +20,12 @@ import {
   type ChatTabOp,
 } from '$lib/stores/chatTabs';
 import { activeChatHash } from '$lib/stores/friends';
+import { isAcceptedFriendInput } from '$lib/friendCode';
 import { loadAppSettings } from '$lib/stores/settings';
 import { initTheme } from '$lib/stores/theme';
 import { toastError } from '$lib/stores/toast';
-import { chatWindowPresence, type ChatWindowPresence } from '$lib/windowRole';
+import { chatWindowPresence, isChatWindow, type ChatWindowPresence } from '$lib/windowRole';
+import { feedLinksIn } from '$lib/feedLinks';
 import {
   closeChatWindow,
   focusMainWindow,
@@ -45,6 +47,10 @@ import {
 
 const MODE_KEY = 'ember.chatDock.mode.v1';
 const BOUNDS_KEY = 'ember.chatWindow.bounds.v1';
+const REOPEN_KEY = 'ember.chatWindow.reopenAtLaunch.v1';
+/** In session storage, so a reload of the main window (a language change)
+ *  is not taken for a launch. */
+const LAUNCH_CHECKED_KEY = 'ember.chatWindow.launchChecked';
 
 const TAB_OP_EVENT = 'ember-ui:chat-tab-op';
 const PRESENCE_EVENT = 'ember-ui:chat-presence';
@@ -114,6 +120,32 @@ function loadBounds(): ChatWindowBounds | null {
 
 /** The chat is in its own window rather than the dock. */
 export const chatPoppedOut = writable<boolean>(readStorage(MODE_KEY) === 'window');
+
+/** Open the chat window when Ember starts if the chat was in it when Ember
+ *  closed. Kept on this device, as the mode is; off unless chosen, since
+ *  until then the window opened only once a conversation was. */
+export const chatReopenAtLaunch = writable<boolean>(readStorage(REOPEN_KEY) === '1');
+chatReopenAtLaunch.subscribe((on) => writeStorage(REOPEN_KEY, on ? '1' : '0'));
+
+/** The launch's one look at whether to reopen the chat window. Not when the
+ *  main window starts hidden (in the tray at login): the chat would be the
+ *  only window on screen. An update restart reopens it on its own when it
+ *  was open, and a second ask only brings it forward. */
+async function reopenAtLaunch() {
+  try {
+    if (sessionStorage.getItem(LAUNCH_CHECKED_KEY)) return;
+    sessionStorage.setItem(LAUNCH_CHECKED_KEY, '1');
+  } catch {
+    return;
+  }
+  if (!get(chatPoppedOut) || !get(chatReopenAtLaunch)) return;
+  try {
+    if (!(await getCurrentWindow().isVisible())) return;
+  } catch {
+    return;
+  }
+  await showChatWindow();
+}
 
 /** Drafts waiting for the chat window to ask for them. Held in memory only,
  *  for the reason the dock keeps its drafts off disk. */
@@ -201,7 +233,7 @@ function parsePresence(raw: unknown): ChatWindowPresence | null {
 }
 
 /** Pages the chat window may send the main window to. */
-const NAVIGABLE = new Set(['/friends']);
+const NAVIGABLE = new Set(['/friends', '/feeds']);
 
 export async function initChatPopoutMain(): Promise<() => void> {
   const unsubscribe = chatPoppedOut.subscribe((out) => {
@@ -229,16 +261,28 @@ export async function initChatPopoutMain(): Promise<() => void> {
         pendingDrafts = parseDrafts(e.payload?.drafts);
         pendingActiveHash = validHash(e.payload?.activeHash) ?? pendingActiveHash;
       }),
-      await listen<{ path?: unknown }>(NAVIGATE_EVENT, (e) => {
+      await listen<{ path?: unknown; add?: unknown; name?: unknown; follow?: unknown }>(NAVIGATE_EVENT, (e) => {
         const path = e.payload?.path;
-        if (typeof path === 'string' && NAVIGABLE.has(path)) {
-          void goto(path).catch((err) => console.warn('chat window: navigation failed', err));
-        }
+        if (typeof path !== 'string' || !NAVIGABLE.has(path)) return;
+        // Only fills the Add or Follow form: adding a friend or following a
+        // feed stays a click in this window.
+        const add = e.payload?.add;
+        const name = typeof e.payload?.name === 'string' ? e.payload.name : '';
+        const follow = typeof e.payload?.follow === 'string' ? feedLinksIn(e.payload.follow) : [];
+        const target =
+          path === '/friends' && typeof add === 'string' && isAcceptedFriendInput(add)
+            ? friendsAddPath(add, name)
+            : path === '/feeds' && follow.length === 1
+              ? feedsPrefillPath(follow[0])
+              : path;
+        void goto(target).catch((err) => console.warn('chat window: navigation failed', err));
       }),
     );
   } catch (e) {
     console.warn('chat popout: listener registration failed', e);
   }
+  // After the listeners, so the window's ready handshake is heard.
+  void reopenAtLaunch();
   return () => {
     unsubscribe();
     setChatPopout(null);
@@ -288,6 +332,43 @@ export async function dockBack(): Promise<void> {
 export function showInMainWindow(path: string) {
   void emit(NAVIGATE_EVENT, { path }).catch(() => {});
   void focusMainWindow().catch(() => {});
+}
+
+/** Show the main window's Friends page with `code` and the name they go by
+ *  in its Add form, from the chat window, which cannot add friends itself. */
+export function addFriendInMainWindow(code: string, name: string) {
+  void emit(NAVIGATE_EVENT, { path: '/friends', add: code, name }).catch(() => {});
+  void focusMainWindow().catch(() => {});
+}
+
+/** The Feeds page following the feed `link` names, or opening it when it is
+ *  followed already or one of ours. */
+export function feedsFollowPath(link: string): string {
+  return `/feeds?follow=${encodeURIComponent(link)}`;
+}
+
+/** The Feeds page with its Follow box filled with `link`, for what the chat
+ *  window asks: following stays a click in the main window. */
+export function feedsPrefillPath(link: string): string {
+  return `/feeds?prefill=${encodeURIComponent(link)}`;
+}
+
+/** Follow or open the feed a link in a message names, in the main window:
+ *  the chat window cannot follow a feed itself. */
+export function openFeedLink(link: string) {
+  if (isChatWindow()) {
+    void emit(NAVIGATE_EVENT, { path: '/feeds', follow: link }).catch(() => {});
+    void focusMainWindow().catch(() => {});
+  } else {
+    void goto(feedsFollowPath(link)).catch((err) => console.warn('feed link: navigation failed', err));
+  }
+}
+
+/** The Friends page with its Add form filled: `code`, and `name` when there
+ *  is one. */
+export function friendsAddPath(code: string, name: string): string {
+  const shown = name.trim().slice(0, 256);
+  return `/friends?add=${encodeURIComponent(code.trim())}${shown ? `&name=${encodeURIComponent(shown)}` : ''}`;
 }
 
 /**

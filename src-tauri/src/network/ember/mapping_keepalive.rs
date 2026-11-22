@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
 
 use super::nat::{
@@ -71,7 +71,7 @@ async fn lookup_ipv4(
     host: impl tokio::net::ToSocketAddrs,
     label: &str,
 ) -> Result<SocketAddr, String> {
-    let mut resolved = tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(host))
+    let mut resolved = tokio::time::timeout(DNS_TIMEOUT, crate::net_bind::lookup_host(host))
         .await
         .map_err(|_| format!("DNS {label}: timed out"))?
         .map_err(|e| format!("DNS {label}: {e}"))?;
@@ -98,12 +98,7 @@ pub async fn tcp_stun_mapped_addr_on_port(local_port: u16) -> Option<SocketAddr>
 async fn tcp_stun_exchange(local_port: u16, server: &str) -> Result<SocketAddr, String> {
     let server_addr = lookup_ipv4(server, server).await?;
 
-    let tcp = TcpSocket::new_v4().map_err(|e| format!("socket: {e}"))?;
-    tcp.set_reuseaddr(true)
-        .map_err(|e| format!("reuseaddr: {e}"))?;
-    tcp.bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, local_port)))
-        .map_err(|e| format!("bind {local_port}: {e}"))?;
-    let mut stream = tokio::time::timeout(STUN_TIMEOUT, tcp.connect(server_addr))
+    let mut stream = tokio::time::timeout(STUN_TIMEOUT, crate::net_bind::tcp_connect_from(local_port, server_addr))
         .await
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("connect: {e}"))?;
@@ -242,14 +237,7 @@ async fn open_tcp_mapping_hold(local_port: u16) -> Option<TcpStream> {
 async fn tcp_hold_connect(local_port: u16, host: &str, port: u16) -> Result<TcpStream, String> {
     let remote = lookup_ipv4((host, port), host).await?;
 
-    let tcp = TcpSocket::new_v4().map_err(|e| format!("socket: {e}"))?;
-    tcp.set_reuseaddr(true)
-        .map_err(|e| format!("reuseaddr: {e}"))?;
-    let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, local_port));
-    tcp.bind(bind_addr)
-        .map_err(|e| format!("bind {local_port}: {e}"))?;
-
-    let stream = tokio::time::timeout(Duration::from_secs(8), tcp.connect(remote))
+    let stream = tokio::time::timeout(Duration::from_secs(8), crate::net_bind::tcp_connect_from(local_port, remote))
         .await
         .map_err(|_| "connect timeout".to_string())?
         .map_err(|e| format!("connect: {e}"))?;

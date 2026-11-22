@@ -10,6 +10,11 @@ export function shortcutModSymbol(): string {
   return isApplePlatform() ? '\u2318' : m.shortcuts_key_ctrl();
 }
 
+/** Visible Alt key: ⌥ (Option) on Apple, Alt (as the active locale names it) elsewhere. */
+export function shortcutAltSymbol(): string {
+  return isApplePlatform() ? '\u2325' : m.shortcuts_key_alt();
+}
+
 /** `aria-keyshortcuts` token: Meta on Apple, Control elsewhere. */
 export function shortcutModAria(): string {
   return isApplePlatform() ? 'Meta' : 'Control';

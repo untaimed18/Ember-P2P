@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tauri::Emitter;
+use crate::host::Emitter;
 use tracing::{debug, info, warn};
 
 use super::ed2k::messages::{
@@ -231,25 +231,25 @@ fn retryable(direction: &str, status: &str) -> bool {
     }
 }
 
-pub(crate) fn emit_row(app: &tauri::AppHandle, row: &ChatAttachmentRow) {
+pub(crate) fn emit_row(app: &crate::host::AppHandle, row: &ChatAttachmentRow) {
     let _ = app.emit(ATTACH_EVENT, ChatAttachmentInfo::from_row(row));
 }
 
-fn emit_by_id(app: &tauri::AppHandle, db: &Database, xfer_hex: &str) {
+fn emit_by_id(app: &crate::host::AppHandle, db: &Database, xfer_hex: &str) {
     if let Some(row) = db.chat_attachment(xfer_hex) {
         emit_row(app, &row);
     }
 }
 
 /// A row the periodic sweep just expired.
-pub(crate) fn emit_expired(app: &tauri::AppHandle, db: &Database, xfer_hex: &str) {
+pub(crate) fn emit_expired(app: &crate::host::AppHandle, db: &Database, xfer_hex: &str) {
     emit_by_id(app, db, xfer_hex);
 }
 
 /// A progress tick, built from a snapshot. The stored status is still read
 /// first: a cancel can land between two chunks, and a tick after it would set
 /// a stopped bubble moving again.
-fn emit_progress(app: &tauri::AppHandle, db: &Database, row: &ChatAttachmentRow, transferred: u64) {
+fn emit_progress(app: &crate::host::AppHandle, db: &Database, row: &ChatAttachmentRow, transferred: u64) {
     if db
         .chat_attachment(&row.xfer_id)
         .is_none_or(|current| is_terminal(&current.status))
@@ -792,7 +792,7 @@ fn unanswerable(status: Option<&str>) -> String {
 pub(super) async fn send_offer(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     friend: [u8; 16],
     xfer_id: [u8; 16],
@@ -873,7 +873,7 @@ fn queue_full() -> String {
 #[allow(clippy::too_many_arguments)]
 fn queue_offer(
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     friend: [u8; 16],
     xfer_hex: &str,
     name: &str,
@@ -921,7 +921,7 @@ fn queue_offer(
 pub(super) async fn send_queued(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     friend: [u8; 16],
 ) {
@@ -1058,7 +1058,7 @@ async fn offer_again_body(
 async fn reoffer(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     friend: [u8; 16],
     xfer_id: [u8; 16],
@@ -1117,7 +1117,7 @@ async fn reoffer(
 pub(super) async fn retry(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     xfer_id: [u8; 16],
 ) -> Result<(), String> {
@@ -1192,7 +1192,7 @@ pub(super) async fn retry(
 pub(super) async fn on_reply(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     friend: [u8; 16],
     xfer_id: [u8; 16],
@@ -1313,7 +1313,7 @@ pub(super) async fn on_reply(
 async fn on_friend_retry(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     friend: [u8; 16],
     xfer_id: [u8; 16],
@@ -1478,7 +1478,7 @@ impl ServeProgress {
     pub(crate) fn note(
         &mut self,
         db: &Database,
-        app: &tauri::AppHandle,
+        app: &crate::host::AppHandle,
         xfer_id: &[u8; 16],
         peer_hex: &str,
         position: u64,
@@ -1538,7 +1538,7 @@ impl ServeProgress {
     /// The stream is over. `delivered` is whether the friend acknowledged
     /// every byte. Only then is the row finished — otherwise it is left for
     /// the friend's retry or its cancel to settle.
-    pub(crate) fn finish(&self, db: &Database, app: &tauri::AppHandle, delivered: bool) {
+    pub(crate) fn finish(&self, db: &Database, app: &crate::host::AppHandle, delivered: bool) {
         let Some(row) = &self.row else {
             return;
         };
@@ -1564,7 +1564,7 @@ impl ServeProgress {
 pub(super) async fn on_offer(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     friend: [u8; 16],
@@ -1772,7 +1772,7 @@ fn receive_running(state: &NetworkState, xfer_id: &[u8; 16]) -> bool {
 async fn on_reoffer(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     friend: [u8; 16],
@@ -1858,7 +1858,7 @@ async fn on_reoffer(
 async fn try_auto_accept(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     friend: [u8; 16],
@@ -1927,7 +1927,7 @@ pub(super) fn auto_accept_allowed(
 /// holds no earlier than ours (see [`HELD_OFFER_GRANT_SECS`]). A re-offer we
 /// asked for with "Try again" may have gone out already accepted, which it
 /// would hold until the grant ran out, so the sender hears it lapsed.
-async fn prune_inbound(state: &mut NetworkState, db: &Database, app: &tauri::AppHandle, now: i64) {
+async fn prune_inbound(state: &mut NetworkState, db: &Database, app: &crate::host::AppHandle, now: i64) {
     let lapsed = {
         let sessions = state.ember_sessions.read().await;
         settle_lapsed(db, &mut state.attach_inbound, &sessions, now)
@@ -1956,7 +1956,7 @@ fn settle_lapsed(
         .collect()
 }
 
-fn emit_lapsed(app: &tauri::AppHandle, db: &Database, lapsed: &[[u8; 16]]) {
+fn emit_lapsed(app: &crate::host::AppHandle, db: &Database, lapsed: &[[u8; 16]]) {
     for id in lapsed {
         emit_by_id(app, db, &hex::encode(id));
     }
@@ -1982,7 +1982,7 @@ fn take_lapsed(
 pub(super) async fn respond(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     xfer_id: [u8; 16],
@@ -2075,7 +2075,7 @@ fn accept_dial(
 async fn accept_offer(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     credits: &Arc<tokio::sync::RwLock<CreditManager>>,
     xfer_id: [u8; 16],
@@ -2187,7 +2187,7 @@ async fn accept_offer(
 
 struct FetchCtx {
     db: Arc<Database>,
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
     endpoint: Arc<quinn::Endpoint>,
     seed: [u8; 32],
     our_pubkey: [u8; 32],
@@ -2701,7 +2701,7 @@ fn retry_owed_at(
 pub(super) async fn on_held(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     friend: [u8; 16],
     xfer_id: Option<[u8; 16]>,
 ) {
@@ -2857,7 +2857,7 @@ fn record_lapses(db: &Database, moved: &[([u8; 16], i64)]) {
 /// they hold may be what they let go, so it goes back on five minutes and is
 /// named again with every other offer of theirs still waiting; their echo
 /// gives the day back.
-async fn on_friend_waits(state: &mut NetworkState, db: &Database, app: &tauri::AppHandle, friend: [u8; 16]) {
+async fn on_friend_waits(state: &mut NetworkState, db: &Database, app: &crate::host::AppHandle, friend: [u8; 16]) {
     let now = chrono::Utc::now().timestamp();
     let lapsed = {
         let sessions = state.ember_sessions.read().await;
@@ -2895,7 +2895,7 @@ fn friend_waits_at(
 pub(super) async fn on_session_ended(
     state: &mut NetworkState,
     db: &Database,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     friend: [u8; 16],
     newer_session_active: bool,
 ) {
@@ -3051,7 +3051,7 @@ fn look_at_held(db: &Database, xfer_id: &[u8; 16], last: Option<&SourceStamp>) -
 pub(super) async fn apply_held_look(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     looked: HeldLooked,
 ) {
     let HeldLooked { xfer_id, look } = looked;
@@ -3162,7 +3162,7 @@ fn remove_part_files(download_folders: &[String], xfer_id: &[u8; 16]) {
 pub(super) async fn cancel(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     xfer_id: [u8; 16],
 ) -> Result<(), String> {
@@ -3201,7 +3201,7 @@ pub(super) async fn cancel(
 pub(super) fn on_cancel(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     settings: &AppSettings,
     friend: [u8; 16],
     xfer_id: [u8; 16],

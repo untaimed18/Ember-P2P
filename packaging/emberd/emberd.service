@@ -1,0 +1,54 @@
+# emberd as a systemd service. The .deb installs it, with the emberd user and
+# /usr/bin/emberd. From the tarball, unpacked to /opt/emberd:
+#
+#   sudo useradd --system --home-dir /var/lib/emberd --shell /usr/sbin/nologin emberd
+#   sudo ln -s /opt/emberd/emberd /usr/local/bin/emberd
+#   sudo install -Dm644 emberd.service /etc/systemd/system/emberd.service
+#   sudo install -Dm644 emberd.toml /etc/emberd/emberd.toml
+#   sudo systemctl enable --now emberd
+#   journalctl -u emberd        (the setup code for the first visit is here)
+#
+# Ember's data is in /var/lib/emberd/data and, unless the config file says
+# otherwise, downloads go to /var/lib/emberd/Downloads/Ember.
+
+[Unit]
+Description=Ember P2P file sharing, without a window (emberd)
+Documentation=https://www.emberp2p.org/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=emberd
+Group=emberd
+ExecStart=/opt/emberd/emberd --config /etc/emberd/emberd.toml
+# Settings can ask for a restart; emberd does it in place, as the same
+# process, so systemd sees it keep running.
+Restart=on-failure
+RestartSec=5
+# Ember saves its transfers and its database before it stops.
+TimeoutStopSec=60
+# Its home is its state folder: the default download folder is under it, and
+# Ember allows the path to the home folder where it allows no other system
+# folder.
+Environment=HOME=/var/lib/emberd
+Environment=EMBER_DATA_DIR=/var/lib/emberd/data
+StateDirectory=emberd
+StateDirectoryMode=0700
+# The command line's socket, /run/emberd/emberd.sock, open to the emberd
+# group: `sudo usermod -aG emberd $USER` lets you run `emberd ctl` as yourself.
+RuntimeDirectory=emberd
+RuntimeDirectoryMode=0750
+UMask=0077
+LimitNOFILE=8192
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

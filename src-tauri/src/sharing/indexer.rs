@@ -136,9 +136,27 @@ fn folder_gone_from_recorded_volume(
         .unwrap_or(false)
 }
 
+/// What a flat entry's last component is: a NUL, which no file or folder on
+/// any system can be named, so the entry is never a path that exists.
+const FLAT_ENTRY_NAME: char = '\0';
+
+/// The allowlist entry that offers the files directly in `folder` and nothing
+/// in its subfolders, including files added later: a flat share, as eMule
+/// shares a folder. It sits under its folder like any entry, so moving,
+/// clearing and tidying a list carry it unchanged.
+pub(crate) fn flat_entry(folder: &str) -> String {
+    let key = normalize_path_key(folder);
+    if key.ends_with(std::path::MAIN_SEPARATOR) {
+        format!("{key}{FLAT_ENTRY_NAME}")
+    } else {
+        format!("{key}{}{FLAT_ENTRY_NAME}", std::path::MAIN_SEPARATOR)
+    }
+}
+
 /// Whether an allowlist of `normalize_path_key` forms offers the file or
 /// folder at `key`: it is listed, or sits inside a listed folder. `..=at` as
-/// well, for a drive root, whose key keeps its separator.
+/// well, for a drive root, whose key keeps its separator. A flat entry offers
+/// no folder; [`allowlist_permits_file`] is what reads it.
 pub(crate) fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
     allowed.contains(key)
         || key.rmatch_indices(std::path::MAIN_SEPARATOR).any(|(at, _)| {
@@ -146,34 +164,92 @@ pub(crate) fn allowlist_permits(allowed: &HashSet<String>, key: &str) -> bool {
         })
 }
 
+/// [`allowlist_permits`] for a file, which a flat entry for the folder it is
+/// directly in takes in too. What discovery walks; what is offered is
+/// [`allowlist_offers_file`].
+pub(crate) fn allowlist_permits_file(allowed: &HashSet<String>, key: &str) -> bool {
+    allowlist_permits(allowed, key) || flat_covers(allowed, key)
+}
+
+/// Whether a folder's list offers the file at `key`: listed, inside a listed
+/// folder, or directly in a flat entry's folder and not withheld there. A
+/// file the user unshares from a flat share stays in the folder the entry
+/// names, so the withheld list is what keeps it off: known.met has one flag
+/// per content, which a copy shared elsewhere sets.
+pub(crate) fn allowlist_offers_file(allowed: &HashSet<String>, withheld: Option<&HashSet<String>>, key: &str) -> bool {
+    allowlist_permits(allowed, key)
+        || (flat_covers(allowed, key) && !withheld.is_some_and(|withheld| allowlist_permits(withheld, key)))
+}
+
+fn flat_covers(allowed: &HashSet<String>, key: &str) -> bool {
+    key.rfind(std::path::MAIN_SEPARATOR)
+        .is_some_and(|at| allowed.contains(&format!("{}{FLAT_ENTRY_NAME}", &key[..=at])))
+}
+
+pub(crate) fn is_flat_entry(entry: &str) -> bool {
+    entry.ends_with(FLAT_ENTRY_NAME)
+}
+
+/// Whether `entry` is the flat entry for the folder the file at `key` is
+/// directly in.
+pub(crate) fn flat_entry_offers(entry: &str, key: &str) -> bool {
+    entry.strip_suffix(FLAT_ENTRY_NAME).is_some_and(|folder| {
+        key.rfind(std::path::MAIN_SEPARATOR).is_some_and(|at| &key[..=at] == folder)
+    })
+}
+
 /// The folder allowlists as sets, for asking about many paths.
 #[derive(Debug, Default)]
 pub(crate) struct AllowlistOffers {
     lists: Vec<(String, HashSet<String>)>,
+    /// Each partly shared folder's withheld files, which its flat entries do
+    /// not offer.
+    withheld: std::collections::HashMap<String, HashSet<String>>,
 }
 
 impl AllowlistOffers {
+    /// Without the withheld files: for asking about folders, or lists that
+    /// hold no flat entry.
     pub(crate) fn new(allowlists: &std::collections::HashMap<String, Vec<String>>) -> Self {
-        Self {
-            lists: allowlists
+        Self::with_withheld(allowlists, &std::collections::HashMap::new())
+    }
+
+    pub(crate) fn with_withheld(
+        allowlists: &std::collections::HashMap<String, Vec<String>>,
+        withheld: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Self {
+        let sets = |lists: &std::collections::HashMap<String, Vec<String>>| {
+            lists
                 .iter()
-                .map(|(folder, entries)| (folder.clone(), entries.iter().cloned().collect()))
-                .collect(),
+                .map(|(folder, entries)| (folder.clone(), entries.iter().cloned().collect::<HashSet<_>>()))
+                .collect::<Vec<_>>()
+        };
+        Self {
+            lists: sets(allowlists),
+            withheld: sets(withheld).into_iter().collect(),
         }
     }
 
     /// Whether the file at `path` may be offered: no partly shared folder
-    /// holds it, or the innermost one that does lists it.
+    /// holds it, or the innermost one that does offers it.
     pub(crate) fn offers(&self, path: &str) -> bool {
-        let Some((_, allowed)) = self
-            .lists
+        self.innermost(path).is_none_or(|(folder, allowed)| {
+            allowlist_offers_file(allowed, self.withheld.get(folder), &normalize_path_key(path))
+        })
+    }
+
+    /// [`Self::offers`] for a folder, which a flat entry never offers.
+    pub(crate) fn offers_folder(&self, path: &str) -> bool {
+        self.innermost(path)
+            .is_none_or(|(_, allowed)| allowlist_permits(allowed, &normalize_path_key(path)))
+    }
+
+    fn innermost(&self, path: &str) -> Option<(&String, &HashSet<String>)> {
+        self.lists
             .iter()
             .filter(|(folder, _)| crate::security::path_within_dir(path, folder))
             .max_by_key(|(folder, _)| folder.len())
-        else {
-            return true;
-        };
-        allowlist_permits(allowed, &normalize_path_key(path))
+            .map(|(folder, allowed)| (folder, allowed))
     }
 }
 
@@ -231,7 +307,7 @@ impl DiscoveryScope {
     }
 
     fn admits_file(&self, key: &str) -> bool {
-        allowlist_permits(&self.entries, key)
+        allowlist_permits_file(&self.entries, key)
     }
 
     fn admits_dir(&self, key: &str) -> bool {
@@ -434,7 +510,7 @@ pub fn is_excluded_share_location(path: &Path) -> bool {
 /// volume (recycle bins, restore points, desktop.ini). A shared drive root
 /// walks straight into them.
 #[cfg(target_os = "windows")]
-fn walk_skips_metadata(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn walk_skips_metadata(metadata: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
@@ -445,7 +521,7 @@ fn walk_skips_metadata(metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn walk_skips_metadata(_metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn walk_skips_metadata(_metadata: &std::fs::Metadata) -> bool {
     false
 }
 
@@ -551,12 +627,14 @@ fn private_receive_dir_on_the_way(below: &Path) -> bool {
 
 /// Whether the walk of the innermost of `roots` holding the file at `path`
 /// passes through a folder of private receives on the way, so would never
-/// find it. For records re-admitted without a walk.
+/// find it. For records re-admitted without a walk. A file in a room's
+/// library is never found, whatever holds it.
 pub fn under_private_receive_dir(roots: &[String], path: &Path) -> bool {
-    innermost_root(roots, &path.to_string_lossy()).is_some_and(|root| {
-        private_receive_dir_on_the_way(&components_below(root, path))
-            || crate::sharing::feed_downloads::walk_passes_feeds_dir(root, path)
-    })
+    crate::sharing::room_library::holds(path)
+        || innermost_root(roots, &path.to_string_lossy()).is_some_and(|root| {
+            private_receive_dir_on_the_way(&components_below(root, path))
+                || crate::sharing::feed_downloads::walk_passes_feeds_dir(root, path)
+        })
 }
 
 /// One path a filesystem event named, resolved for a scoped rescan.
@@ -693,6 +771,7 @@ impl FileIndexer {
         }
         if private_receive_dir_on_the_way(&below)
             || crate::sharing::feed_downloads::walk_passes_feeds_dir(root, path)
+            || crate::sharing::room_library::holds(path)
             || is_excluded_share_location(path)
         {
             return ScopedDiscovery::Removed;
@@ -726,10 +805,21 @@ impl FileIndexer {
         if metadata.is_dir() {
             let private = path
                 .file_name()
-                .is_some_and(|name| crate::sharing::is_private_receive_dir_name(&name.to_string_lossy()))
-                || crate::sharing::feed_downloads::is_feeds_dir(path);
+                .is_some_and(|name| crate::sharing::is_private_receive_dir_name(&name.to_string_lossy()));
             if private || scope.is_some_and(|scope| !scope.admits_dir(&key)) {
                 return ScopedDiscovery::Removed;
+            }
+            // A download folder's `Feeds` holds nothing shared but the
+            // folders of feeds that share their files.
+            if crate::sharing::feed_downloads::is_feeds_dir(path) {
+                let mut partial = false;
+                let mut files = Vec::new();
+                for dir in crate::sharing::feed_downloads::sharing_dirs_in(path) {
+                    let result = Self::discover_directory_page_in(&dir.to_string_lossy(), None, scope);
+                    partial |= result.partial || !result.unreadable.is_empty();
+                    files.extend(result.files);
+                }
+                return ScopedDiscovery::Found { partial, files };
             }
             let result = Self::discover_directory_page_in(&path.to_string_lossy(), None, scope);
             return ScopedDiscovery::Found {
@@ -796,7 +886,23 @@ impl FileIndexer {
         // shared, never walk into it (config, identity, known.met, …).
         let data_dir = crate::storage::paths::resolve_data_dir();
         let data_canon = data_dir.canonicalize().unwrap_or(data_dir);
-        if let Ok(root_canon) = path.canonicalize() {
+        let root_canon = path.canonicalize().ok();
+        // A folder in a room's library is the room's alone, however it came to
+        // be listed as shared.
+        if crate::sharing::room_library::holds(path)
+            || root_canon.as_deref().is_some_and(crate::sharing::room_library::holds)
+        {
+            warn!("Refusing to discover a folder in a room library: {dir}");
+            return DiscoveryResult {
+                files,
+                truncated: false,
+                partial: true,
+                frontier_trimmed: true,
+                next_cursor: None,
+                unreadable: Vec::new(),
+            };
+        }
+        if let Some(root_canon) = root_canon {
             if root_canon == data_canon || root_canon.starts_with(&data_canon) {
                 warn!("Refusing to discover the application data directory: {dir}");
                 // `partial`: this is a refusal, not an authoritative empty
@@ -894,28 +1000,42 @@ impl FileIndexer {
                     let dir_name = entry.file_name().to_string_lossy().into_owned();
                     if crate::sharing::is_index_skip_dir_name(&dir_name)
                         || crate::sharing::is_private_receive_dir_name(&dir_name)
-                        || crate::sharing::feed_downloads::is_feeds_dir(&entry_path)
                     {
                         continue;
                     }
-                    let mut key = normalize_path_key(&entry_path.to_string_lossy());
-                    if scope.is_some_and(|scope| !scope.admits_dir(&key)) {
-                        continue;
-                    }
-                    if let Ok(canonical) = entry_path.canonicalize() {
-                        if canonical == data_canon || canonical.starts_with(&data_canon) {
+                    // A download folder's `Feeds` is entered for the folders of
+                    // feeds that share their files, and no further.
+                    let dirs = if crate::sharing::feed_downloads::is_feeds_dir(&entry_path) {
+                        crate::sharing::feed_downloads::sharing_dirs_in(&entry_path)
+                    } else {
+                        vec![entry_path]
+                    };
+                    for entry_path in dirs {
+                        let mut key = normalize_path_key(&entry_path.to_string_lossy());
+                        if scope.is_some_and(|scope| !scope.admits_dir(&key)) {
                             continue;
                         }
+                        if crate::sharing::room_library::holds(&entry_path) {
+                            continue;
+                        }
+                        if let Ok(canonical) = entry_path.canonicalize() {
+                            if canonical == data_canon
+                                || canonical.starts_with(&data_canon)
+                                || crate::sharing::room_library::holds(&canonical)
+                            {
+                                continue;
+                            }
+                        }
+                        key.push(std::path::MAIN_SEPARATOR);
+                        // Skipped here rather than when popped: queued, entries
+                        // before the cursor took frontier room on every resumed
+                        // page, crowding out the ones the page resumed for.
+                        if cursor.is_some_and(|value| subtree_sorts_before_cursor(&key, value)) {
+                            *saw_before_cursor = true;
+                            continue;
+                        }
+                        insert_bounded(pending, dropped_floor, key, entry_path, true);
                     }
-                    key.push(std::path::MAIN_SEPARATOR);
-                    // Skipped here rather than when popped: queued, entries
-                    // before the cursor took frontier room on every resumed
-                    // page, crowding out the ones the page resumed for.
-                    if cursor.is_some_and(|value| subtree_sorts_before_cursor(&key, value)) {
-                        *saw_before_cursor = true;
-                        continue;
-                    }
-                    insert_bounded(pending, dropped_floor, key, entry_path, true);
                 } else if file_type.is_file() {
                     let key = normalize_path_key(&entry_path.to_string_lossy());
                     if scope.is_some_and(|scope| !scope.admits_file(&key)) {
@@ -1134,16 +1254,23 @@ impl FileIndexer {
                     let dir_name = entry.file_name().to_string_lossy().into_owned();
                     if crate::sharing::is_index_skip_dir_name(&dir_name)
                         || crate::sharing::is_private_receive_dir_name(&dir_name)
-                        || crate::sharing::feed_downloads::is_feeds_dir(&entry_path)
+                        || crate::sharing::room_library::holds(&entry_path)
                     {
                         continue;
                     }
-                    if let Ok(canonical) = entry_path.canonicalize() {
-                        if canonical == data_canon || canonical.starts_with(data_canon) {
-                            continue;
+                    let dirs = if crate::sharing::feed_downloads::is_feeds_dir(&entry_path) {
+                        crate::sharing::feed_downloads::sharing_dirs_in(&entry_path)
+                    } else {
+                        vec![entry_path]
+                    };
+                    for entry_path in dirs {
+                        if let Ok(canonical) = entry_path.canonicalize() {
+                            if canonical == data_canon || canonical.starts_with(data_canon) {
+                                continue;
+                            }
                         }
+                        stack.push(entry_path);
                     }
-                    stack.push(entry_path);
                 } else if file_type.is_file() {
                     if is_excluded_share_file_name(&entry_path)
                         || metadata.as_ref().is_some_and(|metadata| !shareable_size(metadata.len()))
@@ -1965,6 +2092,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A folder in a room's library is never walked for sharing: not below a
+    /// shared folder, not on an event, not on hydration, and not even when it
+    /// is listed as a shared folder itself, unlike the private receive
+    /// folders above.
+    #[test]
+    fn room_library_folders_are_never_walked_for_sharing() {
+        let root = scratch_tree("room-library");
+        let roots = vec![root.to_string_lossy().to_string()];
+        let no_lists = DiscoveryScopes::default();
+        let library = root.join("Kept");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::write(library.join("a.jpg"), b"x").unwrap();
+        std::fs::write(root.join("open.jpg"), b"x").unwrap();
+        let channel = "5e1f0000000000000000000000000001";
+        crate::sharing::room_library::set(
+            channel,
+            crate::sharing::room_library::RoomLibrary {
+                open: true,
+                folders: vec![library.to_string_lossy().to_string()],
+            },
+        );
+
+        let page = FileIndexer::discover_directory_page_in(&roots[0], None, None);
+        let names: Vec<&str> = page.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["open.jpg"]);
+        for path in [library.join("a.jpg"), library.clone()] {
+            assert!(matches!(
+                FileIndexer::discover_scoped_path(&roots, &no_lists, &path),
+                ScopedDiscovery::Removed
+            ));
+        }
+        assert!(under_private_receive_dir(&roots, &library.join("a.jpg")));
+        let listed = FileIndexer::discover_directory_page_in(&library.to_string_lossy(), None, None);
+        assert!(listed.files.is_empty() && listed.partial, "refused, not an empty listing");
+
+        crate::sharing::room_library::set(channel, crate::sharing::room_library::RoomLibrary::default());
+        assert!(!under_private_receive_dir(&roots, &library.join("a.jpg")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A share holding a download folder walks into its `Feeds` for the folder
+    /// of a feed that shares its files, and for nothing else there.
+    #[test]
+    fn a_share_holding_feeds_reaches_only_a_sharing_feeds_folder() {
+        use crate::sharing::feed_downloads as feeds;
+        let _sharing = feeds::sharing_test_lock();
+        let root = scratch_tree("feeds-share");
+        let roots = vec![root.to_string_lossy().to_string()];
+        let no_lists = DiscoveryScopes::default();
+        let shared = format!("Shared {}", uuid::Uuid::new_v4());
+        let dir = feeds::feeds_dir(&root);
+        for folder in [shared.as_str(), "Private"] {
+            std::fs::create_dir_all(dir.join(folder)).unwrap();
+            std::fs::write(dir.join(folder).join("a.mp3"), b"x").unwrap();
+        }
+        feeds::mark_feeds_dir(&dir);
+        let names = |files: &[crate::types::FileInfo]| {
+            let mut paths: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+            paths.sort();
+            paths
+        };
+
+        let page = FileIndexer::discover_directory_page_in(&roots[0], None, None);
+        assert!(page.files.is_empty(), "{:?}", page.files);
+
+        feeds::set_sharing([shared.clone()]);
+        let wanted = vec![dir.join(&shared).join("a.mp3").to_string_lossy().to_string()];
+        let page = FileIndexer::discover_directory_page_in(&roots[0], None, None);
+        assert_eq!(names(&page.files), wanted);
+        match FileIndexer::discover_scoped_path(&roots, &no_lists, &dir) {
+            ScopedDiscovery::Found { files, .. } => assert_eq!(names(&files), wanted),
+            other => panic!("a rescan of Feeds finds the sharing feed's files, got {other:?}"),
+        }
+        assert!(!under_private_receive_dir(&roots, &dir.join(&shared).join("a.mp3")));
+        assert!(under_private_receive_dir(&roots, &dir.join("Private").join("a.mp3")));
+        assert!(matches!(
+            FileIndexer::discover_scoped_path(&roots, &no_lists, &dir.join("Private").join("a.mp3")),
+            ScopedDiscovery::Removed
+        ));
+
+        feeds::set_sharing([]);
+        match FileIndexer::discover_scoped_path(&roots, &no_lists, &dir) {
+            ScopedDiscovery::Found { files, .. } => assert!(files.is_empty(), "{files:?}"),
+            other => panic!("a rescan of Feeds finds nothing once it stops sharing, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Roots are stored canonicalized (`\\?\C:\…` on Windows) while a share
     /// queues its paths spelled for display; the rescan must still find them,
     /// and record them under the root as stored.
@@ -2036,6 +2251,45 @@ mod tests {
             }
             other => panic!("a rescan of the root walks what it offers, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A flat share walks its folder's own files, a file added since among
+    /// them, and none of its subfolders; a folder named inside it with a flat
+    /// entry of its own adds that folder's files and no deeper.
+    #[test]
+    fn a_flat_share_walks_one_level_and_keeps_up() {
+        let root = scratch_tree("flat");
+        let key = |path: &Path| normalize_path_key(&path.to_string_lossy());
+        std::fs::create_dir_all(root.join("sub").join("deep")).unwrap();
+        for file in ["a.mp3", "sub/c.mp3", "sub/deep/d.mp3"] {
+            std::fs::write(root.join(file), b"x").unwrap();
+        }
+        let root_str = root.to_string_lossy().to_string();
+        let flat = DiscoveryScope::new(&[flat_entry(&root_str)]);
+        let page = FileIndexer::discover_directory_page_in(&root_str, None, Some(&flat));
+        assert_eq!(page_names(&page), ["a.mp3"]);
+
+        let with_sub = DiscoveryScope::new(&[flat_entry(&root_str), flat_entry(&root.join("sub").to_string_lossy())]);
+        let page = FileIndexer::discover_directory_page_in(&root_str, None, Some(&with_sub));
+        assert_eq!(page_names(&page), ["a.mp3", "c.mp3"]);
+
+        std::fs::write(root.join("later.mp3"), b"x").unwrap();
+        let lists = std::collections::HashMap::from([(key(&root), vec![flat_entry(&root_str)])]);
+        let scopes = DiscoveryScopes::new(&lists);
+        let roots = vec![root_str.clone()];
+        match FileIndexer::discover_scoped_path(&roots, &scopes, &root.join("later.mp3")) {
+            ScopedDiscovery::Found { files, .. } => assert_eq!(files.len(), 1),
+            other => panic!("expected the file added later, got {other:?}"),
+        }
+        assert!(matches!(
+            FileIndexer::discover_scoped_path(&roots, &scopes, &root.join("sub").join("c.mp3")),
+            ScopedDiscovery::Removed
+        ));
+        let offers = AllowlistOffers::new(&lists);
+        assert!(offers.offers(&root.join("later.mp3").to_string_lossy()));
+        assert!(!offers.offers(&root.join("sub").join("c.mp3").to_string_lossy()));
+        assert!(!offers.offers_folder(&root.join("sub").to_string_lossy()));
         let _ = std::fs::remove_dir_all(&root);
     }
 

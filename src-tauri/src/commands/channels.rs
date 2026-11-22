@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use rand::rngs::OsRng;
 use rand::RngCore;
-use tauri::Emitter;
+use crate::host::Emitter;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, coded, coded_ctx, CMD_SEND_TIMEOUT};
@@ -25,6 +25,7 @@ use crate::storage::database::{
     CachedChannel, ChannelEditOutcome, ChannelReplyLookup, ChannelReplyParent, Database,
     StoredChannel, StoredChannelMember,
 };
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 
 /// Room names are bounded in characters, not only by the record's bytes: a
@@ -138,6 +139,10 @@ pub struct ChannelInfo {
     pub in_room: bool,
     /// Owner has permanently deleted this room.
     pub deleted: bool,
+    /// The registry lists this room, which we do not own, as deleted, and no
+    /// signed delete from its owner has been seen yet to remove it with. It
+    /// cannot be joined; it can be removed from the list.
+    pub deleted_by_owner: bool,
     /// Only the owner may hand out invites for this room.
     pub invites_owner_only: bool,
     /// Seconds a member must wait between messages; 0 when slow mode is off.
@@ -197,6 +202,7 @@ impl ChannelInfo {
             owner_pubkey: row.owner_pubkey,
             in_room: row.in_room,
             deleted: row.deleted,
+            deleted_by_owner: false,
             invites_owner_only: row.invites_owner_only,
             slow_mode_secs: row.slow_mode_secs,
             announce_only: row.announce_only,
@@ -470,31 +476,52 @@ fn username_claim_key(display: &str) -> String {
     display.to_lowercase()
 }
 
-fn registry_fail(err: crate::network::rendezvous::ChannelRegistryError, taken: &'static str) -> String {
+/// What a Rendezvous registry call was doing, so its refusal reads right.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistryOp {
+    /// Claiming the channel username.
+    Username,
+    /// Claiming or renaming a channel name.
+    Name,
+    /// Deleting a channel.
+    Delete,
+}
+
+fn registry_fail(err: crate::network::rendezvous::ChannelRegistryError, op: RegistryOp) -> String {
+    use crate::network::rendezvous::ChannelRegistryError as E;
     match err {
-        crate::network::rendezvous::ChannelRegistryError::Taken => coded(
-            taken,
+        E::Taken if op == RegistryOp::Username => coded(
+            "channels_username_taken",
             "That name is already taken",
         ),
-        crate::network::rendezvous::ChannelRegistryError::Forbidden => coded(
+        E::Taken => coded("channels_name_taken", "That name is already taken"),
+        E::Forbidden if op == RegistryOp::Delete => coded(
             "channels_delete_forbidden",
-            "Only the channel owner can delete this room",
+            "Only the channel owner can delete this channel",
         ),
-        crate::network::rendezvous::ChannelRegistryError::Invalid => coded(
-            "channels_name_invalid",
-            "Channel name must not be empty",
+        E::Forbidden => coded(
+            "channels_registry_forbidden",
+            "Ember Rendezvous refused this change: only the owner of this channel or name can make it",
         ),
-        crate::network::rendezvous::ChannelRegistryError::Unavailable => coded(
+        E::Invalid if op == RegistryOp::Delete => coded(
+            "channels_registry_rejected",
+            "Ember Rendezvous rejected this request",
+        ),
+        E::Invalid => coded(
+            "channels_registry_invalid",
+            "Ember Rendezvous didn't accept that name. Choose a different one",
+        ),
+        E::Unavailable => coded(
             "channels_registry_unavailable",
-            "The name registry is unreachable; try again when online",
+            "Ember Rendezvous can't be reached; try again when online",
         ),
-        crate::network::rendezvous::ChannelRegistryError::TooSoon => coded(
+        E::TooSoon => coded(
             "channels_rename_too_soon",
-            "A room can be renamed once a day",
+            "A channel can be renamed once a day",
         ),
-        crate::network::rendezvous::ChannelRegistryError::Unsupported => coded(
+        E::Unsupported => coded(
             "channels_rename_unsupported",
-            "Renaming rooms isn't available on this server yet",
+            "Renaming channels isn't available on this server yet",
         ),
     }
 }
@@ -593,7 +620,7 @@ pub(crate) async fn apply_channel_username_locally(state: &AppState, username: &
 /// itself is the network loop's, when it applies `UpdateSettings`, for the
 /// reason [`apply_channel_username_locally`] gives.
 pub(crate) async fn apply_channel_language_locally(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     languages: ChannelLanguages,
 ) {
@@ -638,7 +665,7 @@ pub(crate) async fn claim_username_on_registry(
         &key,
     ))
     .await
-    .map_err(|e| registry_fail(e, "channels_username_taken"))?;
+    .map_err(|e| registry_fail(e, RegistryOp::Username))?;
     Ok(display)
 }
 
@@ -695,7 +722,7 @@ fn truncate_bytes(s: String, max_bytes: usize) -> String {
     s[..end].to_string()
 }
 
-fn parse_member_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
+pub(crate) fn parse_member_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
     let canonical = hex_str.trim().to_ascii_lowercase();
     let bytes = hex::decode(&canonical).map_err(|_| {
         coded(
@@ -711,7 +738,7 @@ fn parse_member_pubkey(hex_str: &str) -> Result<[u8; 32], String> {
     })
 }
 
-fn parse_channel_id(hex_str: &str) -> Result<String, String> {
+pub(crate) fn parse_channel_id(hex_str: &str) -> Result<String, String> {
     let canonical = hex_str.trim().to_ascii_lowercase();
     if canonical.len() != 32 || hex::decode(&canonical).map(|b| b.len()).unwrap_or(0) != 16 {
         return Err(coded(
@@ -803,8 +830,8 @@ async fn discard_partial_channel(state: &AppState, channel_id: &str) {
     );
 }
 
-#[tauri::command]
-pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
+#[ember_macros::command]
+pub async fn list_channels(state: crate::host::State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
     require_ember(&state).await?;
     let our_pk = hex::encode(state.identity.ed25519_public_key);
     let db = state.db.clone();
@@ -823,8 +850,12 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
         // A notice, not a gate, so a failed read shows none rather than
         // failing the list.
         let newer = db.channel_newer_status_all().unwrap_or_default();
+        // The same: what fails here is a label, and joining checks for itself.
+        let listed_deleted = db.registry_deleted_ids().unwrap_or_default();
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
+            let deleted_by_owner =
+                !row.is_owner && !row.deleted && listed_deleted.contains(&row.channel_id.to_ascii_lowercase());
             // No roster row in a room means neither flag is set there. That is
             // the absent entry, not a failure — the query above already spoke
             // for the whole table.
@@ -839,11 +870,11 @@ pub async fn list_channels(state: tauri::State<'_, AppState>) -> Result<Vec<Chan
             let moderation_updated_at = row.moderation_updated_at;
             let moderation_checked_at = row.moderation_checked_at;
             let newer_status = newer.get(&row.channel_id).copied().unwrap_or_default();
-            out.push(
-                ChannelInfo::from_stored(row, you_are_banned, you_are_moderator)
-                    .with_viewer(&our_pk, moderation_updated_at, moderation_checked_at)
-                    .with_newer(newer_status),
-            );
+            let mut info = ChannelInfo::from_stored(row, you_are_banned, you_are_moderator)
+                .with_viewer(&our_pk, moderation_updated_at, moderation_checked_at)
+                .with_newer(newer_status);
+            info.deleted_by_owner = deleted_by_owner;
+            out.push(info);
         }
         Ok::<_, anyhow::Error>(out)
     })
@@ -878,10 +909,10 @@ pub(crate) fn new_room_tail(
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn create_channel(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     name: String,
     private: bool,
     language: Option<String>,
@@ -956,6 +987,12 @@ pub async fn create_channel(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_create_failed", "Failed to create channel", e))?;
+    // Made here, so there is nothing elsewhere to read before editing it.
+    crate::network::channel_membership::note_channel_moderation_read(
+        ident.channel_id,
+        true,
+        chrono::Utc::now().timestamp(),
+    );
 
     // Bounded and fatal, unlike the username re-claim above: this call is what
     // makes the name ours, so proceeding without an answer would publish a room
@@ -972,7 +1009,7 @@ pub async fn create_channel(
     .await
     {
         discard_partial_channel(&state, &channel_id_hex).await;
-        return Err(registry_fail(e, "channels_name_taken"));
+        return Err(registry_fail(e, RegistryOp::Name));
     }
 
     let nickname = username;
@@ -1147,9 +1184,9 @@ pub async fn create_channel(
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn join_channel(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     uri: String,
 ) -> Result<ChannelInfo, String> {
     require_ember(&state).await?;
@@ -1322,9 +1359,9 @@ pub async fn join_channel(
 }
 
 /// Re-enter a room this device already has a row for, without an invite URI.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn enter_channel(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
     require_ember(&state).await?;
@@ -1352,10 +1389,24 @@ async fn refuse_deleted_channel(
                 "This channel has been deleted",
             ))
         }
-        Ok(Ok(_)) => Ok(()),
         // Tombstones are a directory hint, not uniqueness. A private invite
-        // must still work when Rendezvous is unreachable or slow.
-        Ok(Err(_)) | Err(_) => Ok(()),
+        // must still work when Rendezvous is unreachable or slow, unless the
+        // list as last read here already named the room; and a list read now
+        // may have been cut short, so that is asked either way.
+        Ok(Ok(_)) | Ok(Err(_)) | Err(_) => {
+            let db = state.db.clone();
+            let id = channel_id.to_string();
+            let listed = tokio::task::spawn_blocking(move || db.registry_lists_deleted(&id))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+            if listed {
+                Err(coded("channels_deleted", "This channel has been deleted"))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1372,7 +1423,11 @@ pub(crate) async fn enter_stored_channel(
         move || {
             let row = db.get_channel(&id)?;
             if let Some(ref row) = row {
-                if row.deleted {
+                // Or listed as deleted by the registry, as last read: walking
+                // back in would only be walked out again, into a room whose
+                // owner has gone. An owner's own row is the owner's call, made
+                // through the deleted-elsewhere prompt.
+                if row.deleted || (!row.is_owner && db.registry_lists_deleted(&id)?) {
                     return Err(anyhow::anyhow!("deleted"));
                 }
                 db.set_channel_in_room(&id, true)?;
@@ -1568,13 +1623,26 @@ async fn publish_join_presence(state: &AppState, invite: &ChannelInvite, usernam
         });
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn leave_channel(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
     require_ember(&state).await?;
     let channel_id = parse_channel_id(&channel_id)?;
+    if !step_out_of_room(&state, &channel_id).await? {
+        return Err(coded("channels_not_found", "Channel not found"));
+    }
+    Ok(())
+}
+
+/// Leave a room: what Leave does, and what being walked out of a room its
+/// owner deleted does. `Ok(false)` when there is no such room.
+pub(crate) async fn step_out_of_room(state: &AppState, channel_id: &str) -> Result<bool, String> {
+    let channel_id = channel_id.to_string();
+    // A library open to the room closes as we leave, said while we are still
+    // in the room to say it.
+    super::room_library::close_for_leave(state, &channel_id).await;
     // Straight to the write. The room used to be read first for the key and the
     // visibility the tombstone was built from, and `set_channel_in_room` reports
     // a missing row on its own, so the read is only a second chance to race.
@@ -1585,7 +1653,7 @@ pub async fn leave_channel(
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_leave_failed", "Failed to leave channel", e))?;
     if !left {
-        return Err(coded("channels_not_found", "Channel not found"));
+        return Ok(false);
     }
     if let Ok(bytes) = hex::decode(&channel_id) {
         if let Ok(id) = <[u8; 16]>::try_from(bytes.as_slice()) {
@@ -1630,7 +1698,7 @@ pub async fn leave_channel(
         Ok(Err(e)) => tracing::warn!(channel_id = %channel_id, error = %e, "could not record the departure notice as owed"),
         Err(e) => tracing::warn!(channel_id = %channel_id, error = %e, "departure notice task failed"),
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Drop a room this device has left and does not own.
@@ -1643,9 +1711,9 @@ pub async fn leave_channel(
 /// this off my list" into "never let me back in". Removing the row leaves the
 /// room reachable through Discover or a fresh invite, which is what a member
 /// who changes their mind expects.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn forget_channel(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
     let channel_id = parse_channel_id(&channel_id)?;
@@ -1689,11 +1757,11 @@ pub async fn forget_channel(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn claim_channel_username(
-    window: tauri::WebviewWindow,
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     name: String,
 ) -> Result<String, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -1707,10 +1775,10 @@ pub async fn claim_channel_username(
 
 /// Owner-only permanent delete: tombstone the name on Rendezvous and walk
 /// this device out. Moderators cannot call this.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_owned_channel(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -1726,7 +1794,7 @@ pub async fn delete_owned_channel(
         &channel_seed,
     ))
     .await
-    .map_err(|e| registry_fail(e, "channels_name_taken"))?;
+    .map_err(|e| registry_fail(e, RegistryOp::Delete))?;
     retire_deleted_room(&state, &owned).await
 }
 
@@ -1785,9 +1853,9 @@ pub struct RoomDeletedElsewhere {
 }
 
 /// Rooms waiting on the user's answer.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn list_rooms_deleted_elsewhere(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<RoomDeletedElsewhere>, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.rooms_deleted_elsewhere())
@@ -1805,9 +1873,9 @@ pub async fn list_rooms_deleted_elsewhere(
 /// it would have, `keep` keeps it here and stops asking. Only for a room the
 /// prompt lists: this is not a way to delete any room without its own
 /// confirmation.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn confirm_room_deleted_elsewhere(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     delete: bool,
 ) -> Result<(), String> {
@@ -1834,9 +1902,9 @@ pub async fn confirm_room_deleted_elsewhere(
         .map_err(|e| coded_ctx("channels_delete_failed", "Failed to delete the room", e))
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_invite(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInviteInfo, String> {
     require_ember(&state).await?;
@@ -1922,9 +1990,9 @@ pub async fn get_channel_invite(
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn list_channel_members(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<Vec<ChannelMemberInfo>, String> {
     require_ember(&state).await?;
@@ -1962,7 +2030,7 @@ pub struct ChannelPresenceConfig {
     pub beat_secs: i64,
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn channel_presence_config() -> Result<ChannelPresenceConfig, String> {
     Ok(ChannelPresenceConfig {
         mesh_fresh_secs: channel::PRESENCE_MESH_FRESH_SECS,
@@ -1976,9 +2044,9 @@ pub async fn channel_presence_config() -> Result<ChannelPresenceConfig, String> 
 /// Presence costs are per room and a user who has joined thirty is reading one.
 /// Naming it is what lets that one be walked at the rate somebody watching it
 /// would expect without paying the same for the other twenty-nine.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_focus(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: Option<String>,
 ) -> Result<(), String> {
     require_ember(&state).await?;
@@ -1994,9 +2062,9 @@ pub async fn set_channel_focus(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_messages(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     limit: Option<i64>,
     before_id: Option<i64>,
@@ -2020,9 +2088,9 @@ pub async fn get_channel_messages(
 
 /// Substring search over one room's stored history. Local only — nothing is
 /// asked of the network, so this finds what this device has kept.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn search_channel_messages(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     query: String,
     limit: Option<i64>,
@@ -2060,10 +2128,10 @@ pub async fn search_channel_messages(
 ///
 /// The room's slow mode deliberately does not apply. It exists to bound how fast
 /// *new* lines arrive, and a revision replaces one that has already been counted.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn edit_channel_message(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     message_id: i64,
     message: String,
@@ -2109,7 +2177,7 @@ pub async fn edit_channel_message(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_edit_failed", "Failed to load message", e))?
-    .ok_or_else(|| coded("channels_not_found", "Message not found"))?;
+    .ok_or_else(|| coded("channels_message_not_found", "That message no longer exists"))?;
 
     if !target.sender_pubkey.eq_ignore_ascii_case(&sender) {
         return Err(coded(
@@ -2162,7 +2230,6 @@ pub async fn edit_channel_message(
         &msg_id_bytes,
         target.timestamp,
         edited_at,
-        &wire_text,
         &v2_text,
         reply_parent.as_ref(),
     )
@@ -2172,14 +2239,10 @@ pub async fn edit_channel_message(
             "Message must be between 1 and 4096 bytes",
         )
     })?;
-    let mut envelope_id = [0u8; 16];
-    OsRng.fill_bytes(&mut envelope_id);
-    let frames = chat_gossip_frames(
+    let frame = chat_gossip_frame(
         channel_id_bytes,
         &channel::content_key(&join_secret),
         &sender_pk,
-        envelope_id,
-        edited_at,
         &revision,
     )?;
 
@@ -2198,7 +2261,6 @@ pub async fn edit_channel_message(
     let msg_id_for_edit = target.msg_id.clone();
     let sender_for_edit = sender.clone();
     let text_for_edit = revision.stored_text.clone();
-    let sig_hex = revision.legacy.as_ref().map(|(_, sig)| hex::encode(sig)).unwrap_or_default();
     let v2_frame = revision.v2.clone();
     let original_ts = target.timestamp;
     let outcome = tokio::task::spawn_blocking(move || {
@@ -2209,7 +2271,8 @@ pub async fn edit_channel_message(
             original_ts,
             edited_at,
             &text_for_edit,
-            &sig_hex,
+            // No legacy frame (19), so no signature of one.
+            "",
             edited_at,
             Some(&v2_frame),
         )
@@ -2258,9 +2321,9 @@ pub async fn edit_channel_message(
     }
 
     // Spends the slot claimed before the write. Nothing between the two can
-    // refuse it, so the revision on disk and the frames on the mesh are one
+    // refuse it, so the revision on disk and the frame on the mesh are one
     // outcome rather than two.
-    permit.send(NetworkCommand::FanoutChannelChat { bodies: frames });
+    permit.send(NetworkCommand::FanoutChannelChat { bodies: vec![frame] });
     let _ = app.emit(
         "ember:channel-message-edited",
         serde_json::json!({
@@ -2326,9 +2389,9 @@ async fn reply_lookup_for(
 /// would silently displace the first on any v1.6.x peer and in what it
 /// re-serves. Clearing is stored rather than deleted, because the row carries
 /// the timestamp that stops a stale frame reasserting what was withdrawn.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_message_reaction(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     message_id: i64,
     reaction: u8,
@@ -2360,7 +2423,7 @@ pub async fn set_channel_message_reaction(
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_reaction_failed", "Failed to load message", e))?
-    .ok_or_else(|| coded("channels_not_found", "Message not found"))?;
+    .ok_or_else(|| coded("channels_message_not_found", "That message no longer exists"))?;
 
     let join_secret = join_secret_for_channel(&state, &row)
         .await
@@ -2472,9 +2535,9 @@ pub async fn set_channel_message_reaction(
 /// cached view, so this costs no database read per keystroke; and a full
 /// command queue drops the signal rather than waiting, since the next
 /// keystroke sends a fresh one and a late one would be wrong.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn send_channel_typing(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     typing: bool,
 ) -> Result<(), String> {
@@ -2488,9 +2551,9 @@ pub async fn send_channel_typing(
 
 /// Every live reaction tally in a room, so the UI can draw counts in one read
 /// rather than a query per bubble.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_reactions(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<Vec<ChannelReactionInfo>, String> {
     let channel_id = parse_channel_id(&channel_id)?;
@@ -2556,9 +2619,9 @@ fn tally_channel_reactions(rows: Vec<(String, String, u8)>, mine: &str) -> Vec<C
 /// Remove one message from this device. Deliberately does not propagate: the
 /// protocol has no redaction, so pretending otherwise would be a lie about
 /// what every other member still holds.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_channel_message(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     message_id: i64,
 ) -> Result<(), String> {
@@ -2572,7 +2635,7 @@ pub async fn delete_channel_message(
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_remove_message_failed", "Could not remove the message", e))?;
     if !removed {
-        return Err(coded("channels_not_found", "Message not found"));
+        return Err(coded("channels_message_not_found", "That message no longer exists"));
     }
     Ok(())
 }
@@ -2584,9 +2647,9 @@ pub async fn delete_channel_message(
 /// show it, so it is checked against something real rather than passed through
 /// — and a line the sender cannot see is not one they can meaningfully answer.
 /// Receivers are not held to this, since a reply can outrun its parent.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn send_channel_message(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     message: String,
     reply_to: Option<String>,
@@ -2618,8 +2681,9 @@ pub async fn send_channel_message(
         }
     };
     let wire_text = channel::with_reply_trailer(&cleaned, reply_parent.as_ref());
-    // The cap is on what goes on the wire, which a reply's trailer is part of:
-    // every receiver, old builds included, refuses a line over 4096 bytes.
+    // The cap is on the stored text, which a reply's trailer is part of: every
+    // receiver refuses a line over 4096 bytes. The v2 text falls back to this
+    // one when its own would be longer, so this is the check that holds it.
     if cleaned.is_empty() || wire_text.len() > MAX_CHANNEL_MESSAGE {
         return Err(coded(
             "channels_message_size_invalid",
@@ -2745,7 +2809,6 @@ pub async fn send_channel_message(
         &channel_id_bytes,
         &msg_id,
         sent_at,
-        &wire_text,
         &v2_text,
         reply_parent.as_ref(),
     ) else {
@@ -2756,8 +2819,8 @@ pub async fn send_channel_message(
         ));
     };
     let key = channel::content_key(&join_secret);
-    let frames = match chat_gossip_frames(channel_id_bytes, &key, &sender_pk, msg_id, sent_at, &line) {
-        Ok(frames) => frames,
+    let frame = match chat_gossip_frame(channel_id_bytes, &key, &sender_pk, &line) {
+        Ok(frame) => frame,
         Err(e) => {
             refund_local_send(&channel_id);
             return Err(e);
@@ -2773,10 +2836,10 @@ pub async fn send_channel_message(
     let id = channel_id.clone();
     let sender2 = sender.clone();
     // Stored as signed, trailer and all, so a catch-up re-serves the same
-    // bytes: the v2 text, and beside it both frames' signatures.
+    // bytes: the v2 text, and beside it the frame and its signature. There is
+    // no legacy frame (15), so no signature of one.
     let text = line.stored_text.clone();
     let msg_id_hex = hex::encode(msg_id);
-    let author_sig_hex = line.legacy.as_ref().map(|(_, sig)| hex::encode(sig)).unwrap_or_default();
     let v2_frame = line.v2.clone();
     let row_id = tokio::task::spawn_blocking(move || {
         let row_id = db.insert_channel_message_with(
@@ -2786,7 +2849,7 @@ pub async fn send_channel_message(
             &text,
             &msg_id_hex,
             sent_at,
-            &author_sig_hex,
+            "",
             true,
             Some(&v2_frame),
         )?;
@@ -2813,7 +2876,7 @@ pub async fn send_channel_message(
 
     if let Err(e) = state
         .network_tx
-        .try_send(NetworkCommand::FanoutChannelChat { bodies: frames })
+        .try_send(NetworkCommand::FanoutChannelChat { bodies: vec![frame] })
     {
         // Take the row back out. A line nobody was sent is not history, and
         // leaving it would show the sender a transcript the room does not have —
@@ -2857,9 +2920,9 @@ pub async fn send_channel_message(
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_channel_messages_read(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<(), String> {
     require_ember(&state).await?;
@@ -2873,9 +2936,9 @@ pub async fn mark_channel_messages_read(
 }
 
 /// The line left half-typed in a room, kept across restarts.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_draft(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<String, String> {
     require_ember(&state).await?;
@@ -2888,9 +2951,9 @@ pub async fn get_channel_draft(
 }
 
 /// Keep a room's draft, or drop it when `text` is empty.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_draft(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     text: String,
 ) -> Result<(), String> {
@@ -3009,74 +3072,56 @@ async fn load_owned_channel_as(
 /// across the DHT publish too, which is bounded by that call's own timeout.
 static MODERATION_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-/// The longest line, in UTF-8 bytes of its text, whose sealed legacy frame
-/// fits [`channel::RELAYABLE_GOSSIP_MAX_BYTES`]: past it, [`chat_gossip_frames`]
-/// refuses the line. A reply's trailer ([`channel::REPLY_TRAILER_BYTES`]) comes
-/// out of the same room.
+/// The longest line, in UTF-8 bytes of its text, whose sealed v2 frame fits
+/// [`channel::RELAYABLE_GOSSIP_MAX_BYTES`]: past it, [`chat_gossip_frame`]
+/// refuses the line. A reply's reference ([`channel::CHAT_V2_REPLY_BYTES`])
+/// comes out of the same room.
 ///
-/// The frame adds the same overhead whatever the text says, but the text it
-/// carries is what was typed with emoji joiners and the other characters the
-/// outgoing sanitiser drops taken out, so a line typed with those can run a
-/// little longer. Measured on what was typed, this is the most that always goes
-/// out. The send path measures the frame itself; this is the number the
-/// frontend holds (`CHANNEL_LINE_MAX_TEXT_BYTES` in `src/lib/api/channels.ts`).
-/// Once [`channel::SEND_LEGACY_CHAT_FRAMES`] is off the v2 frame sets the
-/// limit instead, and this changes.
+/// The frame adds the same overhead whatever the text says, and it keeps the
+/// text's emoji joiners, so this is measured on the text as typed. The send
+/// path measures the frame itself; this is the number the frontend holds
+/// (`CHANNEL_LINE_MAX_TEXT_BYTES` in `src/lib/api/channels.ts`). It was the
+/// legacy frame's, 3728, while 1.7.5 to 1.7.8 sent that frame first.
 #[cfg(test)]
-const CHANNEL_LINE_MAX_TEXT_BYTES: usize = 3728;
-/// [`CHANNEL_LINE_MAX_TEXT_BYTES`] for a revision, whose legacy frame also
-/// carries the line's id and both its times. A revised reply keeps its
-/// trailer, so it too leaves [`channel::REPLY_TRAILER_BYTES`] less.
+const CHANNEL_LINE_MAX_TEXT_BYTES: usize = 3704;
+/// [`CHANNEL_LINE_MAX_TEXT_BYTES`] for a revision, whose frame also carries
+/// the line's original time. A revised reply keeps its reference, so it too
+/// leaves [`channel::CHAT_V2_REPLY_BYTES`] less.
 #[cfg(test)]
-const CHANNEL_EDIT_MAX_TEXT_BYTES: usize = 3696;
+const CHANNEL_EDIT_MAX_TEXT_BYTES: usize = 3693;
 
-/// The sealed frames of one outgoing line or revision, the legacy one first so
-/// that a build reading only it meets it ahead of the frame it cannot read.
-/// `legacy_envelope` and `at` are the legacy frame's envelope id and time; the
-/// v2 frame carries its own.
+/// The sealed frame of one outgoing line or revision, its v2 frame, under the
+/// envelope id and time it was signed with.
 ///
 /// A sealed frame has to fit one datagram inside the overlay relay envelope a
 /// firewalled member's copy goes in ([`channel::RELAYABLE_GOSSIP_MAX_BYTES`]),
-/// which a text near the 4096-byte cap does not. Unless the line is a reply,
-/// whose legacy trailer outweighs the v2 frame's reference, the v2 frame is the
-/// larger of the two, so a line whose legacy frame fits and v2 frame does not
-/// goes out in the legacy form alone, which every build reads; one whose first
-/// frame does not fit is refused, before the callers store anything, rather
-/// than kept here and delivered nowhere.
-fn chat_gossip_frames(
+/// which a text near the 4096-byte cap does not. A line whose frame does not
+/// fit is refused, before the callers store anything, rather than kept here
+/// and delivered nowhere.
+fn chat_gossip_frame(
     channel_id: [u8; 16],
     key: &[u8; 32],
     sender: &[u8; 32],
-    legacy_envelope: [u8; 16],
-    at: i64,
     chat: &channel::OutgoingChat,
-) -> Result<Vec<Vec<u8>>, String> {
-    let seal = |envelope_id: [u8; 16], at: i64, plain: &[u8]| {
-        channel::ChannelGossip::sealed(
-            channel_id,
-            envelope_id,
-            key,
-            at.max(0) as u64,
-            plain,
-            channel::CHANNEL_MSG_TTL_DEFAULT,
-            at,
-        )
-        .encode()
-    };
-    let fits = |frame: &Vec<u8>| frame.len() <= channel::RELAYABLE_GOSSIP_MAX_BYTES;
-    let mut frames = Vec::with_capacity(2);
-    if let Some((plain, _)) = &chat.legacy {
-        frames.push(seal(legacy_envelope, at, plain));
-    }
-    frames.push(seal(chat.v2.frame_id, chat.v2.signed_at, &chat.v2.plain(sender)));
-    if !fits(&frames[0]) {
+) -> Result<Vec<u8>, String> {
+    let at = chat.v2.signed_at;
+    let frame = channel::ChannelGossip::sealed(
+        channel_id,
+        chat.v2.frame_id,
+        key,
+        at.max(0) as u64,
+        &chat.v2.plain(sender),
+        channel::CHANNEL_MSG_TTL_DEFAULT,
+        at,
+    )
+    .encode();
+    if frame.len() > channel::RELAYABLE_GOSSIP_MAX_BYTES {
         return Err(coded(
             "channels_message_too_long_to_send",
             "This message is too long to send to a room. Shorten it and try again.",
         ));
     }
-    frames.retain(fits);
-    Ok(frames)
+    Ok(frame)
 }
 
 /// Our own outbound chat times, per room, for [`LOCAL_SEND_PER_MINUTE`].
@@ -3173,14 +3218,16 @@ async fn owner_moderation_tail(state: &AppState, owned: &OwnedChannel) -> Modera
         let pins = owned.row.pinned_msg_ids.clone();
         // Held back if it cannot be read: a stand-in name signed into the
         // snapshot would rename the room for every member.
-        let fallback = (owned.row.key_epoch, Vec::new(), true);
+        let fallback = (owned.row.key_epoch.max(owned.row.key_epoch_wanted), Vec::new(), true);
         tokio::task::spawn_blocking(move || {
             let row = db.get_channel_lite(&id).ok().flatten()?;
             // A pin this device has removed is pruned here, which is the
             // owner's next commit of any kind.
             let removed = db.channel_messages_removed(&id, &pins).unwrap_or_default();
             let unconfirmed = db.channel_name_unconfirmed(&id).unwrap_or(true);
-            Some((row.key_epoch, removed, unconfirmed))
+            // The room's newest epoch, as the owner pass announces it: another
+            // device of ours may have rotated past the one held here.
+            Some((row.key_epoch.max(row.key_epoch_wanted), removed, unconfirmed))
         })
         .await
         .ok()
@@ -3283,8 +3330,13 @@ fn owner_pins_fit(
 }
 
 /// Refuse an owner edit while the room waits for a claim lookup
-/// ([`crate::network::channel_membership::owner_edit_waits_for_claims`]).
-async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str) -> Result<(), String> {
+/// ([`crate::network::channel_membership::owner_edit_waits_for_claims`]), or
+/// for a recent answered look at its snapshot
+/// ([`crate::network::channel_membership::owner_edit_waits_for_first_read`]),
+/// which one that `rotates` the key waits for however long it takes
+/// ([`crate::network::channel_membership::owner_rotation_waits_for_first_read`]).
+/// Every commit of an owner snapshot comes through here, not only the UI's.
+async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str, rotates: bool) -> Result<(), String> {
     let db = state.db.clone();
     let id = channel_id.to_string();
     let waits = tokio::task::spawn_blocking(move || {
@@ -3303,6 +3355,19 @@ async fn refuse_owner_edit_during_return(state: &AppState, channel_id: &str) -> 
              Try again in a few minutes.",
         ));
     }
+    crate::network::channel_membership::wait_for_unwritten_read(channel_id).await;
+    let now = chrono::Utc::now().timestamp();
+    let unread = if rotates {
+        crate::network::channel_membership::owner_rotation_waits_for_first_read(channel_id, now)
+    } else {
+        crate::network::channel_membership::owner_edit_waits_for_first_read(channel_id, now)
+    };
+    if unread {
+        return Err(coded(
+            "channels_owner_reading",
+            "Ember is still loading this room's latest state from the network. Try again in a moment.",
+        ));
+    }
     Ok(())
 }
 
@@ -3315,7 +3380,7 @@ async fn commit_channel_moderation_with(
     mods: &[[u8; 32]],
     pin_fit: PinFit,
 ) -> Result<(), String> {
-    refuse_owner_edit_during_return(state, &owned.row.channel_id).await?;
+    refuse_owner_edit_during_return(state, &owned.row.channel_id, false).await?;
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     let our_pk = state.identity.ed25519_public_key;
     let tail = owner_moderation_tail(state, owned).await;
@@ -3401,6 +3466,14 @@ async fn commit_channel_moderation_with(
     ) else {
         return Ok(());
     };
+    // So a snapshot another device of ours signs in the same second is ordered
+    // against this one as members order the two.
+    {
+        let db = state.db.clone();
+        let id = owned.row.channel_id.clone();
+        let signature = record.signature;
+        let _ = tokio::task::spawn_blocking(move || db.note_owner_snapshot_signed(&id, stamp, &signature)).await;
+    }
     // Queued, not awaited. The rows above are already committed and the owner's
     // periodic republish (`maybe_republish_channel_moderation`) rebuilds this
     // record from them, so the STORE result was never acted on — only logged.
@@ -3478,9 +3551,9 @@ async fn channel_info_from_id(state: &AppState, channel_id: &str) -> Result<Chan
 
 /// The user has seen that some of a room's lines need a newer Ember. Returns
 /// the room as it reads now.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn dismiss_channel_newer_lines(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
     let channel_id = channel_id.trim().to_ascii_lowercase();
@@ -3496,7 +3569,7 @@ pub async fn dismiss_channel_newer_lines(
     channel_info_from_id(&state, &channel_id).await
 }
 
-async fn load_joined_channel(
+pub(crate) async fn load_joined_channel(
     state: &AppState,
     channel_id: &str,
 ) -> Result<StoredChannel, String> {
@@ -3555,7 +3628,7 @@ async fn you_are_moderator(state: &AppState, channel_id: &str) -> bool {
 /// and strip the moderation tools needed to undo it.
 ///
 /// `fail_code` lets the caller keep its own translated framing.
-async fn self_banned_from(
+pub(crate) async fn self_banned_from(
     state: &AppState,
     row: &StoredChannel,
     fail_code: &'static str,
@@ -3765,35 +3838,50 @@ async fn rotate_channel_key(
     if owned.row.visibility != CHANNEL_KIND_PRIVATE {
         return Ok(None);
     }
-    let next_epoch = owned.row.key_epoch.saturating_add(1);
-    let mut secret = [0u8; 32];
-    OsRng.fill_bytes(&mut secret);
+    let next_epoch = next_rotation_epoch(&owned.row);
+    // The seed's key for this epoch, as the owner pass mints, so another device
+    // owning the room that rotates from the same epoch mints the same one.
+    let secret = zeroize::Zeroizing::new(channel::derive_owned_epoch_secret(&owned.ident.seed(), next_epoch));
 
     // Members before the key: a failure after the key is stored would leave an
     // epoch no snapshot announces and no caller rolls back.
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
-    let members = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
+    let mut members = tokio::task::spawn_blocking(move || db.list_channel_members(&id))
         .await
         .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
         .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
+    // Sealed in an order drawn afresh, as the owner pass seals, so a storer
+    // cannot pair the members' ids across epochs by their place in line.
+    rand::seq::SliceRandom::shuffle(members.as_mut_slice(), &mut rand::thread_rng());
 
     let db = state.db.clone();
     let id = owned.row.channel_id.clone();
-    let stored_secret = secret;
-    tokio::task::spawn_blocking(move || {
-        db.insert_channel_key_epoch(&id, next_epoch, &stored_secret)
+    let stored_secret = secret.clone();
+    let minted = tokio::task::spawn_blocking(move || {
+        db.mint_channel_key_epoch(&id, next_epoch, &stored_secret)
     })
     .await
     .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
     .map_err(|e| coded_ctx("channels_moderation_failed", "Could not rotate the room key", e))?;
+    // Another rotation took this epoch meanwhile: the owner pass's, or one of
+    // this identity's other device that this one has since fetched or been
+    // told of. This ban never committed, so that key went to the member being
+    // banned too; refused, the ban can be made again on the room as it now is.
+    if !minted {
+        return Err(coded(
+            "channels_owner_reading",
+            "Ember is still loading this room's latest state from the network. Try again in a moment.",
+        ));
+    }
 
     let our_seed = state.identity.ed25519_secret_key;
     let our_hex = hex::encode(state.identity.ed25519_public_key);
     let mut records = Vec::new();
-    // Sealed to ourselves as well, in a member's slot: the key is random, so
-    // this copy is the only way a device restored from an older backup gets
-    // the room's current key back.
+    // Sealed to ourselves as well, in a member's slot: a device restored from
+    // a backup (`catch_up_own_epochs`, which derives only the first key) and
+    // this identity's other owning device (`channel_epoch_lookup`) get the key
+    // back from this copy.
     if let (Some(wrap), Some(blind)) = (
         channel::derive_channel_epoch_secret(
             &our_seed,
@@ -3855,6 +3943,14 @@ async fn rotate_channel_key(
     }))
 }
 
+/// The epoch a rotation of `row` mints: past the newest the room has announced,
+/// not just the one held here. Another device of this identity may have rotated
+/// past this one, and its key for that epoch, which this device would derive
+/// again, already went to everyone it was sealed to.
+fn next_rotation_epoch(row: &crate::storage::database::StoredChannel) -> i64 {
+    row.key_epoch.max(row.key_epoch_wanted).saturating_add(1)
+}
+
 /// A content key [`rotate_channel_key`] stored, and the records sealing it to
 /// us and to each member still entitled to it.
 struct RotatedKey {
@@ -3870,9 +3966,9 @@ struct RotatedKey {
 /// nobody will ever go looking for.
 ///
 /// The sealed key goes out only once the snapshot has committed. A key taken
-/// back must not reach anyone: a member who fetched it would store it for its
-/// epoch, and the key minted next under the same number would be refused
-/// there until the owner's commitments showed the first one wrong. Nor its
+/// back must not reach anyone: the next rotation from the same epoch mints the
+/// very same key ([`channel::derive_owned_epoch_secret`]), and that rotation
+/// may be one that leaves out a member this one sealed it to. Nor its
 /// commitment: the settings pass signs nothing for the room until the commit
 /// or the undo is done ([`RotatingRoom`]).
 async fn rotate_and_commit(
@@ -3881,14 +3977,14 @@ async fn rotate_and_commit(
     bans: &[[u8; 32]],
     mods: &[[u8; 32]],
 ) -> Result<(), String> {
-    // Before a key is minted, which the commit refusing would take back.
-    refuse_owner_edit_during_return(state, &owned.row.channel_id).await?;
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
+    // Before a key is minted, which the commit refusing would take back.
+    refuse_owner_edit_during_return(state, &owned.row.channel_id, private).await?;
     if private {
         // The snapshot the commit will sign, naming the epoch about to be
         // minted, refused for size before the key is stored rather than after.
         let mut tail = owner_moderation_tail(state, owned).await;
-        tail.key_epoch = Some(owned.row.key_epoch.saturating_add(1).max(0) as u64);
+        tail.key_epoch = Some(next_rotation_epoch(&owned.row).max(0) as u64);
         let tail = crate::network::ember::dht::publish::fit_moderation_pins(
             &owned.row.topic,
             &owned.row.welcome,
@@ -4043,10 +4139,10 @@ async fn reseal_current_epoch_to_member(
 /// Rotation otherwise only happens on a ban, so an owner whose invite link had
 /// leaked had no remedy but to ban somebody who had done nothing wrong. Every
 /// invite handed out before this stops working, which is the point.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn rotate_channel_room_key(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -4083,6 +4179,9 @@ pub(crate) async fn rekey_recovered_room(
     channel_id: &str,
     pending: i64,
 ) -> Result<i64, String> {
+    // Read the room first, as every owner commit must, and before the lock
+    // every owner edit shares: nobody is there to try this again in a moment.
+    crate::network::channel_membership::wait_for_owner_read(channel_id).await;
     let _snapshot = moderation_lock().lock().await;
     let mut owned = load_owned_channel_as(state, channel_id, true).await?;
     if owned.row.visibility != CHANNEL_KIND_PRIVATE {
@@ -4111,10 +4210,10 @@ pub(crate) async fn rekey_recovered_room(
 /// way they learn bans. Enforcement is each client refusing to mint, which
 /// makes this a guard against carelessness rather than against a member who
 /// patches their build — they already hold the key either way.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_invite_policy(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     owner_only: bool,
 ) -> Result<ChannelInfo, String> {
@@ -4167,10 +4266,10 @@ pub async fn set_channel_invite_policy(
 /// the same way they learn bans, and like the invite policy it is enforced by
 /// each client declining to send — a guard against a flood of ordinary clients
 /// rather than against a patched one.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_slow_mode(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     secs: u16,
 ) -> Result<ChannelInfo, String> {
@@ -4223,10 +4322,10 @@ pub async fn set_channel_slow_mode(
 /// snapshot like slow mode, and like slow mode it is each member's client that
 /// declines to send; nothing is dropped on receipt (see
 /// `ModerationTail::announce_only`). Reactions stay open.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_announce_only(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     announce_only: bool,
 ) -> Result<ChannelInfo, String> {
@@ -4284,10 +4383,10 @@ fn parse_channel_language(code: Option<&str>) -> Result<Option<&'static str>, St
 /// Shown to members as a flag beside the room's name, and nothing more — it
 /// filters nothing and stops no one writing in another language. Rides the
 /// owner-signed moderation snapshot like the posting rule.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_language(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     language: Option<String>,
 ) -> Result<ChannelInfo, String> {
@@ -4383,9 +4482,9 @@ fn next_pins(current: &[String], msg_id: &str, pinned: bool) -> Result<Option<Ve
 /// a refresh and a patched client cannot forge one. The pin commit refuses
 /// rather than sheds when the record is full ([`PinFit::Require`]); every other
 /// commit sheds the oldest pin first.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_message_pinned(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     msg_id: String,
     pinned: bool,
@@ -4457,9 +4556,9 @@ pub struct ChannelPinInfo {
 
 /// The room's pins, oldest first, each resolved against local history the way
 /// a reply's quote is.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_channel_pins(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<Vec<ChannelPinInfo>, String> {
     require_ember(&state).await?;
@@ -4637,10 +4736,10 @@ async fn apply_local_mod_ban(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn update_channel_moderation(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     topic: String,
     welcome: String,
@@ -4677,10 +4776,10 @@ const RENAME_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// learn the new name from the owner's moderation snapshot, the record that
 /// already carries the topic, which they fetch every few minutes while in the
 /// room — so one who is offline picks it up when they are back.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn rename_channel(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     name: String,
 ) -> Result<ChannelInfo, String> {
@@ -4762,7 +4861,7 @@ pub async fn rename_channel(
     }
     // Before the registry grants the name: past it the snapshot's refusal
     // would leave members on the old one.
-    refuse_owner_edit_during_return(&state, &channel_id).await?;
+    refuse_owner_edit_during_return(&state, &channel_id, false).await?;
 
     let private = owned.row.visibility == CHANNEL_KIND_PRIVATE;
     let url = rendezvous_url(&state).await;
@@ -4795,7 +4894,10 @@ pub async fn rename_channel(
         ))
         .await
     };
-    granted.map_err(|e| registry_fail(e, "channels_name_taken"))?;
+    granted.map_err(|e| registry_fail(e, RegistryOp::Name))?;
+    // The name is ours now, so its snapshot must not be refused for a read
+    // that lapsed or landed during the round trip: waited for, not refused.
+    crate::network::channel_membership::wait_for_owner_read(&channel_id).await;
 
     // Retaken for the write and the commit, read afresh: other owner edits may
     // have landed while the registry was being asked, and the snapshot below
@@ -4859,10 +4961,10 @@ pub async fn rename_channel(
     channel_info_from_id(&state, &channel_id).await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn ban_channel_member(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -5061,10 +5163,10 @@ pub async fn ban_channel_member(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn unban_channel_member(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -5135,10 +5237,10 @@ async fn refuse_protected_ban_target(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn add_channel_moderator(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -5192,10 +5294,10 @@ pub async fn add_channel_moderator(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_channel_moderator(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -5229,10 +5331,10 @@ pub async fn remove_channel_moderator(
 /// Nominate who may take the room over if the owner stops republishing, and
 /// after how long. Both facts ride the owner-signed moderation record, so every
 /// member can check a later claim against them.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_channel_successor_nominee(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: Option<String>,
     claim_after_days: Option<u16>,
@@ -5287,8 +5389,8 @@ pub async fn set_channel_successor_nominee(
         .map_err(|e| coded_ctx("channels_moderation_failed", "Could not load members", e))?;
         if !ok {
             return Err(coded(
-                "channels_member_invalid",
-                "That member is not in this room",
+                "channels_member_not_in_channel",
+                "That person is no longer a member of this channel",
             ));
         }
     }
@@ -5371,10 +5473,10 @@ async fn register_nominee_with_registry(
 /// Mints a fresh room key — the old owner's seed is never copied — and publishes
 /// a claim every member checks against the nomination in the owner's last signed
 /// record before following it.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn claim_channel_ownership(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
 ) -> Result<ChannelInfo, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -5476,6 +5578,12 @@ pub async fn claim_channel_ownership(
             "This room does not need claiming",
         ));
     }
+    // Made here, as a created room is: its first snapshot is the one below.
+    crate::network::channel_membership::note_channel_moderation_read(
+        successor.channel_id,
+        true,
+        chrono::Utc::now().timestamp(),
+    );
     // Everything that needed serialising is now in the database, and the room
     // reads as claimed, so a second attempt is refused by the guard above
     // rather than by this lock. Released before the network work because
@@ -5789,9 +5897,9 @@ async fn probe_public_member_counts(
 ///
 /// Several storers can hold different generations of one room's record, so
 /// the same room can appear more than once; [`merge_signed_listing`] keeps the
-/// newest. Private rooms publish an index record too and are dropped here:
-/// theirs exists so a holder of the invite can confirm the room, not so a
-/// browse can find it.
+/// newest. An index record flagged private is dropped here: this build
+/// publishes none, but one from an older build, or from anyone holding a room
+/// key, must not put a private room in front of a browse.
 fn listings_from_blobs(
     blobs: Vec<Vec<u8>>,
     joined_ids: &std::collections::HashSet<String>,
@@ -5911,6 +6019,15 @@ fn discovered_room_name(raw: &str, channel_id_hex: &str) -> String {
         .to_string()
 }
 
+/// Our own rooms and the Discover cache, for the Discover views. Our rooms
+/// fail the read, as in `list_channels`: read as none, every room we are in
+/// was offered to join and every one we hid came back. The cache only lends
+/// hints, so it may fail quietly. Blocking.
+fn discover_room_lists(db: &Database) -> anyhow::Result<(Vec<StoredChannel>, Vec<CachedChannel>)> {
+    let local = db.list_channels()?;
+    Ok((local, db.list_cached_channels().unwrap_or_default()))
+}
+
 fn inside_ids(rows: &[StoredChannel]) -> std::collections::HashSet<String> {
     rows.iter()
         .filter(|c| c.in_room_now())
@@ -6020,10 +6137,10 @@ const GATHER_WALK_MAX: usize = 64;
 /// slowest walk gives up, and the merged result is cached for the next open.
 /// The return value is still the complete set: a caller that ignores the
 /// events behaves exactly as before.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn gather_channels(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     walk: String,
 ) -> Result<Vec<GatheredChannelInfo>, String> {
     use futures::StreamExt;
@@ -6041,14 +6158,10 @@ pub async fn gather_channels(
 
     require_ember(&state).await?;
     let db = state.db.clone();
-    let (local, cached) = tokio::task::spawn_blocking(move || {
-        (
-            db.list_channels().unwrap_or_default(),
-            db.list_cached_channels().unwrap_or_default(),
-        )
-    })
-    .await
-    .unwrap_or_default();
+    let (local, cached) = tokio::task::spawn_blocking(move || discover_room_lists(&db))
+        .await
+        .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+        .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
     let joined_ids = inside_ids(&local);
     let hidden: std::collections::HashSet<String> = local
         .iter()
@@ -6062,12 +6175,12 @@ pub async fn gather_channels(
         .collect();
 
     let url = rendezvous_url(&state).await;
+    // The registry's deleted rooms, acted on as well as read: rooms we are in
+    // are left, and those proved deleted removed. As last read here when the
+    // registry cannot be reached, so a slow server does not put them back.
     let (directory, deleted) = tokio::join!(
         crate::network::rendezvous::fetch_channel_directory(&url, DIRECTORY_FETCH_TIMEOUT),
-        tokio::time::timeout(
-            DIRECTORY_FETCH_TIMEOUT,
-            crate::network::rendezvous::fetch_deleted_channel_ids(&url),
-        ),
+        super::room_deletion::settle_deleted_rooms(&app, &state),
     );
     // A rendezvous that is down or slow degrades Discover to whatever the DHT
     // walks below turn up, which is the right behaviour — but it used to be
@@ -6081,42 +6194,6 @@ pub async fn gather_channels(
             Vec::new()
         }
     };
-    let deleted: std::collections::HashSet<String> = match deleted {
-        Ok(Ok(ids)) => ids,
-        Ok(Err(error)) => {
-            tracing::warn!(?error, "deleted-channel list fetch failed; tombstoned rooms may still be listed");
-            Vec::new()
-        }
-        Err(_) => {
-            tracing::warn!("deleted-channel list fetch timed out; tombstoned rooms may still be listed");
-            Vec::new()
-        }
-    }
-    .into_iter()
-    .map(|id| id.to_ascii_lowercase())
-    .collect();
-    if !deleted.is_empty() {
-        let db = state.db.clone();
-        let ids: Vec<String> = deleted.iter().cloned().collect();
-        let walked = tokio::task::spawn_blocking(move || db.walk_out_deleted_channels(&ids))
-            .await
-            .ok()
-            .and_then(|walked| walked.ok())
-            .unwrap_or_default();
-        // As leaving does: transfers in a room we just walked out of would keep
-        // serving, and offers from it stay acceptable, while every frame that
-        // could settle them is now dropped.
-        for id in walked {
-            if let Ok(channel_id) = <[u8; 16]>::try_from(hex::decode(&id).unwrap_or_default().as_slice()) {
-                let _ = crate::commands::errors::bounded_send(
-                    &state.network_tx,
-                    NetworkCommand::DropChannelTransfers { channel_id, member: None },
-                )
-                .await;
-            }
-        }
-    }
-
     let mut walks: futures::stream::FuturesUnordered<_> = channel::all_index_keys()
         .into_iter()
         .zip(0u8..)
@@ -6283,25 +6360,26 @@ pub async fn gather_channels(
 /// Answers without touching the network so the browse has something on screen
 /// while [`gather_channels`] is still walking. These are hints and may name a
 /// room that has since gone; the walk that follows is what confirms them.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cached_channels(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<GatheredChannelInfo>, String> {
     let db = state.db.clone();
-    let (cached, joined) = tokio::task::spawn_blocking(move || {
-        (
-            db.list_cached_channels().unwrap_or_default(),
-            db.list_channels().unwrap_or_default(),
-        )
+    let ((joined, cached), listed_deleted) = tokio::task::spawn_blocking(move || {
+        // Rooms the registry was last seen to list as deleted stay out of the
+        // cache's answer too; it is what a slow walk shows first.
+        discover_room_lists(&db).map(|lists| (lists, db.registry_deleted_ids().unwrap_or_default()))
     })
     .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?;
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))?
+    .map_err(|e| coded_ctx("channels_list_failed", "Failed to list channels", e))?;
 
     let joined_ids = inside_ids(&joined);
     let hidden: std::collections::HashSet<String> = joined
         .iter()
         .filter(|c| c.deleted)
         .map(|c| c.channel_id.clone())
+        .chain(listed_deleted)
         .collect();
     Ok(cached
         .into_iter()
@@ -6431,10 +6509,10 @@ pub(crate) async fn find_raw_keys_counted(
 
 /// Owner starts a transfer: the named member mints a new channel key; the
 /// old key then signs a DHT handoff. The seed is never copied.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn transfer_channel_ownership(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
 ) -> Result<(), String> {
@@ -6541,8 +6619,8 @@ pub async fn transfer_channel_ownership(
     .map_err(|e| coded_ctx("channels_handoff_failed", "Could not start transfer", e))?;
     if !member_ok {
         return Err(coded(
-            "channels_member_invalid",
-            "That member is not in this room",
+            "channels_member_not_in_channel",
+            "That person is no longer a member of this channel",
         ));
     }
     let version = chrono::Utc::now().timestamp().max(1) as u64;
@@ -6602,16 +6680,19 @@ async fn clear_channel_pending_handoff(
 /// Deriving it here rather than in the UI keeps one implementation of that
 /// binding, and hands `add_friend` a code whose pubkey it can verify instead
 /// of a bare hash it would have to learn the key for later.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn channel_member_friend_code(
-    _state: tauri::State<'_, AppState>,
+    _state: crate::host::State<'_, AppState>,
     member_pubkey: String,
 ) -> Result<String, String> {
     let pk = parse_member_pubkey(&member_pubkey)?;
-    let hash = crypto::node_id_from_ed25519_bytes(&pk).ok_or_else(|| {
-        coded("channels_member_invalid", "Invalid member key")
-    })?;
-    Ok(format!("ember2:{}:{}", hex::encode(hash), hex::encode(pk)))
+    member_friend_code(&pk).ok_or_else(|| coded("channels_member_invalid", "Invalid member key"))
+}
+
+/// [`channel_member_friend_code`] for a key already parsed.
+pub(crate) fn member_friend_code(member: &[u8; 32]) -> Option<String> {
+    let hash = crypto::node_id_from_ed25519_bytes(member)?;
+    Some(format!("ember2:{}:{}", hex::encode(hash), hex::encode(member)))
 }
 
 /// Rooms one friend request is sent across when it goes through rooms.
@@ -6793,18 +6874,70 @@ mod room_friend_request_backoff_tests {
 /// `canonicalize`.
 ///
 /// `Ok(None)` means the user dismissed the picker.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_and_offer_channel_transfer(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     channel_id: String,
     member_pubkey: String,
     title: Option<String>,
 ) -> Result<Option<String>, String> {
     let dialog_title = super::picker_title(title, "Choose a file to send");
-    require_ember(&state).await?;
-    let channel_id = parse_channel_id(&channel_id)?;
-    let peer = parse_member_pubkey(&member_pubkey)?;
+    let (channel_id, peer) = channel_transfer_recipient(&state, &channel_id, &member_pubkey).await?;
+
+    // Only prompt once the offer is known to have somewhere to go, so a
+    // dismissed dialog is the only reason this returns `Ok(None)`.
+    let picker = app.clone();
+    let picked = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .set_title(dialog_title)
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path()
+                    .map_err(|e| coded_ctx("channels_xfer_failed", "Invalid file path", e))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))??;
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    offer_channel_transfer_from(&state, channel_id, peer, picked).await.map(Some)
+}
+
+/// emberd: offer a room member a file sent from the browser's computer. It
+/// is kept on the server while the member may still take it.
+#[ember_macros::command(server)]
+pub async fn offer_channel_transfer_upload(
+    state: crate::host::State<'_, AppState>,
+    channel_id: String,
+    member_pubkey: String,
+    upload: String,
+) -> Result<String, String> {
+    let (channel_id, peer) = match channel_transfer_recipient(&state, &channel_id, &member_pubkey).await {
+        Ok(recipient) => recipient,
+        Err(e) => {
+            crate::server::uploads::discard(&upload);
+            return Err(e);
+        }
+    };
+    let path = crate::server::uploads::keep(&upload)?;
+    offer_channel_transfer_from(&state, channel_id, peer, path).await
+}
+
+/// The room and member a file may be offered to: Ember on, the room joined
+/// and not banned from, and the member someone else the room can see.
+pub(crate) async fn channel_transfer_recipient(
+    state: &AppState,
+    channel_id: &str,
+    member_pubkey: &str,
+) -> Result<(String, [u8; 32]), String> {
+    require_ember(state).await?;
+    let channel_id = parse_channel_id(channel_id)?;
+    let peer = parse_member_pubkey(member_pubkey)?;
     if peer == state.identity.ed25519_public_key {
         return Err(coded(
             "channels_xfer_self",
@@ -6812,8 +6945,8 @@ pub async fn pick_and_offer_channel_transfer(
         ));
     }
 
-    let row = load_joined_channel(&state, &channel_id).await?;
-    if self_banned_from(&state, &row, "channels_xfer_failed").await? {
+    let row = load_joined_channel(state, &channel_id).await?;
+    if self_banned_from(state, &row, "channels_xfer_failed").await? {
         return Err(coded(
             "channels_banned",
             "You are banned from this channel",
@@ -6836,28 +6969,16 @@ pub async fn pick_and_offer_channel_transfer(
             "That member is not in this channel",
         ));
     }
+    Ok((channel_id, peer))
+}
 
-    // Only prompt once the offer is known to have somewhere to go, so a
-    // dismissed dialog is the only reason this returns `Ok(None)`.
-    let picker = app.clone();
-    let picked = tokio::task::spawn_blocking(move || {
-        picker
-            .dialog()
-            .file()
-            .set_title(dialog_title)
-            .blocking_pick_file()
-            .map(|file| {
-                file.into_path()
-                    .map_err(|e| coded_ctx("channels_xfer_failed", "Invalid file path", e))
-            })
-            .transpose()
-    })
-    .await
-    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))??;
-    let Some(picked) = picked else {
-        return Ok(None);
-    };
-
+/// Offer `peer` in `channel_id` the file at `picked`, chosen by the user.
+async fn offer_channel_transfer_from(
+    state: &AppState,
+    channel_id: String,
+    peer: [u8; 32],
+    picked: std::path::PathBuf,
+) -> Result<String, String> {
     let prepared = tokio::task::spawn_blocking(move || {
         let canonical = picked
             .canonicalize()
@@ -6913,8 +7034,7 @@ pub async fn pick_and_offer_channel_transfer(
     let mut channel_id_bytes = [0u8; 16];
     hex::decode_to_slice(&channel_id, &mut channel_id_bytes)
         .map_err(|_| coded("channels_not_found", "Channel not found"))?;
-    let mut xfer_id = [0u8; 16];
-    OsRng.fill_bytes(&mut xfer_id);
+    let xfer_id = crate::network::ember::channel::mint_xfer_id(chrono::Utc::now().timestamp());
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -6931,13 +7051,13 @@ pub async fn pick_and_offer_channel_transfer(
         })
         .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
     await_reply(rx, "channels_xfer_failed", "No response from network").await??;
-    Ok(Some(hex::encode(xfer_id)))
+    Ok(hex::encode(xfer_id))
 }
 
 /// Accept or decline an offer someone made you.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn respond_channel_transfer(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     xfer_id: String,
     accept: bool,
 ) -> Result<(), String> {
@@ -6962,9 +7082,9 @@ pub async fn respond_channel_transfer(
 }
 
 /// Stop a transfer in either direction, and tell the other end.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cancel_channel_transfer(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     xfer_id: String,
 ) -> Result<(), String> {
     require_ember(&state).await?;
@@ -6978,28 +7098,9 @@ pub async fn cancel_channel_transfer(
     Ok(())
 }
 
-/// Send the standard offer for a file you offered whose recipient has not
-/// answered the private one. Every member it is forwarded through can read the
-/// file's name and size, so this only runs when the user asks for it.
-#[tauri::command]
-pub async fn send_channel_transfer_standard_offer(
-    state: tauri::State<'_, AppState>,
-    xfer_id: String,
-) -> Result<(), String> {
-    require_ember(&state).await?;
-    let xfer_id = parse_xfer_id(&xfer_id)?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    state
-        .network_tx
-        .try_send(NetworkCommand::SendChannelTransferPlainOffer { xfer_id, tx })
-        .map_err(|_| coded("channels_xfer_failed", "Network is busy"))?;
-    await_reply(rx, "channels_xfer_failed", "No response from network").await??;
-    Ok(())
-}
-
 /// Open the Channel Files folder, creating it if nothing has landed there yet.
-#[tauri::command]
-pub async fn open_channel_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn open_channel_files_folder(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     let dl_folder = state.config.read().await.settings.download_folder.clone();
     tokio::task::spawn_blocking(move || {
         let allowed = vec![dl_folder.clone()];
@@ -7022,9 +7123,9 @@ pub async fn open_channel_files_folder(state: tauri::State<'_, AppState>) -> Res
 }
 
 /// Everything currently offered, awaiting an answer, or moving.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn list_channel_transfers(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<crate::network::ChannelTransferSnapshot>, String> {
     if !state.config.read().await.settings.ember_native_enabled {
         return Ok(Vec::new());
@@ -7080,69 +7181,57 @@ mod tests {
     }
 
     /// Every frame handed to the gossip layer fits a datagram, wrapped for an
-    /// overlay relay hop too, which is how a firewalled member gets it. Near
-    /// the cap a line goes out in the legacy form alone; past what the legacy
-    /// frame can carry it is refused, so it is neither stored nor lost on the
-    /// way.
+    /// overlay relay hop too, which is how a firewalled member gets it. Past
+    /// what the frame can carry a line is refused, so it is neither stored nor
+    /// lost on the way.
     #[test]
-    fn a_line_too_long_for_a_datagram_is_refused_and_its_oversized_twin_dropped() {
+    fn a_line_too_long_for_a_relayed_datagram_is_refused() {
         let key = crypto::signing_key_from_bytes(&[0x31; 32]);
         let sender = key.verifying_key().to_bytes();
         let room = [0x5a; 16];
         let content_key = [0x77; 32];
-        let frames_for = |len: usize| {
+        let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
+        let line_of = |len: usize| {
             let text = "a".repeat(len);
-            let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
-            let line = channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, &text, None)
-                .expect("under the text cap");
-            chat_gossip_frames(room, &content_key, &sender, line_id, 1_700_000_000, &line)
+            channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, None).expect("under the text cap")
         };
+        let frame_for = |len: usize| chat_gossip_frame(room, &content_key, &sender, &line_of(len));
         let max = crate::network::ember::dht::messages::MAX_DELIVERABLE_PAYLOAD;
-        let both = if channel::SEND_LEGACY_CHAT_FRAMES { 2 } else { 1 };
 
-        assert_eq!(frames_for(200).unwrap().len(), both);
-        assert!(frames_for(MAX_CHANNEL_MESSAGE).is_err());
+        assert!(frame_for(200).is_ok());
+        assert!(frame_for(MAX_CHANNEL_MESSAGE).is_err());
         let longest = (1..=MAX_CHANNEL_MESSAGE)
             .rev()
-            .find(|len| frames_for(*len).is_ok())
+            .find(|len| frame_for(*len).is_ok())
             .expect("some line fits");
         assert!(longest > 3_500, "a long line still goes out: {longest}");
         let relayed = |frame: &Vec<u8>| channel::encode_channel_relay_envelope(&room, &[0x42; 16], frame).len();
         for len in longest.saturating_sub(64)..=longest {
-            let frames = frames_for(len).expect("every shorter line fits too");
-            assert!(
-                frames.iter().all(|frame| relayed(frame) <= max),
-                "a {len}-byte line's frame fits a relay hop's datagram"
-            );
-        }
-        let frames = frames_for(longest).unwrap();
-        if channel::SEND_LEGACY_CHAT_FRAMES {
-            assert_eq!(frames.len(), 1, "only the legacy frame fits at the edge");
+            let frame = frame_for(len).expect("every shorter line fits too");
+            assert!(relayed(&frame) <= max, "a {len}-byte line's frame fits a relay hop's datagram");
         }
         // The first length refused is one whose frame would still fit a direct
         // datagram, and only a relay hop's would not.
-        let line_id = channel::new_chat_msg_id(&room, &sender, 1_700_000_000);
-        let text = "a".repeat(longest + 1);
-        let line = channel::outgoing_chat_line(&key, &room, &line_id, 1_700_000_000, &text, &text, None).unwrap();
+        let line = line_of(longest + 1);
         let first = channel::ChannelGossip::sealed(
             room,
             line_id,
             &content_key,
             1_700_000_000,
-            &line.legacy.as_ref().map_or_else(|| line.v2.plain(&sender), |(plain, _)| plain.clone()),
+            &line.v2.plain(&sender),
             channel::CHANNEL_MSG_TTL_DEFAULT,
             1_700_000_000,
         )
         .encode();
         assert!(first.len() <= max && relayed(&first) > max, "{}", first.len());
-        assert!(frames_for(longest + 1).is_err());
+        assert!(frame_for(longest + 1).is_err());
     }
 
     /// The limits the frontend holds are exactly where the send path starts
     /// refusing: for a line and a revision, each with and without a reply,
     /// built as `send_channel_message` and `edit_channel_message` build them.
-    /// Multi-byte text meets the same edge, and text whose joiners the legacy
-    /// frame drops only ever gets further.
+    /// Multi-byte text meets the same edge, and so does text with emoji
+    /// joiners, which the frame keeps.
     #[test]
     fn the_frontends_line_limits_are_where_the_frames_stop_fitting() {
         let key = crypto::signing_key_from_bytes(&[0x31; 32]);
@@ -7155,18 +7244,13 @@ mod tests {
         let frames_for = |typed: &str, parent: Option<&[u8; 16]>, edit: bool| {
             let sanitized = crate::security::sanitize_outgoing_message_text(typed).expect("under the character cap");
             let cleaned = channel::strip_reply_trailers(&sanitized).to_string();
-            let wire_text = channel::with_reply_trailer(&cleaned, parent);
             let v2_text = channel::chat_v2_outgoing_text(typed, &cleaned, parent);
-            if edit {
-                let revision =
-                    channel::outgoing_chat_edit(&key, &room, &line_id, sent, sent + 60, &wire_text, &v2_text, parent)
-                        .expect("under the text cap");
-                chat_gossip_frames(room, &content_key, &sender, [0x42; 16], sent + 60, &revision)
+            let chat = if edit {
+                channel::outgoing_chat_edit(&key, &room, &line_id, sent, sent + 60, &v2_text, parent)
             } else {
-                let line = channel::outgoing_chat_line(&key, &room, &line_id, sent, &wire_text, &v2_text, parent)
-                    .expect("under the text cap");
-                chat_gossip_frames(room, &content_key, &sender, line_id, sent, &line)
-            }
+                channel::outgoing_chat_line(&key, &room, &line_id, sent, &v2_text, parent)
+            };
+            chat_gossip_frame(room, &content_key, &sender, &chat.expect("under the text cap"))
         };
         let longest = |parent: Option<&[u8; 16]>, edit: bool| {
             let fits = |len: usize| frames_for(&"a".repeat(len), parent, edit).is_ok();
@@ -7174,7 +7258,7 @@ mod tests {
             assert!((1..=longest).step_by(97).all(fits), "every shorter line fits too");
             longest
         };
-        let reply = channel::REPLY_TRAILER_BYTES;
+        let reply = channel::CHAT_V2_REPLY_BYTES;
         let cases = [
             (None, false, CHANNEL_LINE_MAX_TEXT_BYTES),
             (Some(&parent), false, CHANNEL_LINE_MAX_TEXT_BYTES - reply),
@@ -7192,14 +7276,13 @@ mod tests {
             assert!(frames_for(&at_edge, parent, edit).is_ok(), "{what}: multi-byte text at the edge");
             assert!(frames_for(&format!("{at_edge}a"), parent, edit).is_err(), "{what}: one byte past it");
 
-            // Each family emoji is 18 bytes typed and 12 once its joiners are
-            // gone, and the edge is measured on the 12.
+            // The v2 frame carries a line's emoji joiners, so they count: the
+            // edge is on the text as typed, which is what the frontend measures.
             let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}".repeat(10);
-            let legacy_len = crate::security::without_message_text_joiners(&family).len();
-            let joined = format!("{family}{}", "a".repeat(limit - legacy_len));
-            assert_eq!(joined.len(), limit + 60);
-            assert!(frames_for(&joined, parent, edit).is_ok(), "{what}: joiners do not count");
-            assert!(frames_for(&format!("{joined}a"), parent, edit).is_err(), "{what}: past the edge without them");
+            let joined = format!("{family}{}", "a".repeat(limit - family.len()));
+            assert_eq!(joined.len(), limit);
+            assert!(frames_for(&joined, parent, edit).is_ok(), "{what}: joiners and all at the edge");
+            assert!(frames_for(&format!("{joined}a"), parent, edit).is_err(), "{what}: one byte past it");
         }
     }
 
@@ -7344,6 +7427,37 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    /// Discover's read of our own rooms fails rather than reading as none,
+    /// which offered every room we are in to join and brought back every one
+    /// we hid. A broken cache costs only its hints.
+    #[test]
+    fn a_failed_read_of_our_rooms_is_not_read_as_none() {
+        let path = std::env::temp_dir().join(format!("ember-discover-rooms-{}.db", uuid::Uuid::new_v4()));
+        let db = Database::open_at(&path).expect("open db");
+        db.insert_channel(&"ab".repeat(16), &"01".repeat(32), "News", "public", false, None, None)
+            .expect("insert room");
+        let (local, _) = discover_room_lists(&db).expect("both read");
+        assert_eq!(local.len(), 1);
+
+        let other = rusqlite::Connection::open(&path).expect("second connection");
+        other
+            .execute_batch("ALTER TABLE channel_index_cache RENAME TO channel_index_cache_gone")
+            .expect("break the cache");
+        let (local, cached) = discover_room_lists(&db).expect("a broken cache is only hints");
+        assert_eq!((local.len(), cached.len()), (1, 0));
+
+        other
+            .execute_batch("ALTER TABLE channels RENAME TO channels_gone")
+            .expect("break our rooms");
+        assert!(discover_room_lists(&db).is_err());
+
+        drop(other);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     /// In an announcement-only room the owner and the snapshot's moderators

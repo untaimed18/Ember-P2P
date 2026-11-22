@@ -23,11 +23,12 @@ name: Release
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the password set during key generation
 # (GITHUB_TOKEN is provided automatically.)
 #
-# Nothing is compiled while the signing key exists. `build-windows` and
-# `build-linux` are ordinary no-secret jobs: they produce the installers with
-# `createUpdaterArtifacts` off and hand them over as workflow artifacts. A key
-# present during a build is within reach of every npm install script, Vite
-# plugin, build.rs and proc-macro in the dependency tree. `sign-publish`
+# Nothing is compiled while the signing key exists. `build-windows`,
+# `build-linux-deb` and `build-linux-appimage` are ordinary no-secret jobs: they
+# produce the installers with `createUpdaterArtifacts` off and hand them over
+# as workflow artifacts. A key present during a build is within reach of every
+# npm install script, Vite plugin, build.rs and proc-macro in the dependency
+# tree. `sign-publish`
 # executes nothing from the dependency tree besides the lockfile-pinned Tauri
 # CLI (installed with install scripts off), signs the downloaded bundles with
 # `tauri signer sign`, and publishes — so the key only ever exists inside that
@@ -41,9 +42,18 @@ name: Release
 # Both Linux formats self-update. `tauri-plugin-updater` chooses its artifact
 # from a marker the bundler writes into each package it builds, so a `.deb`
 # install resolves `linux-x86_64-deb` and installs it with `dpkg -i`, while an
-# AppImage resolves `linux-x86_64-appimage` and rewrites itself in place.
-# `scripts/add-linux-platforms.mjs` composes both entries, and says there why no
-# bare `linux-x86_64` key is published.
+# AppImage takes `linux-x86_64-appimage-glibc` once it has checked that its
+# system has the glibc that entry states, and rewrites itself in place.
+# `scripts/add-linux-platforms.mjs` composes both entries, and says there why
+# neither a plain `linux-x86_64-appimage` nor a bare `linux-x86_64` key is
+# published.
+#
+# emberd, Ember without a window, is built by `build-emberd` for x86-64 and
+# ARM64 and attached as tarballs and `.deb`s with a list of their SHA-256. It
+# never enters latest.json: it is updated the way it was installed, and the
+# desktop's updater must never hand a desktop install a server. Publishing the
+# draft is also what pushes its Docker image, made from those tarballs by
+# `emberd-image.yml`, so `latest` moves when latest.json does.
 
 on:
   push:
@@ -154,7 +164,7 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # Same override as `build-linux`, for the same reason: this job holds no
+      # Same override as the Linux jobs, for the same reason: this job holds no
       # signing key. bash rather than pwsh because pwsh hands `npm.cmd` the JSON
       # with its inner quotes stripped.
       - name: Build installers
@@ -173,28 +183,106 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  build-linux:
-    name: Build Linux packages
+  build-linux-deb:
+    name: Build the Linux .deb
     needs: verify
     runs-on: ubuntu-22.04
     # The glibc baseline (2.35) Tauri recommends for shipping, and the same
-    # runner `check-linux` compiles on. An AppImage bundles everything except
-    # glibc and glibc is only forwards compatible, so the distro this is built
-    # on is the oldest one the result can run on.
+    # runner `check-linux` compiles on. A `.deb` links the host's glibc and
+    # glibc is only forwards compatible, so the distro this is built on is the
+    # oldest one the package can run on.
     #
-    # It also bundles WebKit but not FreeType, so the AppImage works around
-    # this distro's FreeType (2.11) on hosts with 2.13 or newer: see
-    # `src-tauri/src/appimage_fonts.rs`, whose `BUILT_AGAINST_FREETYPE` moves
-    # with this line. Moving the AppImage to a newer distro raises its glibc
-    # floor, and an AppImage rewrites itself in place, so an install on an
-    # older system must never be handed it: publish that build under
-    # `linux-x86_64-appimage-glibc` with its `min_glibc`, which only 1.7.7 and
-    # later read (`choose_appimage_target` in `commands/updater.rs`), and keep
-    # the plain `linux-x86_64-appimage` entry for a build that runs wherever
-    # this one does, or drop it.
+    # It stays here while the AppImage moves on because a `.deb` before 1.8.0
+    # asks for `linux-x86_64-deb` and checks no glibc, so a build from a newer
+    # distro would install on an older one and then not start. 1.8.0 is the
+    # first `.deb` to prefer `linux-x86_64-deb-glibc` when its system has that
+    # entry's `min_glibc` (`choose_glibc_target` in `commands/updater.rs`), so
+    # a newer build can go out there once enough installs have taken 1.8.0.
+    # The release policy holds this job here until then.
     timeout-minutes: 90
     permissions:
       contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            pkg-config \
+            file \
+            xdg-utils \
+            desktop-file-utils
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # `createUpdaterArtifacts` is forced off because this job holds no signing
+      # key: tauri.conf.json enables it for the release, and the bundler would
+      # fail at the updater step after paying for a full compile. The bundle
+      # itself still carries the marker that tells the updater which format it
+      # is, so signing it in `sign-publish` loses nothing.
+      - name: Build the .deb
+        run: |
+          npm run tauri build -- --bundles deb \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload the .deb
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ember-linux-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  build-linux-appimage:
+    name: Build the Linux AppImage
+    needs: verify
+    runs-on: ubuntu-24.04
+    # An AppImage bundles everything except glibc, and glibc is only forwards
+    # compatible, so this distro's glibc (2.39) is the oldest the AppImage runs
+    # on. That is above the 2.35 releases through 1.7.8 were built for, and an
+    # AppImage rewrites itself in place, so an install on an older system must
+    # never be handed it: it is published only under
+    # `linux-x86_64-appimage-glibc`, with the glibc measured below as its
+    # `min_glibc`. 1.7.7 and later check that before taking the update
+    # (`choose_glibc_target` in `commands/updater.rs`) and point a system
+    # below it at the `.deb`; earlier releases read only the plain
+    # `linux-x86_64-appimage`, and are offered nothing. The eD2K notes, the
+    # website and the guide give that floor in words, so the release policy
+    # holds this job here.
+    #
+    # It also bundles WebKit but not FreeType, so the AppImage works around a
+    # host whose FreeType is on the other side of 2.13 from this distro's:
+    # `src-tauri/src/appimage_fonts.rs`, told which FreeType that is by
+    # `build.rs`.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      min-glibc: ${{ steps.glibc.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -236,35 +324,111 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # `createUpdaterArtifacts` is forced off because this job holds no signing
-      # key: tauri.conf.json enables it for the release, and the bundler would
-      # fail at the updater step after paying for a full compile. The bundles
-      # themselves still carry the marker that tells the updater which format
-      # each one is, so signing them in `sign-publish` loses nothing.
+      # `createUpdaterArtifacts` is forced off for the same reason as in
+      # `build-linux-deb`.
       #
       # `APPIMAGE_EXTRACT_AND_RUN` is set because the bundler runs linuxdeploy,
       # which is itself an AppImage and therefore wants FUSE the runner has not
       # got.
-      - name: Build packages
+      - name: Build the AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
-          npm run tauri build -- --bundles appimage,deb \
+          npm run tauri build -- --bundles appimage \
             --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      - name: Upload packages
+      # Read from the runner rather than written down, so the floor the manifest
+      # states moves with `runs-on` above.
+      - name: Record the glibc the AppImage needs
+        id: glibc
+        run: |
+          version="$(getconf GNU_LIBC_VERSION | awk '{ print $2 }')"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "could not read this runner's glibc version (got '$version')" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the AppImage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ember-linux-x86_64
+          name: ember-linux-appimage
+          path: src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
+  build-emberd:
+    name: Build emberd for ${{ matrix.arch }}
+    needs: verify
+    # emberd, Ember without a window: a tarball and a `.deb` for each machine,
+    # attached to the release beside the desktop's packages. They are no part
+    # of its update: `sign-publish` keeps them out of the bundle folders, so
+    # nothing signs them with the updater key or names them in latest.json.
+    # The Docker image is made from the tarballs once the release is
+    # published, by `emberd-image.yml`.
+    #
+    # Ubuntu 22.04 on both, for its glibc (2.35), as the desktop `.deb`: glibc
+    # is only forwards compatible, and the docs give 2.35 as emberd's floor.
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+          key: emberd-release-${{ matrix.arch }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build the web interface
+        run: npm run build:web
+
+      - name: Build emberd
+        run: cargo build --locked --release --manifest-path src-tauri/Cargo.toml --no-default-features --features server --bin emberd
+
+      - name: Package the tarball and the .deb
+        run: bash packaging/emberd/package.sh "${GITHUB_REF_NAME#v}" out
+
+      - name: Check the packages
+        run: bash packaging/emberd/check-packages.sh "${GITHUB_REF_NAME#v}" out
+
+      - name: Upload emberd's packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: emberd-linux-${{ matrix.arch }}
           path: |
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/deb/*.deb
+            out/*.tar.gz
+            out/*.deb
           if-no-files-found: error
           retention-days: 7
 
   sign-publish:
     name: Sign and create draft release
-    needs: [verify, build, build-windows, build-linux]
+    needs: [verify, build, build-windows, build-linux-deb, build-linux-appimage, build-emberd]
     # Nothing is built here, so the runner OS is free; bash keeps the argument
     # handling for `gh` and the CLI predictable.
     runs-on: ubuntu-latest
@@ -287,6 +451,10 @@ jobs:
       # website is refreshed from. Beside the bundles, not among them, so the
       # signing pass does not take them for installers.
       EMBER_ED2K_OUT_DIR: src-tauri/target/ed2k-out
+      # emberd's tarballs and `.deb`s. Outside `src-tauri/target` and both
+      # bundle folders, so neither the signing pass, the eD2K links nor any
+      # step that writes latest.json comes across them.
+      EMBERD_OUT_DIR: emberd-out
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout
@@ -327,11 +495,45 @@ jobs:
           name: ember-windows-x86_64
           path: ${{ env.EMBER_WINDOWS_BUNDLE_DIR }}
 
-      - name: Download the Linux packages
+      - name: Download the Linux .deb
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: ember-linux-x86_64
-          path: ${{ env.EMBER_LINUX_BUNDLE_DIR }}
+          name: ember-linux-deb
+          path: ${{ env.EMBER_LINUX_BUNDLE_DIR }}/deb
+
+      - name: Download the Linux AppImage
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ember-linux-appimage
+          path: ${{ env.EMBER_LINUX_BUNDLE_DIR }}/appimage
+
+      - name: Download emberd's packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: emberd-linux-*
+          merge-multiple: true
+          path: ${{ env.EMBERD_OUT_DIR }}
+
+      # Exactly these four, by name, so a missing machine fails the release
+      # rather than publishing without it. The checksums are what
+      # `emberd-image.yml` checks a tarball against before building the image.
+      - name: Check emberd's packages and list their SHA-256
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          packages=(
+            "emberd-${version}-linux-x86_64.tar.gz"
+            "emberd-${version}-linux-aarch64.tar.gz"
+            "emberd_${version}_amd64.deb"
+            "emberd_${version}_arm64.deb"
+          )
+          found=$(find "$EMBERD_OUT_DIR" -type f | wc -l)
+          if [ "$found" -ne "${#packages[@]}" ]; then
+            echo "expected emberd's ${#packages[@]} packages alone in $EMBERD_OUT_DIR, found $found files" >&2
+            exit 1
+          fi
+          cd "$EMBERD_OUT_DIR"
+          sha256sum -- "${packages[@]}" > "emberd-${version}-SHA256SUMS"
+          cat "emberd-${version}-SHA256SUMS"
 
       # `signer sign` writes `<file>.sig` beside each bundle, which is both what
       # the manifest carries and what the plugin verifies the downloaded bytes
@@ -344,8 +546,10 @@ jobs:
         run: |
           mapfile -d '' bundles < <(find "$EMBER_WINDOWS_BUNDLE_DIR" "$EMBER_LINUX_BUNDLE_DIR" \
             -type f ! -name '*.sig' -print0)
-          if [ "${#bundles[@]}" -lt 4 ]; then
-            echo "expected the NSIS, MSI, AppImage and .deb bundles, found ${#bundles[@]}" >&2
+          # Exactly these four: anything else under the bundle folders would be
+          # signed with the release key and attached to the release.
+          if [ "${#bundles[@]}" -ne 4 ]; then
+            echo "expected the NSIS, MSI, AppImage and .deb bundles alone, found ${#bundles[@]} files" >&2
             exit 1
           fi
           for bundle in "${bundles[@]}"; do
@@ -414,7 +618,7 @@ jobs:
             echo "$EMBER_ED2K_OUT_DIR is missing; run the eD2K step before attaching" >&2
             exit 1
           fi
-          mapfile -d '' assets < <(find "$EMBER_WINDOWS_BUNDLE_DIR" "$EMBER_LINUX_BUNDLE_DIR" \
+          mapfile -d '' assets < <(find "$EMBER_WINDOWS_BUNDLE_DIR" "$EMBER_LINUX_BUNDLE_DIR" "$EMBERD_OUT_DIR" \
             "$EMBER_ED2K_OUT_DIR" -type f -print0)
           gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
 
@@ -427,6 +631,8 @@ jobs:
         run: node scripts/compose-update-manifest.mjs
 
       - name: Add the Linux targets to latest.json
+        env:
+          EMBER_APPIMAGE_MIN_GLIBC: ${{ needs.build-linux-appimage.outputs.min-glibc }}
         run: node scripts/add-linux-platforms.mjs
 
       - name: Add signed security metadata to latest.json

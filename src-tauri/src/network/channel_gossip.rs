@@ -185,7 +185,7 @@ pub(super) fn note_channel_delivery(
 pub(super) async fn flush_channel_delivery_notes(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
     if state.channel_delivery_notes.is_empty() {
         return;
@@ -198,7 +198,7 @@ pub(super) async fn flush_channel_delivery_notes(
 pub(super) async fn write_channel_delivery_notes(
     notes: Vec<([u8; 16], [u8; 16], i64)>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
     let db_write = db.clone();
     let written = tokio::task::spawn_blocking(move || {
@@ -610,8 +610,14 @@ pub(super) async fn fanout_channel_gossip_retry(
     // typed is stored and on screen before this runs, so one that reaches
     // nobody has to come back here rather than be counted as sent.
     let mut delivered = false;
+    // One frame for them all: it names no recipient, and its signature binds
+    // it to our own session key, which every neighbour checks it against alike.
+    let frame = if direct.is_empty() {
+        Vec::new()
+    } else {
+        state.ember_dht.build_channel_msg(body.clone()).1
+    };
     for (pk, contact) in direct {
-        let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
         if send_ember_dht_frame_established(socket, state, &contact, &frame).await {
             delivered = true;
         } else {
@@ -753,7 +759,7 @@ static NOTED_NEWER_ENVELOPES: std::sync::Mutex<Option<HashSet<([u8; 16], &'stati
 async fn note_unread_channel_envelope(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     from_id: ember::dht::EmberNodeId,
     source: &'static str,
     version: u8,
@@ -809,7 +815,7 @@ pub(super) async fn handle_inbound_channel_relay(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     body: Vec<u8>,
     from_id: ember::dht::EmberNodeId,
 ) {
@@ -933,7 +939,7 @@ pub(super) async fn handle_inbound_channel_gossip(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     body: Vec<u8>,
     from_id: ember::dht::EmberNodeId,
     metering: HopMetering,
@@ -1101,16 +1107,6 @@ pub(super) async fn handle_inbound_channel_gossip(
             &sender,
             chrono::Utc::now().timestamp(),
         );
-        if ember::channel::xfer_frame_proves_sealed_reader(&plain) {
-            note_sealed_offer_reader(state, db, app_handle, gossip.channel_id, &sender);
-        }
-        // Anything the recipient says about a transfer we offered — "seen", a
-        // reply, a block request — means it read the sealed offer.
-        if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
-            if send.heard_from(&sender) {
-                emit_xfer_send_update(app_handle, &xfer_id, send);
-            }
-        }
         if answer_finished_xfer(socket, state, db, xfer_id, sender).await {
             return;
         }
@@ -1136,7 +1132,7 @@ pub(super) async fn handle_inbound_channel_gossip(
                 debug!("Ember Transfer: ignored an offer in {channel_id_hex} under a retired key");
             }
         } else if ember::channel::decode_xfer_seen(body).is_some() {
-            // Acted on above, like everything else the recipient says.
+            // Only a sender holding a plain offer back, 1.7.1 to 1.7.8, acts on it.
             debug!(
                 "Ember Transfer: the recipient of {} read its sealed offer",
                 hex::encode(xfer_id)
@@ -1150,6 +1146,13 @@ pub(super) async fn handle_inbound_channel_gossip(
         } else if let Some((_, _, _, role, ports)) = ember::channel::decode_xfer_stream(&key, body) {
             apply_xfer_stream(state, xfer_id, sender, role, ports);
         }
+        return;
+    }
+    // Room library frames are addressed and never relayed on, like transfer
+    // frames, and sealed to the pair they are between.
+    if super::room_library::on_library_frame(socket, state, db, app_handle, &ch, gossip.channel_id, &plain, opened)
+        .await
+    {
         return;
     }
     // Ahead of the rest because it is the frame this room sends most often once
@@ -1541,6 +1544,7 @@ pub(super) async fn handle_inbound_channel_gossip(
                 // Relayed under the same rules as any extension frame first:
                 // whether it is to us must make no difference to that.
                 let private = (ext.kind == ember::channel::EXT_KIND_PRIVATE_MESSAGE).then(|| ext.clone());
+                let library = (ext.kind == ember::channel::EXT_KIND_ROOM_LIBRARY).then(|| ext.clone());
                 let passed = handle_inbound_channel_ext(
                     socket,
                     state,
@@ -1565,6 +1569,9 @@ pub(super) async fn handle_inbound_channel_gossip(
                         opened,
                     )
                     .await;
+                }
+                if let Some(ext) = library.filter(|_| passed) {
+                    super::room_library::on_library_status(state, db, app_handle, &ch, &gossip, &ext, opened);
                 }
             }
             None => debug!(
@@ -1746,7 +1753,7 @@ async fn handle_inbound_channel_chat(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ch: &crate::storage::database::StoredChannel,
     gossip: &ember::channel::ChannelGossip,
     channel_id_hex: &str,
@@ -2176,7 +2183,7 @@ pub(super) async fn apply_channel_handoff_offer(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ch: &crate::storage::database::StoredChannel,
     gossip: &ember::channel::ChannelGossip,
     from_id: ember::dht::EmberNodeId,
@@ -2312,7 +2319,7 @@ async fn apply_room_friend_request(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     gossip: &ember::channel::ChannelGossip,
     from_id: ember::dht::EmberNodeId,
     opened: ember::channel::OpenedUnder,
@@ -2337,8 +2344,6 @@ async fn apply_room_friend_request(
         forget_channel_gossip(state, &dedup_key);
         return;
     }
-    // Signed by its sender, and v1.6.x has no room friend request.
-    note_sealed_offer_reader(state, db, app_handle, channel_id, &sender_pk);
     let for_us = ember::channel::room_friend_request_is_for(
         &state.local_ed25519_seed,
         &sender_pk,
@@ -2533,7 +2538,7 @@ pub(super) async fn apply_channel_handoff_ready(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ch: &crate::storage::database::StoredChannel,
     gossip: &ember::channel::ChannelGossip,
     from_id: ember::dht::EmberNodeId,
@@ -2703,7 +2708,7 @@ pub(super) async fn publish_committed_channel_handoff(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ch: &crate::storage::database::StoredChannel,
     channel_id: [u8; 16],
     commit: &crate::storage::database::ChannelHandoffCommit,
@@ -2782,7 +2787,7 @@ pub(super) async fn publish_committed_channel_handoff(
 pub(super) fn spawn_owned_channel_handoff_completion(
     state: &NetworkState,
     db: &Arc<Database>,
-    app_handle: tauri::AppHandle,
+    app_handle: crate::host::AppHandle,
     channel_id: [u8; 16],
 ) {
     let registry_url = (!state.rendezvous_url.is_empty()).then(|| state.rendezvous_url.clone());
@@ -2807,7 +2812,7 @@ pub(super) fn spawn_owned_channel_handoff_completion(
 /// registry answers the same way.
 async fn complete_owned_channel_handoff(
     db: Arc<Database>,
-    app_handle: tauri::AppHandle,
+    app_handle: crate::host::AppHandle,
     registry_url: Option<String>,
     completing: Arc<std::sync::Mutex<HashSet<[u8; 16]>>>,
     channel_id: [u8; 16],
@@ -3271,7 +3276,7 @@ pub(super) enum ChannelUnicast {
 pub(super) fn apply_channel_typing(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     channel_id: [u8; 16],
     timestamp: i64,
     member: [u8; 32],
@@ -3301,8 +3306,6 @@ pub(super) fn apply_channel_typing(
         );
         return;
     }
-    // Signed by the member it names, and v1.6.x has no typing signal.
-    note_sealed_offer_reader(state, db, app_handle, channel_id, &member);
     let _ = app_handle.emit(
         "ember:channel-typing",
         serde_json::json!({
@@ -3385,12 +3388,12 @@ pub(super) async fn send_channel_typing(
     );
     // Seen before it leaves, so a peer echoing it back is dropped at dedup.
     remember_originated_gossip(state, &sealed);
-    let body = sealed.encode();
+    // One frame for every recipient, as in `fanout_channel_gossip_retry`.
+    let (_rid, frame) = state.ember_dht.build_channel_msg(sealed.encode());
     for pk in recipients {
         let Some(contact) = contacts.get(&pk) else {
             continue;
         };
-        let (_rid, frame) = state.ember_dht.build_channel_msg(body.clone());
         send_ember_dht_frame_established(socket, state, contact, &frame).await;
     }
 }
@@ -3414,7 +3417,7 @@ pub(super) async fn handle_inbound_channel_edit(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     gossip: &ember::channel::ChannelGossip,
     channel_id_hex: &str,
     edit: ember::channel::ChannelChatEdit,
@@ -3629,7 +3632,7 @@ pub(super) async fn handle_inbound_channel_reactions(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     gossip: &ember::channel::ChannelGossip,
     channel_id_hex: &str,
     entries: Vec<ember::channel::ChannelReaction>,
@@ -3758,7 +3761,7 @@ async fn handle_inbound_channel_ext(
     socket: &UdpSocket,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     gossip: &ember::channel::ChannelGossip,
     channel_id_hex: &str,
     ext: ember::channel::ChannelExtFrame,

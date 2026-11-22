@@ -16,11 +16,11 @@ function deniedCommands() {
   return [...body.matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]);
 }
 
-/** Every command name registered with `generate_handler!`. */
+/** Every command name in the command table (`command_table.rs`). */
 function registeredCommands() {
-  const text = readFileSync(join(rustRoot, "lib.rs"), "utf8");
-  const start = text.indexOf("generate_handler![");
-  const body = text.slice(start, text.indexOf("]", start));
+  const text = readFileSync(join(rustRoot, "command_table.rs"), "utf8");
+  const start = text.indexOf("ember_macros::command_table! {");
+  const body = text.slice(start, text.indexOf("\n}", start));
   return new Set([...body.matchAll(/::([a-z][a-z0-9_]*)\s*,/g)].map((m) => m[1]));
 }
 
@@ -455,11 +455,15 @@ function rustFiles(dir) {
 test("every command that refuses other windows is listed as main-window-only", () => {
   const listed = new Set(MAIN_WINDOW_ONLY.map(({ command }) => command));
   const unlisted = [];
+  let scanned = 0;
   for (const file of rustFiles(rustRoot)) {
     const text = readFileSync(file, "utf8");
     const commands = [
-      ...text.matchAll(/#\[tauri::command[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?fn\s+([a-z][a-z0-9_]*)/g),
+      ...text.matchAll(
+        /#\[(?:tauri|ember_macros)::command[^\]]*\]\s*(?:#\[[^\]]*\]\s*)*pub\s+(?:async\s+)?fn\s+([a-z][a-z0-9_]*)/g,
+      ),
     ];
+    scanned += commands.length;
     for (const [i, m] of commands.entries()) {
       const next = commands[i + 1]?.index ?? text.length;
       const end = text.indexOf("\n}\n", m.index);
@@ -469,6 +473,7 @@ test("every command that refuses other windows is listed as main-window-only", (
       }
     }
   }
+  assert.ok(scanned > 300, `only ${scanned} commands found: the pattern no longer matches how commands are declared`);
   assert.deepEqual(unlisted, [], "list these in MAIN_WINDOW_ONLY, so removing their guard fails this test");
 });
 

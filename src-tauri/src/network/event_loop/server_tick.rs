@@ -13,7 +13,7 @@ pub(in crate::network) async fn on_server_tick(
     settings: &AppSettings,
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
@@ -65,7 +65,7 @@ pub(in crate::network) async fn on_server_tick(
                                 &mut state.ip_filter,
                             );
                             if added > 0 {
-                                emit_server_log(app_handle, &format!("Added {added} servers from server list update"));
+                                emit_server_log(app_handle, &added_servers_line(added, "server list update"));
                                 let met_path = state.data_dir.join("server.met");
                                 spawn_save_server_met(&state.server_list, met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
                             }
@@ -1050,6 +1050,16 @@ pub(in crate::network) async fn on_server_tick(
                             // search, not another page of the first.
                             state.server_search_more_due_at = None;
                             state.server_search_more_requests = 0;
+                            // And the server pages only its last search,
+                            // so what the first had left is out of reach;
+                            // this one's own pages say whether there is more.
+                            if let Some(active) = state
+                                .active_search_request
+                                .as_mut()
+                                .filter(|active| active.request_id == followup_id)
+                            {
+                                active.server_has_more = false;
+                            }
                             // Only queued behind a first request the
                             // server answered.
                             state.pending_server_search = Some(PendingServerSearch {
@@ -1190,14 +1200,10 @@ pub(in crate::network) async fn on_server_tick(
         state.server_search_age = 0;
     }
 
-    // An explicit Disconnect has to outlast this tick. `preferred_ed2k_server`
-    // and `server_auto_reconnect` both survive going offline, so without this
-    // guard the disconnect the user just asked for was undone ~2s later by
-    // the drop-recovery path: the server came back on its own while
-    // `uploads_halted_for_shutdown` stayed raised, leaving a session that reads
-    // "server connected" in the UI and refuses every upload.
+    // An explicit Disconnect has to outlast this tick: `DisconnectServer`
+    // clears `server_auto_reconnect`, so the drop-recovery path below cannot
+    // bring the server back ~2s after the user dropped it.
     if state.server_auto_reconnect
-        && !state.user_offline.load(std::sync::atomic::Ordering::Relaxed)
         && !state.server_connected
         && state.pending_server_connect.is_none()
         && state.server_connection.is_none()
@@ -1295,7 +1301,7 @@ pub(in crate::network) async fn on_server_tick(
                                 &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
                             );
                             drop(conn);
-                            let plain_addr = tokio::net::lookup_host((ip.as_str(), port))
+                            let plain_addr = crate::net_bind::lookup_host((ip.as_str(), port))
                                 .await
                                 .map_err(|e| format!("Plain fallback resolve failed: {e}"))?
                                 .find(|addr| addr.is_ipv4())

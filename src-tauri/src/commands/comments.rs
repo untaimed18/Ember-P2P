@@ -3,10 +3,10 @@ use crate::commands::errors::{await_reply, coded, coded_ctx};
 use crate::network::ed2k::comments::FileCommentInfo;
 use crate::network::NetworkCommand;
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_file_comment(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     rating: u8,
     comment: String,
@@ -46,9 +46,9 @@ pub async fn set_file_comment(
         .map_err(|e| coded_ctx("comments_save_failed", "Failed to save comment", e))
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_file_comments(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
 ) -> Result<Option<FileCommentInfo>, String> {
     if file_hash.len() != 32 || !file_hash.chars().all(|c| c.is_ascii_hexdigit()) {

@@ -111,6 +111,9 @@ const KNOWN_UNTRANSLATED = new Set([
 const CODE_PATTERNS = [
   /coded(?:_ctx)?\(\s*"([a-z0-9_]+)"/gs,
   /await_reply\(\s*[A-Za-z0-9_]+\s*,\s*"([a-z0-9_]+)"/gs,
+  // emberd's web refusals (`src-tauri/src/server`).
+  /refuse\(\s*StatusCode::[A-Z_]+\s*,\s*"([a-z0-9_]+)"/gs,
+  /Refusal::Invalid\(\s*"([a-z0-9_]+)"/gs,
 ];
 
 function rustFiles(dir) {

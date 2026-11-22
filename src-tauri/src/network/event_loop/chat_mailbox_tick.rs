@@ -9,7 +9,7 @@ use super::*;
 pub(in crate::network) fn on_chat_mailbox_tick(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     ed25519_secret_key: [u8; 32],
     ed25519_pubkey: [u8; 32],

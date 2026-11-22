@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { AntiLeechSnapshot, AntiLeechReplaceResult } from '$lib/types';
+import { isServer } from '$lib/runtime';
+import { pickAndUpload } from '$lib/runtime/web/files';
 
 export interface IpFilterEntry {
   start_ip: string;
@@ -126,6 +128,10 @@ export async function updateIpfilterFromUrl(url: string): Promise<IpFilterApplyR
  * when the user dismisses the picker.
  */
 export async function pickAndImportIpfilterFile(): Promise<IpFilterApplyResult | null> {
+  if (isServer) {
+    const upload = await pickAndUpload('.dat,.txt,.gz,.zip,.p2p,.p2b');
+    return upload ? invoke('import_ipfilter_upload', { upload }) : null;
+  }
   return invoke('pick_and_import_ipfilter_file');
 }
 

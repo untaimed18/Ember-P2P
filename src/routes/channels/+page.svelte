@@ -14,6 +14,14 @@
   import IconX from '$lib/components/IconX.svelte';
   import IconGear from '$lib/components/IconGear.svelte';
   import ChannelLanguagePicker from '$lib/components/ChannelLanguagePicker.svelte';
+  import RoomLibrarySettingsDialog from '$lib/components/RoomLibrarySettingsDialog.svelte';
+  import RoomLibraryBrowser from '$lib/components/RoomLibraryBrowser.svelte';
+  import {
+    getRoomLibrary,
+    listRoomLibraryMembers,
+    ROOM_LIBRARY_ERROR_EVENT,
+    ROOM_LIBRARY_EVENT,
+  } from '$lib/api/roomLibrary';
   import {
     type ChannelLanguage,
     channelLanguageFlagSrc,
@@ -54,6 +62,7 @@
   import { toastsFor } from '$lib/stores/toast';
   const { toast, toastError, toastSuccess } = toastsFor('channels');
   import { translateError } from '$lib/i18n';
+  import { isServer } from '$lib/runtime';
   import { plural } from '$lib/plural';
   import {
     checkForUpdates,
@@ -92,7 +101,6 @@
     pickAndOfferChannelTransfer,
     removeChannelModerator,
     respondChannelTransfer,
-    sendChannelTransferStandardOffer,
     rotateChannelRoomKey,
     setChannelInvitePolicy,
     setChannelSlowMode,
@@ -159,7 +167,6 @@
     unreadBadgeTone,
     channelTransfers,
     mergeChannelTransfers,
-    xferNeedsConsent,
     type ChannelNotifyLevel,
   } from '$lib/stores/channels';
   import {
@@ -170,7 +177,7 @@
     sectionRooms,
   } from '$lib/channelSections';
   import { LIKELY_SPAM_SCORE, listingSpamScores } from '$lib/channelListingSpam';
-  import { isApplePlatform, shortcutModAria, shortcutModSymbol } from '$lib/platform';
+  import { isApplePlatform, shortcutAltSymbol, shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
 
   let channelList = $derived($channelsStore.filter((c) => !c.deleted));
@@ -791,6 +798,36 @@
   let selectedChannelId = $derived(selected?.channel_id ?? '');
   let selectedName = $derived(selected?.name ?? '');
   let selectedBanned = $derived(selected?.you_are_banned ?? false);
+  let selectedPrivate = $derived(selected?.visibility === 'private');
+
+  /** Room libraries: members whose libraries are open to each room, as they
+   *  last said, and whether ours is open to the room shown. */
+  let libraryMembers = $state<Record<string, string[]>>({});
+  let ownLibraryOpen = $state<Record<string, boolean>>({});
+  let librarySettingsOpen = $state(false);
+  let libraryBrowseOpen = $state(false);
+  let libraryBrowseMember = $state<{ pubkey: string; name: string } | null>(null);
+  let selectedLibraryMembers = $derived(new Set(libraryMembers[selectedChannelId] ?? []));
+
+  $effect(() => {
+    const id = selectedChannelId;
+    if (!id || !selectedPrivate) return;
+    untrack(() => {
+      listRoomLibraryMembers(id)
+        .then((list) => {
+          libraryMembers = { ...libraryMembers, [id]: list.map((pk) => pk.toLowerCase()) };
+        })
+        .catch(() => {});
+      getRoomLibrary(id)
+        .then((info) => (ownLibraryOpen = { ...ownLibraryOpen, [id]: info.open }))
+        .catch(() => {});
+    });
+  });
+
+  function openLibraryBrowser(mem: ChannelMemberInfo) {
+    libraryBrowseMember = { pubkey: mem.member_pubkey, name: roomMemberLabel(mem) };
+    libraryBrowseOpen = true;
+  }
   let selectedKeyBehind = $derived(selected?.key_behind ?? false);
   /** Zero for anyone the room exempts, so the composer has one number to read
    *  rather than a rule to re-derive. */
@@ -1247,8 +1284,8 @@
   /** The room shortcuts, shown where a room would be while none is open. */
   const roomShortcutHints = [
     { keys: [shortcutModSymbol(), 'K'], label: () => m.shortcuts_channels_search() },
-    { keys: ['Alt', '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
-    { keys: ['Alt', m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
+    { keys: [shortcutAltSymbol(), '↑ / ↓'], label: () => m.shortcuts_channels_prev_next() },
+    { keys: [shortcutAltSymbol(), m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_channels_unread_prev_next() },
   ];
 
   /** Ctrl/⌘+F: opens the room's message search, or returns to it if open. */
@@ -1751,6 +1788,28 @@
         else unlistenHandoff = fn;
       })
       .catch((e) => console.error('Failed to register channel-handoff listener:', e));
+    let unlistenLibrary: UnlistenFn | undefined;
+    listen<{ channel_id: string; member_pubkey: string; open: boolean }>(ROOM_LIBRARY_EVENT, (event) => {
+      const p = event.payload;
+      if (!p?.channel_id || !p.member_pubkey) return;
+      const member = p.member_pubkey.toLowerCase();
+      const others = (libraryMembers[p.channel_id] ?? []).filter((pk) => pk !== member);
+      libraryMembers = { ...libraryMembers, [p.channel_id]: p.open ? [...others, member] : others };
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenLibrary = fn;
+      })
+      .catch((e) => console.error('Failed to register room-library listener:', e));
+    let unlistenLibraryError: UnlistenFn | undefined;
+    listen<{ error: string }>(ROOM_LIBRARY_ERROR_EVENT, (event) => {
+      toastError(translateError(event.payload?.error, m.browse_download_failed()));
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlistenLibraryError = fn;
+      })
+      .catch((e) => console.error('Failed to register room-library-error listener:', e));
     // One index shard answered. Sixteen of these arrive per browse, in whatever
     // order the DHT returns them, so the list grows as the walk proceeds instead
     // of appearing all at once when the slowest shard gives up.
@@ -1804,6 +1863,8 @@
       clearTimeout(newerRefresh);
       clearTimeout(listRefreshTimer);
       unlistenHandoff?.();
+      unlistenLibrary?.();
+      unlistenLibraryError?.();
       unlistenFound?.();
       document.removeEventListener('pointerdown', onCardMenuPointerDown);
       document.removeEventListener('focusout', onCardMenuFocusOut);
@@ -2284,7 +2345,9 @@
    *  it closes by itself once the room is joined or drops out of it. */
   let previewId = $state<string | null>(null);
   let previewRoom = $derived(
-    previewId ? directoryList.find((c) => c.channel_id === previewId && !c.in_room) ?? null : null,
+    previewId
+      ? directoryList.find((c) => c.channel_id === previewId && !c.in_room && !c.deleted_by_owner) ?? null
+      : null,
   );
   let previewOverlayEl = $state<HTMLDivElement>();
   let previewEl = $state<HTMLDivElement>();
@@ -2913,21 +2976,10 @@
     }
   }
 
-  async function handleSendStandardOffer(xferId: string) {
-    if (respondingTo.includes(xferId)) return;
-    respondingTo = [...respondingTo, xferId];
-    try {
-      await sendChannelTransferStandardOffer(xferId);
-    } catch (e) {
-      toastError(translateError(e, m.error_operation_failed()));
-    } finally {
-      respondingTo = respondingTo.filter((id) => id !== xferId);
-    }
-  }
-
   /** Transfers belonging to the room on screen. A transfer is between two
-   *  people in one room, so showing another room's would be noise. */
-  /** Offers waiting on an answer come first — they are the only rows that
+   *  people in one room, so showing another room's would be noise.
+   *
+   *  Offers waiting on an answer come first — they are the only rows that
    *  need the user to do something, and they expire. Everything else keeps a
    *  stable order so a progress bar does not jump around as it fills. */
   let roomTransfers = $derived(
@@ -2942,17 +2994,13 @@
       }),
   );
 
-  const LEGACY_XFER_MAX_BYTES = 100 * 1024 * 1024;
-
   function transferLabel(t: ChannelTransferInfo): string {
     const who = memberNames[t.peer_pubkey] || shortId(t.peer_pubkey);
     switch (t.status) {
       case 'awaiting':
         return m.channels_xfer_awaiting({ name: who });
       case 'offered':
-        return xferNeedsConsent(t)
-          ? m.channels_xfer_no_reply({ name: who })
-          : m.channels_xfer_offered({ name: who });
+        return m.channels_xfer_offered({ name: who });
       case 'accepted':
       case 'active':
         return t.direction === 'send'
@@ -2973,23 +3021,25 @@
       case 'not_allowed':
         return m.channels_xfer_peer_refuses({ name: who });
       case 'expired':
-        // Builds before 1.7.0 drop an offer over 100 MB without answering, so
-        // for a file that size silence is as likely to be that as absence.
-        return t.direction === 'send' && t.size > LEGACY_XFER_MAX_BYTES
-          ? m.channels_xfer_expired_large()
-          : m.channels_xfer_expired();
+        return m.channels_xfer_expired();
       case 'stalled':
         return m.channels_xfer_stalled();
       case 'source_gone':
         return m.channels_xfer_source_gone();
       case 'cancelled':
         return m.channels_xfer_cancelled();
+      case 'queued':
+        return m.channels_library_xfer_queued({ name: who });
+      case 'requested':
+        return m.channels_library_xfer_requested({ name: who });
+      case 'unavailable':
+        return m.channels_library_xfer_unavailable({ name: who });
       default:
         return m.channels_xfer_failed();
     }
   }
 
-  const XFER_FAILED = new Set(['stalled', 'source_gone', 'failed', 'busy', 'too_large', 'not_allowed']);
+  const XFER_FAILED = new Set(['stalled', 'source_gone', 'failed', 'busy', 'too_large', 'not_allowed', 'unavailable']);
 
   function xferTone(t: ChannelTransferInfo): 'awaiting' | 'moving' | 'done' | 'failed' | 'ended' {
     switch (t.status) {
@@ -2998,6 +3048,8 @@
       case 'offered':
       case 'accepted':
       case 'active':
+      case 'queued':
+      case 'requested':
         return 'moving';
       case 'complete':
         return 'done';
@@ -3035,11 +3087,8 @@
     return () => clearInterval(timer);
   });
 
-  /** Offers waiting on this user: one to answer, or their own one asking
-   *  whether to send the standard offer. */
-  let roomOffersWaiting = $derived(
-    roomTransfers.filter((t) => t.status === 'awaiting' || xferNeedsConsent(t)).length,
-  );
+  /** Offers waiting on this user to answer them. */
+  let roomOffersWaiting = $derived(roomTransfers.filter((t) => t.status === 'awaiting').length);
   /** How long `ember:channel-newer` events are gathered into one list re-read. */
   const NEWER_REFRESH_MS = 2_000;
   /** The same for members, moderation and handoff events, kept short because
@@ -3131,16 +3180,6 @@
     const fresh = roomTransfers.filter((t) => t.status === 'awaiting' && !offersSeen.has(t.xfer_id));
     if (fresh.length === 0) return;
     for (const t of fresh) offersSeen.add(t.xfer_id);
-    untrack(bringOutXferDrawer);
-  });
-
-  /** The question about a standard offer is brought out the same way, since
-   *  its button is in the drawer too. */
-  const consentAsked = new Set<string>();
-  $effect(() => {
-    const fresh = roomTransfers.filter((t) => xferNeedsConsent(t) && !consentAsked.has(t.xfer_id));
-    if (fresh.length === 0) return;
-    for (const t of fresh) consentAsked.add(t.xfer_id);
     untrack(bringOutXferDrawer);
   });
 </script>
@@ -3675,10 +3714,10 @@
                     aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
                     aria-haspopup={ch.in_room ? undefined : 'dialog'}
                     aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
-                    disabled={!ch.in_room && joiningIds.includes(ch.channel_id)}
+                    disabled={!ch.in_room && (joiningIds.includes(ch.channel_id) || !!ch.deleted_by_owner)}
                     onclick={() => {
                       if (ch.in_room) void selectChannel(ch.channel_id);
-                      else previewId = ch.channel_id;
+                      else if (!ch.deleted_by_owner) previewId = ch.channel_id;
                     }}
                   >
                     <div
@@ -3717,6 +3756,9 @@
                            tooltip read as broken to anyone not hovering it. -->
                       {#if ch.successor_id}
                         <span class="badge sm tone-muted chan-moved-badge">{m.channels_transferred_badge()}</span>
+                      {/if}
+                      {#if !ch.in_room && ch.deleted_by_owner}
+                        <span class="badge sm tone-muted chan-moved-badge" title={m.channels_deleted_by_owner_title()}>{m.channels_deleted_by_owner_badge()}</span>
                       {/if}
                     </span>
                     {#if ch.in_room && favouriteSet.has(ch.channel_id)}
@@ -3821,6 +3863,23 @@
                           >{m.channels_leave()}</button>
                         </div>
                       </details>
+                    {:else if ch.deleted_by_owner}
+                      <!-- Nothing to join: its owner deleted it. Removing it is
+                           what is left to do here. -->
+                      <button
+                        type="button"
+                        class="chan-forget"
+                        title={m.channels_forget()}
+                        aria-label={m.channels_forget_aria({ name: ch.name })}
+                        disabled={forgettingIds.includes(ch.channel_id)}
+                        onclick={() => requestForget(ch.channel_id)}
+                      >
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M2.5 4.5h11"/>
+                          <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
+                          <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
+                        </svg>
+                      </button>
                     {:else}
                       <button
                         type="button"
@@ -4048,6 +4107,26 @@
                 {/if}
               </div>
               <div class="conv-actions">
+                {#if selectedPrivate}
+                  <button
+                    class="icon-btn library-btn"
+                    class:on={librarySettingsOpen}
+                    class:shared={ownLibraryOpen[selectedChannelId] === true}
+                    onclick={() => (librarySettingsOpen = true)}
+                    title={ownLibraryOpen[selectedChannelId] ? m.channels_library_button_open() : m.channels_library()}
+                    aria-haspopup="dialog"
+                    aria-expanded={librarySettingsOpen}
+                    aria-label={ownLibraryOpen[selectedChannelId] ? m.channels_library_button_open() : m.channels_library()}
+                  >
+                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M4 4.5h4v15H4zM10 4.5h4v15h-4z" />
+                      <path d="m16 5.2 3.8-1 3.4 14.4-3.8 1z" />
+                    </svg>
+                    {#if ownLibraryOpen[selectedChannelId]}
+                      <span class="library-dot" aria-hidden="true"></span>
+                    {/if}
+                  </button>
+                {/if}
                 {#if selected.is_owner}
                   <button
                     class="icon-btn"
@@ -4552,6 +4631,13 @@
                               : $appSettings?.room_dm_policy === 'off'
                                 ? m.channels_dm_policy_off()
                                 : null}
+                      {@const browseBlocked = selectedBanned
+                        ? m.channels_you_are_banned()
+                        : mem.banned
+                          ? m.channels_send_file_member_banned()
+                          : !selectedLibraryMembers.has(mem.member_pubkey.toLowerCase())
+                            ? m.channels_library_member_closed()
+                            : null}
                       <details class="card-more">
                         <summary class="card-more-btn" title={m.common_more()} aria-haspopup="menu" aria-label={m.common_more()}>
                           <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
@@ -4571,6 +4657,16 @@
                             aria-describedby={sendFileBlocked ? `member-file-why-${mem.member_pubkey}` : undefined}
                             onclick={(e) => { if (sendFileBlocked) return; closeCardMenu(e.currentTarget); handleSendFile(mem); }}
                           >{m.channels_send_file()}{#if sendFileBlocked}<span class="menu-reason" id="member-file-why-{mem.member_pubkey}" aria-hidden="true">{sendFileBlocked}</span>{/if}</button>
+                          {#if selectedPrivate}
+                            <button
+                              type="button"
+                              role="menuitem"
+                              tabindex="-1"
+                              aria-disabled={browseBlocked ? 'true' : undefined}
+                              aria-describedby={browseBlocked ? `member-library-why-${mem.member_pubkey}` : undefined}
+                              onclick={(e) => { if (browseBlocked) return; closeCardMenu(e.currentTarget); openLibraryBrowser(mem); }}
+                            >{m.channels_library_browse()}{#if browseBlocked}<span class="menu-reason" id="member-library-why-{mem.member_pubkey}" aria-hidden="true">{browseBlocked}</span>{/if}</button>
+                          {/if}
                           <button
                             type="button"
                             role="menuitem"
@@ -4748,9 +4844,6 @@
                           </p>
                         {/if}
                         <p class="xfer-status">{transferLabel(t)}</p>
-                        {#if xferNeedsConsent(t)}
-                          <p class="xfer-note">{m.channels_xfer_standard_offer_hint()}</p>
-                        {/if}
                         {#if t.status === 'accepted' || t.status === 'active'}
                           <div
                             class="xfer-progress"
@@ -4802,25 +4895,6 @@
                               {m.channels_xfer_decline()}
                             </button>
                           </div>
-                        {:else if xferNeedsConsent(t)}
-                          <div class="xfer-actions two">
-                            <button
-                              type="button"
-                              class="secondary"
-                              disabled={busy}
-                              onclick={() => handleSendStandardOffer(t.xfer_id)}
-                            >
-                              {m.channels_xfer_send_standard_offer()}
-                            </button>
-                            <button
-                              type="button"
-                              class="ghost xfer-cancel"
-                              disabled={busy}
-                              onclick={() => handleCancelTransfer(t.xfer_id)}
-                            >
-                              {m.common_cancel()}
-                            </button>
-                          </div>
                         {:else if tone === 'moving'}
                           <div class="xfer-actions">
                             <button
@@ -4832,7 +4906,7 @@
                               {m.common_cancel()}
                             </button>
                           </div>
-                        {:else if t.status === 'complete' && t.direction === 'receive'}
+                        {:else if t.status === 'complete' && t.direction === 'receive' && !isServer}
                           <div class="xfer-actions">
                             <button
                               type="button"
@@ -5257,6 +5331,22 @@
   danger
   onconfirm={handleDeleteOwned}
 />
+
+{#if selectedPrivate && selectedChannelId}
+  <RoomLibrarySettingsDialog
+    bind:open={librarySettingsOpen}
+    channelId={selectedChannelId}
+    onchange={(info) => (ownLibraryOpen = { ...ownLibraryOpen, [selectedChannelId]: info.open })}
+  />
+{/if}
+{#if libraryBrowseMember && selectedChannelId}
+  <RoomLibraryBrowser
+    bind:open={libraryBrowseOpen}
+    channelId={selectedChannelId}
+    memberPubkey={libraryBrowseMember.pubkey}
+    memberName={libraryBrowseMember.name}
+  />
+{/if}
 
 <ConfirmDialog
   bind:open={removeElsewhereOpen}
@@ -6983,14 +7073,6 @@
   .xfer-card.tone-done .xfer-status { color: var(--success); }
   .xfer-card.tone-failed .xfer-status { color: var(--danger); }
 
-  .xfer-note {
-    margin: 0;
-    font-size: var(--font-size-xs);
-    line-height: 1.4;
-    color: var(--text-muted);
-    overflow-wrap: anywhere;
-  }
-
   .xfer-progress {
     position: relative;
     height: 6px;
@@ -7079,6 +7161,20 @@
   }
 
   .members-toggle { position: relative; }
+
+  .library-btn { position: relative; }
+  .library-btn.shared { color: var(--accent); }
+  .library-dot {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 0 2px var(--bg-tertiary);
+    pointer-events: none;
+  }
 
   .toggle-badge {
     position: absolute;

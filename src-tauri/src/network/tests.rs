@@ -3,6 +3,27 @@
 use super::ember_publish::{EmberQueuedRecord, EMBER_MAX_CARRY_OVER_PER_PEER};
 use super::*;
 
+/// Settings saved while the network waits to go online (its policy gate, or
+/// the chosen interface not yet connected) are what it then starts on.
+#[test]
+fn settings_saved_while_the_network_waits_to_start_are_kept() {
+    let mut settings = AppSettings::default();
+    let filter_on = !settings.ip_filter_enabled;
+    assert!(hold_settings_before_start(&mut settings, NetworkCommand::SetIpFilterEnabled { enabled: filter_on }));
+    assert_eq!(settings.ip_filter_enabled, filter_on);
+    let block = !settings.block_private_ips;
+    assert!(hold_settings_before_start(&mut settings, NetworkCommand::SetBlockPrivateIps { block_private: block }));
+    assert_eq!(settings.block_private_ips, block);
+    let mut changed = settings.clone();
+    changed.nickname = "saved while waiting".into();
+    assert!(hold_settings_before_start(
+        &mut settings,
+        NetworkCommand::UpdateSettings { settings: Box::new(changed) }
+    ));
+    assert_eq!(settings.nickname, "saved while waiting");
+    assert!(!hold_settings_before_start(&mut settings, NetworkCommand::StartupLibraryIndexed));
+}
+
 /// The server log is held here so the frontend can ask for it back. It has
 /// to survive a reload of the webview, which wipes the store that used to
 /// be the only copy — and the uploads pane was offering the webview's own
@@ -5618,6 +5639,64 @@ fn our_own_echoed_source_record_is_not_harvested_as_a_bridge_key() {
     harvest_ember_noise_keys(&mut keys, &sources, &HashSet::new(), &ours);
     assert_eq!(keys.len(), 1);
     assert_eq!(lookup_ember_noise_key(&keys, peer, 4672), Some([0xAA; 32]));
+}
+
+#[test]
+fn each_rendezvous_advert_is_told_apart_by_why_it_is_or_is_not_a_contact() {
+    let advert = |ip: Ipv4Addr, udp_port: u16, npub: Option<[u8; 32]>| KadSource {
+        ip,
+        tcp_port: 4662,
+        udp_port,
+        source_type: 1,
+        connect_options: 0,
+        buddy_ip: None,
+        buddy_port: None,
+        buddy_hash: None,
+        source_user_hash: None,
+        lowid: 0,
+        ed2k_server_ip: 0,
+        ed2k_server_port: 0,
+        is_ember_capable: true,
+        ember_noise_pub: npub,
+    };
+    let contact = Ipv4Addr::new(8, 8, 8, 8);
+    let session_peer = Ipv4Addr::new(8, 8, 4, 4);
+    let fresh = Ipv4Addr::new(9, 9, 9, 9);
+    let tried = Ipv4Addr::new(1, 1, 1, 1);
+    let pinned = Ipv4Addr::new(1, 0, 0, 1);
+    let established: HashSet<_> = [(contact, 4672)].into();
+    let session: HashSet<_> = [(session_peer, 4672)].into();
+    let now = std::time::Instant::now();
+    let keys: HashMap<_, _> = [
+        ((fresh, 4672), ([0xAA; 32], now)),
+        ((tried, 4672), ([0xBB; 32], now)),
+        ((pinned, 4672), ([0xCC; 32], now)),
+    ]
+    .into();
+    let attempted: HashMap<_, _> = [((tried, 4672), (now, 3))].into();
+    let status = |s: &KadSource| rendezvous_advert_status(s, &established, &session, &keys, &attempted);
+
+    assert_eq!(status(&advert(contact, 4672, Some([1; 32]))), RendezvousAdvert::Contact);
+    assert_eq!(status(&advert(session_peer, 4672, None)), RendezvousAdvert::Contact);
+    assert_eq!(status(&advert(fresh, 0, Some([0xAA; 32]))), RendezvousAdvert::NoUdpPort);
+    assert_eq!(
+        status(&advert(Ipv4Addr::new(192, 0, 2, 10), 4672, Some([0xDD; 32]))),
+        RendezvousAdvert::Unroutable
+    );
+    assert_eq!(status(&advert(Ipv4Addr::new(5, 5, 5, 5), 4672, None)), RendezvousAdvert::NoNoiseKey);
+    assert_eq!(status(&advert(pinned, 4672, Some([0xEE; 32]))), RendezvousAdvert::KeyConflict);
+    assert_eq!(
+        status(&advert(fresh, 4672, Some([0xAA; 32]))),
+        RendezvousAdvert::Dialable { misses: 0 }
+    );
+    assert_eq!(
+        status(&advert(tried, 4672, Some([0xBB; 32]))),
+        RendezvousAdvert::Dialable { misses: 3 }
+    );
+    assert_eq!(
+        RendezvousAdvert::Dialable { misses: 3 }.to_string(),
+        "dialable, 3 ping(s) unanswered so far"
+    );
 }
 
 #[test]

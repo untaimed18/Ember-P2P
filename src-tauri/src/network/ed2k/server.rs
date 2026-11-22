@@ -4,7 +4,6 @@ use std::sync::{Arc, OnceLock};
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -387,7 +386,7 @@ pub struct Ed2kServerConnection {
 impl Ed2kServerConnection {
     pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
         let stream =
-            tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr))
+            tokio::time::timeout(std::time::Duration::from_secs(10), crate::net_bind::tcp_connect(addr))
                 .await??;
         let _ = stream.set_nodelay(true);
 
@@ -872,6 +871,10 @@ async fn run_server_reader(mut half: ServerReadHalf, inbound: mpsc::Sender<Serve
     loop {
         let (opcode, payload) = match half.read_packet().await {
             Ok(packet) => packet,
+            Err(e) if is_unreadable_packet(&e) => {
+                warn!("{e}; discarded");
+                continue;
+            }
             Err(e) => {
                 debug!("Server packet read error: {e}");
                 let _ = inbound.send(ServerInbound::Closed(e.to_string())).await;
@@ -1675,6 +1678,7 @@ pub(super) fn server_name_from_tags(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpStream;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -1683,6 +1687,26 @@ mod tests {
         let mut payload = (text.len() as u16).to_le_bytes().to_vec();
         payload.extend_from_slice(text.as_bytes());
         payload
+    }
+
+    /// A packed packet that will not inflate is read whole and set apart, and
+    /// the packet after it reads as usual.
+    #[tokio::test]
+    async fn a_packet_that_will_not_decompress_leaves_the_stream_readable() {
+        let mut wire = vec![OP_PACKEDPROT];
+        wire.extend_from_slice(&4u32.to_le_bytes());
+        wire.extend_from_slice(&[0x33, 0x01, 0x02, 0x03]);
+        let text = message_payload("hi");
+        wire.push(OP_EDONKEYHEADER);
+        wire.extend_from_slice(&(1 + text.len() as u32).to_le_bytes());
+        wire.push(0x38);
+        wire.extend_from_slice(&text);
+
+        let mut reader: &[u8] = &wire;
+        let bad = read_server_packet(&mut reader).await.unwrap_err();
+        assert!(is_unreadable_packet(&bad), "{bad}");
+        let (opcode, payload) = read_server_packet(&mut reader).await.unwrap();
+        assert_eq!((opcode, payload), (0x38, text));
     }
 
     /// A welcome is read line by line as eMule reads it: ERROR and WARNING
@@ -2929,12 +2953,45 @@ fn read_tag_header(cursor: &mut Cursor<&[u8]>) -> Option<(u8, u8, Option<String>
     }
 }
 
+/// FT_FILESIZE (0x02) and FT_FILESIZE_HI (0x3A) as eMule reads them
+/// (`SearchFile.cpp`): at whatever integer width they came in, since eMule's
+/// tag writer puts a small value such as a high half of 1 in one byte; in
+/// either order; and a 64-bit FT_FILESIZE as the whole size, which leaves
+/// FT_FILESIZE_HI unread.
+#[derive(Default, Clone, Copy)]
+pub(super) struct FileSizeTags {
+    pub(super) size: u64,
+    whole: bool,
+}
+
+impl FileSizeTags {
+    /// Take `value` when `name_id` is one of the two size tags, and say so.
+    /// `wide` is a 64-bit integer tag.
+    pub(super) fn apply(&mut self, name_id: u8, value: u64, wide: bool) -> bool {
+        match name_id {
+            0x02 if wide => {
+                self.size = value;
+                self.whole = true;
+            }
+            0x02 if !self.whole => {
+                self.size = (self.size & 0xFFFF_FFFF_0000_0000) | (value & 0xFFFF_FFFF)
+            }
+            0x3A if !self.whole => {
+                self.size = (self.size & 0xFFFF_FFFF) | ((value & 0xFFFF_FFFF) << 32)
+            }
+            0x02 | 0x3A => {}
+            _ => return false,
+        }
+        true
+    }
+}
+
 /// Accumulator for the per-result tags we care about (filled across the tag
 /// loop, then moved into a [`ServerSearchResult`]).
 #[derive(Default)]
 struct ServerResultTags {
     file_name: String,
-    file_size: u64,
+    file_size: FileSizeTags,
     source_count: u32,
     complete_sources: u32,
     rating: Option<u8>,
@@ -3127,12 +3184,8 @@ fn read_tag_value(
                 Ok(v) => v,
                 Err(_) => return false,
             };
-            match name_id {
-                0x02 => sink.file_size = (sink.file_size & 0xFFFF_FFFF_0000_0000) | v as u64,
-                0x3A => {
-                    sink.file_size = (sink.file_size & 0x0000_0000_FFFF_FFFF) | ((v as u64) << 32)
-                }
-                _ => sink.apply_uint(name_id, name, v as u64),
+            if !sink.file_size.apply(name_id, v as u64, false) {
+                sink.apply_uint(name_id, name, v as u64);
             }
             true
         }
@@ -3185,9 +3238,7 @@ fn read_tag_value(
         // TAGTYPE_UINT16 (0x08)
         0x08 => {
             if let Ok(v) = ReadBytesExt::read_u16::<LittleEndian>(cursor) {
-                if name_id == 0x02 {
-                    sink.file_size = v as u64;
-                } else {
+                if !sink.file_size.apply(name_id, v as u64, false) {
                     sink.apply_uint(name_id, name, v as u64);
                 }
                 true
@@ -3198,9 +3249,7 @@ fn read_tag_value(
         // TAGTYPE_UINT8 (0x09)
         0x09 => {
             if let Ok(v) = ReadBytesExt::read_u8(cursor) {
-                if name_id == 0x02 {
-                    sink.file_size = v as u64;
-                } else {
+                if !sink.file_size.apply(name_id, v as u64, false) {
                     sink.apply_uint(name_id, name, v as u64);
                 }
                 true
@@ -3226,10 +3275,7 @@ fn read_tag_value(
         // TAGTYPE_UINT64 (0x0B)
         0x0B => {
             if let Ok(v) = ReadBytesExt::read_u64::<LittleEndian>(cursor) {
-                if name_id == 0x02 {
-                    // FT_FILESIZE
-                    sink.file_size = v;
-                } else {
+                if !sink.file_size.apply(name_id, v, true) {
                     sink.apply_uint(name_id, name, v);
                 }
                 true
@@ -3348,7 +3394,7 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<(Vec<ServerSearchResult
             break;
         }
         records_read += 1;
-        if tags.file_name.is_empty() || tags.file_size == 0 {
+        if tags.file_name.is_empty() || tags.file_size.size == 0 {
             continue;
         }
         results.push(ServerSearchResult {
@@ -3356,7 +3402,7 @@ fn parse_search_result(payload: &[u8]) -> anyhow::Result<(Vec<ServerSearchResult
             client_id,
             client_port,
             file_name: tags.file_name,
-            file_size: tags.file_size,
+            file_size: tags.file_size.size,
             source_count: tags.source_count,
             complete_source_count: tags.complete_sources,
             rating: tags.rating,
@@ -3527,7 +3573,8 @@ async fn read_server_packet_after_protocol<R: AsyncReadExt + Unpin>(
     }
 
     if protocol == OP_PACKEDPROT {
-        let decompressed = decompress_server_payload(&payload)?;
+        let decompressed =
+            decompress_server_payload(&payload).map_err(|e| unreadable_packet(opcode, e))?;
         debug!(
             "Decompressed server packet: opcode=0x{opcode:02X}, {payload_len} -> {} bytes",
             decompressed.len()
@@ -3536,6 +3583,31 @@ async fn read_server_packet_after_protocol<R: AsyncReadExt + Unpin>(
     } else {
         Ok((opcode, payload))
     }
+}
+
+/// A packed packet that would not inflate. It was read whole, so the stream is
+/// still in step: eMule drops just that packet (`CServerSocket::PacketReceived`)
+/// and goes on, where ending the session lost the server over one answer.
+#[derive(Debug)]
+pub(super) struct UnreadablePacket {
+    opcode: u8,
+    reason: String,
+}
+
+impl std::fmt::Display for UnreadablePacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server packet 0x{:02X} would not decompress: {}", self.opcode, self.reason)
+    }
+}
+
+impl std::error::Error for UnreadablePacket {}
+
+pub(super) fn unreadable_packet(opcode: u8, e: io::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, UnreadablePacket { opcode, reason: e.to_string() })
+}
+
+fn is_unreadable_packet(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<UnreadablePacket>())
 }
 
 fn decompress_server_payload(compressed: &[u8]) -> io::Result<Vec<u8>> {

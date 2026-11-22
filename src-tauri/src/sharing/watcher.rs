@@ -6,7 +6,7 @@ use std::time::Duration;
 use notify::event::{AccessKind, AccessMode, MetadataKind, ModifyKind, RenameMode};
 use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
-use tauri::{AppHandle, Emitter, Manager};
+use crate::host::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -272,7 +272,7 @@ impl SharedFoldersWatcher {
         // because `SharedFoldersWatcher::start` is called from Tauri's
         // synchronous `setup` hook, which is not itself running inside a
         // Tokio reactor context.
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             /// How long to wait before retrying a rescan that collided with a
             /// scan already in progress. Long enough not to spin, short enough
             /// that files land in the Library promptly once the scan ends.
@@ -392,7 +392,7 @@ impl SharedFoldersWatcher {
                     if e.contains("sharing_reload_in_flight") {
                         pending_for_driver.lock().restore(scope);
                         let retry_tx = reload_tx_for_retry.clone();
-                        tauri::async_runtime::spawn(async move {
+                        crate::host::async_runtime::spawn(async move {
                             tokio::time::sleep(RELOAD_RETRY_DELAY).await;
                             let _ = retry_tx.send(()).await;
                         });
@@ -466,7 +466,7 @@ impl SharedFoldersWatcher {
         // on Linux, the recursive inotify walk of every tree in front of the
         // first window.
         let initial_watcher = Arc::downgrade(&watcher);
-        tauri::async_runtime::spawn_blocking(move || {
+        crate::host::async_runtime::spawn_blocking(move || {
             if let Some(watcher) = initial_watcher.upgrade() {
                 let desired = watcher.desired.lock().clone();
                 watcher.apply_watches(&desired);
@@ -492,7 +492,7 @@ impl SharedFoldersWatcher {
         // to a watched directory that disappears mid-session, which kills its
         // OS watch with nothing to re-establish it.
         let retry_watcher = Arc::downgrade(&watcher);
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(WATCH_RETRY_INTERVAL).await;
                 let Some(watcher) = retry_watcher.upgrade() else {
@@ -640,7 +640,7 @@ impl SharedFoldersWatcher {
         }
         let pending = self.pending.clone();
         let reload_tx = self.reload_tx.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             tokio::time::sleep(delay).await;
             pending.lock().note_paths(paths);
             let _ = reload_tx.send(()).await;

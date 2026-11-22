@@ -239,8 +239,8 @@ pub(super) fn stun_udp_mapping_active(state: &NetworkState) -> bool {
 /// Fully reset STUN keep-alive session state: clears auto-suspend, all
 /// candidate/stability tracking (UDP + TCP), and reverts advertise ports to
 /// Settings. Used for state transitions where prior STUN progress is no
-/// longer meaningful — disabling the feature, re-enabling it after it was
-/// off, and KAD disconnect (a new session may be a different network).
+/// longer meaningful — disabling the feature, and re-enabling it after it was
+/// off.
 pub(super) fn reset_stun_keepalive_session(state: &mut NetworkState) {
     state.stun_ka_auto_suspended = false;
     state.stun_ka_suspended_at = None;
@@ -320,7 +320,7 @@ pub(super) fn maybe_suspend_stun_from_nat_type(state: &mut NetworkState) {
 pub(super) fn apply_udp_mapping_keepalive(
     state: &mut NetworkState,
     mapped: SocketAddr,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
 ) -> bool {
     if !stun_keepalive_should_run(state) {
         return false;
@@ -524,7 +524,7 @@ pub(super) fn apply_tcp_mapping_keepalive(
     state: &mut NetworkState,
     hold_ok: bool,
     mapped: Option<SocketAddr>,
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
 ) -> bool {
     if !stun_keepalive_should_run(state) {
         return false;

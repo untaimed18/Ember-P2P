@@ -33,6 +33,7 @@
     refreshFeed,
     setDiscoveredFeedHidden,
     setFeedAutoDownload,
+    setFeedShareFiles,
     setFeedDetails,
     setFeedItems,
     setFeedListed,
@@ -47,6 +48,7 @@
     type LookupOutcome,
     type OwnFeed,
   } from '$lib/api/feeds';
+  import { isServer } from '$lib/runtime';
   import {
     AUTO_MIB_MAX,
     capMib,
@@ -80,7 +82,7 @@
   import { toastsFor } from '$lib/stores/toast';
   const { addActionToast, toastError, toastSuccess, toastWarning } = toastsFor('feeds');
   import { menuKeydown } from '$lib/a11y';
-  import { codedErrorOf, transferFailureReasonText, translateError } from '$lib/i18n';
+  import { codedErrorOf, getLocale, transferFailureReasonText, translateError } from '$lib/i18n';
   import { plural } from '$lib/plural';
   import { copyToClipboard, formatBytes, formatDurationSecs, formatNumber, formatRelativeTime, formatSpeed } from '$lib/utils';
   import { pauseTransfer, resumeTransfer } from '$lib/api/transfers';
@@ -286,8 +288,11 @@
   let refreshing = $derived(selectedKey !== null && refreshingFor.has(selectedKey));
   let downloading = $derived(selectedKey !== null && downloadingFor.has(selectedKey));
   let autoEnabled = $state(false);
+  let shareEnabled = $state(false);
   let autoItemMib = $state(0);
   let autoDayMib = $state(0);
+  /** The types auto-download takes, as eD2K type terms; none for every type. */
+  let autoTypes = $state<string[]>([]);
   let autoOpen = $state(false);
   let itemFilter = $state<'all' | 'new'>('all');
   let itemQuery = $state('');
@@ -457,6 +462,23 @@
     });
   });
 
+  // A link the chat window asked about: the Follow box filled, following
+  // left to a click here.
+  $effect(() => {
+    const offered = page.url.searchParams.get('prefill');
+    if (!offered) return;
+    untrack(() => {
+      setTab('following');
+      compose = 'follow';
+      followLink = offered;
+      const next = new URL(page.url);
+      next.searchParams.delete('prefill');
+      void goto(`${next.pathname}${next.search}${next.hash}`, { replaceState: true, keepFocus: true, noScroll: true }).catch(
+        () => {},
+      );
+    });
+  });
+
   /** The followed feed last opened, so coming back opens it again. */
   const SELECTED_KEY = 'ember.feeds.followedSelected';
 
@@ -600,8 +622,12 @@
     if (shownSettingsFor !== key) {
       shownSettingsFor = key;
       autoEnabled = feed.auto_download;
+      shareEnabled = feed.share_files;
+      // Asked about another feed, which is not the one shown any more.
+      shareAsk = null;
       autoItemMib = feed.auto_max_item_mib;
       autoDayMib = feed.auto_max_day_mib;
+      autoTypes = typesOf(feed.auto_types);
       autoOpen = false;
     }
   });
@@ -633,9 +659,10 @@
     const enabled = autoEnabled;
     const itemMib = (autoItemMib = capMib(autoItemMib));
     const dayMib = (autoDayMib = capMib(autoDayMib));
+    const types = [...autoTypes];
     const run = autoQueue.then(async () => {
       try {
-        const saved = await setFeedAutoDownload(feed.publisher, feed.salt, enabled, itemMib, dayMib);
+        const saved = await setFeedAutoDownload(feed.publisher, feed.salt, enabled, itemMib, dayMib, types);
         await refreshFollowedFeeds();
         // The fields show what was saved, which the backend may have clipped,
         // unless the user has typed something else since.
@@ -665,6 +692,48 @@
     if (on && selectedKey === key) autoOpen = true;
   }
 
+  let shareQueue: Promise<unknown> = Promise.resolve();
+  /** The feed whose sharing is being turned on, asked about first: it tells
+   *  anyone who looks one of its files up that this follower has it. */
+  let shareAsk = $state<FollowedFeed | null>(null);
+  /** Its name as asked, as `unfollowTitle` is. */
+  let shareAskTitle = $state('');
+
+  /** Turning sharing on asks first, as listing in Discover does; off saves at once. */
+  function toggleShare(on: boolean) {
+    const feed = selected;
+    if (!feed) return;
+    shareEnabled = on;
+    if (on) {
+      shareAskTitle = feed.title.trim() || m.feeds_untitled();
+      shareAsk = feed;
+    } else {
+      shareAsk = null;
+      saveShare(feed, false);
+    }
+  }
+
+  function cancelShare() {
+    const feed = shareAsk;
+    shareAsk = null;
+    if (feed && selectedKey === keyOf(feed)) shareEnabled = feed.share_files;
+  }
+
+  /** Saves one change at a time, as the auto-download switch does. */
+  function saveShare(feed: FollowedFeed, on: boolean) {
+    const key = keyOf(feed);
+    shareQueue = shareQueue.then(async () => {
+      try {
+        await setFeedShareFiles(feed.publisher, feed.salt, on);
+        await refreshFollowedFeeds();
+        toastSuccess(aboutFeed(feed, on ? m.feeds_share_on_saved() : m.feeds_share_off_saved()));
+      } catch (e) {
+        toastError(aboutFeed(feed, translateError(e, m.error_operation_failed())));
+        if (selectedKey === key && shareEnabled === on) shareEnabled = !on;
+      }
+    });
+  }
+
   /** A limit saves once its field is left, as the switch does when flipped. */
   async function commitAutoLimits() {
     autoItemMib = capMib(autoItemMib);
@@ -690,9 +759,49 @@
     return m.feeds_auto_summary({ item: mibText(item), day: mibText(day) });
   }
 
+  /** The types a follower may limit auto-download to, as the backend names
+   *  them (`AUTO_TYPES` in `commands/feeds.rs`), with the Library's labels.
+   *  Programs and disc images are never downloaded automatically anyway. */
+  const AUTO_TYPE_CHOICES: { term: string; type: FileTypeKey }[] = [
+    { term: 'Video', type: 'Video' },
+    { term: 'Audio', type: 'Audio' },
+    { term: 'Image', type: 'Image' },
+    { term: 'Doc', type: 'Document' },
+    { term: 'Arc', type: 'Archive' },
+  ];
+
+  function typesOf(saved: string): string[] {
+    return saved.split(',').filter((term) => AUTO_TYPE_CHOICES.some((c) => c.term === term));
+  }
+
+  /** The types chosen, said under the switch; empty for every type. */
+  function autoTypesSummary(saved: string): string {
+    const labels = AUTO_TYPE_CHOICES.filter((c) => typesOf(saved).includes(c.term)).map((c) =>
+      fileTypeFilterLabel(c.type),
+    );
+    if (labels.length === 0) return '';
+    const types = new Intl.ListFormat(getLocale(), { style: 'long', type: 'conjunction' }).format(labels);
+    return m.feeds_auto_summary_types({ types });
+  }
+
+  /** A type ticked or unticked saves at once, and goes back if that fails, as
+   *  the switch does. */
+  async function toggleAutoType(term: string, on: boolean) {
+    const feed = selected;
+    if (!feed) return;
+    const key = selectedKey;
+    const before = autoTypes;
+    autoTypes = on ? [...autoTypes.filter((t) => t !== term), term] : autoTypes.filter((t) => t !== term);
+    const after = autoTypes;
+    if (await saveAuto()) toastSuccess(aboutFeed(feed, m.feeds_auto_saved()));
+    // Not another feed's choice, nor one changed again meanwhile.
+    else if (selectedKey === key && autoTypes === after) autoTypes = before;
+  }
+
   /** Why auto-download has left a file for the user to start. */
   function heldText(held: NonNullable<FollowedItem['held']>): string {
     if (held === 'risky') return m.feeds_held_risky();
+    if (held === 'type') return m.feeds_held_type();
     if (held === 'too_large') return m.feeds_held_too_large();
     if (held === 'disk') return m.feeds_held_disk();
     if (held === 'spam') return m.feeds_held_spam();
@@ -871,7 +980,7 @@
       case 'too_large':
         return m.feeds_state_too_large();
       case 'busy':
-        return m.feeds_state_waiting_short();
+        return m.feeds_check_busy();
       case 'deleted':
         return m.feeds_check_deleted();
       default:
@@ -1107,6 +1216,26 @@
 
   /** Show only this publisher's feeds. */
   let discoverPublisher = $state<string | null>(null);
+
+  // A friend's feeds, asked for from their card: Discover, filtered to them.
+  // Dropped from the address once taken, as a followed link is.
+  $effect(() => {
+    const publisher = page.url.searchParams.get('publisher')?.trim().toLowerCase() ?? '';
+    if (!publisher) return;
+    untrack(() => {
+      if (/^[0-9a-f]{64}$/.test(publisher)) {
+        discoverQuery = '';
+        discoverFilter = 'all';
+        discoverPublisher = publisher;
+        setTab('discover');
+      }
+      const next = new URL(page.url);
+      next.searchParams.delete('publisher');
+      void goto(`${next.pathname}${next.search}${next.hash}`, { replaceState: true, keepFocus: true, noScroll: true }).catch(
+        () => {},
+      );
+    });
+  });
   let discoverMatches = $derived.by(() => {
     const q = discoverQuery.trim().toLowerCase();
     const matched = discovered.filter(
@@ -2215,11 +2344,13 @@
                           </svg>
                         </button>
                       {/if}
-                      <button type="button" class="icon-btn" title={m.feeds_open_folder()} aria-label={m.feeds_open_folder()} onclick={() => void openFolder()}>
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
-                        </svg>
-                      </button>
+                      {#if !isServer}
+                        <button type="button" class="icon-btn" title={m.feeds_open_folder()} aria-label={m.feeds_open_folder()} onclick={() => void openFolder()}>
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
+                          </svg>
+                        </button>
+                      {/if}
                       <button type="button" class="icon-btn" title={m.feeds_copy_link()} aria-label={m.feeds_copy_link()} onclick={() => void copy(selected!.link)}>
                         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                           <path d="M6.5 9.5a3 3 0 0 0 4.2 0l2.1-2.1a3 3 0 0 0-4.2-4.2l-.7.7"/><path d="M9.5 6.5a3 3 0 0 0-4.2 0L3.2 8.6a3 3 0 0 0 4.2 4.2l.7-.7"/>
@@ -2235,7 +2366,7 @@
                     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                       <rect x="3.5" y="7" width="9" height="6.5" rx="1"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/>
                     </svg>
-                    <span>{m.feeds_private_note()}</span>
+                    <span>{selected.share_files ? m.feeds_shared_note() : m.feeds_private_note()}</span>
                   </p>
 
                   {#if selected.deleted}
@@ -2289,7 +2420,11 @@
                             </span>
                             <span class="auto-desc">{m.feeds_auto_desc()}</span>
                             {#if selected.auto_download}
+                              {@const typesLine = autoTypesSummary(selected.auto_types)}
                               <span class="auto-summary">{autoSummary(selected.auto_max_item_mib, selected.auto_max_day_mib)}</span>
+                              {#if typesLine}
+                                <span class="auto-summary">{typesLine}</span>
+                              {/if}
                             {/if}
                           </span>
                           <svg class="chevron" class:open={autoOpen} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2316,11 +2451,54 @@
                               <span class="field-hint">{mibText(autoDayMib)}</span>
                             </label>
                           </div>
+                          <fieldset class="auto-types">
+                            <legend class="auto-types-label">{m.feeds_auto_types_label()}</legend>
+                            <div class="auto-type-list">
+                              {#each AUTO_TYPE_CHOICES as choice (choice.term)}
+                                <label class="auto-type">
+                                  <input
+                                    type="checkbox"
+                                    checked={autoTypes.includes(choice.term)}
+                                    onchange={(e) => void toggleAutoType(choice.term, e.currentTarget.checked)}
+                                  />
+                                  {fileTypeFilterLabel(choice.type)}
+                                </label>
+                              {/each}
+                            </div>
+                            <span class="field-hint">{autoTypes.length === 0 ? m.feeds_auto_types_all() : m.feeds_auto_types_some()}</span>
+                          </fieldset>
                           <div class="auto-foot">
                             <p class="hint">{m.feeds_auto_hint()}</p>
                           </div>
                         </div>
                       {/if}
+                    </div>
+                  {/if}
+
+                  <!-- Its files stay where they are, so a deleted feed's can still be shared. -->
+                  {#if selected.folder !== '' || !selected.deleted}
+                    <div class="auto-card" class:on={shareEnabled}>
+                      <div class="auto-head">
+                        <span class="auto-icon" aria-hidden="true">
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="4" cy="8" r="1.75"/><circle cx="12" cy="4" r="1.75"/><circle cx="12" cy="12" r="1.75"/><path d="M5.6 7.2 10.4 4.8M5.6 8.8l4.8 2.4"/>
+                          </svg>
+                        </span>
+                        <div class="auto-title static">
+                          <span class="auto-text">
+                            <span class="auto-line">
+                              <span class="auto-name">{m.feeds_share_title()}</span>
+                              <span class="auto-state">{shareEnabled ? m.feeds_auto_on() : m.feeds_auto_off()}</span>
+                            </span>
+                            <span class="auto-desc">{m.feeds_share_desc()}</span>
+                          </span>
+                        </div>
+                        <ToggleSwitch
+                          checked={shareEnabled}
+                          ariaLabel={m.feeds_share_title()}
+                          onchange={(on) => toggleShare(on)}
+                        />
+                      </div>
                     </div>
                   {/if}
 
@@ -2418,28 +2596,30 @@
                               </svg>
                               <span>{item.status === 'done' ? m.feeds_badge_downloaded() : m.feeds_item_in_library()}</span>
                             </span>
-                            <button
-                              type="button"
-                              class="icon-btn"
-                              title={m.feeds_item_open()}
-                              aria-label={m.feeds_item_open_named({ name: item.name })}
-                              onclick={() => void openItem(item, openFeedItem)}
-                            >
-                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                <path d="M9.5 2.5h4v4"/><path d="M13.5 2.5 7.5 8.5"/><path d="M12 9.5v4H2.5V4h4"/>
-                              </svg>
-                            </button>
-                            <button
-                              type="button"
-                              class="icon-btn"
-                              title={m.feeds_item_show()}
-                              aria-label={m.feeds_item_show_named({ name: item.name })}
-                              onclick={() => void openItem(item, showFeedItem)}
-                            >
-                              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
-                                <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
-                              </svg>
-                            </button>
+                            {#if !isServer}
+                              <button
+                                type="button"
+                                class="icon-btn"
+                                title={m.feeds_item_open()}
+                                aria-label={m.feeds_item_open_named({ name: item.name })}
+                                onclick={() => void openItem(item, openFeedItem)}
+                              >
+                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                  <path d="M9.5 2.5h4v4"/><path d="M13.5 2.5 7.5 8.5"/><path d="M12 9.5v4H2.5V4h4"/>
+                                </svg>
+                              </button>
+                              <button
+                                type="button"
+                                class="icon-btn"
+                                title={m.feeds_item_show()}
+                                aria-label={m.feeds_item_show_named({ name: item.name })}
+                                onclick={() => void openItem(item, showFeedItem)}
+                              >
+                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
+                                  <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
+                                </svg>
+                              </button>
+                            {/if}
                           </div>
                         {:else if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
                           {@const stateText =
@@ -3216,6 +3396,20 @@
 />
 
 <ConfirmDialog
+  open={shareAsk !== null}
+  title={m.feeds_share_confirm_title({ title: shareAskTitle })}
+  message={m.feeds_share_desc()}
+  confirmLabel={m.feeds_share_confirm()}
+  focusCancel
+  onconfirm={() => {
+    const feed = shareAsk;
+    shareAsk = null;
+    if (feed) saveShare(feed, true);
+  }}
+  oncancel={cancelShare}
+/>
+
+<ConfirmDialog
   open={discardThen !== null}
   title={m.feeds_discard_title()}
   message={m.feeds_discard_body()}
@@ -3919,6 +4113,10 @@
     background: none;
   }
 
+  .auto-title.static {
+    cursor: default;
+  }
+
   .auto-text {
     flex: 1;
     min-width: 0;
@@ -4005,6 +4203,35 @@
     justify-content: space-between;
     gap: 12px;
     margin-top: 10px;
+  }
+
+  .auto-types {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 12px 0 0;
+    padding: 0;
+    border: none;
+  }
+
+  .auto-types-label {
+    padding: 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+  }
+
+  .auto-type-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+  }
+
+  .auto-type {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--font-size-sm);
+    cursor: pointer;
   }
 
   .hint {

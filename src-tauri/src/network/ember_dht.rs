@@ -410,6 +410,29 @@ pub(super) fn saturating_u32(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+/// The storer's session counters for the store heartbeat, read from where they
+/// are kept rather than from `ember_diagnostics`, whose refusal fields are only
+/// mirrored when diagnostics are read.
+pub(super) fn ember_store_beat(state: &NetworkState) -> EmberStoreBeat {
+    let diag = &state.ember_diagnostics;
+    let rejects = state.ember_dht.store_reject_stats();
+    EmberStoreBeat {
+        accepted: diag.ember_dht_stores_received.into(),
+        lookups: diag.ember_dht_find_values_received.into(),
+        hits: diag.ember_dht_find_value_hits.into(),
+        republished: diag.ember_dht_records_republished.into(),
+        refused_not_closest: state.ember_dht.store_reject_proximity(),
+        refused_full: rejects.key_cap.saturating_add(rejects.per_key_cap),
+        refused_share: rejects.publisher_cap.saturating_add(rejects.source_ip_cap),
+        refused_invalid: state
+            .ember_dht
+            .store_reject_verify()
+            .saturating_add(rejects.signature)
+            .saturating_add(rejects.timestamp)
+            .saturating_add(state.ember_dht.store_reject_source_ip()),
+    }
+}
+
 /// Copy the counters the DHT store, engine and frame limiter keep themselves
 /// into `diag`. Done when diagnostics are read, not per frame: several of them
 /// only move on frames that are refused, so a copy taken on the accept path
@@ -716,6 +739,9 @@ pub(super) struct EmberKeywordSearch {
     /// `IterativeSearch::results` is append-only and deduped before push, so
     /// everything past this index is new.
     pub(super) last_streamed_count: usize,
+    /// When the last streaming rebuild went out, for the flush a few records
+    /// get when no full batch follows them.
+    pub(super) last_streamed_at: std::time::Instant,
     /// Distinct eD2K file hashes of the rows this lookup has put on screen, or
     /// found again once another network had, for the `results_so_far` the
     /// search page shows while the walk runs.
@@ -789,6 +815,16 @@ pub(super) const EMBER_SEARCH_QUERY_TIMEOUT: std::time::Duration = std::time::Du
 /// Covers a Noise_XX 2-RTT setup plus the query round trip, and stays well
 /// inside the 60-second whole-search cap.
 pub(super) const EMBER_SEARCH_QUEUED_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// How long a query queued behind a Noise handshake waits for the handshake
+/// alone. Most of a lookup's shortlist is first contacts learned from
+/// `FOUND_NODE` answers, and the silent among them never answer the
+/// handshake at all: holding each for the whole
+/// [`EMBER_SEARCH_QUEUED_QUERY_TIMEOUT`] is what made a lookup that walked its
+/// shortlist cost 12 seconds per silent node. Past both resends of message 1
+/// (`MSG1_RESEND_AFTER`, the last at 3 seconds) and a slow round trip; once
+/// the handshake completes, the query keeps the rest of its budget.
+pub(super) const EMBER_SEARCH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 // ── DHT maintenance (slice 6) ──
 
@@ -1154,7 +1190,7 @@ pub(super) fn ember_rendezvous_retry_secs(empty_streak: u32) -> i64 {
 /// no reachable seeds could not rejoin no matter how long it ran.
 pub(super) fn maybe_start_ember_rendezvous_lookup(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ember_native_enabled: bool,
 ) -> bool {
     // Cheapest gates first: this is re-evaluated every second while the table
@@ -2564,7 +2600,7 @@ pub(super) async fn handle_ember_dht_message(
     remote_noise_pub: [u8; 32],
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     // Slice 14: per-IP rate limit before any crypto/table work. Wire layout
@@ -2703,6 +2739,9 @@ pub(super) async fn handle_ember_dht_message(
         // way back.
         if let std::net::IpAddr::V4(v4) = from.ip() {
             state.ember_kad_bridge_attempted.remove(&(v4, from.port()));
+            if state.ember_rendezvous_listed.remove(&(v4, from.port())) {
+                debug!("Ember rendezvous advert {from}: answered");
+            }
         }
         // And if this peer was a lead somebody named, that name has just been
         // shown to be worth something. Any signed frame counts, not only the

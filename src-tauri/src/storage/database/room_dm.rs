@@ -14,6 +14,13 @@ pub const DM_REQUESTS_PER_ROOM_HOUR: i64 = 5;
 /// How long someone declined cannot ask again, and how long their decline
 /// keeps us from writing to them.
 pub const DM_DECLINE_MEMORY_SECS: i64 = 7 * 86_400;
+/// How often one of ours left in the mailbox is still tried live: the
+/// recipient may have stopped collecting since it said it does.
+pub const DM_MAILED_RESEND_SECS: i64 = 30 * 60;
+/// How long the id of a message we stored is remembered after its row is
+/// gone (a timer, a deleted conversation, pruning): a resend or a mailbox
+/// copy, which can come for a week, must not bring it back.
+const DM_SEEN_KEEP_SECS: i64 = 8 * 86_400;
 /// Messages a request holds before the user answers it. Past this, more are
 /// dropped unanswered: someone not yet accepted gets a few lines, not a disk.
 pub const DM_REQUEST_MESSAGES_MAX: i64 = 20;
@@ -61,6 +68,13 @@ pub struct DmMessage {
     /// Its row, which orders messages sharing a timestamp and pages past
     /// them; 0 for one not read back from storage.
     pub seq: i64,
+    /// Its disappearing-message timer in seconds; 0 for none.
+    pub ttl_secs: i64,
+    /// When it goes; 0 until its timer starts (delivery for ours, reading
+    /// for theirs).
+    pub expires_at: i64,
+    /// Ours, left in their room-mail box for them to collect.
+    pub mailboxed: bool,
 }
 
 /// What became of a message that arrived.
@@ -88,6 +102,8 @@ pub struct DmResend {
     pub text: String,
     pub channel_id: String,
     pub attempts: i64,
+    /// Its disappearing-message timer, told again with each resend; 0 for none.
+    pub ttl_secs: i64,
 }
 
 impl Database {
@@ -140,9 +156,311 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_room_dm_messages_received
                 ON room_dm_messages(member_pubkey, received_at) WHERE direction = 'in';
             CREATE INDEX IF NOT EXISTS idx_room_dm_messages_sending
-                ON room_dm_messages(next_attempt_at) WHERE direction = 'out' AND status = 'sending';",
+                ON room_dm_messages(next_attempt_at) WHERE direction = 'out' AND status = 'sending';
+            CREATE TABLE IF NOT EXISTS room_dm_timers (
+                member_pubkey TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                ttl_secs INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (member_pubkey, direction, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_room_dm_timers_due ON room_dm_timers(expires_at) WHERE expires_at > 0;
+            CREATE TABLE IF NOT EXISTS room_dm_disappear (
+                member_pubkey TEXT PRIMARY KEY,
+                ttl_secs INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS room_dm_mail_peers (
+                member_pubkey TEXT PRIMARY KEY,
+                collects_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS room_dm_mail_sent (
+                member_pubkey TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                mailbox TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                deposited_at INTEGER NOT NULL,
+                PRIMARY KEY (member_pubkey, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS room_dm_seen (
+                member_pubkey TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                seen_at INTEGER NOT NULL,
+                PRIMARY KEY (member_pubkey, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_room_dm_seen_at ON room_dm_seen(seen_at);",
         )?;
         Ok(())
+    }
+
+    /// `member` said it collects room mail from us.
+    pub fn dm_note_collects(&self, member: &str, now: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        conn.execute(
+            "INSERT INTO room_dm_mail_peers (member_pubkey, collects_at) VALUES (?1, ?2)
+             ON CONFLICT(member_pubkey) DO UPDATE SET collects_at = MAX(collects_at, excluded.collects_at)",
+            params![member.to_ascii_lowercase(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Ours still unanswered `unanswered_secs` after they went, to members who
+    /// said within `collects_within` seconds that they collect, and not yet
+    /// left in the mailbox, opened.
+    pub fn dm_mail_due(&self, now: i64, unanswered_secs: i64, collects_within: i64) -> anyhow::Result<Vec<DmResend>> {
+        let key = self.chat_key.as_deref();
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        // A word that ran out counts for nothing; any member can leave one.
+        conn.execute(
+            "DELETE FROM room_dm_mail_peers WHERE collects_at < ?1",
+            params![now - collects_within],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT m.message_id, m.member_pubkey, m.body, m.ts, m.channel_id, m.attempts, COALESCE(t.ttl_secs, 0)
+             FROM room_dm_messages m
+             JOIN room_dm_mail_peers p ON p.member_pubkey = m.member_pubkey AND p.collects_at >= ?3
+             LEFT JOIN room_dm_timers t ON t.member_pubkey = m.member_pubkey
+                 AND t.direction = 'out' AND t.message_id = m.message_id
+             WHERE m.direction = 'out' AND m.status = 'sending' AND m.ts <= ?2
+               AND NOT EXISTS (SELECT 1 FROM room_dm_mail_sent s
+                               WHERE s.member_pubkey = m.member_pubkey AND s.message_id = m.message_id)
+             ORDER BY m.ts LIMIT 32",
+        )?;
+        let rows = stmt
+            .query_map(params![now, now - unanswered_secs, now - collects_within], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(message_id, member, body, ts, channel_id, attempts, ttl_secs)| {
+                let text = Self::open_dm_body(key, &message_id, &member, "out", ts, &body)?;
+                Some(DmResend { message_id, member_pubkey: member, text, channel_id, attempts, ttl_secs })
+            })
+            .collect())
+    }
+
+    /// A message of ours was left in `member`'s room-mail box: it is no longer
+    /// resent live, and waits for its receipt until `give_up_at`.
+    pub fn dm_note_mailed(
+        &self,
+        member: &str,
+        message_id: &str,
+        mailbox: &str,
+        item_id: &str,
+        now: i64,
+        give_up_at: i64,
+    ) -> anyhow::Result<()> {
+        let member = member.to_ascii_lowercase();
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO room_dm_mail_sent (member_pubkey, message_id, mailbox, item_id, deposited_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![member, message_id, mailbox, item_id, now],
+        )?;
+        tx.execute(
+            "UPDATE room_dm_messages SET next_attempt_at = ?4, give_up_at = MAX(give_up_at, ?3)
+             WHERE member_pubkey = ?1 AND direction = 'out' AND message_id = ?2 AND status = 'sending'",
+            params![member, message_id, give_up_at, now + DM_MAILED_RESEND_SECS],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Copies left in the mailbox whose message no longer waits for one: it
+    /// was delivered, given up on, or deleted. `(member, message_id, mailbox,
+    /// item_id, deposited_at)`.
+    pub fn dm_mail_stale(&self) -> anyhow::Result<Vec<(String, String, String, String, i64)>> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT s.member_pubkey, s.message_id, s.mailbox, s.item_id, s.deposited_at FROM room_dm_mail_sent s
+             WHERE NOT EXISTS (SELECT 1 FROM room_dm_messages m
+                               WHERE m.member_pubkey = s.member_pubkey AND m.direction = 'out'
+                                 AND m.message_id = s.message_id AND m.status = 'sending')
+             LIMIT 256",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn dm_forget_mailed(&self, entries: &[(String, String)]) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        for (member, message_id) in entries {
+            tx.execute(
+                "DELETE FROM room_dm_mail_sent WHERE member_pubkey = ?1 AND message_id = ?2",
+                params![member, message_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The conversations room mail is collected for, declined ones too: what
+    /// a member left after our decline draws one, as a live resend does.
+    /// `(member, name, channel_id)`.
+    pub fn dm_mail_threads(&self) -> anyhow::Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        let mut stmt = conn.prepare(
+            "SELECT member_pubkey, name, channel_id FROM room_dm_threads ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The disappearing-message timer chosen for the conversation with
+    /// `member`, in seconds; 0 for none. Timers sit in tables of their own,
+    /// beside `room_dm_messages`, for the reason
+    /// [`Database::ensure_transfer_part_folders_locked`] gives.
+    pub fn dm_disappear_secs(&self, member: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        Ok(conn
+            .query_row(
+                "SELECT ttl_secs FROM room_dm_disappear WHERE member_pubkey = ?1",
+                params![member.to_ascii_lowercase()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    pub fn set_dm_disappear_secs(&self, member: &str, ttl_secs: i64) -> anyhow::Result<()> {
+        let member = member.to_ascii_lowercase();
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        if ttl_secs > 0 {
+            conn.execute(
+                "INSERT INTO room_dm_disappear (member_pubkey, ttl_secs) VALUES (?1, ?2)
+                 ON CONFLICT(member_pubkey) DO UPDATE SET ttl_secs = excluded.ttl_secs",
+                params![member, ttl_secs],
+            )?;
+        } else {
+            conn.execute("DELETE FROM room_dm_disappear WHERE member_pubkey = ?1", params![member])?;
+        }
+        Ok(())
+    }
+
+    /// Give a message of ours a timer, started once it is delivered.
+    pub fn dm_set_sent_timer(&self, member: &str, message_id: &str, ttl_secs: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO room_dm_timers (member_pubkey, direction, message_id, ttl_secs) VALUES (?1, 'out', ?2, ?3)",
+            params![member.to_ascii_lowercase(), message_id, ttl_secs],
+        )?;
+        Ok(())
+    }
+
+    /// Its sender's timer for a message they sent us, started now if the
+    /// conversation has been read since it came, else when it next is. Only
+    /// for a message kept, and once: a resend's timer changes nothing.
+    /// Returns whether one was set.
+    pub fn dm_set_received_timer(&self, member: &str, message_id: &str, ttl_secs: i64, now: i64) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        Ok(conn.execute(
+            "INSERT OR IGNORE INTO room_dm_timers (member_pubkey, direction, message_id, ttl_secs, expires_at)
+             SELECT m.member_pubkey, 'in', m.message_id, ?3,
+                    CASE WHEN COALESCE(t.unread, 0) = 0 THEN ?4 + ?3 ELSE 0 END
+             FROM room_dm_messages m LEFT JOIN room_dm_threads t ON t.member_pubkey = m.member_pubkey
+             WHERE m.member_pubkey = ?1 AND m.direction = 'in' AND m.message_id = ?2",
+            params![member.to_ascii_lowercase(), message_id, ttl_secs, now],
+        )? > 0)
+    }
+
+    /// Start the timer of a message of ours that was just delivered. Returns
+    /// its length when this started it.
+    pub fn dm_start_sent_timer(&self, member: &str, message_id: &str, now: i64) -> anyhow::Result<Option<i64>> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        let member = member.to_ascii_lowercase();
+        let started = conn.execute(
+            "UPDATE room_dm_timers SET expires_at = ?3 + ttl_secs
+             WHERE member_pubkey = ?1 AND direction = 'out' AND message_id = ?2 AND expires_at = 0",
+            params![member, message_id, now],
+        )?;
+        if started == 0 {
+            return Ok(None);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT ttl_secs FROM room_dm_timers WHERE member_pubkey = ?1 AND direction = 'out' AND message_id = ?2",
+                params![member, message_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Start the timers of what `member` sent us, now that it has been read.
+    pub fn dm_start_read_timers(&self, member: &str, now: i64) -> anyhow::Result<()> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        conn.execute(
+            "UPDATE room_dm_timers SET expires_at = ?2 + ttl_secs
+             WHERE member_pubkey = ?1 AND direction = 'in' AND expires_at = 0",
+            params![member.to_ascii_lowercase(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Delete the messages whose timers ran out by `now`, and timers left
+    /// without a message. Returns the members whose conversations lost one.
+    pub fn dm_expire_due(&self, now: i64) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        Self::ensure_room_dm_locked(&conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let members = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT member_pubkey FROM room_dm_timers WHERE expires_at > 0 AND expires_at <= ?1",
+            )?;
+            let rows = stmt.query_map(params![now], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            rows
+        };
+        if !members.is_empty() {
+            tx.execute(
+                "DELETE FROM room_dm_messages WHERE EXISTS (
+                     SELECT 1 FROM room_dm_timers t
+                     WHERE t.member_pubkey = room_dm_messages.member_pubkey
+                       AND t.direction = room_dm_messages.direction
+                       AND t.message_id = room_dm_messages.message_id
+                       AND t.expires_at > 0 AND t.expires_at <= ?1)",
+                params![now],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM room_dm_timers WHERE (expires_at > 0 AND expires_at <= ?1) OR NOT EXISTS (
+                 SELECT 1 FROM room_dm_messages m
+                 WHERE m.member_pubkey = room_dm_timers.member_pubkey
+                   AND m.direction = room_dm_timers.direction
+                   AND m.message_id = room_dm_timers.message_id)",
+            params![now],
+        )?;
+        tx.execute(
+            "DELETE FROM room_dm_seen WHERE seen_at < ?1",
+            params![now.saturating_sub(DM_SEEN_KEEP_SECS)],
+        )?;
+        tx.commit()?;
+        Ok(members)
     }
 
     fn dm_row_aad(message_id: &str, member: &str, direction: &str, timestamp: i64) -> Vec<u8> {
@@ -269,6 +587,19 @@ impl Database {
             )
             .optional()?;
         let declined_lately = |at: i64| now.saturating_sub(at) < DM_DECLINE_MEMORY_SECS;
+        // Stored before and since deleted. A decline still answers as one.
+        let declined = matches!(&thread, Some((state, at)) if state == DM_STATE_DECLINED && declined_lately(*at));
+        let stored_before = tx
+            .query_row(
+                "SELECT 1 FROM room_dm_seen WHERE member_pubkey = ?1 AND message_id = ?2",
+                params![member, message_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if stored_before && !declined {
+            return Ok(DmIncoming::Duplicate);
+        }
         let stored_lately: i64 = tx.query_row(
             "SELECT COUNT(*) FROM room_dm_messages
              WHERE member_pubkey = ?1 AND direction = 'in' AND received_at > ?2",
@@ -339,6 +670,10 @@ impl Database {
             "INSERT INTO room_dm_messages (message_id, member_pubkey, direction, body, ts, status, channel_id, received_at)
              VALUES (?1, ?2, 'in', ?3, ?4, 'received', ?5, ?6)",
             params![message_id, member, body, timestamp, channel_id, now],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO room_dm_seen (member_pubkey, message_id, seen_at) VALUES (?1, ?2, ?3)",
+            params![member, message_id, now],
         )?;
         Self::prune_dm_thread_locked(&tx, &member)?;
         tx.commit()?;
@@ -514,10 +849,13 @@ impl Database {
         let conn = self.conn.lock();
         Self::ensure_room_dm_locked(&conn)?;
         let mut stmt = conn.prepare(
-            "SELECT message_id, member_pubkey, body, ts, channel_id, attempts FROM room_dm_messages
-             WHERE direction = 'out' AND status = 'sending' AND next_attempt_at > 0
-               AND next_attempt_at <= ?1 AND give_up_at > ?1
-             ORDER BY next_attempt_at LIMIT 32",
+            "SELECT m.message_id, m.member_pubkey, m.body, m.ts, m.channel_id, m.attempts, COALESCE(t.ttl_secs, 0)
+             FROM room_dm_messages m
+             LEFT JOIN room_dm_timers t ON t.member_pubkey = m.member_pubkey
+                 AND t.direction = 'out' AND t.message_id = m.message_id
+             WHERE m.direction = 'out' AND m.status = 'sending' AND m.next_attempt_at > 0
+               AND m.next_attempt_at <= ?1 AND m.give_up_at > ?1
+             ORDER BY m.next_attempt_at LIMIT 32",
         )?;
         let rows = stmt
             .query_map(params![now], |row| {
@@ -528,14 +866,17 @@ impl Database {
                     row.get::<_, i64>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
         let mut due = Vec::with_capacity(rows.len());
-        for (message_id, member, body, ts, channel_id, attempts) in rows {
+        for (message_id, member, body, ts, channel_id, attempts, ttl_secs) in rows {
             match Self::open_dm_body(key, &message_id, &member, "out", ts, &body) {
-                Some(text) => due.push(DmResend { message_id, member_pubkey: member, text, channel_id, attempts }),
+                Some(text) => {
+                    due.push(DmResend { message_id, member_pubkey: member, text, channel_id, attempts, ttl_secs })
+                }
                 None => {
                     conn.execute(
                         "UPDATE room_dm_messages SET status = 'failed', next_attempt_at = 0
@@ -548,14 +889,26 @@ impl Database {
         Ok(due)
     }
 
-    /// One more attempt went out; the next is due at `next_attempt_at`.
-    pub fn dm_note_attempt(&self, member: &str, message_id: &str, channel_id: &str, next_attempt_at: i64) -> anyhow::Result<()> {
+    /// One more attempt went out at `now`; the next is due at
+    /// `next_attempt_at`, or [`DM_MAILED_RESEND_SECS`] on for one in the
+    /// mailbox.
+    pub fn dm_note_attempt(
+        &self,
+        member: &str,
+        message_id: &str,
+        channel_id: &str,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock();
         Self::ensure_room_dm_locked(&conn)?;
         conn.execute(
-            "UPDATE room_dm_messages SET attempts = attempts + 1, next_attempt_at = ?3, channel_id = ?4
+            "UPDATE room_dm_messages SET attempts = attempts + 1, channel_id = ?4,
+                next_attempt_at = CASE WHEN EXISTS (
+                    SELECT 1 FROM room_dm_mail_sent s WHERE s.member_pubkey = ?1 AND s.message_id = ?2
+                ) THEN ?5 ELSE ?3 END
              WHERE member_pubkey = ?1 AND direction = 'out' AND message_id = ?2 AND status = 'sending'",
-            params![member, message_id, next_attempt_at, channel_id],
+            params![member, message_id, next_attempt_at, channel_id, now + DM_MAILED_RESEND_SECS],
         )?;
         Ok(())
     }
@@ -684,10 +1037,16 @@ impl Database {
         let conn = self.conn.lock();
         Self::ensure_room_dm_locked(&conn)?;
         let mut stmt = conn.prepare(
-            "SELECT message_id, direction, ts, status, body, rowid FROM room_dm_messages
-             WHERE member_pubkey = ?1
-               AND (?2 IS NULL OR ts < ?2 OR (?3 IS NOT NULL AND ts = ?2 AND rowid < ?3))
-             ORDER BY ts DESC, rowid DESC",
+            "SELECT m.message_id, m.direction, m.ts, m.status, m.body, m.rowid,
+                    COALESCE(t.ttl_secs, 0), COALESCE(t.expires_at, 0), s.message_id IS NOT NULL
+             FROM room_dm_messages m
+             LEFT JOIN room_dm_timers t ON t.member_pubkey = m.member_pubkey
+                 AND t.direction = m.direction AND t.message_id = m.message_id
+             LEFT JOIN room_dm_mail_sent s ON m.direction = 'out'
+                 AND s.member_pubkey = m.member_pubkey AND s.message_id = m.message_id
+             WHERE m.member_pubkey = ?1
+               AND (?2 IS NULL OR m.ts < ?2 OR (?3 IS NOT NULL AND m.ts = ?2 AND m.rowid < ?3))
+             ORDER BY m.ts DESC, m.rowid DESC",
         )?;
         let mut rows = stmt.query(params![member, before, before_seq])?;
         let mut out: Vec<DmMessage> = Vec::new();
@@ -695,16 +1054,30 @@ impl Database {
             let Some(row) = rows.next()? else {
                 break;
             };
-            let (message_id, direction, timestamp, status, body, seq) = (
+            let (message_id, direction, timestamp, status, body, seq, ttl_secs, expires_at, mailboxed) = (
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, bool>(8)?,
             );
             if let Some(text) = Self::open_dm_body(key, &message_id, &member, &direction, timestamp, &body) {
-                out.push(DmMessage { message_id, member_pubkey: member.clone(), direction, text, timestamp, status, seq });
+                out.push(DmMessage {
+                    message_id,
+                    member_pubkey: member.clone(),
+                    direction,
+                    text,
+                    timestamp,
+                    status,
+                    seq,
+                    ttl_secs,
+                    expires_at,
+                    mailboxed,
+                });
             }
         }
         out.reverse();
@@ -731,6 +1104,10 @@ impl Database {
         Self::ensure_room_dm_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
         tx.execute("DELETE FROM room_dm_messages WHERE member_pubkey = ?1", params![member])?;
+        tx.execute("DELETE FROM room_dm_timers WHERE member_pubkey = ?1", params![member])?;
+        tx.execute("DELETE FROM room_dm_disappear WHERE member_pubkey = ?1", params![member])?;
+        // What was left in their mailbox stays on record until the next round
+        // takes it back: its message is gone, so it reads as stale.
         tx.execute(
             "UPDATE room_dm_threads SET state = 'declined', declined_at = ?2, unread = 0
              WHERE member_pubkey = ?1 AND state = 'request'",
@@ -919,7 +1296,7 @@ mod tests {
         assert!(db.dm_due_resends(150).unwrap().is_empty());
         let due = db.dm_due_resends(160).unwrap();
         assert_eq!(due.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), vec!["ping", "pong"]);
-        db.dm_note_attempt(ANN, "o1", ROOM, 280).unwrap();
+        db.dm_note_attempt(ANN, "o1", ROOM, 280, 160).unwrap();
         assert!(db.dm_mark_delivered(ANN, "o2").unwrap());
         assert!(!db.dm_mark_delivered(ANN, "o2").unwrap(), "once");
         assert_eq!(db.dm_due_resends(200).unwrap().len(), 0);
@@ -928,6 +1305,108 @@ mod tests {
         assert_eq!(status, vec!["failed", "delivered"]);
         assert!(db.dm_retry(ANN, "o1", 1_400, 2_600).unwrap());
         assert_eq!(db.dm_due_resends(1_400).unwrap().len(), 1);
+        drop_db(db, path);
+    }
+
+    /// Ours runs from delivery and theirs from reading, as in friend chat;
+    /// each is gone once its time is up, and a resend carries its timer.
+    #[test]
+    fn private_message_timers_start_on_delivery_or_reading_and_delete_on_time() {
+        let (db, path) = db("timers");
+        assert_eq!(db.dm_disappear_secs(ANN).unwrap(), 0);
+        db.set_dm_disappear_secs(ANN, 300).unwrap();
+        assert_eq!(db.dm_disappear_secs(&ANN.to_uppercase()).unwrap(), 300);
+
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o1", "ours", 100, 160, 1_300).unwrap();
+        db.dm_set_sent_timer(ANN, "o1", 300).unwrap();
+        assert_eq!(db.dm_due_resends(160).unwrap()[0].ttl_secs, 300, "a resend tells it again");
+        let ours = |db: &Database| db.dm_messages(ANN, 10, None, None).unwrap().into_iter().find(|m| m.message_id == "o1");
+        assert_eq!(ours(&db).map(|m| (m.ttl_secs, m.expires_at)), Some((300, 0)), "not before delivery");
+        assert!(db.dm_mark_delivered(ANN, "o1").unwrap());
+        assert_eq!(db.dm_start_sent_timer(ANN, "o1", 200).unwrap(), Some(300));
+        assert_eq!(db.dm_start_sent_timer(ANN, "o1", 260).unwrap(), None, "started once");
+        assert_eq!(ours(&db).map(|m| m.expires_at), Some(500));
+
+        db.dm_record_incoming(ANN, "Ann", ROOM, "i1", "theirs", 150, ROOM_DM_POLICY_ANYONE, 150).unwrap();
+        assert!(!db.dm_set_received_timer(ANN, "nope", 600, 210).unwrap(), "only for a message kept");
+        assert!(db.dm_set_received_timer(ANN, "i1", 600, 210).unwrap());
+        assert!(!db.dm_set_received_timer(ANN, "i1", 60, 211).unwrap(), "once");
+        let theirs = |db: &Database| db.dm_messages(ANN, 10, None, None).unwrap().into_iter().find(|m| m.message_id == "i1");
+        assert_eq!(theirs(&db).map(|m| m.expires_at), Some(0), "unread, so not yet");
+        db.dm_mark_read(ANN).unwrap();
+        db.dm_start_read_timers(ANN, 300).unwrap();
+        assert_eq!(theirs(&db).map(|m| m.expires_at), Some(900));
+
+        assert!(db.dm_expire_due(499).unwrap().is_empty());
+        assert_eq!(db.dm_expire_due(500).unwrap(), vec![ANN.to_string()]);
+        assert!(ours(&db).is_none() && theirs(&db).is_some());
+        assert_eq!(db.dm_expire_due(900).unwrap(), vec![ANN.to_string()]);
+        assert!(db.dm_messages(ANN, 10, None, None).unwrap().is_empty());
+        assert_eq!(
+            db.dm_record_incoming(ANN, "Ann", ROOM, "i1", "theirs", 150, ROOM_DM_POLICY_ANYONE, 901).unwrap(),
+            DmIncoming::Duplicate,
+            "a resend of a message its timer deleted stays deleted",
+        );
+        assert!(db.dm_messages(ANN, 10, None, None).unwrap().is_empty());
+
+        // Read already when the timer comes: it runs from then.
+        db.dm_record_incoming(ANN, "Ann", ROOM, "i2", "later", 950, ROOM_DM_POLICY_ANYONE, 950).unwrap();
+        db.dm_mark_read(ANN).unwrap();
+        assert!(db.dm_set_received_timer(ANN, "i2", 300, 1_000).unwrap());
+        assert_eq!(theirs_of(&db, "i2"), Some(1_300));
+        db.dm_delete_thread(ANN, 1_100).unwrap();
+        assert_eq!(db.dm_disappear_secs(ANN).unwrap(), 0, "deleting the conversation forgets its timer");
+        drop_db(db, path);
+
+        fn theirs_of(db: &Database, id: &str) -> Option<i64> {
+            db.dm_messages(ANN, 10, None, None).unwrap().into_iter().find(|m| m.message_id == id).map(|m| m.expires_at)
+        }
+    }
+
+    /// Mail is left only for a member who said lately that it collects, and
+    /// only once a message has gone unanswered live; then it is resent live
+    /// no more, waits its week, and its copy is stale once delivered.
+    #[test]
+    fn room_mail_goes_to_collectors_after_a_silence_and_stops_live_resends() {
+        let (db, path) = db("room-mail");
+        let other = "bb22";
+        db.dm_record_outgoing(ANN, "Ann", ROOM, "o1", "while you were out", 100, 220, 1_300).unwrap();
+        db.dm_record_outgoing(other, "Bo", ROOM, "o2", "to someone who never said", 100, 220, 1_300).unwrap();
+        assert!(db.dm_mail_due(150, 120, 1_000).unwrap().is_empty(), "nobody collects yet");
+        db.dm_note_collects(ANN, 90).unwrap();
+        assert!(db.dm_mail_due(150, 120, 1_000).unwrap().is_empty(), "not unanswered long enough");
+        let due = db.dm_mail_due(220, 120, 1_000).unwrap();
+        assert_eq!(due.iter().map(|d| d.message_id.as_str()).collect::<Vec<_>>(), vec!["o1"]);
+        assert!(db.dm_mail_due(220, 120, 100).unwrap().is_empty(), "a word heard too long ago");
+
+        db.dm_note_mailed(ANN, "o1", "aa", "bb", 220, 220 + 7 * 86_400).unwrap();
+        assert!(db.dm_mail_due(300, 120, 1_000).unwrap().is_empty(), "left once");
+        assert!(
+            db.dm_due_resends(220 + DM_MAILED_RESEND_SECS - 1).unwrap().iter().all(|r| r.message_id != "o1"),
+            "resent live only now and then"
+        );
+        assert!(db.dm_due_resends(220 + DM_MAILED_RESEND_SECS).unwrap().iter().any(|r| r.message_id == "o1"));
+        db.dm_note_attempt(ANN, "o1", ROOM, 2_000 + 150, 2_000).unwrap();
+        assert!(
+            db.dm_due_resends(2_000 + 150).unwrap().iter().all(|r| r.message_id != "o1"),
+            "and stays slow after a resend"
+        );
+        assert!(db.dm_due_resends(2_000 + DM_MAILED_RESEND_SECS).unwrap().iter().any(|r| r.message_id == "o1"));
+        assert!(db.dm_fail_unanswered(1_300).unwrap().iter().all(|(_, id)| id != "o1"), "it waits its week");
+        let mailboxed = db.dm_messages(ANN, 10, None, None).unwrap()[0].mailboxed;
+        assert!(mailboxed);
+        assert!(db.dm_mail_stale().unwrap().is_empty());
+
+        assert!(db.dm_mark_delivered(ANN, "o1").unwrap());
+        let stale = db.dm_mail_stale().unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!((stale[0].2.as_str(), stale[0].3.as_str(), stale[0].4), ("aa", "bb", 220));
+        db.dm_forget_mailed(&[(ANN.to_string(), "o1".to_string())]).unwrap();
+        assert!(db.dm_mail_stale().unwrap().is_empty());
+
+        db.dm_record_incoming(other, "Bo", ROOM, "i1", "hi", 100, ROOM_DM_POLICY_ANYONE, 100).unwrap();
+        let threads: Vec<String> = db.dm_mail_threads().unwrap().into_iter().map(|(m, _, _)| m).collect();
+        assert!(threads.contains(&ANN.to_string()) && threads.contains(&other.to_string()));
         drop_db(db, path);
     }
 
@@ -976,7 +1455,7 @@ mod tests {
         assert_eq!(db.dm_thread(ANN, day8).unwrap().unwrap().peer_state, "", "the first has run out");
         db.dm_record_outgoing(ANN, "Ann", ROOM, "o2", "hello again", day8, day8 + 120, day8 + 1_200).unwrap();
         db.dm_record_outgoing(ANN, "Ann", ROOM, "o3", "still there?", day8, day8 + 120, day8 + 1_200).unwrap();
-        db.dm_note_attempt(ANN, "o3", ROOM, day8 + 120).unwrap();
+        db.dm_note_attempt(ANN, "o3", ROOM, day8 + 120, day8).unwrap();
         let (moved, mut stopped) = db.dm_note_peer_answer(ANN, false, day8 + 10).unwrap();
         stopped.sort();
         assert_eq!((moved, stopped), (true, vec!["o2".to_string(), "o3".to_string()]));

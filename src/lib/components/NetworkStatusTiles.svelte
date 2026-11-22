@@ -98,7 +98,9 @@
     </div>
     <div class="stat-tile">
       <span class="stat-label">{m.kad_stat_upnp()}</span>
-      {#if upnpOff}
+      {#if $networkStats.interface_bound}
+        <span class="stat-value" title={m.kad_upnp_interface_title()}>{m.kad_upnp_not_in_use()}</span>
+      {:else if upnpOff}
         <button
           type="button"
           class="stat-link"

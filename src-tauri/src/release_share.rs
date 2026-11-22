@@ -259,7 +259,16 @@ pub fn retain_installers(folder: &Path, installer_suffix: Option<&str>) -> usize
 }
 
 /// The end of the name of the installer this build updates with, as the
+/// release workflow names them: what [`retain_installers`] keeps. `emberd`
+/// is installed by no desktop installer, so it keeps none.
+#[cfg(not(feature = "desktop"))]
+pub fn own_installer_suffix() -> Option<&'static str> {
+    None
+}
+
+/// The end of the name of the installer this build updates with, as the
 /// release workflow names them: what [`retain_installers`] keeps.
+#[cfg(feature = "desktop")]
 pub fn own_installer_suffix() -> Option<&'static str> {
     use tauri::utils::config::BundleType;
     match tauri::utils::platform::bundle_type()? {

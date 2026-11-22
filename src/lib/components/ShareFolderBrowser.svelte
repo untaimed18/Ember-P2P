@@ -18,6 +18,7 @@
   import IconX from '$lib/components/IconX.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import { formatBytes, formatNumber } from '$lib/utils';
+  import { isServer } from '$lib/runtime';
   import {
     addSharedFolder,
     closeShareBrowser,
@@ -43,7 +44,9 @@
     onerror?: (error: unknown) => void;
   } = $props();
 
+  // emberd's paths are its own computer's, whatever the browser runs on.
   const IS_WINDOWS =
+    !isServer &&
     typeof navigator !== 'undefined' &&
     (/Win/i.test(navigator.platform) || /Windows/i.test(navigator.userAgent));
   const IS_MAC =
@@ -1235,7 +1238,9 @@
           {shareOutcome}
         </p>
         <div class="footer-actions">
-          <button type="button" class="ghost footer-fallback" onclick={() => leaveAfterConfirm(() => void useSystemDialog())} disabled={sharing}>{m.library_explorer_system_dialog()}</button>
+          {#if !isServer}
+            <button type="button" class="ghost footer-fallback" onclick={() => leaveAfterConfirm(() => void useSystemDialog())} disabled={sharing}>{m.library_explorer_system_dialog()}</button>
+          {/if}
           <button type="button" class="ghost" onclick={closeDialog} disabled={sharing}>{m.common_cancel()}</button>
           <button
             type="button"

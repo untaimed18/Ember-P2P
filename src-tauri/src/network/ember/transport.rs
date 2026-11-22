@@ -465,13 +465,6 @@ struct NoiseSession {
     /// could only derive from our handshake reply. Sessions default to
     /// `false` so a new code path has to opt in deliberately.
     addr_validated: bool,
-    /// Built by the peer's handshake when its dial crossed ours and won the
-    /// tie, at an address we had just dialled. `handle_ik_init` seals our first
-    /// message and queue into it before it is proven, so later sends follow
-    /// them there rather than dialling again: a dial's answer would replace
-    /// the session the peer is about to send on, and its frames on it would be
-    /// lost. See [`EmberTransport::outgoing_session_mut`].
-    crossing: bool,
     /// Nonce of the return-routability probe we sealed onto this session,
     /// until its `Pong` comes back. The probe is ours, not the caller's, so
     /// its answer is swallowed rather than surfaced — otherwise it looks
@@ -512,7 +505,6 @@ impl NoiseSession {
             established: now,
             ik_authenticated,
             addr_validated: false,
-            crossing: false,
             probe_nonce: None,
             send_nonce: 0,
             recv_high: 0,
@@ -683,6 +675,16 @@ const MSG1_CROSSED_RESEND_GAP: Duration = Duration::from_secs(1);
 /// that is someone else using our dial as a reflector.
 const MSG1_CROSSED_RESENDS_MAX: u8 = 2;
 
+/// How long the higher key of a crossed dial holds its messages for the
+/// session the peer's handshake built, before giving up on that session and
+/// dialling again with them. See [`EmberTransport::crossing_holds`].
+///
+/// The honest proof is the peer's first frame on the session, one round trip
+/// after our `IK_RESP`, or one round trip after the peer resends message 1 at
+/// `MSG1_RESEND_AFTER[0]` if the `IK_RESP` was lost. Past that the session is
+/// most likely one a replayed `IK_INIT` built, which the real peer cannot read.
+const CROSSING_HOLD: Duration = Duration::from_secs(3);
+
 /// The smallest body an `IK_INIT` can have: the ephemeral key, the sealed
 /// static key and the tag of an empty payload. Anything shorter cannot be the
 /// peer's dial, and must not draw our larger message 1 back.
@@ -695,7 +697,8 @@ enum PendingHandshake {
         state: snow::HandshakeState,
         /// The payload message 1 carried. Kept because a crossed dial we lose
         /// the tie on is refused by the peer, message and all, so it has to go
-        /// again over the session the peer's handshake produces.
+        /// again, over the session the peer's handshake produces once that
+        /// session proves itself (see [`EmberTransport::crossing_holds`]).
         first_message: Vec<u8>,
         /// Message 1 as sent, for [`EmberTransport::due_msg1_resends`].
         msg1: Vec<u8>,
@@ -1112,6 +1115,28 @@ pub struct EmberTransport {
     /// own. `take_deferred_ik` already refused an entry whose static key did not
     /// match, so this only stops one claimant evicting another's.
     deferred_ik: HashMap<(SocketAddr, [u8; 32]), DeferredIkPayload>,
+    /// What we had for a peer whose crossed dial won the tie: the first
+    /// message and queue of the dial we gave up for its handshake, and
+    /// anything sent to it since.
+    ///
+    /// Held rather than sealed into the session the peer's `IK_INIT` built,
+    /// because that message proves nothing about who can read the session.
+    /// Past the replay window a captured `IK_INIT` from the peer's address
+    /// builds one under keys the real peer never derived, and while our dial
+    /// was pending that took over the crossing: everything we sent went into
+    /// the session and was lost until some fault was noticed.
+    ///
+    /// Sends wait here instead of dialling, because the answer to a dial
+    /// would replace the session the peer is about to send on. The first
+    /// frame read from the peer releases them onto the proven session (see
+    /// `dispatch_incoming`); a session that has not proven itself within
+    /// [`CROSSING_HOLD`] is given up on, and they go out over a fresh dial,
+    /// which the real peer can answer and a replayer cannot (see
+    /// [`Self::due_crossing_redials`]).
+    ///
+    /// An entry only ever replaces one of our own pending dials, so the dials
+    /// we make bound this map, not anything a remote sends.
+    crossing_holds: BTreeMap<(SocketAddr, [u8; 32]), CrossingHold>,
     /// Per-process salt for [`Self::salted_addr_rank`], so eviction tie-breaks
     /// cannot be aimed by an attacker choosing its source addresses.
     trim_salt: [u8; 32],
@@ -1177,6 +1202,12 @@ struct DeferredIkPayload {
     /// one packet. The staged session's keys come from our fresh ephemeral, so
     /// a replayer never produces the frame that would release its payload.
     generation: u64,
+}
+
+/// Our messages for one peer, held for [`EmberTransport::crossing_holds`].
+struct CrossingHold {
+    payloads: Vec<Vec<u8>>,
+    created: Instant,
 }
 
 /// A handshake initiation we have already processed.
@@ -1246,6 +1277,7 @@ impl EmberTransport {
             recent_handshakes: HashMap::new(),
             recent_handshake_order: VecDeque::new(),
             deferred_ik: HashMap::new(),
+            crossing_holds: BTreeMap::new(),
             trim_salt: fresh_cookie_secret(),
             dialled,
             cookie_secret: fresh_cookie_secret(),
@@ -1621,11 +1653,8 @@ impl EmberTransport {
     /// delivery use this so they never call `prepare_outgoing` in a way that
     /// starts a handshake and then claim the frame was sent.
     ///
-    /// Only a session whose address is proven counts. `prepare_outgoing` seals
-    /// to no other session but a crossing one (see
-    /// [`Self::outgoing_session_mut`]), which this leaves out until it is proven
-    /// too: a caller choosing between direct delivery and a relay loses nothing
-    /// by waiting one round trip.
+    /// Only a session whose address is proven counts, as only such a session
+    /// is sealed to (see [`Self::outgoing_session_mut`]).
     pub fn has_live_session(&self, addr: &SocketAddr, remote_noise_pub: &[u8; 32]) -> bool {
         self.sessions
             .get(&(*addr, *remote_noise_pub))
@@ -1732,6 +1761,16 @@ impl EmberTransport {
             }
             self.sessions.remove(&(peer, key));
             return OutgoingResult::Error("encrypt failed".to_string());
+        }
+
+        // A peer whose crossed dial we answered: wait for its session to prove
+        // itself rather than dial over it. See `crossing_holds`.
+        if let Some(hold) = self.crossing_hold_mut(peer, remote_noise_pub) {
+            if hold.payloads.len() >= MAX_QUEUED_PER_HANDSHAKE {
+                hold.payloads.remove(0);
+            }
+            hold.payloads.push(message.to_vec());
+            return OutgoingResult::Queued;
         }
 
         // A responder-side pending is not ours — see `XX_RESPONDER_QUEUE_GRACE`.
@@ -1850,6 +1889,9 @@ impl EmberTransport {
         peer: SocketAddr,
         remote_noise_pub: &[u8; 32],
     ) -> bool {
+        if self.crossing_holds.contains_key(&(peer, *remote_noise_pub)) {
+            return true;
+        }
         match self.pending.get(&peer) {
             Some(PendingHandshake::IkInitiator {
                 remote_noise_pub: target,
@@ -1875,27 +1917,120 @@ impl EmberTransport {
     /// replayer cannot answer that, the real peer can, and its answer replaces
     /// the unproven session. In the honest case the session proves itself one
     /// round trip after it forms, when the peer answers our probe or sends its
-    /// next frame, and sends inside that window cost an extra handshake.
-    ///
-    /// The one exception is a [`NoiseSession::crossing`] session, which our
-    /// first message has already gone into.
+    /// next frame, and sends inside that window cost an extra handshake. A
+    /// session built by a crossed dial is the one case where they wait for
+    /// the proof instead (see [`Self::crossing_holds`]).
     fn outgoing_session_mut(
         &mut self,
         peer: SocketAddr,
         remote_noise_pub: Option<&[u8; 32]>,
     ) -> Option<&mut NoiseSession> {
-        let sendable = |session: &NoiseSession| session.addr_validated || session.crossing;
         if let Some(want) = remote_noise_pub {
             return self
                 .sessions
                 .get_mut(&(peer, *want))
-                .filter(|session| sendable(session));
+                .filter(|session| session.addr_validated);
         }
         let slot = slots_at(&self.sessions, peer)
-            .filter(|(_, session)| sendable(session))
+            .filter(|(_, session)| session.addr_validated)
             .max_by_key(|(_, session)| session.last_activity)
             .map(|(slot, _)| *slot)?;
         self.sessions.get_mut(&slot)
+    }
+
+    /// The crossing hold a send to `peer` joins: the one for the named static
+    /// key, or with no key named the newest at the address, as
+    /// [`Self::outgoing_session_mut`] picks the most recent session.
+    fn crossing_hold_mut(
+        &mut self,
+        peer: SocketAddr,
+        remote_noise_pub: Option<&[u8; 32]>,
+    ) -> Option<&mut CrossingHold> {
+        let slot = match remote_noise_pub {
+            Some(want) => (peer, *want),
+            None => *self
+                .crossing_holds
+                .range((peer, [0u8; 32])..=(peer, [0xFFu8; 32]))
+                .max_by_key(|(_, hold)| hold.created)?
+                .0,
+        };
+        self.crossing_holds.get_mut(&slot)
+    }
+
+    /// Hold what the dial we gave up for a crossed one carried. See
+    /// [`Self::crossing_holds`].
+    fn hold_for_crossing(
+        &mut self,
+        addr: SocketAddr,
+        remote_noise_pub: [u8; 32],
+        first_message: Vec<u8>,
+        queued: Vec<QueuedPayload>,
+    ) {
+        let first = (!first_message.is_empty()).then_some(first_message);
+        let hold = self
+            .crossing_holds
+            .entry((addr, remote_noise_pub))
+            .or_insert_with(|| CrossingHold {
+                payloads: Vec::new(),
+                created: Instant::now(),
+            });
+        hold.payloads
+            .extend(first.into_iter().chain(retain_addressed_to(queued, &remote_noise_pub)));
+        let excess = hold.payloads.len().saturating_sub(MAX_QUEUED_PER_HANDSHAKE);
+        hold.payloads.drain(..excess);
+    }
+
+    /// Seal what a crossing held for this peer, once a session for it is
+    /// proven: the peer has just been read on it, or it is one we dialled.
+    fn release_crossing_hold(&mut self, from: SocketAddr, remote_noise_pub: &[u8; 32]) -> Vec<Vec<u8>> {
+        let slot = (from, *remote_noise_pub);
+        if !self.crossing_holds.contains_key(&slot) {
+            return Vec::new();
+        }
+        let Some(session) = self.sessions.get_mut(&slot).filter(|s| s.addr_validated) else {
+            return Vec::new();
+        };
+        let Some(hold) = self.crossing_holds.remove(&slot) else {
+            return Vec::new();
+        };
+        session.last_activity = Instant::now();
+        hold.payloads.iter().filter_map(|msg| session.seal(msg)).collect()
+    }
+
+    /// Messages held for a crossed dial whose session has not proven itself
+    /// within [`CROSSING_HOLD`], with where each packet goes. They go the way
+    /// any send does: over a session for the peer that has proven itself
+    /// since, or behind a fresh dial. The unproven session is left in place,
+    /// so frames the peer sends on it late still promote it. Each is handed
+    /// out once.
+    pub fn due_crossing_redials(&mut self, now: Instant) -> Vec<(SocketAddr, Vec<u8>)> {
+        let lapsed: Vec<(SocketAddr, [u8; 32])> = self
+            .crossing_holds
+            .iter()
+            .filter(|(_, hold)| now.saturating_duration_since(hold.created) >= CROSSING_HOLD)
+            .map(|(slot, _)| *slot)
+            .collect();
+        let mut packets = Vec::new();
+        for slot in lapsed {
+            let Some(hold) = self.crossing_holds.remove(&slot) else {
+                continue;
+            };
+            let (addr, key) = slot;
+            debug!(
+                "Crossed dial with {addr} not proven within {CROSSING_HOLD:?}; \
+                 sending what it held over a fresh dial"
+            );
+            for message in hold.payloads {
+                match self.prepare_outgoing(addr, Some(&key), &message) {
+                    OutgoingResult::Ready { packet } | OutgoingResult::HandshakeStarted { packet } => {
+                        packets.push((addr, packet));
+                    }
+                    OutgoingResult::Queued => {}
+                    OutgoingResult::Error(e) => debug!("Dropping a message held for {addr}: {e}"),
+                }
+            }
+        }
+        packets
     }
 
     /// Install `session` at `(addr, static key)`, replacing a previous handshake
@@ -2088,6 +2223,10 @@ impl EmberTransport {
             };
             now.duration_since(created) < Duration::from_secs(30)
         });
+        // `due_crossing_redials` empties these long before this; the sweep
+        // only covers a transport nothing is driving.
+        self.crossing_holds
+            .retain(|_, hold| now.duration_since(hold.created) < Duration::from_secs(30));
         self.recent_handshakes
             .retain(|_, e| now.duration_since(e.seen_at) < HANDSHAKE_REPLAY_TTL);
         self.deferred_ik
@@ -2108,8 +2247,9 @@ impl EmberTransport {
             .retain(|(k, at)| live_handshakes.get(k).is_some_and(|e| e.seen_at == *at));
     }
 
-    /// Drop the session, staged re-handshake and deferred payload held for one
-    /// peer *identity* (e.g. when the DHT concludes that peer is unreachable).
+    /// Drop the session, staged re-handshake, deferred payload and crossing
+    /// hold kept for one peer *identity* (e.g. when the DHT concludes that
+    /// peer is unreachable).
     ///
     /// Keyed by `(addr, static key)` rather than by address alone. Sessions
     /// coexist per identity precisely so that distinct peers behind one NAT or
@@ -2130,6 +2270,7 @@ impl EmberTransport {
         self.sessions.remove(&slot);
         self.staged_sessions.remove(&slot);
         self.deferred_ik.remove(&slot);
+        self.crossing_holds.remove(&slot);
         self.abandon_stalled_handshake(addr, remote_noise_pub, Instant::now());
     }
 
@@ -2207,6 +2348,15 @@ impl EmberTransport {
             } => self.take_deferred_ik(from, remote_noise_pub, *generation),
             _ => None,
         };
+        // And what we held for the peer of a crossed dial, if a session for it
+        // is proven now.
+        let held = match &result {
+            IncomingResult::Message { remote_noise_pub, .. }
+            | IncomingResult::HandshakeComplete { remote_noise_pub, .. } => {
+                self.release_crossing_hold(from, remote_noise_pub)
+            }
+            _ => Vec::new(),
+        };
 
         let payload = match result {
             IncomingResult::Message {
@@ -2214,6 +2364,7 @@ impl EmberTransport {
                 remote_noise_pub,
                 ..
             } => {
+                outcome.responses = held;
                 outcome.remote_noise_pub = Some(remote_noise_pub);
                 Some(payload)
             }
@@ -2222,11 +2373,12 @@ impl EmberTransport {
                 None
             }
             IncomingResult::HandshakeComplete {
-                packets_to_send,
+                mut packets_to_send,
                 decrypted_payload,
                 remote_noise_pub,
                 ..
             } => {
+                packets_to_send.extend(held);
                 outcome.responses = packets_to_send;
                 outcome.remote_noise_pub = Some(remote_noise_pub);
                 decrypted_payload
@@ -2421,8 +2573,9 @@ impl EmberTransport {
         // Refusing on both sides left each first message to wait out the 30 s
         // timeout instead, so a crossed IK dial is settled by static key: the
         // lower key stays initiator, and the higher one answers as responder
-        // and hands what it had queued to the session that produces. Each side
-        // decides from its own key and the one it dialled, so they agree.
+        // and holds what it had queued for the session that produces, until
+        // that session proves itself (see `crossing_holds`). Each side decides
+        // from its own key and the one it dialled, so they agree.
         //
         // The peer dialling us is also the moment its NAT is known to let our
         // message 1 in, which it may not have when ours first went (see
@@ -2604,23 +2757,6 @@ impl EmberTransport {
 
         let mut cached_answer = vec![resp_buf.clone()];
         let mut packets_to_send = vec![resp_buf];
-        if crossed_initiator == Some(true) {
-            session.crossing = true;
-            if let Some(PendingHandshake::IkInitiator { first_message, queued, .. }) =
-                self.pending.get(&from)
-            {
-                let first = (!first_message.is_empty()).then_some(first_message.as_slice());
-                let rest = queued
-                    .iter()
-                    .filter(|q| q.addressed_to(&remote_noise_pub))
-                    .map(|q| q.bytes.as_slice());
-                for msg in first.into_iter().chain(rest) {
-                    if let Some(packet) = session.seal(msg) {
-                        packets_to_send.push(packet);
-                    }
-                }
-            }
-        }
 
         // Nothing in message 1 proves the sender can *receive* where it says
         // it is. IK is 1-RTT and every node's static key is published in
@@ -2643,9 +2779,11 @@ impl EmberTransport {
         // initiation earns are this 51-byte IK_RESP and the 37-byte probe —
         // together smaller than the 99-byte minimum IK_INIT that triggered
         // them, so there is nothing left to amplify.
+        //
+        // What a crossed dial holds for this peer waits on the same proof, so
+        // the probe goes for a crossing even when message 1 carried nothing.
         self.deferred_ik.remove(&(from, remote_noise_pub));
         if payload_len > 0 {
-            let probe_nonce = rand::random::<u64>();
             self.deferred_ik.insert(
                 (from, remote_noise_pub),
                 DeferredIkPayload {
@@ -2655,6 +2793,13 @@ impl EmberTransport {
                     generation: session.generation,
                 },
             );
+            // Trimmed after the insert, so the bound is applied to the map this
+            // claimant has actually joined — and with its own entry excluded, or the
+            // trim would simply undo the insert. See `trim_deferred_ik`.
+            self.trim_deferred_ik(from, remote_noise_pub);
+        }
+        if payload_len > 0 || crossed_initiator == Some(true) {
+            let probe_nonce = rand::random::<u64>();
             let probe = EmberControlMessage::Ping { nonce: probe_nonce }.encode();
             match session.seal(&probe) {
                 Some(packet) => {
@@ -2662,16 +2807,12 @@ impl EmberTransport {
                     cached_answer.push(packet.clone());
                     packets_to_send.push(packet);
                 }
-                // The payload stays deferred and is not lost: any
-                // authenticated frame from this peer releases it, so without
-                // a probe it simply waits for the peer's own next frame
-                // instead of a prompt reply.
+                // Nothing waiting on the proof is lost: any authenticated
+                // frame from this peer releases it, so without a probe it
+                // simply waits for the peer's own next frame instead of a
+                // prompt reply.
                 None => warn!("IK responder: failed to seal return-routability probe for {from}"),
             }
-            // Trimmed after the insert, so the bound is applied to the map this
-            // claimant has actually joined — and with its own entry excluded, or the
-            // trim would simply undo the insert. See `trim_deferred_ik`.
-            self.trim_deferred_ik(from, remote_noise_pub);
         }
 
         if !self.install_session(from, session) {
@@ -2707,7 +2848,14 @@ impl EmberTransport {
         }
         self.remember_handshake_response(handshake_digest, cached_answer);
         if !keep_pending {
-            self.pending.remove(&from);
+            // An IK dial still here is ours to this identity, since
+            // `keep_pending` kept one aimed elsewhere.
+            if let Some(PendingHandshake::IkInitiator {
+                first_message, queued, ..
+            }) = self.pending.remove(&from)
+            {
+                self.hold_for_crossing(from, remote_noise_pub, first_message, queued);
+            }
         }
 
         IncomingResult::HandshakeComplete {
@@ -3940,7 +4088,8 @@ mod tests {
 
     /// Two peers that IK-dial each other at once settle on one handshake at
     /// once, and both first messages arrive, instead of each refusing the
-    /// other and waiting out the pending timeout.
+    /// other and waiting out the pending timeout. The higher key's messages,
+    /// and what it sends meanwhile, wait for the session to prove itself.
     #[test]
     fn a_crossed_ik_dial_is_settled_by_static_key() {
         let (a_priv, a_pub) = make_keypair();
@@ -3974,27 +4123,35 @@ mod tests {
             }
             _ => panic!("the lower key refuses the crossed dial and sends its own again"),
         }
-        let answer = match high.process_incoming(&low_init, low_addr) {
-            IncomingResult::HandshakeComplete { packets_to_send, .. } => packets_to_send,
-            _ => panic!("the higher key answers"),
-        };
-        assert!(!high.pending.contains_key(&low_addr), "and gives up its own dial");
-        // IK_RESP, high's two messages, then the routability probe.
-        assert_eq!(answer.len(), 4);
+        let answer = high.dispatch_incoming(&low_init, low_addr).responses;
+        assert!(!high.pending.contains_key(&low_addr), "the higher key answers and gives up its own dial");
+        // IK_RESP and the routability probe; high's messages are held.
+        assert_eq!(answer.len(), 2);
+        assert!(matches!(
+            high.prepare_outgoing(low_addr, Some(&low_pub), b"high, later"),
+            OutgoingResult::Queued
+        ));
+        assert!(high.pending.is_empty(), "a send waits for the session rather than dialling over it");
+        assert!(high.queued_delivery_is_certain(low_addr, &low_pub));
 
-        let _ = low.process_incoming(&answer[0], high_addr);
-        let mut heard = Vec::new();
-        for packet in &answer[1..3] {
-            match low.process_incoming(packet, high_addr) {
-                IncomingResult::Message { payload, .. } => heard.push(payload),
-                _ => panic!("expected Message"),
-            }
-        }
-        assert_eq!(heard, vec![b"from high".to_vec(), b"high, queued".to_vec()]);
-
-        let probe_answer = low.dispatch_incoming(&answer[3], high_addr);
+        let _ = low.dispatch_incoming(&answer[0], high_addr);
+        let probe_answer = low.dispatch_incoming(&answer[1], high_addr);
         let released = high.dispatch_incoming(&probe_answer.responses[0], low_addr);
         assert_eq!(released.app_payloads, vec![b"from low".to_vec()]);
+        let heard: Vec<Vec<u8>> = released
+            .responses
+            .iter()
+            .flat_map(|packet| low.dispatch_incoming(packet, high_addr).app_payloads)
+            .collect();
+        assert_eq!(
+            heard,
+            vec![b"from high".to_vec(), b"high, queued".to_vec(), b"high, later".to_vec()]
+        );
+        assert!(high.crossing_holds.is_empty());
+        assert!(matches!(
+            high.prepare_outgoing(low_addr, Some(&low_pub), b"proven"),
+            OutgoingResult::Ready { .. }
+        ));
     }
 
     /// Two transports whose keys order them, each with an IK dial to the other
@@ -4052,13 +4209,13 @@ mod tests {
 
         let _ = low.process_incoming(&answer[0], high_addr);
         assert!(!low.pending.contains_key(&high_addr), "the lower key's dial completed");
-        match low.process_incoming(&answer[1], high_addr) {
+        let probe_answer = low.dispatch_incoming(&answer[1], high_addr);
+        let released = high.dispatch_incoming(&probe_answer.responses[0], low_addr);
+        assert_eq!(released.app_payloads, vec![b"from low".to_vec()]);
+        match low.process_incoming(&released.responses[0], high_addr) {
             IncomingResult::Message { payload, .. } => assert_eq!(payload, b"from high"),
             _ => panic!("the higher key's own first message arrives over the session"),
         }
-        let probe_answer = low.dispatch_incoming(&answer[2], high_addr);
-        let released = high.dispatch_incoming(&probe_answer.responses[0], low_addr);
-        assert_eq!(released.app_payloads, vec![b"from low".to_vec()]);
     }
 
     /// A crossed dial refused again and again draws our message 1 at most once
@@ -7195,24 +7352,107 @@ mod tests {
         ));
     }
 
-    /// The higher key of a crossed dial answers the peer's handshake and seals
-    /// its own first message into the session that produced. Its next send
-    /// follows it there rather than dialling again, which would replace the
-    /// session the peer is about to send on; the session still is not reported
-    /// live before it is proven.
+    /// A captured `IK_INIT` replayed from the peer's address while our dial to
+    /// it is pending takes the crossing, as the peer's own would. Our messages
+    /// used to go into the session it built, which only an ephemeral key long
+    /// gone could read. Now they wait for a proof that never comes, then go
+    /// out over a fresh dial that the real peer answers.
     #[test]
-    fn a_crossed_dials_session_is_sent_into_before_it_is_proven() {
-        let (_low, mut high, low_init, _high_init, low_addr, _high_addr) = crossed_ik_dials();
-        assert!(matches!(
-            high.process_incoming(&low_init, low_addr),
-            IncomingResult::HandshakeComplete { .. }
-        ));
+    fn a_replayed_init_crossing_our_dial_costs_a_redial_not_our_messages() {
+        let (mut low, mut high, captured, _lost, low_addr, high_addr) = crossed_ik_dials();
+        // The dial that sent it timed out long ago.
+        low.pending.clear();
+
+        let answer = high.dispatch_incoming(&captured, low_addr).responses;
         let (_, low_pub) = *high.sessions.keys().next().unwrap();
-        assert!(!high.has_live_session(&low_addr, &low_pub));
         assert!(matches!(
-            high.prepare_outgoing(low_addr, Some(&low_pub), b"more"),
-            OutgoingResult::Ready { .. }
+            high.prepare_outgoing(low_addr, Some(&low_pub), b"high, later"),
+            OutgoingResult::Queued
         ));
+        for packet in &answer {
+            assert!(low.dispatch_incoming(packet, high_addr).rejected, "nobody can read the answer");
+        }
+        assert!(!high.has_live_session(&low_addr, &low_pub));
+        assert!(high.due_crossing_redials(Instant::now()).is_empty(), "held for a while first");
+
+        let redial = high.due_crossing_redials(Instant::now() + CROSSING_HOLD);
+        assert_eq!(redial.len(), 1, "one message 1, the rest queued behind it");
+        assert!(high.crossing_holds.is_empty());
+        assert!(high.due_crossing_redials(Instant::now() + CROSSING_HOLD).is_empty(), "handed out once");
+
+        let low_answer = low.dispatch_incoming(&redial[0].1, high_addr).responses;
+        assert_eq!(low_answer.len(), 2, "IK_RESP and the probe");
+        let mut to_low = high.dispatch_incoming(&low_answer[0], low_addr).responses;
+        let probe = high.dispatch_incoming(&low_answer[1], low_addr);
+        assert!(probe.app_payloads.is_empty(), "the replayed init's payload is never released");
+        to_low.extend(probe.responses);
+        let heard: Vec<Vec<u8>> = to_low
+            .iter()
+            .flat_map(|packet| low.dispatch_incoming(packet, high_addr).app_payloads)
+            .collect();
+        assert_eq!(heard, vec![b"from high".to_vec(), b"high, later".to_vec()]);
+        assert!(high.has_live_session(&low_addr, &low_pub));
+    }
+
+    /// The probe goes for a crossing even when the peer's message 1 carried
+    /// nothing: what the crossing holds waits on the same proof.
+    #[test]
+    fn a_crossed_dial_with_an_empty_message_1_is_still_probed() {
+        let (a_priv, a_pub) = make_keypair();
+        let (b_priv, b_pub) = make_keypair();
+        let ((low_priv, low_pub), (high_priv, high_pub)) = if a_pub < b_pub {
+            ((a_priv, a_pub), (b_priv, b_pub))
+        } else {
+            ((b_priv, b_pub), (a_priv, a_pub))
+        };
+        let mut low = EmberTransport::new(low_priv, low_pub);
+        let mut high = EmberTransport::new(high_priv, high_pub);
+        let low_addr: SocketAddr = "1.2.3.4:1000".parse().unwrap();
+        let high_addr: SocketAddr = "5.6.7.8:2000".parse().unwrap();
+        // Too large to ride in message 1, so it follows the handshake.
+        let big = vec![0x42; MAX_EMBER_DATAGRAM_BYTES - TRANSPORT_PACKET_OVERHEAD];
+        let low_init = match low.prepare_outgoing(high_addr, Some(&high_pub), &big) {
+            OutgoingResult::HandshakeStarted { packet } => packet,
+            other => panic!("expected HandshakeStarted, got {}", variant_name(&other)),
+        };
+        assert!(matches!(
+            high.prepare_outgoing(low_addr, Some(&low_pub), b"from high"),
+            OutgoingResult::HandshakeStarted { .. }
+        ));
+
+        let answer = high.dispatch_incoming(&low_init, low_addr).responses;
+        assert_eq!(answer.len(), 2, "IK_RESP and the probe");
+        let flushed = low.dispatch_incoming(&answer[0], high_addr).responses;
+        let pong = low.dispatch_incoming(&answer[1], high_addr).responses;
+        let proven = high.dispatch_incoming(&flushed[0], low_addr);
+        assert_eq!(proven.app_payloads, vec![big]);
+        let heard: Vec<Vec<u8>> = proven
+            .responses
+            .iter()
+            .flat_map(|packet| low.dispatch_incoming(packet, high_addr).app_payloads)
+            .collect();
+        assert_eq!(heard, vec![b"from high".to_vec()]);
+        let answered = high.dispatch_incoming(&pong[0], low_addr);
+        assert!(answered.controls.is_empty() && answered.app_payloads.is_empty(), "the probe's answer is ours");
+    }
+
+    /// A send with no key named joins the newest hold at the address, as it
+    /// would have taken the newest session there, and dropping the peer drops
+    /// what is held for it.
+    #[test]
+    fn an_unkeyed_send_joins_a_crossing_hold_and_dropping_the_peer_drops_it() {
+        let (_low, mut high, low_init, _high_init, low_addr, _high_addr) = crossed_ik_dials();
+        let _ = high.dispatch_incoming(&low_init, low_addr);
+        let (_, low_pub) = *high.sessions.keys().next().unwrap();
+        assert!(matches!(high.prepare_outgoing(low_addr, None, b"unkeyed"), OutgoingResult::Queued));
+        assert!(high.pending.is_empty());
+        assert_eq!(
+            high.crossing_holds[&(low_addr, low_pub)].payloads,
+            vec![b"from high".to_vec(), b"unkeyed".to_vec()]
+        );
+        high.remove_session_for(&low_addr, &low_pub);
+        assert!(high.crossing_holds.is_empty());
+        assert!(high.due_crossing_redials(Instant::now() + CROSSING_HOLD).is_empty());
     }
 
     fn variant_name(r: &OutgoingResult) -> &'static str {

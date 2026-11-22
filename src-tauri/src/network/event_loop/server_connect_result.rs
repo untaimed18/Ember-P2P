@@ -11,7 +11,7 @@ pub(in crate::network) async fn on_server_connect_result(
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     known_files: &KnownFileList,
@@ -290,7 +290,7 @@ pub(in crate::network) async fn on_server_connect_result(
                         &mut state.ip_filter,
                     );
                     if added > 0 {
-                        emit_server_log(app_handle, &format!("Added {added} servers from connected server"));
+                        emit_server_log(app_handle, &added_servers_line(added, "connected server"));
                         let met_path = state.data_dir.join("server.met");
                         spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
                     }
@@ -512,7 +512,7 @@ pub(in crate::network) async fn on_server_connect_result(
 async fn follow_moved_server(
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     ip: &str,
     port: u16,

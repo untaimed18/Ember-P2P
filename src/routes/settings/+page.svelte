@@ -14,6 +14,7 @@
     type LaunchSettings,
     type UpdateSettingsResult,
   } from '$lib/api/settings';
+  import { listNetworkInterfaces, type NetworkInterface } from '$lib/api/networkInterface';
   import type { WebService } from '$lib/types';
   import { openChatFilesFolder } from '$lib/api/friends';
   import {
@@ -34,6 +35,7 @@
   import { setAppSettings, appSettings } from '$lib/stores/settings';
   import { transfers } from '$lib/stores/transfers';
   import { completedFirst } from '$lib/stores/transfersView';
+  import { chatReopenAtLaunch } from '$lib/chatPopout';
   import CategoriesDialog from '$lib/components/CategoriesDialog.svelte';
   import { BUILTIN_DOWNLOAD_CATEGORIES, downloadCategoryLabel } from '$lib/downloadCategories';
   import {
@@ -79,6 +81,7 @@
     exportBackup,
     importBackup,
     pickBackupFile,
+    uploadBackupFile,
     clearPickedBackup,
     pendingRestoreStatus,
     previewBackup,
@@ -141,6 +144,9 @@
   import * as m from '$lib/paraglide/messages';
   import { plural } from '$lib/plural';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
+  import NavIcon from '$lib/components/NavIcon.svelte';
+  import SpamDataDialog from '$lib/components/SpamDataDialog.svelte';
+  import DownloadHistoryDialog from '$lib/components/DownloadHistoryDialog.svelte';
   import PortTest from '$lib/components/PortTest.svelte';
   import ConnectionDoctor from '$lib/components/ConnectionDoctor.svelte';
   import { highlightMatches } from '$lib/stores/highlight';
@@ -157,14 +163,80 @@
     installUpdate,
     restartToUpdate,
     runStagedInstaller,
+    systemTooOldMessage,
   } from '$lib/stores/updater';
   import { silentUpdate, silentUpdateResume } from '$lib/stores/silentUpdate';
   import { toastError } from '$lib/stores/toast';
   import { networkStats } from '$lib/stores/network';
   import { isShortcutLetter } from '$lib/shortcutKey';
+  import { isServer } from '$lib/runtime';
+  import { changePassword, logOut } from '$lib/runtime/web/session';
+  import { askForBrowserNotifications, browserNotificationState } from '$lib/notifications';
 
   const appVersion = import.meta.env.VITE_APP_VERSION;
   const appLicense = import.meta.env.VITE_APP_LICENSE;
+
+  /** emberd's "This server" section: how it was started (`server_overview`). */
+  interface ServerOverview {
+    version: string;
+    config_file: string | null;
+    data_folder: string;
+    web_address: string;
+    https: boolean;
+    download_folder: string | null;
+    shared_folders: string[];
+    browse_under: string[];
+    min_password_chars: number;
+  }
+  let serverOverview = $state<ServerOverview | null>(null);
+  let currentPassword = $state('');
+  let newPassword = $state('');
+  let repeatPassword = $state('');
+  let passwordBusy = $state(false);
+  let passwordMessage = $state<{ text: string; error: boolean } | null>(null);
+  let signingOut = $state(false);
+  /** Whether this browser shows emberd's notifications: its own permission. */
+  let browserNotify = $state(isServer ? browserNotificationState() : 'unsupported');
+
+  onMount(() => {
+    if (!isServer) return;
+    invoke<ServerOverview | null>('server_overview')
+      .then((overview) => (serverOverview = overview))
+      .catch((e) => console.error('Failed to read how emberd was started:', e));
+  });
+
+  async function submitPasswordChange(event: SubmitEvent) {
+    event.preventDefault();
+    if (passwordBusy) return;
+    passwordMessage = null;
+    if (newPassword !== repeatPassword) {
+      passwordMessage = { text: m.server_setup_mismatch(), error: true };
+      return;
+    }
+    passwordBusy = true;
+    try {
+      await changePassword(currentPassword, newPassword);
+      currentPassword = '';
+      newPassword = '';
+      repeatPassword = '';
+      passwordMessage = { text: m.server_settings_password_changed(), error: false };
+    } catch (e) {
+      passwordMessage = { text: translateError(e, m.error_operation_failed()), error: true };
+    } finally {
+      passwordBusy = false;
+    }
+  }
+
+  async function signOut() {
+    if (signingOut) return;
+    signingOut = true;
+    try {
+      await logOut();
+    } catch (e) {
+      signingOut = false;
+      toastError(translateError(e, m.error_operation_failed()));
+    }
+  }
 
   // Silent updates. `supported` is the backend's answer for this install;
   // the status line describes what the saved setting is doing right now.
@@ -382,6 +454,85 @@
   let showRestartPrompt = $state(false);
   let restarting = $state(false);
 
+  // --- Network interface ---
+  /** Null until first read. */
+  let networkInterfaces: NetworkInterface[] | null = $state(null);
+  let interfacesReading = false;
+
+  /** Read the interfaces again: a VPN adds its adapter when it connects. */
+  async function refreshInterfaces() {
+    if (interfacesReading) return;
+    interfacesReading = true;
+    try {
+      const list = await listNetworkInterfaces();
+      if (!unmounted) networkInterfaces = list;
+    } catch (e) {
+      console.warn('Settings: network interfaces unavailable', e);
+    } finally {
+      interfacesReading = false;
+    }
+  }
+
+  $effect(() => {
+    if (!sectionOnScreen('network') || networkInterfaces !== null) return;
+    void refreshInterfaces();
+  });
+
+  function interfaceLabel(iface: NetworkInterface): string {
+    if (!iface.connected) {
+      return iface.vpn
+        ? m.settings_bind_interface_option_off_vpn({ name: iface.name })
+        : m.settings_bind_interface_option_off({ name: iface.name });
+    }
+    const address = iface.addresses.find((a) => !a.startsWith('169.254.')) ?? iface.addresses[0] ?? '';
+    return iface.vpn
+      ? m.settings_bind_interface_option_vpn({ name: iface.name, address })
+      : m.settings_bind_interface_option({ name: iface.name, address });
+  }
+
+  /** The picker's entries. One saved but not on this computer now (a VPN
+   *  that is off, a backup from another computer) stays listed, by the name
+   *  it was chosen under, so the picker never shows a choice that is not in
+   *  force. */
+  let interfaceChoices = $derived.by((): { id: string; label: string; title: string }[] => {
+    const list = networkInterfaces ?? [];
+    const choices = list.map((iface) => ({ id: iface.id, label: interfaceLabel(iface), title: iface.description }));
+    const chosen = settings?.bind_interface ?? '';
+    if (chosen && !list.some((iface) => iface.id === chosen)) {
+      const name = settings?.bind_interface_name || chosen;
+      choices.unshift({
+        id: chosen,
+        label: networkInterfaces === null ? name : m.settings_bind_interface_option_off({ name }),
+        title: '',
+      });
+    }
+    return choices;
+  });
+
+  let interfaceChosen = $derived.by(() => Boolean(settings?.bind_interface));
+
+  /** The chosen interface is not connected now, as last read. */
+  let chosenInterfaceOffline = $derived.by(() => {
+    const chosen = settings?.bind_interface;
+    const list = networkInterfaces;
+    return Boolean(chosen) && list !== null && !list.some((iface) => iface.id === chosen && iface.connected);
+  });
+
+  function chooseInterface(id: string) {
+    if (!settings) return;
+    const iface = networkInterfaces?.find((candidate) => candidate.id === id);
+    settings.bind_interface = id;
+    settings.bind_interface_name = id ? (iface?.name ?? settings.bind_interface_name) : '';
+  }
+
+  /** What an interface id is called, for the restart banner. */
+  function interfaceName(id: string, saved: AppSettings): string {
+    if (!id) return m.settings_bind_interface_any();
+    return networkInterfaces?.find((iface) => iface.id === id)?.name
+      || (id === saved.bind_interface ? saved.bind_interface_name : '')
+      || id;
+  }
+
   // --- Backup / restore ---
   // A restore cannot be applied while the app is running (SQLite holds the
   // database open, and identity/config are already in memory), so the backend
@@ -499,11 +650,13 @@
         // Only the reminder's clock is lost.
       }
       lastBackupMs = readLastBackup();
-      const done = m.settings_backup_export_done({
-        files: summary.files,
-        size: formatSize(summary.bytes),
-        path: summary.path,
-      });
+      const done = isServer
+        ? m.server_backup_export_done({ files: summary.files, size: formatSize(summary.bytes), name: summary.path })
+        : m.settings_backup_export_done({
+            files: summary.files,
+            size: formatSize(summary.bytes),
+            path: summary.path,
+          });
       showBackupMsg(
         summary.skipped.length > 0 ? `${done} ${m.settings_backup_export_skipped_chat_key()}` : done,
         'success',
@@ -515,7 +668,33 @@
     }
   }
 
+  /** emberd: the backup is chosen on the browser's computer and sent over. */
+  let backupFileInput: HTMLInputElement | undefined = $state(undefined);
+
+  async function handleUploadBackupFile(event: Event & { currentTarget: HTMLInputElement }) {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file || backupBusy) return;
+    backupBusy = true;
+    showBackupMsg(m.server_backup_uploading(), 'progress');
+    try {
+      await uploadBackupFile(file);
+      restoreSource = file.name;
+      restorePreview = null;
+      backupMessage = null;
+    } catch (e) {
+      showBackupMsg(translateError(e, m.settings_backup_restore_failed()), 'error');
+    } finally {
+      backupBusy = false;
+    }
+  }
+
   async function handlePickBackupFile() {
+    if (isServer) {
+      backupFileInput?.click();
+      return;
+    }
     try {
       const selected = await pickBackupFile();
       if (typeof selected === 'string') {
@@ -571,6 +750,7 @@
   let showRestoreRestartPrompt = $state(false);
 
   let historyClearMsg: string | null = $state(null);
+  let historyDataOpen = $state(false);
   let historyStats: DownloadHistoryStats | null = $state(null);
   let historyStatsLoading = $state(false);
   let historyStatsError: string | null = $state(null);
@@ -840,14 +1020,16 @@
   let spamStatsLoading = $state(false);
   let spamStatsError: string | null = $state(null);
   let spamResetting = $state(false);
-  type SettingsSection = 'general' | 'notifications' | 'downloads' | 'library' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
+  type SettingsSection = 'general' | 'server' | 'notifications' | 'downloads' | 'library' | 'bandwidth' | 'network' | 'security' | 'friends' | 'channels' | 'search' | 'webservices' | 'backup' | 'about';
 
   /// Sidebar order, and the order the cards are declared in below. Keep them
   /// in step: while filtering, every matching card is on screen in DOM order,
   /// and the arrow-key handling below walks this array, so a mismatch makes
-  /// the keyboard order disagree with what is on screen.
+  /// the keyboard order disagree with what is on screen. emberd has a
+  /// section of its own.
   const sections: SettingsSection[] = [
     'general',
+    ...(isServer ? (['server'] as const) : []),
     'notifications',
     'downloads',
     'library',
@@ -1081,6 +1263,7 @@
   function sectionLabel(id: SettingsSection): string {
     switch (id) {
       case 'general': return m.settings_section_general();
+      case 'server': return m.server_settings_section();
       case 'notifications': return m.settings_section_notifications();
       case 'downloads': return m.settings_section_downloads();
       case 'library': return m.nav_library();
@@ -1734,7 +1917,7 @@
     untrack(scheduleAutoSave);
   });
 
-  type RestartField = 'tcp_port' | 'udp_port' | 'upnp_enabled';
+  type RestartField = 'tcp_port' | 'udp_port' | 'upnp_enabled' | 'bind_interface';
 
   /** Saved values the running network stack has not picked up yet. */
   let pendingRestart = $derived.by((): { field: RestartField; reason: string }[] => {
@@ -1766,6 +1949,15 @@
         reason: saved.upnp_enabled
           ? m.settings_restart_reason_upnp_on()
           : m.settings_restart_reason_upnp_off(),
+      });
+    }
+    if (saved.bind_interface !== launch.bind_interface) {
+      pending.push({
+        field: 'bind_interface',
+        reason: m.settings_restart_reason_interface({
+          from: interfaceName(launch.bind_interface, saved),
+          to: interfaceName(saved.bind_interface, saved),
+        }),
       });
     }
     return pending;
@@ -1966,6 +2158,7 @@
   // delete, IP-filter range remove, etc.) — same focus trap, same dark
   // theme, same Escape-to-cancel.
   let spamResetConfirmOpen = $state(false);
+  let spamDataOpen = $state(false);
   let ignoredClearConfirmOpen = $state(false);
   let mutedClearConfirmOpen = $state(false);
   let hiddenClearConfirmOpen = $state(false);
@@ -2000,7 +2193,8 @@
     spamResetting = true;
     try {
       await resetSpamFilter();
-      await notifySpamFilterReset();
+      // Re-scoring every open search tab can take a while; the reset is done.
+      void notifySpamFilterReset();
       await refreshSpamStats();
       showSaveMsg(m.settings_spam_reset_success(), false, 3000);
     } catch (e: unknown) {
@@ -2553,15 +2747,73 @@
   }
 
   /** The parts of the window whose confirmation toasts can be turned off,
-   *  named as the sidebar names them. See `toastsFor`. */
+   *  named and drawn as the sidebar names and draws them. See `toastsFor`. */
   const popupAreas = [
-    { id: 'downloads', key: 'popups_downloads', label: m.nav_transfers },
-    { id: 'search', key: 'popups_search', label: m.nav_search },
-    { id: 'library', key: 'popups_library', label: m.nav_library },
-    { id: 'friends', key: 'popups_friends', label: m.nav_friends },
-    { id: 'channels', key: 'popups_channels', label: m.nav_channels },
-    { id: 'feeds', key: 'popups_feeds', label: m.nav_feeds },
-    { id: 'network', key: 'popups_network', label: m.nav_group_networks },
+    { id: 'downloads', key: 'popups_downloads', label: m.nav_transfers, icon: 'transfers' },
+    { id: 'search', key: 'popups_search', label: m.nav_search, icon: 'search' },
+    { id: 'library', key: 'popups_library', label: m.nav_library, icon: 'library' },
+    { id: 'friends', key: 'popups_friends', label: m.nav_friends, icon: 'friends' },
+    { id: 'channels', key: 'popups_channels', label: m.nav_channels, icon: 'channels' },
+    { id: 'feeds', key: 'popups_feeds', label: m.nav_feeds, icon: 'feeds' },
+    { id: 'network', key: 'popups_network', label: m.nav_group_networks, icon: 'kad' },
+  ] as const;
+
+  /** The desktop notification events, under the part of Ember each comes
+   *  from, named and drawn as the sidebar names and draws it. `manageRooms`
+   *  ends the hint with a way to the rooms that notify less. */
+  const notifyAreas = [
+    {
+      id: 'transfers',
+      label: m.nav_transfers,
+      events: [
+        { id: 'download-complete', key: 'notify_download_complete', label: m.settings_notify_download_complete },
+        { id: 'download-failed', key: 'notify_download_failed', label: m.settings_notify_download_failed },
+      ],
+    },
+    {
+      id: 'friends',
+      label: m.nav_friends,
+      events: [
+        { id: 'friend-online', key: 'notify_friend_online', label: m.settings_notify_friend_online },
+        {
+          id: 'friend-message',
+          key: 'notify_friend_message',
+          label: m.settings_notify_friend_message,
+          hint: m.settings_notify_friend_message_hint,
+        },
+        { id: 'friend-request', key: 'notify_friend_request', label: m.settings_notify_friend_request },
+      ],
+    },
+    {
+      id: 'library',
+      label: m.nav_library,
+      events: [
+        {
+          id: 'shares-browsed',
+          key: 'notify_shares_browsed',
+          label: m.settings_notify_shares_browsed,
+          hint: m.settings_notify_shares_browsed_hint,
+        },
+      ],
+    },
+    {
+      id: 'channels',
+      label: m.nav_channels,
+      events: [
+        {
+          id: 'channel-message',
+          key: 'notify_channel_message',
+          label: m.settings_notify_channel_message,
+          hint: m.settings_notify_channel_message_hint,
+          manageRooms: true,
+        },
+      ],
+    },
+    {
+      id: 'feeds',
+      label: m.nav_feeds,
+      events: [{ id: 'feed-update', key: 'notify_feed_update', label: m.settings_notify_feed_update }],
+    },
   ] as const;
 
   /** The master switch, which every notification event depends on. */
@@ -2827,6 +3079,13 @@
                   <line x1="3" y1="5.5" x2="17" y2="5.5"/>
                   <line x1="3" y1="10" x2="17" y2="10"/>
                   <line x1="3" y1="14.5" x2="17" y2="14.5"/>
+                </svg>
+              {:else if section === 'server'}
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="3" width="14" height="5.5" rx="1"/>
+                  <rect x="3" y="11.5" width="14" height="5.5" rx="1"/>
+                  <line x1="6" y1="5.75" x2="6.01" y2="5.75"/>
+                  <line x1="6" y1="14.25" x2="6.01" y2="14.25"/>
                 </svg>
               {:else if section === 'notifications'}
                 <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -3113,6 +3372,7 @@
               <div class="apply-input">
                 <input
                   id="nickname"
+                  class="short-text"
                   value={settings.nickname}
                   maxlength="128"
                   oninput={clampNicknameInput}
@@ -3140,6 +3400,7 @@
             </div>
           </div>
 
+          {#if !isServer}
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_startup()}</h4>
             <div class="field">
@@ -3286,7 +3547,9 @@
               />
             </div>
           </div>
+          {/if}
 
+          {#if !isServer}
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_power()}</h4>
             <div class="field toggle-row">
@@ -3312,8 +3575,117 @@
               />
             </div>
           </div>
+          {/if}
         </div>
       </section>
+
+      {#if isServer}
+      <!-- This server: emberd's sign-in, and what its config file set -->
+      <section class="card" class:hidden={!filtering && activeSection !== 'server'} id={panelId('server')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('server')}>
+        <div class="card-header">
+          <span class="card-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="3" width="14" height="5.5" rx="1"/>
+              <rect x="3" y="11.5" width="14" height="5.5" rx="1"/>
+              <line x1="6" y1="5.75" x2="6.01" y2="5.75"/>
+              <line x1="6" y1="14.25" x2="6.01" y2="14.25"/>
+            </svg>
+          </span>
+          <div>
+            <h3>{m.server_settings_section()}</h3>
+            <p class="card-desc">{m.server_settings_desc()}</p>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.server_settings_group_signin()}</h4>
+            <form class="field" onsubmit={submitPasswordChange}>
+              <span class="field-label">{m.server_settings_change_password()}</span>
+              <label for="server-current-password">{m.server_settings_current_password()}</label>
+              <input id="server-current-password" type="password" autocomplete="current-password" bind:value={currentPassword} required />
+              <label for="server-new-password">{m.server_settings_new_password()}</label>
+              <input
+                id="server-new-password"
+                type="password"
+                autocomplete="new-password"
+                minlength={serverOverview?.min_password_chars ?? 8}
+                bind:value={newPassword}
+                required
+              />
+              <span class="hint">{m.server_password_hint({ count: serverOverview?.min_password_chars ?? 8 })}</span>
+              <label for="server-repeat-password">{m.server_setup_repeat()}</label>
+              <input id="server-repeat-password" type="password" autocomplete="new-password" bind:value={repeatPassword} required />
+              <div class="action-row">
+                <button type="submit" class="action-btn primary" disabled={passwordBusy}>{m.server_settings_change_password_button()}</button>
+              </div>
+              {#if passwordMessage}
+                <span class="feedback {passwordMessage.error ? 'error' : 'success'}" role={passwordMessage.error ? 'alert' : 'status'}>{passwordMessage.text}</span>
+              {/if}
+            </form>
+            <div class="field">
+              <span class="field-label">{m.server_settings_sign_out()}</span>
+              <span class="hint">{m.server_settings_sign_out_hint()}</span>
+              <div class="action-row">
+                <button type="button" class="action-btn" onclick={signOut} disabled={signingOut}>{m.server_settings_sign_out()}</button>
+              </div>
+            </div>
+          </div>
+
+          {#if serverOverview}
+            {@const overview = serverOverview}
+            <div class="settings-group">
+              <h4 class="subsection-title">{m.server_settings_group_config()}</h4>
+              <span class="hint">{m.server_settings_config_hint()}</span>
+              <div class="field">
+                <span class="field-label">{m.server_settings_web_address()}</span>
+                <span class="hint server-path">{overview.web_address}</span>
+                <span class="hint">{overview.https ? m.server_settings_https() : m.server_settings_plain_http()}</span>
+              </div>
+              <div class="field">
+                <span class="field-label">{m.server_settings_config_file()}</span>
+                <span class="hint server-path">{overview.config_file ?? m.server_settings_config_none()}</span>
+              </div>
+              <div class="field">
+                <span class="field-label">{m.server_settings_data_folder()}</span>
+                <span class="hint server-path">{overview.data_folder}</span>
+              </div>
+              <div class="field">
+                <span class="field-label">{m.settings_download_folder_label()}</span>
+                <span class="hint server-path">
+                  {overview.download_folder ?? m.server_settings_download_default({ path: settings?.download_folder ?? '' })}
+                </span>
+              </div>
+              <div class="field">
+                <span class="field-label">{m.server_settings_shared_folders()}</span>
+                {#each overview.shared_folders as folder (folder)}
+                  <span class="hint server-path">{folder}</span>
+                {:else}
+                  <span class="hint">{m.server_settings_none()}</span>
+                {/each}
+              </div>
+              <div class="field">
+                <span class="field-label">{m.server_settings_browse_under()}</span>
+                {#each overview.browse_under as folder (folder)}
+                  <span class="hint server-path">{folder}</span>
+                {:else}
+                  <span class="hint">{m.server_settings_browse_under_none()}</span>
+                {/each}
+              </div>
+            </div>
+          {/if}
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.server_settings_restart()}</h4>
+            <div class="field">
+              <span class="hint">{m.server_settings_restart_hint()}</span>
+              <div class="action-row">
+                <button type="button" class="action-btn" onclick={performRestart}>{m.server_settings_restart()}</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      {/if}
 
       <!-- Notifications -->
       <section class="card" class:hidden={!filtering && activeSection !== 'notifications'} id={panelId('notifications')} role={filtering ? undefined : 'tabpanel'} aria-labelledby={filtering ? undefined : tabId('notifications')}>
@@ -3326,20 +3698,41 @@
           </span>
           <div>
             <h3>{m.settings_section_notifications()}</h3>
-            <p class="card-desc">{m.settings_notifications_desc()}</p>
+            <p class="card-desc">{isServer ? m.server_notifications_desc() : m.settings_notifications_desc()}</p>
           </div>
         </div>
         <div class="card-body">
           <!-- Two systems, kept apart: desktop notifications come from the
                operating system and reach the user outside the window; pop-ups
                are Ember's own, inside it. Neither group's switches govern the
-               other's. -->
+               other's. On emberd the browser shows them, once allowed. -->
           <div class="settings-group">
-            <h4 class="subsection-title">{m.settings_group_desktop_notifications()}</h4>
+            <h4 class="subsection-title">{isServer ? m.server_notifications_title() : m.settings_group_desktop_notifications()}</h4>
+            {#if isServer}
+              <div class="field">
+                <span class="field-label">{m.server_notifications_here()}</span>
+                <span class="hint">
+                  {browserNotify === 'granted'
+                    ? m.server_notifications_granted()
+                    : browserNotify === 'denied'
+                      ? m.server_notifications_denied()
+                      : browserNotify === 'unsupported'
+                        ? m.server_notifications_unsupported()
+                        : m.server_notifications_default()}
+                </span>
+                {#if browserNotify === 'default'}
+                  <div class="action-row">
+                    <button type="button" class="action-btn" onclick={async () => (browserNotify = await askForBrowserNotifications())}>
+                      {m.server_notifications_allow()}
+                    </button>
+                  </div>
+                {/if}
+              </div>
+            {/if}
             <div class="field toggle-row">
               <div class="toggle-info">
-                <label class="toggle-title" id="notifications-enabled-label" for="notifications-enabled-switch">{m.settings_notifications_enabled_label()}</label>
-                <span class="hint" id="notifications-enabled-hint">{m.settings_notifications_enabled_hint()}</span>
+                <label class="toggle-title" id="notifications-enabled-label" for="notifications-enabled-switch">{isServer ? m.server_notifications_enabled_label() : m.settings_notifications_enabled_label()}</label>
+                <span class="hint" id="notifications-enabled-hint">{isServer ? m.server_notifications_enabled_hint() : m.settings_notifications_enabled_hint()}</span>
               </div>
               <ToggleSwitch
                 id="notifications-enabled-switch"
@@ -3348,126 +3741,55 @@
                 ariaDescribedby="notifications-enabled-hint"
               />
             </div>
-            <!-- Everything the switch above governs, indented under it and
-                 sorted by the part of Ember each event comes from. -->
-            <div class="nested notify-options" class:is-disabled={notifyOff}>
-              <div class="field toggle-row" class:is-disabled={notifyOff}>
-                <div class="toggle-info">
-                  <label class="toggle-title" id="notifications-unfocused-label" for="notifications-unfocused-switch">{m.settings_notifications_unfocused_label()}</label>
-                  <span class="hint" id="notifications-unfocused-hint">{m.settings_notifications_unfocused_hint()}</span>
-                </div>
-                <ToggleSwitch
-                  id="notifications-unfocused-switch"
-                  bind:checked={settings.notifications_only_when_unfocused}
-                  disabled={notifyOff}
-                  ariaLabelledby="notifications-unfocused-label"
-                  ariaDescribedby="notifications-unfocused-hint"
-                />
+            <div class="field toggle-row nested" class:is-disabled={notifyOff}>
+              <div class="toggle-info">
+                <label class="toggle-title" id="notifications-unfocused-label" for="notifications-unfocused-switch">{m.settings_notifications_unfocused_label()}</label>
+                <span class="hint" id="notifications-unfocused-hint">{m.settings_notifications_unfocused_hint()}</span>
               </div>
-
-              <div class="settings-subgroup" role="group" aria-labelledby="notify-transfers-title">
-                <h5 class="subgroup-title" id="notify-transfers-title">{m.nav_transfers()}</h5>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-download-complete-label" for="notify-download-complete-switch">{m.settings_notify_download_complete()}</label>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-download-complete-switch"
-                    bind:checked={settings.notify_download_complete}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-download-complete-label"
-                  />
+              <ToggleSwitch
+                id="notifications-unfocused-switch"
+                bind:checked={settings.notifications_only_when_unfocused}
+                disabled={notifyOff}
+                ariaLabelledby="notifications-unfocused-label"
+                ariaDescribedby="notifications-unfocused-hint"
+              />
+            </div>
+            <!-- Everything the switch above governs, a panel for each part of
+                 Ember the events come from. -->
+            <div class="notify-options" class:is-disabled={notifyOff}>
+              {#each notifyAreas as area (area.id)}
+                <div class="settings-subgroup notify-panel" role="group" aria-labelledby="notify-{area.id}-title">
+                  <h5 class="subgroup-title" id="notify-{area.id}-title">
+                    <span class="area-icon" aria-hidden="true"><NavIcon id={area.id} size={14} /></span>
+                    {area.label()}
+                  </h5>
+                  {#each area.events as event (event.id)}
+                    {@const hint = 'hint' in event ? event.hint : undefined}
+                    <div class="field toggle-row" class:is-disabled={notifyOff}>
+                      <div class="toggle-info">
+                        <label class="toggle-title" id="notify-{event.id}-label" for="notify-{event.id}-switch">{event.label()}</label>
+                        {#if hint}
+                          <span class="hint" id="notify-{event.id}-hint">
+                            {hint()}
+                            {#if 'manageRooms' in event}
+                              <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
+                                {m.settings_notify_channel_manage()}
+                              </button>
+                            {/if}
+                          </span>
+                        {/if}
+                      </div>
+                      <ToggleSwitch
+                        id="notify-{event.id}-switch"
+                        bind:checked={settings[event.key]}
+                        disabled={notifyOff}
+                        ariaLabelledby="notify-{event.id}-label"
+                        ariaDescribedby={hint ? `notify-${event.id}-hint` : undefined}
+                      />
+                    </div>
+                  {/each}
                 </div>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-download-failed-label" for="notify-download-failed-switch">{m.settings_notify_download_failed()}</label>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-download-failed-switch"
-                    bind:checked={settings.notify_download_failed}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-download-failed-label"
-                  />
-                </div>
-              </div>
-
-              <div class="settings-subgroup" role="group" aria-labelledby="notify-friends-title">
-                <h5 class="subgroup-title" id="notify-friends-title">{m.nav_friends()}</h5>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-friend-online-label" for="notify-friend-online-switch">{m.settings_notify_friend_online()}</label>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-friend-online-switch"
-                    bind:checked={settings.notify_friend_online}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-friend-online-label"
-                  />
-                </div>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-friend-message-label" for="notify-friend-message-switch">{m.settings_notify_friend_message()}</label>
-                    <span class="hint" id="notify-friend-message-hint">{m.settings_notify_friend_message_hint()}</span>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-friend-message-switch"
-                    bind:checked={settings.notify_friend_message}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-friend-message-label"
-                    ariaDescribedby="notify-friend-message-hint"
-                  />
-                </div>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-friend-request-label" for="notify-friend-request-switch">{m.settings_notify_friend_request()}</label>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-friend-request-switch"
-                    bind:checked={settings.notify_friend_request}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-friend-request-label"
-                  />
-                </div>
-              </div>
-
-              <div class="settings-subgroup" role="group" aria-labelledby="notify-library-title">
-                <h5 class="subgroup-title" id="notify-library-title">{m.nav_library()}</h5>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-shares-browsed-label" for="notify-shares-browsed-switch">{m.settings_notify_shares_browsed()}</label>
-                    <span class="hint" id="notify-shares-browsed-hint">{m.settings_notify_shares_browsed_hint()}</span>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-shares-browsed-switch"
-                    bind:checked={settings.notify_shares_browsed}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-shares-browsed-label"
-                    ariaDescribedby="notify-shares-browsed-hint"
-                  />
-                </div>
-              </div>
-
-              <div class="settings-subgroup" role="group" aria-labelledby="notify-channels-title">
-                <h5 class="subgroup-title" id="notify-channels-title">{m.nav_channels()}</h5>
-                <div class="field toggle-row" class:is-disabled={notifyOff}>
-                  <div class="toggle-info">
-                    <label class="toggle-title" id="notify-channel-message-label" for="notify-channel-message-switch">{m.settings_notify_channel_message()}</label>
-                    <span class="hint" id="notify-channel-message-hint">
-                      {m.settings_notify_channel_message_hint()}
-                      <button type="button" class="link-btn" onclick={() => selectSection('channels')}>
-                        {m.settings_notify_channel_manage()}
-                      </button>
-                    </span>
-                  </div>
-                  <ToggleSwitch
-                    id="notify-channel-message-switch"
-                    bind:checked={settings.notify_channel_message}
-                    disabled={notifyOff}
-                    ariaLabelledby="notify-channel-message-label"
-                    ariaDescribedby="notify-channel-message-hint"
-                  />
-                </div>
-              </div>
+              {/each}
             </div>
           </div>
 
@@ -3476,9 +3798,12 @@
             <p class="hint" id="popups-hint">{m.settings_popups_hint()}</p>
             <div class="toggle-grid">
               {#each popupAreas as area (area.key)}
-                <div class="field toggle-row">
+                <div class="field toggle-row toggle-tile">
                   <div class="toggle-info">
-                    <label class="toggle-title" id="popups-{area.id}-label" for="popups-{area.id}-switch">{area.label()}</label>
+                    <label class="toggle-title" id="popups-{area.id}-label" for="popups-{area.id}-switch">
+                      <span class="area-icon" aria-hidden="true"><NavIcon id={area.icon} size={14} /></span>
+                      {area.label()}
+                    </label>
                   </div>
                   <ToggleSwitch
                     id="popups-{area.id}-switch"
@@ -3522,9 +3847,14 @@
               <label for="download-folder">{m.settings_download_folder_label()}</label>
               <div class="folder-input">
                 <input id="download-folder" value={settings.download_folder} readonly />
-                <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
+                {#if !isServer}
+                  <button class="folder-btn" onclick={pickDownloadFolder}>{m.settings_browse()}</button>
+                {/if}
               </div>
               <span class="hint">{folderLayoutHint(settings.download_folder)}</span>
+              {#if isServer}
+                <span class="hint">{m.server_download_folder_hint()}</span>
+              {/if}
             </div>
             <div class="field">
               <span class="field-label">{m.settings_category_folders_label()}</span>
@@ -3620,7 +3950,7 @@
               <div class="field half">
                 <label for="max-dl-gib">{m.settings_max_file_size_label()}</label>
                 <div class="apply-input">
-                  <input id="max-dl-gib" class="compact-number" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} onkeydown={(e) => applyOnEnter(e, ['max_download_file_size_gib'])} />
+                  <input id="max-dl-gib" type="number" min="1" max="593" bind:value={settings.max_download_file_size_gib} onkeydown={(e) => applyOnEnter(e, ['max_download_file_size_gib'])} />
                   {@render applyButton(['max_download_file_size_gib'], m.settings_max_file_size_label())}
                 </div>
                 <span class="hint">{m.settings_max_file_size_hint()}</span>
@@ -3690,6 +4020,8 @@
                 ariaDescribedby="delete-permanently-hint"
               />
             </div>
+            <!-- emberd's pages do not watch the clipboard (+layout.svelte). -->
+            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="watch-clipboard-label" for="watch-clipboard-switch">{m.settings_watch_clipboard_label()}</label>
@@ -3702,6 +4034,7 @@
                 ariaDescribedby="watch-clipboard-hint"
               />
             </div>
+            {/if}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="web-sources-label" for="web-sources-switch">{m.settings_web_sources_label()}</label>
@@ -3712,6 +4045,18 @@
                 bind:checked={settings.web_sources_enabled}
                 ariaLabelledby="web-sources-label"
                 ariaDescribedby="web-sources-hint"
+              />
+            </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="link-mirrors-label" for="link-mirrors-switch">{m.settings_link_mirrors_label()}</label>
+                <span class="hint" id="link-mirrors-hint">{m.settings_link_mirrors_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="link-mirrors-switch"
+                bind:checked={settings.copied_links_carry_mirrors}
+                ariaLabelledby="link-mirrors-label"
+                ariaDescribedby="link-mirrors-hint"
               />
             </div>
           </div>
@@ -3730,6 +4075,7 @@
                 ariaDescribedby="preview-priority-all-hint"
               />
             </div>
+            {#if !isServer}
             <div class="field">
               <label for="preview-player">{m.settings_preview_player_label()}</label>
               <div class="folder-input">
@@ -3744,6 +4090,7 @@
               </div>
               <span class="hint">{m.settings_preview_player_hint()}</span>
             </div>
+            {/if}
           </div>
 
           <div class="settings-group">
@@ -3771,6 +4118,7 @@
                 </div>
               </div>
               <div class="action-row">
+                <button class="action-btn" onclick={() => (historyDataOpen = true)}>{m.settings_history_view()}</button>
                 <button class="action-btn danger" onclick={() => requestClearHistory('completed')}>{m.settings_clear_completed()}</button>
                 <button class="action-btn danger" onclick={() => requestClearHistory('cancelled')}>{m.settings_clear_cancelled()}</button>
                 <button class="action-btn danger" onclick={() => requestClearHistory('all')}>{m.settings_clear_all_history()}</button>
@@ -3951,13 +4299,14 @@
                 <span class="hint hint-error" role="alert">{spamStatsError}</span>
               {:else if spamStats}
                 <div class="stat-grid">
-                  <div class="stat"><span>{m.settings_spam_stat_hashes()}</span><strong>{spamStats.spam_hashes}</strong></div>
-                  <div class="stat"><span>{m.settings_spam_stat_not_spam_hashes()}</span><strong>{spamStats.not_spam_hashes}</strong></div>
-                  <div class="stat"><span>{m.settings_spam_stat_names()}</span><strong>{spamStats.spam_filenames}</strong></div>
-                  <div class="stat"><span>{m.settings_spam_stat_source_ips()}</span><strong>{spamStats.spam_source_ips}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_hashes()}</span><strong>{formatNumber(spamStats.spam_hashes)}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_not_spam_hashes()}</span><strong>{formatNumber(spamStats.not_spam_hashes)}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_names()}</span><strong>{formatNumber(spamStats.spam_filenames)}</strong></div>
+                  <div class="stat"><span>{m.settings_spam_stat_source_ips()}</span><strong>{formatNumber(spamStats.spam_source_ips)}</strong></div>
                 </div>
               {/if}
               <div class="action-row">
+                <button class="action-btn" onclick={() => (spamDataOpen = true)} disabled={spamResetting}>{m.settings_spam_data_view()}</button>
                 <button class="action-btn" onclick={refreshSpamStats} disabled={spamStatsLoading || spamResetting}>{m.settings_refresh_stats()}</button>
                 <button class="action-btn danger" onclick={handleResetSpamData} disabled={spamResetting}>
                   {spamResetting ? m.settings_resetting() : m.settings_reset_spam_data()}
@@ -3974,7 +4323,6 @@
               <div class="apply-input">
                 <input
                   id="search-timeout-secs"
-                  class="compact-number"
                   type="number"
                   min="30"
                   max="600"
@@ -4207,26 +4555,28 @@
           {/if}
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_speed_limits()}</h4>
-            <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
-              <div class="apply-input">
-                <div class="apply-grow">
-                  <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} onescape={() => revertTyped(['max_upload_speed'])} />
+            <div class="field-row">
+              <div class="field half manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
+                <div class="apply-input">
+                  <div class="apply-grow">
+                    <SpeedInput label={m.settings_max_upload_speed()} bind:value={settings.max_upload_speed} onenter={() => void applyFields(['max_upload_speed'])} onescape={() => revertTyped(['max_upload_speed'])} />
+                  </div>
+                  {@render applyButton(['max_upload_speed'], m.settings_max_upload_speed())}
                 </div>
-                {@render applyButton(['max_upload_speed'], m.settings_max_upload_speed())}
+                <span class="hint">{m.settings_max_upload_speed_hint()}</span>
               </div>
-              <span class="hint">{m.settings_max_upload_speed_hint()}</span>
-            </div>
-            <div class="field manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
-              <div class="apply-input">
-                <div class="apply-grow">
-                  <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} onescape={() => revertTyped(['max_download_speed'])} />
+              <div class="field half manual-speed-limit" class:is-inactive={settings.alt_speed_enabled}>
+                <div class="apply-input">
+                  <div class="apply-grow">
+                    <SpeedInput label={m.settings_max_download_speed()} bind:value={settings.max_download_speed} onenter={() => void applyFields(['max_download_speed'])} onescape={() => revertTyped(['max_download_speed'])} />
+                  </div>
+                  {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
                 </div>
-                {@render applyButton(['max_download_speed'], m.settings_max_download_speed())}
+                <span class="hint">{m.settings_max_download_speed_hint()}</span>
+                {#if !runtimeStatus?.alt_speed}
+                  {@render downloadRatioCapNote()}
+                {/if}
               </div>
-              <span class="hint">{m.settings_max_download_speed_hint()}</span>
-              {#if !runtimeStatus?.alt_speed}
-                {@render downloadRatioCapNote()}
-              {/if}
             </div>
             <div class="field toggle-row" class:is-disabled={savedSettings?.max_upload_speed === 0}>
               <div class="toggle-info">
@@ -4260,17 +4610,19 @@
             <!-- Editable while off, so the limits can be ready before they are
                  switched on from the tray; dimmed because they are not in force. -->
             <div class="field nested alt-speed-limits" class:is-inactive={!settings.alt_speed_enabled}>
-              <div class="apply-input">
-                <div class="apply-grow">
-                  <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} onenter={() => void applyFields(['alt_max_upload_speed'])} onescape={() => revertTyped(['alt_max_upload_speed'])} />
+              <div class="speed-pair">
+                <div class="apply-input">
+                  <div class="apply-grow">
+                    <SpeedInput label={m.settings_alt_max_upload_speed()} bind:value={settings.alt_max_upload_speed} onenter={() => void applyFields(['alt_max_upload_speed'])} onescape={() => revertTyped(['alt_max_upload_speed'])} />
+                  </div>
+                  {@render applyButton(['alt_max_upload_speed'], m.settings_alt_max_upload_speed())}
                 </div>
-                {@render applyButton(['alt_max_upload_speed'], m.settings_alt_max_upload_speed())}
-              </div>
-              <div class="apply-input">
-                <div class="apply-grow">
-                  <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} onenter={() => void applyFields(['alt_max_download_speed'])} onescape={() => revertTyped(['alt_max_download_speed'])} />
+                <div class="apply-input">
+                  <div class="apply-grow">
+                    <SpeedInput label={m.settings_alt_max_download_speed()} bind:value={settings.alt_max_download_speed} onenter={() => void applyFields(['alt_max_download_speed'])} onescape={() => revertTyped(['alt_max_download_speed'])} />
+                  </div>
+                  {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
                 </div>
-                {@render applyButton(['alt_max_download_speed'], m.settings_alt_max_download_speed())}
               </div>
               {#if runtimeStatus?.alt_speed}
                 {@render downloadRatioCapNote()}
@@ -4299,7 +4651,6 @@
               <div class="apply-input">
                 <input
                   id="upload-quota-gb"
-                  class="compact-number"
                   type="number"
                   min="1"
                   max={UPLOAD_QUOTA_MAX_GB}
@@ -4597,14 +4948,17 @@
                 <span class="hint">{m.settings_udp_port_hint()}</span>
               </div>
             </div>
-            <div class="field toggle-row">
+            <div class="field toggle-row" class:is-disabled={interfaceChosen}>
               <div class="toggle-info">
                 <label class="toggle-title" id="upnp-label" for="upnp-switch">{m.settings_upnp_label()} {@render restartBadge('upnp_enabled', 'upnp-restart')}</label>
-                <span class="hint" id="upnp-hint">{m.settings_upnp_hint()}</span>
+                <span class="hint" id="upnp-hint">
+                  {interfaceChosen ? m.settings_upnp_off_for_interface() : m.settings_upnp_hint()}
+                </span>
               </div>
               <ToggleSwitch
                 id="upnp-switch"
                 bind:checked={settings.upnp_enabled}
+                disabled={interfaceChosen}
                 ariaLabelledby="upnp-label"
                 ariaDescribedby="upnp-restart upnp-hint"
               />
@@ -4623,6 +4977,35 @@
                 ariaLabelledby="stun-keepalive-label"
                 ariaDescribedby="stun-keepalive-hint"
               />
+            </div>
+          </div>
+
+          <div class="settings-group">
+            <h4 class="subsection-title">{m.settings_group_interface()}</h4>
+            <div class="field">
+              <label for="bind-interface">
+                {m.settings_bind_interface_label()}
+                {@render restartBadge('bind_interface', 'bind-interface-restart')}
+              </label>
+              <select
+                id="bind-interface"
+                onfocus={() => void refreshInterfaces()}
+                onchange={(e) => chooseInterface(e.currentTarget.value)}
+                aria-describedby="bind-interface-restart bind-interface-hint bind-interface-note"
+              >
+                <option value="" selected={!settings.bind_interface}>{m.settings_bind_interface_any()}</option>
+                {#each interfaceChoices as choice (choice.id)}
+                  <option value={choice.id} title={choice.title || undefined} selected={choice.id === settings.bind_interface}>{choice.label}</option>
+                {/each}
+              </select>
+              <span id="bind-interface-hint" class="hint">{m.settings_bind_interface_hint()}</span>
+              {#if chosenInterfaceOffline}
+                <span id="bind-interface-note" class="hint hint-warning">
+                  {m.settings_bind_interface_offline({ name: settings.bind_interface_name || settings.bind_interface })}
+                </span>
+              {:else if interfaceChosen}
+                <span id="bind-interface-note" class="hint">{m.settings_bind_interface_limits()}</span>
+              {/if}
             </div>
           </div>
 
@@ -5011,6 +5394,22 @@
               </select>
               <span id="chat-disappear-hint" class="hint">{m.settings_chat_disappear_hint()}</span>
             </div>
+            <!-- Kept on this device, like whether the chat is popped out. -->
+            {#if !isServer}
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="chat-reopen-label" for="chat-reopen-switch">{m.settings_chat_window_reopen_label()}</label>
+                <span class="hint" id="chat-reopen-hint">{m.settings_chat_window_reopen_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="chat-reopen-switch"
+                checked={$chatReopenAtLaunch}
+                onchange={(on) => chatReopenAtLaunch.set(on)}
+                ariaLabelledby="chat-reopen-label"
+                ariaDescribedby="chat-reopen-hint"
+              />
+            </div>
+            {/if}
           </div>
 
           <div class="settings-group">
@@ -5049,12 +5448,14 @@
                   </div>
                   {@render applyButton(['chat_attachment_auto_accept_mb'], m.settings_chat_attach_auto_label())}
                 </div>
-                <button type="button" class="action-btn chat-files-btn" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
-                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
-                  </svg>
-                  {m.settings_chat_attach_open_folder()}
-                </button>
+                {#if !isServer}
+                  <button type="button" class="action-btn chat-files-btn" onclick={() => void openChatFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                    </svg>
+                    {m.settings_chat_attach_open_folder()}
+                  </button>
+                {/if}
               </div>
               <span id="chat-attach-auto-hint" class="hint">{m.settings_chat_attach_auto_hint()}</span>
             </div>
@@ -5075,6 +5476,20 @@
                 ariaDescribedby="friend-browse-hint"
               />
             </div>
+            <div class="field toggle-row">
+              <div class="toggle-info">
+                <label class="toggle-title" id="friend-browse-folders-label" for="friend-browse-folders-switch">{m.settings_friend_browse_folders_label()}</label>
+                <span class="hint" id="friend-browse-folders-hint">{m.settings_friend_browse_folders_hint()}</span>
+              </div>
+              <ToggleSwitch
+                id="friend-browse-folders-switch"
+                checked={settings.friend_browse_shows_folders === true}
+                disabled={settings.friend_browse_disabled === true}
+                onchange={(on) => { if (settings) settings.friend_browse_shows_folders = on; }}
+                ariaLabelledby="friend-browse-folders-label"
+                ariaDescribedby="friend-browse-folders-hint"
+              />
+            </div>
           </div>
 
           <div class="settings-group">
@@ -5084,7 +5499,6 @@
               <div class="apply-input">
                 <input
                   id="max-friends"
-                  class="compact-number"
                   type="number"
                   min="1"
                   max="500"
@@ -5128,6 +5542,7 @@
               <div class="apply-input">
                 <input
                   id="channel_username"
+                  class="short-text"
                   value={settings.channel_username}
                   maxlength={CHANNEL_USERNAME_MAX}
                   spellcheck="false"
@@ -5198,12 +5613,14 @@
                   <option value="friends">{m.settings_channel_file_offers_friends()}</option>
                   <option value="nobody">{m.settings_channel_file_offers_nobody()}</option>
                 </select>
-                <button type="button" class="action-btn chat-files-btn" onclick={() => void openChannelFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
-                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
-                  </svg>
-                  {m.settings_channel_files_open_folder()}
-                </button>
+                {#if !isServer}
+                  <button type="button" class="action-btn chat-files-btn" onclick={() => void openChannelFilesFolder().catch((e) => showSaveMsg(translateError(e), true, 6000))}>
+                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.6l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>
+                    </svg>
+                    {m.settings_channel_files_open_folder()}
+                  </button>
+                {/if}
               </div>
               <span class="hint">{m.settings_channel_file_offers_hint()}</span>
             </div>
@@ -5428,7 +5845,7 @@
               />
               <span class="hint">{m.settings_backup_passphrase_hint()}</span>
             </div>
-            <div class="field">
+            <div class="field continues">
               <label for="backup-passphrase-confirm">{m.settings_backup_passphrase_confirm_label()}</label>
               <input
                 id="backup-passphrase-confirm"
@@ -5470,6 +5887,15 @@
                 <button class="action-btn" onclick={handlePickBackupFile} disabled={backupBusy}>
                   {m.settings_backup_choose_file()}
                 </button>
+                {#if isServer}
+                  <input
+                    bind:this={backupFileInput}
+                    type="file"
+                    accept=".emberbackup"
+                    hidden
+                    onchange={handleUploadBackupFile}
+                  />
+                {/if}
               </div>
               {#if restoreSource}
                 <span class="hint backup-path" title={restoreSource}>{restoreSource}</span>
@@ -5601,6 +6027,17 @@
             <div class="about-actions">
               <!-- The same links, in the same order, as the About dialog. -->
               <EmberLinks />
+              {#if isServer}
+                <div class="about-action">
+                  <span class="about-action-body">
+                    <span class="about-action-title">{m.server_settings_logs()}</span>
+                    <span class="about-action-desc">{m.server_settings_logs_hint()}</span>
+                    {#if logFolderPath}
+                      <code class="about-action-path">{logFolderPath}</code>
+                    {/if}
+                  </span>
+                </div>
+              {:else}
               <button type="button" class="about-action" onclick={() => void revealLogs()}>
                 <span class="about-action-icon" aria-hidden="true">
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -5625,6 +6062,7 @@
                   </svg>
                 </span>
               </button>
+              {/if}
             </div>
           </div>
 
@@ -5647,6 +6085,11 @@
           <div class="settings-group">
             <h4 class="subsection-title">{m.settings_group_updates()}</h4>
 
+            {#if isServer}
+              <div class="field">
+                <span class="hint">{m.server_settings_update_hint()}</span>
+              </div>
+            {:else}
             <!-- A `.field`, so the filter can find the check and install
                  buttons by their text. -->
             <div class="field about-update-panel">
@@ -5723,9 +6166,11 @@
                     <span class="feedback error about-update-note">{m.updater_signature_missing()}</span>
                   {/if}
                 {:else if $updater.phase === 'error' || $updater.signatureMissing}
-                  <span class="feedback error">{m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })}</span>
+                  <span class="feedback error">{$updater.error || $updater.signatureMissing
+                    ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
+                    : m.updater_check_failed()}</span>
                 {:else if $updater.systemTooOld}
-                  <span class="feedback error">{m.updater_system_too_old({ version: $updater.systemTooOld.version, glibc: $updater.systemTooOld.glibc })}</span>
+                  <span class="feedback error">{systemTooOldMessage($updater.systemTooOld)}</span>
                 {:else}
                   <span class="hint">{m.settings_about_check_hint()}</span>
                 {/if}
@@ -5762,7 +6207,9 @@
                 ariaDescribedby="silent-update-hint silent-update-status"
               />
             </div>
+            {/if}
 
+            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="share-installer-label" for="share-installer-switch">{m.settings_share_ember_installer()}</label>
@@ -5775,7 +6222,11 @@
                 ariaDescribedby="share-installer-hint"
               />
             </div>
+            {/if}
 
+            <!-- Releases are fetched by the desktop app's updater, which emberd
+                 does not have. -->
+            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="seed-releases-label" for="seed-releases-switch">{m.settings_seed_ember_releases()}</label>
@@ -5788,6 +6239,7 @@
                 ariaDescribedby="seed-releases-hint"
               />
             </div>
+            {/if}
           </div>
         </div>
       </section>
@@ -5904,6 +6356,9 @@
   danger={true}
   onconfirm={confirmClearHistory}
 />
+
+<SpamDataDialog bind:open={spamDataOpen} onchange={() => void refreshSpamStats()} />
+<DownloadHistoryDialog bind:open={historyDataOpen} onchange={() => void refreshHistoryStats()} />
 
 <ConfirmDialog
   bind:open={antileechResetConfirmOpen}
@@ -6332,11 +6787,28 @@
     line-height: 1.4;
   }
 
-  .field input[type='number'],
+  /* Text and paths take the row. A number, or a choice from a list, is as
+     wide as what it holds, so a two-digit limit does not span the card. */
   .field input[type='text'],
-  .field input:not([type]),
-  .field > select {
+  .field input:not([type]) {
     width: 100%;
+  }
+
+  .field input[type='number'] {
+    width: 120px;
+  }
+
+  /* `align-self`, or the field's column would stretch it to the row. */
+  .field > select {
+    align-self: flex-start;
+    width: auto;
+    min-width: 16rem;
+    max-width: 100%;
+  }
+
+  /* A name rather than a path: room for a long one, not the card's width. */
+  .field input.short-text {
+    max-width: 24rem;
   }
 
   .field input[type='password'] {
@@ -6367,10 +6839,8 @@
     color: var(--badge-danger-text);
   }
 
-  /* Counts and sizes want a few digits, not the whole card; specific enough
-     to beat the `.field input[type='number']` full-width rule above. */
-  .field input[type='number'].compact-number {
-    width: 120px;
+  .hint.hint-warning {
+    color: var(--warning);
   }
 
   /* A typed field and the Apply button that appears once it is edited. */
@@ -6381,10 +6851,29 @@
     gap: 8px;
   }
 
-  .apply-input > input:not(.compact-number),
+  .apply-input > input:not([type='number']),
   .apply-input > .apply-grow {
     flex: 1;
     min-width: 0;
+  }
+
+  /* A speed box, with the unit and Unlimited beside the number, needs no
+     more than this. */
+  .apply-input > .apply-grow {
+    max-width: 24rem;
+  }
+
+  /* `SpeedInput` draws its own label; here it reads as every other one. */
+  .field :global(.speed-label) {
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+
+  /* Two speeds that go together, upload and download, side by side. */
+  .speed-pair {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
   }
 
   .field-apply {
@@ -6466,6 +6955,27 @@
     margin-top: 0;
   }
 
+  /* Settings, each with a line of its own explaining it, read as one block
+     without a hairline between them: every setting after the first in its
+     group draws one above itself, in the middle of the group's gap, so
+     nothing moves. A setting nested under the one above has its own rule
+     down the side instead, a notice framed on its own needs none on either
+     side, and `.continues` is the second half of the setting above, as
+     typing a passphrase again is. */
+  .settings-group > :is(.field, .field-row):not(.schedule-unsaved) + :is(.field, .field-row):not(.nested, .schedule-unsaved, .continues) {
+    border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    margin-top: -9px;
+    padding-top: 9px;
+  }
+
+  /* While filtering, the row above may be a hidden one, which would leave
+     the line under the group's heading. */
+  .cards-grid.filtering .settings-group > :is(.field, .field-row):not(.schedule-unsaved) + :is(.field, .field-row):not(.nested, .schedule-unsaved, .continues) {
+    border-top: none;
+    margin-top: 0;
+    padding-top: 0;
+  }
+
   /* A setting that only means something while the one above it is on. */
   .nested {
     margin-left: 0;
@@ -6474,37 +6984,85 @@
     border-left: 2px solid color-mix(in srgb, var(--border) 70%, transparent);
   }
 
-  /* Several such settings at once: the group's own rhythm, inside the rule. */
+  /* The notification events, a panel for each part of Ember, two columns of
+     them where the card is wide enough. Columns rather than a grid, so a short
+     panel leaves no hole beside a tall one. */
   .notify-options {
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
+    columns: 2 280px;
+    column-gap: 14px;
   }
 
-  /* A run of fields within a group, named for the part of Ember they are
-     about. Quieter than the group heading above it. */
-  .settings-subgroup {
+  /* One part of Ember's events: its name and icon over its switches, as the
+     sidebar names and draws it. */
+  .notify-panel {
     display: flex;
     flex-direction: column;
-    gap: 18px;
+    break-inside: avoid;
+    margin: 0 0 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    overflow: hidden;
   }
 
   .subgroup-title {
-    margin: 0 0 -7px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0;
+    padding: 8px 14px;
+    background: var(--bg-surface);
     font-size: var(--font-size-sm);
     font-weight: 600;
-    color: var(--text-secondary);
+    color: var(--text-primary);
+  }
+
+  /* Every row draws the line above it, the first one under the panel's
+     name, so a row the filter hides takes no line with it. */
+  .notify-panel > .toggle-row {
+    padding: 11px 14px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* The sidebar's icon for the area, on the tint the card header's icon has. */
+  .area-icon {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
   }
 
   .notify-options.is-disabled .subgroup-title {
+    color: var(--text-muted);
+  }
+
+  .notify-options.is-disabled .area-icon {
     opacity: 0.55;
   }
 
-  /* Short switches with one-word labels, two to a row. */
+  /* Short switches with one-word labels, each in a tile of its own, as many
+     to a row as fit. */
   .toggle-grid {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 18px 32px;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 10px;
+  }
+
+  .toggle-tile {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    gap: 10px;
+  }
+
+  .toggle-tile .toggle-title {
+    gap: 10px;
   }
 
   /* Its control is disabled; the words go quiet with it. The control dims
@@ -7402,7 +7960,8 @@
     min-width: 0;
   }
 
-  .lang-text .behavior-title,
+  /* A name too long for the chip, as "Português (Brasil)" is, takes a
+     second line rather than losing its end. */
   .lang-text .behavior-desc {
     overflow: hidden;
     text-overflow: ellipsis;
@@ -7452,8 +8011,7 @@
   }
 
   @media (max-width: 760px) {
-    .behavior-picker,
-    .toggle-grid {
+    .behavior-picker {
       grid-template-columns: 1fr;
     }
 
@@ -7465,6 +8023,10 @@
     /* Paired fields (ports, limits) stack rather than squeeze side by side. */
     .field-row {
       flex-direction: column;
+    }
+
+    .speed-pair {
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 
@@ -7523,12 +8085,6 @@
   .upload-quota-limits.is-inactive,
   .manual-speed-limit.is-inactive {
     opacity: 0.62;
-  }
-
-  .alt-speed-limits {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 12px;
   }
 
   .schedule-empty {
@@ -7801,7 +8357,7 @@
 
   @media (max-width: 980px) {
     .settings-layout {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
       gap: 12px;
       padding: 12px;
       max-width: none;
@@ -7908,7 +8464,7 @@
     box-shadow: 0 0 0 2px var(--accent-halo);
   }
 
-  /* Specific enough to beat `.field input[type='number'] { width: 100% }`. */
+  /* Specific enough to beat `.field input[type='number']`. */
   .field .unit-input input[type='number'] {
     width: 96px;
     border: none;
@@ -7931,6 +8487,11 @@
     font-weight: 600;
   }
 
+  .server-path {
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+  }
+
   .chat-files-btn {
     display: inline-flex;
     align-items: center;
@@ -7944,8 +8505,8 @@
   }
 
   .channel-offers-row select {
-    flex: 1;
-    min-width: 200px;
+    min-width: 16rem;
+    max-width: 100%;
   }
 
   .channel-language-row {

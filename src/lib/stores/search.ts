@@ -897,6 +897,39 @@ function settleIdleTabs(tabs: SearchTab[], activeId: string | null): SearchTab[]
 }
 
 /**
+ * Search More runs that Stop leaves resumable: the backend sets them aside
+ * under the same id, so Stop keeps the id instead of rotating it. Kept here
+ * rather than on the search page, which forgot them when the user went to
+ * another page and came back.
+ */
+export const continuedSearchRequests = new Set<number>();
+
+/**
+ * Continued searches stopped and not yet confirmed so: their id has to stay,
+ * for Search More, so rows still on their way until the cancel lands would
+ * land in a tab that already says it stopped. The `search-complete` the
+ * cancel emits lets them through again.
+ */
+export const stoppingSearchRequests = new Set<number>();
+
+/**
+ * Searches a newer one replaced as the one the network may continue. A
+ * `search-complete` for one of them, from a stop that landed after the new
+ * search opened, cannot offer Search More again. The newest few are enough:
+ * an older id's events have long been heard.
+ */
+const replacedSearchRequests = new Set<number>();
+const REPLACED_SEARCHES_KEPT = 256;
+
+function notContinuable(requestId: number) {
+  replacedSearchRequests.add(requestId);
+  if (replacedSearchRequests.size > REPLACED_SEARCHES_KEPT) {
+    const oldest = replacedSearchRequests.values().next().value;
+    if (oldest !== undefined) replacedSearchRequests.delete(oldest);
+  }
+}
+
+/**
  * Cancel a search, retrying briefly when the network task is busy.
  *
  * A tab's request id is rotated the moment it stops being the active search,
@@ -969,6 +1002,7 @@ export function openSearchTab(
     const next = tabs.map((t) => {
       // The network keeps only the latest search to continue; a new one
       // replaces it, so no older tab can offer Search More any longer.
+      notContinuable(t.requestId);
       if (!t.isSearching) return t.canSearchMore ? { ...t, canSearchMore: false } : t;
       stoppedOthers = true;
       return { ...t, isSearching: false, progress: null, requestId: newSearchNonce() };
@@ -1006,24 +1040,25 @@ export function setActiveSearchTab(tabId: string | null) {
   if (settled !== tabs) searchTabs.set(settled);
 }
 
-export async function closeSearchTab(tabId: string): Promise<void> {
+export function closeSearchTab(tabId: string): void {
   const tabs = get(searchTabs);
   const idx = tabs.findIndex((t) => t.id === tabId);
   if (idx === -1) return;
   const tab = tabs[idx];
-  if (tab.isSearching) {
-    await cancelSearchWithRetry(tab.requestId);
-  }
-  const currentTabs = get(searchTabs);
-  const currentIdx = currentTabs.findIndex((t) => t.id === tabId);
-  if (currentIdx === -1) return;
-  const remaining = currentTabs.filter((t) => t.id !== tabId);
+  const remaining = tabs.filter((t) => t.id !== tabId);
   searchTabs.set(remaining);
+  pendingByRequest.delete(tab.requestId);
+  continuedSearchRequests.delete(tab.requestId);
+  stoppingSearchRequests.delete(tab.requestId);
   const active = get(activeSearchTabId);
   if (active === tabId) {
-    const newIdx = Math.max(0, currentIdx - 1);
+    const newIdx = Math.max(0, idx - 1);
     activeSearchTabId.set(remaining[newIdx]?.id ?? remaining[0]?.id ?? null);
   }
+  // Closed first: the cancel can wait out a busy network for half a minute,
+  // and the tab stayed open, still filling, for as long. With the tab gone no
+  // row of its request has anywhere to land.
+  if (tab.isSearching) void cancelSearchWithRetry(tab.requestId);
 }
 
 // search-results coalescing buffer + flush scheduling. Hoisted to module
@@ -1197,8 +1232,9 @@ async function rescoreRowsIntoTab(tabId: string, query: string, rows: SearchResu
 }
 
 /** Re-score every open tab after spam settings change (SF8). Honors per-hash
- *  user mark/unmark overrides so an explicit classification is not overwritten. */
-async function rescoreOpenTabs() {
+ *  user mark/unmark overrides so an explicit classification is not overwritten.
+ *  With `which`, only the rows it picks are sent. */
+async function rescoreOpenTabs(which?: (r: SearchResult) => boolean) {
   const tabs = get(searchTabs);
   // Active tab first, so the one the user is looking at is corrected before the
   // work for up to nineteen others they cannot see. Each call is a full re-pass
@@ -1210,13 +1246,43 @@ async function rescoreOpenTabs() {
     a.id === activeId ? -1 : b.id === activeId ? 1 : 0,
   );
   for (const tab of ordered) {
-    if (tab.results.length === 0) continue;
+    const rows = which ? tab.results.filter(which) : tab.results;
+    if (rows.length === 0) continue;
     try {
-      await rescoreRowsIntoTab(tab.id, tab.query, tab.results);
+      await rescoreRowsIntoTab(tab.id, tab.query, rows);
     } catch (e) {
       console.error('Failed to rescore search results:', e);
     }
   }
+}
+
+let openTabsRescoreTimer: ReturnType<typeof setTimeout> | null = null;
+let openTabsRescoreAll = false;
+
+/**
+ * Re-score every open tab once a burst of changes to the learned data settles,
+ * so ten files unmarked in a row cost one pass rather than ten. A change that
+ * can only pull scores down passes `onlyScored`, which leaves out the rows with
+ * no score to lose; one that can raise them re-scores every row.
+ */
+function rescoreOpenTabsSoon(onlyScored: boolean) {
+  openTabsRescoreAll ||= !onlyScored;
+  if (openTabsRescoreTimer !== null) clearTimeout(openTabsRescoreTimer);
+  openTabsRescoreTimer = setTimeout(() => {
+    openTabsRescoreTimer = null;
+    const all = openTabsRescoreAll;
+    openTabsRescoreAll = false;
+    void rescoreOpenTabs(all ? undefined : (r) => r.is_spam || r.spam_rating > 0);
+  }, SPAM_MARK_RESCORE_DEBOUNCE_MS);
+}
+
+/**
+ * After a spam mark is taken back, by Undo or by marking the file not spam.
+ * What the mark taught went into every search run since, in any tab, so every
+ * open tab is re-scored, not only the one the mark was made in.
+ */
+export function rescoreTabsAfterSpamUnmark() {
+  rescoreOpenTabsSoon(true);
 }
 
 /**
@@ -1295,7 +1361,21 @@ async function runSpamMarkRescore(pending: {
 export async function notifySpamFilterReset() {
   spamUserOverrides.clear();
   spamFilterEpoch.update((n) => n + 1);
+  if (openTabsRescoreTimer !== null) clearTimeout(openTabsRescoreTimer);
+  openTabsRescoreTimer = null;
+  openTabsRescoreAll = false;
   await rescoreOpenTabs();
+}
+
+/** After the learned spam data drops its verdict on `fileHash`, a spam mark
+ *  or a not-spam one: drop this session's mark of it, which would otherwise
+ *  keep its rows as they were, and rescore. */
+export function notifySpamVerdictRemoved(fileHash: string) {
+  spamUserOverrides.delete(fileHash);
+  spamUserOverrides.delete(fileHash.toLowerCase());
+  spamUserOverrides.delete(fileHash.toUpperCase());
+  spamFilterEpoch.update((n) => n + 1);
+  rescoreOpenTabsSoon(false);
 }
 
 export async function initSearchStore() {
@@ -1317,7 +1397,7 @@ export async function initSearchStore() {
       if (!Array.isArray(incoming)) return;
       // A leg still running for a stopped, superseded or closed search: no tab
       // will take these, so there is nothing to buffer or flush.
-      if (!hasRequest(requestId)) return;
+      if (!hasRequest(requestId) || stoppingSearchRequests.has(requestId)) return;
       if (dev) {
         const origins = new Set(incoming.map((r) => r.result_origin).filter(Boolean));
         if (origins.size > 0) {
@@ -1337,7 +1417,8 @@ export async function initSearchStore() {
     registered.push(await listen<{ request_id: number; can_search_more?: boolean }>('search-complete', (event) => {
       const requestId = validRequestId(event.payload?.request_id);
       if (requestId === null) return;
-      const canSearchMore = event.payload?.can_search_more === true;
+      stoppingSearchRequests.delete(requestId);
+      const canSearchMore = event.payload?.can_search_more === true && !replacedSearchRequests.has(requestId);
       // Flush any buffered `search-results` for this request synchronously
       // before flipping `isSearching` off — otherwise the spinner could
       // disappear while the last batch of results is still queued for the
@@ -1361,13 +1442,17 @@ export async function initSearchStore() {
           updateTabByRequestId(tabs, requestId, (t) => {
             if (!t.isSearching) return t;
             const phase = typeof event.payload?.phase === 'string' ? event.payload.phase : '';
+            const nodes = validCount(event.payload?.nodes_contacted);
+            const found = validCount(event.payload?.results_so_far);
+            // A walk reports every second whether or not it moved, and a new
+            // tab object re-derives the page's whole list.
+            const p = t.progress;
+            if (p && p.nodes_contacted === nodes && p.results_so_far === found && p.phase === phase) {
+              return withNotice(t, phase);
+            }
             return withNotice({
               ...t,
-              progress: {
-                nodes_contacted: validCount(event.payload?.nodes_contacted),
-                results_so_far: validCount(event.payload?.results_so_far),
-                phase,
-              },
+              progress: { nodes_contacted: nodes, results_so_far: found, phase },
             }, phase);
           }),
         );
@@ -1426,6 +1511,11 @@ export function cleanupSearchStore() {
   if (spamMarkRescoreTimer !== null) clearTimeout(spamMarkRescoreTimer);
   spamMarkRescoreTimer = null;
   spamMarkRescorePending = null;
+  if (openTabsRescoreTimer !== null) clearTimeout(openTabsRescoreTimer);
+  openTabsRescoreTimer = null;
+  openTabsRescoreAll = false;
+  continuedSearchRequests.clear();
+  stoppingSearchRequests.clear();
   spamUserOverrides.clear();
   spamFilterEpoch.update((n) => n + 1);
   // Save the tabs before dropping them, and leave the emptied store unsaved.

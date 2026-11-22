@@ -8,8 +8,8 @@ pub(in crate::network) async fn on_nodes_save_tick(
     nodes_save_started_at: &mut Option<tokio::time::Instant>,
     periodic_save_result_tx: &mpsc::UnboundedSender<PeriodicSaveResult>,
 ) {
-    // `try_lock`, like the Ember half below: the KAD Disconnect task holds this
-    // lock across its own blocking save, and waiting on it here parks the whole
+    // `try_lock`, like the Ember half below: the shutdown save holds this lock
+    // across its own blocking save, and waiting on it here parks the whole
     // event loop behind that fsync. Skipping is free — the next tick writes the
     // same table.
     let ownership = (!*nodes_save_in_flight)

@@ -883,7 +883,10 @@ pub(super) fn ember_keyword_constraints(
     ember::dht::messages::ValueConstraints {
         min_size: min_size.filter(|v| *v > 0),
         max_size: max_size.filter(|v| *v > 0),
-        file_type: file_type_filter,
+        // A responder compares one type exactly, so it would answer Program
+        // without the archives and disc images Program covers; those rows are
+        // narrowed here instead.
+        file_type: file_type_filter.filter(|t| t != "Pro"),
         file_extension,
         extra_keys: Vec::new(),
     }
@@ -1417,6 +1420,7 @@ pub(super) fn maybe_finish_ember_publish(state: &mut NetworkState, publish_id: u
         None => return,
     };
 
+    super::channel_membership::note_owner_snapshot_finished(state, publish_id, result.stored_on);
     if let Some(tx) = state.ember_dht_pending_publishes.remove(&publish_id) {
         let _ = tx.send(result);
     }

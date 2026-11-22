@@ -479,13 +479,10 @@ fn mix_word(h: u64, w: u64) -> u64 {
 /// differently.
 fn mix_bytes(mut h: u64, bytes: &[u8]) -> u64 {
     h = mix_word(h, bytes.len() as u64);
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        let mut word = [0u8; 8];
-        word.copy_from_slice(chunk);
+    let (words, rest) = bytes.as_chunks::<8>();
+    for &word in words {
         h = mix_word(h, u64::from_le_bytes(word));
     }
-    let rest = chunks.remainder();
     if !rest.is_empty() {
         let mut word = [0u8; 8];
         word[..rest.len()].copy_from_slice(rest);
@@ -2691,7 +2688,7 @@ impl TransferManager {
             .chain(self.completed.iter())
             .filter(|t| {
                 !crate::sharing::feed_files::is_internal_fetch(&t.id)
-                    && !crate::sharing::feed_downloads::is_private(&t.id)
+                    && !crate::sharing::feed_downloads::is_feed_download(&t.id)
             })
             .map(|t| {
                 let preview_ready = self

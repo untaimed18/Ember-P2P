@@ -20,16 +20,28 @@
 #![allow(clippy::manual_div_ceil)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::type_complexity)]
+// `clippy.toml` sends every socket through `net_bind`. Tests open loopback
+// sockets of their own; the build without them still checks the rest.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+// The desktop build has every command, so it is the one that finds dead code
+// in what both share. `emberd` leaves the desktop's commands out, and their
+// helpers would all read as unused; its own modules check themselves.
+#![cfg_attr(not(feature = "desktop"), allow(dead_code, unused_imports))]
 
 mod app_state;
-#[cfg(any(all(unix, not(target_os = "macos")), test))]
+mod command_table;
+mod host;
+#[cfg(all(feature = "desktop", any(all(unix, not(target_os = "macos")), test)))]
 mod appimage_fonts;
+#[cfg(feature = "desktop")]
 mod auto_update;
 mod background;
 mod bandwidth;
 mod commands;
 mod emule_import;
 mod finish_action;
+#[cfg(test)]
+mod fuzz;
 mod geoip;
 mod idle;
 mod ipfilter_update;
@@ -38,23 +50,32 @@ mod power;
 mod release_share;
 mod search;
 pub mod security;
+#[cfg(feature = "server")]
+mod server;
+#[cfg(feature = "desktop")]
 mod session_end;
 mod sharing;
 mod storage;
+#[cfg(feature = "desktop")]
 mod login_launch;
+mod net_bind;
+#[cfg(feature = "desktop")]
 mod tray;
 mod types;
 mod vpn;
 mod webservices;
+#[cfg(feature = "desktop")]
 mod window_state;
 
 use futures::FutureExt;
-use tauri::Emitter;
+use crate::host::Emitter;
 
 use std::sync::Arc;
+#[cfg(feature = "desktop")]
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
+#[cfg(feature = "desktop")]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::Manager;
+use crate::host::Manager;
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
 use tracing_subscriber::layer::SubscriberExt;
@@ -174,6 +195,7 @@ fn raise_open_file_limit() {
 /// `cancel` is the silent-update countdown's "Cancel update" entry, shown above
 /// the others while the countdown runs. The "When downloads finish" countdown
 /// gets its own entry there too while it runs.
+#[cfg(feature = "desktop")]
 pub(crate) fn build_tray_menu<R: tauri::Runtime, M: Manager<R>>(
     manager: &M,
     cancel: Option<&MenuItem<R>>,
@@ -278,7 +300,7 @@ pub(crate) const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_
 /// send fails closed instead of waiting, and every remaining step is an
 /// idempotent re-save.
 pub(crate) async fn run_graceful_shutdown(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     shutdown_wait: std::time::Duration,
 ) {
     network::ed2k::preview::cleanup_previews();
@@ -438,10 +460,12 @@ pub(crate) async fn run_graceful_shutdown(
 /// Run as the update watchdog if this process was started as one
 /// (`auto_update::watchdog`). Returns whether it was, in which case the process
 /// should exit rather than start Ember.
+#[cfg(feature = "desktop")]
 pub fn run_update_watchdog_if_requested() -> bool {
     auto_update::watchdog::run_if_requested()
 }
 
+#[cfg(feature = "desktop")]
 const FATAL_STARTUP_TITLE: &str = "Ember cannot start";
 
 /// Tell the user why Ember is about to exit when that happens before any
@@ -452,7 +476,7 @@ const FATAL_STARTUP_TITLE: &str = "Ember cannot start";
 /// nothing shown through that loop can appear until it returns: the dialog
 /// plugin's `blocking_show` would wait forever. `rfd`'s synchronous dialog
 /// runs a modal loop of its own on Windows and macOS.
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(all(feature = "desktop", any(windows, target_os = "macos")))]
 fn show_fatal_startup_dialog(message: &str) {
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
@@ -466,7 +490,7 @@ fn show_fatal_startup_dialog(message: &str) {
 /// the GLib main context the event loop holds, which would leave Ember running
 /// without a window and holding its instance lock. A separate dialog program
 /// has a main loop of its own; without one the log is all there is.
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(all(feature = "desktop", not(any(windows, target_os = "macos"))))]
 fn show_fatal_startup_dialog(message: &str) {
     let dialogs: [(&str, Vec<&str>); 3] = [
         (
@@ -486,6 +510,7 @@ fn show_fatal_startup_dialog(message: &str) {
     }
 }
 
+#[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // First: it sets environment variables, which only a process with one
@@ -493,167 +518,7 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     let appimage_fonts = appimage_fonts::prepare();
 
-    // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
-    //
-    // Ember drives several very large async state machines — the multi-source
-    // download loop, the per-peer message loops, and the central network
-    // `select!` loop. In debug builds these compile to deep, unboxed poll
-    // chains whose combined stack frames sit close to the 2 MiB limit, and
-    // small additions have overflowed it (STATUS_STACK_OVERFLOW) right as a
-    // download starts. Build our own multi-thread runtime with a roomier stack
-    // and hand its handle to Tauri *before* anything spawns (the first spawn
-    // happens in `.setup`, and `async_runtime::set` panics if the runtime was
-    // already initialized). The runtime is intentionally leaked: Tauri requires
-    // the underlying Tokio runtime to outlive the app, and it lives for the
-    // whole process regardless.
-    let rt = Box::leak(Box::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_stack_size(8 * 1024 * 1024)
-            .build()
-            .expect("failed to build Tokio runtime"),
-    ));
-    tauri::async_runtime::set(rt.handle().clone());
-
-    // Install the process-wide rustls CryptoProvider before *anything*
-    // can do TLS. Multiple crates in this app speak rustls 0.23
-    // (`quinn`, `tokio-tungstenite`, `reqwest`) and 0.23 deliberately
-    // refuses to pick a default automatically — any code path that
-    // doesn't pass an explicit provider will panic with:
-    //   "Could not automatically determine the process-level
-    //    CryptoProvider from Rustls crate features."
-    // QUIC is fine because `quic.rs::build_{server,client}_config`
-    // pass `builder_with_provider(...)` explicitly, but the WS client
-    // used by `connect_server_relay` (every LowID-to-LowID relay
-    // fallback) goes through `tokio_tungstenite::connect_async`,
-    // which uses the global default — no install, every relay
-    // attempt panicked the spawned task.
-    //
-    // Idempotent: returns Err if a provider is already installed
-    // (e.g. a future `cargo test` linking us in alongside another
-    // initializer). We don't care about that case, hence `let _ =`.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let data_dir = storage::paths::resolve_data_dir();
-    let _ = std::fs::create_dir_all(&data_dir);
-    #[cfg(target_os = "windows")]
-    repair_legacy_data_acls(&data_dir);
-
-    let log_dir = data_dir.join("logs");
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    // Escape hatch for diagnosing a problem the pseudonymised log cannot
-    // explain: set `EMBER_VERBOSE_DIAGNOSTICS=1` (or `=true`) and both the
-    // console and file layers write raw peer IPs, file hashes, local paths and
-    // search text instead of `<ip:…>` / `<id:…>` / `<path:…>` / `<text:…>`
-    // tokens. Off by default and deliberately env-only: a log produced with
-    // this on must never be shared, so it must not be reachable from the UI.
-    let verbose_diagnostics = std::env::var("EMBER_VERBOSE_DIAGNOSTICS")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    // Logs now live in their own directory so a stale/locked file can never
-    // block access to the rest of the application data directory.
-    security::cleanup_old_logs(&data_dir, 7);
-
-    let file_logging = match std::fs::create_dir_all(&log_dir) {
-        Ok(()) => {
-            #[cfg(target_os = "windows")]
-            if let Err(error) = security::restrict_file_permissions_checked(&log_dir) {
-                eprintln!("Failed to restrict Ember log directory ACL: {error}");
-            }
-
-            security::cleanup_old_logs(&log_dir, 7);
-            if let Ok(entries) = std::fs::read_dir(&log_dir) {
-                for entry in entries.flatten() {
-                    if entry.file_name().to_string_lossy().starts_with("ember.log") {
-                        let _ = security::restrict_file_permissions_checked(&entry.path());
-                    }
-                }
-            }
-
-            tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("ember.log")
-                // The `cleanup_old_logs` sweep above only ever runs at startup,
-                // so a client left running for months rotated one new
-                // `ember.log.<date>` per day with nothing pruning them until
-                // the next launch. Rotation-time pruning keeps the same 7-file
-                // bound enforced in-session; the startup sweep stays because it
-                // also removes files left by versions that predate this.
-                .max_log_files(7)
-                .build(&log_dir)
-                .map(tracing_appender::non_blocking)
-                .map_err(|error| error.to_string())
-        }
-        Err(error) => Err(error.to_string()),
-    };
-    let (file_writer, log_guard) = match file_logging {
-        Ok((writer, guard)) => (Some(writer), Some(guard)),
-        Err(error) => {
-            eprintln!(
-                "File logging is unavailable at {}: {error}; continuing with console logging",
-                log_dir.display()
-            );
-            (None, None)
-        }
-    };
-    let file_layer = file_writer.map(|writer| {
-        tracing_subscriber::fmt::layer()
-            .with_ansi(false)
-            .with_writer(security::logging::PrivacyMakeWriter::new(
-                writer,
-                verbose_diagnostics,
-            ))
-    });
-
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(
-            security::logging::PrivacyMakeWriter::new(std::io::stdout, verbose_diagnostics),
-        ))
-        .with(file_layer)
-        .init();
-
-    // Keep the guard alive for the entire app lifetime
-    let _log_guard = log_guard;
-
-    // Before any download can dial: an uploader we asked just before the
-    // last exit still counts that ask against the next one.
-    network::ed2k::peer_sessions::load_upload_requests(&data_dir);
-
-    // Route panics into the log file. Release builds are linked with
-    // `windows_subsystem = "windows"` (no console), so the default hook's
-    // stderr message goes nowhere and a startup panic is indistinguishable
-    // from "the window opened and instantly closed". Without this, the log
-    // simply stops mid-startup with no cause recorded.
-    let default_panic_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "<unknown location>".to_string());
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .map(|s| (*s).to_string())
-            .or_else(|| info.payload().downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "<non-string panic payload>".to_string());
-        tracing::error!(
-            "PANIC at {location} on thread '{}': {payload}",
-            std::thread::current().name().unwrap_or("unnamed"),
-        );
-        default_panic_hook(info);
-    }));
-
-    tracing::info!(
-        "Ember starting: version={} os={} arch={}",
-        env!("CARGO_PKG_VERSION"),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-    );
-
-    #[cfg(target_os = "linux")]
-    raise_open_file_limit();
+    let _log_guard = init_process();
     #[cfg(target_os = "linux")]
     appimage_fonts.log();
 
@@ -714,7 +579,7 @@ pub fn run() {
                 .get(tauri::http::header::RANGE)
                 .and_then(|header| header.to_str().ok())
                 .map(str::to_string);
-            tauri::async_runtime::spawn(async move {
+            crate::host::async_runtime::spawn(async move {
                 responder.respond(
                     commands::sharing::serve_media_request(app, encoded_path, range).await,
                 );
@@ -729,2094 +594,12 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .setup(|app| {
-            let app_handle = app.handle().clone();
-
-            // First, before anything slow: an update watchdog judges "Ember is
-            // running again" by this lock, and a first launch of a new version
-            // can spend minutes in migrations or an antivirus scan before
-            // reaching the rest of setup.
-            {
-                let lock_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
-                if std::fs::create_dir_all(&lock_dir).is_ok() {
-                    auto_update::watchdog::hold_instance_lock(&lock_dir);
-                }
-            }
-
-            // Associate the `ed2k://` scheme with this executable.
-            //
-            // URI schemes have no Windows "UserChoice" protection: the last
-            // writer wins, and a per-user (HKCU) entry overrides a machine-wide
-            // one. So calling `register_all()` on every production launch would
-            // silently re-claim `ed2k://` from whatever client the user
-            // actually prefers (eMule, another ed2k app) — even if they set it
-            // back by hand. That's hostile, so we DON'T do it in release.
-            //
-            // Instead, installed builds get the scheme registered once by the
-            // NSIS/MSI installer (driven by `plugins.deep-link.desktop.schemes`
-            // in tauri.conf.json), which is an explicit, user-initiated install
-            // action and is undone on uninstall. Runtime `register_all()` is
-            // only needed for dev builds, which aren't installed and so have no
-            // installer to register the scheme — hence the `debug_assertions`
-            // gate on Windows. Linux has no standard installer-side mechanism,
-            // so it registers at runtime there, but only while no other client
-            // holds the scheme. macOS reads the association from the bundle's
-            // Info.plist and needs neither path.
-            #[cfg(all(debug_assertions, windows))]
-            {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                if let Err(e) = app.deep_link().register_all() {
-                    tracing::warn!("Failed to register ed2k:// deep link scheme: {e}");
-                }
-            }
-            #[cfg(target_os = "linux")]
-            commands::deeplink::register_scheme_unless_taken(&app_handle);
-
-            // Show the running version in the main window title so users
-            // can confirm which build they're on at a glance (matches the
-            // wix product version we ship and the value reported by the
-            // About / Update dialog). `package_info().version` reads the
-            // `version` field of `tauri.conf.json` at build time.
-            //
-            // In harness mode (`EMBER_DATA_DIR` set), we also tag the
-            // title with the basename of the data dir so two side-by-side
-            // harness instances are visually distinguishable from the
-            // taskbar without opening devtools. Production launches
-            // (no env var) keep the original title.
-            if let Some(window) = app.get_webview_window("main") {
-                let version = &app.package_info().version;
-                let title = match std::env::var(storage::paths::EMBER_DATA_DIR_ENV) {
-                    Ok(dir) if !dir.trim().is_empty() => {
-                        let label = std::path::Path::new(dir.trim())
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("harness");
-                        format!("Ember v{version} [{label}]")
-                    }
-                    _ => format!("Ember v{version}"),
-                };
-                let _ = window.set_title(&title);
-            }
-
-            // Swap in a restore staged by `import_backup` before anything
-            // opens the files it replaces. Once the database is open and the
-            // identity is cached in memory, replacing them underneath is not
-            // something that can be done safely. Failures and leftover staging
-            // are latched for a blocking UI notice — logging alone left users
-            // running on mixed or pre-restore files with no explanation.
-            let mut restore_failed_notice = false;
-            let mut restore_expired_notice = false;
-            let mut restore_applied = false;
-            let mut restore_download_folder_notice = None;
-            match storage::paths::ensure_data_dir_with_app(&app_handle) {
-                Ok(dir) => {
-                    use commands::backup::StartupRestore;
-                    match commands::backup::apply_pending_restore(&dir) {
-                        Err(e) => {
-                            tracing::error!("Failed to apply the staged restore: {e}");
-                            restore_failed_notice = true;
-                        }
-                        // A leftover marker after `Applied` is a failed
-                        // staging-dir cleanup, not a failed restore — the
-                        // toast would wrongly say we are on previous files.
-                        // `NotApplied` with a marker still on disk is schema-
-                        // too-new or a mid-apply abort left for retry.
-                        Ok(StartupRestore::NotApplied) => {
-                            if commands::backup::pending_restore_still_staged(&dir) {
-                                restore_failed_notice = true;
-                            }
-                        }
-                        Ok(StartupRestore::Applied {
-                            download_folder_replaced,
-                        }) => {
-                            restore_applied = true;
-                            restore_download_folder_notice = download_folder_replaced;
-                        }
-                        Ok(StartupRestore::Expired) => restore_expired_notice = true,
-                        // The restored profile is the one in use; only the
-                        // staged copies were left behind, and are retried.
-                        Ok(StartupRestore::AlreadyApplied) => {}
-                    }
-                }
-                Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),
-            }
-
-            let db = Arc::new(
-                Database::new(&app_handle).map_err(|e| {
-                    tracing::error!("Failed to initialize database: {e:#}");
-                    let failure = storage::database::OpenFailure::of(&e);
-                    show_fatal_startup_dialog(&failure.message(
-                        &storage::paths::resolve_data_dir_with_app(&app_handle),
-                        &e,
-                    ));
-                    e
-                })?,
-            );
-
-            // A database that came back from a backup, or was rebuilt, counts
-            // only the rooms made before it: the rooms this identity owns are
-            // looked for again before a number is handed out.
-            if restore_applied || db.corrupt_backup.is_some() {
-                commands::channel_recovery::owe_scan(&db);
-            }
-            let mut config = AppConfig::load(&app_handle).map_err(|e| {
-                tracing::error!("Failed to load config: {e}");
-                e
-            })?;
-            let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
-            std::fs::create_dir_all(&data_dir)?;
-            let orphan_disposal = commands::transfers::OrphanDisposal::at_startup(
-                &data_dir,
-                restore_applied || db.corrupt_backup.is_some(),
-            );
-            // Before the network task starts and before the window is shown:
-            // both come back the way an update restart left them.
-            auto_update::watchdog::schedule_cleanup(&data_dir);
-            let resume_window = auto_update::resume::begin_launch(&app_handle, &data_dir);
-            auto_update::silent::note_launch_outcome(&app_handle);
-            // An eMule import staged last session. Here because it rewrites
-            // what the identity, the approved roots, the credit store and the
-            // network all read below, and none of them can take a change once
-            // they have.
-            let emule_import = emule_import::apply::apply_pending(&data_dir, &db, &mut config);
-            storage::part_folders::forget_finished_previous_folders(&db, &mut config);
-            let settings = config.settings.clone();
-            // Before the library is scanned or a download restored: both must
-            // know which downloads, and which folders, are feeds' and private.
-            sharing::feed_downloads::set_roots(&settings.download_roots());
-            match db.transfer_feed_folders() {
-                Ok(rows) => sharing::feed_downloads::load(rows),
-                Err(error) => tracing::error!("Could not read which downloads are from feeds: {error}"),
-            }
-            match db.transfer_collection_folders() {
-                Ok(rows) => storage::category_folders::load_collection_folders(rows),
-                Err(error) => tracing::error!("Could not read which downloads came from collections: {error}"),
-            }
-            // Best-effort, never fatal. A download folder on an unplugged USB
-            // drive, an offline NAS or an unmapped share makes these fail, and
-            // propagating that out of `setup` returns Err from `build()` — which
-            // exits the process before a window exists, with no dialog and no way
-            // for the user to correct the path. The condition also survives config
-            // load (`validate_settings` checks length and forbidden roots, not
-            // reachability), so it would repeat on every launch. Start anyway;
-            // `PartFileWriter::open` retries the creation when a download actually
-            // needs the directory, so a drive reconnected mid-session self-heals.
-            if !settings.download_folder.is_empty() {
-                for sub in ["Downloads", "Temp"] {
-                    let dir = std::path::PathBuf::from(&settings.download_folder).join(sub);
-                    if let Err(error) = std::fs::create_dir_all(&dir) {
-                        tracing::error!(
-                            "Could not create {}: {error}. Downloads will fail until the \
-                             folder is reachable or changed in Settings.",
-                            dir.display()
-                        );
-                    }
-                }
-            }
-            let configured_roots = settings.configured_roots();
-            let mut import_roots =
-                emule_import::apply::pending_root_additions(&data_dir, emule_import.as_ref());
-            // The backup deliberately leaves out `approved_roots.json`, whose
-            // records bind folders to one machine's file identities, so the
-            // download folders a restore just brought back are approved here,
-            // as the ones an eMule import names are. Left out, a restore onto
-            // a new install kept them configured but unapproved, and every
-            // download refused its target. Its shared folders are not: an
-            // archive is not the user picking a folder to share, so they wait
-            // in the Library for the user to re-approve them.
-            if restore_applied {
-                for root in settings.download_roots() {
-                    if !import_roots.contains(&root) {
-                        import_roots.push(root);
-                    }
-                }
-            }
-            let approved_roots = security::filesystem::initialize_approved_roots_with_additions(
-                &data_dir,
-                &configured_roots,
-                &import_roots,
-            )
-            .map_err(|error| anyhow::anyhow!("Failed to load approved filesystem roots: {error}"))?;
-            sharing::feed_files::allow_list_dirs(&data_dir);
-            // Not an approved root, unlike the lists' folders: nothing in it is
-            // ever served.
-            network::ember::attach_stream::set_feed_tree_dir(data_dir.join("feed-trees"));
-            emule_import::apply::root_additions_approved(&data_dir);
-            // Only share_intent.json is read here; the known.met migration runs
-            // on its own thread, and every share-intent reader and known.met
-            // writer (including `migrate_aich_v2` below) blocks until it lands.
-            storage::share_intent::initialize_in_background(&data_dir)
-                .map_err(|error| anyhow::anyhow!("Failed to load durable share intent: {error}"))?;
-            // Load the persistent identity once before commands or the network
-            // task can run. Re-reading/creating it independently at several
-            // call sites allowed concurrent first-run callers to generate
-            // different identities and race their atomic writes.
-            let identity = Arc::new(
-                storage::identity::NodeIdentity::load_or_create(
-                    &storage::paths::resolve_data_dir_with_app(&app_handle),
-                )
-                .map_err(|e| {
-                    tracing::error!("Failed to load node identity: {e}");
-                    e
-                })?,
-            );
-            // Earliest point at which the log pseudonyms can be made stable
-            // across restarts — the subscriber is installed before this so a
-            // failure in between still reaches the log file.
-            security::logging::install_pseudonym_key(&identity.ed25519_secret_key);
-            network::friend_intro::set_own_intro_secret(identity.intro_secret);
-            match db.get_friend_intro_secrets() {
-                Ok(secrets) => network::friend_intro::load_friend_intro_secrets(secrets),
-                Err(e) => tracing::warn!("Failed to load friend intro secrets: {e}"),
-            }
-            // If config.json was corrupt and reset to defaults, surface it to the
-            // user once the webview has mounted (the file is preserved as a .bak).
-            let corrupt_backup = config.corrupt_backup.clone();
-            let ember_default_on_applied = config.ember_default_on_applied;
-            let db_corrupt_backup = db.corrupt_backup.clone();
-            let mut policy_failures = Vec::new();
-            let mut policy_scope = security::policy::PolicyResetScope::default();
-            if db_corrupt_backup.is_some() {
-                policy_scope.reset_bans = true;
-                policy_failures.push(
-                    "The policy database was corrupt and was replaced; prior bans cannot be trusted"
-                        .to_string(),
-                );
-            }
-            if let Err(error) = db.validate_security_policy() {
-                policy_scope.reset_bans = true;
-                policy_failures.push(format!("Persisted ban policy could not be validated: {error}"));
-            }
-            if let Err(error) =
-                network::ember::reputation::ReputationManager::load_checked(
-                    &data_dir.join("reputation.json"),
-                )
-            {
-                policy_scope.reset_reputation = true;
-                policy_failures.push(error);
-            }
-            let security_policy = Arc::new(if policy_failures.is_empty() {
-                security::policy::SecurityPolicyGate::ready(data_dir.clone())
-            } else {
-                security::policy::SecurityPolicyGate::blocked(
-                    data_dir.clone(),
-                    policy_failures.join("; "),
-                    policy_scope,
-                )
-            });
-
-            let spam_data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
-            let spam_filter = Arc::new(RwLock::new(
-                search::spam::SpamFilter::load(&spam_data_dir),
-            ));
-            let comment_manager = Arc::new(RwLock::new(
-                network::ed2k::comments::CommentManager::new(),
-            ));
-
-            // Capacity 1024 (was 256): every Tauri command that mutates
-            // persistent state (`UpdateSettings`, `BanPeer`, `BootstrapContacts`,
-            // `ReloadIpFilter`, `FriendRemoved`, etc.) dispatches a live
-            // `NetworkCommand` here via `try_send` after the DB/config write
-            // succeeds. The on-disk write is the source of truth, so a
-            // dropped live update only delays application until the next
-            // restart, but security-relevant changes (ipfilter reload, peer
-            // ban) shouldn't degrade silently under burst. 1024 covers the
-            // realistic worst case (a user clicking through many rows in
-            // rapid succession) with a comfortable margin while the network
-            // task drains continuously.
-            let (network_tx, network_rx) = mpsc::channel(1024);
-
-            let local_index = Arc::new(RwLock::new(LocalIndex::new()));
-
-            let (initial_upload_limit, initial_download_limit) =
-                background::effective_limits_now(&settings);
-            let bandwidth_limiter = Arc::new(BandwidthLimiter::new(
-                initial_upload_limit,
-                initial_download_limit,
-            ));
-            let uss_rtt_queue = bandwidth::new_uss_rtt_queue();
-            let uss_enabled_flag = bandwidth::new_uss_enabled_flag(settings.uss_enabled);
-
-            let transfer_manager = Arc::new(RwLock::new(TransferManager::new(settings.max_concurrent_downloads)));
-
-            let shutdown_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let shutdown_complete_net = shutdown_complete.clone();
-
-            let bw_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let scanning_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let scan_coordination = Arc::new(tokio::sync::Mutex::new(()));
-
-            let cached_peers: Arc<RwLock<Vec<crate::types::PeerInfo>>> = Arc::new(RwLock::new(Vec::new()));
-            let cached_stats: Arc<RwLock<crate::types::NetworkStats>> = Arc::new(RwLock::new(crate::types::NetworkStats::default()));
-            let cached_contacts: Arc<RwLock<Vec<crate::types::KadContactInfo>>> = Arc::new(RwLock::new(Vec::new()));
-            let cached_searches: Arc<RwLock<Vec<crate::types::KadSearchInfo>>> = Arc::new(RwLock::new(Vec::new()));
-            let cached_servers: Arc<RwLock<Vec<crate::types::ServerInfo>>> = Arc::new(RwLock::new(Vec::new()));
-            let cached_connected_server: Arc<RwLock<Option<crate::types::ServerInfo>>> = Arc::new(RwLock::new(None));
-            let cached_transfer_stats: Arc<RwLock<crate::storage::statistics::TransferStats>> = Arc::new(RwLock::new(Default::default()));
-            let cached_shared_files: Arc<RwLock<Vec<crate::types::FileInfo>>> = Arc::new(RwLock::new(Vec::new()));
-            let hash_cancel_flags: Arc<RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> = Arc::new(RwLock::new(std::collections::HashMap::new()));
-            let fresh_part_hashes: Arc<RwLock<std::collections::HashMap<[u8; 16], Vec<[u8; 16]>>>> = Arc::new(RwLock::new(std::collections::HashMap::new()));
-            let cached_peers_net = cached_peers.clone();
-            let cached_stats_net = cached_stats.clone();
-            let cached_contacts_net = cached_contacts.clone();
-            let cached_searches_net = cached_searches.clone();
-            let cached_servers_net = cached_servers.clone();
-            let cached_connected_server_net = cached_connected_server.clone();
-            let cached_transfer_stats_net = cached_transfer_stats.clone();
-            let cached_shared_files_net = cached_shared_files.clone();
-            let startup_network_tx = network_tx.clone();
-
-            let upload_shared_folders: app_state::SharedFolderList = Arc::new(RwLock::new(settings.shared_folders.clone()));
-            // Mutual friends are the subset that also added us back. Friend-only
-            // shares and browse answers key off that rather than every friend,
-            // so a one-sided add cannot reach private content. Both come from
-            // one read so they cannot disagree, and a failed read is logged
-            // loudly: every friend would otherwise look like a stranger and
-            // the friend limit would count from zero.
-            let (friend_hashes, mutual_friend_hashes): (
-                app_state::SharedFriendHashes,
-                app_state::SharedFriendHashes,
-            ) = {
-                let mut friends = std::collections::HashSet::new();
-                let mut mutual = std::collections::HashSet::new();
-                match db.get_friends_full() {
-                    Ok(rows) => {
-                        for row in &rows {
-                            let Ok(hash) = <[u8; 16]>::try_from(
-                                hex::decode(&row.0).unwrap_or_default().as_slice(),
-                            ) else {
-                                continue;
-                            };
-                            friends.insert(hash);
-                            if row.6 {
-                                mutual.insert(hash);
-                            }
-                        }
-                        if !friends.is_empty() {
-                            info!(
-                                "Loaded {} friends ({} mutual) from database",
-                                friends.len(),
-                                mutual.len()
-                            );
-                        }
-                    }
-                    Err(e) => tracing::error!("Failed to load the friend list: {e}"),
-                }
-                (Arc::new(RwLock::new(friends)), Arc::new(RwLock::new(mutual)))
-            };
-
-            sharing::disk::set_hash_at_low_priority(settings.hash_low_priority);
-            release_share::configure(&settings);
-            let shared_folder_watcher = sharing::watcher::SharedFoldersWatcher::start(
-                app_handle.clone(),
-                settings.shared_folders.clone(),
-                settings.watch_shared_folders,
-            );
-
-            // One-time AICH migration: invalidate multi-part AICH root hashes
-            // computed before the SHAHashSet part-boundary fix so they get
-            // recomputed on this startup's hashing pass. Must run before ANY
-            // known.met consumer loads the file so the indexer/hashing task and
-            // network task both see the cleared roots. Guarded by a marker file.
-            {
-                let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
-                storage::known_files::migrate_aich_v2(&data_dir);
-                // Sealed bytes from the withdrawn room-attachment feature. The
-                // rows that described them went with schema v34, so without
-                // this the blobs are unreferenced files nothing will ever open
-                // or clean up.
-                let legacy_channel_files = data_dir.join("channel-files");
-                if legacy_channel_files.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&legacy_channel_files) {
-                        tracing::warn!(
-                            error = %e,
-                            "could not remove stored room attachments from the previous version"
-                        );
-                    }
-                }
-                commands::backup::sweep_orphaned_scratch(&data_dir);
-            }
-            // The same reclaim for `%TEMP%/Ember`, which the backup sweep above
-            // never looks at: previews land there and are only cleaned up by a
-            // clean shutdown, so a crash leaves up to 64 MiB apiece behind
-            // indefinitely.
-            security::filesystem::sweep_orphaned_temp_dirs();
-
-            // Allow WebView media playback for files under shared/download dirs.
-            commands::sharing::sync_asset_protocol_scope(&app_handle, &config);
-
-            let pending_deep_links =
-                commands::deeplink::load_pending_queue(&app_handle);
-            app.manage(AppState {
-                network_tx,
-                db: db.clone(),
-                approved_roots: approved_roots.clone(),
-                pending_folder_drop: Arc::new(tokio::sync::Mutex::new(None)),
-                security_policy: security_policy.clone(),
-                identity: identity.clone(),
-                launch_settings: app_state::LaunchSettings::from_settings(&settings),
-                config: Arc::new(RwLock::new(config)),
-                settings_save_lock: Arc::new(tokio::sync::Mutex::new(())),
-                restore_import_lock: Arc::new(tokio::sync::Mutex::new(())),
-                picked_backup: Arc::new(tokio::sync::Mutex::new(None)),
-                local_index: local_index.clone(),
-                bandwidth_limiter: bandwidth_limiter.clone(),
-                transfer_manager: transfer_manager.clone(),
-                download_admission: Arc::new(tokio::sync::Mutex::new(())),
-                shutdown_complete,
-                bw_shutdown: bw_shutdown.clone(),
-                scanning_count: scanning_count.clone(),
-                library_scan_truncated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                scan_coordination: scan_coordination.clone(),
-                hashing_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                hashing_fs_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                cached_transfer_stats,
-                cached_shared_files: cached_shared_files.clone(),
-                hash_cancel_flags: hash_cancel_flags.clone(),
-                fresh_part_hashes: fresh_part_hashes.clone(),
-                spam_filter: spam_filter.clone(),
-                comment_manager: comment_manager.clone(),
-                upload_shared_folders: upload_shared_folders.clone(),
-                friend_hashes: friend_hashes.clone(),
-                mutual_friend_hashes: mutual_friend_hashes.clone(),
-                shared_folder_watcher,
-                background_scans: Arc::new(RwLock::new(std::collections::HashMap::new())),
-                background_scan_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                quit_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                pending_close_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                pending_ember_default_on_notice: Arc::new(std::sync::atomic::AtomicBool::new(
-                    ember_default_on_applied,
-                )),
-                pending_restore_failed_notice: Arc::new(std::sync::atomic::AtomicBool::new(
-                    restore_failed_notice,
-                )),
-                pending_restore_expired_notice: Arc::new(std::sync::atomic::AtomicBool::new(
-                    restore_expired_notice,
-                )),
-                pending_restore_download_folder_notice: Arc::new(parking_lot::Mutex::new(
-                    restore_download_folder_notice,
-                )),
-                close_behavior: Arc::new(parking_lot::RwLock::new(
-                    settings.close_to_tray_behavior.clone(),
-                )),
-                minimize_to_tray: Arc::new(std::sync::atomic::AtomicBool::new(
-                    settings.minimize_to_tray,
-                )),
-                pending_deep_links: Arc::new(parking_lot::Mutex::new(pending_deep_links)),
-                runtime_status: Arc::new(parking_lot::RwLock::new(Default::default())),
-                upload_quota: Arc::new(parking_lot::Mutex::new(bandwidth::quota::UploadQuota::load(
-                    &bandwidth::quota::path_in(&storage::paths::resolve_data_dir_with_app(&app_handle)),
-                    &bandwidth::quota::local_today(),
-                ))),
-            });
-
-            // Seed the schedule/sleep snapshot and apply whatever bandwidth
-            // window is open *before* the first background tick, so a profile
-            // whose overnight rule is in force does not spend its first second
-            // running at the daytime cap — and so Settings, which can be opened
-            // inside that second, does not report "no schedule" while one
-            // applies.
-            {
-                let state = app.state::<AppState>();
-                background::seed_status(&state, &settings);
-                background::apply_effective_limits(&app_handle, &state, &settings);
-            }
-            background::spawn(app_handle.clone());
-            auto_update::scheduler::spawn(app_handle.clone());
-            ipfilter_update::spawn(app_handle.clone());
-            commands::channel_recovery::spawn_startup_scan(app_handle.clone());
-            commands::room_dm::spawn_resends(app_handle.clone());
-            commands::feeds::spawn_feeds(app_handle.clone());
-
-            // Non-silent recovery notice: if config.json was corrupt at load,
-            // tell the user (their settings were reset to defaults; the original
-            // is preserved). Delay the emit so the webview has registered its
-            // listeners — the file is already safely backed up regardless.
-            if let Some(bak) = corrupt_backup {
-                let emit_handle = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let _ = emit_handle.emit(
-                        "config-corrupt-recovered",
-                        serde_json::json!({ "backup_path": bak.to_string_lossy().to_string() }),
-                    );
-                });
-            }
-            if let Some(bak) = db_corrupt_backup {
-                let emit_handle = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let _ = emit_handle.emit(
-                        "db-corrupt-recovered",
-                        serde_json::json!({ "backup_path": bak.to_string_lossy().to_string() }),
-                    );
-                });
-            }
-            // No delayed emit for this one: it is latched in `AppState` above
-            // and the layout drains it once its listeners are up. The recovery
-            // notices beside it still race a slow cold start — an event fired
-            // three seconds in is simply dropped if the webview has not
-            // resolved `listen()` yet — but they can be re-derived from the
-            // `.bak` files on disk, whereas this migration is one-shot and
-            // already persisted, so a lost notice is lost for good.
-            if !security_policy.is_loaded() {
-                let emit_handle = app_handle.clone();
-                let status = security_policy.status();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let _ = emit_handle.emit("security-policy-reset-required", status);
-                });
-            }
-
-            // Cold-start deep link: an `ed2k://` link or `.emulecollection`
-            // file that launched Ember arrives in our own process args. Buffer
-            // it now (AppState is managed above) — the frontend drains the
-            // buffer once it mounts the deep-link handler. Done after
-            // `app.manage` so `dispatch_deep_links` can reach the buffer. An
-            // update restart carries the replaced process's args, whose links
-            // were offered then.
-            {
-                let args: Vec<String> = std::env::args().collect();
-                let payloads = auto_update::resume::without_replayed_links(
-                    &app_handle,
-                    commands::deeplink::extract_deep_link_payloads(&args),
-                );
-                if !payloads.is_empty() {
-                    commands::deeplink::dispatch_deep_links(&app_handle, payloads);
-                }
-            }
-
-            session_end::watch(app.handle());
-
-            // System tray icon. Rendered unconditionally so users who pick
-            // "Minimize to Tray" (or the saved `tray` behavior) always have
-            // a way back into the running app — without this, hiding the
-            // window would orphan the process. The menu also exposes an
-            // explicit Quit entry that routes through `app.exit(0)` so the
-            // existing `RunEvent::Exit` shutdown sequence still runs.
-            let tray_menu = build_tray_menu(app, None)?;
-
-            let tray_icon = app
-                .default_window_icon()
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("missing default window icon for tray"))?;
-
-            let tray_result = TrayIconBuilder::with_id("main")
-                .icon(tray_icon)
-                .tooltip("Ember")
-                .menu(&tray_menu)
-                // Default to "the menu shows on left-click" so users who
-                // can't right-click (touchscreens, accessibility tools)
-                // can still get to Show/Quit. Linux ignores this flag.
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "tray_show" => {
-                        commands::chat_window::set_chat_window_visible(app, true);
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.unminimize();
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                    auto_update::silent::TRAY_CANCEL_ID => {
-                        tauri::async_runtime::spawn(auto_update::silent::postpone());
-                    }
-                    finish_action::TRAY_CANCEL_ID => {
-                        finish_action::cancel_finish_action(app.clone());
-                    }
-                    "tray_pause_all" | "tray_resume_all" => {
-                        let pause = event.id.as_ref() == "tray_pause_all";
-                        let app = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let Some(state) = app.try_state::<AppState>() else {
-                                return;
-                            };
-                            let result = if pause {
-                                commands::transfers::pause_all_transfers(app.clone(), state).await
-                            } else {
-                                commands::transfers::resume_all_transfers(app.clone(), state).await
-                            };
-                            if let Err(error) = result {
-                                tracing::warn!("Tray pause/resume all failed: {error}");
-                            }
-                        });
-                    }
-                    "tray_alt_speed" => {
-                        let app = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            let Some(state) = app.try_state::<AppState>() else {
-                                return;
-                            };
-                            let patch = commands::settings::QuickLimitsPatch {
-                                alt_speed_enabled: Some(!tray::alt_speed_checked()),
-                                ..Default::default()
-                            };
-                            if let Err(error) =
-                                commands::settings::apply_quick_limits(&app, &state, patch).await
-                            {
-                                tracing::warn!("Tray alternative speed toggle failed: {error}");
-                            }
-                            // The OS flips a check item on click by itself; put it back
-                            // in step with what was actually saved.
-                            auto_update::silent::rebuild_tray_menu(&app);
-                        });
-                    }
-                    "tray_quit" => commands::settings::exit_app(app),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    // Single left-click reveals the window. The double-click
-                    // event is platform-conditional (macOS doesn't fire it),
-                    // so we settle for the click-up flavor of the single
-                    // click which is universal.
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        commands::chat_window::set_chat_window_visible(app, true);
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.unminimize();
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                })
-                .build(app);
-            let tray_available = tray_result.is_ok();
-            if let Err(e) = tray_result {
-                // No session bus / AppIndicator host (WSL, some live sessions,
-                // GNOME without the extension). Failing `setup` here would
-                // never show a window.
-                #[cfg(target_os = "linux")]
-                {
-                    tracing::warn!(
-                        "System tray unavailable ({e}); close-to-tray will not have an icon"
-                    );
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    return Err(e.into());
-                }
-            }
-            tray::note_built(tray_available);
-
-            // The window is created hidden (`tauri.conf.json`) and shown here,
-            // once the tray exists, so a session an update restart left in the
-            // tray comes back there instead of flashing onto the desktop. The
-            // "launch maximized" preference is applied here too: it is a
-            // launch-time preference, so toggling it in Settings only changes
-            // how the *next* launch opens.
-            let launch_window = resume_window.or_else(|| {
-                window_state::for_launch(
-                    settings
-                        .remember_window_position
-                        .then(|| window_state::load(&data_dir))
-                        .flatten(),
-                    settings.launch_maximized,
-                    login_launch::launched_at_login() && settings.start_hidden_at_login,
-                )
-            });
-            auto_update::resume::show_main_window(
-                &app_handle,
-                launch_window.as_ref(),
-                tray::reachable(),
-                settings.launch_maximized,
-            );
-            login_launch::reconcile_at_launch(&app_handle, settings.launch_at_login);
-            auto_update::silent::spawn(app_handle.clone());
-
-            let index_clone = local_index.clone();
-            let shared_folders = settings.shared_folders.clone();
-            let startup_allowlists = sharing::indexer::discovery_lists(
-                &settings.pending_folder_allowlists,
-                &settings.withheld_folder_files,
-            );
-            let startup_scanning = scanning_count.clone();
-            let startup_scan_coordination = scan_coordination.clone();
-            let csf = cached_shared_files.clone();
-            let startup_app = app_handle.clone();
-            let net_tx = startup_network_tx;
-            let startup_cancel_flags = hash_cancel_flags.clone();
-            let startup_fresh_part_hashes = fresh_part_hashes.clone();
-            commands::sharing::STARTUP_LIBRARY_LOADING.store(true, std::sync::atomic::Ordering::Release);
-            let startup_scan_handle = tauri::async_runtime::handle().inner().spawn(async move {
-                // However the scan ends, the index stops being a partial one.
-                struct LibraryLoaded;
-                impl Drop for LibraryLoaded {
-                    fn drop(&mut self) {
-                        commands::sharing::STARTUP_LIBRARY_LOADING
-                            .store(false, std::sync::atomic::Ordering::Release);
-                    }
-                }
-                let library_loaded = LibraryLoaded;
-                if shared_folders.is_empty() {
-                    info!("Indexed 0 files from 0 shared folders");
-                    let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
-                    return;
-                }
-                // Held for the whole scan and released when this task ends. It is
-                // deliberately not handed to the hash-timeout drain: that drain
-                // can block indefinitely on a stuck read, and passing the lease
-                // to it would wedge every later reload.
-                let _coordination_guard = startup_scan_coordination.clone().lock_owned().await;
-
-                struct StartupScanGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-                impl Drop for StartupScanGuard {
-                    fn drop(&mut self) {
-                        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                startup_scanning.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let scan_guard = StartupScanGuard(startup_scanning.clone());
-                let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                startup_cancel_flags.write().await.insert("__startup__".to_string(), cancel_flag.clone());
-
-                let discovery_handles: Vec<_> = shared_folders
-                    .iter()
-                    .map(|folder| {
-                        let f = folder.clone();
-                        // A persisted cursor describes a partial live scan.
-                        // Startup begins with an empty index, so resuming at a
-                        // later page would make every earlier page disappear
-                        // until another full cycle completes. Start each cold
-                        // scan at the first page; successful startup persists
-                        // a fresh cursor for the next live reload.
-                        let cursor: Option<String> = None;
-                        let scope =
-                            sharing::indexer::DiscoveryScope::for_root(&f, &startup_allowlists);
-                        (
-                            folder.clone(),
-                            tokio::task::spawn_blocking(move || {
-                                match FileIndexer::refuse_unapproved_root(&f) {
-                                    Some(refused) => (true, false, refused),
-                                    None => {
-                                        let result = FileIndexer::discover_directory_page_in(
-                                            &f,
-                                            cursor.as_deref(),
-                                            scope.as_ref(),
-                                        );
-                                        let gone = result.saw_nothing()
-                                            && sharing::indexer::folder_gone_from_present_volume(
-                                                std::path::Path::new(&f),
-                                            );
-                                        (false, gone, result)
-                                    }
-                                }
-                            }),
-                        )
-                    })
-                    .collect();
-                // Read while the folders are walked; nothing below needs it sooner.
-                let known_path =
-                    storage::paths::resolve_data_dir_with_app(&startup_app).join("known.met");
-                let known_load = tokio::task::spawn_blocking(move || {
-                    let known_list = storage::known_files::KnownFileList::load(&known_path);
-                    // The per-file `effective_shared` calls below would
-                    // otherwise wait out the share-intent migration on this
-                    // runtime worker.
-                    storage::share_intent::wait_until_initialized();
-                    known_list
-                });
-                let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
-                let mut startup_cursor_updates = std::collections::HashMap::new();
-                // Not walked until re-approved, so not filled in from known.met
-                // either: what is at the path now is not what was approved.
-                let mut refused_roots: Vec<String> = Vec::new();
-                // Read nothing of: a drive not plugged in, a share offline.
-                let mut unreachable_roots: Vec<String> = Vec::new();
-                for (folder, handle) in discovery_handles {
-                    match handle.await {
-                        Ok((refused, gone, result)) => {
-                            if refused {
-                                refused_roots.push(folder);
-                                continue;
-                            }
-                            // An unreachable folder (a drive not plugged in)
-                            // says nothing about where its paging stood; a
-                            // `None` here erased the cursor it had. One deleted
-                            // from a drive that is there has nothing to keep
-                            // rows for, or they would be announced every session.
-                            if result.saw_nothing() {
-                                if !gone {
-                                    unreachable_roots.push(folder);
-                                }
-                                continue;
-                            }
-                            if result.reached_file_cap() {
-                                tracing::warn!(
-                                    "Startup discovery reached the per-folder file cap; some files will wait for a later scan"
-                                );
-                                startup_app
-                                    .state::<AppState>()
-                                    .library_scan_truncated
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                                let _ = startup_app.emit(
-                                    "shared-files-scan-truncated",
-                                    serde_json::json!({ "folder": "startup", "limit": 100_000 }),
-                                );
-                            }
-                            startup_cursor_updates.insert(folder, result.next_cursor);
-                            all_discovered.extend(result.files);
-                        }
-                        Err(e) => {
-                            tracing::error!("discover_directory panicked for folder: {e}");
-                            // The rest of the library still loads; this folder
-                            // is simply missing from it, and the user is told.
-                            let _ = startup_app.emit(
-                                "shared-folder-scan-failed",
-                                serde_json::json!({ "folder": folder }),
-                            );
-                        }
-                    }
-                }
-
-                // A Stop during the walk still lets last session's files into
-                // the index: only hashing is skipped (see `was_cancelled`).
-                // Returning here left the Library empty with the loading flag
-                // cleared, and a feed saved or published then dropped every
-                // item as gone.
-                let cancelled_in_discovery = cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
-                if cancelled_in_discovery {
-                    info!("Startup hashing cancelled during discovery; indexing known files only");
-                }
-
-                let known_list = match known_load.await {
-                    Ok(known_list) => known_list,
-                    Err(e) => {
-                        tracing::error!("Startup known.met load panicked: {e}");
-                        startup_cancel_flags.write().await.remove("__startup__");
-                        let _ = startup_app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
-                        return;
-                    }
-                };
-
-                let mut files_to_hash: Vec<crate::types::FileInfo> = Vec::new();
-                // Rows wanting only a digest repair are deliberately *not*
-                // accumulated here. They are already servable, so they stay out
-                // of `files_to_hash` — a cold start is not a full re-read of the
-                // library — and the background pass is handed `all_discovered`
-                // itself once the scan has finished with the drives. Collecting
-                // them separately meant cloning a whole `FileInfo` per row and
-                // holding both copies until the pass drained, which on the run
-                // that matters most (first launch after an upgrade, library big
-                // enough to paginate) is the entire share resident twice.
-                // `queue_hash_top_up` applies the same `wants_hash_top_up`
-                // predicate and narrows to the few columns the pass reads, so
-                // the list it builds is the same one — minus the rows the
-                // shared-folder retain below drops, which have no business
-                // costing a whole-file read.
-                // Paths with no known.met record at all — genuinely new to
-                // this library, as opposed to a previously-shared file that's
-                // merely being rediscovered. Only these should inherit a
-                // shared folder's *current* default priority below; a file
-                // that already has a persisted priority keeps it even if the
-                // folder default has since changed, matching `set_file_priority`'s
-                // per-file-override contract.
-                let mut new_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
-                let known_lookup = known_list.name_size_lookup();
-                for file in &mut all_discovered {
-                    if let Some(record) = known_list.find_by_path_and_meta_in(
-                        &known_lookup,
-                        &file.path,
-                        file.size,
-                        file.modified_at,
-                    ) {
-                        let hash = hex::encode(record.file_hash);
-                        file.id = hash.clone();
-                        file.hash = hash;
-                        file.aich_hash = record.aich_hash.clone();
-                        file.ember_file_hash = record.ember_file_hash.clone();
-                        // Restore the per-file priority and shared/unshared
-                        // choice from known.met. Without this, every cold
-                        // start silently reset custom priorities to "normal"
-                        // and re-shared files the user had explicitly
-                        // unshared.
-                        file.priority = storage::known_files::priority_u8_to_str(record.upload_priority).to_string();
-                        file.shared = storage::share_intent::effective_shared(
-                            &record.file_hash,
-                            record.is_shared,
-                        );
-                        // Same reasoning for the friends-only scope: losing it
-                        // on a cold start would republish a file the user had
-                        // deliberately kept off the open network.
-                        file.friends_only = record.friends_only;
-                        file.alltime_requests = record.all_time_requested;
-                        file.alltime_accepted = record.all_time_accepted;
-                        file.alltime_transferred = record.all_time_transferred;
-                        // Restore the last-known Peers count so the Library
-                        // doesn't show 0 until the next 60s source-count sync.
-                        file.complete_sources = record.complete_sources;
-                        // A matched record short-circuits hashing unless it
-                        // still wants a one-time repair, and both repairs go to
-                        // the same background pass. Kept in step with
-                        // `resolve_from_known`, which documents the reasoning:
-                        //
-                        // - an empty AICH root (v2 migration, or a file such as
-                        //   a completed download that arrived without one) is
-                        //   eD2k recovery data. Valuable, but it costs a
-                        //   downloader one re-fetched part rather than one
-                        //   re-fetched block, and only once something is
-                        //   actually corrupt — not worth blocking a scan that
-                        //   would otherwise re-read the whole share.
-                        // - empty ember_file_hash is an Ember-only extra that
-                        //   lets a downloader double-check the whole file.
-                        //
-                        // The row is fully servable without either, so it keeps
-                        // its content-hash id and enters the index as an
-                        // ordinary entry. ed2k comes out identical either way;
-                        // only the missing digests are filled.
-                    } else {
-                        commands::sharing::carry_scope_at_path(file, &known_list);
-                        new_paths.insert(crate::search::index::normalize_path_key(&file.path));
-                        files_to_hash.push(file.clone());
-                    }
-                }
-                // Before any hashing starts, so a log from a launch that
-                // re-hashes says why even if the user stops it partway.
-                {
-                    let found = all_discovered.len();
-                    let matched = found - files_to_hash.len();
-                    let records = known_list.file_count();
-                    let shift = if files_to_hash.is_empty() {
-                        None
-                    } else {
-                        known_list.time_shift_summary(
-                            files_to_hash.iter().map(|f| (f.name.as_str(), f.size, f.modified_at)),
-                        )
-                    };
-                    match shift {
-                        Some(shift) => info!(
-                            "Startup scan: {found} files found, {matched} matched in known.met \
-                             ({records} records), {} to hash; {} of those match a known file by \
-                             name and size but not by modification time ({} are off by {:+} s)",
-                            files_to_hash.len(),
-                            shift.files,
-                            shift.common_count,
-                            shift.common_delta_secs,
-                        ),
-                        None => info!(
-                            "Startup scan: {found} files found, {matched} matched in known.met \
-                             ({records} records), {} to hash",
-                            files_to_hash.len(),
-                        ),
-                    }
-                }
-
-                let current_shared_folders = {
-                    let state = startup_app.state::<AppState>();
-                    let cfg = state.config.read().await;
-                    cfg.settings.shared_folders.clone()
-                };
-                all_discovered.retain(|file| {
-                    commands::sharing::file_in_shared_folders(&file.path, &current_shared_folders)
-                });
-                // A cursor page is intentionally partial. On a cold start the
-                // index is empty, so retain previously completed pages from
-                // known.met while the first page is rediscovered; otherwise a
-                // large share (>100k files) loses every non-first-page row
-                // until the user manually triggers enough reloads to cycle it
-                // back in.
-                //
-                // A folder that could not be read at all keeps its rows the
-                // same way, as one that goes offline mid-session does: it is
-                // unavailable, not empty. Left out, its files looked gone once
-                // the Library had loaded, and a feed saved or published then
-                // dropped every item on it for good.
-                let hydrate_paged = startup_cursor_updates.values().any(Option::is_some);
-                if hydrate_paged || !unreachable_roots.is_empty() {
-                    let hydration_unreachable = unreachable_roots.clone();
-                    let mut known_paths = all_discovered
-                        .iter()
-                        .map(|file| crate::search::index::normalize_path_key(&file.path))
-                        .collect::<std::collections::HashSet<_>>();
-                    let hydration_records = known_list.all_records().cloned().collect::<Vec<_>>();
-                    let hydration_folders = current_shared_folders.clone();
-                    let hydration_refused = refused_roots.clone();
-                    let hydration_paths = known_paths.clone();
-                    let hydration_allowlists = {
-                        let state = startup_app.state::<AppState>();
-                        let cfg = state.config.read().await;
-                        crate::sharing::indexer::AllowlistOffers::new(
-                            &cfg.settings.pending_folder_allowlists,
-                        )
-                    };
-                    let hydrated_records = tokio::task::spawn_blocking(move || {
-                        hydration_records
-                            .into_iter()
-                            .filter(|record| {
-                                if record.file_path.is_empty()
-                                    || hydration_paths.contains(
-                                        &crate::search::index::normalize_path_key(
-                                            &record.file_path,
-                                        ),
-                                    )
-                                    || !commands::sharing::file_in_shared_folders(
-                                        &record.file_path,
-                                        &hydration_folders,
-                                    )
-                                    || hydration_refused.iter().any(|root| {
-                                        crate::security::path_within_dir(&record.file_path, root)
-                                    })
-                                {
-                                    return false;
-                                }
-                                // Discovery walks a partly shared folder's list
-                                // alone, so a record it does not offer is one
-                                // left by an earlier share of the folder, and
-                                // its flag in known.met may still say shared.
-                                if !hydration_allowlists.offers(&record.file_path) {
-                                    return false;
-                                }
-                                // Re-apply discovery's exclusions. Hydration
-                                // re-admits records without walking the tree, so
-                                // a record written before one of these rules
-                                // existed (the data-directory guard, `.bak`,
-                                // `.migration-tmp`) would otherwise come straight
-                                // back into the shared and announced index.
-                                let record_path = std::path::Path::new(&record.file_path);
-                                if crate::sharing::indexer::is_excluded_share_file_name(record_path)
-                                    || crate::sharing::indexer::under_private_receive_dir(
-                                        &hydration_folders,
-                                        record_path,
-                                    )
-                                    || crate::sharing::indexer::is_excluded_share_location(
-                                        record_path,
-                                    )
-                                {
-                                    return false;
-                                }
-                                // As known.met last saw it: its drive cannot
-                                // say otherwise until it is back, and the
-                                // first walk that reads it reconciles the rows.
-                                if hydration_unreachable
-                                    .iter()
-                                    .any(|root| crate::security::path_within_dir(&record.file_path, root))
-                                {
-                                    return true;
-                                }
-                                if !hydrate_paged {
-                                    return false;
-                                }
-                                let metadata = match std::fs::symlink_metadata(&record.file_path)
-                                {
-                                    Ok(metadata)
-                                        if metadata.file_type().is_file()
-                                            && !metadata.file_type().is_symlink() =>
-                                    {
-                                        metadata
-                                    }
-                                    _ => return false,
-                                };
-                                let modified_at = metadata
-                                    .modified()
-                                    .ok()
-                                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                                    .map(|duration| duration.as_secs() as i64)
-                                    .unwrap_or(0);
-                                metadata.len() == record.file_size
-                                    && modified_at == record.modified_at
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .await
-                    .unwrap_or_default();
-                    for record in hydrated_records {
-                        let record_path_key =
-                            crate::search::index::normalize_path_key(&record.file_path);
-                        if record.file_path.is_empty()
-                            || !commands::sharing::file_in_shared_folders(
-                                &record.file_path,
-                                &current_shared_folders,
-                            )
-                            || known_paths.contains(&record_path_key)
-                        {
-                            continue;
-                        }
-                        known_paths.insert(record_path_key);
-                        let hash = hex::encode(record.file_hash);
-                        let extension = std::path::Path::new(&record.file_path)
-                            .extension()
-                            .map(|extension| extension.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let folder = std::path::Path::new(&record.file_path)
-                            .parent()
-                            .map(|parent| parent.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        let hydrated = crate::types::FileInfo {
-                            id: hash.clone(),
-                            name: record.file_name.clone(),
-                            path: record.file_path.clone(),
-                            size: record.file_size,
-                            hash,
-                            aich_hash: record.aich_hash.clone(),
-                            ember_file_hash: record.ember_file_hash.clone(),
-                            extension,
-                            modified_at: record.modified_at,
-                            priority: storage::known_files::priority_u8_to_str(
-                                record.upload_priority,
-                            )
-                            .to_string(),
-                            requests: 0,
-                            accepted: 0,
-                            bytes_transferred: 0,
-                            alltime_requests: record.all_time_requested,
-                            alltime_accepted: record.all_time_accepted,
-                            alltime_transferred: record.all_time_transferred,
-                            complete_sources: record.complete_sources,
-                            folder,
-                            shared: storage::share_intent::effective_shared(
-                                &record.file_hash,
-                                record.is_shared,
-                            ),
-                            friends_only: record.friends_only,
-                            shared_kad: false,
-                            shared_ed2k: false,
-                            shared_ember: false,
-                        };
-                        // A hydrated row is a full member of the index — it is
-                        // served, searched and published like any other — so it
-                        // wants the same one-time repairs, and the discovery
-                        // loop above never saw it to ask. Leaving it out made a
-                        // paginated library's migration stall at page one: the
-                        // rows the cursor had not reached kept their empty AICH
-                        // root or digest until the user happened to trigger
-                        // enough reloads to cycle them back into a discovery
-                        // page, which on a library large enough to paginate is
-                        // exactly the user least likely to be doing that by
-                        // hand.
-                        //
-                        // Handing the whole library to the pass rather than one
-                        // page of it is affordable because the pass is not
-                        // paginated in the first place: it works at a duty
-                        // cycle, stands aside for real scans, checkpoints as it
-                        // goes and resumes where it stopped. Its cost is set by
-                        // the drives, not by how much is queued.
-                        all_discovered.push(hydrated);
-                    }
-                }
-
-                let (
-                    folder_priorities,
-                    pending_share_states,
-                    pending_file_priorities,
-                    pending_friends_only,
-                    pending_folder_allowlists,
-                ) = {
-                    let state = startup_app.state::<AppState>();
-                    let cfg = state.config.read().await;
-                    (
-                        cfg.settings.folder_priorities.clone(),
-                        cfg.settings.pending_share_states.clone(),
-                        cfg.settings.pending_file_priorities.clone(),
-                        cfg.settings.pending_friends_only.clone(),
-                        cfg.settings.pending_folder_allowlists.clone(),
-                    )
-                };
-                commands::sharing::apply_folder_allowlists(
-                    &mut all_discovered,
-                    &mut files_to_hash,
-                    &pending_folder_allowlists,
-                );
-                commands::sharing::withhold_unlisted_known_files(
-                    &mut all_discovered,
-                    &pending_folder_allowlists,
-                );
-                commands::sharing::apply_pending_intents(
-                    &mut all_discovered,
-                    &mut files_to_hash,
-                    &pending_share_states,
-                    &pending_file_priorities,
-                    &pending_friends_only,
-                );
-                {
-                    let mut index = index_clone.write().await;
-                    index.add_files(all_discovered.clone());
-                    // Apply each shared folder's default upload priority so
-                    // newly discovered files (files with no known.met record —
-                    // never seen before, or added while the app was closed)
-                    // inherit eMule-style per-directory priority. Restricted to
-                    // `new_paths` so this doesn't clobber a per-file priority
-                    // that was just restored from known.met above for a file
-                    // that was already known.
-                    for (folder, priority) in &folder_priorities {
-                        index.set_priority_under_folder_for_paths(folder, priority, &new_paths);
-                    }
-                    // An explicit priority selected while this path was
-                    // pending wins over its folder default — but only for
-                    // paths that are actually pending in THIS pass. Applying
-                    // the map index-wide would override the priority just
-                    // restored from known.met for already-hashed files (a
-                    // stale intent would make the user's later choice
-                    // permanently un-stickable across restarts).
-                    let pending_priority_paths: std::collections::HashSet<String> = files_to_hash
-                        .iter()
-                        .map(|f| crate::search::index::normalize_path_key(&f.path))
-                        .collect();
-                    for (path, priority) in &pending_file_priorities {
-                        if pending_priority_paths
-                            .contains(&crate::search::index::normalize_path_key(path))
-                        {
-                            index.set_file_priority_by_path(path, priority);
-                        }
-                    }
-                }
-                commands::sharing::refresh_file_cache(&index_clone, &csf).await;
-                // Every file known from last session is in the index now, with
-                // its hash; only new ones wait for hashing.
-                drop(library_loaded);
-                let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
-
-                let _ = startup_app.emit("shared-files-changed", serde_json::json!({
-                    "phase": "discovered",
-                    "count": all_discovered.len(),
-                }));
-
-                let total_to_hash = files_to_hash.len();
-                let mut hashed = 0usize;
-                let mut last_cache_refresh = std::time::Instant::now();
-                // Checkpoint recomputed hashes into known.met periodically so a
-                // long hash pass (notably the one-time AICH migration re-hash)
-                // resumes after a restart instead of starting from zero. Bounded
-                // by both elapsed time and file count so the loss window stays
-                // small whether files hash slowly (large) or quickly (many).
-                let mut last_known_met_persist = std::time::Instant::now();
-                let mut hashed_since_persist = 0usize;
-                let mut was_cancelled = cancelled_in_discovery;
-
-                // Same scheduler the folder-add and reload passes use: one read
-                // at a time per physical drive, more only where a drive has
-                // reported that its reads do not seek. A cold start on a
-                // library spread over several drives used to hash strictly one
-                // file at a time and leave every other drive idle — the same
-                // waste the reload path was fixed for, on the path that runs
-                // before anything else in the app works.
-                // Paced like the scans' progress: one event per file flooded
-                // the IPC bridge on a cold start of many small files.
-                let mut hash_progress = commands::sharing::HashProgressEmitter::new(&files_to_hash);
-                let mut pipeline = commands::sharing::HashLookahead::new(
-                    &files_to_hash,
-                    cancel_flag.clone(),
-                );
-                pipeline.log_plan("Startup hashing", total_to_hash);
-                // Every exit that cancels sets `was_cancelled` and breaks.
-                while !was_cancelled {
-                    let started = match pipeline.next_started() {
-                        commands::sharing::NextHash::Ready(started) => started,
-                        // Every drive with work left is busy with a read this
-                        // pass did not start, most likely a download verifying
-                        // itself. Wait rather than pile on, and never mistake
-                        // it for the end of the queue.
-                        commands::sharing::NextHash::Busy => {
-                            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                                was_cancelled = true;
-                                break;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            continue;
-                        }
-                        commands::sharing::NextHash::Done => break,
-                    };
-                    if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                        info!("Startup hashing cancelled at {hashed}/{total_to_hash}");
-                        was_cancelled = true;
-                        // Claimed and already running: hand it to the drain or
-                        // its claim outlives the scan.
-                        pipeline.drain_started(started);
-                        break;
-                    }
-
-                    let file = &files_to_hash[started.index];
-                    let file_temp_id = file.id.clone();
-                    let hash_claim = started.claim;
-                    let mut hash_task = started.task;
-
-                    tracing::debug!("Startup hashing {}/{}: {}", hashed + 1, total_to_hash, file.name);
-
-                    hash_progress.emit(&startup_app, hashed + 1, total_to_hash, &file.name);
-
-                    let hash_result = commands::sharing::await_hash(
-                        &mut hash_task,
-                        &started.progress,
-                        &file.path,
-                        hash_claim,
-                    )
-                    .await;
-
-                    match hash_result {
-                        Ok(Ok(Ok((
-                            ed2k_hash,
-                            aich_hash,
-                            part_hashes,
-                            ember_file_hash,
-                            hashed_size,
-                            hashed_modified_at,
-                        )))) => {
-                            tracing::debug!("Startup hash complete: {} -> {}", file.name, &ed2k_hash[..ed2k_hash.len().min(8)]);
-                            let mut updated = file.clone();
-                            updated.id = ed2k_hash.clone();
-                            updated.hash = ed2k_hash;
-                            updated.aich_hash = aich_hash;
-                            updated.ember_file_hash = ember_file_hash;
-                            updated.size = hashed_size;
-                            updated.modified_at = hashed_modified_at;
-                            commands::sharing::restore_known_hash_flags(&mut updated, &known_list);
-                            let still_shared = {
-                                let state = startup_app.state::<AppState>();
-                                let cfg = state.config.read().await;
-                                commands::sharing::file_in_shared_folders(&updated.path, &cfg.settings.shared_folders)
-                            };
-                            // Keep the combined-pass handoff only after the
-                            // completed row is committed. A cancellation can
-                            // remove the pending row after hashing, leaving no
-                            // reconciliation path to drain an early insert.
-                            let fresh_handoff = still_shared
-                                .then(|| {
-                                    commands::sharing::fresh_part_hash_handoff(
-                                        &updated.hash,
-                                        part_hashes,
-                                    )
-                                })
-                                .flatten();
-                            let finalized = {
-                                let mut idx = index_clone.write().await;
-                                if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) && still_shared {
-                                    // Keep any explicit share/priority choice
-                                    // made while this row was pending. A
-                                    // removed pending row must not return just
-                                    // because its hash computation finished.
-                                    idx.finalize_pending_hash(&file_temp_id, updated.clone()).is_some()
-                                } else if still_shared {
-                                    // Cancelled. A re-hash row is already
-                                    // servable and keeps its place; only an
-                                    // unhashed row is discarded.
-                                    idx.abandon_hash_placeholder(&file_temp_id);
-                                    false
-                                } else {
-                                    // No longer under a shared folder, so the
-                                    // row goes whatever kind it is.
-                                    idx.remove_file_by_id(&file_temp_id);
-                                    false
-                                }
-                            };
-                            commands::sharing::cache_fresh_part_hash_handoff(
-                                &startup_fresh_part_hashes,
-                                finalized,
-                                fresh_handoff,
-                            )
-                            .await;
-                            if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) && still_shared {
-                                hashed += 1;
-                            }
-                            if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
-                                && still_shared
-                                && last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5)
-                            {
-                                commands::sharing::refresh_file_cache(&index_clone, &csf).await;
-                                last_cache_refresh = std::time::Instant::now();
-                            }
-                            // Fold freshly hashed AICH roots into known.met so an
-                            // interrupted pass resumes where it left off. A
-                            // SharedFilesChanged reconcile copies the index's new
-                            // roots into the network task's known.met (preserving
-                            // cumulative counters); its periodic + shutdown save
-                            // then flush them to disk.
-                            if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
-                                && still_shared
-                            {
-                                hashed_since_persist += 1;
-                                if hashed_since_persist >= 500
-                                    || last_known_met_persist.elapsed()
-                                        >= std::time::Duration::from_secs(30)
-                                {
-                                    if reconcile_shared_files(&net_tx).await {
-                                        last_known_met_persist = std::time::Instant::now();
-                                        hashed_since_persist = 0;
-                                    }
-                                }
-                            }
-                            commands::sharing::release_in_flight_hash(&file.path, hash_claim);
-                        }
-                        Ok(Ok(Err(e))) => {
-                            if commands::sharing::is_hash_cancellation(&e, &cancel_flag) {
-                                info!("Startup hashing cancelled mid-file");
-                                was_cancelled = true;
-                                let mut idx = index_clone.write().await;
-                                idx.abandon_hash_placeholder(&file_temp_id);
-                                drop(idx);
-                                commands::sharing::release_in_flight_hash(&file.path, hash_claim);
-                                break;
-                            }
-                            tracing::warn!("Startup hash failed for {}: {e}", file.name);
-                            let mut idx = index_clone.write().await;
-                            idx.abandon_hash_placeholder(&file_temp_id);
-                            drop(idx);
-                            commands::sharing::release_in_flight_hash(&file.path, hash_claim);
-                        }
-                        Ok(Err(e)) => {
-                            tracing::error!("Startup hash task panicked for {}: {e}", file.name);
-                            let mut idx = index_clone.write().await;
-                            idx.abandon_hash_placeholder(&file_temp_id);
-                            drop(idx);
-                            commands::sharing::release_in_flight_hash(&file.path, hash_claim);
-                        }
-                        Err(commands::sharing::HashStalled) => {
-                            // One stuck file must not end the scan. Cancelling the
-                            // whole pass here and dropping the pending rows made
-                            // every file after this one silently un-indexed, and
-                            // it recurred on every launch because the queue is
-                            // walked in a stable order — the same failure the
-                            // "leaving pending for retry" behaviour was written to
-                            // prevent. Leave the row pending and move on.
-                            tracing::warn!(
-                                "Startup hash of {} read nothing for {} min (file may be on cloud storage or locked); leaving pending for retry",
-                                file.name,
-                                commands::sharing::HASH_STALL_TIMEOUT.as_secs() / 60
-                            );
-                            // Drain the abandoned blocking hash and release its
-                            // claim only once it really ends. It must hold no
-                            // scan lease: the read may be stuck in the kernel
-                            // where the cancel flag cannot reach it, and holding
-                            // the coordination/scan guards across that wait
-                            // would block every later reload and stall shutdown
-                            // for the rest of the session.
-                            let timed_out_name = file.name.clone();
-                            let timed_out_path = file.path.clone();
-                            // Keep the drive spoken for until the abandoned
-                            // read really ends; otherwise the look-ahead sees
-                            // the device as free and stacks another read on
-                            // top of the one still running.
-                            let orphan_device = sharing::disk::note_external_read_for_key(
-                                pipeline.device_key(started.device),
-                            );
-                            tokio::spawn(async move {
-                                let _orphan_device = orphan_device;
-                                if let Err(error) = hash_task.await {
-                                    tracing::warn!(
-                                        "Timed-out startup hash task for {timed_out_name} failed while draining: {error}"
-                                    );
-                                }
-                                commands::sharing::release_in_flight_hash(
-                                    &timed_out_path,
-                                    hash_claim,
-                                );
-                            });
-                            continue;
-                        }
-                    }
-                }
-                // Cancelling leaves the look-ahead window full of claimed,
-                // still-running hashes; hand them off to drain rather than
-                // stranding their claims for the length of the lease.
-                pipeline.abandon();
-                // A file another pass still held was never hashed here, so this
-                // page is unfinished and nothing may be reconciled away on the
-                // strength of it. One that failed or stalled is retried by the
-                // next walk of the page; see the reload loop.
-                let page_complete = pipeline.skipped() == 0;
-
-                {
-                    let mut idx = index_clone.write().await;
-                    if was_cancelled {
-                        idx.remove_pending_files();
-                    }
-                    idx.rebuild();
-                }
-
-                if !was_cancelled && page_complete {
-                    let app_state = startup_app.state::<AppState>();
-                    // Startup always rescans page 1, so its cursor must never
-                    // move a reload's further-advanced cursor backward.
-                    match commands::sharing::persist_scan_cursors(
-                        &app_state,
-                        &startup_cursor_updates,
-                        true,
-                    )
-                    .await
-                    {
-                        // The later pages came back from known.met, which has
-                        // nothing added to them while Ember was closed; only a
-                        // walk finds that. Queued like a reload's own pages.
-                        Ok(()) if startup_cursor_updates.values().any(Option::is_some) => {
-                            commands::sharing::schedule_chained_scan_page(
-                                startup_app.clone(),
-                                commands::sharing::MAX_CHAINED_SCAN_PAGES - 1,
-                            )
-                            .await;
-                        }
-                        Ok(()) => {}
-                        Err(error) => tracing::warn!(
-                            "Startup shared-folder pages were indexed but scan cursors were not saved: {error}"
-                        ),
-                    }
-                }
-                commands::sharing::refresh_file_cache(&index_clone, &csf).await;
-
-                if !was_cancelled {
-                    let all_hashed: Vec<_> = index_clone.read().await.all_files().iter()
-                        .filter(|f| !f.hash.is_empty())
-                        .cloned()
-                        .collect();
-                    if !all_hashed.is_empty() {
-                        if let Err(e) = net_tx.send(network::NetworkCommand::AnnounceFiles { files: all_hashed }).await {
-                            tracing::warn!("Failed to send initial file announcement: {e}");
-                        }
-                    }
-                }
-
-                drop(scan_guard);
-                startup_cancel_flags.write().await.remove("__startup__");
-                if !reconcile_shared_files(&net_tx).await {
-                    tracing::warn!("Startup shared-file reconciliation failed");
-                } else if !was_cancelled {
-                    // known.met now owns everything hashed this pass — sweep
-                    // handed-off (or stale pre-fix) pending intents so they
-                    // can't re-apply share/priority flips on a later rehash.
-                    let app_state = startup_app.state::<AppState>();
-                    commands::sharing::prune_pending_intents_for_hashed(&app_state).await;
-                }
-                if !was_cancelled {
-                    // Last, and only once the scan has let go of the drives.
-                    commands::sharing::queue_hash_top_up(
-                        startup_app.clone(),
-                        &all_discovered,
-                    )
-                    .await;
-                }
-                let _ = startup_app.emit("file-hash-progress", serde_json::json!({
-                    "current": total_to_hash,
-                    "total": total_to_hash,
-                    "file_name": "",
-                    "done": true,
-                }));
-                let from_known = all_discovered.len().saturating_sub(total_to_hash);
-                info!(
-                    "Indexed {} files from {} shared folders ({} from known.met, {} hashed)",
-                    index_clone.read().await.file_count(),
-                    shared_folders.len(),
-                    from_known,
-                    hashed,
-                );
-            });
-            {
-                let state = app_handle.state::<AppState>();
-                tauri::async_runtime::handle()
-                    .block_on(state.register_background_scan(startup_scan_handle));
-            }
-
-            let net_handle = app_handle.clone();
-            let net_index = local_index.clone();
-            let net_fresh_part_hashes = fresh_part_hashes.clone();
-            let net_db = db.clone();
-            let net_transfers = transfer_manager.clone();
-            let net_bw = bandwidth_limiter.clone();
-            let bw_limiter = bandwidth_limiter.clone();
-            let bw_shutdown_spawn = bw_shutdown.clone();
-            let bw_rtt = uss_rtt_queue.clone();
-            let bw_uss_flag = uss_enabled_flag.clone();
-            let net_spam = spam_filter.clone();
-            let net_comments = comment_manager.clone();
-            let net_identity = identity.clone();
-            let net_security_policy = security_policy.clone();
-            let net_handle_err = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                // `catch_unwind` because a panic here is not survivable in the
-                // way an `Err` is: it unwinds straight past the reporting below,
-                // so the UI is never told and every later poll keeps succeeding
-                // off the last cached snapshot. The user sees a frozen-but-
-                // plausible network view instead of an error. Release builds set
-                // `overflow-checks`, and this loop does arithmetic on lengths and
-                // offsets taken from ed2k, KAD and Ember frames, so an overflow
-                // panic on hostile input is exactly the case to contain.
-                let outcome = std::panic::AssertUnwindSafe(network::start_network(
-                    network::NetworkDeps {
-                        app_handle: net_handle,
-                        cmd_rx: network_rx,
-                        settings,
-                        identity: net_identity,
-                        security_policy: net_security_policy,
-                        local_index: net_index,
-                        fresh_part_hashes: net_fresh_part_hashes,
-                        db: net_db,
-                        orphan_disposal,
-                        transfer_manager: net_transfers,
-                        bandwidth_limiter: net_bw,
-                        shared_peers: cached_peers_net,
-                        shared_stats: cached_stats_net,
-                        shared_contacts: cached_contacts_net,
-                        shared_searches: cached_searches_net,
-                        shared_servers: cached_servers_net,
-                        shared_connected_server: cached_connected_server_net,
-                        shared_transfer_stats: cached_transfer_stats_net,
-                        shared_files: cached_shared_files_net,
-                        upload_shared_folders,
-                        friend_hashes,
-                        mutual_friend_hashes,
-                        uss_rtt_queue,
-                        uss_enabled_flag,
-                        spam_filter: net_spam,
-                        comment_manager: net_comments,
-                    },
-                ))
-                .catch_unwind()
-                .await;
-                match outcome {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!("Network error: {e}");
-                        // The full error chain can contain IPs, peer IDs, paths,
-                        // and low-level socket diagnostics we don't want to leak
-                        // to the UI (it's shown verbatim). Log the rich version
-                        // for diagnostics and send a redacted, user-facing summary.
-                        let redacted = crate::security::redact_fatal_error(&e);
-                        let _ = net_handle_err.emit("network-fatal-error", redacted);
-                    }
-                    Err(_panic) => {
-                        // Location and payload are already in the log via the
-                        // panic hook installed at startup; the payload itself can
-                        // carry peer data, so it is not forwarded to the UI.
-                        tracing::error!(
-                            "Network task panicked; networking is stopped until restart"
-                        );
-                        let _ = net_handle_err.emit(
-                            "network-fatal-error",
-                            crate::commands::errors::coded(
-                                "network_task_panicked",
-                                "The network service stopped unexpectedly. \
-                                 Restart Ember to reconnect; see logs for details.",
-                            ),
-                        );
-                    }
-                }
-                shutdown_complete_net.store(true, std::sync::atomic::Ordering::Release);
-            });
-            // Same containment as the network task above, and for the same
-            // reason: the release profile enables `overflow-checks`, so
-            // arithmetic reachable from a configured limit or a peer-fed RTT
-            // sample panics rather than wrapping. Uncontained, that panic drops
-            // `RefillAliveGuard`, which flips `refill_alive` so every
-            // `acquire_upload`/`acquire_download` caller aborts its transfer —
-            // the whole session's rate-limited traffic, with nothing in the UI
-            // to explain it. The guard still does its job here; this just adds
-            // the log line and the user-facing notice that were missing.
-            let refill_handle = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let outcome = std::panic::AssertUnwindSafe(bandwidth::limiter::start_token_refill(
-                    bw_limiter,
-                    bw_shutdown_spawn,
-                    bw_rtt,
-                    bw_uss_flag,
-                ))
-                .catch_unwind()
-                .await;
-                if outcome.is_err() {
-                    // Payload withheld for the same reason as the network task.
-                    tracing::error!(
-                        "Token refill task panicked; rate-limited transfers are stopped until restart"
-                    );
-                    let _ = refill_handle.emit(
-                        "network-fatal-error",
-                        crate::commands::errors::coded(
-                            "bandwidth_refill_panicked",
-                            "Bandwidth limiting stopped unexpectedly. \
-                             Restart Ember to resume limited transfers; see logs for details.",
-                        ),
-                    );
-                }
-            });
-
-            // Files new to a shared folder, tagged `[Ember-P2P]` when the user
-            // asked for that. Polled rather than hooked into each hashing pass:
-            // startup, folder adds, rescans and the watcher all add files, and
-            // one sweep over the index covers every one of them.
-            let tag_handle = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                let mut tick = tokio::time::interval(commands::sharing::IMPORT_TAG_INTERVAL);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let mut seen: commands::sharing::NameTagSeenCache = None;
-                loop {
-                    tick.tick().await;
-                    let Some(state) = tag_handle.try_state::<AppState>() else {
-                        continue;
-                    };
-                    commands::sharing::tag_new_shared_imports(&tag_handle, &state, &mut seen).await;
-                }
-            });
-
-            info!("Ember P2P application started");
-            Ok(())
-        })
+        .setup(|app| setup(app.handle()))
         .invoke_handler({
-            macro_rules! ember_invoke_handler {
-                ($($harness:path),* $(,)?) => {
-                    tauri::generate_handler![
-            commands::backup::export_backup,
-            commands::backup::pick_backup_file,
-            commands::backup::clear_picked_backup,
-            commands::backup::preview_backup,
-            commands::backup::import_backup,
-            commands::backup::pending_restore_status,
-            commands::backup::discard_pending_restore,
-            commands::backup::take_pending_restored_prefs,
-            commands::search::search_files,
-            commands::search::plan_related_search,
-            commands::search::related_search_supported,
-            commands::search::cancel_search,
-            commands::search::search_more,
-            commands::search::find_notes,
-            commands::search::find_sources,
-            commands::search::publish_note,
-            commands::search::format_ed2k_link,
-            commands::search::format_ed2k_links,
-            commands::search::build_ed2k_link,
-            commands::search::parse_ed2k_link,
-            commands::search::parse_ed2k_links,
-            commands::search::mark_spam,
-            commands::search::mark_not_spam,
-            commands::search::undo_mark_spam,
-            commands::search::get_spam_stats,
-            commands::search::explain_spam_result,
-            commands::search::reset_spam_filter,
-            commands::search::rescore_search_results,
-            commands::search::get_download_history,
-            commands::search::get_download_history_stats,
-            commands::search::clear_download_history,
-            commands::search::remove_download_history_entry,
-            commands::transfers::start_download,
-            commands::transfers::pause_transfers_batch,
-            commands::transfers::resume_transfers_batch,
-            commands::transfers::stop_transfers_batch,
-            commands::transfers::take_pending_download_overflow_notice,
-            commands::transfers::cancel_transfers_batch,
-            commands::transfers::pause_transfer,
-            commands::transfers::resume_transfer,
-            commands::transfers::remove_transfer,
-            commands::transfers::get_transfers,
-            commands::transfers::get_transfers_since,
-            commands::transfers::get_upload_queue,
-            commands::transfers::get_download_file_details,
-            commands::transfers::get_known_clients,
-            commands::transfers::get_known_client_counts,
-            commands::transfers::clear_completed,
-            commands::transfers::get_transfer_sources,
-            commands::transfers::set_transfer_priority,
-            commands::transfers::move_transfers_in_queue,
-            commands::transfers::get_download_queue_ids,
-            commands::transfers::set_transfers_category,
-            commands::transfers::rename_transfer,
-            commands::transfers::add_transfer_web_sources,
-            commands::transfers::set_preview_priority,
-            commands::transfers::stop_transfer,
-            commands::transfers::open_file,
-            commands::transfers::open_transfer_file_location,
-            commands::transfers::open_downloads_folder,
-            commands::transfers::recover_archive,
-            commands::sharing::pick_shared_folder,
-            commands::share_browser::open_share_browser,
-            commands::share_browser::list_share_browser_children,
-            commands::share_browser::navigate_share_browser,
-            commands::share_browser::share_browser_selection,
-            commands::share_browser::measure_share_browser_entries,
-            commands::share_browser::close_share_browser,
-            commands::chat_attachments::pick_and_send_chat_attachment,
-            commands::chat_attachments::respond_chat_attachment,
-            commands::chat_attachments::cancel_chat_attachment,
-            commands::chat_attachments::retry_chat_attachment,
-            commands::settings::set_friend_overrides,
-            commands::settings::set_friend_status,
-            commands::chat_attachments::list_chat_attachments,
-            commands::chat_attachments::open_chat_attachment,
-            commands::chat_attachments::open_chat_files_folder,
-            commands::channels::open_channel_files_folder,
-            commands::chat_window::open_chat_window,
-            commands::chat_window::close_chat_window,
-            commands::chat_window::focus_main_window,
-            commands::sharing::confirm_dropped_folders,
-            commands::sharing::dismiss_dropped_folders,
-            commands::sharing::remove_shared_folder,
-            commands::sharing::library_hashes_among,
-            commands::sharing::get_shared_files_if_changed,
-            commands::sharing::get_shared_file_count,
-            commands::sharing::library_has_hashes,
-            commands::sharing::get_shared_folders,
-            commands::sharing::get_unapproved_shared_folders,
-            commands::sharing::reapprove_shared_folder,
-            commands::sharing::reapprove_shared_folders,
-            commands::sharing::get_file_media_metadata,
-            commands::sharing::get_folder_priorities,
-            commands::sharing::set_folder_priority,
-            commands::sharing::set_file_priority,
-            commands::sharing::batch_set_priority,
-            commands::sharing::batch_unshare,
-            commands::sharing::share_library_files,
-            commands::sharing::set_files_friends_only,
-            commands::sharing::reload_shared_files,
-            commands::sharing::unshare_file,
-            commands::sharing::unshare_folder,
-            commands::sharing::get_scan_status,
-            commands::sharing::get_hashing_paused,
-            commands::sharing::get_library_scan_truncated,
-            commands::sharing::stop_hashing,
-            commands::sharing::preview_stop_hashing,
-            commands::sharing::hash_top_up_status,
-            commands::sharing::resume_hashing,
-            commands::sharing::open_shared_file,
-            commands::sharing::resolve_media_asset_path,
-            commands::sharing::open_shared_folder,
-            commands::sharing::open_library_folder,
-            commands::sharing::move_files_to_category,
-            commands::sharing::rename_library_file,
-            commands::sharing::tag_library_files,
-            commands::sharing::restore_library_file_names,
-            commands::transfers::delete_finished_downloads,
-            commands::sharing::delete_shared_file,
-            commands::sharing::republish_file,
-            commands::sharing::scan_missing_files,
-            commands::sharing::remove_missing_files,
-            commands::peers::get_network_stats,
-            commands::peers::ban_peer,
-            commands::peers::unban_peer,
-            commands::peers::get_banned_peers,
-            commands::peers::add_friend,
-            commands::peers::remove_friend,
-            commands::peers::block_friend,
-            commands::peers::unblock_friend,
-            commands::peers::get_blocked_friends,
-            commands::peers::get_friends,
-            commands::peers::update_friend_nickname,
-            commands::peers::get_my_ember_hash,
-            commands::peers::reset_friend_code,
-            commands::peers::send_chat_message,
-            commands::peers::discard_failed_chat_message,
-            commands::peers::delete_chat_history,
-            commands::peers::delete_chat_message,
-            commands::peers::get_chat_messages,
-            commands::peers::is_chat_locked,
-            commands::peers::mark_messages_read,
-            commands::peers::send_chat_typing,
-            commands::peers::get_unread_message_counts,
-            commands::peers::offer_file_to_friend,
-            commands::peers::get_friend_requests,
-            commands::peers::accept_friend_request,
-            commands::peers::reject_friend_request,
-            commands::peers::browse_friend,
-            commands::peers::cancel_browse_friend,
-            commands::peers::retry_friend_search,
-            commands::peers::is_friend_discoverable,
-            commands::peers::get_online_friends,
-            commands::peers::get_friend_statuses,
-            commands::peers::get_idle_away,
-            commands::peers::kad_connect,
-            commands::peers::kad_bootstrap_ip,
-            commands::peers::kad_bootstrap_url,
-            commands::peers::kad_bootstrap_clients,
-            commands::peers::kad_recheck_firewall,
-            commands::connection_doctor::run_connection_check,
-            commands::connection_doctor::connection_doctor_action,
-            commands::peers::get_kad_contacts,
-            commands::peers::get_kad_searches,
-            commands::peers::kad_cancel_search,
-            commands::peers::get_peer_reputation_batch,
-            commands::peers::get_reputation_stats,
-            commands::peers::get_ember_diagnostics,
-            commands::peers::get_ember_dht_contacts,
-            commands::peers::get_ember_dht_searches,
-            commands::peers::get_ember_dht_store,
-            $($harness,)*
-            commands::channels::list_channels,
-            commands::channels::dismiss_channel_newer_lines,
-            commands::channel_recovery::recover_owned_channels,
-            commands::channels::create_channel,
-            commands::channels::join_channel,
-            commands::channels::enter_channel,
-            commands::channels::leave_channel,
-            commands::channels::forget_channel,
-            commands::channels::claim_channel_username,
-            commands::channels::rotate_channel_room_key,
-            commands::channels::set_channel_invite_policy,
-            commands::channels::set_channel_slow_mode,
-            commands::channels::set_channel_announce_only,
-            commands::channels::set_channel_language,
-            commands::channels::set_channel_message_pinned,
-            commands::channels::get_channel_pins,
-            commands::channels::delete_owned_channel,
-            commands::channels::list_rooms_deleted_elsewhere,
-            commands::channels::confirm_room_deleted_elsewhere,
-            commands::room_dm::list_room_dm_threads,
-            commands::room_dm::get_room_dm_messages,
-            commands::room_dm::send_room_dm,
-            commands::room_dm::answer_room_dm_request,
-            commands::room_dm::mark_room_dm_read,
-            commands::room_dm::delete_room_dm_thread,
-            commands::room_dm::drop_room_dm_request,
-            commands::room_dm::retry_room_dm,
-            commands::room_dm::set_ignored_members,
-            commands::feeds::list_my_feeds,
-            commands::feeds::create_feed,
-            commands::feeds::set_feed_details,
-            commands::feeds::set_feed_listed,
-            commands::feeds::set_feed_items,
-            commands::feeds::add_feed_items,
-            commands::feeds::publish_feed,
-            commands::feeds::delete_feed,
-            commands::feeds::list_followed_feeds,
-            commands::feeds::follow_feed,
-            commands::feeds::refresh_feed,
-            commands::feeds::get_feed_items,
-            commands::feeds::mark_feed_read,
-            commands::feeds::set_feed_auto_download,
-            commands::feeds::download_feed_items,
-            commands::feeds::cancel_feed_download,
-            commands::feeds::unfollow_feed,
-            commands::feeds::open_feed_folder,
-            commands::feeds::open_feed_files_folder,
-            commands::feeds::open_feed_item,
-            commands::feeds::show_feed_item,
-            commands::feed_discover::discover_feeds,
-            commands::feed_discover::cached_discovered_feeds,
-            commands::feed_discover::set_discovered_feed_hidden,
-            commands::feed_discover::hidden_discovered_feed_count,
-            commands::feed_discover::clear_hidden_discovered_feeds,
-            commands::channels::get_channel_invite,
-            commands::channels::list_channel_members,
-            commands::channels::channel_presence_config,
-            commands::channels::set_channel_focus,
-            commands::channels::get_channel_messages,
-            commands::channels::search_channel_messages,
-            commands::channels::delete_channel_message,
-            commands::channels::edit_channel_message,
-            commands::channels::set_channel_message_reaction,
-            commands::channels::send_channel_typing,
-            commands::channels::get_channel_reactions,
-            commands::channels::send_channel_message,
-            commands::channels::mark_channel_messages_read,
-            commands::channels::get_channel_draft,
-            commands::channels::set_channel_draft,
-            commands::channels::gather_channels,
-            commands::channels::cached_channels,
-            commands::channels::update_channel_moderation,
-            commands::channels::rename_channel,
-            commands::channels::ban_channel_member,
-            commands::channels::unban_channel_member,
-            commands::channels::add_channel_moderator,
-            commands::channels::remove_channel_moderator,
-            commands::channels::transfer_channel_ownership,
-            commands::channels::set_channel_successor_nominee,
-            commands::channels::claim_channel_ownership,
-            commands::channels::channel_member_friend_code,
-            commands::channels::pick_and_offer_channel_transfer,
-            commands::channels::respond_channel_transfer,
-            commands::channels::cancel_channel_transfer,
-            commands::channels::send_channel_transfer_standard_offer,
-            commands::channels::list_channel_transfers,
-            commands::settings::get_settings,
-            commands::settings::get_launch_settings,
-            commands::settings::update_settings,
-            commands::settings::pick_download_folder,
-            commands::settings::pick_preview_player,
-            commands::emule_import::detect_emule_installs,
-            commands::emule_import::pick_emule_folder,
-            commands::emule_import::preview_emule_import,
-            commands::emule_import::stage_emule_import,
-            commands::emule_import::discard_emule_import,
-            commands::emule_import::pending_emule_import,
-            commands::emule_import::get_emule_import_report,
-            commands::settings::download_nodes_dat,
-            commands::settings::download_ipfilter,
-            commands::settings::hide_to_tray,
-            commands::settings::quit_app,
-            commands::settings::quit_flush_pending,
-            commands::settings::finish_requested_quit,
-            commands::settings::set_pending_undo,
-            commands::settings::set_close_behavior,
-            commands::settings::set_quick_limits,
-            commands::settings::take_pending_close_request,
-            commands::settings::take_pending_ember_default_on_notice,
-            commands::settings::take_pending_restore_failed_notice,
-            commands::settings::take_pending_restore_expired_notice,
-            commands::settings::take_pending_restore_download_folder_notice,
-            commands::settings::take_pending_known_met_notice,
-            commands::settings::open_ember_link,
-            commands::settings::open_release_notes,
-            commands::settings::open_support_page,
-            commands::settings::get_ember_website_url,
-            commands::settings::open_ember_share,
-            commands::settings::open_external_url,
-            commands::settings::open_web_service,
-            commands::settings::pick_and_import_webservices_file,
-            commands::settings::get_example_web_service,
-            commands::settings::get_log_folder_path,
-            commands::settings::open_log_folder,
-            commands::security::get_security_policy_state,
-            commands::security::acknowledge_security_policy_reset,
-            commands::security::get_ip_filter_stats,
-            commands::security::add_ip_filter_range,
-            commands::security::remove_ip_filter_range,
-            commands::security::set_ip_filter_enabled,
-            commands::security::set_block_private_ips,
-            commands::security::set_ip_filter_auto_update,
-            commands::security::get_ip_filter_update_info,
-            commands::security::download_and_load_ipfilter,
-            commands::security::update_ipfilter_from_url,
-            commands::security::pick_and_import_ipfilter_file,
-            commands::security::get_antileech_patterns,
-            commands::security::set_antileech_patterns,
-            commands::security::set_antileech_enabled,
-            commands::security::reset_antileech_to_defaults,
-            commands::server::connect_to_server,
-            commands::server::disconnect_server,
-            commands::server::add_server,
-            commands::server::remove_server,
-            commands::server::set_server_static,
-            commands::server::set_server_priority,
-            commands::server::get_server_list,
-            commands::server::get_connected_server,
-            commands::server::get_last_server,
-            commands::server::get_server_log,
-            commands::server::clear_server_log,
-            commands::server::download_server_met,
-            commands::comments::set_file_comment,
-            commands::comments::get_file_comments,
-            commands::statistics::get_statistics,
-            commands::collections::pick_and_load_collection,
-            commands::collections::create_collection_with_dialog,
-            commands::collections::download_collection_files,
-            commands::preview::preview_file,
-            commands::speed_test::run_speed_test,
-            commands::system::show_notification,
-            commands::system::get_runtime_status,
-            commands::system::read_clipboard_text,
-            commands::system::write_clipboard_text,
-            commands::system::identity_keyring_fallback,
-            commands::system::ui_ping,
-            commands::system::log_ui_stall,
-            commands::deeplink::list_pending_deep_links,
-            commands::deeplink::ack_pending_deep_link,
-            commands::deeplink::preview_deep_link,
-            commands::deeplink::open_pending_collection,
-            commands::updater::secure_updater_check,
-            commands::updater::get_last_update_check_result,
-            commands::updater::secure_updater_install,
-            commands::updater::secure_updater_handoff_status,
-            commands::updater::secure_updater_run_saved_installer,
-            auto_update::resume::submit_resume_ui_snapshot,
-            auto_update::resume::take_update_resume_ui,
-            auto_update::silent::get_silent_update_status,
-            auto_update::silent::silent_update_now,
-            auto_update::silent::silent_update_postpone,
-            auto_update::silent::silent_update_skip,
-            auto_update::silent::silent_update_resume,
-            auto_update::silent::note_user_activity,
-            auto_update::silent::take_update_outcome,
-            finish_action::get_finish_action,
-            finish_action::set_finish_action,
-            finish_action::cancel_finish_action,
-            finish_action::run_finish_action_now,
-            tray::set_tray_labels,
-                    ]
-                };
+            // Names the handler's type, which passing it straight to
+            // `invoke_handler` used to supply.
+            fn typed<F: Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static>(handler: F) -> F {
+                handler
             }
             // Harness-only commands, reachable by hand from devtools and never
             // called by the UI. They dial arbitrary peers and ask them for
@@ -2824,25 +607,10 @@ pub fn run() {
             // callable IPC. `ember_ping_peer` and `ember_request_sources` were
             // registered unconditionally while the rest of this list was
             // already gated; that was an oversight rather than a decision.
-            // Names the handler's type, which passing it straight to
-            // `invoke_handler` used to supply.
-            fn typed<F: Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static>(handler: F) -> F {
-                handler
-            }
             #[cfg(debug_assertions)]
-            let handler = typed(ember_invoke_handler![
-                commands::peers::ember_ping_peer,
-                commands::peers::ember_request_sources,
-                commands::peers::add_ember_dht_contact,
-                commands::peers::ember_dht_ping_peer,
-                commands::peers::ember_dht_find_node,
-                commands::peers::ember_dht_iterative_find_node,
-                commands::peers::ember_dht_publish_keyword,
-                commands::peers::ember_dht_find_value,
-                commands::peers::ember_dht_run_maintenance,
-            ]);
+            let handler = typed(command_table::desktop_handler!(harness));
             #[cfg(not(debug_assertions))]
-            let handler = typed(ember_invoke_handler![]);
+            let handler = typed(command_table::desktop_handler!());
             // App commands are not covered by the capability files, so the
             // chat window could otherwise call every one of them.
             move |invoke: tauri::ipc::Invoke| {
@@ -2917,7 +685,7 @@ pub fn run() {
                 }
                 if !paths.is_empty() {
                     let app_handle = window.app_handle().clone();
-                    tauri::async_runtime::spawn(async move {
+                    crate::host::async_runtime::spawn(async move {
                         commands::sharing::share_dropped_paths(app_handle, paths).await;
                     });
                 }
@@ -3040,8 +808,1983 @@ pub fn run() {
                 // runtime, and the process is torn down the moment this
                 // returns — block here until the teardown has finished
                 // flushing rather than letting it race the exit.
-                tauri::async_runtime::handle()
+                crate::host::async_runtime::handle()
                     .block_on(run_graceful_shutdown(app_handle, SHUTDOWN_WAIT));
             }
         });
+}
+
+/// `emberd`'s `main`: Ember with no window, used from a web browser.
+#[cfg(feature = "server")]
+pub fn emberd_main() -> i32 {
+    server::main()
+}
+
+/// What both the desktop app and `emberd` do before anything else: the async
+/// runtime, TLS, the data folder, logging and the panic hook. The guard
+/// flushes the log file; keep it for the life of the process.
+pub(crate) fn init_process() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    // Give async tasks a larger worker-thread stack than tokio's 2 MiB default.
+    //
+    // Ember drives several very large async state machines — the multi-source
+    // download loop, the per-peer message loops, and the central network
+    // `select!` loop. In debug builds these compile to deep, unboxed poll
+    // chains whose combined stack frames sit close to the 2 MiB limit, and
+    // small additions have overflowed it (STATUS_STACK_OVERFLOW) right as a
+    // download starts. Build our own multi-thread runtime with a roomier stack
+    // and hand its handle to Tauri *before* anything spawns (the first spawn
+    // happens in `.setup`, and `async_runtime::set` panics if the runtime was
+    // already initialized). The runtime is intentionally leaked: Tauri requires
+    // the underlying Tokio runtime to outlive the app, and it lives for the
+    // whole process regardless.
+    let rt = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(8 * 1024 * 1024)
+            .build()
+            .expect("failed to build Tokio runtime"),
+    ));
+    crate::host::async_runtime::set(rt.handle().clone());
+
+    // Install the process-wide rustls CryptoProvider before *anything*
+    // can do TLS. Multiple crates in this app speak rustls 0.23
+    // (`quinn`, `tokio-tungstenite`, `reqwest`) and 0.23 deliberately
+    // refuses to pick a default automatically — any code path that
+    // doesn't pass an explicit provider will panic with:
+    //   "Could not automatically determine the process-level
+    //    CryptoProvider from Rustls crate features."
+    // QUIC is fine because `quic.rs::build_{server,client}_config`
+    // pass `builder_with_provider(...)` explicitly, but the WS client
+    // used by `connect_server_relay` (every LowID-to-LowID relay
+    // fallback) goes through tokio-tungstenite's TLS client,
+    // which uses the global default — no install, every relay
+    // attempt panicked the spawned task.
+    //
+    // Idempotent: returns Err if a provider is already installed
+    // (e.g. a future `cargo test` linking us in alongside another
+    // initializer). We don't care about that case, hence `let _ =`.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let data_dir = storage::paths::resolve_data_dir();
+    let _ = std::fs::create_dir_all(&data_dir);
+    #[cfg(target_os = "windows")]
+    repair_legacy_data_acls(&data_dir);
+
+    let log_dir = data_dir.join("logs");
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Escape hatch for diagnosing a problem the pseudonymised log cannot
+    // explain: set `EMBER_VERBOSE_DIAGNOSTICS=1` (or `=true`) and both the
+    // console and file layers write raw peer IPs, file hashes, local paths and
+    // search text instead of `<ip:…>` / `<id:…>` / `<path:…>` / `<text:…>`
+    // tokens. Off by default and deliberately env-only: a log produced with
+    // this on must never be shared, so it must not be reachable from the UI.
+    let verbose_diagnostics = std::env::var("EMBER_VERBOSE_DIAGNOSTICS")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // Logs now live in their own directory so a stale/locked file can never
+    // block access to the rest of the application data directory.
+    security::cleanup_old_logs(&data_dir, 7);
+
+    let file_logging = match std::fs::create_dir_all(&log_dir) {
+        Ok(()) => {
+            #[cfg(target_os = "windows")]
+            if let Err(error) = security::restrict_file_permissions_checked(&log_dir) {
+                eprintln!("Failed to restrict Ember log directory ACL: {error}");
+            }
+
+            security::cleanup_old_logs(&log_dir, 7);
+            if let Ok(entries) = std::fs::read_dir(&log_dir) {
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with("ember.log") {
+                        let _ = security::restrict_file_permissions_checked(&entry.path());
+                    }
+                }
+            }
+
+            tracing_appender::rolling::RollingFileAppender::builder()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("ember.log")
+                // The `cleanup_old_logs` sweep above only ever runs at startup,
+                // so a client left running for months rotated one new
+                // `ember.log.<date>` per day with nothing pruning them until
+                // the next launch. Rotation-time pruning keeps the same 7-file
+                // bound enforced in-session; the startup sweep stays because it
+                // also removes files left by versions that predate this.
+                .max_log_files(7)
+                .build(&log_dir)
+                .map(tracing_appender::non_blocking)
+                .map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    let (file_writer, log_guard) = match file_logging {
+        Ok((writer, guard)) => (Some(writer), Some(guard)),
+        Err(error) => {
+            eprintln!(
+                "File logging is unavailable at {}: {error}; continuing with console logging",
+                log_dir.display()
+            );
+            (None, None)
+        }
+    };
+    let file_layer = file_writer.map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(security::logging::PrivacyMakeWriter::new(
+                writer,
+                verbose_diagnostics,
+            ))
+    });
+
+    // Colours only for a terminal: journald and `docker logs` keep the escape
+    // codes as text.
+    let colour = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer().with_ansi(colour).with_writer(
+            security::logging::PrivacyMakeWriter::new(std::io::stdout, verbose_diagnostics),
+        ))
+        .with(file_layer)
+        .init();
+
+
+    // Before any download can dial: an uploader we asked just before the
+    // last exit still counts that ask against the next one.
+    network::ed2k::peer_sessions::load_upload_requests(&data_dir);
+
+    // Route panics into the log file. Release builds are linked with
+    // `windows_subsystem = "windows"` (no console), so the default hook's
+    // stderr message goes nowhere and a startup panic is indistinguishable
+    // from "the window opened and instantly closed". Without this, the log
+    // simply stops mid-startup with no cause recorded.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        tracing::error!(
+            "PANIC at {location} on thread '{}': {payload}",
+            std::thread::current().name().unwrap_or("unnamed"),
+        );
+        default_panic_hook(info);
+    }));
+
+    tracing::info!(
+        "Ember starting: version={} os={} arch={}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+
+    #[cfg(target_os = "linux")]
+    raise_open_file_limit();
+    log_guard
+}
+
+/// Ember's startup, for the desktop app and `emberd` alike: the data folder,
+/// the database, the config, the identity, the approved roots, the state
+/// every command reads, the background tasks, the library scan and the
+/// network. What only the desktop app has (the tray, the window, deep links,
+/// the update machinery) is behind `feature = "desktop"`.
+pub(crate) fn setup(app: &crate::host::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let app_handle = app.clone();
+
+    // First, before anything slow: an update watchdog judges "Ember is
+    // running again" by this lock, and a first launch of a new version
+    // can spend minutes in migrations or an antivirus scan before
+    // reaching the rest of setup.
+    #[cfg(feature = "desktop")]
+    {
+        let lock_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
+        if std::fs::create_dir_all(&lock_dir).is_ok() {
+            // Two Embers on one profile would share its identity, database
+            // and part files.
+            if storage::paths::emberd_running_on(&lock_dir) {
+                let message = format!(
+                    "emberd is running on Ember's data folder:\n\n{}\n\nStop emberd before starting the Ember app, \
+                     or give emberd a data folder of its own (data_dir in emberd.toml).",
+                    lock_dir.display()
+                );
+                show_fatal_startup_dialog(&message);
+                return Err(message.into());
+            }
+            auto_update::watchdog::hold_instance_lock(&lock_dir);
+        }
+    }
+
+    // Associate the `ed2k://` scheme with this executable.
+    //
+    // URI schemes have no Windows "UserChoice" protection: the last
+    // writer wins, and a per-user (HKCU) entry overrides a machine-wide
+    // one. So calling `register_all()` on every production launch would
+    // silently re-claim `ed2k://` from whatever client the user
+    // actually prefers (eMule, another ed2k app) — even if they set it
+    // back by hand. That's hostile, so we DON'T do it in release.
+    //
+    // Instead, installed builds get the scheme registered once by the
+    // NSIS/MSI installer (driven by `plugins.deep-link.desktop.schemes`
+    // in tauri.conf.json), which is an explicit, user-initiated install
+    // action and is undone on uninstall. Runtime `register_all()` is
+    // only needed for dev builds, which aren't installed and so have no
+    // installer to register the scheme — hence the `debug_assertions`
+    // gate on Windows. Linux has no standard installer-side mechanism,
+    // so it registers at runtime there, but only while no other client
+    // holds the scheme. macOS reads the association from the bundle's
+    // Info.plist and needs neither path.
+    #[cfg(all(feature = "desktop", debug_assertions, windows))]
+    {
+        use tauri_plugin_deep_link::DeepLinkExt;
+        if let Err(e) = app.deep_link().register_all() {
+            tracing::warn!("Failed to register ed2k:// deep link scheme: {e}");
+        }
+    }
+    #[cfg(all(feature = "desktop", target_os = "linux"))]
+    commands::deeplink::register_scheme_unless_taken(&app_handle);
+
+    // Show the running version in the main window title so users
+    // can confirm which build they're on at a glance (matches the
+    // wix product version we ship and the value reported by the
+    // About / Update dialog). `package_info().version` reads the
+    // `version` field of `tauri.conf.json` at build time.
+    //
+    // In harness mode (`EMBER_DATA_DIR` set), we also tag the
+    // title with the basename of the data dir so two side-by-side
+    // harness instances are visually distinguishable from the
+    // taskbar without opening devtools. Production launches
+    // (no env var) keep the original title.
+    #[cfg(feature = "desktop")]
+    if let Some(window) = app.get_webview_window("main") {
+        let version = &app.package_info().version;
+        let title = match std::env::var(storage::paths::EMBER_DATA_DIR_ENV) {
+            Ok(dir) if !dir.trim().is_empty() => {
+                let label = std::path::Path::new(dir.trim())
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("harness");
+                format!("Ember v{version} [{label}]")
+            }
+            _ => format!("Ember v{version}"),
+        };
+        let _ = window.set_title(&title);
+    }
+
+    // Swap in a restore staged by `import_backup` before anything
+    // opens the files it replaces. Once the database is open and the
+    // identity is cached in memory, replacing them underneath is not
+    // something that can be done safely. Failures and leftover staging
+    // are latched for a blocking UI notice — logging alone left users
+    // running on mixed or pre-restore files with no explanation.
+    let mut restore_failed_notice = false;
+    let mut restore_expired_notice = false;
+    let mut restore_applied = false;
+    let mut restore_download_folder_notice = None;
+    match storage::paths::ensure_data_dir_with_app(&app_handle) {
+        Ok(dir) => {
+            use commands::backup::StartupRestore;
+            match commands::backup::apply_pending_restore(&dir) {
+                Err(e) => {
+                    tracing::error!("Failed to apply the staged restore: {e}");
+                    restore_failed_notice = true;
+                }
+                // A leftover marker after `Applied` is a failed
+                // staging-dir cleanup, not a failed restore — the
+                // toast would wrongly say we are on previous files.
+                // `NotApplied` with a marker still on disk is schema-
+                // too-new or a mid-apply abort left for retry.
+                Ok(StartupRestore::NotApplied) => {
+                    if commands::backup::pending_restore_still_staged(&dir) {
+                        restore_failed_notice = true;
+                    }
+                }
+                Ok(StartupRestore::Applied {
+                    download_folder_replaced,
+                }) => {
+                    restore_applied = true;
+                    restore_download_folder_notice = download_folder_replaced;
+                }
+                Ok(StartupRestore::Expired) => restore_expired_notice = true,
+                // The restored profile is the one in use; only the
+                // staged copies were left behind, and are retried.
+                Ok(StartupRestore::AlreadyApplied) => {}
+            }
+        }
+        Err(e) => tracing::error!("Failed to prepare the data dir: {e}"),
+    }
+
+    let db = Arc::new(
+        Database::new(&app_handle).map_err(|e| {
+            tracing::error!("Failed to initialize database: {e:#}");
+            let failure = storage::database::OpenFailure::of(&e);
+            let message = failure.message(&storage::paths::resolve_data_dir_with_app(&app_handle), &e);
+            #[cfg(feature = "desktop")]
+            show_fatal_startup_dialog(&message);
+            #[cfg(not(feature = "desktop"))]
+            tracing::error!("{message}");
+            e
+        })?,
+    );
+
+    // A database that came back from a backup, or was rebuilt, counts
+    // only the rooms made before it: the rooms this identity owns are
+    // looked for again before a number is handed out.
+    if restore_applied || db.corrupt_backup.is_some() {
+        commands::channel_recovery::owe_scan(&db);
+    }
+    let mut config = AppConfig::load(&app_handle).map_err(|e| {
+        tracing::error!("Failed to load config: {e}");
+        e
+    })?;
+    let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
+    std::fs::create_dir_all(&data_dir)?;
+    let orphan_disposal = commands::transfers::OrphanDisposal::at_startup(
+        &data_dir,
+        restore_applied || db.corrupt_backup.is_some(),
+    );
+    // Before the network task starts and before the window is shown:
+    // both come back the way an update restart left them.
+    #[cfg(feature = "desktop")]
+    auto_update::watchdog::schedule_cleanup(&data_dir);
+    #[cfg(feature = "desktop")]
+    let resume_window = auto_update::resume::begin_launch(&app_handle, &data_dir);
+    #[cfg(feature = "desktop")]
+    auto_update::silent::note_launch_outcome(&app_handle);
+    // An eMule import staged last session. Here because it rewrites
+    // what the identity, the approved roots, the credit store and the
+    // network all read below, and none of them can take a change once
+    // they have.
+    let emule_import = emule_import::apply::apply_pending(&data_dir, &db, &mut config);
+    storage::part_folders::forget_finished_previous_folders(&db, &mut config);
+    // The folders `emberd.toml` names: in the settings, and approved below.
+    #[cfg(feature = "server")]
+    let operator_roots = server::apply_operator_folders(&mut config, &data_dir);
+    let settings = config.settings.clone();
+    // Before anything opens a socket: with an interface chosen and not
+    // there, nothing does (see `net_bind`).
+    net_bind::configure(&settings.bind_interface, &settings.bind_interface_name);
+    if net_bind::is_configured() {
+        crate::host::async_runtime::spawn(async {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                tick.tick().await;
+                let before = net_bind::binding();
+                let now = crate::host::async_runtime::spawn_blocking(net_bind::refresh)
+                    .await
+                    .unwrap_or(before);
+                if now != before {
+                    tracing::info!("Chosen network interface: {}", net_bind::status().state);
+                }
+            }
+        });
+    }
+    // Before the library is scanned or a download restored: both must
+    // know which downloads, and which folders, are feeds' and private.
+    sharing::feed_downloads::set_roots(&settings.download_roots());
+    match db.transfer_feed_folders() {
+        Ok(rows) => sharing::feed_downloads::load(rows),
+        Err(error) => tracing::error!("Could not read which downloads are from feeds: {error}"),
+    }
+    match db.feed_sharing_folders() {
+        Ok(folders) => sharing::feed_downloads::set_sharing(folders),
+        Err(error) => tracing::error!("Could not read which feeds share their files: {error}"),
+    }
+    // Before the library is scanned too: no walk of a shared folder may enter
+    // a folder kept for a room.
+    match db.room_libraries() {
+        Ok(rows) => sharing::room_library::load(rows),
+        Err(error) => tracing::error!("Could not read the room libraries: {error}"),
+    }
+    match db.transfer_collection_folders() {
+        Ok(rows) => storage::category_folders::load_collection_folders(rows),
+        Err(error) => tracing::error!("Could not read which downloads came from collections: {error}"),
+    }
+    // Best-effort, never fatal. A download folder on an unplugged USB
+    // drive, an offline NAS or an unmapped share makes these fail, and
+    // propagating that out of `setup` returns Err from `build()` — which
+    // exits the process before a window exists, with no dialog and no way
+    // for the user to correct the path. The condition also survives config
+    // load (`validate_settings` checks length and forbidden roots, not
+    // reachability), so it would repeat on every launch. Start anyway;
+    // `PartFileWriter::open` retries the creation when a download actually
+    // needs the directory, so a drive reconnected mid-session self-heals.
+    if !settings.download_folder.is_empty() {
+        for sub in ["Downloads", "Temp"] {
+            let dir = std::path::PathBuf::from(&settings.download_folder).join(sub);
+            if let Err(error) = std::fs::create_dir_all(&dir) {
+                tracing::error!(
+                    "Could not create {}: {error}. Downloads will fail until the \
+                     folder is reachable or changed in Settings.",
+                    dir.display()
+                );
+            }
+        }
+    }
+    let configured_roots = settings.configured_roots();
+    let mut import_roots =
+        emule_import::apply::pending_root_additions(&data_dir, emule_import.as_ref());
+    #[cfg(feature = "server")]
+    for root in operator_roots {
+        if !import_roots.contains(&root) {
+            import_roots.push(root);
+        }
+    }
+    // The backup deliberately leaves out `approved_roots.json`, whose
+    // records bind folders to one machine's file identities, so the
+    // download folders a restore just brought back are approved here,
+    // as the ones an eMule import names are. Left out, a restore onto
+    // a new install kept them configured but unapproved, and every
+    // download refused its target. Its shared folders are not: an
+    // archive is not the user picking a folder to share, so they wait
+    // in the Library for the user to re-approve them.
+    if restore_applied {
+        for root in settings.download_roots() {
+            if !import_roots.contains(&root) {
+                import_roots.push(root);
+            }
+        }
+    }
+    let approved_roots = security::filesystem::initialize_approved_roots_with_additions(
+        &data_dir,
+        &configured_roots,
+        &import_roots,
+    )
+    .map_err(|error| anyhow::anyhow!("Failed to load approved filesystem roots: {error}"))?;
+    sharing::feed_files::allow_list_dirs(&data_dir);
+    // Not an approved root, unlike the lists' folders: nothing in it is
+    // ever served.
+    network::ember::attach_stream::set_feed_tree_dir(data_dir.join("feed-trees"));
+    emule_import::apply::root_additions_approved(&data_dir);
+    // Only share_intent.json is read here; the known.met migration runs
+    // on its own thread, and every share-intent reader and known.met
+    // writer (including `migrate_aich_v2` below) blocks until it lands.
+    storage::share_intent::initialize_in_background(&data_dir)
+        .map_err(|error| anyhow::anyhow!("Failed to load durable share intent: {error}"))?;
+    // Load the persistent identity once before commands or the network
+    // task can run. Re-reading/creating it independently at several
+    // call sites allowed concurrent first-run callers to generate
+    // different identities and race their atomic writes.
+    let identity = Arc::new(
+        storage::identity::NodeIdentity::load_or_create(
+            &storage::paths::resolve_data_dir_with_app(&app_handle),
+        )
+        .map_err(|e| {
+            tracing::error!("Failed to load node identity: {e}");
+            e
+        })?,
+    );
+    // Earliest point at which the log pseudonyms can be made stable
+    // across restarts — the subscriber is installed before this so a
+    // failure in between still reaches the log file.
+    security::logging::install_pseudonym_key(&identity.ed25519_secret_key);
+    network::friend_intro::set_own_intro_secret(identity.intro_secret);
+    match db.get_friend_intro_secrets() {
+        Ok(secrets) => network::friend_intro::load_friend_intro_secrets(secrets),
+        Err(e) => tracing::warn!("Failed to load friend intro secrets: {e}"),
+    }
+    // If config.json was corrupt and reset to defaults, surface it to the
+    // user once the webview has mounted (the file is preserved as a .bak).
+    let corrupt_backup = config.corrupt_backup.clone();
+    let ember_default_on_applied = config.ember_default_on_applied;
+    let db_corrupt_backup = db.corrupt_backup.clone();
+    let mut policy_failures = Vec::new();
+    let mut policy_scope = security::policy::PolicyResetScope::default();
+    if db_corrupt_backup.is_some() {
+        policy_scope.reset_bans = true;
+        policy_failures.push(
+            "The policy database was corrupt and was replaced; prior bans cannot be trusted"
+                .to_string(),
+        );
+    }
+    if let Err(error) = db.validate_security_policy() {
+        policy_scope.reset_bans = true;
+        policy_failures.push(format!("Persisted ban policy could not be validated: {error}"));
+    }
+    if let Err(error) =
+        network::ember::reputation::ReputationManager::load_checked(
+            &data_dir.join("reputation.json"),
+        )
+    {
+        policy_scope.reset_reputation = true;
+        policy_failures.push(error);
+    }
+    let security_policy = Arc::new(if policy_failures.is_empty() {
+        security::policy::SecurityPolicyGate::ready(data_dir.clone())
+    } else {
+        security::policy::SecurityPolicyGate::blocked(
+            data_dir.clone(),
+            policy_failures.join("; "),
+            policy_scope,
+        )
+    });
+
+    let spam_data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
+    let spam_filter = Arc::new(RwLock::new(
+        search::spam::SpamFilter::load(&spam_data_dir),
+    ));
+    let comment_manager = Arc::new(RwLock::new(
+        network::ed2k::comments::CommentManager::new(),
+    ));
+
+    // Capacity 1024 (was 256): every Tauri command that mutates
+    // persistent state (`UpdateSettings`, `BanPeer`, `BootstrapContacts`,
+    // `ReloadIpFilter`, `FriendRemoved`, etc.) dispatches a live
+    // `NetworkCommand` here via `try_send` after the DB/config write
+    // succeeds. The on-disk write is the source of truth, so a
+    // dropped live update only delays application until the next
+    // restart, but security-relevant changes (ipfilter reload, peer
+    // ban) shouldn't degrade silently under burst. 1024 covers the
+    // realistic worst case (a user clicking through many rows in
+    // rapid succession) with a comfortable margin while the network
+    // task drains continuously.
+    let (network_tx, network_rx) = mpsc::channel(1024);
+
+    let local_index = Arc::new(RwLock::new(LocalIndex::new()));
+
+    let (initial_upload_limit, initial_download_limit) =
+        background::effective_limits_now(&settings);
+    let bandwidth_limiter = Arc::new(BandwidthLimiter::new(
+        initial_upload_limit,
+        initial_download_limit,
+    ));
+    let uss_rtt_queue = bandwidth::new_uss_rtt_queue();
+    let uss_enabled_flag = bandwidth::new_uss_enabled_flag(settings.uss_enabled);
+
+    let transfer_manager = Arc::new(RwLock::new(TransferManager::new(settings.max_concurrent_downloads)));
+
+    let shutdown_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_complete_net = shutdown_complete.clone();
+
+    let bw_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let scanning_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let scan_coordination = Arc::new(tokio::sync::Mutex::new(()));
+
+    let cached_peers: Arc<RwLock<Vec<crate::types::PeerInfo>>> = Arc::new(RwLock::new(Vec::new()));
+    let cached_stats: Arc<RwLock<crate::types::NetworkStats>> = Arc::new(RwLock::new(crate::types::NetworkStats::default()));
+    let cached_contacts: Arc<RwLock<Vec<crate::types::KadContactInfo>>> = Arc::new(RwLock::new(Vec::new()));
+    let cached_searches: Arc<RwLock<Vec<crate::types::KadSearchInfo>>> = Arc::new(RwLock::new(Vec::new()));
+    let cached_servers: Arc<RwLock<Vec<crate::types::ServerInfo>>> = Arc::new(RwLock::new(Vec::new()));
+    let cached_connected_server: Arc<RwLock<Option<crate::types::ServerInfo>>> = Arc::new(RwLock::new(None));
+    let cached_transfer_stats: Arc<RwLock<crate::storage::statistics::TransferStats>> = Arc::new(RwLock::new(Default::default()));
+    let cached_shared_files: Arc<RwLock<Vec<crate::types::FileInfo>>> = Arc::new(RwLock::new(Vec::new()));
+    let hash_cancel_flags: Arc<RwLock<std::collections::HashMap<String, Arc<std::sync::atomic::AtomicBool>>>> = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let fresh_part_hashes: Arc<RwLock<std::collections::HashMap<[u8; 16], Vec<[u8; 16]>>>> = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let cached_peers_net = cached_peers.clone();
+    let cached_stats_net = cached_stats.clone();
+    let cached_contacts_net = cached_contacts.clone();
+    let cached_searches_net = cached_searches.clone();
+    let cached_servers_net = cached_servers.clone();
+    let cached_connected_server_net = cached_connected_server.clone();
+    let cached_transfer_stats_net = cached_transfer_stats.clone();
+    let cached_shared_files_net = cached_shared_files.clone();
+    let startup_network_tx = network_tx.clone();
+
+    let upload_shared_folders: app_state::SharedFolderList = Arc::new(RwLock::new(settings.shared_folders.clone()));
+    // Mutual friends are the subset that also added us back. Friend-only
+    // shares and browse answers key off that rather than every friend,
+    // so a one-sided add cannot reach private content. Both come from
+    // one read so they cannot disagree, and a failed read is logged
+    // loudly: every friend would otherwise look like a stranger and
+    // the friend limit would count from zero.
+    let (friend_hashes, mutual_friend_hashes): (
+        app_state::SharedFriendHashes,
+        app_state::SharedFriendHashes,
+    ) = {
+        let mut friends = std::collections::HashSet::new();
+        let mut mutual = std::collections::HashSet::new();
+        match db.get_friends_full() {
+            Ok(rows) => {
+                for row in &rows {
+                    let Ok(hash) = <[u8; 16]>::try_from(
+                        hex::decode(&row.0).unwrap_or_default().as_slice(),
+                    ) else {
+                        continue;
+                    };
+                    friends.insert(hash);
+                    if row.6 {
+                        mutual.insert(hash);
+                    }
+                }
+                if !friends.is_empty() {
+                    info!(
+                        "Loaded {} friends ({} mutual) from database",
+                        friends.len(),
+                        mutual.len()
+                    );
+                }
+            }
+            Err(e) => tracing::error!("Failed to load the friend list: {e}"),
+        }
+        (Arc::new(RwLock::new(friends)), Arc::new(RwLock::new(mutual)))
+    };
+
+    sharing::disk::set_hash_at_low_priority(settings.hash_low_priority);
+    release_share::configure(&settings);
+    let shared_folder_watcher = sharing::watcher::SharedFoldersWatcher::start(
+        app_handle.clone(),
+        settings.shared_folders.clone(),
+        settings.watch_shared_folders,
+    );
+
+    // One-time AICH migration: invalidate multi-part AICH root hashes
+    // computed before the SHAHashSet part-boundary fix so they get
+    // recomputed on this startup's hashing pass. Must run before ANY
+    // known.met consumer loads the file so the indexer/hashing task and
+    // network task both see the cleared roots. Guarded by a marker file.
+    {
+        let data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
+        storage::known_files::migrate_aich_v2(&data_dir);
+        // Sealed bytes from the withdrawn room-attachment feature. The
+        // rows that described them went with schema v34, so without
+        // this the blobs are unreferenced files nothing will ever open
+        // or clean up.
+        let legacy_channel_files = data_dir.join("channel-files");
+        if legacy_channel_files.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&legacy_channel_files) {
+                tracing::warn!(
+                    error = %e,
+                    "could not remove stored room attachments from the previous version"
+                );
+            }
+        }
+        commands::backup::sweep_orphaned_scratch(&data_dir);
+    }
+    // The same reclaim for `%TEMP%/Ember`, which the backup sweep above
+    // never looks at: previews land there and are only cleaned up by a
+    // clean shutdown, so a crash leaves up to 64 MiB apiece behind
+    // indefinitely.
+    security::filesystem::sweep_orphaned_temp_dirs();
+
+    // Allow WebView media playback for files under shared/download dirs.
+    commands::sharing::sync_asset_protocol_scope(&app_handle, &config);
+
+    let pending_deep_links =
+        commands::deeplink::load_pending_queue(&app_handle);
+    app.manage(AppState {
+        network_tx,
+        db: db.clone(),
+        approved_roots: approved_roots.clone(),
+        pending_folder_drop: Arc::new(tokio::sync::Mutex::new(None)),
+        security_policy: security_policy.clone(),
+        identity: identity.clone(),
+        launch_settings: app_state::LaunchSettings::from_settings(&settings),
+        config: Arc::new(RwLock::new(config)),
+        settings_save_lock: Arc::new(tokio::sync::Mutex::new(())),
+        restore_import_lock: Arc::new(tokio::sync::Mutex::new(())),
+        picked_backup: Arc::new(tokio::sync::Mutex::new(None)),
+        local_index: local_index.clone(),
+        bandwidth_limiter: bandwidth_limiter.clone(),
+        transfer_manager: transfer_manager.clone(),
+        download_admission: Arc::new(tokio::sync::Mutex::new(())),
+        shutdown_complete,
+        bw_shutdown: bw_shutdown.clone(),
+        scanning_count: scanning_count.clone(),
+        library_scan_truncated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        scan_coordination: scan_coordination.clone(),
+        hashing_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        hashing_fs_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        cached_transfer_stats,
+        cached_shared_files: cached_shared_files.clone(),
+        hash_cancel_flags: hash_cancel_flags.clone(),
+        fresh_part_hashes: fresh_part_hashes.clone(),
+        spam_filter: spam_filter.clone(),
+        comment_manager: comment_manager.clone(),
+        upload_shared_folders: upload_shared_folders.clone(),
+        friend_hashes: friend_hashes.clone(),
+        mutual_friend_hashes: mutual_friend_hashes.clone(),
+        shared_folder_watcher,
+        background_scans: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        background_scan_seq: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        quit_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pending_close_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pending_ember_default_on_notice: Arc::new(std::sync::atomic::AtomicBool::new(
+            ember_default_on_applied,
+        )),
+        pending_restore_failed_notice: Arc::new(std::sync::atomic::AtomicBool::new(
+            restore_failed_notice,
+        )),
+        pending_restore_expired_notice: Arc::new(std::sync::atomic::AtomicBool::new(
+            restore_expired_notice,
+        )),
+        pending_restore_download_folder_notice: Arc::new(parking_lot::Mutex::new(
+            restore_download_folder_notice,
+        )),
+        close_behavior: Arc::new(parking_lot::RwLock::new(
+            settings.close_to_tray_behavior.clone(),
+        )),
+        minimize_to_tray: Arc::new(std::sync::atomic::AtomicBool::new(
+            settings.minimize_to_tray,
+        )),
+        pending_deep_links: Arc::new(parking_lot::Mutex::new(pending_deep_links)),
+        runtime_status: Arc::new(parking_lot::RwLock::new(Default::default())),
+        upload_quota: Arc::new(parking_lot::Mutex::new(bandwidth::quota::UploadQuota::load(
+            &bandwidth::quota::path_in(&storage::paths::resolve_data_dir_with_app(&app_handle)),
+            &bandwidth::quota::local_today(),
+        ))),
+    });
+
+    // Seed the schedule/sleep snapshot and apply whatever bandwidth
+    // window is open *before* the first background tick, so a profile
+    // whose overnight rule is in force does not spend its first second
+    // running at the daytime cap — and so Settings, which can be opened
+    // inside that second, does not report "no schedule" while one
+    // applies.
+    {
+        let state = app.state::<AppState>();
+        background::seed_status(&state, &settings);
+        background::apply_effective_limits(&app_handle, &state, &settings);
+    }
+    background::spawn(app_handle.clone());
+    #[cfg(feature = "desktop")]
+    auto_update::scheduler::spawn(app_handle.clone());
+    ipfilter_update::spawn(app_handle.clone());
+    commands::channel_recovery::spawn_startup_scan(app_handle.clone());
+    commands::room_deletion::spawn_deleted_rooms_watch(app_handle.clone());
+    commands::room_dm::spawn_resends(app_handle.clone());
+    commands::feeds::spawn_feeds(app_handle.clone());
+
+    // Non-silent recovery notice: if config.json was corrupt at load,
+    // tell the user (their settings were reset to defaults; the original
+    // is preserved). Delay the emit so the webview has registered its
+    // listeners — the file is already safely backed up regardless.
+    // The folders of feeds that share their files, once the startup
+    // scan has begun: one a crash left unshared, or a download folder
+    // moved since, is set right.
+    if !sharing::feed_downloads::sharing_folders().is_empty() {
+        let handle = app_handle.clone();
+        crate::host::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            sharing::feed_shares::reconcile(&handle, &[]).await;
+        });
+    }
+    if let Some(bak) = corrupt_backup {
+        let emit_handle = app_handle.clone();
+        crate::host::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = emit_handle.emit(
+                "config-corrupt-recovered",
+                serde_json::json!({ "backup_path": bak.to_string_lossy().to_string() }),
+            );
+        });
+    }
+    if let Some(bak) = db_corrupt_backup {
+        let emit_handle = app_handle.clone();
+        crate::host::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = emit_handle.emit(
+                "db-corrupt-recovered",
+                serde_json::json!({ "backup_path": bak.to_string_lossy().to_string() }),
+            );
+        });
+    }
+    // No delayed emit for this one: it is latched in `AppState` above
+    // and the layout drains it once its listeners are up. The recovery
+    // notices beside it still race a slow cold start — an event fired
+    // three seconds in is simply dropped if the webview has not
+    // resolved `listen()` yet — but they can be re-derived from the
+    // `.bak` files on disk, whereas this migration is one-shot and
+    // already persisted, so a lost notice is lost for good.
+    if !security_policy.is_loaded() {
+        let emit_handle = app_handle.clone();
+        let status = security_policy.status();
+        crate::host::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = emit_handle.emit("security-policy-reset-required", status);
+        });
+    }
+
+    // Cold-start deep link: an `ed2k://` link or `.emulecollection`
+    // file that launched Ember arrives in our own process args. Buffer
+    // it now (AppState is managed above) — the frontend drains the
+    // buffer once it mounts the deep-link handler. Done after
+    // `app.manage` so `dispatch_deep_links` can reach the buffer. An
+    // update restart carries the replaced process's args, whose links
+    // were offered then.
+    #[cfg(feature = "desktop")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        let payloads = auto_update::resume::without_replayed_links(
+            &app_handle,
+            commands::deeplink::extract_deep_link_payloads(&args),
+        );
+        if !payloads.is_empty() {
+            commands::deeplink::dispatch_deep_links(&app_handle, payloads);
+        }
+    }
+
+    #[cfg(feature = "desktop")]
+    {
+        session_end::watch(app);
+
+        // System tray icon. Rendered unconditionally so users who pick
+        // "Minimize to Tray" (or the saved `tray` behavior) always have
+        // a way back into the running app — without this, hiding the
+        // window would orphan the process. The menu also exposes an
+        // explicit Quit entry that routes through `app.exit(0)` so the
+        // existing `RunEvent::Exit` shutdown sequence still runs.
+        let tray_menu = build_tray_menu(app, None)?;
+
+        let tray_icon = app
+            .default_window_icon()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("missing default window icon for tray"))?;
+
+        let tray_result = TrayIconBuilder::with_id("main")
+            .icon(tray_icon)
+            .tooltip("Ember")
+            .menu(&tray_menu)
+            // Default to "the menu shows on left-click" so users who
+            // can't right-click (touchscreens, accessibility tools)
+            // can still get to Show/Quit. Linux ignores this flag.
+            .show_menu_on_left_click(false)
+            .on_menu_event(|app, event| match event.id.as_ref() {
+                "tray_show" => {
+                    commands::chat_window::set_chat_window_visible(app, true);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+                auto_update::silent::TRAY_CANCEL_ID => {
+                    crate::host::async_runtime::spawn(auto_update::silent::postpone());
+                }
+                finish_action::TRAY_CANCEL_ID => {
+                    finish_action::cancel_finish_action(app.clone());
+                }
+                "tray_pause_all" | "tray_resume_all" => {
+                    let pause = event.id.as_ref() == "tray_pause_all";
+                    let app = app.clone();
+                    crate::host::async_runtime::spawn(async move {
+                        let Some(state) = app.try_state::<AppState>() else {
+                            return;
+                        };
+                        let result = if pause {
+                            commands::transfers::pause_all_transfers(app.clone(), state).await
+                        } else {
+                            commands::transfers::resume_all_transfers(app.clone(), state).await
+                        };
+                        if let Err(error) = result {
+                            tracing::warn!("Tray pause/resume all failed: {error}");
+                        }
+                    });
+                }
+                "tray_alt_speed" => {
+                    let app = app.clone();
+                    crate::host::async_runtime::spawn(async move {
+                        let Some(state) = app.try_state::<AppState>() else {
+                            return;
+                        };
+                        let patch = commands::settings::QuickLimitsPatch {
+                            alt_speed_enabled: Some(!tray::alt_speed_checked()),
+                            ..Default::default()
+                        };
+                        if let Err(error) =
+                            commands::settings::apply_quick_limits(&app, &state, patch).await
+                        {
+                            tracing::warn!("Tray alternative speed toggle failed: {error}");
+                        }
+                        // The OS flips a check item on click by itself; put it back
+                        // in step with what was actually saved.
+                        auto_update::silent::rebuild_tray_menu(&app);
+                    });
+                }
+                "tray_quit" => commands::settings::exit_app(app),
+                _ => {}
+            })
+            .on_tray_icon_event(|tray, event| {
+                // Single left-click reveals the window. The double-click
+                // event is platform-conditional (macOS doesn't fire it),
+                // so we settle for the click-up flavor of the single
+                // click which is universal.
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    let app = tray.app_handle();
+                    commands::chat_window::set_chat_window_visible(app, true);
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            })
+            .build(app);
+        let tray_available = tray_result.is_ok();
+        if let Err(e) = tray_result {
+            // No session bus / AppIndicator host (WSL, some live sessions,
+            // GNOME without the extension). Failing `setup` here would
+            // never show a window.
+            #[cfg(target_os = "linux")]
+            {
+                tracing::warn!(
+                    "System tray unavailable ({e}); close-to-tray will not have an icon"
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(e.into());
+            }
+        }
+        tray::note_built(tray_available);
+
+        // The window is created hidden (`tauri.conf.json`) and shown here,
+        // once the tray exists, so a session an update restart left in the
+        // tray comes back there instead of flashing onto the desktop. The
+        // "launch maximized" preference is applied here too: it is a
+        // launch-time preference, so toggling it in Settings only changes
+        // how the *next* launch opens.
+        let launch_window = resume_window.or_else(|| {
+            window_state::for_launch(
+                settings
+                    .remember_window_position
+                    .then(|| window_state::load(&data_dir))
+                    .flatten(),
+                settings.launch_maximized,
+                login_launch::launched_at_login() && settings.start_hidden_at_login,
+            )
+        });
+        auto_update::resume::show_main_window(
+            &app_handle,
+            launch_window.as_ref(),
+            tray::reachable(),
+            settings.launch_maximized,
+        );
+        login_launch::reconcile_at_launch(&app_handle, settings.launch_at_login);
+        auto_update::silent::spawn(app_handle.clone());
+    }
+
+    let index_clone = local_index.clone();
+    let shared_folders = settings.shared_folders.clone();
+    let startup_allowlists = sharing::indexer::discovery_lists(
+        &settings.pending_folder_allowlists,
+        &settings.withheld_folder_files,
+    );
+    let startup_scanning = scanning_count.clone();
+    let startup_scan_coordination = scan_coordination.clone();
+    let csf = cached_shared_files.clone();
+    let startup_app = app_handle.clone();
+    let net_tx = startup_network_tx;
+    let startup_cancel_flags = hash_cancel_flags.clone();
+    let startup_fresh_part_hashes = fresh_part_hashes.clone();
+    commands::sharing::STARTUP_LIBRARY_LOADING.store(true, std::sync::atomic::Ordering::Release);
+    let startup_scan_handle = crate::host::async_runtime::handle().inner().spawn(async move {
+        // However the scan ends, the index stops being a partial one.
+        struct LibraryLoaded;
+        impl Drop for LibraryLoaded {
+            fn drop(&mut self) {
+                commands::sharing::STARTUP_LIBRARY_LOADING
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let library_loaded = LibraryLoaded;
+        if shared_folders.is_empty() {
+            info!("Indexed 0 files from 0 shared folders");
+            let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
+            return;
+        }
+        // Held for the whole scan and released when this task ends. It is
+        // deliberately not handed to the hash-timeout drain: that drain
+        // can block indefinitely on a stuck read, and passing the lease
+        // to it would wedge every later reload.
+        let _coordination_guard = startup_scan_coordination.clone().lock_owned().await;
+
+        struct StartupScanGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for StartupScanGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        startup_scanning.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let scan_guard = StartupScanGuard(startup_scanning.clone());
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        startup_cancel_flags.write().await.insert("__startup__".to_string(), cancel_flag.clone());
+
+        let discovery_handles: Vec<_> = shared_folders
+            .iter()
+            .map(|folder| {
+                let f = folder.clone();
+                // A persisted cursor describes a partial live scan.
+                // Startup begins with an empty index, so resuming at a
+                // later page would make every earlier page disappear
+                // until another full cycle completes. Start each cold
+                // scan at the first page; successful startup persists
+                // a fresh cursor for the next live reload.
+                let cursor: Option<String> = None;
+                let scope =
+                    sharing::indexer::DiscoveryScope::for_root(&f, &startup_allowlists);
+                (
+                    folder.clone(),
+                    tokio::task::spawn_blocking(move || {
+                        match FileIndexer::refuse_unapproved_root(&f) {
+                            Some(refused) => (true, false, refused),
+                            None => {
+                                let result = FileIndexer::discover_directory_page_in(
+                                    &f,
+                                    cursor.as_deref(),
+                                    scope.as_ref(),
+                                );
+                                let gone = result.saw_nothing()
+                                    && sharing::indexer::folder_gone_from_present_volume(
+                                        std::path::Path::new(&f),
+                                    );
+                                (false, gone, result)
+                            }
+                        }
+                    }),
+                )
+            })
+            .collect();
+        // Read while the folders are walked; nothing below needs it sooner.
+        let known_path =
+            storage::paths::resolve_data_dir_with_app(&startup_app).join("known.met");
+        let known_load = tokio::task::spawn_blocking(move || {
+            let known_list = storage::known_files::KnownFileList::load(&known_path);
+            // The per-file `effective_shared` calls below would
+            // otherwise wait out the share-intent migration on this
+            // runtime worker.
+            storage::share_intent::wait_until_initialized();
+            known_list
+        });
+        let mut all_discovered: Vec<crate::types::FileInfo> = Vec::new();
+        let mut startup_cursor_updates = std::collections::HashMap::new();
+        // Not walked until re-approved, so not filled in from known.met
+        // either: what is at the path now is not what was approved.
+        let mut refused_roots: Vec<String> = Vec::new();
+        // Read nothing of: a drive not plugged in, a share offline.
+        let mut unreachable_roots: Vec<String> = Vec::new();
+        for (folder, handle) in discovery_handles {
+            match handle.await {
+                Ok((refused, gone, result)) => {
+                    if refused {
+                        refused_roots.push(folder);
+                        continue;
+                    }
+                    // An unreachable folder (a drive not plugged in)
+                    // says nothing about where its paging stood; a
+                    // `None` here erased the cursor it had. One deleted
+                    // from a drive that is there has nothing to keep
+                    // rows for, or they would be announced every session.
+                    if result.saw_nothing() {
+                        if !gone {
+                            unreachable_roots.push(folder);
+                        }
+                        continue;
+                    }
+                    if result.reached_file_cap() {
+                        tracing::warn!(
+                            "Startup discovery reached the per-folder file cap; some files will wait for a later scan"
+                        );
+                        startup_app
+                            .state::<AppState>()
+                            .library_scan_truncated
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = startup_app.emit(
+                            "shared-files-scan-truncated",
+                            serde_json::json!({ "folder": "startup", "limit": 100_000 }),
+                        );
+                    }
+                    startup_cursor_updates.insert(folder, result.next_cursor);
+                    all_discovered.extend(result.files);
+                }
+                Err(e) => {
+                    tracing::error!("discover_directory panicked for folder: {e}");
+                    // The rest of the library still loads; this folder
+                    // is simply missing from it, and the user is told.
+                    let _ = startup_app.emit(
+                        "shared-folder-scan-failed",
+                        serde_json::json!({ "folder": folder }),
+                    );
+                }
+            }
+        }
+
+        // A Stop during the walk still lets last session's files into
+        // the index: only hashing is skipped (see `was_cancelled`).
+        // Returning here left the Library empty with the loading flag
+        // cleared, and a feed saved or published then dropped every
+        // item as gone.
+        let cancelled_in_discovery = cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
+        if cancelled_in_discovery {
+            info!("Startup hashing cancelled during discovery; indexing known files only");
+        }
+
+        let known_list = match known_load.await {
+            Ok(known_list) => known_list,
+            Err(e) => {
+                tracing::error!("Startup known.met load panicked: {e}");
+                startup_cancel_flags.write().await.remove("__startup__");
+                let _ = startup_app.emit("file-hash-progress", serde_json::json!({ "done": true, "current": 0, "total": 0, "file_name": "" }));
+                return;
+            }
+        };
+
+        let mut files_to_hash: Vec<crate::types::FileInfo> = Vec::new();
+        // Rows wanting only a digest repair are deliberately *not*
+        // accumulated here. They are already servable, so they stay out
+        // of `files_to_hash` — a cold start is not a full re-read of the
+        // library — and the background pass is handed `all_discovered`
+        // itself once the scan has finished with the drives. Collecting
+        // them separately meant cloning a whole `FileInfo` per row and
+        // holding both copies until the pass drained, which on the run
+        // that matters most (first launch after an upgrade, library big
+        // enough to paginate) is the entire share resident twice.
+        // `queue_hash_top_up` applies the same `wants_hash_top_up`
+        // predicate and narrows to the few columns the pass reads, so
+        // the list it builds is the same one — minus the rows the
+        // shared-folder retain below drops, which have no business
+        // costing a whole-file read.
+        // Paths with no known.met record at all — genuinely new to
+        // this library, as opposed to a previously-shared file that's
+        // merely being rediscovered. Only these should inherit a
+        // shared folder's *current* default priority below; a file
+        // that already has a persisted priority keeps it even if the
+        // folder default has since changed, matching `set_file_priority`'s
+        // per-file-override contract.
+        let mut new_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let known_lookup = known_list.name_size_lookup();
+        for file in &mut all_discovered {
+            if let Some(record) = known_list.find_by_path_and_meta_in(
+                &known_lookup,
+                &file.path,
+                file.size,
+                file.modified_at,
+            ) {
+                let hash = hex::encode(record.file_hash);
+                file.id = hash.clone();
+                file.hash = hash;
+                file.aich_hash = record.aich_hash.clone();
+                file.ember_file_hash = record.ember_file_hash.clone();
+                // Restore the per-file priority and shared/unshared
+                // choice from known.met. Without this, every cold
+                // start silently reset custom priorities to "normal"
+                // and re-shared files the user had explicitly
+                // unshared.
+                file.priority = storage::known_files::priority_u8_to_str(record.upload_priority).to_string();
+                file.shared = storage::share_intent::effective_shared(
+                    &record.file_hash,
+                    record.is_shared,
+                );
+                // Same reasoning for the friends-only scope: losing it
+                // on a cold start would republish a file the user had
+                // deliberately kept off the open network.
+                file.friends_only = record.friends_only;
+                file.alltime_requests = record.all_time_requested;
+                file.alltime_accepted = record.all_time_accepted;
+                file.alltime_transferred = record.all_time_transferred;
+                // Restore the last-known Peers count so the Library
+                // doesn't show 0 until the next 60s source-count sync.
+                file.complete_sources = record.complete_sources;
+                // A matched record short-circuits hashing unless it
+                // still wants a one-time repair, and both repairs go to
+                // the same background pass. Kept in step with
+                // `resolve_from_known`, which documents the reasoning:
+                //
+                // - an empty AICH root (v2 migration, or a file such as
+                //   a completed download that arrived without one) is
+                //   eD2k recovery data. Valuable, but it costs a
+                //   downloader one re-fetched part rather than one
+                //   re-fetched block, and only once something is
+                //   actually corrupt — not worth blocking a scan that
+                //   would otherwise re-read the whole share.
+                // - empty ember_file_hash is an Ember-only extra that
+                //   lets a downloader double-check the whole file.
+                //
+                // The row is fully servable without either, so it keeps
+                // its content-hash id and enters the index as an
+                // ordinary entry. ed2k comes out identical either way;
+                // only the missing digests are filled.
+            } else {
+                commands::sharing::carry_scope_at_path(file, &known_list);
+                new_paths.insert(crate::search::index::normalize_path_key(&file.path));
+                files_to_hash.push(file.clone());
+            }
+        }
+        // Before any hashing starts, so a log from a launch that
+        // re-hashes says why even if the user stops it partway.
+        {
+            let found = all_discovered.len();
+            let matched = found - files_to_hash.len();
+            let records = known_list.file_count();
+            let shift = if files_to_hash.is_empty() {
+                None
+            } else {
+                known_list.time_shift_summary(
+                    files_to_hash.iter().map(|f| (f.name.as_str(), f.size, f.modified_at)),
+                )
+            };
+            match shift {
+                Some(shift) => info!(
+                    "Startup scan: {found} files found, {matched} matched in known.met \
+                     ({records} records), {} to hash; {} of those match a known file by \
+                     name and size but not by modification time ({} are off by {:+} s)",
+                    files_to_hash.len(),
+                    shift.files,
+                    shift.common_count,
+                    shift.common_delta_secs,
+                ),
+                None => info!(
+                    "Startup scan: {found} files found, {matched} matched in known.met \
+                     ({records} records), {} to hash",
+                    files_to_hash.len(),
+                ),
+            }
+        }
+
+        let current_shared_folders = {
+            let state = startup_app.state::<AppState>();
+            let cfg = state.config.read().await;
+            cfg.settings.shared_folders.clone()
+        };
+        all_discovered.retain(|file| {
+            commands::sharing::file_in_shared_folders(&file.path, &current_shared_folders)
+        });
+        // A cursor page is intentionally partial. On a cold start the
+        // index is empty, so retain previously completed pages from
+        // known.met while the first page is rediscovered; otherwise a
+        // large share (>100k files) loses every non-first-page row
+        // until the user manually triggers enough reloads to cycle it
+        // back in.
+        //
+        // A folder that could not be read at all keeps its rows the
+        // same way, as one that goes offline mid-session does: it is
+        // unavailable, not empty. Left out, its files looked gone once
+        // the Library had loaded, and a feed saved or published then
+        // dropped every item on it for good.
+        let hydrate_paged = startup_cursor_updates.values().any(Option::is_some);
+        if hydrate_paged || !unreachable_roots.is_empty() {
+            let hydration_unreachable = unreachable_roots.clone();
+            let mut known_paths = all_discovered
+                .iter()
+                .map(|file| crate::search::index::normalize_path_key(&file.path))
+                .collect::<std::collections::HashSet<_>>();
+            let hydration_records = known_list.all_records().cloned().collect::<Vec<_>>();
+            let hydration_folders = current_shared_folders.clone();
+            let hydration_refused = refused_roots.clone();
+            let hydration_paths = known_paths.clone();
+            let hydration_allowlists = {
+                let state = startup_app.state::<AppState>();
+                let cfg = state.config.read().await;
+                crate::sharing::indexer::AllowlistOffers::with_withheld(
+                    &cfg.settings.pending_folder_allowlists,
+                    &cfg.settings.withheld_folder_files,
+                )
+            };
+            let hydrated_records = tokio::task::spawn_blocking(move || {
+                hydration_records
+                    .into_iter()
+                    .filter(|record| {
+                        if record.file_path.is_empty()
+                            || hydration_paths.contains(
+                                &crate::search::index::normalize_path_key(
+                                    &record.file_path,
+                                ),
+                            )
+                            || !commands::sharing::file_in_shared_folders(
+                                &record.file_path,
+                                &hydration_folders,
+                            )
+                            || hydration_refused.iter().any(|root| {
+                                crate::security::path_within_dir(&record.file_path, root)
+                            })
+                        {
+                            return false;
+                        }
+                        // Discovery walks a partly shared folder's list
+                        // alone, so a record it does not offer is one
+                        // left by an earlier share of the folder, and
+                        // its flag in known.met may still say shared.
+                        if !hydration_allowlists.offers(&record.file_path) {
+                            return false;
+                        }
+                        // Re-apply discovery's exclusions. Hydration
+                        // re-admits records without walking the tree, so
+                        // a record written before one of these rules
+                        // existed (the data-directory guard, `.bak`,
+                        // `.migration-tmp`) would otherwise come straight
+                        // back into the shared and announced index.
+                        let record_path = std::path::Path::new(&record.file_path);
+                        if crate::sharing::indexer::is_excluded_share_file_name(record_path)
+                            || crate::sharing::indexer::under_private_receive_dir(
+                                &hydration_folders,
+                                record_path,
+                            )
+                            || crate::sharing::indexer::is_excluded_share_location(
+                                record_path,
+                            )
+                        {
+                            return false;
+                        }
+                        // As known.met last saw it: its drive cannot
+                        // say otherwise until it is back, and the
+                        // first walk that reads it reconciles the rows.
+                        if hydration_unreachable
+                            .iter()
+                            .any(|root| crate::security::path_within_dir(&record.file_path, root))
+                        {
+                            return true;
+                        }
+                        if !hydrate_paged {
+                            return false;
+                        }
+                        let metadata = match std::fs::symlink_metadata(&record.file_path)
+                        {
+                            Ok(metadata)
+                                if metadata.file_type().is_file()
+                                    && !metadata.file_type().is_symlink() =>
+                            {
+                                metadata
+                            }
+                            _ => return false,
+                        };
+                        let modified_at = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|duration| duration.as_secs() as i64)
+                            .unwrap_or(0);
+                        metadata.len() == record.file_size
+                            && modified_at == record.modified_at
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default();
+            for record in hydrated_records {
+                let record_path_key =
+                    crate::search::index::normalize_path_key(&record.file_path);
+                if record.file_path.is_empty()
+                    || !commands::sharing::file_in_shared_folders(
+                        &record.file_path,
+                        &current_shared_folders,
+                    )
+                    || known_paths.contains(&record_path_key)
+                {
+                    continue;
+                }
+                known_paths.insert(record_path_key);
+                let hash = hex::encode(record.file_hash);
+                let extension = std::path::Path::new(&record.file_path)
+                    .extension()
+                    .map(|extension| extension.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let folder = std::path::Path::new(&record.file_path)
+                    .parent()
+                    .map(|parent| parent.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let hydrated = crate::types::FileInfo {
+                    id: hash.clone(),
+                    name: record.file_name.clone(),
+                    path: record.file_path.clone(),
+                    size: record.file_size,
+                    hash,
+                    aich_hash: record.aich_hash.clone(),
+                    ember_file_hash: record.ember_file_hash.clone(),
+                    extension,
+                    modified_at: record.modified_at,
+                    priority: storage::known_files::priority_u8_to_str(
+                        record.upload_priority,
+                    )
+                    .to_string(),
+                    requests: 0,
+                    accepted: 0,
+                    bytes_transferred: 0,
+                    alltime_requests: record.all_time_requested,
+                    alltime_accepted: record.all_time_accepted,
+                    alltime_transferred: record.all_time_transferred,
+                    complete_sources: record.complete_sources,
+                    folder,
+                    shared: storage::share_intent::effective_shared(
+                        &record.file_hash,
+                        record.is_shared,
+                    ),
+                    friends_only: record.friends_only,
+                    shared_kad: false,
+                    shared_ed2k: false,
+                    shared_ember: false,
+                };
+                // A hydrated row is a full member of the index — it is
+                // served, searched and published like any other — so it
+                // wants the same one-time repairs, and the discovery
+                // loop above never saw it to ask. Leaving it out made a
+                // paginated library's migration stall at page one: the
+                // rows the cursor had not reached kept their empty AICH
+                // root or digest until the user happened to trigger
+                // enough reloads to cycle them back into a discovery
+                // page, which on a library large enough to paginate is
+                // exactly the user least likely to be doing that by
+                // hand.
+                //
+                // Handing the whole library to the pass rather than one
+                // page of it is affordable because the pass is not
+                // paginated in the first place: it works at a duty
+                // cycle, stands aside for real scans, checkpoints as it
+                // goes and resumes where it stopped. Its cost is set by
+                // the drives, not by how much is queued.
+                all_discovered.push(hydrated);
+            }
+        }
+
+        let (
+            folder_priorities,
+            pending_share_states,
+            pending_file_priorities,
+            pending_friends_only,
+            pending_folder_allowlists,
+            withheld_folder_files,
+        ) = {
+            let state = startup_app.state::<AppState>();
+            let cfg = state.config.read().await;
+            (
+                cfg.settings.folder_priorities.clone(),
+                cfg.settings.pending_share_states.clone(),
+                cfg.settings.pending_file_priorities.clone(),
+                cfg.settings.pending_friends_only.clone(),
+                cfg.settings.pending_folder_allowlists.clone(),
+                cfg.settings.withheld_folder_files.clone(),
+            )
+        };
+        commands::sharing::apply_folder_allowlists(
+            &mut all_discovered,
+            &mut files_to_hash,
+            &pending_folder_allowlists,
+            &withheld_folder_files,
+        );
+        commands::sharing::withhold_unlisted_known_files(
+            &mut all_discovered,
+            &pending_folder_allowlists,
+            &withheld_folder_files,
+        );
+        commands::sharing::apply_pending_intents(
+            &mut all_discovered,
+            &mut files_to_hash,
+            &pending_share_states,
+            &pending_file_priorities,
+            &pending_friends_only,
+        );
+        {
+            let mut index = index_clone.write().await;
+            index.add_files(all_discovered.clone());
+            // Apply each shared folder's default upload priority so
+            // newly discovered files (files with no known.met record —
+            // never seen before, or added while the app was closed)
+            // inherit eMule-style per-directory priority. Restricted to
+            // `new_paths` so this doesn't clobber a per-file priority
+            // that was just restored from known.met above for a file
+            // that was already known.
+            for (folder, priority) in &folder_priorities {
+                index.set_priority_under_folder_for_paths(folder, priority, &new_paths);
+            }
+            // An explicit priority selected while this path was
+            // pending wins over its folder default — but only for
+            // paths that are actually pending in THIS pass. Applying
+            // the map index-wide would override the priority just
+            // restored from known.met for already-hashed files (a
+            // stale intent would make the user's later choice
+            // permanently un-stickable across restarts).
+            let pending_priority_paths: std::collections::HashSet<String> = files_to_hash
+                .iter()
+                .map(|f| crate::search::index::normalize_path_key(&f.path))
+                .collect();
+            for (path, priority) in &pending_file_priorities {
+                if pending_priority_paths
+                    .contains(&crate::search::index::normalize_path_key(path))
+                {
+                    index.set_file_priority_by_path(path, priority);
+                }
+            }
+        }
+        commands::sharing::refresh_file_cache(&index_clone, &csf).await;
+        // Every file known from last session is in the index now, with
+        // its hash; only new ones wait for hashing.
+        drop(library_loaded);
+        let _ = net_tx.send(network::NetworkCommand::StartupLibraryIndexed).await;
+
+        let _ = startup_app.emit("shared-files-changed", serde_json::json!({
+            "phase": "discovered",
+            "count": all_discovered.len(),
+        }));
+
+        let total_to_hash = files_to_hash.len();
+        let mut hashed = 0usize;
+        let mut last_cache_refresh = std::time::Instant::now();
+        // Checkpoint recomputed hashes into known.met periodically so a
+        // long hash pass (notably the one-time AICH migration re-hash)
+        // resumes after a restart instead of starting from zero. Bounded
+        // by both elapsed time and file count so the loss window stays
+        // small whether files hash slowly (large) or quickly (many).
+        let mut last_known_met_persist = std::time::Instant::now();
+        let mut hashed_since_persist = 0usize;
+        let mut was_cancelled = cancelled_in_discovery;
+
+        // Same scheduler the folder-add and reload passes use: one read
+        // at a time per physical drive, more only where a drive has
+        // reported that its reads do not seek. A cold start on a
+        // library spread over several drives used to hash strictly one
+        // file at a time and leave every other drive idle — the same
+        // waste the reload path was fixed for, on the path that runs
+        // before anything else in the app works.
+        // Paced like the scans' progress: one event per file flooded
+        // the IPC bridge on a cold start of many small files.
+        let mut hash_progress = commands::sharing::HashProgressEmitter::new(&files_to_hash);
+        let mut pipeline = commands::sharing::HashLookahead::new(
+            &files_to_hash,
+            cancel_flag.clone(),
+        );
+        pipeline.log_plan("Startup hashing", total_to_hash);
+        // Every exit that cancels sets `was_cancelled` and breaks.
+        while !was_cancelled {
+            let started = match pipeline.next_started() {
+                commands::sharing::NextHash::Ready(started) => started,
+                // Every drive with work left is busy with a read this
+                // pass did not start, most likely a download verifying
+                // itself. Wait rather than pile on, and never mistake
+                // it for the end of the queue.
+                commands::sharing::NextHash::Busy => {
+                    if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        was_cancelled = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                commands::sharing::NextHash::Done => break,
+            };
+            if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                info!("Startup hashing cancelled at {hashed}/{total_to_hash}");
+                was_cancelled = true;
+                // Claimed and already running: hand it to the drain or
+                // its claim outlives the scan.
+                pipeline.drain_started(started);
+                break;
+            }
+
+            let file = &files_to_hash[started.index];
+            let file_temp_id = file.id.clone();
+            let hash_claim = started.claim;
+            let mut hash_task = started.task;
+
+            tracing::debug!("Startup hashing {}/{}: {}", hashed + 1, total_to_hash, file.name);
+
+            hash_progress.emit(&startup_app, hashed + 1, total_to_hash, &file.name);
+
+            let hash_result = commands::sharing::await_hash(
+                &mut hash_task,
+                &started.progress,
+                &file.path,
+                hash_claim,
+            )
+            .await;
+
+            match hash_result {
+                Ok(Ok(Ok((
+                    ed2k_hash,
+                    aich_hash,
+                    part_hashes,
+                    ember_file_hash,
+                    hashed_size,
+                    hashed_modified_at,
+                )))) => {
+                    tracing::debug!("Startup hash complete: {} -> {}", file.name, &ed2k_hash[..ed2k_hash.len().min(8)]);
+                    let mut updated = file.clone();
+                    updated.id = ed2k_hash.clone();
+                    updated.hash = ed2k_hash;
+                    updated.aich_hash = aich_hash;
+                    updated.ember_file_hash = ember_file_hash;
+                    updated.size = hashed_size;
+                    updated.modified_at = hashed_modified_at;
+                    commands::sharing::restore_known_hash_flags(&mut updated, &known_list);
+                    let still_shared = {
+                        let state = startup_app.state::<AppState>();
+                        let cfg = state.config.read().await;
+                        commands::sharing::file_in_shared_folders(&updated.path, &cfg.settings.shared_folders)
+                    };
+                    // Keep the combined-pass handoff only after the
+                    // completed row is committed. A cancellation can
+                    // remove the pending row after hashing, leaving no
+                    // reconciliation path to drain an early insert.
+                    let fresh_handoff = still_shared
+                        .then(|| {
+                            commands::sharing::fresh_part_hash_handoff(
+                                &updated.hash,
+                                part_hashes,
+                            )
+                        })
+                        .flatten();
+                    let finalized = {
+                        let mut idx = index_clone.write().await;
+                        if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) && still_shared {
+                            // Keep any explicit share/priority choice
+                            // made while this row was pending. A
+                            // removed pending row must not return just
+                            // because its hash computation finished.
+                            idx.finalize_pending_hash(&file_temp_id, updated.clone()).is_some()
+                        } else if still_shared {
+                            // Cancelled. A re-hash row is already
+                            // servable and keeps its place; only an
+                            // unhashed row is discarded.
+                            idx.abandon_hash_placeholder(&file_temp_id);
+                            false
+                        } else {
+                            // No longer under a shared folder, so the
+                            // row goes whatever kind it is.
+                            idx.remove_file_by_id(&file_temp_id);
+                            false
+                        }
+                    };
+                    commands::sharing::cache_fresh_part_hash_handoff(
+                        &startup_fresh_part_hashes,
+                        finalized,
+                        fresh_handoff,
+                    )
+                    .await;
+                    if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) && still_shared {
+                        hashed += 1;
+                    }
+                    if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
+                        && still_shared
+                        && last_cache_refresh.elapsed() >= std::time::Duration::from_secs(5)
+                    {
+                        commands::sharing::refresh_file_cache(&index_clone, &csf).await;
+                        last_cache_refresh = std::time::Instant::now();
+                    }
+                    // Fold freshly hashed AICH roots into known.met so an
+                    // interrupted pass resumes where it left off. A
+                    // SharedFilesChanged reconcile copies the index's new
+                    // roots into the network task's known.met (preserving
+                    // cumulative counters); its periodic + shutdown save
+                    // then flush them to disk.
+                    if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed)
+                        && still_shared
+                    {
+                        hashed_since_persist += 1;
+                        if hashed_since_persist >= 500
+                            || last_known_met_persist.elapsed()
+                                >= std::time::Duration::from_secs(30)
+                        {
+                            if reconcile_shared_files(&net_tx).await {
+                                last_known_met_persist = std::time::Instant::now();
+                                hashed_since_persist = 0;
+                            }
+                        }
+                    }
+                    commands::sharing::release_in_flight_hash(&file.path, hash_claim);
+                }
+                Ok(Ok(Err(e))) => {
+                    if commands::sharing::is_hash_cancellation(&e, &cancel_flag) {
+                        info!("Startup hashing cancelled mid-file");
+                        was_cancelled = true;
+                        let mut idx = index_clone.write().await;
+                        idx.abandon_hash_placeholder(&file_temp_id);
+                        drop(idx);
+                        commands::sharing::release_in_flight_hash(&file.path, hash_claim);
+                        break;
+                    }
+                    tracing::warn!("Startup hash failed for {}: {e}", file.name);
+                    let mut idx = index_clone.write().await;
+                    idx.abandon_hash_placeholder(&file_temp_id);
+                    drop(idx);
+                    commands::sharing::release_in_flight_hash(&file.path, hash_claim);
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("Startup hash task panicked for {}: {e}", file.name);
+                    let mut idx = index_clone.write().await;
+                    idx.abandon_hash_placeholder(&file_temp_id);
+                    drop(idx);
+                    commands::sharing::release_in_flight_hash(&file.path, hash_claim);
+                }
+                Err(commands::sharing::HashStalled) => {
+                    // One stuck file must not end the scan. Cancelling the
+                    // whole pass here and dropping the pending rows made
+                    // every file after this one silently un-indexed, and
+                    // it recurred on every launch because the queue is
+                    // walked in a stable order — the same failure the
+                    // "leaving pending for retry" behaviour was written to
+                    // prevent. Leave the row pending and move on.
+                    tracing::warn!(
+                        "Startup hash of {} read nothing for {} min (file may be on cloud storage or locked); leaving pending for retry",
+                        file.name,
+                        commands::sharing::HASH_STALL_TIMEOUT.as_secs() / 60
+                    );
+                    // Drain the abandoned blocking hash and release its
+                    // claim only once it really ends. It must hold no
+                    // scan lease: the read may be stuck in the kernel
+                    // where the cancel flag cannot reach it, and holding
+                    // the coordination/scan guards across that wait
+                    // would block every later reload and stall shutdown
+                    // for the rest of the session.
+                    let timed_out_name = file.name.clone();
+                    let timed_out_path = file.path.clone();
+                    // Keep the drive spoken for until the abandoned
+                    // read really ends; otherwise the look-ahead sees
+                    // the device as free and stacks another read on
+                    // top of the one still running.
+                    let orphan_device = sharing::disk::note_external_read_for_key(
+                        pipeline.device_key(started.device),
+                    );
+                    tokio::spawn(async move {
+                        let _orphan_device = orphan_device;
+                        if let Err(error) = hash_task.await {
+                            tracing::warn!(
+                                "Timed-out startup hash task for {timed_out_name} failed while draining: {error}"
+                            );
+                        }
+                        commands::sharing::release_in_flight_hash(
+                            &timed_out_path,
+                            hash_claim,
+                        );
+                    });
+                    continue;
+                }
+            }
+        }
+        // Cancelling leaves the look-ahead window full of claimed,
+        // still-running hashes; hand them off to drain rather than
+        // stranding their claims for the length of the lease.
+        pipeline.abandon();
+        // A file another pass still held was never hashed here, so this
+        // page is unfinished and nothing may be reconciled away on the
+        // strength of it. One that failed or stalled is retried by the
+        // next walk of the page; see the reload loop.
+        let page_complete = pipeline.skipped() == 0;
+
+        {
+            let mut idx = index_clone.write().await;
+            if was_cancelled {
+                idx.remove_pending_files();
+            }
+            idx.rebuild();
+        }
+
+        if !was_cancelled && page_complete {
+            let app_state = startup_app.state::<AppState>();
+            // Startup always rescans page 1, so its cursor must never
+            // move a reload's further-advanced cursor backward.
+            match commands::sharing::persist_scan_cursors(
+                &app_state,
+                &startup_cursor_updates,
+                true,
+            )
+            .await
+            {
+                // The later pages came back from known.met, which has
+                // nothing added to them while Ember was closed; only a
+                // walk finds that. Queued like a reload's own pages.
+                Ok(()) if startup_cursor_updates.values().any(Option::is_some) => {
+                    commands::sharing::schedule_chained_scan_page(
+                        startup_app.clone(),
+                        commands::sharing::MAX_CHAINED_SCAN_PAGES - 1,
+                    )
+                    .await;
+                }
+                Ok(()) => {}
+                Err(error) => tracing::warn!(
+                    "Startup shared-folder pages were indexed but scan cursors were not saved: {error}"
+                ),
+            }
+        }
+        commands::sharing::refresh_file_cache(&index_clone, &csf).await;
+
+        if !was_cancelled {
+            let all_hashed: Vec<_> = index_clone.read().await.all_files().iter()
+                .filter(|f| !f.hash.is_empty())
+                .cloned()
+                .collect();
+            if !all_hashed.is_empty() {
+                if let Err(e) = net_tx.send(network::NetworkCommand::AnnounceFiles { files: all_hashed }).await {
+                    tracing::warn!("Failed to send initial file announcement: {e}");
+                }
+            }
+        }
+
+        drop(scan_guard);
+        startup_cancel_flags.write().await.remove("__startup__");
+        if !reconcile_shared_files(&net_tx).await {
+            tracing::warn!("Startup shared-file reconciliation failed");
+        } else if !was_cancelled {
+            // known.met now owns everything hashed this pass — sweep
+            // handed-off (or stale pre-fix) pending intents so they
+            // can't re-apply share/priority flips on a later rehash.
+            let app_state = startup_app.state::<AppState>();
+            commands::sharing::prune_pending_intents_for_hashed(&app_state).await;
+        }
+        if !was_cancelled {
+            // Last, and only once the scan has let go of the drives.
+            commands::sharing::queue_hash_top_up(
+                startup_app.clone(),
+                &all_discovered,
+            )
+            .await;
+        }
+        let _ = startup_app.emit("file-hash-progress", serde_json::json!({
+            "current": total_to_hash,
+            "total": total_to_hash,
+            "file_name": "",
+            "done": true,
+        }));
+        let from_known = all_discovered.len().saturating_sub(total_to_hash);
+        info!(
+            "Indexed {} files from {} shared folders ({} from known.met, {} hashed)",
+            index_clone.read().await.file_count(),
+            shared_folders.len(),
+            from_known,
+            hashed,
+        );
+    });
+    {
+        let state = app_handle.state::<AppState>();
+        crate::host::async_runtime::handle()
+            .block_on(state.register_background_scan(startup_scan_handle));
+    }
+
+    let net_handle = app_handle.clone();
+    let net_index = local_index.clone();
+    let net_fresh_part_hashes = fresh_part_hashes.clone();
+    let net_db = db.clone();
+    let net_transfers = transfer_manager.clone();
+    let net_bw = bandwidth_limiter.clone();
+    let bw_limiter = bandwidth_limiter.clone();
+    let bw_shutdown_spawn = bw_shutdown.clone();
+    let bw_rtt = uss_rtt_queue.clone();
+    let bw_uss_flag = uss_enabled_flag.clone();
+    let net_spam = spam_filter.clone();
+    let net_comments = comment_manager.clone();
+    let net_identity = identity.clone();
+    let net_security_policy = security_policy.clone();
+    let net_handle_err = app_handle.clone();
+    crate::host::async_runtime::spawn(async move {
+        // `catch_unwind` because a panic here is not survivable in the
+        // way an `Err` is: it unwinds straight past the reporting below,
+        // so the UI is never told and every later poll keeps succeeding
+        // off the last cached snapshot. The user sees a frozen-but-
+        // plausible network view instead of an error. Release builds set
+        // `overflow-checks`, and this loop does arithmetic on lengths and
+        // offsets taken from ed2k, KAD and Ember frames, so an overflow
+        // panic on hostile input is exactly the case to contain.
+        let outcome = std::panic::AssertUnwindSafe(network::start_network(
+            network::NetworkDeps {
+                app_handle: net_handle,
+                cmd_rx: network_rx,
+                settings,
+                identity: net_identity,
+                security_policy: net_security_policy,
+                local_index: net_index,
+                fresh_part_hashes: net_fresh_part_hashes,
+                db: net_db,
+                orphan_disposal,
+                transfer_manager: net_transfers,
+                bandwidth_limiter: net_bw,
+                shared_peers: cached_peers_net,
+                shared_stats: cached_stats_net,
+                shared_contacts: cached_contacts_net,
+                shared_searches: cached_searches_net,
+                shared_servers: cached_servers_net,
+                shared_connected_server: cached_connected_server_net,
+                shared_transfer_stats: cached_transfer_stats_net,
+                shared_files: cached_shared_files_net,
+                upload_shared_folders,
+                friend_hashes,
+                mutual_friend_hashes,
+                uss_rtt_queue,
+                uss_enabled_flag,
+                spam_filter: net_spam,
+                comment_manager: net_comments,
+            },
+        ))
+        .catch_unwind()
+        .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!("Network error: {e}");
+                // The full error chain can contain IPs, peer IDs, paths,
+                // and low-level socket diagnostics we don't want to leak
+                // to the UI (it's shown verbatim). Log the rich version
+                // for diagnostics and send a redacted, user-facing summary.
+                let redacted = crate::security::redact_fatal_error(&e);
+                let _ = net_handle_err.emit("network-fatal-error", redacted);
+            }
+            Err(_panic) => {
+                // Location and payload are already in the log via the
+                // panic hook installed at startup; the payload itself can
+                // carry peer data, so it is not forwarded to the UI.
+                tracing::error!(
+                    "Network task panicked; networking is stopped until restart"
+                );
+                let _ = net_handle_err.emit(
+                    "network-fatal-error",
+                    crate::commands::errors::coded(
+                        "network_task_panicked",
+                        "The network service stopped unexpectedly. \
+                         Restart Ember to reconnect; see logs for details.",
+                    ),
+                );
+            }
+        }
+        shutdown_complete_net.store(true, std::sync::atomic::Ordering::Release);
+    });
+    // Same containment as the network task above, and for the same
+    // reason: the release profile enables `overflow-checks`, so
+    // arithmetic reachable from a configured limit or a peer-fed RTT
+    // sample panics rather than wrapping. Uncontained, that panic drops
+    // `RefillAliveGuard`, which flips `refill_alive` so every
+    // `acquire_upload`/`acquire_download` caller aborts its transfer —
+    // the whole session's rate-limited traffic, with nothing in the UI
+    // to explain it. The guard still does its job here; this just adds
+    // the log line and the user-facing notice that were missing.
+    let refill_handle = app_handle.clone();
+    crate::host::async_runtime::spawn(async move {
+        let outcome = std::panic::AssertUnwindSafe(bandwidth::limiter::start_token_refill(
+            bw_limiter,
+            bw_shutdown_spawn,
+            bw_rtt,
+            bw_uss_flag,
+        ))
+        .catch_unwind()
+        .await;
+        if outcome.is_err() {
+            // Payload withheld for the same reason as the network task.
+            tracing::error!(
+                "Token refill task panicked; rate-limited transfers are stopped until restart"
+            );
+            let _ = refill_handle.emit(
+                "network-fatal-error",
+                crate::commands::errors::coded(
+                    "bandwidth_refill_panicked",
+                    "Bandwidth limiting stopped unexpectedly. \
+                     Restart Ember to resume limited transfers; see logs for details.",
+                ),
+            );
+        }
+    });
+
+    // Files new to a shared folder, tagged `[Ember-P2P]` when the user
+    // asked for that. Polled rather than hooked into each hashing pass:
+    // startup, folder adds, rescans and the watcher all add files, and
+    // one sweep over the index covers every one of them.
+    let tag_handle = app_handle.clone();
+    crate::host::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(commands::sharing::IMPORT_TAG_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut seen: commands::sharing::NameTagSeenCache = None;
+        loop {
+            tick.tick().await;
+            let Some(state) = tag_handle.try_state::<AppState>() else {
+                continue;
+            };
+            commands::sharing::tag_new_shared_imports(&tag_handle, &state, &mut seen).await;
+        }
+    });
+
+    info!("Ember P2P application started");
+    Ok(())
 }

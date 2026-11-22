@@ -1,10 +1,12 @@
 pub mod disk;
 pub mod feed_downloads;
 pub mod feed_files;
+pub mod feed_shares;
 pub mod indexer;
 pub mod manager;
 pub mod name_tag;
 pub mod paged_cycle;
+pub mod room_library;
 pub mod watcher;
 
 /// Directory basenames that must not be shared as roots and must be skipped
@@ -142,7 +144,17 @@ const CREDENTIAL_DIR_NAMES: &[&str] = &[
 /// True when indexing should not descend into a directory named `name`.
 pub fn is_index_skip_dir_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    SENSITIVE_DIR_NAMES.contains(&lower.as_str()) || CREDENTIAL_DIR_NAMES.contains(&lower.as_str())
+    SENSITIVE_DIR_NAMES.contains(&lower.as_str())
+        || CREDENTIAL_DIR_NAMES.contains(&lower.as_str())
+        || is_trash_dir_name(&lower)
+}
+
+/// The trash Linux desktops keep at the top of a mount (`.Trash-1000`,
+/// `.Trash`) and macOS's `.Trashes`: a file deleted from a shared folder on
+/// that mount lands there, beside a note of where it was, and must not be
+/// shared again from it.
+fn is_trash_dir_name(lower: &str) -> bool {
+    lower == ".trash" || lower == ".trashes" || lower.starts_with(".trash-")
 }
 
 /// The folders Ember files privately received chat attachments and room
@@ -277,7 +289,19 @@ pub(crate) fn volume_key(path: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
+    #[cfg(windows)]
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_mounts_trash_is_not_walked() {
+        for name in [".Trash-1000", ".Trash", ".trashes", "$RECYCLE.BIN"] {
+            assert!(is_index_skip_dir_name(name), "{name}");
+        }
+        for name in ["Trash", "trash-metal", ".trashy"] {
+            assert!(!is_index_skip_dir_name(name), "{name}");
+        }
+    }
 
     #[test]
     fn the_home_folder_is_found_whatever_its_spelling() {

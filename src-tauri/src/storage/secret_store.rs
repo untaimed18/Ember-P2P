@@ -40,6 +40,26 @@ const MAGIC_V4: &[u8; 8] = b"EMBRSEC4";
 const KEY_SRC_HKDF: u8 = 0;
 #[cfg(not(target_os = "windows"))]
 const KEY_SRC_KEYRING: u8 = 1;
+/// The wrapping key is the one in the key file `emberd` was given.
+#[cfg(not(target_os = "windows"))]
+const KEY_SRC_FILE: u8 = 2;
+
+/// `emberd`'s key file. A server rarely runs a keyring, and a container's
+/// machine id can change when it is recreated, which would leave the identity
+/// sealed under it unreadable. Kept with the data it is no weaker than the
+/// machine-id key; mounted apart from it, it is stronger.
+static KEY_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The key file `emberd` makes in its data folder when its config names none.
+#[cfg_attr(all(windows, not(feature = "server")), allow(dead_code))]
+pub const DEFAULT_KEY_FILE: &str = "emberd-secret.key";
+
+/// Seal secrets with the 32-byte key in `path` (64 hex digits), made there on
+/// first use. Set once, before anything is sealed or opened.
+#[cfg_attr(not(feature = "server"), allow(dead_code))]
+pub fn use_key_file(path: std::path::PathBuf) {
+    let _ = KEY_FILE.set(path);
+}
 
 /// Set once this process has sealed a secret under the machine-id fallback key,
 /// or read one that stays there because the keyring still cannot be reached.
@@ -83,6 +103,15 @@ pub fn needs_rewrap(stored: &[u8]) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        // Given a key file, everything moves under it.
+        if KEY_FILE.get().is_some() {
+            return stored.len() > 8 && &stored[..8] == MAGIC_V4 && stored[8] != KEY_SRC_FILE;
+        }
+        // Sealed by emberd on this data folder; the desktop app keeps its own
+        // under the keyring.
+        if stored.len() > 8 && &stored[..8] == MAGIC_V4 && stored[8] == KEY_SRC_FILE {
+            return true;
+        }
         if stored.len() > 8 && &stored[..8] == MAGIC_V4 && stored[8] == KEY_SRC_HKDF {
             return unix::keyring_reachable();
         }
@@ -324,7 +353,7 @@ mod derive_tests {
 #[cfg(not(target_os = "windows"))]
 mod unix {
     use super::derive::{expand, legacy_ikm, ordered_legacy_usernames, uid_ikm};
-    use super::{KEY_SRC_HKDF, KEY_SRC_KEYRING, MAGIC_V2, MAGIC_V3, MAGIC_V4};
+    use super::{KEY_FILE, KEY_SRC_FILE, KEY_SRC_HKDF, KEY_SRC_KEYRING, MAGIC_V2, MAGIC_V3, MAGIC_V4};
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::{Key as ChaChaKey, XChaCha20Poly1305, XNonce};
     use rand::{rngs::OsRng, RngCore};
@@ -575,9 +604,45 @@ mod unix {
         Ok(Zeroizing::new(plain))
     }
 
+    /// The key in the key file: 64 hex digits. `create` makes one where there
+    /// is none; opening a secret never does, since a new key opens nothing.
+    fn key_file_key(path: &std::path::Path, create: bool) -> anyhow::Result<[u8; 32]> {
+        let read = std::fs::read_to_string(path);
+        let text = match read {
+            Ok(text) => Zeroizing::new(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
+                let mut key = [0u8; 32];
+                OsRng.fill_bytes(&mut key);
+                let text = Zeroizing::new(format!("{}\n", hex::encode(key)));
+                key.zeroize();
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                crate::security::atomic_write(path, text.as_bytes(), true)
+                    .map_err(|e| anyhow::anyhow!("could not create the key file {}: {e}", path.display()))?;
+                tracing::info!("Made the key file {} that seals Ember's identity", path.display());
+                text
+            }
+            Err(e) => anyhow::bail!("could not read the key file {}: {e}", path.display()),
+        };
+        let bytes = Zeroizing::new(
+            hex::decode(text.trim())
+                .map_err(|_| anyhow::anyhow!("the key file {} must hold 64 hex digits", path.display()))?,
+        );
+        let key: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("the key file {} must hold 64 hex digits", path.display()))?;
+        Ok(key)
+    }
+
     pub fn protect(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let (src, mut key) = match keyring_wrapping_key_for_protect() {
-            Ok(k) => (KEY_SRC_KEYRING, k),
+        let chosen = match KEY_FILE.get() {
+            Some(path) => Ok((KEY_SRC_FILE, key_file_key(path, true)?)),
+            None => keyring_wrapping_key_for_protect().map(|k| (KEY_SRC_KEYRING, k)),
+        };
+        let (src, mut key) = match chosen {
+            Ok(chosen) => chosen,
             Err(e) => {
                 tracing::warn!(
                     "OS keyring unavailable ({e}); sealing this secret under a key derived \
@@ -623,11 +688,22 @@ mod unix {
             let mut key = match src {
                 KEY_SRC_KEYRING => keyring_wrapping_key_existing()?,
                 KEY_SRC_HKDF => hkdf_key_uid(HKDF_SALT_V4, HKDF_INFO_V4)?,
+                KEY_SRC_FILE => match KEY_FILE.get() {
+                    Some(path) => key_file_key(path, false)?,
+                    // The desktop app on a data folder emberd ran on: its
+                    // default key file is beside what it sealed.
+                    None => key_file_key(&crate::storage::paths::resolve_data_dir().join(super::DEFAULT_KEY_FILE), false)
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "this secret was sealed by emberd with its key file; run emberd with that key file"
+                            )
+                        })?,
+                },
                 _ => anyhow::bail!("unknown {label} key source"),
             };
             let result = decrypt_with(&key, nonce, ct);
             key.zeroize();
-            if result.is_ok() && src == KEY_SRC_HKDF {
+            if result.is_ok() && src == KEY_SRC_HKDF && KEY_FILE.get().is_none() {
                 tracing::warn!(
                     "A stored secret is sealed only under the machine-id fallback key, \
                      not the OS keyring; it will be re-sealed once the keyring is reachable"
@@ -659,6 +735,22 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A key file is made once and then read back the same; opening a
+        /// secret never makes one, and a file that is not a key is refused.
+        #[test]
+        fn the_key_file_is_made_once_and_never_invented_to_open_a_secret() {
+            let dir = std::env::temp_dir().join(format!("ember-key-file-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let path = dir.join("emberd-secret.key");
+            assert!(key_file_key(&path, false).is_err(), "nothing to open with");
+            let made = key_file_key(&path, true).unwrap();
+            assert_eq!(key_file_key(&path, false).unwrap(), made);
+            assert_eq!(key_file_key(&path, true).unwrap(), made, "not made again");
+            std::fs::write(&path, "not a key").unwrap();
+            assert!(key_file_key(&path, false).is_err());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
 
         /// The whole point of moving off `$USER`: the same uid must derive the
         /// same wrapping key no matter what the launcher exported, including

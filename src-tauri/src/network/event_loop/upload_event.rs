@@ -79,7 +79,7 @@ const SHARED_FILE_STATS_INTERVAL: std::time::Duration = std::time::Duration::fro
 static PENDING_SHARED_FILE_STATS: std::sync::Mutex<Option<HashMap<String, SharedFileStats>>> =
     std::sync::Mutex::new(None);
 
-fn queue_shared_file_stats(app_handle: &tauri::AppHandle, stats: SharedFileStats) {
+fn queue_shared_file_stats(app_handle: &crate::host::AppHandle, stats: SharedFileStats) {
     let key = stats.hash.to_ascii_lowercase();
     {
         let mut pending = PENDING_SHARED_FILE_STATS
@@ -92,7 +92,7 @@ fn queue_shared_file_stats(app_handle: &tauri::AppHandle, stats: SharedFileStats
         *pending = Some(HashMap::from([(key, stats)]));
     }
     let app_handle = app_handle.clone();
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         tokio::time::sleep(SHARED_FILE_STATS_INTERVAL).await;
         let batch = PENDING_SHARED_FILE_STATS
             .lock()
@@ -169,7 +169,7 @@ pub(in crate::network) async fn on_upload_event(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
@@ -665,6 +665,7 @@ pub(in crate::network) async fn on_upload_event(
             // queue and leave no room for it.
             if still_friend {
                 on_friend_session_for_mailbox(state, settings, *ember_hash).await;
+                announce_ember_features(state, *ember_hash).await;
                 chat_attach::on_friend_session(state, *ember_hash).await;
                 send_friend_status(state, settings, &ed25519_secret_key, *ember_hash).await;
                 crate::network::settings::announce_nickname_to_friend(
@@ -780,7 +781,7 @@ pub(in crate::network) async fn on_upload_event(
             ip,
             port,
         }
-            // Gate on current membership: FriendSeen fires post-PoP for a
+            // Gate on current membership: FriendSeen fires on a secure-v2 session for a
             // peer that was a friend at emit time, but a concurrent
             // removal can still race it. Without this a just-removed
             // friend could be resurrected as "online" in the UI until the
@@ -789,9 +790,8 @@ pub(in crate::network) async fn on_upload_event(
                 let hash_hex = hex::encode(ember_hash);
                 let now = chrono::Utc::now().timestamp();
                 state.online_friends.insert(*ember_hash, now);
-                // Mirror the download-side FriendSeen handler: clear any
-                // reconnect backoff so a later disconnect can re-dial
-                // promptly instead of waiting out the cooldown.
+                // Clear any reconnect backoff so a later disconnect can
+                // re-dial promptly instead of waiting out the cooldown.
                 state.friend_reconnect_last.remove(ember_hash);
                 // A relayed session reports no address: it is online, but
                 // nothing about where to reach it is known.
@@ -845,6 +845,7 @@ pub(in crate::network) async fn on_upload_event(
                 // Whether we collect goes first, for the reason the
                 // outbound arm gives.
                 on_friend_session_for_mailbox(state, settings, *ember_hash).await;
+                announce_ember_features(state, *ember_hash).await;
                 chat_attach::on_friend_session(state, *ember_hash).await;
                 send_friend_status(state, settings, &ed25519_secret_key, *ember_hash).await;
                 if settings.chat_allowed_with(ember_hash) {
@@ -964,7 +965,7 @@ pub(in crate::network) async fn on_upload_event(
                 // settings back to it and would wait on itself.
                 let clear_app = app_handle.clone();
                 tokio::spawn(async move {
-                    use tauri::Manager;
+                    use crate::host::Manager;
                     let Some(state) = clear_app.try_state::<crate::app_state::AppState>() else {
                         return;
                     };
@@ -1010,8 +1011,7 @@ pub(in crate::network) async fn on_upload_event(
         }
         if settings.chat_allowed_with(&chat_eh) {
             let hash_hex = hex::encode(chat_eh);
-            // L20: same ingress sanitisation as the
-            // download-event path above. Inbound chat
+            // L20: ingress sanitisation. Inbound chat
             // arrives via two upload-listener routes
             // (`upload.rs` direct, plus the
             // friend-session reader in
@@ -1019,14 +1019,12 @@ pub(in crate::network) async fn on_upload_event(
             // land here, so this single call covers
             // every inbound chat persistence point.
             let cleaned = crate::security::sanitize_chat_text(message);
-            // Dedup against the `DownloadEvent::EmberChatMessage`
-            // path above — see `recent_ember_chat`'s doc comment.
-            // The two upload-listener routes feeding *this* arm
-            // already can't double-deliver on their own (both
-            // honour `ember_sessions` slot ownership), but an
-            // ordinary download connection to the same friend
-            // deliberately doesn't participate in that ownership
-            // check, so this shared map is what catches it.
+            // Short-window dedup of an exact-text repeat — see
+            // `recent_ember_chat`'s doc comment. One send from the
+            // peer goes out on one connection, but simultaneous
+            // dials can leave two live ones that both accept chat,
+            // so this catches a retry or repeat arriving on the
+            // second.
             let now = chrono::Utc::now().timestamp();
             // A message with a mailbox id is told apart by that id alone: two
             // identical texts sent in a row are two messages, and dropping
@@ -1186,8 +1184,16 @@ pub(in crate::network) async fn on_upload_event(
         ref reply_tx,
         supports_ebr1,
         supports_scope,
+        ref filter,
+        supports_details,
     } = event.kind
     {
+        // Stamped before the walk, as a friend's contact ask is: a request is
+        // cheap to send and its answer is a walk of every shared file.
+        if !browse_serve_allowed(&browse_eh) {
+            debug!("Browse request from {} refused: asking too fast", hex::encode(browse_eh));
+            return;
+        }
         // Mutual, not merely listed. The UI already hides Browse
         // until a friendship is mutual, but that is cosmetic: the
         // wire has to enforce it, or anyone who learns our Ember
@@ -1217,7 +1223,14 @@ pub(in crate::network) async fn on_upload_event(
                 Vec<u8>,
                 Option<[u8; 20]>,
                 Option<[u8; 32]>,
+                ed2k::multi_source::BrowseDetail,
             )> = Vec::new();
+            let details = supports_ebr1 && supports_details;
+            let folder_roots = if details && settings.friend_browse_shows_folders {
+                settings.configured_roots()
+            } else {
+                Vec::new()
+            };
             let mut restricted_entries: Vec<[u8; 16]> = Vec::new();
             // Fail closed until known.met is absorbed: a friends-only row
             // can still read public in the index during that window, and
@@ -1229,13 +1242,18 @@ pub(in crate::network) async fn on_upload_event(
             // what was added most recently rather than index order; and
             // one row per hash, so copies of a file in two shared folders
             // don't spend two of the answer's slots.
-            let mut visible: Vec<&FileInfo> =
-                files.iter().filter(|f| f.is_friend_visible()).collect();
+            // A filtered request's filter comes before the caps and the total,
+            // or a large library would still answer with an arbitrary thousand.
+            let mut visible: Vec<&FileInfo> = files
+                .iter()
+                .filter(|f| f.is_friend_visible())
+                .filter(|f| filter.as_ref().is_none_or(|filter| filter.admits(&f.name, f.size, &f.hash)))
+                .collect();
             visible.sort_by_key(|f| std::cmp::Reverse(f.modified_at));
             let mut seen_hashes: std::collections::HashSet<[u8; 16]> =
                 std::collections::HashSet::new();
             let mut total_unique: u32 = 0;
-            let mut approx_bytes = 8usize;
+            let mut approx_bytes = 8usize + if details { ed2k::multi_source::BROWSE_DETAILS_MAGIC.len() } else { 0 };
             let mut answer_full = false;
             for f in visible {
                 let Ok(hash_bytes) = hex::decode(&f.hash) else {
@@ -1286,6 +1304,17 @@ pub(in crate::network) async fn on_upload_event(
                 {
                     restricted_entries.push(hash);
                 }
+                let detail = if details {
+                    let media = known_files.find_by_hash(&hash).and_then(|record| record.media.as_ref());
+                    ed2k::multi_source::BrowseDetail {
+                        folder: crate::network::browse::browse_folder_of(&f.path, &folder_roots),
+                        duration: media.and_then(|m| m.duration),
+                        bitrate: media.and_then(|m| m.bitrate),
+                        codec: media.and_then(|m| m.codec.clone()),
+                    }
+                } else {
+                    Default::default()
+                };
                 // Rough pre-cap so encode stays under the frame budget.
                 approx_bytes += 16
                     + 8
@@ -1293,8 +1322,15 @@ pub(in crate::network) async fn on_upload_event(
                     + name_bytes.len()
                     + 1
                     + if aich.is_some() { 20 } else { 0 }
-                    + 32;
-                encoded_entries.push((hash, f.size, name_bytes, aich, ember));
+                    + 32
+                    + if details {
+                        2 + detail.folder.len().min(ed2k::multi_source::MAX_BROWSE_FOLDER_BYTES)
+                            + 9
+                            + detail.codec.as_ref().map_or(0, String::len)
+                    } else {
+                        0
+                    };
+                encoded_entries.push((hash, f.size, name_bytes, aich, ember, detail));
                 if approx_bytes >= MAX_BROWSE_ANSWER_BYTES {
                     answer_full = true;
                 }
@@ -1344,16 +1380,22 @@ pub(in crate::network) async fn on_upload_event(
                 }
             }
             let res_payload = if supports_ebr1 {
-                ed2k::multi_source::encode_browse_response_v1(
-                    encoded_entries.iter().map(|(h, s, n, a, e)| {
+                let mut payload = ed2k::multi_source::encode_browse_response_v1(
+                    encoded_entries.iter().map(|(h, s, n, a, e, _)| {
                         (h, *s, n.as_slice(), a.as_ref(), e.as_ref())
                     }),
-                )
+                );
+                if details {
+                    payload.extend(ed2k::multi_source::encode_browse_details(
+                        encoded_entries.iter().map(|(.., detail)| detail),
+                    ));
+                }
+                payload
             } else {
                 ed2k::multi_source::encode_browse_response_legacy(
                     encoded_entries
                         .iter()
-                        .map(|(h, s, n, _, _)| (h, *s, n.as_slice())),
+                        .map(|(h, s, n, ..)| (h, *s, n.as_slice())),
                 )
             };
             let mut packet = Vec::with_capacity(6 + res_payload.len());
@@ -1523,6 +1565,7 @@ pub(in crate::network) async fn on_upload_event(
         ember_hash: browse_eh,
         session_id,
         ref entries,
+        ref details,
     } = event.kind
     {
         if !friend_hashes.read().await.contains(&browse_eh) {
@@ -1547,13 +1590,32 @@ pub(in crate::network) async fn on_upload_event(
             .collect();
         let files: Vec<serde_json::Value> = entries
             .iter()
-            .map(|(hash, size, name, aich, ember)| {
+            .enumerate()
+            .map(|(i, (hash, size, name, aich, ember))| {
                 let clean_name = crate::security::sanitize_display_name(name);
                 let mut obj = serde_json::json!({
                     "hash": hash,
                     "size": size,
                     "name": clean_name,
                 });
+                if let Some(detail) = details.get(i) {
+                    let fields = obj.as_object_mut().unwrap();
+                    let folder = crate::network::browse::clean_browse_folder(&detail.folder);
+                    if !folder.is_empty() {
+                        fields.insert("folder".into(), folder.into());
+                    }
+                    if let Some(duration) = detail.duration {
+                        fields.insert("duration".into(), duration.into());
+                    }
+                    if let Some(bitrate) = detail.bitrate {
+                        fields.insert("bitrate".into(), bitrate.into());
+                    }
+                    if let Some(codec) = detail.codec.as_deref().map(|codec| crate::security::sanitize_remote_text(codec, 32)) {
+                        if !codec.is_empty() {
+                            fields.insert("codec".into(), codec.into());
+                        }
+                    }
+                }
                 if parse_ed2k_hash16(hash).is_some_and(|h| restricted.contains(&h)) {
                     obj.as_object_mut()
                         .unwrap()
@@ -1575,6 +1637,13 @@ pub(in crate::network) async fn on_upload_event(
                 obj
             })
             .collect();
+        // Read off the head before it completes: the friend narrowed this
+        // answer to the filter itself, and the total counts its matches.
+        let filtered = state
+            .pending_browse_requests
+            .get(&browse_eh)
+            .and_then(|queue| queue.front())
+            .is_some_and(|head| head.session_id == session_id && head.dispatched && head.filtered);
         match complete_browse_request(
             &mut state.pending_browse_requests,
             browse_eh,
@@ -1592,6 +1661,7 @@ pub(in crate::network) async fn on_upload_event(
                         "request_id": request_id,
                         "files": files,
                         "total": total,
+                        "filtered": filtered,
                     }));
                 }
                 dispatch_browse_head(state, app_handle, browse_eh).await;

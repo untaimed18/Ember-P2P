@@ -4,6 +4,20 @@
 
 use super::*;
 
+/// Whether a search query is past its time: its deadline, or, behind a
+/// handshake, the handshake's own deadline with no session from it yet.
+fn search_query_expired(
+    request: &EmberSearchRequest,
+    now: std::time::Instant,
+    has_live_session: impl Fn(&std::net::SocketAddr, &[u8; 32]) -> bool,
+) -> bool {
+    now >= request.deadline
+        || (request.handshake_deadline.is_some_and(|due| now >= due)
+            && request
+                .handshake_to
+                .is_some_and(|(addr, key)| !has_live_session(&addr, &key)))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_ember_search_tick(
     udp_socket: &Arc<UdpSocket>,
@@ -13,7 +27,7 @@ pub(in crate::network) async fn on_ember_search_tick(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
@@ -90,6 +104,13 @@ pub(in crate::network) async fn on_ember_search_tick(
             debug!("Ember: resending handshake message 1 to {addr} failed: {e}");
         }
     }
+    // And what a crossed dial held for a session that never proved itself,
+    // over a fresh dial (see `CROSSING_HOLD`).
+    for (addr, packet) in state.ember_transport.due_crossing_redials(std::time::Instant::now()) {
+        if let Err(e) = send_ember_udp(udp_socket, &packet, addr, &state.ember_dht_overhead).await {
+            debug!("Ember: redialling a crossed dial to {addr} failed: {e}");
+        }
+    }
 
     // Ahead of the idle guard: a queued lookup is not one of the maps it reads.
     top_up_awaited_target_lookups(udp_socket, state).await;
@@ -137,11 +158,13 @@ pub(in crate::network) async fn on_ember_search_tick(
     let now = std::time::Instant::now();
 
     // 1) Expire search queries unanswered too long, marking
-    //    their shortlist entry failed.
+    //    their shortlist entry failed: past their deadline, or, behind a
+    //    handshake the peer has not answered, past the handshake's own.
+    let transport = &state.ember_transport;
     let stale: Vec<u32> = state
         .ember_dht_search_requests
         .iter()
-        .filter(|(_, r)| now >= r.deadline)
+        .filter(|(_, r)| search_query_expired(r, now, |addr, key| transport.has_live_session(addr, key)))
         .map(|(wire_id, _)| *wire_id)
         .collect();
 
@@ -278,8 +301,10 @@ pub(in crate::network) async fn on_ember_search_tick(
     }
 
     for op in state.ember_publish.cleanup_expired() {
+        let result = ember_publish_result(&op);
+        crate::network::channel_membership::note_owner_snapshot_finished(state, op.id, result.stored_on);
         if let Some(tx) = state.ember_dht_pending_publishes.remove(&op.id) {
-            let _ = tx.send(ember_publish_result(&op));
+            let _ = tx.send(result);
         }
         state
             .ember_dht_publish_requests
@@ -774,7 +799,7 @@ pub(in crate::network) async fn on_ember_search_tick(
     //    before its neighbourhood settles, and buffering until then
     //    would leave KAD rows on screen with nothing from Ember.
     //    Cadence matches the KAD path: a rebuild on the first record,
-    //    then every 20.
+    //    then every 20, or what has gathered once two seconds pass.
     if !state.ember_keyword_searches.is_empty() {
         let search_ids: Vec<u32> =
             state.ember_keyword_searches.keys().copied().collect();
@@ -806,8 +831,19 @@ pub(in crate::network) async fn on_ember_search_tick(
             // first record, and the search page's spinner has
             // nothing else to say during it. KAD reports this from
             // its own sweep, so Ember-only searches were the one
-            // case that showed a bare spinner.
-            if let Some(kw) = state.ember_keyword_searches.get(&search_id) {
+            // case that showed a bare spinner. Only for those: beside a KAD
+            // leg the two counts took turns on the same line.
+            let kad_reporting = |request_id: u64| {
+                state
+                    .pending_keyword_searches
+                    .values()
+                    .any(|pending| pending.request_id == request_id)
+            };
+            if let Some(kw) = state
+                .ember_keyword_searches
+                .get(&search_id)
+                .filter(|kw| !kad_reporting(kw.request_id))
+            {
                 let _ = app_handle.emit(
                     "search-progress",
                     SearchProgressEvent {
@@ -827,17 +863,22 @@ pub(in crate::network) async fn on_ember_search_tick(
             }
             // A row held back for the next rebuild (see `ember_stream_rows`)
             // gets it on the next tick, whether or not new records are due.
-            let threshold = if cursor == 0 { 1 } else { 20 };
             let Some(kw) = state.ember_keyword_searches.get_mut(&search_id) else {
                 continue;
             };
-            if gathered < cursor + threshold && !ember_rows_held(&kw.streamed_publishers) {
+            let due = super::search_poll_tick::kad_keyword_batch_due(
+                cursor,
+                gathered,
+                kw.last_streamed_at.elapsed(),
+            );
+            if !due && !ember_rows_held(&kw.streamed_publishers) {
                 continue;
             }
             // Advanced even when the rows below all fail the query
             // filter: those records have been considered, and not
             // moving the cursor would re-examine them every tick.
             kw.last_streamed_count = gathered;
+            kw.last_streamed_at = std::time::Instant::now();
             // Every slice is a rebuild over all the walk has gathered: a
             // row's count is the publishers agreeing with its plurality
             // digest, which only the whole set can say, so each batch is a
@@ -850,12 +891,12 @@ pub(in crate::network) async fn on_ember_search_tick(
                     read_ember_keyword_records(search, &reader);
                 }
             }
-            let built = fold_ember_keyword_rows(
+            let built = fold_ember_keyword_rows(ember::dht::search::within_shares(
                 walks
                     .iter()
                     .filter_map(|walk| state.ember_search.get(*walk))
                     .flat_map(ember_keyword_readings),
-            );
+            ));
             let results = ember_stream_rows(&mut kw.streamed_publishers, built);
             // Streamed pages deliberately do not seed the enforced
             // digest map. A rebuild part-way through the walk can find
@@ -979,17 +1020,39 @@ pub(in crate::network) async fn on_ember_search_tick(
         .is_some_and(|job| job.is_finished())
     {
         if let Some(job) = state.ember_channel_ingest.take() {
+            let read = std::mem::take(&mut state.ember_channel_ingest_moderation);
             match job.await {
                 Ok(results) => {
+                    let now = chrono::Utc::now().timestamp();
+                    for (channel_id, answered) in read {
+                        crate::network::channel_membership::note_channel_moderation_read(channel_id, answered, now);
+                    }
+                    // A newer look at one of them, queued meanwhile, is still
+                    // to be written.
+                    for (channel_id, _, _) in &state.ember_pending_channel_moderation {
+                        crate::network::channel_membership::note_channel_moderation_unwritten(*channel_id);
+                    }
                     apply_channel_ingest_results(udp_socket, state, db, app_handle, results)
                         .await
                 }
-                Err(e) => tracing::warn!("channel lookup ingest failed: {e}"),
+                Err(e) => {
+                    // Nothing it read was written, so no look stands for it.
+                    let now = chrono::Utc::now().timestamp();
+                    for channel_id in read.keys() {
+                        state.channel_moderation_looked_at.remove(channel_id);
+                        crate::network::channel_membership::note_channel_moderation_read(*channel_id, false, now);
+                    }
+                    tracing::warn!("channel lookup ingest failed: {e}");
+                }
             }
         }
     }
     if state.ember_channel_ingest.is_none() {
         if let Some(batch) = ChannelIngestBatch::take(state) {
+            for (channel_id, _, _) in &batch.moderation {
+                let read = state.channel_moderation_look_read.remove(channel_id).unwrap_or(false);
+                *state.ember_channel_ingest_moderation.entry(*channel_id).or_default() |= read;
+            }
             let db = db.clone();
             let identity = identity.clone();
             state.ember_channel_ingest = Some(tokio::task::spawn_blocking(move || {
@@ -1005,7 +1068,7 @@ async fn apply_channel_ingest_results(
     udp_socket: &Arc<UdpSocket>,
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     results: ChannelIngestResults,
 ) {
     if !results.presence.is_empty() {
@@ -1052,6 +1115,19 @@ async fn apply_channel_ingest_results(
         );
     }
     state.channel_settings_fetch_owed.extend(results.settings_owed);
+    // The key this device holds may have reached a member the other device
+    // banned, so the owner pass makes the rotation it owes now, not at its
+    // next republish hours away. One that fetched back the newest key another
+    // device of ours minted re-seals it on that pass to the members it knows.
+    for channel_id in results.rotation_owed.into_iter().chain(results.owner_caught_up) {
+        state.channel_moderation_publish_at.remove(&channel_id);
+    }
+    // An older epoch is passed over for a while after this; the current one
+    // is asked for again at the usual interval.
+    let missed_at = chrono::Utc::now().timestamp();
+    for missed in results.epoch_missed {
+        state.channel_epoch_missed.insert(missed, missed_at);
+    }
     for (channel_id, successor_id) in results.claimed {
         let _ = app_handle.emit(
             "ember:channel-handoff",
@@ -1109,5 +1185,57 @@ async fn apply_channel_ingest_results(
         if let Some(started) = state.channel_handoff_fetch_at.get(&channel_id).copied() {
             state.channel_handoff_absent_at.insert(channel_id, started);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(sent: std::time::Instant, behind_handshake: bool) -> EmberSearchRequest {
+        let addr: std::net::SocketAddr = "203.0.113.9:4672".parse().unwrap();
+        EmberSearchRequest {
+            search_id: 1,
+            per_search_req_id: 1,
+            deadline: sent
+                + if behind_handshake {
+                    EMBER_SEARCH_QUEUED_QUERY_TIMEOUT
+                } else {
+                    EMBER_SEARCH_QUERY_TIMEOUT
+                },
+            sent_unix: 0,
+            handshake_to: behind_handshake.then_some((addr, [7u8; 32])),
+            handshake_deadline: behind_handshake.then(|| sent + EMBER_SEARCH_HANDSHAKE_TIMEOUT),
+            sent_to: addr,
+        }
+    }
+
+    #[test]
+    fn a_first_contact_that_never_answers_the_handshake_fails_at_the_handshake_deadline() {
+        let sent = std::time::Instant::now();
+        let queued = request(sent, true);
+        let no_session = |_: &std::net::SocketAddr, _: &[u8; 32]| false;
+        let session = |_: &std::net::SocketAddr, _: &[u8; 32]| true;
+        let just_before = sent + EMBER_SEARCH_HANDSHAKE_TIMEOUT - std::time::Duration::from_millis(1);
+        assert!(!search_query_expired(&queued, just_before, no_session));
+        assert!(
+            search_query_expired(&queued, sent + EMBER_SEARCH_HANDSHAKE_TIMEOUT, no_session),
+            "silent: given up at 6 seconds, not 12"
+        );
+        assert!(
+            !search_query_expired(&queued, sent + EMBER_SEARCH_HANDSHAKE_TIMEOUT, session),
+            "the handshake completed: the query keeps the rest of its budget"
+        );
+        assert!(search_query_expired(&queued, sent + EMBER_SEARCH_QUEUED_QUERY_TIMEOUT, session));
+        assert!(EMBER_SEARCH_HANDSHAKE_TIMEOUT < EMBER_SEARCH_QUEUED_QUERY_TIMEOUT);
+    }
+
+    #[test]
+    fn a_query_on_a_live_session_keeps_its_own_deadline() {
+        let sent = std::time::Instant::now();
+        let live = request(sent, false);
+        let no_session = |_: &std::net::SocketAddr, _: &[u8; 32]| false;
+        assert!(!search_query_expired(&live, sent + EMBER_SEARCH_QUERY_TIMEOUT - std::time::Duration::from_millis(1), no_session));
+        assert!(search_query_expired(&live, sent + EMBER_SEARCH_QUERY_TIMEOUT, no_session));
     }
 }

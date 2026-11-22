@@ -47,8 +47,14 @@
   const version = $derived($silentUpdate?.version ?? '');
 
   function answer(action: () => Promise<void>) {
-    answeredFor = endsAt;
-    void action().catch((e) => toastError(translateError(e, m.error_operation_failed())));
+    const answered = endsAt;
+    answeredFor = answered;
+    void action().catch((e) => {
+      toastError(translateError(e, m.error_operation_failed()));
+      // Still counting down: put the dialog back rather than leave the user
+      // thinking the update was put off.
+      if (answeredFor === answered) answeredFor = null;
+    });
   }
 </script>
 

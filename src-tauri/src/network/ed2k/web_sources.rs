@@ -67,6 +67,8 @@ struct WebSource {
     /// Corrupt parts it wrote most of with another source writing into them
     /// too. Only suspicion: never retires it.
     shared_bad_parts: u32,
+    /// Parts it wrote into that then passed their check, over the session.
+    verified_parts: u32,
 }
 
 impl WebSource {
@@ -79,7 +81,14 @@ impl WebSource {
             written: Vec::new(),
             bad_parts: 0,
             shared_bad_parts: 0,
+            verified_parts: 0,
         }
+    }
+
+    /// Proven by the file itself: it wrote into a part that passed its check,
+    /// was never charged with or suspected of a corrupt one, and is still in use.
+    fn proven(&self) -> bool {
+        self.verified_parts > 0 && self.bad_parts == 0 && self.shared_bad_parts == 0 && !self.retired
     }
 }
 
@@ -452,8 +461,22 @@ pub fn note_verified_range(file_hash: &[u8; 16], start: u64, end: u64) {
         return;
     };
     for source in sources.iter_mut() {
+        if overlap(&source.written, start, end) > 0 {
+            source.verified_parts = source.verified_parts.saturating_add(1);
+        }
         remove_range(&mut source.written, start, end);
     }
+}
+
+/// The mirrors of `file_hash` worth keeping with the finished file, for a
+/// copied link to carry: those the file itself proved (see [`WebSource::proven`]).
+/// Read before [`forget`], as the download completes.
+pub fn proven(file_hash: &[u8; 16]) -> Vec<String> {
+    registry()
+        .read()
+        .get(file_hash)
+        .map(|sources| sources.iter().filter(|s| s.proven()).map(|s| s.url.clone()).collect())
+        .unwrap_or_default()
 }
 
 /// Corrupt parts `url` has been charged for `file_hash` this session.
@@ -721,6 +744,37 @@ mod tests {
         assert!(!is_retired(&hash, "https://new.example/f"));
         forget(&hash);
         assert!(is_retired(&hash, &held[1]), "the download let its sources go");
+    }
+
+    /// Only a mirror the file proved is kept with it: one that wrote into a
+    /// part that passed, and was never charged or suspected over a bad one.
+    #[test]
+    fn a_mirror_is_kept_only_once_a_part_it_wrote_passes_and_none_failed() {
+        let hash = [0xD4; 16];
+        clear_for_tests(&hash);
+        let good = "https://good.example/f".to_string();
+        let idle = "https://idle.example/f".to_string();
+        let bad = "https://bad.example/f".to_string();
+        let shared = "https://shared.example/f".to_string();
+        register(hash, [good.clone(), idle.clone(), bad.clone(), shared.clone()]);
+        let part = 9_728_000u64;
+        assert!(proven(&hash).is_empty(), "nothing has been checked yet");
+
+        note_written(&hash, &good, &[(0, part / 4)]);
+        note_written(&hash, &bad, &[(part / 4, part)]);
+        note_verified_range(&hash, 0, part);
+        // A later part the bad mirror wrote whole fails; one the shared mirror
+        // wrote most of beside a peer fails too, and is only suspicion.
+        note_written(&hash, &bad, &[(part, 2 * part)]);
+        note_corrupt_range(&hash, part, 2 * part, true);
+        note_written(&hash, &shared, &[(2 * part, 3 * part)]);
+        note_verified_range(&hash, 2 * part, 3 * part);
+        note_written(&hash, &shared, &[(3 * part + part / 10, 4 * part)]);
+        note_corrupt_range(&hash, 3 * part, 4 * part, true);
+
+        assert_eq!(proven(&hash), vec![good.clone()]);
+        forget(&hash);
+        assert!(proven(&hash).is_empty());
     }
 
     /// A verified part's writes have their verdict, so they no longer count

@@ -100,7 +100,7 @@ export function renderDownloads(downloads) {
     "          </tbody>",
     "        </table>",
     "      </div>",
-    '      <p class="meta">Windows 10 or 11, 64-bit &middot; Linux x86-64 with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later); the AppImage also needs FUSE 2 &middot; <a href="guide.html#installation">System requirements and updates</a></p>',
+    '      <p class="meta">Windows 10 or 11, 64-bit &middot; Linux x86-64: the <code>.deb</code> with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), the AppImage with glibc 2.39 or newer (Ubuntu 24.04, Debian 13, Fedora 40 and later) and FUSE 2 &middot; <a href="guide.html#installation">System requirements and updates</a></p>',
   ].join("\n");
 }
 

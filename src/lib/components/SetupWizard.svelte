@@ -25,6 +25,7 @@
   } from '$lib/api/settings';
   import * as m from '$lib/paraglide/messages';
   import { translateError } from '$lib/i18n';
+  import { isServer } from '$lib/runtime';
   import { addToast } from '$lib/stores/toast';
   import { inertBackground, trapTabKey } from '$lib/a11y';
   import { clampInputUtf8Bytes, formatSpeed, NICKNAME_MAX_BYTES } from '$lib/utils';
@@ -676,12 +677,14 @@
                 class="text-input folder-input"
                 readonly
               />
-              <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
+              {#if !isServer}
+                <button type="button" class="browse-btn" onclick={pickFolder}>{m.wizard_folder_browse()}</button>
+              {/if}
             </div>
             {#if folderFromEmule}
               <p class="step-hint from-emule">{m.wizard_folder_from_emule()}</p>
             {/if}
-            <p class="step-hint">{m.wizard_folder_picker_hint()}</p>
+            <p class="step-hint">{isServer ? m.server_download_folder_hint() : m.wizard_folder_picker_hint()}</p>
             {#if folderError}
               <p class="save-error">{folderError}</p>
             {/if}
@@ -766,10 +769,12 @@
             </div>
           </div>
           <p class="step-hint">{m.wizard_connect_hint()}</p>
-          <div class="toggle-row">
-            <ToggleSwitch bind:checked={launchAtLogin} label={m.wizard_launch_at_login_label()} />
-          </div>
-          <p class="step-hint toggle-hint">{m.wizard_launch_at_login_hint()}</p>
+          {#if !isServer}
+            <div class="toggle-row">
+              <ToggleSwitch bind:checked={launchAtLogin} label={m.wizard_launch_at_login_label()} />
+            </div>
+            <p class="step-hint toggle-hint">{m.wizard_launch_at_login_hint()}</p>
+          {/if}
         </div>
 
       {:else if step === 8}
@@ -847,10 +852,12 @@
               <span class="summary-label">{m.wizard_summary_theme()}</span>
               <span class="summary-value">{selectedTheme === 'dark' ? m.wizard_theme_dark() : m.wizard_theme_light()}</span>
             </div>
-            <div class="summary-row">
-              <span class="summary-label">{m.wizard_launch_at_login_label()}</span>
-              <span class="summary-value">{launchAtLogin ? m.common_yes() : m.common_no()}</span>
-            </div>
+            {#if !isServer}
+              <div class="summary-row">
+                <span class="summary-label">{m.wizard_launch_at_login_label()}</span>
+                <span class="summary-value">{launchAtLogin ? m.common_yes() : m.common_no()}</span>
+              </div>
+            {/if}
             <div class="summary-row">
               <span class="summary-label">{m.wizard_summary_import()}</span>
               <span class="summary-value">{willImport ? m.wizard_summary_import_yes() : m.wizard_summary_import_no()}</span>

@@ -51,6 +51,7 @@ use zeroize::Zeroizing;
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
 use crate::storage::{paths, secret_store};
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 
 const MAGIC: &[u8; 8] = b"EMBRBAK1";
@@ -1195,11 +1196,9 @@ fn ensure_backup_extension(mut path: PathBuf) -> PathBuf {
     }
 }
 
-async fn pick_backup_save_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
-    let default_name = format!(
-        "ember-backup-{}.{BACKUP_EXTENSION}",
-        chrono::Utc::now().format("%Y-%m-%d")
-    );
+#[cfg(feature = "desktop")]
+async fn pick_backup_save_path(app: &crate::host::AppHandle) -> Result<Option<PathBuf>, String> {
+    let default_name = backup_file_name();
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
         app.dialog()
@@ -1217,7 +1216,8 @@ async fn pick_backup_save_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>
     .map_err(|e| coded_ctx("backup_task_failed", "Backup dialog failed", e))?
 }
 
-async fn pick_backup_open_path(app: &tauri::AppHandle) -> Result<Option<PathBuf>, String> {
+#[cfg(feature = "desktop")]
+async fn pick_backup_open_path(app: &crate::host::AppHandle) -> Result<Option<PathBuf>, String> {
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
         app.dialog()
@@ -1294,10 +1294,10 @@ fn open_backup_error(error: std::io::Error, context: &str) -> String {
 
 /// Native save-dialog export. The OS dialog *is* the authorization; this
 /// command never accepts a renderer-supplied path.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn export_backup(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     passphrase: String,
     webview_prefs: Option<WebviewPrefs>,
 ) -> Result<Option<BackupSummary>, String> {
@@ -1315,7 +1315,7 @@ pub async fn export_backup(
 }
 
 async fn write_backup(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     dest: PathBuf,
     passphrase: String,
@@ -1325,6 +1325,12 @@ async fn write_backup(
     let app_version = app.package_info().version.to_string();
     let data_dir = paths::resolve_data_dir_with_app(app);
     let passphrase = Zeroizing::new(passphrase);
+    // The spam filter writes some of what it learns once a minute: what
+    // finished downloads earned and how server reputations aged. The archive
+    // reads the file, so it takes them only once they are on disk.
+    if let Err(e) = crate::search::spam::SpamFilter::drain_saves(&state.spam_filter).await {
+        tracing::warn!("Backup: could not save the spam filter first: {e}");
+    }
 
     tokio::task::spawn_blocking(move || {
         let scratch = temp_dir_in(&data_dir, "backup-tmp")?;
@@ -1365,12 +1371,53 @@ async fn write_backup(
     .map_err(|e| coded_ctx("backup_task_failed", "Backup task failed", e))?
 }
 
+/// emberd: an export waiting in the data folder for the web page to download
+/// (`GET /api/backup`), and an uploaded backup waiting to be restored. One of
+/// each; a new one replaces it.
+#[cfg(feature = "server")]
+pub(crate) const DOWNLOAD_BACKUP: &str = "emberd-backup-download.emberbackup";
+#[cfg(feature = "server")]
+pub(crate) const UPLOADED_BACKUP: &str = "emberd-backup-upload.emberbackup";
+
+/// The name an export is saved under.
+pub(crate) fn backup_file_name() -> String {
+    format!("ember-backup-{}.{BACKUP_EXTENSION}", chrono::Utc::now().format("%Y-%m-%d"))
+}
+
+/// emberd's export: into the data folder, for the web page to download. The
+/// summary names the file the browser saves it as.
+#[ember_macros::command(server)]
+pub async fn export_backup_for_download(
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
+    passphrase: String,
+    webview_prefs: Option<WebviewPrefs>,
+) -> Result<BackupSummary, String> {
+    validate_passphrase(&passphrase)?;
+    if let Some(prefs) = &webview_prefs {
+        validate_webview_prefs(prefs)?;
+    }
+    let dest = paths::resolve_data_dir_with_app(&app).join(DOWNLOAD_BACKUP);
+    let mut summary = write_backup(&app, &state, dest, passphrase, webview_prefs).await?;
+    summary.path = backup_file_name();
+    Ok(summary)
+}
+
+/// emberd: choose an uploaded backup for restore, as [`pick_backup_file`]
+/// chooses a picked one.
+#[cfg(feature = "server")]
+pub(crate) async fn choose_uploaded_backup(state: &AppState, path: &Path) -> Result<(), String> {
+    let source = validate_source(path)?;
+    *state.picked_backup.lock().await = Some(source);
+    Ok(())
+}
+
 /// Native open-dialog for restore. Stores the canonical path server-side so
 /// preview/import cannot be aimed at an arbitrary readable file.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_backup_file(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
     let Some(picked) = pick_backup_open_path(&app).await? else {
         return Ok(None);
@@ -1381,8 +1428,8 @@ pub async fn pick_backup_file(
     Ok(Some(display))
 }
 
-#[tauri::command]
-pub async fn clear_picked_backup(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command]
+pub async fn clear_picked_backup(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     *state.picked_backup.lock().await = None;
     Ok(())
 }
@@ -1749,8 +1796,8 @@ fn staged_restore_expires_at(staged_at: i64) -> i64 {
     }
 }
 
-#[tauri::command]
-pub async fn pending_restore_status(app: tauri::AppHandle) -> Result<PendingRestoreStatus, String> {
+#[ember_macros::command]
+pub async fn pending_restore_status(app: crate::host::AppHandle) -> Result<PendingRestoreStatus, String> {
     let data_dir = paths::resolve_data_dir_with_app(&app);
     let staging = staging_dir(&data_dir);
     let pending = read_pending_marker(&staging).filter(|_| !staging_already_applied(&staging));
@@ -1774,10 +1821,10 @@ pub async fn pending_restore_status(app: tauri::AppHandle) -> Result<PendingRest
 
 /// Throw away a staged restore. The staged copies are re-wrapped secrets and
 /// database contents, so they are deleted rather than left lying around.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn discard_pending_restore(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<(), String> {
     // The import command writes into this same stable directory. Holding the
     // shared guard prevents a discard from deleting an import halfway through
@@ -1820,10 +1867,10 @@ fn discard_staging(staging: &Path) -> Result<(), String> {
     })
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn preview_backup(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     passphrase: String,
 ) -> Result<BackupPreview, String> {
     let source = require_picked_backup(&state).await?;
@@ -1878,10 +1925,10 @@ pub async fn preview_backup(
     .map_err(|e| coded_ctx("backup_task_failed", "Restore task failed", e))?
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn import_backup(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     passphrase: String,
 ) -> Result<RestoreSummary, String> {
     // `restore-pending` has a fixed name because startup must discover it
@@ -2363,9 +2410,9 @@ fn take_restored_prefs(data_dir: &Path) -> Option<WebviewPrefs> {
 
 /// The app-window preferences a restore applied at this launch brought back,
 /// once; `None` on every later call and when there were none.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn take_pending_restored_prefs(
-    app: tauri::AppHandle,
+    app: crate::host::AppHandle,
 ) -> Result<Option<WebviewPrefs>, String> {
     let data_dir = paths::resolve_data_dir_with_app(&app);
     tokio::task::spawn_blocking(move || take_restored_prefs(&data_dir))

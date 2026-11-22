@@ -76,7 +76,9 @@ pub mod feed_discover;
 pub mod feeds;
 pub mod peers;
 pub mod preview;
+pub mod room_deletion;
 pub mod room_dm;
+pub mod room_library;
 pub mod search;
 pub mod security;
 pub mod server;
@@ -87,4 +89,5 @@ pub mod speed_test;
 pub mod statistics;
 pub mod system;
 pub mod transfers;
+#[cfg(feature = "desktop")]
 pub mod updater;

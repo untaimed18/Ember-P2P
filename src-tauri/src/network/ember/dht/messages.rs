@@ -77,9 +77,10 @@ pub const BUDDY_ENDORSE_WIRE_LEN: usize = 4 + 2 + 32 + 8 + 64;
 /// Why a storer turned a record away, reported per record in the block trailing
 /// a `STORE_BATCH_ACK`.
 ///
-/// The bitmap alone could not tell "over your 150 under this word" from a lost
-/// datagram, so a publisher retried both alike — several rounds an interval for
-/// a refusal every storer would repeat. The block is additive: the ack decoder
+/// The bitmap said a record was refused but not why, so a publisher retried a
+/// refusal as it would a lost datagram — several rounds an interval for one,
+/// like "over your 150 under this word", that every storer would repeat. The
+/// block is additive: the ack decoder
 /// has always read the bitmap and ignored what follows, so a storer that sends
 /// it costs an older publisher nothing, and a publisher reading an older storer
 /// simply has no reasons and behaves as it always has.
@@ -389,6 +390,24 @@ fn encode_value_constraints(
     buf.extend_from_slice(&tlv);
 }
 
+/// The constraint block by itself, as a friend's filtered browse (`EBR2`)
+/// carries it: the same encoder and decoder a keyword walk uses, so the two
+/// agree on what every field means. Keyword hashes and resume anchors are a
+/// walk's alone and never written. Empty constraints encode to nothing.
+pub fn encode_constraint_block(constraints: &ValueConstraints) -> Vec<u8> {
+    let content = ValueConstraints { extra_keys: Vec::new(), ..constraints.clone() };
+    let mut buf = Vec::new();
+    encode_value_constraints(&mut buf, &content, &ResumeAnchors::default());
+    buf
+}
+
+/// [`encode_constraint_block`]'s reader, as lenient as a walk's: what it
+/// cannot read is left unfiltered.
+pub fn decode_constraint_block(bytes: &[u8]) -> ValueConstraints {
+    let (constraints, _) = decode_value_constraints(bytes);
+    ValueConstraints { extra_keys: Vec::new(), ..constraints }
+}
+
 /// Read the optional block trailing a `FIND_VALUE` payload.
 ///
 /// Lenient by design, and never an error. A missing magic or a block length
@@ -457,19 +476,14 @@ fn decode_value_constraints(rest: &[u8]) -> (ValueConstraints, ResumeAnchors) {
                 // Across every entry, not per entry: the tag may repeat, and each
                 // repeat would otherwise buy another fifteen keys of intersection.
                 let room = MAX_FIND_VALUE_EXTRA_KEYS.saturating_sub(out.extra_keys.len());
-                for chunk in value.chunks_exact(16).take(room) {
-                    if let Ok(key) = <[u8; 16]>::try_from(chunk) {
-                        out.extra_keys.push(key);
-                    }
-                }
+                out.extra_keys
+                    .extend(value.as_chunks::<16>().0.iter().take(room).copied());
             }
             VALUE_EXT_TAG_RESUME_AFTER => {
                 // Held to the cap across repeats too, so a peer cannot buy a
                 // longer scan of the key by naming more anchors.
-                for chunk in value.chunks_exact(RESUME_ANCHOR_LEN) {
-                    if let Ok(anchor) = <[u8; RESUME_ANCHOR_LEN]>::try_from(chunk) {
-                        resume_after.push(anchor);
-                    }
+                for anchor in value.as_chunks::<RESUME_ANCHOR_LEN>().0 {
+                    resume_after.push(*anchor);
                 }
             }
             // An unknown tag is skipped by its own length, which is the point of
@@ -949,7 +963,7 @@ fn oversized_store_record(payload: &DhtPayload) -> Option<usize> {
 /// signer's own key at a fixed offset, which is an accident that any future
 /// field addition would quietly spend. Everything else in the tree that signs
 /// with this key is already separated (`BUDDY_ENDORSE_DOMAIN`, `RDV_DOMAIN`,
-/// `ember_auth`), so this brings frames in line.
+/// `KEY_LINK_DOMAIN`), so this brings frames in line.
 ///
 /// Appended rather than prepended, unlike those. They build a preimage from
 /// scratch; this one signs a buffer that is already the frame, and appending is
@@ -3135,13 +3149,13 @@ mod tests {
 
     #[test]
     fn decode_message_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0xE19E_19E1);
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0xE19E_19E1);
         // Header-level soak: truncated frames, bad versions, random trailing
         // junk. Deliberately does *not* reach `decode_payload` — random bytes
         // cannot pass an Ed25519 check — which is what
         // `decode_payload_fuzz_never_panics` below exists to cover.
-        for _ in 0..2_000 {
+        for _ in 0..crate::fuzz::rounds(2_000) {
             let len = rng.gen_range(0..=2_048);
             let mut buf = vec![0u8; len];
             rng.fill(&mut buf[..]);
@@ -3161,9 +3175,9 @@ mod tests {
     /// where the parsing is.
     #[test]
     fn decode_payload_fuzz_never_panics() {
-        use rand::{Rng, SeedableRng};
+        use rand::Rng;
         let (sk, id) = test_keypair();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0x0EC0_DEC0);
+        let mut rng = crate::fuzz::rng(0x0EC0_DEC0);
         let types = [
             MSG_PING,
             MSG_PONG,
@@ -3197,7 +3211,7 @@ mod tests {
         // prove that `PING` decodes. Counting the random ones separately is
         // what makes the claim real.
         let mut random_decoded_ok = 0usize;
-        for _ in 0..2_000 {
+        for _ in 0..crate::fuzz::rounds(2_000) {
             let msg_type = types[rng.gen_range(0..types.len())];
             // Up to the wire ceiling, not 600: every length prefix above that
             // — `FOUND_VALUE` pages, `STORE_BATCH` bodies, the source-contact

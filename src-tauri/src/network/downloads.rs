@@ -817,7 +817,7 @@ pub(super) fn spawn_transfer_status_write(
 pub(super) async fn mark_download_insufficient(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_id: &str,
     file_name: &str,
     status_writes: &Arc<TransferStatusWriteClock>,
@@ -860,7 +860,7 @@ pub(super) async fn mark_download_insufficient(
     promoted
 }
 
-pub(super) fn emit_transfer_health(app_handle: &tauri::AppHandle, update: &TransferHealthUpdate) {
+pub(super) fn emit_transfer_health(app_handle: &crate::host::AppHandle, update: &TransferHealthUpdate) {
     let _ = app_handle.emit(
         "transfer-health",
         serde_json::json!({
@@ -905,7 +905,7 @@ pub(super) async fn try_start_pending_download_from_known_sources(
     credit_manager: &Arc<RwLock<CreditManager>>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     shared_ember_payload: &ember::SharedEmberPayload,
     ember_payload_generation: &ember::EmberPayloadGeneration,
@@ -957,7 +957,7 @@ pub(super) async fn start_pending_download_for_callback(
     credit_manager: &Arc<RwLock<CreditManager>>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     shared_ember_payload: &ember::SharedEmberPayload,
     ember_payload_generation: &ember::EmberPayloadGeneration,
@@ -1005,7 +1005,7 @@ async fn start_pending_download_worker(
     credit_manager: &Arc<RwLock<CreditManager>>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     shared_ember_payload: &ember::SharedEmberPayload,
     ember_payload_generation: &ember::EmberPayloadGeneration,
@@ -1020,20 +1020,6 @@ async fn start_pending_download_worker(
     epx_overhead: &crate::storage::statistics::SharedSxOverheadCounters,
     callback_stream_in_hand: bool,
 ) -> bool {
-    // The user asked activity to stop. Disconnect re-queues every active
-    // download as pending so it resumes on reconnect, but the Ember overlay
-    // keeps running and its source lookups call straight back into here — so
-    // without this gate a transfer the user just stopped could restart itself
-    // from an Ember source while the UI still read Disconnected. Checked here
-    // rather than at the five call sites so no future one can miss it.
-    if state
-        .user_offline
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        debug!("Not starting {transfer_id}: the user is offline");
-        return false;
-    }
-
     if let Some(pd) = state.pending_downloads.get(transfer_id) {
         if pd.control.is_paused() || pd.control.is_cancelled() {
             return false;

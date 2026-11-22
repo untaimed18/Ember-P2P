@@ -11,7 +11,7 @@ pub(in crate::network) async fn save_on_shutdown(
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,

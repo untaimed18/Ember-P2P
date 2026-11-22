@@ -13,6 +13,7 @@
     type ConnectionReport,
   } from '$lib/api/connectionDoctor';
   import { translateError } from '$lib/i18n';
+  import { downloadDefaultIpFilter } from '$lib/ipFilterWatch';
   import { toastsFor } from '$lib/stores/toast';
   const { toast, toastError } = toastsFor('network');
   import { copyToClipboard } from '$lib/utils';
@@ -58,11 +59,13 @@
     punch: m.doctor_helping_punch,
   };
   const FIX: Record<string, [(p: FixParams) => string, (p: FixParams) => string]> = {
+    ip_filter: [m.doctor_fix_ip_filter, m.doctor_fix_ip_filter_body],
     restart: [m.doctor_fix_restart, m.doctor_fix_restart_body],
     port_in_use: [m.doctor_fix_port_in_use, m.doctor_fix_port_in_use_body],
     windows_firewall: [m.doctor_fix_windows_firewall, m.doctor_fix_windows_firewall_body],
     carrier_nat: [m.doctor_fix_carrier_nat, m.doctor_fix_carrier_nat_body],
     vpn: [m.doctor_fix_vpn, m.doctor_fix_vpn_body],
+    bound_interface: [m.doctor_fix_bound_interface, m.doctor_fix_bound_interface_body],
     enable_upnp: [m.doctor_fix_enable_upnp, m.doctor_fix_enable_upnp_body],
     router_upnp: [m.doctor_fix_router_upnp, m.doctor_fix_router_upnp_body],
     forward_ports: [m.doctor_fix_forward_ports, m.doctor_fix_forward_ports_body],
@@ -72,6 +75,7 @@
     clock: [m.doctor_fix_clock, m.doctor_fix_clock_body],
   };
   const ACTION: Record<string, () => string> = {
+    download_ip_filter: m.security_download_ipfilter,
     move_ports: m.doctor_action_move_ports,
     add_firewall_rules: m.doctor_action_add_firewall_rules,
     enable_upnp: m.doctor_action_enable_upnp,
@@ -80,6 +84,7 @@
   };
   const CHECK: Record<string, () => string> = {
     listen_ports: m.doctor_check_listen_ports,
+    ip_filter: m.doctor_check_ip_filter,
     windows_firewall: m.doctor_check_windows_firewall,
     upnp: m.doctor_check_upnp,
     router_wan: m.doctor_check_router_wan,
@@ -101,6 +106,7 @@
     off: m.doctor_detail_off,
     stood_down: m.doctor_detail_stood_down,
     vpn: m.doctor_detail_vpn,
+    bound_interface: m.doctor_detail_bound_interface,
     mapped: m.doctor_detail_mapped,
     not_mapped: m.doctor_detail_not_mapped,
     carrier_nat: m.doctor_detail_carrier_nat,
@@ -123,6 +129,8 @@
     symmetric: m.doctor_detail_symmetric,
     no_contacts: m.doctor_detail_no_contacts,
     skewed: m.doctor_detail_skewed,
+    blocking_all: m.doctor_detail_blocking_all,
+    loading: m.doctor_detail_loading,
   };
   const STATUS: Record<string, () => string> = {
     pass: m.doctor_status_pass,
@@ -156,6 +164,16 @@
     if (!action || acting) return;
     if (action === 'move_ports') {
       onMovePorts?.();
+      return;
+    }
+    if (action === 'download_ip_filter') {
+      acting = action;
+      try {
+        await downloadDefaultIpFilter();
+        if (!destroyed) void run();
+      } finally {
+        acting = null;
+      }
       return;
     }
     if (action === 'enable_upnp') {

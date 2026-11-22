@@ -314,7 +314,9 @@ const REQUIRED_JOBS = [
   "verify",
   "build",
   "build-windows",
-  "build-linux",
+  "build-linux-deb",
+  "build-linux-appimage",
+  "build-emberd",
   "sign-publish",
 ];
 
@@ -365,11 +367,13 @@ function releaseJobs(source) {
 /**
  * The write permissions a job may hold, by workflow and job, exactly: every
  * other job reads only. The release write is the signing job's; the website
- * job commits docs/index.html to `main` and asks Pages to rebuild.
+ * job commits docs/index.html to `main` and asks Pages to rebuild; emberd's
+ * image jobs push to the container registry.
  */
 const JOB_WRITE_PERMISSIONS = {
   ".github/workflows/release.yml": { "sign-publish": ["contents: write"] },
   ".github/workflows/website.yml": { downloads: ["contents: write", "pages: write"] },
+  ".github/workflows/emberd-image.yml": { image: ["packages: write"], publish: ["packages: write"] },
 };
 
 /**
@@ -556,23 +560,57 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
     errors.push("sign-publish must compose the Windows updater targets into latest.json");
   }
 
-  // A Linux release is three things that have to stay together: both formats
-  // built, neither of them asking a keyless runner to produce updater
-  // signatures, and both reaching the manifest. Dropping any one of them still
-  // produces a green release — one that silently stops offering Linux users an
-  // update, or offers them an artifact with no signature to verify.
-  const linuxJob = jobs.get("build-linux") ?? "";
-  if (!/--bundles\s+appimage,deb\b/.test(linuxJob)) {
-    errors.push("build-linux must build both the AppImage and the .deb");
+  // A Linux release is several things that have to stay together: both formats
+  // built, each on its own runner, neither of them asking a keyless runner to
+  // produce updater signatures, and both reaching the manifest. Dropping any
+  // one of them still produces a green release — one that silently stops
+  // offering Linux users an update, or offers them an artifact with no
+  // signature to verify.
+  const debJob = jobs.get("build-linux-deb") ?? "";
+  const appImageJob = jobs.get("build-linux-appimage") ?? "";
+  if (!/--bundles\s+deb\s/.test(debJob)) {
+    errors.push("build-linux-deb must build the .deb, and only the .deb");
   }
-  if (!/"createUpdaterArtifacts"\s*:\s*false/.test(linuxJob)) {
-    errors.push(
-      "build-linux holds no signing key, so it must disable createUpdaterArtifacts",
-    );
+  if (!/--bundles\s+appimage\s/.test(appImageJob)) {
+    errors.push("build-linux-appimage must build the AppImage, and only the AppImage");
+  }
+  for (const [name, body] of [["build-linux-deb", debJob], ["build-linux-appimage", appImageJob]]) {
+    if (!/"createUpdaterArtifacts"\s*:\s*false/.test(body)) {
+      errors.push(
+        `${name} holds no signing key, so it must disable createUpdaterArtifacts`,
+      );
+    }
   }
   if (!signJob.includes("scripts/add-linux-platforms.mjs")) {
     errors.push(
       "sign-publish must add the Linux updater targets to latest.json",
+    );
+  }
+  // A `.deb` before 1.8.0 checks no glibc before it takes an update, so a
+  // `.deb` built on a newer distro installs on an older one and then cannot
+  // start. Until a newer build goes out under the gated entry 1.8.0 reads, the
+  // plain one stays on the distro every earlier `.deb` was built on.
+  if (!/^\s{4}runs-on:\s*ubuntu-22\.04\s*$/m.test(debJob)) {
+    errors.push(
+      "build-linux-deb must stay on ubuntu-22.04: nothing stops a .deb built against a newer glibc reaching an older system",
+    );
+  }
+  // The manifest states the glibc the AppImage's runner measured, but the
+  // eD2K notes, the website's download line and the guide say 2.39 in words.
+  if (!/^\s{4}runs-on:\s*ubuntu-24\.04\s*$/m.test(appImageJob)) {
+    errors.push(
+      "build-linux-appimage must run on ubuntu-24.04: the eD2K notes, the website and the guide give its glibc as 2.39, so they move with it",
+    );
+  }
+  // The AppImage's entry is the one that may name a newer glibc, and the
+  // updater refuses a manifest whose gated entry states none, so the value the
+  // AppImage's runner measured has to reach the step that writes the entry.
+  if (
+    !/^\s{6}min-glibc:\s*\$\{\{\s*steps\.glibc\.outputs\.version\s*\}\}\s*$/m.test(appImageJob) ||
+    !/^\s+EMBER_APPIMAGE_MIN_GLIBC:\s*\$\{\{\s*needs\.build-linux-appimage\.outputs\.min-glibc\s*\}\}\s*$/m.test(signJob)
+  ) {
+    errors.push(
+      "sign-publish must state, as the AppImage's min_glibc, the glibc build-linux-appimage was built against",
     );
   }
   // Where GitHub cannot be reached, these are the only way to the installers:
@@ -585,6 +623,99 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
   ) {
     errors.push(
       "sign-publish must prepare the installers' eD2K links, sign the collection and notes, and attach them",
+    );
+  }
+
+  // emberd ships beside the desktop app and outside its update. The updater
+  // installs whatever latest.json names for its platform, so an emberd
+  // package that reached a bundle folder would be signed with the updater key
+  // and could be handed to every desktop install as Ember itself.
+  const emberdJob = jobs.get("build-emberd") ?? "";
+  if (
+    !emberdJob.includes("--no-default-features --features server --bin emberd") ||
+    !emberdJob.includes("packaging/emberd/package.sh") ||
+    !emberdJob.includes("packaging/emberd/check-packages.sh")
+  ) {
+    errors.push(
+      "build-emberd must build emberd, package it with packaging/emberd/package.sh and check the packages with check-packages.sh",
+    );
+  }
+  for (const [arch, runner] of [["x86_64", "ubuntu-22.04"], ["aarch64", "ubuntu-22.04-arm"]]) {
+    if (!new RegExp(`^ +- arch: ${arch}[ \\t]*\\r?\\n +runner: ${runner}[ \\t]*$`, "m").test(emberdJob)) {
+      errors.push(`build-emberd must build ${arch} on ${runner}: the docs give emberd's glibc as 2.35`);
+    }
+  }
+  const emberdDir = signJob.match(/^ {6}EMBERD_OUT_DIR:[ \t]*(\S+)[ \t]*$/m)?.[1]?.replace(/^\.\//, "");
+  const bundleDirs = [...signJob.matchAll(/^ {6}EMBER_\w+_DIR:[ \t]*(\S+)[ \t]*$/gm)].map(([, dir]) => dir);
+  const within = (inner, outer) => inner === outer || inner.startsWith(`${outer}/`);
+  if (
+    !emberdDir ||
+    within(emberdDir, "src-tauri/target") ||
+    bundleDirs.some((dir) => within(emberdDir, dir) || within(dir, emberdDir))
+  ) {
+    errors.push(
+      "sign-publish must keep emberd's packages in an EMBERD_OUT_DIR of their own, outside src-tauri/target, where nothing that signs bundles or writes latest.json looks",
+    );
+  }
+  const signSteps = signJob.split(/\r?\n(?= {6}- )/);
+  const downloads = signSteps.filter((step) => step.includes("actions/download-artifact@"));
+  for (const step of downloads) {
+    const artifact = step.match(/^ {10}(?:name|pattern):[ \t]*(\S+)/m)?.[1] ?? "";
+    const path = step.match(/^ {10}path:[ \t]*(.+?)[ \t]*$/m)?.[1] ?? "";
+    if (artifact.startsWith("emberd") !== (path === "${{ env.EMBERD_OUT_DIR }}")) {
+      errors.push(
+        `sign-publish must download emberd's packages, and only them, to EMBERD_OUT_DIR, not ${artifact || "an artifact"} to ${path || "nowhere"}`,
+      );
+    }
+  }
+  if (!downloads.some((step) => /^ {10}pattern:[ \t]*emberd-linux-\*[ \t]*$/m.test(step))) {
+    errors.push("sign-publish must download emberd's packages");
+  }
+  for (const step of signSteps) {
+    if (
+      /tauri signer sign|compose-update-manifest|add-linux-platforms|harden-update-manifest|ed2k-links\.mjs/.test(step) &&
+      step.includes("EMBERD_OUT_DIR")
+    ) {
+      errors.push(
+        "sign-publish must not sign emberd's packages with the updater key, link them over eD2K or put them in latest.json",
+      );
+    }
+  }
+  if (!signJob.includes('sha256sum -- "${packages[@]}" > "emberd-${version}-SHA256SUMS"')) {
+    errors.push("sign-publish must list the SHA-256 of emberd's packages, which emberd-image.yml checks a tarball against");
+  }
+  const attach = signSteps.find((step) => step.includes('gh release upload "$GITHUB_REF_NAME" "${assets[@]}"')) ?? "";
+  if (!attach.includes('"$EMBERD_OUT_DIR"')) {
+    errors.push("sign-publish must attach emberd's packages to the release");
+  }
+
+  // emberd's image can write to the registry, so it is held to what the
+  // signing job is: nothing compiled, nothing installed with scripts. It is
+  // made from the tarball the release holds, and only once the release is
+  // published, so `latest` never moves to a draft nobody reviewed.
+  const imagePath = ".github/workflows/emberd-image.yml";
+  const imageWorkflow = read(root, imagePath);
+  if (!/^on:[ \t]*\r?\n {2}release:[ \t]*\r?\n {4}types:[ \t]*\[published\][ \t]*$/m.test(imageWorkflow)) {
+    errors.push(`${imagePath}: emberd's image must be pushed when a release is published, and not before`);
+  }
+  if (/^ {2}(?:push|pull_request|pull_request_target|workflow_run|schedule):/m.test(imageWorkflow.slice(0, imageWorkflow.indexOf("\njobs:")))) {
+    errors.push(`${imagePath}: emberd's image must be pushed when a release is published, and not before`);
+  }
+  for (const [name, body] of releaseJobs(imageWorkflow)) {
+    for (const [pattern, what] of SIGNING_JOB_FORBIDDEN) {
+      if (pattern.test(body)) {
+        errors.push(`${imagePath}: ${name} can write to the registry, so it must not ${what}`);
+      }
+    }
+  }
+  const imageJob = releaseJobs(imageWorkflow).get("image") ?? "";
+  if (
+    !/--build-arg EMBERD_FROM=release\b/.test(imageJob) ||
+    !/--build-context tarball=/.test(imageJob) ||
+    !/sha256sum --check --strict/.test(imageJob)
+  ) {
+    errors.push(
+      `${imagePath}: emberd's image must be made from the release's tarball, checked against its SHA-256, and not compiled`,
     );
   }
 

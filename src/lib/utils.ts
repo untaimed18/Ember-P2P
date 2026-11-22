@@ -1,5 +1,6 @@
 import { getLocale } from '$lib/i18n';
 import { noteOwnClipboardText } from '$lib/clipboardOwn';
+import { isServer } from '$lib/runtime';
 
 /**
  * Format a byte count as a human-readable string (e.g. "1.5 MB", "1,5 Mo").
@@ -349,6 +350,15 @@ function compactDuration(secs: number): string {
   return formatDurationParts([[Math.floor(secs), 'second']]);
 }
 
+/** A media file's playing time as a player shows it: "3:32", "1:02:05". */
+export function formatMediaLength(secs: number): string {
+  const s = Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0;
+  const h = Math.floor(s / 3600);
+  const min = Math.floor((s % 3600) / 60);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(min)}:${pad(s % 60)}` : `${min}:${pad(s % 60)}`;
+}
+
 /** Format seconds as a human-readable duration (e.g. "2h 15m"). */
 export function formatDurationSecs(secs: number): string {
   if (!Number.isFinite(secs) || secs < 0) return '\u2014';
@@ -489,12 +499,16 @@ export { TimeoutError, withTimeout } from './timeout';
  */
 export async function copyToClipboard(text: string): Promise<boolean> {
   noteOwnClipboardText(text);
-  try {
-    const { writeClipboardText } = await import('$lib/api/system');
-    await writeClipboardText(text);
-    return true;
-  } catch {
-    // Fall through to the webview paths.
+  // emberd's clipboard is the server's. A browser copies only while the
+  // click that asked is still being handled, so its own paths go first.
+  if (!isServer) {
+    try {
+      const { writeClipboardText } = await import('$lib/api/system');
+      await writeClipboardText(text);
+      return true;
+    } catch {
+      // Fall through to the webview paths.
+    }
   }
   try {
     await navigator.clipboard.writeText(text);
@@ -796,16 +810,18 @@ export function insertMention(
  * callers treat both as nothing to paste.
  */
 export async function readFromClipboard(): Promise<string | null> {
-  try {
-    const { readClipboardText } = await import('$lib/api/system');
-    const text = await readClipboardText();
-    if (text) return text;
-    // An empty (or image-only) clipboard is an answer, not a failure — don't
-    // retry the webview paths, which cannot do better and on Linux report a
-    // permission error that would be shown as if the read had broken.
-    return null;
-  } catch {
-    // Fall through to the webview paths.
+  if (!isServer) {
+    try {
+      const { readClipboardText } = await import('$lib/api/system');
+      const text = await readClipboardText();
+      if (text) return text;
+      // An empty (or image-only) clipboard is an answer, not a failure — don't
+      // retry the webview paths, which cannot do better and on Linux report a
+      // permission error that would be shown as if the read had broken.
+      return null;
+    } catch {
+      // Fall through to the webview paths.
+    }
   }
   try {
     return await navigator.clipboard.readText();

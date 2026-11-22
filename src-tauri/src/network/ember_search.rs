@@ -585,14 +585,16 @@ async fn drive_ember_search_once(socket: &UdpSocket, state: &mut NetworkState, s
         } else {
             EMBER_SEARCH_QUERY_TIMEOUT
         };
+        let sent_at = std::time::Instant::now();
         state.ember_dht_search_requests.insert(
             wire_req_id,
             EmberSearchRequest {
                 search_id,
                 per_search_req_id,
-                deadline: std::time::Instant::now() + budget,
+                deadline: sent_at + budget,
                 sent_unix: chrono::Utc::now().timestamp(),
                 handshake_to: behind_handshake.then_some((contact.addr, contact.noise_pub)),
+                handshake_deadline: behind_handshake.then(|| sent_at + EMBER_SEARCH_HANDSHAKE_TIMEOUT),
                 sent_to: contact.addr,
             },
         );
@@ -889,7 +891,12 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
             } else if let Some((channel_id, epoch)) =
                 state.ember_channel_epoch_searches.remove(&search_id)
             {
-                buffer_channel_epoch_records(state, channel_id, epoch, into_blobs(held));
+                // Finding nothing counts against the epoch only from a walk
+                // enough peers answered, as recovery reads absence.
+                let answered = search.as_ref().is_some_and(|s| {
+                    s.responded_count() >= crate::commands::channel_recovery::MIN_RESPONDERS_FOR_ABSENCE
+                });
+                buffer_channel_epoch_records(state, channel_id, epoch, into_blobs(held), answered);
             } else if let Some(channel_id) =
                 state.ember_channel_moderation_searches.remove(&search_id)
             {
@@ -898,9 +905,22 @@ pub(super) fn maybe_finish_ember_search(state: &mut NetworkState, search_id: u32
                 // we could not reach the network — and succession must not read
                 // the two the same way.
                 let answered = search.as_ref().map_or(0, |s| s.responded_count());
+                // A look an owner's republish or edit can sign after: one that
+                // found the snapshot on another node, not just in our own
+                // store, or that enough peers answered for its absence to mean
+                // something, as recovery reads it.
+                let found = held.iter().filter(|record| !record.from_local_store).count();
+                let read = moderation_look_answered(answered, found);
+                let blobs = into_blobs(held);
+                if read {
+                    let began = state.channel_moderation_fetch_at.get(&channel_id).copied().unwrap_or(0);
+                    state.channel_moderation_looked_at.insert(channel_id, began);
+                }
+                *state.channel_moderation_look_read.entry(channel_id).or_default() |= read;
+                super::channel_membership::note_channel_moderation_unwritten(channel_id);
                 state
                     .ember_pending_channel_moderation
-                    .push((channel_id, into_blobs(held), answered));
+                    .push((channel_id, blobs, answered));
             } else if let Some(channel_id) =
                 state.ember_channel_settings_searches.remove(&search_id)
             {
@@ -1141,10 +1161,12 @@ pub(super) fn ember_stream_rows(stream: &mut HashSet<EmberStreamMark>, built: Em
     }
     let mut out = Vec::new();
     let mut resent: HashMap<EmberRowKey, HashSet<[u8; 32]>> = HashMap::new();
+    let mut built_rows: HashSet<EmberRowKey> = HashSet::new();
     for mut row in built.results {
         let Some(key) = ember_row_key(&row) else {
             continue;
         };
+        built_rows.insert(key);
         let now = counted.remove(&key).unwrap_or_default();
         let due = match sent.get(&key) {
             Some(before) => *before != now,
@@ -1161,7 +1183,10 @@ pub(super) fn ember_stream_rows(stream: &mut HashSet<EmberStreamMark>, built: Em
         resent.insert(key, now);
     }
     stream.retain(|mark| match mark {
-        EmberStreamMark::Sent(row, _) | EmberStreamMark::Held(row) => !resent.contains_key(row),
+        EmberStreamMark::Sent(row, _) => !resent.contains_key(row),
+        // A held row this build no longer has, its digest outvoted, has
+        // nothing to send, and its mark would ask for a rebuild every tick.
+        EmberStreamMark::Held(row) => built_rows.contains(row) && !resent.contains_key(row),
     });
     for (row, publishers) in resent {
         stream.extend(publishers.into_iter().map(|publisher| EmberStreamMark::Sent(row, publisher)));
@@ -2027,11 +2052,12 @@ pub(super) fn seed_ember_content_hash(
 }
 
 /// Start an Ember DHT `FIND_VALUE` for the sources of `file_hash` on behalf
-/// of a download (slice 9). Returns whether a search was started (`false`
-/// if the search-manager slot cap is hit). Results are delivered
-/// asynchronously: `maybe_finish_ember_search` parses them into
+/// of a download (slice 9). Returns whether a search is under way: one was
+/// started, or one for this file already runs (`false` if the search-manager
+/// slot cap is hit). Results are delivered asynchronously:
+/// `maybe_finish_ember_search` parses them into
 /// `ember_pending_source_injections`, which the search-timer sweep drains
-/// through `handle_epx_sources` into the download.
+/// through `handle_epx_sources` into every download of the file.
 pub(super) async fn start_ember_source_search(
     socket: &UdpSocket,
     state: &mut NetworkState,
@@ -2040,6 +2066,12 @@ pub(super) async fn start_ember_source_search(
 ) -> bool {
     let source_key = ember::dht::publish::source_key(&file_hash);
     let target = ember::dht::EmberNodeId(source_key);
+    // A second walk would only ask the same nodes again: what the running one
+    // finds goes to every download of the file. A Find sources click during a
+    // lookup used to start one each time.
+    if ember_source_search_running(&state.ember_download_source_searches, &state.ember_search, &file_hash) {
+        return true;
+    }
     let Some(search_id) =
         state
             .ember_search
@@ -2047,6 +2079,10 @@ pub(super) async fn start_ember_source_search(
     else {
         return false;
     };
+    // Sources are stored on the k nodes closest to the file's key.
+    if let Some(search) = state.ember_search.get_mut(search_id) {
+        search.mark_settling_lookup();
+    }
     seed_ember_local_records(state, search_id, &source_key, &[]);
     seed_ember_session_search_contacts(state, search_id);
     state
@@ -2058,6 +2094,51 @@ pub(super) async fn start_ember_source_search(
         .saturating_add(1);
     drive_ember_search(socket, state, search_id).await;
     true
+}
+
+/// Whether a source lookup for `file_hash` is still held: walking, or finished
+/// with its sources about to be handed over. Asks the search manager as well
+/// as the map, so an entry its search outlived can never hold a file's lookups
+/// off.
+fn ember_source_search_running(
+    lookups: &HashMap<u32, (String, [u8; 16])>,
+    searches: &ember::dht::search::SearchManager,
+    file_hash: &[u8; 16],
+) -> bool {
+    let target = ember::dht::EmberNodeId(ember::dht::publish::source_key(file_hash));
+    lookups.iter().any(|(search_id, (_, hash))| {
+        hash == file_hash && searches.get(*search_id).is_some_and(|search| search.target == target)
+    })
+}
+
+#[cfg(test)]
+mod ember_source_search_dedup_tests {
+    use super::*;
+
+    /// A file's source lookup is not started twice while one is held, and a
+    /// map entry its search outlived does not hold the next one off.
+    #[test]
+    fn a_running_source_lookup_is_not_started_again() {
+        let table = ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0; 16]), false);
+        let mut searches = ember::dht::search::SearchManager::new();
+        let file = [7u8; 16];
+        let other = [8u8; 16];
+        let target = ember::dht::EmberNodeId(ember::dht::publish::source_key(&file));
+        let search_id = searches
+            .start_background_find_value(target, Vec::new(), &table)
+            .expect("a free slot");
+        let mut lookups = HashMap::new();
+        lookups.insert(search_id, ("transfer".to_string(), file));
+
+        assert!(ember_source_search_running(&lookups, &searches, &file));
+        assert!(!ember_source_search_running(&lookups, &searches, &other), "another file is its own lookup");
+
+        searches.remove(search_id);
+        assert!(
+            !ember_source_search_running(&lookups, &searches, &file),
+            "an entry whose search is gone holds nothing off"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3000,6 +3081,25 @@ mod ember_keyword_match_tests {
         ember_stream_rows(stream, fold_ember_keyword_rows(ember_keyword_readings(search)))
     }
 
+    /// A row held back for the next rebuild that the next rebuild no longer
+    /// builds leaves no mark asking for rebuilds.
+    #[test]
+    fn a_held_row_that_drops_out_of_the_build_is_forgotten() {
+        let row = ember_keyword_row([7; 16], 10, "x.iso".to_string(), None, 1, String::new());
+        let key = ember_row_key(&row).unwrap();
+        let built = |results: Vec<SearchResult>, publishers: &[[u8; 32]]| EmberKeywordBuilt {
+            results,
+            corroborated: Vec::new(),
+            counted_publishers: Vec::new(),
+            counted_rows: publishers.iter().map(|p| (key, *p)).collect(),
+        };
+        let mut stream = HashSet::new();
+        assert!(ember_stream_rows(&mut stream, built(vec![row], &[[1; 32]])).is_empty());
+        assert!(ember_rows_held(&stream), "one publisher waits a rebuild");
+        assert!(ember_stream_rows(&mut stream, built(Vec::new(), &[])).is_empty());
+        assert!(!ember_rows_held(&stream));
+    }
+
     fn two_linked_walks() -> (ember::dht::search::SearchManager, u32, u32) {
         use ember::dht::search::{Companion, SearchManager};
         let rt = ember::dht::routing::RoutingTable::new(ember::dht::EmberNodeId([0; 16]), false);
@@ -3466,6 +3566,7 @@ mod ember_keyword_match_tests {
             file_extension: None,
             min_availability: None,
             last_streamed_count: 0,
+            last_streamed_at: std::time::Instant::now(),
             streamed_files: HashSet::new(),
             streamed_publishers: HashSet::new(),
         };

@@ -746,13 +746,17 @@ pub struct NetworkStats {
     pub quic_udp_port: u16,
     /// What this session started with, which a saved change only replaces
     /// at the next restart: the TCP port it listens on (or tried to), the UDP
-    /// port it was configured with, and whether UPnP runs.
+    /// port it was configured with, and whether UPnP was turned on.
     #[serde(default)]
     pub session_tcp_port: u16,
     #[serde(default)]
     pub session_udp_port: u16,
     #[serde(default)]
     pub session_upnp_enabled: bool,
+    /// This session keeps every connection on one chosen network interface,
+    /// so UPnP does not run whatever `session_upnp_enabled` says.
+    #[serde(default)]
+    pub interface_bound: bool,
     /// The ports peers are told to dial (`advertised_tcp_port` and
     /// `advertised_udp_port` in `network::nat_mapping`), which is where the
     /// outside has to get through. Unlike `public_tcp_port` and
@@ -1527,6 +1531,7 @@ impl Default for NetworkStats {
             session_tcp_port: 0,
             session_udp_port: 0,
             session_upnp_enabled: false,
+            interface_bound: false,
             advertised_tcp_port: 0,
             advertised_udp_port: 0,
             session_age_secs: 0,
@@ -1594,6 +1599,16 @@ pub struct AppSettings {
     pub udp_port: u16,
     pub nodes_dat_path: String,
     pub upnp_enabled: bool,
+    /// The network interface every connection leaves from, so traffic meant
+    /// for a VPN cannot take the ordinary connection; empty for any. The
+    /// adapter's GUID on Windows and its name on Linux (see `net_bind`). Read
+    /// at startup.
+    #[serde(default)]
+    pub bind_interface: String,
+    /// The interface's name when it was chosen, to name it by while it is not
+    /// connected.
+    #[serde(default)]
+    pub bind_interface_name: String,
     /// Keep full-cone / CGNAT port mappings alive with STUN (and a TCP
     /// hold from the listen port), and advertise the discovered public
     /// ports for HighID. Safe no-op on open/UPnP networks; disable if
@@ -1736,6 +1751,11 @@ pub struct AppSettings {
     /// computer's address, as any web server does.
     #[serde(default = "default_true")]
     pub web_sources_enabled: bool,
+    /// A copied eD2K link of a finished file carries the mirrors its download
+    /// proved (`s=`), which eMule reads too. On by default; off for someone
+    /// whose mirror is a server of their own they would rather not pass on.
+    #[serde(default = "default_true")]
+    pub copied_links_carry_mirrors: bool,
     /// Absolute path to an external media player for Preview, or empty to
     /// hand the file to the system's default handler (eMule's "Video Player"
     /// preference).
@@ -1842,6 +1862,11 @@ pub struct AppSettings {
     /// Refuse inbound friend-browse listings. Outbound browse is unaffected.
     #[serde(default)]
     pub friend_browse_disabled: bool,
+    /// A friend browsing our files sees the folder each is in: the shared
+    /// folder's name and the folders below it, never the path above. Off by
+    /// default, as how a library is arranged can say more than its files.
+    #[serde(default)]
+    pub friend_browse_shows_folders: bool,
     /// Decline files friends send: chat attachments and file offers. Chat
     /// itself is unaffected, and a friend's own `files` override wins.
     #[serde(default)]
@@ -2065,6 +2090,11 @@ pub struct AppSettings {
     /// exactly that one. Empty when none is. Backend-owned.
     #[serde(default)]
     pub ember_releases_folder: String,
+    /// The feed folders Ember put in `shared_folders` for feeds whose files
+    /// are shared (`sharing::feed_shares`), so turning a feed's sharing off
+    /// takes back exactly those and never one the user shared. Backend-owned.
+    #[serde(default)]
+    pub feed_share_folders: Vec<String>,
 
     /// Master switch for desktop notifications. Off means Ember never asks the
     /// OS to show anything, whatever the per-event switches below say.
@@ -2109,6 +2139,9 @@ pub struct AppSettings {
     /// way.
     #[serde(default)]
     pub notify_channel_message: bool,
+    /// A followed feed has new files.
+    #[serde(default = "default_true")]
+    pub notify_feed_update: bool,
 
     /// Show the confirmation and info pop-ups (toasts) each part of the window
     /// raises: "Download queued", "Link copied" and the like. Off hides only
@@ -3031,9 +3064,9 @@ impl AppSettings {
 /// `(ember_id, ip, port, pubkey)` tuples that other Ember nodes
 /// can look up to find each other when KAD doesn't know the peer.
 /// It can NOT impersonate a friend on the data plane — every
-/// friend session does its own Ed25519 proof-of-possession before
-/// accepting chat, browse, or files (`friend_connect.rs`,
-/// `ember_auth.rs`). It can NOT silently rewrite a friend's
+/// friend session proves possession of the friend's key in its
+/// secure-v2 handshake before accepting chat, browse, or files
+/// (`friend_connect.rs`, `secure_stream.rs`). It can NOT silently rewrite a friend's
 /// address to attacker infrastructure either: after C4 the client
 /// signs the (id, port, ipv4, pubkey, ts) tuple with the node's
 /// Ed25519 secret, the server pins the pubkey to the id on first
@@ -3176,6 +3209,8 @@ impl Default for AppSettings {
             shared_folder_scan_cursors: std::collections::HashMap::new(),
             nodes_dat_path: String::new(),
             upnp_enabled: true,
+            bind_interface: String::new(),
+            bind_interface_name: String::new(),
             stun_keepalive_enabled: true,
             obfuscation_enabled: true,
             ip_filter_enabled: true,
@@ -3207,6 +3242,7 @@ impl Default for AppSettings {
             tag_shared_imports: false,
             preview_priority_all: false,
             web_sources_enabled: true,
+            copied_links_carry_mirrors: true,
             preview_player: String::new(),
             skip_compress_video: true,
             antileech_enabled: true,
@@ -3229,6 +3265,7 @@ impl Default for AppSettings {
             chat_disappear_secs: 0,
             chat_mailbox_enabled: true,
             friend_browse_disabled: false,
+            friend_browse_shows_folders: false,
             friend_files_disabled: false,
             friend_session_encryption: true,
             channel_file_offers: default_channel_file_offers(),
@@ -3254,6 +3291,7 @@ impl Default for AppSettings {
             share_ember_installer: false,
             seed_ember_releases: false,
             ember_releases_folder: String::new(),
+            feed_share_folders: Vec::new(),
             notifications_enabled: true,
             notifications_only_when_unfocused: true,
             notify_download_complete: true,
@@ -3265,6 +3303,7 @@ impl Default for AppSettings {
             // See the field docs: a room is chatty enough that this is the one
             // notification a user has to ask for.
             notify_channel_message: false,
+            notify_feed_update: true,
             popups_downloads: true,
             popups_search: true,
             popups_library: true,

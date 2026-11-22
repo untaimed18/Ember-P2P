@@ -5,7 +5,7 @@ use super::*;
 pub(in crate::network) async fn on_rendezvous_register_result(
     result: RendezvousRegisterResult,
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     rendezvous_register_in_flight: &mut bool,
     rendezvous_register_started_at: &mut Option<tokio::time::Instant>,
 ) {

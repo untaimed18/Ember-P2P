@@ -35,6 +35,15 @@ use std::time::{Duration, Instant};
 use super::ember::attach::{feed_stream_capability, feed_stream_id, AttachStreamStatus, FEED_STREAM_MAX_BYTES};
 use super::ember::dht::publish::DiscoveredSource;
 
+/// A friend publisher's last address as its feed downloads dial it: an IPv4
+/// address and a port that can be dialled.
+pub fn friend_tcp(ip: &str, port: u16) -> Option<SocketAddr> {
+    ip.parse::<std::net::Ipv4Addr>()
+        .ok()
+        .filter(|ip| port != 0 && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast())
+        .map(|ip| SocketAddr::from((ip, port)))
+}
+
 /// How long a held download may go without a byte before the rest of the
 /// network is asked: from the lookup's answer, and again whenever the
 /// publisher stops sending.
@@ -717,6 +726,15 @@ mod tests {
 
     const SALT: [u8; 16] = [3; 16];
 
+    #[test]
+    fn a_friends_last_address_is_dialled_only_when_it_can_be() {
+        assert_eq!(friend_tcp("203.0.113.7", 4662), Some(SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 4662))));
+        assert_eq!(friend_tcp("203.0.113.7", 0), None, "no port");
+        for ip in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "::1", "host", ""] {
+            assert_eq!(friend_tcp(ip, 4662), None, "{ip}");
+        }
+    }
+
     fn key() -> [u8; 32] {
         ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key().to_bytes()
     }
@@ -910,7 +928,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_punched_publisher_streams_its_downloads_that_have_none() {
-        let (key, id) = (key(), "punched-publisher-test");
+        // A publisher of its own: a punch reaches every download of its
+        // publisher's feeds, those of the tests running beside this one too.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]).verifying_key().to_bytes();
+        let id = "punched-publisher-test";
         assert!(begin(id, [0x51; 16], 1_000, Publisher { key, salt: SALT, friend_tcp: None }));
         assert_eq!(needs_publisher(id), None, "still held for a lookup");
         lookup_unavailable(id);

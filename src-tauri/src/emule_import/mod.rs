@@ -149,6 +149,10 @@ pub struct EmuleImportSelection {
     pub library: bool,
     #[serde(default)]
     pub shared_folders: Vec<usize>,
+    /// Of `shared_folders`, the ones to share as eMule did: their own files,
+    /// and those of the folders eMule listed inside them, and no others.
+    #[serde(default)]
+    pub shared_folders_flat: Vec<usize>,
     #[serde(default)]
     pub identity: bool,
     #[serde(default)]
@@ -196,6 +200,16 @@ pub struct StagedDownload {
     pub source_met: String,
 }
 
+/// A folder shared the way eMule shares one: its own files, not its
+/// subfolders. eMule shares a folder listed inside it in the same way, so
+/// those come along for their own files too.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FlatShare {
+    pub folder: String,
+    #[serde(default)]
+    pub listed_inside: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
@@ -203,6 +217,9 @@ pub struct Manifest {
     pub source_dir: String,
     pub settings: SettingsChanges,
     pub shared_folders: Vec<String>,
+    /// Of `shared_folders`, those shared without their subfolders.
+    #[serde(default)]
+    pub flat_shares: Vec<FlatShare>,
     /// Hex. The matching `cryptkey.dat` is staged beside the manifest.
     pub user_hash: Option<String>,
     pub cryptkey: bool,
@@ -894,6 +911,7 @@ fn stage_scan(
         source_dir: scan.config_dir.to_string_lossy().into_owned(),
         settings: SettingsChanges::default(),
         shared_folders: Vec::new(),
+        flat_shares: Vec::new(),
         user_hash: None,
         cryptkey: false,
         credits: false,
@@ -981,6 +999,19 @@ fn stage_scan(
     for &index in &selection.shared_folders {
         if let Some((path, FolderStatus::Ready | FolderStatus::DriveRoot)) = scan.folders.get(index) {
             manifest.shared_folders.push(path.to_string_lossy().into_owned());
+            if selection.shared_folders_flat.contains(&index) {
+                manifest.flat_shares.push(FlatShare {
+                    folder: path.to_string_lossy().into_owned(),
+                    listed_inside: scan
+                        .folders
+                        .iter()
+                        .filter(|(inner, status)| {
+                            *status == FolderStatus::Covered && inner.starts_with(path)
+                        })
+                        .map(|(inner, _)| inner.to_string_lossy().into_owned())
+                        .collect(),
+                });
+            }
         }
     }
     summary.shared_folders = manifest.shared_folders.len();

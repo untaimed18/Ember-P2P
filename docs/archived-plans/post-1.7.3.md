@@ -1,6 +1,6 @@
 # After 1.7.3: planned for 1.7.4
 
-What 1.7.3 left. Two sources: everything from `docs/post-1.7.2.md` that 1.7.3
+What 1.7.3 left. Two sources: everything from `docs/archived-plans/post-1.7.2.md` that 1.7.3
 did not get to, carried over unchanged in substance, and what the 1.7.3
 Friends and Channels audits found but deliberately did not fix, usually
 because the fix changes a wire or DHT format older builds read.
@@ -8,11 +8,11 @@ because the fix changes a wire or DHT format older builds read.
 1.7.4's scope is now settled: testing and small fixes, with no Channels format
 change. 1.7.4 already carries a large amount of new code and has not been run
 across machines; a format change on top would make a failed run hard to read,
-and the mixed-version run in `docs/release-checklist-1.7.4.md` assumes 1.7.4
+and the mixed-version run in `docs/archived-plans/release-checklist-1.7.4.md` assumes 1.7.4
 sends nothing 1.7.3 cannot read. The format freeze moves to 1.7.5. Everything
 not in "Left for 1.7.4" below, including the full Channels freeze items,
 the receiving half of waiting offers, and every known limit, has moved to
-`docs/post-1.7.4.md`, the plan for 1.7.5. Anything on the list below that
+`docs/archived-plans/post-1.7.4.md`, the plan for 1.7.5. Anything on the list below that
 1.7.4 does not finish moves there too.
 
 1.7.3 already did these:
@@ -40,11 +40,11 @@ the receiving half of waiting offers, and every known limit, has moved to
 - Unknown gossip and relay envelope versions are counted per room and raise the
   "needs a newer Ember" notice (the first half of the freeze plan's item 3).
 - `docs/channels-format.md` exists (the freeze plan's item 4) and
-  `docs/release-checklist-1.7.4.md` has the cross-machine Channels run.
+  `docs/archived-plans/release-checklist-1.7.4.md` has the cross-machine Channels run.
 - Smaller Friends follow-ups: the friend-session frame limit, the search-failed
   slot release, and `reseed_friend_endpoint`'s lock.
 - **The room settings decision:** a second "room settings" record, kind 8,
-  built in 1.7.5. Written into `docs/post-1.7.4.md` item 1 and
+  built in 1.7.5. Written into `docs/archived-plans/post-1.7.4.md` item 1 and
   `docs/channels-format.md`.
 - **One limit on friend names:** 64 characters (`MAX_FRIEND_NICKNAME_CHARS`)
   for names a request brings in and names typed in Add Friend or the rename
@@ -97,10 +97,10 @@ the receiving half of waiting offers, and every known limit, has moved to
 
 ### Run the rest of the release checklist
 
-Section 0 of `docs/release-checklist-1.7.4.md`, the automated checks, has
+Section 0 of `docs/archived-plans/release-checklist-1.7.4.md`, the automated checks, has
 passed. Sections 1 to 4 need people and machines: Channels on three or more
 machines with one behind a firewall that is not reachable, Friends, mixed
 versions with 1.7.3, and the translation review. File anything that fails
 before tagging. The Channels run is also the baseline for 1.7.5's format
 freeze: note anything that looks like a format problem in
-`docs/post-1.7.4.md` rather than fixing it here.
+`docs/archived-plans/post-1.7.4.md` rather than fixing it here.

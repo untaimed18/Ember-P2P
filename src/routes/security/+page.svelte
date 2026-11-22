@@ -13,7 +13,6 @@
     type IpFilterUpdateInfo,
     type IpFilterStats,
     type IpFilterEntry,
-    type IpFilterApplyResult,
   } from '$lib/api/security';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
   import ToggleSwitch from '$lib/components/ToggleSwitch.svelte';
@@ -30,6 +29,7 @@
   import { networkStats } from '$lib/stores/network';
   import BannedUsersDialog from '$lib/components/BannedUsersDialog.svelte';
   import IconX from '$lib/components/IconX.svelte';
+  import { ipFilterApplyMessage } from '$lib/ipFilterWatch';
 
   let stats = $state<IpFilterStats | null>(null);
   let loading = $state(true);
@@ -45,17 +45,6 @@
   let customUrl = $state('');
   let urlFetching = $state(false);
   let showUrlForm = $state(false);
-
-  function ipFilterApplyMessage(result: IpFilterApplyResult): string {
-    switch (result.outcome) {
-      case 'applied':
-        return m.security_ipfilter_applied({ entries: result.entryCount });
-      case 'failed':
-        return m.security_ipfilter_live_reload_failed({ entries: result.entryCount });
-      default:
-        return m.security_ipfilter_live_reload_deferred({ entries: result.entryCount });
-    }
-  }
 
   let showBanned = $state(false);
   // Kept current by the dialog, which loads the list on mount, so the header
@@ -737,6 +726,9 @@
     {#if stats.enabled && !stats.ranges_ready}
       <div class="error-banner" role="alert">
         <span>{m.security_filter_fail_closed_banner()}</span>
+        <button type="button" onclick={handleDownload} disabled={downloading}>
+          {downloading ? m.security_downloading() : m.security_download_ipfilter()}
+        </button>
       </div>
     {/if}
 

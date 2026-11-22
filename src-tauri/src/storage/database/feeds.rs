@@ -191,6 +191,13 @@ pub struct FollowedFeed {
     /// and files stay; no list is fetched for it and nothing more is
     /// auto-downloaded, as nothing newer will come.
     pub deleted: bool,
+    /// "Share files from this feed": its downloads are advertised and served
+    /// as any download is, and its folder is shared. Off by default.
+    pub share_files: bool,
+    /// The file types auto-download takes, as eD2K type terms
+    /// (`search::index::infer_file_type`) joined by commas; empty for every
+    /// type. Kept in the `auto_category` column.
+    pub auto_types: String,
 }
 
 /// An item of a followed feed's list, with what this side knows of it.
@@ -430,6 +437,8 @@ impl Database {
             ("feeds_followed", "total_size", "INTEGER NOT NULL DEFAULT 0"),
             // The newest head taken up was its publisher's tombstone.
             ("feeds_followed", "deleted", "INTEGER NOT NULL DEFAULT 0"),
+            // The follower shares the feed's files; off for every feed before.
+            ("feeds_followed", "share_files", "INTEGER NOT NULL DEFAULT 0"),
             ("feeds_discovered", "total_size", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             let present: bool = conn.query_row(
@@ -952,7 +961,7 @@ impl Database {
         let select = "SELECT publisher, salt, title, description, sequence, list_ed2k, list_blake3, list_size,
                     item_count, state, list_sequence, unread, followed_at, checked_at, auto_download,
                     auto_max_item_mib, auto_max_day_mib, held_ed2k, held_blake3, held_size, folder,
-                    auto_since, seen_at, total_size, deleted
+                    auto_since, seen_at, total_size, deleted, share_files, auto_category
              FROM feeds_followed";
         let map = |row: &rusqlite::Row<'_>| {
             Ok(FollowedFeed {
@@ -981,6 +990,8 @@ impl Database {
                 seen_at: row.get(22)?,
                 total_size: row.get(23)?,
                 deleted: row.get::<_, i64>(24)? != 0,
+                share_files: row.get::<_, i64>(25)? != 0,
+                auto_types: row.get(26)?,
             })
         };
         let rows = match key {
@@ -1321,8 +1332,9 @@ impl Database {
         Ok(())
     }
 
-    /// Set a followed feed's auto-download. Turned on from off at `now`, it
-    /// takes the files first seen from then.
+    /// Set a followed feed's auto-download: its caps and the file types it
+    /// takes (see [`FollowedFeed::auto_types`]). Turned on from off at `now`,
+    /// it takes the files first seen from then.
     #[allow(clippy::too_many_arguments)]
     pub fn feed_set_auto_download(
         &self,
@@ -1331,16 +1343,17 @@ impl Database {
         enabled: bool,
         max_item_mib: i64,
         max_day_mib: i64,
+        types: &str,
         now: i64,
     ) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         self.ensure_feeds_locked(&conn)?;
         Ok(conn.execute(
             "UPDATE feeds_followed SET
-                    auto_since = CASE WHEN ?3 AND auto_download = 0 THEN ?6 ELSE auto_since END,
-                    auto_download = ?3, auto_max_item_mib = ?4, auto_max_day_mib = ?5, auto_category = ''
+                    auto_since = CASE WHEN ?3 AND auto_download = 0 THEN ?7 ELSE auto_since END,
+                    auto_download = ?3, auto_max_item_mib = ?4, auto_max_day_mib = ?5, auto_category = ?6
              WHERE publisher = ?1 AND salt = ?2",
-            params![publisher, salt, enabled, max_item_mib, max_day_mib, now],
+            params![publisher, salt, enabled, max_item_mib, max_day_mib, types, now],
         )? > 0)
     }
 
@@ -1388,6 +1401,27 @@ impl Database {
         Ok(())
     }
 
+    /// Set whether a followed feed's files are shared. False when it is not
+    /// followed.
+    pub fn feed_set_share_files(&self, publisher: &str, salt: &str, share: bool) -> anyhow::Result<bool> {
+        let conn = self.conn.lock();
+        self.ensure_feeds_locked(&conn)?;
+        Ok(conn.execute(
+            "UPDATE feeds_followed SET share_files = ?3 WHERE publisher = ?1 AND salt = ?2",
+            params![publisher, salt, share],
+        )? > 0)
+    }
+
+    /// The folders of the followed feeds whose files are shared, for those
+    /// given one by a download.
+    pub fn feed_sharing_folders(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock();
+        self.ensure_feeds_locked(&conn)?;
+        let mut stmt = conn.prepare("SELECT folder FROM feeds_followed WHERE share_files != 0 AND folder != ''")?;
+        let rows = stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Stop following a feed and forget its items. Files downloaded from it
     /// stay where they are.
     pub fn feed_unfollow(&self, publisher: &str, salt: &str) -> anyhow::Result<()> {
@@ -1406,8 +1440,15 @@ impl Database {
 
     /// The folder in `Feeds` the followed feed's files finish in: the one it
     /// was given by its first download, or, for that first, one named after
-    /// `title` and unlike every other feed's. `None` when it is not followed.
-    pub fn feed_followed_folder(&self, publisher: &str, salt: &str, title: &str) -> anyhow::Result<Option<String>> {
+    /// `title` and unlike every other feed's and every folder already in
+    /// `Feeds` (`on_disk`). `None` when it is not followed.
+    pub fn feed_followed_folder(
+        &self,
+        publisher: &str,
+        salt: &str,
+        title: &str,
+        on_disk: &[String],
+    ) -> anyhow::Result<Option<String>> {
         let conn = self.conn.lock();
         self.ensure_feeds_locked(&conn)?;
         let tx = conn.unchecked_transaction()?;
@@ -1426,8 +1467,8 @@ impl Database {
         }
         let taken: Vec<String> = {
             let mut stmt = tx.prepare("SELECT folder FROM feeds_followed WHERE folder != ''")?;
-            let rows = stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()?;
-            rows
+            let rows = stmt.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+            rows.into_iter().chain(on_disk.iter().cloned()).collect()
         };
         let folder = crate::sharing::feed_downloads::unique_folder_name(title, salt, &taken);
         tx.execute(
@@ -1671,7 +1712,7 @@ mod tests {
         assert!(db.feed_downloaded_elsewhere(PUB, SALT).unwrap().is_empty(), "nothing downloaded yet");
         db.feed_mark_downloaded(PUB, "other", "a").unwrap();
         assert!(db.feed_downloaded_elsewhere(PUB, SALT).unwrap().is_empty(), "no folder before the first");
-        let folder = db.feed_followed_folder(PUB, "other", "Other").unwrap().unwrap();
+        let folder = db.feed_followed_folder(PUB, "other", "Other", &[]).unwrap().unwrap();
         let found = db.feed_downloaded_elsewhere(PUB, SALT).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!((found[0].ed2k.as_str(), found[0].folder.as_str(), found[0].name.as_str()), ("a", folder.as_str(), "A"));
@@ -1919,18 +1960,47 @@ mod tests {
     #[test]
     fn a_feed_keeps_the_folder_its_first_download_gave_it() {
         let (db, path) = db("folder");
-        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes").unwrap(), None, "not followed");
+        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes", &[]).unwrap(), None, "not followed");
         db.feed_follow(PUB, SALT, 1).unwrap();
         db.feed_follow(PUB, "other-salt", 1).unwrap();
         assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().folder, "");
-        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes").unwrap().as_deref(), Some("Mixes"));
-        assert_eq!(db.feed_followed_folder(PUB, SALT, "Renamed").unwrap().as_deref(), Some("Mixes"), "kept");
+        assert_eq!(db.feed_followed_folder(PUB, SALT, "Mixes", &[]).unwrap().as_deref(), Some("Mixes"));
+        assert_eq!(db.feed_followed_folder(PUB, SALT, "Renamed", &[]).unwrap().as_deref(), Some("Mixes"), "kept");
         assert_eq!(
-            db.feed_followed_folder(PUB, "other-salt", "mixes").unwrap().as_deref(),
+            db.feed_followed_folder(PUB, "other-salt", "mixes", &[]).unwrap().as_deref(),
             Some("mixes (other-sa)"),
             "another feed of that name"
         );
+        db.feed_follow(PUB, "third-salt", 1).unwrap();
+        assert_eq!(
+            db.feed_followed_folder(PUB, "third-salt", "Live", &["live".to_string()]).unwrap().as_deref(),
+            Some("Live (third-sa)"),
+            "a folder a feed no longer followed left in Feeds"
+        );
         assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().folder, "Mixes");
+        drop_db(db, path);
+    }
+
+    #[test]
+    fn a_feeds_files_are_shared_only_once_its_follower_says_so() {
+        let (db, path) = db("share-files");
+        db.feed_follow(PUB, SALT, 1).unwrap();
+        db.feed_follow(PUB, "no-folder", 1).unwrap();
+        assert!(!db.feed_followed(PUB, SALT).unwrap().unwrap().share_files, "off for a new follow");
+        db.feed_followed_folder(PUB, SALT, "Mixes", &[]).unwrap();
+        assert!(db.feed_sharing_folders().unwrap().is_empty());
+
+        assert!(db.feed_set_share_files(PUB, SALT, true).unwrap());
+        assert!(db.feed_set_share_files(PUB, "no-folder", true).unwrap());
+        assert!(db.feed_followed(PUB, SALT).unwrap().unwrap().share_files);
+        assert_eq!(db.feed_sharing_folders().unwrap(), vec!["Mixes".to_string()], "only a feed with a folder");
+
+        assert!(db.feed_set_share_files(PUB, SALT, false).unwrap());
+        assert!(db.feed_sharing_folders().unwrap().is_empty());
+        assert!(!db.feed_set_share_files(PUB, "nope", true).unwrap(), "not followed");
+        db.feed_set_share_files(PUB, SALT, true).unwrap();
+        db.feed_unfollow(PUB, SALT).unwrap();
+        assert!(db.feed_sharing_folders().unwrap().is_empty(), "gone with the follow");
         drop_db(db, path);
     }
 
@@ -1940,15 +2010,16 @@ mod tests {
         db.feed_follow(PUB, SALT, 1).unwrap();
         let since = |salt: &str| db.feed_followed(PUB, salt).unwrap().unwrap().auto_since;
         assert_eq!(since(SALT), 0);
-        assert!(db.feed_set_auto_download(PUB, SALT, true, 0, 0, 100).unwrap());
+        assert!(db.feed_set_auto_download(PUB, SALT, true, 0, 0, "", 100).unwrap());
         assert_eq!(since(SALT), 100);
-        db.feed_set_auto_download(PUB, SALT, true, 50, 0, 200).unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 50, 0, "Video", 200).unwrap();
         assert_eq!(since(SALT), 100, "a cap changed while on");
-        db.feed_set_auto_download(PUB, SALT, false, 50, 0, 300).unwrap();
+        assert_eq!(db.feed_followed(PUB, SALT).unwrap().unwrap().auto_types, "Video", "and the types kept");
+        db.feed_set_auto_download(PUB, SALT, false, 50, 0, "Video", 300).unwrap();
         assert_eq!(since(SALT), 100);
-        db.feed_set_auto_download(PUB, SALT, true, 50, 0, 400).unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 50, 0, "", 400).unwrap();
         assert_eq!(since(SALT), 400, "turned on again");
-        assert!(!db.feed_set_auto_download(PUB, "nope", true, 0, 0, 500).unwrap(), "not followed");
+        assert!(!db.feed_set_auto_download(PUB, "nope", true, 0, 0, "", 500).unwrap(), "not followed");
 
         db.feed_follow(PUB, "older", 1).unwrap();
         db.feed_start_auto_since(PUB, "older", 50).unwrap();
@@ -2134,7 +2205,7 @@ mod tests {
             "the column defaults"
         );
 
-        db.feed_set_auto_download(PUB, SALT, true, 0, 0, 1).unwrap();
+        db.feed_set_auto_download(PUB, SALT, true, 0, 0, "", 1).unwrap();
         let feed = db.feed_followed(PUB, SALT).unwrap().unwrap();
         assert_eq!((feed.auto_download, feed.auto_max_item_mib, feed.auto_max_day_mib), (true, 0, 0));
         drop_db(db, path);

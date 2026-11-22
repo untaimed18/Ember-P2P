@@ -130,7 +130,7 @@ pub(crate) async fn handle_command(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
@@ -321,7 +321,7 @@ async fn handle_command_inner(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
@@ -377,8 +377,8 @@ async fn handle_command_inner(
             let mut tx = Some(tx);
             let mut local_results: Option<Vec<SearchResult>> = Some(Vec::new());
             let ui_file_type = search_filters.as_ref().and_then(|f| f.file_type.clone());
-            // eMule: Arc/Iso → Pro on the wire; Program clears local filter;
-            // Arc/Iso keep theirs for post-filter.
+            // eMule: Arc/Iso → Pro on the wire, and keep their type for the
+            // post-filter; Program keeps its own for the library and Ember rows.
             let file_type_filter =
                 crate::search::merge::client_search_file_type_filter(ui_file_type.as_deref());
             let wire_file_type =
@@ -533,9 +533,6 @@ async fn handle_command_inner(
                 method,
                 has_keyword_query,
                 !keywords.is_empty() && !server_directive_query,
-                state
-                    .user_offline
-                    .load(std::sync::atomic::Ordering::Relaxed),
             );
             // A filter-only expression matches every file that passes it; the
             // connected server caps its answer, but the global sweep would ask
@@ -640,25 +637,28 @@ async fn handle_command_inner(
             // --- UDP global search ---
             if legs.udp {
                 active_request.udp_search_expr = search_expr.clone();
-                let uses_64bit_search = kad::messages::search_expression_uses_64bit(&search_expr);
-                let connected_addr = state.server_addr;
-                let servers = state.server_list.servers().to_vec();
+                active_request.udp_search_expr_32 =
+                    if kad::messages::search_expression_uses_64bit(&search_expr) {
+                        server_keyword_expression(
+                            &search_expr,
+                            query_expr.as_ref(),
+                            &search_constraints,
+                            false,
+                        )
+                    } else {
+                        None
+                    };
                 let mut dropped = 0usize;
-                for server in &servers {
-                    if !is_eligible_udp_server(server, connected_addr) {
+                for (packet, addr) in udp_search_packets(
+                    state,
+                    &search_expr,
+                    active_request.udp_search_expr_32.as_deref(),
+                ) {
+                    if state.udp_search_queue.len() >= MAX_UDP_SEARCH_QUEUE {
+                        dropped = dropped.saturating_add(1);
                         continue;
                     }
-                    if let Some(pkt) = ServerUdpSocket::build_global_search_packet(
-                        server,
-                        &search_expr,
-                        uses_64bit_search,
-                    ) {
-                        if state.udp_search_queue.len() >= MAX_UDP_SEARCH_QUEUE {
-                            dropped = dropped.saturating_add(1);
-                            continue;
-                        }
-                        state.udp_search_queue.push_back((request_id, pkt.0, pkt.1));
-                    }
+                    state.udp_search_queue.push_back((request_id, packet, addr));
                 }
                 if dropped > 0 {
                     debug!(
@@ -889,6 +889,7 @@ async fn handle_command_inner(
                                 file_extension: active_request.file_extension.clone(),
                                 min_availability: active_request.min_availability,
                                 last_streamed_count: 0,
+                                last_streamed_at: std::time::Instant::now(),
                                 streamed_files: HashSet::new(),
                                 streamed_publishers: HashSet::new(),
                             },
@@ -1047,8 +1048,7 @@ async fn handle_command_inner(
                 // join here stalled UDP receive, all 41 timers and every IPC
                 // snapshot for up to 5 s *per row*, and batch cancel enqueues
                 // one command per selected row. Bounding the wait did not fix
-                // that; a bounded freeze is still a freeze. This mirrors what
-                // `KadDisconnect` already does with its own aborts.
+                // that; a bounded freeze is still a freeze.
                 //
                 // The ack moves into the spawned task rather than staying at
                 // the tail of this handler because `cancel_transfers_batch`
@@ -1174,7 +1174,7 @@ async fn handle_command_inner(
             // eMule PauseFile: tear down active network state but keep source
             // knowledge so the download can be resumed quickly.
             // Cancel the shared control BEFORE aborting the worker so detached
-            // per-source tasks observe teardown cooperatively (N1 / KadDisconnect).
+            // per-source tasks observe teardown cooperatively (N1).
             {
                 let mgr = transfer_manager.read().await;
                 if let Some(control) = mgr.get_control(&transfer_id) {
@@ -2263,10 +2263,6 @@ async fn handle_command_inner(
             comment,
             tx,
         } => {
-            if state.stats.status == NetworkStatus::Disconnected {
-                let _ = tx.send(Err("KAD is disconnected".to_string()));
-                return;
-            }
             let closest = state
                 .routing_table
                 .find_closest_prefer_verified(&file_hash, SEARCH_INITIAL_CONTACTS);
@@ -2294,7 +2290,9 @@ async fn handle_command_inner(
             } else {
                 let local_note_file = {
                     let index = local_index.read().await;
-                    index.get_by_hash(&file_hash.to_hex()).cloned()
+                    index
+                        .get_by_hash(&hex::encode(kad::publish::kad_id_to_md4_bytes(&file_hash)))
+                        .cloned()
                 };
                 let message = build_publish_notes_message(
                     state.local_id,
@@ -3593,102 +3591,8 @@ async fn handle_command_inner(
                 )));
                 return;
             }
-            // Per peer *and* overall. Without the second bound, offering to
-            // one member each across many rooms would grow `xfer_send` — and
-            // the open file handle each entry holds — without limit.
-            let to_peer = state
-                .xfer_send
-                .values()
-                .filter(|send| send.peer == peer)
-                .count();
-            if to_peer >= ember::channel::XFER_MAX_ACTIVE
-                || state.xfer_send.len() >= ember::channel::XFER_MAX_ACTIVE * 4
-            {
-                let _ = tx.send(Err(coded(
-                    "channels_xfer_busy",
-                    "Too many transfers already running with this member",
-                )));
-                return;
-            }
-            let Some(key) = ember::channel::derive_xfer_key(
-                &state.local_ed25519_seed,
-                &peer,
-                &channel_id,
-                &xfer_id,
-            ) else {
-                // Only reachable if the member's key is not a usable Ed25519
-                // point, which membership records should already have caught.
-                let _ = tx.send(Err(coded("channels_member_invalid", "Invalid member key")));
-                return;
-            };
-            let offer = ember::channel::XferOffer {
-                sender: state.local_ed25519_pubkey,
-                target: peer,
-                xfer_id,
-                size,
-                root,
-                name: name.clone(),
-            };
-            // Sealed only, so the members it is forwarded through cannot read
-            // the file's name and size. A recipient on v1.6.x cannot read it
-            // either, so unless this one is known to, the plain offer is kept
-            // and the user is asked about it if the recipient stays silent.
-            // The file as it stands now, which the block path checks before it
-            // serves a byte. Off this task: an open can stall on a scanner.
-            let stamp_path = path.clone();
-            let stamp = match tokio::task::spawn_blocking(move || {
-                ember::xfer::SourceStamp::of_path(&stamp_path)
-            })
-            .await
-            {
-                Ok(Ok(stamp)) if stamp.size() == size => stamp,
-                _ => {
-                    let _ = tx.send(Err(coded(
-                        "channels_xfer_source_changed",
-                        "The file changed or was moved before it could be offered",
-                    )));
-                    return;
-                }
-            };
-            let mut send =
-                ember::xfer::SendState::new(channel_id, peer, key, name.clone(), size, path.clone())
-                    .with_source_stamp(stamp);
-            if ember::xfer::holds_plain_offer(size, member_reads_sealed_offers(state, db, &peer)) {
-                send.hold_plain_offer(
-                    ember::channel::encode_xfer_offer(&key, &offer),
-                    std::time::Instant::now()
-                        + std::time::Duration::from_secs(
-                            ember::channel::XFER_PLAIN_OFFER_FALLBACK_SECS,
-                        ),
-                );
-            }
-            state.xfer_send.insert(xfer_id, send);
-            let sealed = ember::channel::encode_xfer_offer_sealed(&key, &offer);
-            let sent = send_xfer_frame(socket, state, db, channel_id, peer, &sealed).await;
-            if !sent {
-                state.xfer_send.remove(&xfer_id);
-                let _ = tx.send(Err(coded(
-                    "channels_xfer_unreachable",
-                    "Could not reach that member right now",
-                )));
-                return;
-            }
-            emit_xfer_update(
-                app_handle,
-                &xfer_id,
-                &channel_id,
-                &peer,
-                "send",
-                &name,
-                size,
-                0,
-                "offered",
-            );
-            let _ = tx.send(Ok(()));
-            // After the offer, so the recipient has the offer before the port
-            // it belongs to.
-            offer_xfer_stream(socket, state, db, channel_id, peer, xfer_id, key, path, size, root)
-                .await;
+            let offer = OutgoingXferOffer { channel_id, peer, xfer_id, path, name, size, root };
+            let _ = start_xfer_offer(socket, state, db, app_handle, offer, tx).await;
         }
 
         NetworkCommand::RespondChannelTransfer {
@@ -3724,6 +3628,11 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::CancelChannelTransfer { xfer_id, tx } => {
+            // A fetch from a room library still waiting for its offer.
+            if super::room_library::cancel_pull(state, app_handle, &xfer_id) {
+                let _ = tx.send(Ok(()));
+                return;
+            }
             let me = state.local_ed25519_pubkey;
             #[allow(clippy::type_complexity)]
             let mut target: Option<(
@@ -3798,46 +3707,6 @@ async fn handle_command_inner(
             let _ = tx.send(Ok(()));
         }
 
-        NetworkCommand::SendChannelTransferPlainOffer { xfer_id, tx } => {
-            let me = state.local_ed25519_pubkey;
-            let Some(send) = state.xfer_send.get_mut(&xfer_id) else {
-                let _ = tx.send(Err(coded(
-                    "channels_xfer_not_found",
-                    "That transfer is no longer running",
-                )));
-                return;
-            };
-            let (channel_id, peer) = (send.channel_id, send.peer);
-            // Nothing held means the recipient read the sealed offer in the
-            // meantime, or the plain one already went: either way it has one.
-            let Some(frame) = send.take_consented_plain_offer() else {
-                let _ = tx.send(Ok(()));
-                return;
-            };
-            if ember::channel::xfer_frame_peek(&frame) != Some((me, peer, xfer_id)) {
-                let _ = tx.send(Err(coded(
-                    "channels_xfer_not_found",
-                    "That transfer is no longer running",
-                )));
-                return;
-            }
-            if !send_xfer_frame_within_room(socket, state, db, channel_id, peer, &frame).await {
-                if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
-                    send.ask_again(frame);
-                }
-                let _ = tx.send(Err(coded(
-                    "channels_xfer_unreachable",
-                    "Could not reach that member right now",
-                )));
-                return;
-            }
-            if let Some(send) = state.xfer_send.get_mut(&xfer_id) {
-                send.plain_offer_sent(std::time::Instant::now());
-                emit_xfer_send_update(app_handle, &xfer_id, send);
-            }
-            let _ = tx.send(Ok(()));
-        }
-
         NetworkCommand::DropChannelTransfers { channel_id, member } => {
             // `delete_owned_channel` tombstones the row and then sends this, so
             // it is the point at which the network task learns a room it may be
@@ -3873,7 +3742,6 @@ async fn handle_command_inner(
                     transferred: 0,
                     status: "awaiting".into(),
                     risky: crate::security::is_dangerous_extension(&offer.name),
-                    awaiting_consent: false,
                 });
             }
             for (xfer_id, recv) in &state.xfer_recv {
@@ -3887,7 +3755,6 @@ async fn handle_command_inner(
                     transferred: recv.bytes_received(),
                     status: "active".into(),
                     risky: crate::security::is_dangerous_extension(&recv.name),
-                    awaiting_consent: false,
                 });
             }
             for (xfer_id, send) in &state.xfer_send {
@@ -3904,10 +3771,46 @@ async fn handle_command_inner(
                         .min(send.size),
                     status: if send.accepted { "active" } else { "offered" }.into(),
                     risky: crate::security::is_dangerous_extension(&send.name),
-                    awaiting_consent: send.awaiting_consent(),
                 });
             }
+            out.extend(super::room_library::pull_snapshots(state));
             let _ = tx.send(out);
+        }
+
+        NetworkCommand::AskRoomLibrary {
+            channel_id,
+            peer,
+            request,
+            tx,
+        } => {
+            if !settings.ember_native_enabled {
+                let _ = tx.send(Err(coded(
+                    "channels_ember_disabled",
+                    "Channels require the Ember Network to be on",
+                )));
+                return;
+            }
+            super::room_library::ask(socket, state, db, channel_id, peer, request, tx).await;
+        }
+
+        NetworkCommand::PullRoomLibraryFile { request, tx } => {
+            if !settings.ember_native_enabled {
+                let _ = tx.send(Err(coded(
+                    "channels_ember_disabled",
+                    "Channels require the Ember Network to be on",
+                )));
+                return;
+            }
+            let _ = tx.send(super::room_library::queue_pull(state, app_handle, request));
+        }
+
+        NetworkCommand::RoomLibraryChanged { channel_id, tx } => {
+            super::room_library::library_changed(socket, state, db, app_handle, channel_id).await;
+            let _ = tx.send(());
+        }
+
+        NetworkCommand::ListRoomLibraries { channel_id, tx } => {
+            let _ = tx.send(super::room_library::open_members(state, channel_id));
         }
 
         #[cfg(debug_assertions)]
@@ -4620,15 +4523,16 @@ async fn handle_command_inner(
         }
 
         NetworkCommand::KadConnect => {
+            // The node opens `Connecting` and moves only between that and
+            // `Connected`, so this finds it on its way or there. A connected
+            // node keeps its session; one still connecting bootstraps again.
+            if state.stats.status == NetworkStatus::Connected {
+                debug!("KAD connect requested while connected; nothing to do");
+                return;
+            }
             info!("KAD connect requested");
-            // Nothing to un-gate for uploads: the listener is not taken down by
-            // going offline, only by shutdown, which does not come back.
-            //
-            // Lift the outbound stop: downloads, friend dials and server
-            // search are suspended for exactly as long as the user is offline.
-            state
-                .user_offline
-                .store(false, std::sync::atomic::Ordering::Relaxed);
+            // Nothing to un-gate for uploads: the listener is taken down only
+            // by shutdown, which does not come back.
             state.stats.status = NetworkStatus::Connecting;
             state.self_lookup_done = false;
             state.last_self_lookup = 0;
@@ -4746,16 +4650,6 @@ async fn handle_command_inner(
                         match socket.send_to(&packet, addr).await {
                             Ok(_) => {
                                 info!("Sent bootstrap request to {addr}");
-                                if state.stats.status == NetworkStatus::Disconnected {
-                                    state.stats.status = NetworkStatus::Connecting;
-                                    // Same rule as `KadConnect`: this is the
-                                    // one path that actually moves us off
-                                    // Disconnected, so the outbound stop must
-                                    // be lifted at this moment.
-                                    state
-                                        .user_offline
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                                }
                                 Ok(format!(
                                     "Bootstrap request sent to {addr} — contacts will appear as they respond"
                                 ))
@@ -4798,9 +4692,6 @@ async fn handle_command_inner(
                     let _ = socket.send_to(&packet, addr).await;
                 }
             }
-            if state.stats.status == NetworkStatus::Disconnected {
-                state.stats.status = NetworkStatus::Connecting;
-            }
             info!("Loaded {count} contacts from URL, bootstrapping");
             let _ = tx.send(Ok(format!("Loaded {count} contacts from nodes.dat")));
         }
@@ -4835,14 +4726,6 @@ async fn handle_command_inner(
                 }
             }
             info!("Sent bootstrap requests to {actually_sent}/{send_count} connected contacts");
-            if state.stats.status == NetworkStatus::Disconnected && actually_sent > 0 {
-                state.stats.status = NetworkStatus::Connecting;
-                // See `KadBootstrapIp`: keep the outbound stop in sync with
-                // every path off Disconnected.
-                state
-                    .user_offline
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
             let _ = tx.send(if actually_sent > 0 {
                 Ok(actually_sent)
             } else {
@@ -6327,7 +6210,7 @@ async fn handle_command_inner(
                 };
                 if let Some(sender) = sender {
                     // Every friend session's `EmberSessionHandle` carries
-                    // the peer's PoP-verified Ed25519 pubkey (see its doc
+                    // the peer's verified Ed25519 pubkey (see its doc
                     // comment), so encryption is always possible for a
                     // live session — there is no plaintext-fallback path.
                     let peer_pubkey = sender.peer_ember_pubkey();
@@ -6337,9 +6220,9 @@ async fn handle_command_inner(
                         message.as_bytes(),
                     ) {
                         None => {
-                            // Can only happen if the peer's already-PoP-verified
+                            // Can only happen if the peer's already-verified
                             // pubkey somehow isn't a valid curve point, which
-                            // `perform_ember_auth` should have ruled out —
+                            // the secure-v2 handshake should have ruled out —
                             // treat as an internal error rather than ever
                             // silently sending plaintext.
                             let _ = tx.send(Err("ChatEncryptFailed".into()));
@@ -6540,7 +6423,6 @@ async fn handle_command_inner(
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
-                                let offline_clone = state.user_offline.clone();
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
                                 let db3 = db.clone();
@@ -6567,7 +6449,6 @@ async fn handle_command_inner(
                                         udp,
                                         obfs,
                                         sessions_clone.clone(),
-                                        offline_clone,
                                         ul_tx,
                                         fh.clone(),
                                         Some(ed25519_pubkey),
@@ -6665,7 +6546,6 @@ async fn handle_command_inner(
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
-                            let offline = state.user_offline.clone();
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
                             let ultx2 = ul_event_tx.clone();
@@ -6701,7 +6581,6 @@ async fn handle_command_inner(
                                             udp,
                                             obfs,
                                             sess,
-                                            offline,
                                             ultx,
                                             fh.clone(),
                                             Some(ed25519_pubkey),
@@ -6819,6 +6698,7 @@ async fn handle_command_inner(
         NetworkCommand::BrowseFriend {
             ember_hash: friend_eh,
             request_id,
+            filter,
             tx,
         } => {
             if !friend_hashes.read().await.contains(&friend_eh) {
@@ -6855,6 +6735,7 @@ async fn handle_command_inner(
                             let _ = tx.send(Err("Duplicate browse request".into()));
                         }
                         Ok(()) => {
+                            set_browse_filter(&mut state.pending_browse_requests, friend_eh, &request_id, filter);
                             dispatch_browse_head(state, app_handle, friend_eh).await;
                             if browse_request_is_pending(
                                 &state.pending_browse_requests,
@@ -6885,6 +6766,7 @@ async fn handle_command_inner(
                             let _ = tx.send(Err("Duplicate browse request".into()));
                             return;
                         }
+                        set_browse_filter(&mut state.pending_browse_requests, friend_eh, &request_id, filter);
                         let db2 = db.clone();
                         let hash_hex = hex::encode(friend_eh);
                         let addr_opt =
@@ -6908,7 +6790,6 @@ async fn handle_command_inner(
                                 let udp = advertised_udp_port(state);
                                 let obfs = settings.friend_session_encryption;
                                 let sessions_clone = state.ember_sessions.clone();
-                                let offline_clone = state.user_offline.clone();
                                 let ul_tx = ul_event_tx.clone();
                                 let fh = friend_hashes.clone();
                                 let browse_event_tx = ul_event_tx.clone();
@@ -6933,7 +6814,6 @@ async fn handle_command_inner(
                                         udp,
                                         obfs,
                                         sessions_clone.clone(),
-                                        offline_clone,
                                         ul_tx,
                                         fh,
                                         Some(ed25519_pubkey),
@@ -7022,7 +6902,6 @@ async fn handle_command_inner(
                             let udp = advertised_udp_port(state);
                             let obfs = settings.friend_session_encryption;
                             let sess = state.ember_sessions.clone();
-                            let offline = state.user_offline.clone();
                             let ultx = ul_event_tx.clone();
                             let fh = friend_hashes.clone();
                             let app2 = app_handle.clone();
@@ -7060,7 +6939,6 @@ async fn handle_command_inner(
                                             udp,
                                             obfs,
                                             sess,
-                                            offline,
                                             ultx,
                                             fh,
                                             Some(ed25519_pubkey),

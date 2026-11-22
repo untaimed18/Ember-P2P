@@ -26,7 +26,7 @@
   import { plural } from '$lib/plural';
   import { EMBER_DIAG_FAILURE_THRESHOLD } from '$lib/emberJoin';
   import { emberJoinTimedOut } from '$lib/stores/emberJoin';
-  import { checkForUpdates, installUpdate, restartToUpdate, updater } from '$lib/stores/updater';
+  import { checkForUpdates, installUpdate, restartToUpdate, systemTooOldMessage, updater } from '$lib/stores/updater';
   import NetworkStatusTiles from '$lib/components/NetworkStatusTiles.svelte';
   import PortTest from '$lib/components/PortTest.svelte';
   import { appSettings } from '$lib/stores/settings';
@@ -321,9 +321,11 @@
         : $updater.phase === 'ready'
           ? m.updater_ready_body({ version: $updater.version ?? '' })
           : $updater.phase === 'error' || $updater.signatureMissing
-            ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
+            ? $updater.error || $updater.signatureMissing
+              ? m.updater_error_body({ detail: $updater.error ?? m.updater_signature_missing() })
+              : m.updater_check_failed()
             : $updater.systemTooOld
-              ? m.updater_system_too_old({ version: $updater.systemTooOld.version, glibc: $updater.systemTooOld.glibc })
+              ? systemTooOldMessage($updater.systemTooOld)
               : '',
   );
   let peerCount = $derived(diag?.ember_dht_contacts ?? 0);
@@ -445,10 +447,12 @@
   // What a relayed user can do about it. Forwarding on the router does nothing
   // while traffic leaves through a VPN (the backend has stood UPnP down for
   // exactly that), and is no advice at all once UPnP has already forwarded
-  // the ports, so those cases point elsewhere.
+  // the ports, so those cases point elsewhere. On a chosen interface UPnP
+  // does not run at all, so turning it on is no advice either.
   let relayedFix = $derived.by(() => {
     if (reachability !== 'relayed' || !$appSettings) return '';
     const ports = { tcp: $appSettings.tcp_port, udp: $appSettings.udp_port };
+    if ($networkStats.interface_bound) return m.ember_health_relayed_fix_interface(ports);
     if (!$appSettings.upnp_enabled) return m.ember_health_relayed_fix_upnp_off(ports);
     if ($networkStats.upnp_stood_down) return m.ember_health_relayed_fix_vpn(ports);
     if ($networkStats.upnp_mapped) return m.ember_health_relayed_fix_forwarded();

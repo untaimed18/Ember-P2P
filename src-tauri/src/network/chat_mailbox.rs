@@ -41,7 +41,7 @@ const BOXES_PER_FETCH: usize = (400 / BOX_DAYS) * BOX_DAYS;
 pub(super) fn start_chat_mailbox_round(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     ed25519_secret_key: [u8; 32],
     ed25519_pubkey: [u8; 32],
@@ -155,7 +155,7 @@ struct MailboxFriend {
 
 struct MailboxRound {
     db: Arc<Database>,
-    app_handle: tauri::AppHandle,
+    app_handle: crate::host::AppHandle,
     settings: AppSettings,
     base_url: String,
     seed: [u8; 32],
@@ -176,9 +176,17 @@ impl MailboxRound {
             return;
         }
         self.withdraw_stale().await;
+        super::room_dm_mail::take_back_stale(&self.db, &self.base_url).await;
         if !self.settings.chat_mailbox_enabled {
             return;
         }
+        // Friends first: deposits can use up the server's per-address
+        // allowance, and a friend's mail matters more than a room's.
+        self.friend_round().await;
+        super::room_dm_mail::run_round(&self.db, &self.app_handle, &self.base_url, &self.seed, &self.our_pubkey).await;
+    }
+
+    async fn friend_round(&self) {
         let db = self.db.clone();
         let Ok(Ok((friends, collectors))) = tokio::task::spawn_blocking(move || {
             Ok::<_, anyhow::Error>((db.get_friend_public_keys()?, db.chat_mailbox_friends()?))
@@ -400,9 +408,10 @@ impl MailboxRound {
                         Some(MailboxPayload::Receipt { msg_ids }) => {
                             confirmed.entry(index).or_default().extend(msg_ids);
                         }
-                        // Not sealed by this friend for this box: nothing a
-                        // round can ever read, so it goes too.
-                        None => {}
+                        // Not sealed by this friend for this box, or room
+                        // mail's alone: nothing a round can ever read, so it
+                        // goes too.
+                        Some(MailboxPayload::Decline { .. }) | None => {}
                     }
                     clear.entry(item.mailbox).or_default().push(item.id);
                 }

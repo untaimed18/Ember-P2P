@@ -10,7 +10,7 @@
 //! `RunEvent::Exit`.
 
 /// Starts listening for the end of the session.
-pub fn watch(app: &tauri::AppHandle) {
+pub fn watch(app: &crate::host::AppHandle) {
     #[cfg(unix)]
     unix::watch(app.clone());
     #[cfg(not(unix))]
@@ -19,11 +19,11 @@ pub fn watch(app: &tauri::AppHandle) {
 
 #[cfg(unix)]
 mod unix {
-    use tauri::Manager;
+    use crate::host::Manager;
     use tokio::signal::unix::{signal, Signal, SignalKind};
 
-    pub(super) fn watch(app: tauri::AppHandle) {
-        tauri::async_runtime::spawn(async move {
+    pub(super) fn watch(app: crate::host::AppHandle) {
+        crate::host::async_runtime::spawn(async move {
             let listen = |kind: SignalKind, name: &str| match signal(kind) {
                 Ok(stream) => Some(stream),
                 Err(e) => {

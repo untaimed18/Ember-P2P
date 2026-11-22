@@ -7,7 +7,7 @@ pub(in crate::network) async fn on_tcp_mapping_keepalive_result(
     result: TcpMappingKeepaliveResult,
     state: &mut NetworkState,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     mapping_ka_cycle_success: &mut bool,
     tcp_map_ka_gen: &mut Option<u64>,

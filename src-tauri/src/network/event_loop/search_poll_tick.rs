@@ -12,7 +12,7 @@ pub(in crate::network) async fn on_search_poll_tick(
     dl_event_tx: &mpsc::Sender<DownloadEvent>,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     credit_manager: &Arc<RwLock<CreditManager>>,
@@ -92,7 +92,6 @@ pub(in crate::network) async fn on_search_poll_tick(
     if let Some(request_id) = udp_finished_request {
         maybe_finish_active_search(state, app_handle, request_id);
     }
-    if state.stats.status == NetworkStatus::Disconnected { return; }
     let new_in_use = state.search_manager.drain_pending_in_use();
     if !new_in_use.is_empty() {
         state.routing_table.mark_contacts_in_use(&new_in_use);
@@ -867,6 +866,7 @@ pub(in crate::network) async fn on_search_poll_tick(
             let keys_learned = state.ember_noise_keys.len().saturating_sub(keys_before);
             let converted = ember_rendezvous_converted_contacts(state, &peers);
             note_ember_rendezvous_lookup(state, peers.len(), converted);
+            note_rendezvous_adverts(state, &peers, &established);
             info!(
                 "Ember rendezvous lookup finished: {found} advertised peer(s), \
                  {} after dropping self, {converted} already overlay contact(s), \
@@ -2500,7 +2500,7 @@ const KAD_KEYWORD_STREAM_FLUSH: std::time::Duration = std::time::Duration::from_
 /// soon as it arrives, then a full batch at a time, or whatever has gathered
 /// once [`KAD_KEYWORD_STREAM_FLUSH`] has passed since the last batch, so a
 /// handful of rows does not wait for the walk to end.
-fn kad_keyword_batch_due(streamed: usize, total: usize, since_last: std::time::Duration) -> bool {
+pub(super) fn kad_keyword_batch_due(streamed: usize, total: usize, since_last: std::time::Duration) -> bool {
     total > streamed
         && (streamed == 0
             || total - streamed >= KAD_KEYWORD_STREAM_BATCH

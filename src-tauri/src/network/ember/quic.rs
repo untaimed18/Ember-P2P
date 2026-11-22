@@ -206,8 +206,8 @@ pub fn build_client_config(
 /// platforms where the requested buffer exceeds the system maximum, the
 /// kernel silently clamps; we log a warning and continue rather than
 /// failing the bind.
-fn bind_tuned_udp(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
-    let socket = std::net::UdpSocket::bind(addr)?;
+fn bind_tuned_udp(port: u16) -> std::io::Result<std::net::UdpSocket> {
+    let socket = crate::net_bind::std_udp(port)?;
     let s = socket2::SockRef::from(&socket);
     if let Err(e) = s.set_recv_buffer_size(UDP_RECV_BUFFER_BYTES) {
         debug!("UDP set_recv_buffer_size({UDP_RECV_BUFFER_BYTES}) failed: {e} (using OS default)");
@@ -485,7 +485,7 @@ async fn stun_public_port(socket: &tokio::net::UdpSocket) -> Option<u16> {
     let probe = async {
         let mut buf = [0u8; 512];
         for server in super::nat::DEFAULT_STUN_SERVERS.iter() {
-            let Ok(mut addrs) = tokio::net::lookup_host(server).await else {
+            let Ok(mut addrs) = crate::net_bind::lookup_host(server).await else {
                 continue;
             };
             let Some(server_addr) = addrs.find(|a| a.is_ipv4()) else {
@@ -568,8 +568,7 @@ pub async fn build_server_client_endpoint(
 
     let mut last_err: Option<anyhow::Error> = None;
     for &candidate in &candidates {
-        let bind_addr: SocketAddr = format!("0.0.0.0:{candidate}").parse()?;
-        let socket = match bind_tuned_udp(bind_addr) {
+        let socket = match bind_tuned_udp(candidate) {
             Ok(s) => s,
             Err(e) => {
                 last_err = Some(anyhow::Error::new(e).context(format!("bind {candidate}")));
@@ -675,7 +674,7 @@ pub fn build_shared_endpoint(
 pub fn build_legacy_endpoint(cert_der: &[u8], key_der: &[u8], port: u16) -> anyhow::Result<Endpoint> {
     let server_config = build_server_config(cert_der, key_der)?;
     let client_config = build_client_config(cert_der, key_der, None)?;
-    let socket = bind_tuned_udp(SocketAddr::from(([0, 0, 0, 0], port)))?;
+    let socket = bind_tuned_udp(port)?;
     let mut endpoint = Endpoint::new(
         EndpointConfig::default(),
         Some(server_config),

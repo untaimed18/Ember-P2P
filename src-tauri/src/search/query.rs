@@ -76,6 +76,18 @@ impl QueryExpr {
                 return;
             }
         }
+        if let QueryExpr::Not(..) = self {
+            // One NOT per excluded word, the same nesting a long AND has.
+            // `a NOT x NOT y` is `a NOT (x OR y)`, which goes out balanced.
+            let (base, excluded) = self.not_chain();
+            if excluded.len() > MAX_WIRE_CHAIN {
+                buf.push(0x00);
+                buf.push(0x02);
+                base.write_wire(buf);
+                Self::write_balanced(buf, 0x01, &excluded);
+                return;
+            }
+        }
         match self {
             QueryExpr::Term(s) => {
                 buf.push(0x01);
@@ -130,6 +142,19 @@ impl QueryExpr {
             }
         }
         operands
+    }
+
+    /// What a run of NOTs rooted here subtracts from, and each thing it
+    /// subtracts, in order.
+    fn not_chain(&self) -> (&QueryExpr, Vec<&QueryExpr>) {
+        let mut excluded = Vec::new();
+        let mut node = self;
+        while let QueryExpr::Not(left, right) = node {
+            excluded.push(right.as_ref());
+            node = left;
+        }
+        excluded.reverse();
+        (node, excluded)
     }
 
     fn write_balanced(buf: &mut Vec<u8>, op: u8, operands: &[&QueryExpr]) {
@@ -1393,6 +1418,16 @@ mod tests {
         let mixed = parse(&format!("({}) -cam", words.join(" "))).unwrap().to_wire_bytes();
         assert_eq!(&mixed[..2], &[0x00, 0x02]);
         assert!(wire_depth(&mixed) <= 7);
+
+        // So is a long run of excluded words, as one NOT of their OR.
+        let excluded: Vec<String> = words.iter().map(|w| format!("-{w}")).collect();
+        let query = parse(&format!("movie {}", excluded.join(" "))).unwrap();
+        let wire = query.to_wire_bytes();
+        assert!(wire_depth(&wire) <= 8, "depth {}", wire_depth(&wire));
+        assert_eq!(&wire[..2], &[0x00, 0x02]);
+        assert_eq!(wire.iter().filter(|&&b| b == b'w').count(), words.len());
+        assert!(query.matches("movie about nothing"));
+        assert!(!query.matches("movie word07 part"));
     }
 
     #[test]

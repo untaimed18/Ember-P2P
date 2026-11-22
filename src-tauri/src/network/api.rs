@@ -488,6 +488,9 @@ pub enum NetworkCommand {
     BrowseFriend {
         ember_hash: [u8; 16],
         request_id: String,
+        /// Sent to a friend that reads one; any other is answered in full,
+        /// for the dialog to filter.
+        filter: Option<crate::network::ed2k::multi_source::BrowseFilter>,
         tx: oneshot::Sender<Result<(), String>>,
     },
     CancelBrowseFriend {
@@ -685,9 +688,9 @@ pub enum NetworkCommand {
     FanoutChannelGossip {
         body: Vec<u8>,
     },
-    /// [`Self::FanoutChannelGossip`] for every frame of one chat line or
-    /// revision, in order: the legacy frame first, then the v2 frame. One
-    /// command, so neither goes out without the other.
+    /// [`Self::FanoutChannelGossip`] for the frames of one chat line or
+    /// revision, in order. This build sends one, its v2 frame; 1.7.5 to 1.7.8
+    /// sent the legacy frame first and the v2 frame after it.
     FanoutChannelChat {
         bodies: Vec<Vec<u8>>,
     },
@@ -784,12 +787,6 @@ pub enum NetworkCommand {
         xfer_id: [u8; 16],
         tx: oneshot::Sender<Result<(), String>>,
     },
-    /// Send the plain offer for one of our offers the user was asked about.
-    /// Does nothing once the recipient has shown it read the sealed one.
-    SendChannelTransferPlainOffer {
-        xfer_id: [u8; 16],
-        tx: oneshot::Sender<Result<(), String>>,
-    },
     /// Everything in flight, for the Channels page to draw.
     ListChannelTransfers {
         tx: oneshot::Sender<Vec<ChannelTransferSnapshot>>,
@@ -804,6 +801,31 @@ pub enum NetworkCommand {
     DropChannelTransfers {
         channel_id: [u8; 16],
         member: Option<[u8; 32]>,
+    },
+    /// Ask a member of a private room for a page of their room library.
+    AskRoomLibrary {
+        channel_id: [u8; 16],
+        peer: [u8; 32],
+        request: crate::network::ember::room_library::LibraryRequest,
+        tx: oneshot::Sender<Result<crate::network::ember::room_library::LibraryAnswer, String>>,
+    },
+    /// Queue a file from a member's room library. Answers with the transfer
+    /// id it will arrive under, as a room transfer.
+    PullRoomLibraryFile {
+        request: super::room_library::PullRequest,
+        tx: oneshot::Sender<Result<[u8; 16], String>>,
+    },
+    /// Our room library in this room was opened, closed, or lost a folder:
+    /// tell the room, and stop sending what it no longer holds. `tx` hears
+    /// once that is done.
+    RoomLibraryChanged {
+        channel_id: [u8; 16],
+        tx: oneshot::Sender<()>,
+    },
+    /// Members of a room whose libraries are open to it, as last heard.
+    ListRoomLibraries {
+        channel_id: [u8; 16],
+        tx: oneshot::Sender<Vec<[u8; 32]>>,
     },
     /// Run one Ember DHT maintenance cycle on demand (dev/harness): refresh
     /// stale buckets, liveness-ping stale contacts, and republish stored
@@ -856,9 +878,6 @@ pub struct ChannelTransferSnapshot {
     /// The name is a program, shortcut or script, or one dressed up as a
     /// document (`report.pdf.exe`); see `security::is_dangerous_extension`.
     pub risky: bool,
-    /// A send whose recipient has not shown it read the sealed offer, and
-    /// whose user is being asked whether to send the plain one.
-    pub awaiting_consent: bool,
 }
 
 /// One Ember DHT routing-table contact, flattened to strings for IPC.

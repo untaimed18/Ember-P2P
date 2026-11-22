@@ -145,7 +145,7 @@ pub fn schedule_cleanup(data_dir: &Path) {
     if !dir.exists() {
         return;
     }
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         for attempt in 1..=CLEANUP_ATTEMPTS {
             tokio::time::sleep(CLEANUP_DELAY).await;
             if STARTED.load(Ordering::Acquire) {

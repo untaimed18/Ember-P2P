@@ -9,12 +9,14 @@ the v3 frame changes, what moved it to v4 (see
 and every additive change since — each marked as additive, since that is the
 distinction an implementer needs.
 
-**This is the single plan for the overlay.** It replaces the separate
-`ember-dht-search-plan.md`, whose live content — the friend-browse filter design,
-the extension decision, and the standing "already better than KAD" list — is folded
-in below. Finished work is no longer narrated item by item; it is listed in
-[Closed](#closed), and the reasoning behind each closed item is in git history and
-in the specification.
+**This is the overlay's design record.** What is still to do, across the whole
+app, is listed in [future-plan.md](future-plan.md), section 4 for the overlay, with
+when to pick each item up; the design detail behind those items stays here. It
+replaces the separate `ember-dht-search-plan.md`, whose live content — the
+friend-browse filter design, the extension decision, and the standing "already
+better than KAD" list — is folded in below. Finished work is no longer narrated
+item by item; it is listed in [Closed](#closed), and the reasoning behind each
+closed item is in git history and in the specification.
 
 Status: **protocol slices complete** and the overlay is **always on**
 (`ember_native_enabled`; profiles that still had it off are turned on at load).
@@ -84,6 +86,9 @@ identity-to-IP map of every participant.
 ---
 
 ## Outstanding work
+
+The items below are tracked in [future-plan.md](future-plan.md); this section
+keeps their design.
 
 ### 1. Ember-native transfers are partly wired
 
@@ -364,7 +369,7 @@ alongside `ember_dht_ping_peer`, `ember_dht_find_node`,
 `ember_dht_iterative_find_node`, `ember_dht_publish_keyword`,
 `ember_dht_find_value`, and `ember_dht_run_maintenance`.
 
-### 6. Filter the friend browse on the wire — designed, not started
+### 6. Filter the friend browse on the wire — built in 1.8.0
 
 What the constraint cannot do is answer "show me every `.mp3`" with no keyword at
 all. Kademlia has to walk *toward* something, and the only key such a query could
@@ -480,6 +485,41 @@ filter there would let a stranger enumerate a library far past the single capped
 packet the setting was reasoned about, which is a genuine exposure change and a
 separate decision.
 
+**As built in 1.8.0**, with two departures from the design above:
+
+- **Feature bits travel twice.** The Ember hello carries them as designed
+  (`flags & 0x02`, then `EMBER_FEATURES` as a `u32`), which is how a queued
+  waiter's are known for the secure slot grant (`EMBER_FEATURE_SECURE_PUSH_GRANT`).
+  A friend session does not always exchange an Ember hello, so each side also
+  sends them as `EMBER_EXT_FEATURES` (0x17) when one comes up, and the session
+  handle keeps them (`EmberSessionHandle::has_feature`), spread to the friend's
+  other live sessions as its other marks are.
+- **The request carries a name filter too:** `EBR2 || name_len(u16) || name ||
+  constraint block` (`encode_browse_request_v2`). The name is matched as the
+  dialog's own filter box matches it, against the name or the hash; the block
+  is `encode_constraint_block`, the walk's encoder without keyword hashes or
+  resume anchors. The dialog sends only the name and the type.
+
+An answer to a friend that announced `EMBER_FEATURE_BROWSE_DETAILS` (1 << 2)
+also carries a details section after the Ember digests: `EBD1`, then per
+entry in order `folder_len(u16) || folder || duration(u32) || bitrate(u32) ||
+codec_len(u8) || codec` (`encode_browse_details`), from the library's media
+record. The folder is empty unless the user turned on
+`friend_browse_shows_folders`, and then starts at the shared folder's name
+(`browse_folder_of`). Only to a friend that announced the bit: a parser before
+1.8.0 wants the digests to end the answer, and drops them otherwise. The
+receiver keeps the details only when every record reads, and cleans each
+folder part before showing it (`clean_browse_folder`).
+
+The answer is v1's with the filter applied before the dedupe and the caps, and
+the summary frame's total counts the matches, which the dialog shows. Every
+browse answer, filtered or not, is held to ten per friend in 30 seconds,
+taken before the walk (`browse_serve_allowed`), and one over it gets no
+answer. So the asker holds its own requests to ten per friend in 35 seconds
+(`browse_ask_allowed`) and says *try again in a moment* rather than waiting
+out its timeout. A friend that did not announce
+the bit gets `EBR1` and is filtered by the dialog as before.
+
 ### 7. Deferred from the 1.7.7 overlay work
 
 1.7.7 came out of a 12-hour field run on an overlay of about twenty nodes
@@ -560,29 +600,28 @@ showing a number rather than "Paused (small network)"), or "Stores acked"
 grows faster than the overlay does. Gate it on an advertised capability as in
 7a. A storer that predates it must never be left owing a reply.
 
-**7c. Ending source, room and directory lookups sooner.**
+**7c. Ending source, room and directory lookups sooner — mostly built in 1.8.0.**
 
 *What.* A keyword walk ends a few seconds after the k closest live contacts
-have answered (`KEYWORD_SETTLE_SECS`). Every other `FIND_VALUE` (download
-sources, room presence, feed heads, the rendezvous directory) walks its whole
-shortlist by design, for recall, and each silent node on it costs the full
-query wait (`EMBER_SEARCH_QUEUED_QUERY_TIMEOUT`, 12 seconds) before the walk can
-end. The 1.7.6 run averaged 20 seconds a lookup, against 9.7 seconds on 1.7.3.
+have answered (`KEYWORD_SETTLE_SECS`). Every other `FIND_VALUE` walked its
+whole shortlist, and each silent first contact on it cost the full queued-query
+wait (`EMBER_SEARCH_QUEUED_QUERY_TIMEOUT`, 12 seconds). The 1.7.6 run averaged
+20 seconds a lookup, against 9.7 seconds on 1.7.3.
 
-*Why it waited.* The 20 seconds mixes the user's searches with background
-lookups, and changing walk termination without knowing which is slow risks
-recall for nothing. 1.7.7 added "Keyword search avg. time"
-(`ember_dht_keyword_search_outcomes`, `ember_dht_keyword_search_elapsed_ms_sum`)
-to tell them apart.
+*Built in 1.8.0.* Source and room presence lookups settle the way keyword walks
+do (`IterativeSearch::mark_settling_lookup`). Records live on the k closest, so
+the cost is only records held by stragglers outside them. Lookups whose empty
+answer is read as "there is none" (a room's moderation, settings, handoff or
+claim) still ask every node they can, and the feed and directory walks are
+unchanged. And a query queued behind a first contact's handshake fails at
+`EMBER_SEARCH_HANDSHAKE_TIMEOUT` (6 seconds) if the handshake has not
+completed by then, rather than at 12; once it completes, the query keeps the
+rest of its budget.
 
-*When.* If keyword searches stay quick while the overall average stays high,
-the slow ones are the background walks. Two changes, in this order:
-
-- Per-peer timeouts from measured round-trip times instead of the fixed 12
-  seconds, so one silent node stops setting the pace.
-- Settling for source and presence lookups, once the k closest have answered
-  and nothing new has arrived for a few seconds. Records live on the k closest,
-  so the cost is only records held by stragglers outside them.
+*Still open.* Per-peer timeouts from measured round-trip times instead of the
+fixed 5 and 12 seconds, so one slow node stops setting the pace. Pick it up if
+the overall lookup average on `/ember` stays well above "Keyword search avg.
+time" (`ember_dht_keyword_search_elapsed_ms_sum`) on 1.8.0.
 
 **7d. Rendezvous adverts that never become contacts.**
 
@@ -810,8 +849,6 @@ settled.
   on the Ember page (listed / lookups / empty).
 - ~~Weight a gossip contact by whether the leads its introducer gave us turned
   out to be reachable.~~ Done — see the Sybil note under Hardening and ops.
-- Stronger observed-IP / STUN interplay under awkward NATs (needs soak
-  data).
 - Shard the rendezvous key space. The derivation is already versioned for
   this; it matters once one KAD bucket's 1000-entry cap is in sight.
 
@@ -829,7 +866,6 @@ settled.
   twenty nodes closest to the key fill at different rates and the first one to
   run out is what decides whether the advert still lands. Read 90 or above as
   due.
-- Table quality: tune announce versus bucket-refresh balance under load.
 
 ### Search and publish
 
@@ -1129,53 +1165,6 @@ against KAD.
   `ember_dht_rate_limited` for the total. The total climbing while the ceiling
   stays flat is pacing; the two climbing together is the case proof-of-work
   would be for.
-- **A replayed `IK_INIT` can take over a crossed dial (deferred from 1.7.1).**
-  A crossed IK dial is settled by static key before anything shows the inbound
-  init is current, and past `HANDSHAKE_REPLAY_TTL` (30 s) a captured `IK_INIT`
-  reads as fresh. Replayed from the peer's address while the higher key has a
-  dial pending to that identity, it makes that node drop its initiator and seal
-  the first message and queue into a session the real peer cannot read. The real
-  `IK_RESP` then finds no pending handshake, and sends go into the unproven
-  session until a liveness fault or `SESSION_TIMEOUT`. It needs a captured init,
-  a way to send from the peer's address, and timing against our dial.
-
-  The case with no dial pending is closed (1.7.6): `prepare_outgoing` seals only
-  into a session whose address is proven, and otherwise dials the peer, whose
-  answer replaces the replayed session; `has_live_session` likewise counts only
-  a proven session. The session a lost crossing leaves is the one exception —
-  our first message is already in it — so the crossing replay below stays open.
-
-  Not fixed in 1.7.1 because each narrow change found trades this for an honest
-  fault. Keeping the initiator so the real `IK_RESP` can still complete it lets
-  both handshakes complete when our `IK_INIT` reaches the lower key after our
-  reply to its own: it answers the late init, and if that answer arrives before
-  the peer's first frame on the crossing session, our first message and queue
-  reach it twice (nothing above the transport collapses a repeated
-  `CHANNEL_MSG`, `CALLBACK_REQ` or EPX frame), or the peer's frames on the
-  replaced session are lost, its first message among them. A crossing session
-  evicted before it is proven also leaves later sends queued behind an
-  initiator the peer refused.
-
-  The fix is responder-side key confirmation, as WireGuard has: a session we
-  answered is not sent on until it decrypts a frame from the peer.
-  `prepare_outgoing` queues behind an unconfirmed responder session, its first
-  decrypt releases the queue, and when we need that slot we also start our own
-  IK dial, whose validated session replaces it. A crossing then keeps the
-  initiator and its payloads, marked with the crossing session's generation:
-  that session's first decrypt seals them into it and drops the initiator, and
-  an `IK_RESP` that completes the initiator first takes them instead, the first
-  message reaching the peer through its own deferral, so each payload is sealed
-  into one session. An evicted crossing session hands the payloads to a fresh
-  dial, and a second crossing init re-points the marker without sealing again,
-  so a replayer cannot multiply what we send to the address it names. Still to
-  settle there: the peer's frames on a crossing session that a faster
-  `IK_RESP` replaced. The cost is a round trip before the higher key's first
-  message in an honest crossing, and before anything we start on a session a
-  peer opened that has not yet sent us a frame.
-
-### Product / UX
-
-- Migration guidance when turning the DHT on alongside existing KAD/eD2K.
 
 ---
 
@@ -1256,6 +1245,24 @@ bump. What was weighed and held back is item 7.
 - Diagnostics: keyword search time apart from the overall average, our refused
   stores by reason, and contacts by reachability.
 
+**Shipped in 1.8.0** — no wire change.
+
+- Source and room presence lookups settle once their neighbourhood has
+  answered, and a first contact's handshake has a deadline of its own (item 7c).
+- A replayed `IK_INIT` could take over a crossed dial (deferred from 1.7.1).
+  Past `HANDSHAKE_REPLAY_TTL` (30 s) a captured `IK_INIT` reads as fresh, and
+  replayed from the peer's address while the higher key had a dial pending, it
+  made that node seal its first message and queue into a session the real peer
+  could not read, and send into it until a fault. The higher key of a crossed
+  dial now holds its messages, and anything sent meanwhile, until the session
+  the peer's handshake built decrypts a frame from the peer; past
+  `CROSSING_HOLD` (3 s) they go out over a fresh dial, which the real peer
+  answers and a replayer cannot (`crossing_holds`). It still gives up its own
+  dial rather than keep it pending: a peer before 1.7.1 answers a kept dial's
+  resend once its own dial has completed, which could leave the two ends on
+  different sessions. The cost is a round trip before the higher key's first
+  message in an honest crossing.
+
 ---
 
 ## Carried over from the 2026-08-18 audit
@@ -1273,13 +1280,14 @@ remains the single most pressing architectural risk in the codebase.** The
 groundwork is in place — `command.rs` is separable and `NetworkDeps` gives the entry
 point a real signature.
 
-**The clippy backlog is gone, which makes a CI change actionable.** That plan
-recorded 123 remaining library warnings, down from 415. `cargo clippy --all-targets`
-now reports **zero** at default lint levels. [`ci.yml`](../.github/workflows/ci.yml)
-says to tighten the lint step to `-- -D warnings` "once that backlog is at zero",
-and the condition is now met. The crate-level baseline in `lib.rs` still allows
-exactly four families, each with a written justification; anything outside those
-four is expected to stay at zero.
+**The clippy backlog is gone, and CI now holds it there.** That plan recorded 123
+remaining library warnings, down from 415. `cargo clippy --all-targets` reports
+**zero** at default lint levels on Windows and Linux, and since 1.8.0 every clippy
+step in [`ci.yml`](../.github/workflows/ci.yml) runs with `-- -D warnings`. CI
+tracks current stable, so a new Rust release can bring a new lint and turn CI red
+until it is fixed; releases run no clippy, so that never blocks one. The
+crate-level baseline in `lib.rs` still allows exactly four families, each with a
+written justification; anything outside those four is expected to stay at zero.
 
 ## Working notes for this tree
 

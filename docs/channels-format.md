@@ -1,7 +1,7 @@
 # Channels: wire and DHT formats
 
 The format spec for Channels, as frozen with 1.7.5
-([post-1.7.4 item 4](post-1.7.4.md#4-a-short-format-spec); what is frozen is
+([post-1.7.4 item 4](archived-plans/post-1.7.4.md#4-a-short-format-spec); what is frozen is
 listed at the end). It covers what goes over the gossip mesh, what is kept on
 the Ember DHT, and the friend-session sub-types frozen with them. Every number here is read
 from the code; identifiers are in backticks so they can be grepped. Where the
@@ -53,7 +53,7 @@ A room frame is three layers deep:
 `"ember-channel-gossip-v1\0" || channel_id || msg_id || sender_counter ||
 timestamp` (`gossip_aad`). Neither version byte nor `ttl` is under the AEAD:
 `ttl` has to change as the frame travels, which is why a relay can raise it
-(see [post-1.7.4 item 8](post-1.7.4.md#8-an-authenticated-marker-on-catch-up-re-serves)
+(see [post-1.7.4 item 8](archived-plans/post-1.7.4.md#8-an-authenticated-marker-on-catch-up-re-serves)
 and kind 8's [admission rule](#admission-item-8), which is how 1.7.5 answers it).
 `GOSSIP_ENVELOPE_OVERHEAD` (41) is the body version, nonce and tag.
 
@@ -156,17 +156,17 @@ rather than a longer old one.
 | 4, 5, 8 | — | retired | The withdrawn broadcast-attachment path; builds still running it are on the network |
 | 6 | `HANDOFF_OFFER_PLAIN_VERSION` | in use | Handoff offer, signed by the channel key; 137 bytes |
 | 7 | — | retired | Unsigned handoff-ready |
-| 9 | `XFER_OFFER_PLAIN_VERSION` | in use | Transfer offer, readable by every member it passes |
+| 9 | `XFER_OFFER_PLAIN_VERSION` | read only | Transfer offer, readable by every member it passes; sent by 1.7.0 and earlier, and by 1.7.1 to 1.7.8 only on their user's say |
 | 10 | `XFER_REPLY_PLAIN_VERSION` | in use | Accept or deny |
 | 11 | `XFER_BLOCK_REQUEST_PLAIN_VERSION` | in use | Receiver asks for blocks |
 | 12 | — | retired | Block with its payload sealed only by the room key |
 | 13 | `XFER_CANCEL_PLAIN_VERSION` | in use | Either side gives up |
 | 14 | `XFER_DONE_PLAIN_VERSION` | in use | Transfer complete |
-| 15 | `CHAT_PLAIN_VERSION` | in use | Signed chat line; sent beside kind 64 until 1.8.0 ([Chat v2](#chat-v2-kinds-64-and-65)) |
+| 15 | `CHAT_PLAIN_VERSION` | read only | Signed chat line; sent beside kind 64 from 1.7.5 to 1.7.8, read from older builds since ([Chat v2](#chat-v2-kinds-64-and-65)) |
 | 16 | `MOD_ACTION_PLAIN_VERSION` | in use | Signed ban or unban; 130 bytes |
 | 17 | `HANDOFF_READY_PLAIN_VERSION` | in use | Signed handoff-ready, exactly 137 bytes; nominees still send it beside 29 |
 | 18 | `SYNC_REQUEST_PLAIN_VERSION` | in use | Signed catch-up request; 105 bytes |
-| 19 | `CHAT_EDIT_PLAIN_VERSION` | in use | Revision of a line, signed by its author; sent beside kind 65 until 1.8.0 |
+| 19 | `CHAT_EDIT_PLAIN_VERSION` | read only | Revision of a line, signed by its author; sent beside kind 65 from 1.7.5 to 1.7.8, read from older builds since |
 | 20 | `REACTION_PLAIN_VERSION` | in use | Batch of reactions |
 | 21 | `XFER_BLOCK_DATA_SEALED_VERSION` | in use | Block encrypted to the recipient alone |
 | 22 | `PRESENCE_BEACON_PLAIN_VERSION` | in use | Batch of signed presence beacons |
@@ -175,7 +175,7 @@ rather than a longer old one.
 | 25 | `XFER_STREAM_SEALED_VERSION` | in use | Transfer QUIC port, encrypted to the other end |
 | 26 | `XFER_OFFER_SEALED_VERSION` | in use | Offer encrypted to the recipient |
 | 27 | `ROOM_FRIEND_REQUEST_PLAIN_VERSION` | in use | Friend request addressed by a pairwise tag |
-| 28 | `XFER_SEEN_PLAIN_VERSION` | in use | "Your sealed offer arrived and I can read it" |
+| 28 | `XFER_SEEN_PLAIN_VERSION` | in use | "Your sealed offer arrived and I can read it"; still sent to every sealed offer's sender for the sake of 1.7.1 to 1.7.8 ones, and ignored on arrival from 1.8.0 |
 | 29 | `HANDOFF_READY_PROVEN_PLAIN_VERSION` | in use | Handoff-ready plus the successor key's signature; 201 bytes |
 | 30–63 | — | unassigned | The code says they "stay unassigned" |
 | 64–255 | `EXT_KIND_MIN` and up | extension | See below |
@@ -184,8 +184,23 @@ rather than a longer old one.
 The transfer frames (9, 10, 11, 13, 14, 21, 25, 26, 28) share a header,
 `version(1) || sender(32) || target(32) || xfer_id(16)` (`XFER_HEADER_LEN`, 81),
 and end in a 16-byte pairwise authenticator (`XFER_MAC_LEN`) under
-`derive_xfer_key`. 25, 26 and 28 are only sent by 1.7.0 and later, which is
-what `xfer_frame_proves_sealed_reader` relies on.
+`derive_xfer_key`. 25, 26 and 28 are only sent by 1.7.0 and later, so from
+1.7.1 to 1.7.8 a sender took any of them from the recipient as proof that it
+read sealed offers, and held no plain offer for it. 1.8.0 sends sealed offers
+only and keeps no such record.
+
+**Stamped transfer ids (from 1.8.0).** A sender mints `xfer_id` as
+`E7 5B 0F FE || seconds(5, LE) || random(7)` (`mint_xfer_id`), so the id
+dates its offer. No frame changes: the id was always 16 opaque bytes to every
+build, and it sits in the header the pairwise authenticator covers, so a
+member the offer is forwarded through can neither read past it nor rewrite the
+time. A recipient drops a stamped offer older than `XFER_OFFER_TTL_SECS` plus
+`CHANNEL_GOSSIP_MAX_FUTURE_SKEW_SECS`, or ahead by more than the skew
+(`xfer_offer_fresh`), which ends the replay of an offer once the recipient has
+forgotten its transfer. An id from a sender before 1.8.0 is random, carries no
+mark (one in 2^32 does by chance, and is dropped as stale), and is taken as
+before. Forwarders learn when the offer was made, which its arrival already
+told them to within a few seconds.
 
 Retired numbers have no constant left in the code; the table is built from
 the comments beside the live constants and from the test that the retired
@@ -244,7 +259,7 @@ older builds drop them like any number they do not know.
 ## Chat v2 (kinds 64 and 65)
 
 From 1.7.5. It fills in
-[post-1.7.4 item 2](post-1.7.4.md#2-a-second-version-of-the-chat-message).
+[post-1.7.4 item 2](archived-plans/post-1.7.4.md#2-a-second-version-of-the-chat-message).
 A chat line (15) and its revision (19) have fixed layouts, so replies were
 fitted inside the signed text as tag characters (`with_reply_trailer`) and
 any further field would have needed another frame number. The second version
@@ -284,7 +299,7 @@ kinds; a later build that needs another layout takes a new tag.
 
 | Tag | Field | Value | Kind 64 | Kind 65 |
 | --- | --- | --- | --- | --- |
-| 1 | line id | 16 bytes: for 64, the line's own id, which is its legacy twin's `msg_id`; for 65, the line revised | required | required |
+| 1 | line id | 16 bytes: for 64, the line's own id, which a legacy twin travels under and, from 1.8.0, the frame itself; for 65, the line revised | required | required |
 | 2 | text | UTF-8, not empty, without a reply trailer; emoji joiners kept | required | required |
 | 3 | reply parent | 16 bytes, the id of the line this one answers; absent for a line that is not a reply | optional | optional |
 | 4 | original time | `i64`, the revised line's send time | ignored | required |
@@ -348,12 +363,14 @@ the editor.
 
 ### Pairing with the legacy frames
 
-During the transition every line goes out twice: as chat line 15 under the
-line's id, and as kind 64 under a **`msg_id` of its own** (random), naming the
-line in tag 1. Every build drops a frame whose `msg_id` it has seen; had the
-two shared one, a 1.7.4 build that met the v2 frame first would drop the
-legacy line as a duplicate and never show it. Revisions go out as 19 and 65,
-each under its own random envelope id, as 19 already did.
+During the transition (1.7.5 to 1.7.8) every line went out twice: as chat
+line 15 under the line's id, and as kind 64 under a **`msg_id` of its own**
+(random), naming the line in tag 1. Every build drops a frame whose `msg_id`
+it has seen; had the two shared one, a 1.7.4 build that met the v2 frame
+first would drop the legacy line as a duplicate and never show it. Revisions
+went out as 19 and 65, each under its own random envelope id, as 19 already
+did. 1.8.0 sends kind 64 alone, under the line's id
+([below](#the-cut-over-in-180)).
 
 Receivers on 1.7.5 keep one row per line, under the line's id; whichever form
 arrives first makes it:
@@ -412,44 +429,48 @@ which is the legacy envelope's and the v2 frame's, or the revision's
 `edited_at`. A line leaves or spends one only when its id binds its author at
 that time (`chat_msg_id_binds`), as every id minted beside a v2 frame does; a
 legacy line under any other id is charged on its own. A credit lasts
-`CHAT_TWIN_CREDIT_TTL` (5 seconds): a sender hands both frames to the network
+`CHAT_TWIN_CREDIT_TTL` (5 seconds): a 1.7.5 to 1.7.8 sender hands both frames to the network
 together and every hop passes them on in that order, so honest twins arrive
 back to back, and one form sent alone cannot bank a free frame for a burst
 later. At most `CHAT_TWIN_CREDITS_CAP` (4096) are held. A third frame for the
 same line is charged, so an author cannot turn one line into a stream of v2
-frames under fresh envelope ids. The sender counts the pair as one message for
-its own per-room limit (`LOCAL_SEND_PER_MINUTE`) and for slow mode, and hands
-both frames to the network task as one command (`FanoutChannelChat`), legacy
-first.
+frames under fresh envelope ids. A 1.7.5 to 1.7.8 sender counted the pair as
+one message for its own per-room limit (`LOCAL_SEND_PER_MINUTE`) and for slow
+mode, and handed both frames to the network task as one command
+(`FanoutChannelChat`), legacy first.
 
 **Budgets count frames.** The relay allowance (`CHANNEL_GOSSIP_OUT_PER_SEC`,
 16 a second), the per-hop inbound allowance derived from it, and a catch-up
 reply's frame budget (`CHANNEL_HISTORY_SYNC_FRAME_MAX`, 40) count frames, not
-lines. While both forms go out, a line or revision is two frames, so each
-carries half as many lines as it did: 8 relayed a second, and as few as 20
-lines in a catch-up reply. A twin whose credit was spent is not exempted from
+lines. While both forms went out (1.7.5 to 1.7.8), a line or revision was two
+frames, so each carried half as many lines: 8 relayed a second, and as few as
+20 lines in a catch-up reply. From 1.8.0 it is one frame again, though a row
+a 1.7.x author sent in both forms is still re-served as two. A twin whose credit was spent is not exempted from
 them: the relay allowance is this node's own bound on what it forwards, and
 it is spent per frame sent.
 
-**Sending.** The legacy frame carries the text as before, joiners stripped
-(`sanitize_outgoing_message_text`). The v2 frame carries what was typed under
-the receive-side rules (`sanitize_message_text`, joiners kept), unless that
-would not pair with the legacy text or would take the stored text past 4096
-bytes (`CHAT_TEXT_MAX_BYTES`), in which case it carries the legacy body
-(`chat_v2_outgoing_text`). The local row holds the v2 text and both frames'
-signatures.
+**Sending.** From 1.7.5 to 1.7.8 the legacy frame carried the text as before,
+joiners stripped (`sanitize_outgoing_message_text`). The v2 frame carries what
+was typed under the receive-side rules (`sanitize_message_text`, joiners
+kept), unless that would not pair with the legacy text or would take the
+stored text past 4096 bytes (`CHAT_TEXT_MAX_BYTES`), in which case it carries
+the legacy body (`chat_v2_outgoing_text`). 1.8.0 sends the v2 frame alone
+under the same rule, so its text still reads alike with the legacy text
+derived from it (`chat_legacy_text`), as on a row from a 1.7.5 to 1.7.8
+author. Such a row holds the v2 text and both frames' signatures; a 1.8.0
+row holds no legacy signature.
 
-**Display flag.** While the legacy frames go out, kinds 64 and 65 are sent
-**without** `EXT_FLAG_DISPLAY` (`CHAT_V2_FLAGS` = 0). Builds 1.7.2–1.7.4 count
+**Display flag.** From 1.7.5 to 1.7.8, beside the legacy frames, kinds 64
+and 65 were sent **without** `EXT_FLAG_DISPLAY`. Builds 1.7.2–1.7.4 count
 a displayable frame of a kind they cannot read as a line needing a newer
 Ember, and with the flag set every line would raise that banner there even
 though its legacy twin shows it. Builds before 1.7.2 drop the frame as an
 unknown number.
 
 **Builds before 1.7.5** charge both frames against the author's rate (four a
-second), so a member there sees a 1.7.5 author's lines capped at two a second.
-The legacy frame is sent first, so it is the one such a build admits when an
-author is at the edge.
+second), so a member there saw a 1.7.5 to 1.7.8 author's lines capped at two
+a second. The legacy frame was sent first, so it was the one such a build
+admitted when an author was at the edge.
 
 ### Storage and catch-up
 
@@ -480,15 +501,17 @@ that downgraded; only re-serving them is lost.
 ### The cut-over in 1.8.0
 
 1.8.0 stops sending 15 and 19 and sets `EXT_FLAG_DISPLAY` on 64 and 65, so a
-build that cannot read them says so. It is one constant,
-`SEND_LEGACY_CHAT_FRAMES`, which also drives `CHAT_V2_FLAGS`. With no legacy
-frame to shadow, a kind 64 frame then takes the line's id as its own envelope
-id, so the line's delivery is settled by the frame that carries it; receivers
-already accept that. 1.8.0 still reads 15 and 19 from members on older
+build that cannot read them says so: 1.7.2 to 1.7.4 count each line as one
+needing a newer Ember, and builds before 1.7.2 drop it. The flag is
+`CHAT_V2_FLAGS`, and `outgoing_chat_line` and `outgoing_chat_edit` build the
+one frame. With no legacy frame to shadow, a kind 64 frame takes the
+line's id as its own envelope id, so the line's delivery is settled by the
+frame that carries it; receivers already accepted that. A revision's frame
+keeps an id of its own. 1.8.0 still reads 15 and 19 from members on older
 builds, and pairs them as above. 1.8.0 is also the release that stops
 publishing v1 membership records
 ([item 9](#the-transition-and-the-cut-over-in-180)), so a room has one
-cut-over to test.
+cut-over.
 
 ## Private messages (kind 66)
 
@@ -526,8 +549,50 @@ Body: `version(1) = 1 || tag(16) || nonce(24) || ciphertext`.
   are counted (3670); the text cap, `DM_TEXT_MAX_BYTES`, is that less `type ||
   len || message_id` (3651). Types and their fields, exactly: 1 message
   (`message_id(16) || UTF-8 text`), 2 receipt (`message_id(16)`), 3 accept
-  (none), 4 decline (none). One kind of frame for all four, so relays cannot
-  tell a message from a receipt.
+  (none), 4 decline (none), and from 1.8.0 5 timer (`message_id(16) ||
+  ttl_secs(4, LE)`) and 6 collects (none). One kind of frame for all of them,
+  so relays cannot tell a message from a receipt, and a timer pads to the
+  bucket a receipt does.
+
+**Room mail (type 6, from 1.8.0).** A member who collects room mail says so
+with a type 6 frame beside its first receipt to each member in a session;
+the sender keeps that word for 30 days (`room_dm_mail_peers`). One of ours
+still unanswered two minutes after it went, to a member who said so, is left
+on the rendezvous server the way chat mail is (`network::room_dm_mail`): the
+same server calls and the same sealed `MailboxPayload`, in boxes of their own
+(`derive_room_dm_mailbox_box`, purpose `room-dm-mailbox-v1\0 || recipient`),
+which no friend-chat box can be, and every blob binds its box. Once left, a
+message is resent live no more and waits for its receipt for the week the
+server keeps it, shown as waiting in their mailbox. A member collects only
+from the conversations it has, declined ones included, so a stranger's first
+message still needs them online. It collects with private messages off too,
+and leaves nothing of its own then. What it collects is kept on the terms a
+live message is (the roster, the policy, the ignore list, the caps), and its
+entry goes once the answer is on the server: a receipt for what was kept,
+and for what is declined a `MailboxPayload::Decline` (kind 3, room mail
+only, body `at(8, LE)`, unix seconds), which the sender records as a live
+decline dated no later than when it read it. What a live message would drop
+unanswered (ignored, off the roster, over a request's hold) is cleared
+without one; one over the sender's hourly allowance stays for a later round.
+Builds before 1.8.0 drop type 6 as they drop type 5, and so are never left
+mail. It rides the chat mailbox's round and its setting.
+
+**Disappearing messages (type 5, from 1.8.0).** A conversation's timer is
+chosen on the sender's side (`room_dm_disappear`, off by default) and goes out
+as a frame of its own after every copy of a message, new or resent, rather
+than as a field of type 1, whose fields are its text and nothing else. It goes
+once more after the message's receipt, held back as a reply is so its timing
+does not tie the two members together: a copy that was lost, paced out or
+overtook its message is otherwise never taken. A
+build before 1.8.0 opens it, finds a type it does not read, and drops it: the
+message arrives and is kept there for good, as an older friend keeps a friend
+chat message. A recipient takes a timer only for a message it kept, once,
+held to friend chat's bounds (`CHAT_DISAPPEAR_PEER_MIN_SECS` to
+`CHAT_DISAPPEAR_PEER_MAX_SECS`). Ours runs from its receipt and theirs from
+when the conversation is read (at once if it already was), and the cleanup
+sweep deletes each at its time (`dm_expire_due`). Timers live in tables of
+their own (`room_dm_timers`, `room_dm_disappear`) beside `room_dm_messages`,
+which is unchanged.
 
 **Receiving** (`network::room_dm::on_private_message`). Only after the frame
 met the relay rules, only under the room's current key, only within
@@ -715,7 +780,7 @@ The `extra` each kind carries:
 - **3, moderation.** The owner's whole governance snapshot (welcome, bans,
   moderators, `ModerationTail`). The storer does not check its shape; readers
   do. Worst case 1164 of 1165 bytes (see
-  [post-1.7.4 item 1](post-1.7.4.md#1-decide-the-future-of-the-room-settings-snapshot)).
+  [post-1.7.4 item 1](archived-plans/post-1.7.4.md#1-decide-the-future-of-the-room-settings-snapshot)).
   From 1.7.5 this record is frozen as it is, and new room settings go in
   kind 8.
 - **4, handoff.** `version(8) || successor_pubkey(32) || successor_id(16) ||
@@ -759,10 +824,10 @@ empty name and kind flags 0.
   `BLAKE3_derive_key("ember-identity-owned-rooms-pad-v1",
   identity_seed || index)[..16]`, so it reads like any salt to everyone but the
   identity, whose recovery drops it before any lookup (`is_owned_rooms_pad`).
-  Nothing in the format changes. 1.7.5 drops pads from what it reads but does
-  not publish them (`PAD_OWNED_ROOMS_LIST`): a build before it, on the same
-  identity, looks the pads up, finds no room, carries them as unsettled and
-  publishes them back in its own list.
+  Nothing in the format changes. 1.7.5 to 1.7.8 drop pads from what they read
+  but do not publish them (`PAD_OWNED_ROOMS_LIST`, on from 1.8.0): a build
+  before 1.7.5, on the same identity, looks the pads up, finds no room,
+  carries them as unsettled and publishes them back in its own list.
 
 Publishing (`maybe_publish_owned_rooms_list`) waits until the network's list
 has been read this launch, so an old database cannot overwrite a newer list.
@@ -785,14 +850,14 @@ Recovery (`commands/channel_recovery.rs`) merges the salts of every copy the
 identity signed that comes back (`merged_lists`), and takes a lookup that
 finds nothing as "no list" only once `MIN_RESPONDERS_FOR_ABSENCE` (4) nodes
 have answered. Builds older than kind 7 do not store it. The known limits are
-under [Owned-room recovery](post-1.7.4.md#owned-room-recovery).
+under [Owned-room recovery](archived-plans/post-1.7.4.md#owned-room-recovery).
 
 ## Room settings (kind 8)
 
 From 1.7.5. It fills in
-[post-1.7.4 item 1](post-1.7.4.md#1-decide-the-future-of-the-room-settings-snapshot)
-and carries [item 7](post-1.7.4.md#7-a-way-back-in-for-a-member-behind-a-private-rooms-key)'s
-key commitment and [item 8](post-1.7.4.md#8-an-authenticated-marker-on-catch-up-re-serves)'s
+[post-1.7.4 item 1](archived-plans/post-1.7.4.md#1-decide-the-future-of-the-room-settings-snapshot)
+and carries [item 7](archived-plans/post-1.7.4.md#7-a-way-back-in-for-a-member-behind-a-private-rooms-key)'s
+key commitment and [item 8](archived-plans/post-1.7.4.md#8-an-authenticated-marker-on-catch-up-re-serves)'s
 admission rule. Code: `SignedRecord::channel_settings_at`,
 `parse_channel_settings`, `encode_settings_extra` and `settings_fields` in
 `publish.rs`; `settings_key`, `key_commitment` and `RosterAdmission` in
@@ -868,9 +933,12 @@ little-endian, at least 1, strictly decreasing along the list; a list that
 breaks that, or whose length is not exactly `1 + 40 × count`, is malformed
 (`decode_key_commitments`). The commitment (`key_commitment`) is
 `blake3::derive_key("ember channel key commitment v1", channel_id ||
-epoch || content_key(join_secret))`. It reveals no key: the join secret is 32
-random bytes. Nor does it reveal anything kind 3 does not already, since
-`key_epoch` there says how many epochs there have been. A public room
+epoch || content_key(join_secret))`. It reveals no key: each epoch's secret
+is 32 bytes that only the room's owner can compute, derived from the room's
+seed (`derive_owned_join_secret`, `derive_owned_epoch_secret`), or drawn at
+random for epochs minted before 1.8.0. Nor does it reveal anything kind 3
+does not already, since `key_epoch` there says how many epochs there have
+been. A public room
 writes no tag 1: its content key derives from a secret everyone holds. Nor
 does epoch 0, the secret a private room was created with, which no rotation
 made and which invites minted before any rotation carry.
@@ -1005,8 +1073,9 @@ seal's AAD names the room but not the member (`presence_extra_aad`), so a
 storer holding a current member's record could copy the sealed extra into a
 record it signs itself, and every device that counted it would put the
 storer's key on the roster for the owner to seal the next epoch to. Every
-member publishes a v1 copy until 1.8.0, not only members on 1.7.4, so any
-storer of the room's presence slot holds one. Only the v2 form from
+member published a v1 copy from 1.7.5 to 1.7.8, and members still on 1.7.4
+publish only that, so a storer of the room's presence slot may hold one.
+Only the v2 form from
 [item 9](#private-membership-records-v2-item-9) counts in a private room: its
 AAD names the pseudonym that signs the record and the seal carries the
 member's signature binding them. A v1 record is still read, refreshing a
@@ -1059,7 +1128,8 @@ once after a rotation committed from a command,
 the commitment list differs from the one it last published, both read from
 the room's epochs when signed, so every key rotation and every rotation taken
 back goes out, including one taken back and minted again under the same epoch
-with another key; then once more within 30 minutes
+(with the same key from 1.8.0, whose owner rotations derive it, and another
+before); then once more within 30 minutes
 (`CHANNEL_SETTINGS_CONFIRM_SECS`), and otherwise on kind 3's republish cadence
 (`MODERATION_REPUBLISH_SECS`, 6 hours) and once each launch. The first of a
 launch is confirmed within 30 minutes too when its commitments differ from
@@ -1134,7 +1204,7 @@ unaffected otherwise: nothing they rely on moves out of kind 3.
 ## Private membership records, v2 (item 9)
 
 From 1.7.5. It fills in
-[post-1.7.4 item 9](post-1.7.4.md#9-keep-private-room-membership-out-of-the-dht).
+[post-1.7.4 item 9](archived-plans/post-1.7.4.md#9-keep-private-room-membership-out-of-the-dht).
 In v1 a private room's presence record names the room (`file_hash`,
 `ember_file_hash`) and the member (`publisher_key`) in its header, so every
 storer learns the roster, and its seal binds the room but not the member, so
@@ -1143,8 +1213,8 @@ record is filed under `epoch_key(channel_id, member, epoch)`, all public
 values, with the member's key in the clear, so anyone who knows the room id
 can test whether a key is a member. Both kinds gain a second form. Code:
 `presence_pseudonym`, `presence_room_blind`, `encode_presence_extra_v2`,
-`decode_presence_extra_v2`, `epoch_blind`, `epoch_member_id`, `epoch_key_v2`,
-`PUBLISH_V1_MEMBERSHIP_RECORDS` and `V1_CUT_OVER_ROTATES` in `channel.rs`;
+`decode_presence_extra_v2`, `epoch_blind`, `epoch_member_id`, `epoch_key_v2`
+and `V1_CUT_OVER` in `channel.rs`;
 `SignedRecord::channel_presence_v2_at`, `parse_channel_presence_member_v2`,
 `channel_key_epoch_at` and the two `*_forms` builders in `publish.rs`;
 `merge_channel_presence_blobs`, `ingest_channel_epoch_records`,
@@ -1257,7 +1327,44 @@ pool), so history under the epochs in between comes after the current key. A
 key stored clears the room's fetch stamp, so the next missing epoch is looked
 up on the next maintenance tick (`EMBER_MAINT_INTERVAL`, a minute) rather than
 possibly the one after, the fetch interval (`CHANNEL_EPOCH_FETCH_SECS`) being a
-minute too. A room with nothing to look up is stamped like one looked up.
+minute too. A room with nothing to look up is stamped like one looked up. The
+window runs back from the newer of the announced epoch and the newest held,
+as the retention keeps it, and a fetched key the retention drops on arrival
+counts as nothing found. An older epoch a lookup did not find is passed over
+for six hours (`CHANNEL_EPOCH_MISS_RETRY_SECS`) when every walk of the lookup
+finished, enough peers answered one for finding nothing to mean the record is
+not there (`MIN_RESPONDERS_FOR_ABSENCE`, four, as recovery reads absence), and
+the epoch was already older than the one the room announced when the lookup
+began (`EpochLookupEnd::miss_counts`), and not while chat is locked. The announced one never is, nor is anything
+after a lookup nobody answered. Otherwise a member who joined after a
+rotation, to whom the epoch before it was never sealed, would ask for it
+every minute for as long as it stayed in the window.
+
+**Owners renew the retained epochs too.** The owner pass renews the current
+epoch's records when the epoch has moved or six hours have passed since it
+last got them all out, and about once a week (`RETAINED_EPOCH_RENEW_SECS`) each
+older epoch the room still keeps is renewed as well, sealed the same way to
+every unbanned member on the roster (`maybe_renew_retained_channel_epochs`).
+When each epoch's records last all went out is kept in the database
+(`channel_epoch_renewals`), the current epoch's included, so the week holds
+across restarts and an epoch's first week as an older one counts from its
+last renewal as the current one. One older epoch at a time across all the
+rooms the device owns, the longest unrenewed first: its records are sealed
+together, members in an order drawn afresh (`seal_epoch_records`, as an
+owner's own ban seals them too), and started as the publish table has room
+beside a margin of 16 slots, since a large room's epoch can hold more records
+than the table and starting them all at once would push out the next room's
+snapshot. Each batch leaves out members banned since the records were
+sealed, and a room deleted or handed over meanwhile is dropped. The epoch
+counts as renewed once every record has started; a batch held up for longer
+than a republish interval is sealed again. A key-epoch record lives 30 days from
+its last renewal, so without this an older epoch would lapse a month after
+it was superseded, and one minted before a member joined would never be
+sealed to them. Either way the member could not read what a peer still on
+that epoch re-served, or an attachment sealed under it. Sealing an older
+epoch to a member who joined after it, or to one unbanned since it was
+minted while they were banned, gives them nothing a catch-up would not:
+replies are sealed under the responder's current key.
 
 ### Storer rules on 1.7.5
 
@@ -1278,23 +1385,23 @@ record's extra and finds it filed elsewhere. Like kinds 7 and 8, v2 lives on
 
 ### The transition, and the cut-over in 1.8.0
 
-**Publishing.** This build publishes both forms
-(`SignedRecord::channel_presence_forms`, `channel_key_epoch_forms`), stamped
-alike. A private presence record goes out as v2 and v1, under the same
-presence key; the two never share a store slot (publisher and `file_hash`
-both differ), so neither replaces the other. A republish or a leave counts as
-landed when either form stored (`any_publish_stored`), since a reader takes
-either. A key-epoch record always goes out as v2 (every rotated epoch is at
-least 1), and as v1 as `epoch_record_publishes_v1` says. Rotation, the
-owner's renewal of the current epoch (`republish_channel_key_epoch`, whose
-key read, DH and seals run on the blocking pool,
-`seal_current_epoch_records`) and an unban's re-seal
-(`reseal_current_epoch_to_member`) publish the same forms.
+**Publishing.** From 1.7.5 to 1.7.8 builds published both forms, stamped
+alike; what 1.8.0 still publishes is below. A private presence record went
+out as v2 and v1, under the same presence key; the two never share a store
+slot (publisher and `file_hash` both differ), so neither replaces the other.
+A republish or a leave counts as landed when any form it sent stored
+(`any_publish_stored`), since a reader takes either. A key-epoch record
+always goes out as v2 (every rotated epoch is at least 1), and from 1.7.5 to
+1.7.8 went out as v1 too. `SignedRecord::channel_presence_forms` and `channel_key_epoch_forms`
+build the forms; rotation, the owner's renewal
+(`republish_channel_key_epoch`, whose key read, DH and seals run on the
+blocking pool, `seal_epoch_records`) and an unban's re-seal
+(`reseal_current_epoch_to_member`) publish the same ones.
 
-**What the transition gives away.** A key-epoch record's v2 and v1 copies go
-out together, stamped the same second and carrying the same envelope, and the
-v1 copy names the member. A storer that holds both links the v2 copy's
-`member_id` to that member, so until 1.8.0 one member's key records can be
+**What the transition gives away.** A key-epoch record's v2 and v1 copies
+went out together, stamped the same second and carrying the same envelope,
+and the v1 copy named the member. A storer that holds both links the v2 copy's
+`member_id` to that member, so until 1.8.0 one member's key records could be
 linked across rotations after all, and each v1 copy's key stays testable from
 public values (above). The v2 ids are per epoch, so this needs no cut-over
 rotation of its own: the first epoch minted after v1 stops has ids nothing
@@ -1310,9 +1417,9 @@ two lookups are held until both end and read together
 signed the same second.
 
 **1.8.0 stops publishing v1,** the same release that stops sending the old
-chat frames (item 2), so a room has one cut-over to test. The switch is one
-constant, `PUBLISH_V1_MEMBERSHIP_RECORDS`. The owner's own key-epoch copy
-stays v1 past it (`epoch_record_publishes_v1`): kind 3 already names the
+chat frames (item 2), so a room has one cut-over. A private room's presence
+record goes out as v2 alone, and a public room's as v1 alone, as before. The
+owner's own key-epoch copy stays v1 as well as v2: kind 3 already names the
 owner, so v1 hides nothing there, and it is the form a device restored from a
 backup reads its keys back from (`catch_up_own_epochs`). 1.8.0 still reads
 v1, which is what members on 1.7.4 publish; stopping that, and with it
@@ -1326,11 +1433,166 @@ and `R` change only when the join secret does, so without a rotation the v2
 records after the cut-over would carry ids the transition already linked.
 Owners therefore rotate each private room they own once when they stop
 publishing v1, and the v2 ids after it are unlinkable to the transition's
-(as far as the records go; see below). `V1_CUT_OVER_ROTATES` stands next to
-the switch, and this build refuses to compile with v1 turned off until that
-rotation is built. Key-epoch records do not need it, since their ids change
-with every epoch, but the same rotation is what gives them their first epoch
-past the transition.
+(as far as the records go; see below). The first time 1.8.0 runs, every
+private room the identity owns is marked as owed a rotation
+(`take_channel_cut_over_rotations`, recorded in `channel_cut_overs` under
+`V1_CUT_OVER` so it is done once), and the owner
+loop makes it with the snapshot naming the new epoch, as it makes the one a
+moderator's ban is owed, once the routing table has heard from enough
+contacts (`MIN_STORE_NODES`) to store that snapshot: members learn the epoch
+from nothing else, and the next regular republish is hours away. An owner's
+snapshot that no storer took, one announcing a rotation included, goes out
+again five minutes later (`note_owner_snapshot_finished`). A room created later
+never had a v1 record, one taken over is owed its rotation by the takeover,
+and one recovered onto the device after the cut-over was taken is marked by
+the recovery (`adopt_recovered_owned_channel`), since the device it came from
+published its v1 records. Key-epoch records do not need it, since their ids
+change with every epoch, but the same rotation is what gives them their first
+epoch past the transition.
+
+**Rooms with members still on 1.7.x rotate once more.** A member still on
+1.7.5 to 1.7.8 when the owner rotates takes the new key and goes on
+publishing v1 and v2 presence side by side under it, so storers link that
+member's new ids at once, and they stay linked after the member updates. The
+owner reads those copies in its own presence walks: a v1 copy opened under
+the current key from a key on the roster (`merge_channel_presence_blobs`'s
+third set) is noted with the epoch it was seen in (`note_channel_v1_walk`, in
+`channel_v1_sightings`), counted only once the cut-over's rotation is made
+and only in the room's current epoch. Each walk after that which finds
+records but no such copy adds the time since the previous walk to a quiet
+span, at most `PRESENCE_FRESH_SECS` (20 minutes, what one walk speaks for),
+and a sighting starts the span over. A walk that found nothing at all counts
+for nothing; one only this node's own store answered still counts, for at
+most the 45 minutes a presence record lives there, which is nothing against
+a week. So time the walks did not watch counts for little, and an owner who
+was offline, or not in its own room (which it then does not walk), does not
+take the silence for an update. A rotation in between, a ban's say, carries
+the sightings into its epoch with the span started over and the first
+sighting kept: a member seen on 1.7.x took that key too, and may have
+published v1 under it before updating. Once the span reaches a week
+(`V1_RELINK_QUIET_SECS`), or 30 days after the first sighting
+(`V1_RELINK_GRACE_SECS`) if they keep coming, or if the owner has since
+stopped walking the room, the room is owed a second rotation
+(`take_channel_relink_rotation`), recorded in
+`channel_relink_rotations` so it is made once. That unlinks everyone who
+updated meanwhile. A member away longer than the quiet week and still on
+1.7.x, or one who never updates, is linked again by this rotation as by any
+other. A room never seen with such a copy is owed nothing, the first
+rotation having been enough. Both tables are per database: a second device
+owning the room keeps its own, and may make the second rotation once more
+itself, which costs only that rotation. A device that downgrades to 1.7.x
+and comes back is not rotated again for the cut-over, which is recorded.
+
+**Two devices owning a room.** An identity can own a room on two devices, and
+each makes the room's rotations on its own. Every owner rotation, the owner
+pass's and an owner's own ban alike, mints the key the room's seed derives for
+the new epoch (`derive_owned_epoch_secret`) rather than drawing one, so two
+devices rotating from the same epoch mint the same key instead of splitting
+the room between two. The same epoch therefore always gets the same key, which
+sets three rules:
+
+- A rotation starts past the newest epoch the room has announced
+  (`key_epoch_wanted`), not just the newest held here
+  (`next_rotation_epoch`, and the owner pass likewise): the other device's key
+  for an epoch it already sealed must not be minted again under a ban it did
+  not make. A device learns of such an epoch from every copy of the snapshot
+  a lookup brings back, those it does not apply included
+  (`note_owned_snapshot_seen`). A device behind the room's announcement looks
+  up its own copy of the newer key as a member would
+  (`channel_epoch_lookup`), whether or not it is in the room (never for a
+  room deleted here), and then the epochs in between, which the other device
+  sealed to this identity too; the newest key fetched so brings its next
+  owner pass forward, which re-seals it to the members this device knows. Until
+  then it sends, and re-seals, under the newest epoch it holds, which members
+  still read. An owner not behind checks for such a gap every six hours.
+  Meanwhile its snapshots announce the room's newest epoch, not the one it
+  holds, so a member whose newest snapshot is this device's is not told to
+  stop at an older epoch. One whose lookups, each answered by enough peers,
+  have gone on finding nothing for twelve hours (`OWNER_BEHIND_ROTATE_SECS`,
+  counted in the
+  database across restarts, each gap between lookups adding ten minutes at
+  most, so time offline counts for little) rotates past the epoch it never
+  found (`note_owner_epoch_missed`): the other device announced it and left
+  before its records were stored, and the members told of it cannot read or
+  send until a newer key reaches them.
+- A rotation claims its epoch: it mints only if neither that epoch nor a later
+  one is held or has been announced (`mint_channel_key_epoch`), the check and
+  the mint in one transaction. An owner's ban that loses that race is refused
+  with `channels_owner_reading` and can be made again on the room as it now
+  is: whichever rotation took the epoch sealed it before this ban was
+  committed, so the member being banned has that key too. A pass that loses
+  it, or cannot announce a rotation yet, tries again a few minutes on
+  (`OWNER_SNAPSHOT_RETRY_SECS`) rather than at its next republish; a pass
+  brought forward so re-seals the current epoch only when it has moved or its
+  six hours are up.
+- A key taken back, by a rotation whose snapshot did not commit, must not
+  have gone out, since the next rotation from that epoch mints it again.
+
+A device that takes in the other's newer snapshot (`ingest_channel_moderation`)
+banning someone it had not banned, while it already holds the epoch the
+snapshot names or a later one, may have sealed that key to them before it
+knew: it owes the room a rotation past it (`owe_rotation_for_unseen_bans_locked`),
+made on its next owner pass, which is brought forward. So does a copy it does
+not take that names the epoch this device is on, while that is the newest the
+room has announced, and leaves out someone this device's own snapshots ban
+(the newest the record carries, never the owner's key) who was banned before
+that copy was signed: whoever signed it did not know of the ban and may have
+sealed this very key to them, as when both devices ban someone in the same
+minute and the room keeps one of the two snapshots
+(`note_owned_snapshot_not_taken_locked`). This device's own snapshots carry
+every such ban, so they owe nothing. The name the other
+device renamed the room to is taken with the snapshot (`apply_own_room_name`),
+unless this device renamed the room since that snapshot was signed; otherwise
+this device's next republish and registry renewal would name the room back.
+The once-a-day rule stays the registry's, which refuses a rename too soon
+after the other device's. Two snapshots the
+devices signed in the same second are settled as members settle them, by
+signature: each device keeps the signature of its newest
+(`note_owner_snapshot_signed`) and takes the other's only if it orders after
+(`owner_takes_fetched_locked`), so neither republishes over the one the room
+kept.
+
+And because a snapshot is a whole state whose newer stamp wins, an edit
+signed from what a device held before the other device's edit undoes that
+edit everywhere. A look counts when it found the snapshot on another node,
+not just in this one's own store, or when enough peers answered it for
+finding nothing to mean something (`moderation_look_answered`). A routine republish signs only after such a
+look, begun within the last 30 seconds or since the republish first asked,
+and written to the database (`owner_republish_read_gate`); that leaves about
+a minute between the look and the signature. Waiting two minutes for one in
+vain, it puts itself off five minutes rather than sign, since a stamp taken
+from a stale view would outrank every snapshot the other device signed
+meanwhile, which this one would then refuse and undo; only once it has been
+putting itself off for a republish interval (`OWNER_REPUBLISH_DEFER_MAX_SECS`,
+six hours, each gap between tries counting ten minutes at most, so a sleep
+does not count) does it sign regardless, so the room's renewal, and its
+registry name with it, cannot hang on a network that answers nobody. Every
+other commit of an owner snapshot, the UI's edits among them, waits for such
+a look written within the last ten minutes (`owner_edit_waits_for_first_read`,
+`OWNER_EDIT_READ_FRESH_SECS`), and is refused with `channels_owner_reading`
+until then; one that finds a snapshot already fetched and still being written
+waits the moments that takes instead (`wait_for_unwritten_read`). The refusal asks the moderation poll to look the room up at once,
+whether or not the device is in it. Two minutes after the first edit refused
+(`OWNER_EDIT_READ_WAIT_SECS`) edits go ahead regardless for ten minutes, and
+the wait starts over after that, so an unreachable network, or Ember's
+network being off, cannot keep the owner from editing, and a device woken
+from a sleep still reads first. A recovered room's re-key, which has no one
+to ask to try again, waits for the read itself (`wait_for_owner_read`), as
+does a rename once the registry has granted the name, so the name it now
+holds is not left without its snapshot. A
+room created on the device, or taken over by its claim, counts as just read.
+In a room the device is in, the regular lookup every five minutes
+(`MODERATION_FETCH_SECS`) keeps the view fresh, so edits there are not held
+back once it has been read. An edit on each device within those few minutes
+still has the later one win, as two people editing one document would.
+
+**What it costs a member still on 1.7.4 or older.** They read neither the v2
+chat frames nor the v2 key records. Lines from members on 1.8.0 are lost to
+them from the cut-over on: 1.7.2 to 1.7.4 count each one as needing a newer
+Ember, and older builds drop them silently. From the rotation on they cannot
+follow the key, so they read nothing more, and nothing tells them so, since
+their lookup for the new epoch finds no record. Updating lets them back in on
+the current key.
 
 ### What storers still learn
 
@@ -1345,7 +1607,7 @@ pseudonym, room-blind key and blinded member id that member uses. It still
 cannot tell from the records which room those belong to. Sending membership
 STOREs and lookups under a throwaway DHT identity, ideally through a relay,
 would close this; it is transport behaviour, not a record format, and is
-planned in [post-1.7.5 item 1](post-1.7.5.md#1-private-room-membership-traffic-under-a-throwaway-dht-identity).
+planned in [post-1.7.5 item 1](archived-plans/post-1.7.5.md#1-private-room-membership-traffic-under-a-throwaway-dht-identity).
 
 ## Feed heads (record type 0x04)
 
@@ -1353,7 +1615,7 @@ Not a room format, but a DHT record with the same header and trailer framing
 as channel records (`network/ember/feed.rs`, `SignedRecord::feed_head_record`).
 A feed is a signed, updatable list of files under a publisher's identity; the
 head points at the current list, which is an ordinary collection file
-fetched like any download. Design: [post-1.7.5 item 3](post-1.7.5.md#3-follow-a-publisher-feeds).
+fetched like any download. Design: [post-1.7.5 item 3](archived-plans/post-1.7.5.md#3-follow-a-publisher-feeds).
 
 **Privacy.** A feed is public to whoever has its link, and to nobody else
 unless it is listed (below). The 16-byte salt only the link holds is never
@@ -1932,9 +2194,9 @@ reads (see kind 2 above).
   line id, the legacy text being the v2 text without emoji joiners at the same
   signed time, first to arrive standing and the second not relayed when they
   disagree, one rate charge for both forms), and the transition: both forms
-  sent, the v2 frame under an
-  envelope id of its own and without `EXT_FLAG_DISPLAY`, until 1.8.0, which
-  stops sending 15 and 19 and sets the flag.
+  sent from 1.7.5 to 1.7.8, the v2 frame under an envelope id of its own and
+  without `EXT_FLAG_DISPLAY`, then from 1.8.0 the v2 frames alone, a line's
+  under its own id, with the flag set.
 - The gossip header and relay envelope layouts at their current versions, the
   rule that every later version keeps byte 0 as the version and bytes 1..17 as
   the channel id, and the rule that an unknown version is never relayed, so a
@@ -1960,10 +2222,13 @@ reads (see kind 2 above).
   and the v2 epoch
   key from the channel id, member id and epoch, which storers recompute;
   `CHANNEL_FLAG_BLINDED` (`0x04`) on kind 5; both storer rules; and the
-  transition: both forms published until 1.8.0, which stops publishing v1
-  except the owner's own key copy and rotates every private room once.
+  transition: both forms published from 1.7.5 to 1.7.8, then from 1.8.0 v2
+  alone but for the owner's own key copy, each owned private room rotated
+  once at the cut-over, and once more where a member's v1 copies were seen
+  after it, once a week of the owner's walks sees none or 30 days after the
+  first.
   Sending membership traffic under a throwaway DHT identity is not part of
-  the format and can come later (`docs/post-1.7.5.md` item 1).
+  the format and can come later (`docs/archived-plans/post-1.7.5.md` item 1).
 - A member's languages in their presence record: the first in byte 67 of a
   public room's record and the nickname pad's last byte in a private room's
   seal, and, from 1.7.6, the second in byte 68 and the pad byte before the
@@ -1984,12 +2249,13 @@ reads (see kind 2 above).
 
 **Nothing is left open.** Every question the post-1.7.4 plan listed for the
 freeze was decided in 1.7.5; the decisions are above and in
-[post-1.7.4.md](post-1.7.4.md#channels-the-format-freeze). What changes next is
-already scheduled: **1.8.0** stops sending chat frames 15 and 19 (and sets
-`EXT_FLAG_DISPLAY` on kinds 64 and 65), and stops publishing v1 private
-membership records, rotating every private room once as it does, so a room
-has one cut-over to test. It also adds a marker that says a catch-up reply
-was relayed, so such a reply moves the asker's catch-up frontier; today a
-relayed reply cannot be told from the hop's own TTL-1 line, and the range is
-asked for again (see
-[post-1.7.5.md](post-1.7.5.md#already-scheduled-for-180)).
+[post-1.7.4.md](archived-plans/post-1.7.4.md#channels-the-format-freeze). The
+one change scheduled since was made in **1.8.0**: it stops sending chat
+frames 15 and 19 (and sets `EXT_FLAG_DISPLAY` on kinds 64 and 65), and stops
+publishing v1 private membership records, rotating every private room once
+as it does, so a room has one cut-over. Nothing in the formats changed for
+it. A catch-up reply that reaches the asker through another member's relay
+still moves no catch-up frontier, so the range is asked for again: marking
+such replies would need a relay envelope version sent beside v1 for as long
+as any build in the room reads only v1, and it costs bandwidth, never a line
+(see [future-plan.md](future-plan.md#considered-and-dropped)).

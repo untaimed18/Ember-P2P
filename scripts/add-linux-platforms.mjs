@@ -10,11 +10,22 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
  *
  * `tauri-plugin-updater` asks for `{os}-{arch}-{installer}` first and only then
  * falls back to a bare `{os}-{arch}`, where `{installer}` comes from a marker
- * the bundler writes into the binary of each package it produces. So a `.deb`
- * install asks for `linux-x86_64-deb` and hands the answer to `dpkg -i`, and an
- * AppImage asks for `linux-x86_64-appimage` and rewrites itself in place. Two
- * keys, two artifacts, and each install updates with the format it was
- * installed from.
+ * the bundler writes into the binary of each package it produces. Ember picks
+ * the entry first (`choose_glibc_target` in `commands/updater.rs`): an install
+ * takes `linux-x86_64-{installer}-glibc` when its system has the glibc that
+ * entry's `min_glibc` states, and the plain `linux-x86_64-{installer}`
+ * otherwise. An AppImage does so from 1.7.7 and rewrites itself in place; a
+ * `.deb` does so from 1.8.0, asks for `linux-x86_64-deb` before that, and
+ * hands the answer to `dpkg -i`. Two keys, two artifacts, and each install
+ * updates with the format it was installed from.
+ *
+ * The AppImage is published under the gated key alone. It is built on a newer
+ * distro than releases through 1.7.8 were, so it needs a newer glibc, and an
+ * AppImage replaces itself in place: a plain `linux-x86_64-appimage`, which
+ * releases before 1.7.7 read and check no glibc against, would hand an install
+ * on an older system a build that cannot start, and one it cannot update its
+ * way out of. Those releases are offered nothing instead, and a later one on
+ * such a system says the update needs a newer glibc.
  *
  * The bare `linux-x86_64` key that `tauri-action` would also have written is
  * deliberately absent. It is a fallback for installs whose format we cannot
@@ -25,9 +36,17 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
  * update" — the truth, for an install shape Ember does not publish for.
  */
 const LINUX_TARGETS = [
-  { target: "linux-x86_64-appimage", extension: ".appimage" },
-  { target: "linux-x86_64-deb", extension: ".deb" },
+  { target: "linux-x86_64-appimage-glibc", extension: ".appimage", glibcGated: true },
+  { target: "linux-x86_64-deb", extension: ".deb", glibcGated: false },
 ];
+
+/**
+ * A glibc release as the updater reads `min_glibc` (`parse_glibc` in
+ * `commands/updater.rs`). It refuses the whole signed manifest when a gated
+ * entry's is missing or malformed, which would stop every install's update
+ * check, Windows included, so a bad value fails the release here instead.
+ */
+const GLIBC_RE = /^\d{1,4}\.\d{1,4}$/;
 
 /**
  * The release's asset directory, taken from a platform entry already in the
@@ -93,8 +112,16 @@ export function collectLinuxBundles({ directory }) {
     throw new Error(`Linux bundle directory ${directory} does not exist`);
   }
   const paths = walkFiles(directory);
+  // emberd's `.deb` in place of the desktop's would pass the count below and
+  // hand every desktop install a server, as an update.
+  const emberd = paths.find((path) => /^emberd[-_]/i.test(basename(path)));
+  if (emberd) {
+    throw new Error(
+      `${basename(emberd)} is emberd's, not the desktop app's, and emberd never goes in latest.json`,
+    );
+  }
 
-  return LINUX_TARGETS.map(({ target, extension }) => {
+  return LINUX_TARGETS.map(({ target, extension, glibcGated }) => {
     const matches = paths.filter((path) =>
       path.toLowerCase().endsWith(extension),
     );
@@ -112,7 +139,7 @@ export function collectLinuxBundles({ directory }) {
     if (signature === "") {
       throw new Error(`${name}.sig is empty`);
     }
-    return { target, name, signature };
+    return { target, name, signature, glibcGated };
   });
 }
 
@@ -121,17 +148,23 @@ export function collectLinuxBundles({ directory }) {
  * written the Windows ones into.
  *
  * Only `url` and `signature` are set, which is the whole of what the Windows
- * entries carry at this point. `target`, `sha256` and `size` are added afterwards by
- * `harden-update-manifest.mjs`, from the artifact bytes themselves, so that
- * every entry in the finished manifest is bound the same way no matter which
- * runner built it.
+ * entries carry at this point, and the AppImage's `min_glibc`: the glibc of the
+ * runner that built it, `appimageMinGlibc`. `target`, `sha256` and `size` are
+ * added afterwards by `harden-update-manifest.mjs`, from the artifact bytes
+ * themselves, so that every entry in the finished manifest is bound the same
+ * way no matter which runner built it.
  */
-export function addLinuxPlatforms({ manifest, bundles, assetBase }) {
+export function addLinuxPlatforms({ manifest, bundles, assetBase, appimageMinGlibc }) {
+  if (bundles.some(({ glibcGated }) => glibcGated) && !GLIBC_RE.test(appimageMinGlibc ?? "")) {
+    throw new Error(
+      `the AppImage's min_glibc must be a glibc release such as 2.39, got ${JSON.stringify(appimageMinGlibc)}`,
+    );
+  }
   // Every `linux-` entry is dropped first, so this rewrites rather than adds:
   // a manifest carrying a previous attempt's entries would otherwise pair that
   // run's signature with this run's bytes. Clearing the whole prefix also
-  // removes a bare `linux-x86_64` if anything ever writes one, which is the key
-  // this deliberately omits.
+  // removes a bare `linux-x86_64` or a plain `linux-x86_64-appimage` if
+  // anything ever writes one, the keys this deliberately omits.
   //
   // The base URL is read after the clear so it can only come from a Windows
   // entry composed during this run.
@@ -139,10 +172,11 @@ export function addLinuxPlatforms({ manifest, bundles, assetBase }) {
     if (target.startsWith("linux-")) delete manifest.platforms[target];
   }
   const base = assetBase ?? releaseAssetBase(manifest);
-  for (const { target, name, signature } of bundles) {
+  for (const { target, name, signature, glibcGated } of bundles) {
     manifest.platforms[target] = {
       url: `${base}/${encodeURIComponent(name)}`,
       signature,
+      ...(glibcGated ? { min_glibc: appimageMinGlibc } : {}),
     };
   }
   return manifest;
@@ -160,7 +194,11 @@ function main() {
 
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   const bundles = collectLinuxBundles({ directory: resolve(root, directory) });
-  addLinuxPlatforms({ manifest, bundles });
+  addLinuxPlatforms({
+    manifest,
+    bundles,
+    appimageMinGlibc: process.env.EMBER_APPIMAGE_MIN_GLIBC,
+  });
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
   console.log(

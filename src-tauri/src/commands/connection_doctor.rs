@@ -28,6 +28,10 @@ const SETTLING_SECS: u64 = 15 * 60;
 /// checking. Kad's check answers within minutes when it can; past this it has
 /// nothing more to say, and "checking" would otherwise last all session.
 const KAD_TCP_CHECK_SECS: u64 = 30 * 60;
+/// How long into a session an enabled IP filter with no list in place may
+/// still be loading one. Past this the load failed, and the filter, failing
+/// closed, blocks every peer until a list loads.
+const IP_FILTER_LOAD_SECS: u64 = 60;
 
 /// The one-line answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -122,6 +126,9 @@ pub struct Signals {
     pub upnp_enabled: bool,
     pub upnp_mapped: bool,
     pub upnp_stood_down: bool,
+    /// Every connection is kept on one chosen network interface, so UPnP
+    /// does not run and the router cannot be asked to forward.
+    pub bound_interface: bool,
     /// Internet traffic leaves through a VPN's adapter, which the router's
     /// UPnP cannot open ports on; the VPN's own port forwarding is what can.
     pub behind_vpn: bool,
@@ -151,6 +158,11 @@ pub struct Signals {
     /// Saved ports or UPnP differ from what this session runs on, so a fix
     /// for them only takes effect at a restart.
     pub restart_pending: bool,
+    /// The network said how the IP filter stands: whether it is on, and
+    /// whether its list is in place. Unknown, the filter has no check.
+    pub ip_filter_known: bool,
+    pub ip_filter_enabled: bool,
+    pub ip_filter_ready: bool,
 }
 
 impl Signals {
@@ -184,6 +196,15 @@ impl Signals {
     fn online(&self) -> bool {
         self.kad_connected || self.server_connected || self.dht_contacts > 0
     }
+
+    /// The filter is on with no list, past the time a load takes: it is
+    /// blocking every peer.
+    fn ip_filter_blocking_all(&self) -> bool {
+        self.ip_filter_known
+            && self.ip_filter_enabled
+            && !self.ip_filter_ready
+            && self.session_secs >= IP_FILTER_LOAD_SECS
+    }
 }
 
 /// The verdict, the checks and the ranked fixes, from `s`. Pure, so every
@@ -214,13 +235,26 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
         if s.tcp_listen_failed { Fail } else if s.udp_port_moved { Warn } else { Pass },
         if s.tcp_listen_failed { "tcp_taken" } else if s.udp_port_moved { "udp_moved" } else { "ok" },
     );
+    if s.ip_filter_known {
+        if !s.ip_filter_enabled {
+            check("ip_filter", Skip, "off");
+        } else if s.ip_filter_ready {
+            check("ip_filter", Pass, "ok");
+        } else if s.ip_filter_blocking_all() {
+            check("ip_filter", Fail, "blocking_all");
+        } else {
+            check("ip_filter", Skip, "loading");
+        }
+    }
     match s.firewall_rules {
         Some(true) => check("windows_firewall", Pass, "ok"),
         Some(false) => check("windows_firewall", Fail, "missing"),
         None if s.firewall_check_failed => check("windows_firewall", Skip, "check_failed"),
         None => check("windows_firewall", Skip, "not_windows"),
     }
-    if !s.upnp_enabled {
+    if s.bound_interface {
+        check("upnp", Skip, "bound_interface");
+    } else if !s.upnp_enabled {
         check("upnp", Skip, "off");
     } else if s.upnp_stood_down {
         check("upnp", Warn, "stood_down");
@@ -311,6 +345,10 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     // another NAT for certain, whatever the verdict and whatever is saved, so
     // that is said wherever peers do not already reach us.
     let mut fixes = Vec::new();
+    // Ahead of everything: while it lasts, no other fix can show.
+    if s.ip_filter_blocking_all() {
+        fixes.push(Fix { id: "ip_filter", action: Some("download_ip_filter") });
+    }
     if s.restart_pending {
         fixes.push(Fix { id: "restart", action: None });
     }
@@ -326,7 +364,9 @@ pub fn assess(s: &Signals) -> (Verdict, Vec<Check>, Vec<&'static str>, Vec<Fix>)
     } else if unreachable && settled && !s.restart_pending {
         // A forward the router did make still counts behind a VPN: a client
         // that tunnels only some programs can leave Ember outside it.
-        if s.upnp_stood_down || (s.behind_vpn && !s.upnp_mapped) {
+        if s.bound_interface {
+            fixes.push(Fix { id: "bound_interface", action: None });
+        } else if s.upnp_stood_down || (s.behind_vpn && !s.upnp_mapped) {
             fixes.push(Fix { id: "vpn", action: None });
         } else if !s.upnp_enabled {
             fixes.push(Fix { id: "enable_upnp", action: Some("enable_upnp") });
@@ -375,7 +415,7 @@ fn behind_another_nat(wan: Ipv4Addr) -> bool {
 /// This computer's address on the local network: the source address the OS
 /// would use to reach the internet. Nothing is sent.
 fn lan_ip() -> String {
-    std::net::UdpSocket::bind("0.0.0.0:0")
+    crate::net_bind::std_udp(0)
         .and_then(|socket| {
             socket.connect("192.0.2.1:9")?;
             socket.local_addr()
@@ -434,6 +474,26 @@ struct Gathered {
     probed: bool,
 }
 
+/// Whether the IP filter is on, and whether its list is in place; `None`
+/// when the network does not answer, so the check says nothing it cannot know.
+async fn ip_filter_state(state: &AppState) -> Option<(bool, bool)> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // In the order the ranges are kept, so the page asked for costs no sort.
+    state
+        .network_tx
+        .try_send(NetworkCommand::GetIpFilterStats {
+            query: String::new(),
+            sort: "range".to_string(),
+            sort_asc: true,
+            offset: 0,
+            limit: 1,
+            tx,
+        })
+        .ok()?;
+    let stats = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await.ok()?.ok()?;
+    Some((stats.enabled, stats.ranges_ready))
+}
+
 /// Read every signal, running the outside-in probe when `probe` is set.
 async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
     let stats = network_stats(state).await?;
@@ -458,6 +518,7 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         upnp_enabled,
         upnp_mapped: stats.upnp_mapped,
         upnp_stood_down: stats.upnp_stood_down,
+        bound_interface: stats.interface_bound,
         behind_vpn: crate::vpn::default_route_is_vpn().unwrap_or(false),
         router_behind_nat: wan.is_some_and(behind_another_nat),
         router_wan_known: wan.is_some(),
@@ -474,6 +535,9 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
         session_secs: stats.session_age_secs,
         ..Signals::default()
     };
+    if let Some((enabled, ready)) = ip_filter_state(state).await {
+        (signals.ip_filter_known, signals.ip_filter_enabled, signals.ip_filter_ready) = (true, enabled, ready);
+    }
 
     let mut probed = false;
     if probe {
@@ -513,8 +577,8 @@ async fn gather(state: &AppState, probe: bool) -> Result<Gathered, String> {
 }
 
 /// Run every check and say what they mean.
-#[tauri::command]
-pub async fn run_connection_check(state: tauri::State<'_, AppState>) -> Result<ConnectionReport, String> {
+#[ember_macros::command]
+pub async fn run_connection_check(state: crate::host::State<'_, AppState>) -> Result<ConnectionReport, String> {
     let mut gathered = gather(&state, true).await?;
     // The outside test reached the TCP port the server would test, so a LowID
     // is from before whatever opened it, and lasts until a login asks again.
@@ -538,10 +602,10 @@ pub async fn run_connection_check(state: tauri::State<'_, AppState>) -> Result<C
 
 /// Do one of the fixes a report offered. `move_ports` and `enable_upnp` are
 /// settings the page changes itself; these are the ones that need the backend.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn connection_doctor_action(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     action: String,
 ) -> Result<bool, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -567,7 +631,9 @@ pub async fn connection_doctor_action(
                 Err(e) => Err(e),
             }
         }
-        #[cfg(target_os = "windows")]
+        // Elevation needs a window to own its prompt, which only the
+        // desktop app has.
+        #[cfg(all(target_os = "windows", feature = "desktop"))]
         "add_firewall_rules" => {
             // The ports the check looked for: the ones this session listens on.
             let stats = network_stats(&state).await?;
@@ -594,7 +660,7 @@ pub async fn connection_doctor_action(
 /// Have the ports tested again once rules let peers in: Kad's firewall check
 /// answers within a minute, and an eD2K server that gave a LowID (`low_id`)
 /// only hands out another ID at a fresh login, so that one logs in again.
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "desktop"))]
 async fn retest_ports(state: &AppState, low_id: bool) {
     let (tx, _) = tokio::sync::oneshot::channel();
     let _ = state.network_tx.try_send(NetworkCommand::RecheckFirewall { tx });
@@ -681,8 +747,37 @@ mod tests {
             probe_udp: Some(true),
             session_secs: 20 * 60,
             clock_skew_secs: Some(2),
+            ip_filter_known: true,
+            ip_filter_enabled: true,
+            ip_filter_ready: true,
             ..Signals::default()
         }
+    }
+
+    /// An IP filter that is on with no list blocks every peer: once a load has
+    /// had its time, that is the first thing the doctor says and offers to
+    /// fix. Before then the list may still be loading, and with no answer
+    /// from the network the filter has no check at all.
+    #[test]
+    fn an_ip_filter_with_no_list_is_named_first() {
+        let blocking = Signals { ip_filter_ready: false, session_secs: IP_FILTER_LOAD_SECS, ..reachable() };
+        let (_, checks, _, fixes) = assess(&blocking);
+        assert!(checks.contains(&Check { id: "ip_filter", status: CheckStatus::Fail, detail: "blocking_all" }));
+        assert_eq!(fixes[0], Fix { id: "ip_filter", action: Some("download_ip_filter") });
+
+        let loading = Signals { session_secs: IP_FILTER_LOAD_SECS - 1, ..blocking.clone() };
+        assert!(!fix_ids(&loading).contains(&"ip_filter"));
+        assert!(assess(&loading).1.contains(&Check { id: "ip_filter", status: CheckStatus::Skip, detail: "loading" }));
+
+        let off = Signals { ip_filter_enabled: false, ..reachable() };
+        for (fine, detail) in [(reachable(), "ok"), (off, "off")] {
+            assert!(!fix_ids(&fine).contains(&"ip_filter"));
+            assert!(assess(&fine).1.iter().any(|c| c.id == "ip_filter" && c.detail == detail));
+        }
+
+        let unknown = Signals { ip_filter_known: false, ..blocking };
+        assert!(!fix_ids(&unknown).contains(&"ip_filter"));
+        assert!(!assess(&unknown).1.iter().any(|c| c.id == "ip_filter"), "no answer is no check");
     }
 
     fn fix_ids(s: &Signals) -> Vec<&'static str> {
@@ -738,6 +833,26 @@ mod tests {
         assert_eq!(fix_ids(&cgnat), vec!["carrier_nat"]);
         let vpn = Signals { upnp_stood_down: true, ..closed };
         assert_eq!(fix_ids(&vpn), vec!["vpn"]);
+    }
+
+    /// On a chosen interface UPnP never runs, whatever Settings says, so
+    /// neither turning it on nor asking the router again is offered.
+    #[test]
+    fn on_a_chosen_interface_upnp_is_not_offered() {
+        let closed = Signals {
+            kad_tcp: Some(false),
+            low_id: Some(true),
+            probe_tcp: Some(TcpProbe::Timeout),
+            upnp_mapped: false,
+            bound_interface: true,
+            ..reachable()
+        };
+        let (_, checks, _, _) = assess(&closed);
+        let upnp = checks.iter().find(|c| c.id == "upnp").expect("a UPnP line");
+        assert_eq!((upnp.status, upnp.detail), (CheckStatus::Skip, "bound_interface"));
+        assert_eq!(fix_ids(&closed), vec!["bound_interface"]);
+        let upnp_off = Signals { upnp_enabled: false, ..closed };
+        assert_eq!(fix_ids(&upnp_off), vec!["bound_interface"]);
     }
 
     /// A LowID the outside test contradicts is from before the port opened:

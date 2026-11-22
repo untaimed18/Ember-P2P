@@ -1,6 +1,6 @@
 # After 1.7.2: planned for 1.7.3
 
-Everything here that 1.7.3 did not get to has moved to `docs/post-1.7.3.md`,
+Everything here that 1.7.3 did not get to has moved to `docs/archived-plans/post-1.7.3.md`,
 which is now the plan to work from. Of this list, 1.7.3 did only the sending
 half of "Offers that wait for the friend".
 
@@ -109,7 +109,7 @@ place, for whoever changes them next.
 ### 5. Test across real machines
 
 **To do:** add a Channels section to the release checklist
-(`docs/release-checklist-1.7.0.md` is the model), and run it on three or more
+(`docs/archived-plans/release-checklist-1.7.0.md` is the model), and run it on three or more
 machines, at least one behind a firewall that is not reachable:
 
 - Create public and private rooms, join from the other machines, chat, edit,

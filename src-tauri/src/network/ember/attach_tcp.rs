@@ -113,7 +113,7 @@ pub async fn dial_secure(
     our_ed25519_secret_key: [u8; 32],
     peer_hash: [u8; 16],
 ) -> anyhow::Result<SecureStreamParts> {
-    let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr))
+    let stream = tokio::time::timeout(TCP_CONNECT_TIMEOUT, crate::net_bind::tcp_connect(addr))
         .await
         .map_err(|_| anyhow::anyhow!("TCP connect timed out"))??;
     crate::network::ed2k::multi_source::tune_peer_stream(&stream);

@@ -11,7 +11,7 @@ use super::*;
 /// to reach it live: the sweep wrote `CHAT_FAILED` straight to SQLite, so an
 /// open conversation kept showing the message as "queued" until it was
 /// reloaded. Mirrors the `delivered` emit in `mark_chat_delivered`.
-pub(super) fn emit_chat_delivery_failed(app_handle: &tauri::AppHandle, expired: &[(i64, String)]) {
+pub(super) fn emit_chat_delivery_failed(app_handle: &crate::host::AppHandle, expired: &[(i64, String)]) {
     for (id, friend_hash) in expired {
         let _ = app_handle.emit(
             "ember:chat-delivery",
@@ -83,7 +83,7 @@ pub(super) fn receipt_excludes(state: &mut NetworkState, friend: &[u8; 16]) -> V
 pub(super) async fn flush_due_chat(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     settings: &AppSettings,
     ed25519_secret_key: &[u8; 32],
 ) {
@@ -136,7 +136,7 @@ pub(super) async fn flush_due_chat(
 /// Returns the ids it delivered.
 pub(super) async fn flush_pending_chat(
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     ember_sessions: &ed2k::upload::EmberSessionMap,
     ed25519_secret_key: &[u8; 32],
     friend: [u8; 16],
@@ -445,7 +445,7 @@ pub(super) const MAX_HELD_CHAT_EXPIRES_PER_FRIEND: usize = 32;
 pub(super) async fn apply_peer_chat_expire(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     friend: [u8; 16],
     target: crate::network::ember::crypto::ChatExpireTarget,
     ttl_secs: u32,
@@ -507,7 +507,7 @@ pub(super) fn take_held_chat_expire(
 }
 
 /// Tell an open conversation when these messages now disappear.
-pub(super) fn emit_chat_expiry(app_handle: &tauri::AppHandle, friend_hash: &str, items: &[(i64, i64)]) {
+pub(super) fn emit_chat_expiry(app_handle: &crate::host::AppHandle, friend_hash: &str, items: &[(i64, i64)]) {
     if items.is_empty() {
         return;
     }
@@ -525,7 +525,7 @@ pub(super) fn emit_chat_expiry(app_handle: &tauri::AppHandle, friend_hash: &str,
 
 /// Tell open conversations what just disappeared or was deleted.
 pub(super) fn emit_chat_removed(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     friend_hash: &str,
     ids: &[i64],
     xfer_ids: &[String],

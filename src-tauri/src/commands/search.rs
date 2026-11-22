@@ -1,4 +1,4 @@
-use tauri::Emitter;
+use crate::host::Emitter;
 use tokio::sync::oneshot;
 
 use crate::app_state::AppState;
@@ -455,7 +455,7 @@ pub struct RelatedSeedInput {
 /// `co_share_hashes` and feeds them straight back into [`search_files`], so a
 /// related search is an ordinary search and inherits streaming, dedup, spam
 /// scoring, filters and cancellation unchanged.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn plan_related_search(
     seeds: Vec<RelatedSeedInput>,
 ) -> Result<crate::search::related::RelatedPlan, String> {
@@ -472,24 +472,29 @@ pub async fn plan_related_search(
             MAX_RELATED_SEEDS,
         ));
     }
-    if seeds.iter().any(|s| {
-        s.name.as_deref().is_some_and(|n| n.len() > MAX_MARK_SPAM_FILENAME)
-            || s.artist.as_deref().is_some_and(|a| a.len() > MAX_SEARCH_FILTER_LEN)
-            || s.album.as_deref().is_some_and(|a| a.len() > MAX_SEARCH_FILTER_LEN)
-    }) {
+    if seeds
+        .iter()
+        .any(|s| s.name.as_deref().is_some_and(|n| n.len() > MAX_MARK_SPAM_FILENAME))
+    {
         return Err(coded(
             "search_related_seed_too_long",
             "Related-search seed metadata is too long",
         ));
     }
 
+    // A result's tags run far longer than a search term can be, and are
+    // only a hint: cut, a long album still names the album.
+    let tag = |tag: Option<String>| {
+        tag.map(|t| crate::commands::feeds::clip(&t, MAX_SEARCH_FILTER_LEN))
+            .filter(|t| !t.is_empty())
+    };
     let seeds: Vec<crate::search::related::SeedFile> = seeds
         .into_iter()
         .map(|s| crate::search::related::SeedFile {
             hash: s.hash.unwrap_or_default(),
             name: s.name.unwrap_or_default(),
-            artist: s.artist,
-            album: s.album,
+            artist: tag(s.artist),
+            album: tag(s.album),
         })
         .collect();
 
@@ -513,7 +518,7 @@ pub async fn plan_related_search(
 /// otherwise, which is what the UI uses this for. The flag mirror is updated on
 /// login, on every `OP_IDCHANGE` and on disconnect, so this is an atomic read
 /// rather than a round-trip to the network task.
-#[tauri::command]
+#[ember_macros::command]
 pub fn related_search_supported() -> bool {
     crate::network::ed2k::server::related_search_supported()
 }
@@ -526,11 +531,11 @@ pub fn related_search_supported() -> bool {
 /// that server advertises `SRV_TCPFLG_RELATEDSEARCH`, and is ignored otherwise
 /// — every other leg always runs `query`. `exclude_hashes` withholds the seed
 /// files from the results, since a file is not related to itself.
-#[tauri::command]
+#[ember_macros::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn search_files(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     query: String,
     method: Option<SearchMethod>,
     request_id: u64,
@@ -629,8 +634,8 @@ pub async fn search_files(
     let client_max_size = max_size;
     let client_file_extension = file_extension.clone();
     let client_min_availability = min_availability;
-    // eMule: Program search clears the local type filter; Archive/CD-Image keep
-    // theirs so Pro-wire replies can be narrowed client-side.
+    // Archive/CD-Image keep their type so Pro-wire replies can be narrowed
+    // client-side; Program keeps it for the rows no server or KAD node filtered.
     let file_type_filter =
         crate::search::merge::client_search_file_type_filter(ui_file_type.as_deref());
 
@@ -812,9 +817,9 @@ pub async fn search_files(
     Ok(results)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn find_notes(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_size: u64,
 ) -> Result<Vec<SearchResult>, String> {
@@ -836,12 +841,13 @@ pub async fn find_notes(
         })
         .map_err(|e| coded_ctx("network_busy", "Network busy", e))?;
 
-    let timeout_secs = {
+    // A notes search runs as long as a keyword search, whatever the setting.
+    let timeout_secs = search_reply_wait_secs({
         let c = state.config.read().await;
         c.settings
             .search_timeout_secs
             .clamp(SEARCH_TIMEOUT_MIN, SEARCH_TIMEOUT_MAX)
-    };
+    });
     let mut results =
         match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
             Ok(Ok(Ok(results))) => results,
@@ -908,9 +914,9 @@ pub async fn find_notes(
 /// send it. The sources themselves arrive on each network's own schedule and go
 /// straight into the transfer, so there is nothing to wait for here and no
 /// timeout worth imposing beyond the network task picking the command up.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn find_sources(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
     file_hash: String,
     file_size: u64,
@@ -943,10 +949,10 @@ pub async fn find_sources(
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn publish_note(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_name: Option<String>,
     file_size: Option<u64>,
@@ -979,6 +985,7 @@ pub async fn publish_note(
             "Add a rating or a comment before publishing",
         ));
     }
+    let comment = crate::network::clip_note_comment(&comment).to_string();
     let kad_hash = md4_bytes_to_kad_id(&parse_exact_file_hash(&file_hash)?);
     let (tx, rx) = oneshot::channel();
 
@@ -1019,9 +1026,9 @@ pub async fn publish_note(
 /// `request_id`, and `search-complete` fires for it again when they are in.
 /// `started` is false when there is nothing left to ask, or the search is no
 /// longer the latest one.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn search_more(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     request_id: u64,
 ) -> Result<crate::network::SearchMoreOutcome, String> {
     let (tx, rx) = oneshot::channel();
@@ -1029,9 +1036,9 @@ pub async fn search_more(
     await_reply(rx, "search_more_failed", "Could not search for more results").await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cancel_search(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     request_id: u64,
 ) -> Result<(), String> {
     // `bounded_send`, not `try_send`. A cancel that never reaches the network
@@ -1045,8 +1052,30 @@ pub async fn cancel_search(
     bounded_send(&state.network_tx, NetworkCommand::CancelSearch { request_id }).await
 }
 
-#[tauri::command]
-pub fn format_ed2k_link(
+/// The mirrors kept with each of `file_hashes` (`library_web_mirrors_for`),
+/// for copied links to carry, unless Settings leave them out. A failed read
+/// costs the links their mirrors, never the copy.
+async fn kept_mirrors(
+    state: &AppState,
+    file_hashes: Vec<String>,
+) -> std::collections::HashMap<String, Vec<String>> {
+    if !state.config.read().await.settings.copied_links_carry_mirrors {
+        return std::collections::HashMap::new();
+    }
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || db.library_web_mirrors_for(&file_hashes)).await {
+        Ok(Ok(mirrors)) => mirrors,
+        Ok(Err(e)) => {
+            tracing::debug!("Could not read the mirrors kept for copied links: {e}");
+            std::collections::HashMap::new()
+        }
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+#[ember_macros::command]
+pub async fn format_ed2k_link(
+    state: crate::host::State<'_, AppState>,
     name: String,
     size: u64,
     file_hash: String,
@@ -1068,12 +1097,14 @@ pub fn format_ed2k_link(
         let t = h.trim();
         (t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
     });
-    Ok(hash::format_ed2k_link_ext(
+    let mirrors = kept_mirrors(&state, vec![file_hash.clone()]).await;
+    Ok(hash::format_ed2k_link_with_mirrors(
         &name,
         size,
         &file_hash,
         None,
         ember,
+        mirrors.get(&file_hash.to_ascii_lowercase()).map_or(&[][..], Vec::as_slice),
         &[],
     ))
 }
@@ -1094,8 +1125,11 @@ pub struct Ed2kLinkFileInput {
 const MAX_ED2K_LINK_BATCH: usize = 50_000;
 
 /// Format many standard eD2K links in one IPC round-trip (newline-separated).
-#[tauri::command]
-pub fn format_ed2k_links(files: Vec<Ed2kLinkFileInput>) -> Result<String, String> {
+#[ember_macros::command]
+pub async fn format_ed2k_links(
+    state: crate::host::State<'_, AppState>,
+    files: Vec<Ed2kLinkFileInput>,
+) -> Result<String, String> {
     if files.len() > MAX_ED2K_LINK_BATCH {
         return Err(coded_ctx(
             "search_ed2k_link_batch_too_large",
@@ -1103,6 +1137,7 @@ pub fn format_ed2k_links(files: Vec<Ed2kLinkFileInput>) -> Result<String, String
             MAX_ED2K_LINK_BATCH,
         ));
     }
+    let mirrors = kept_mirrors(&state, files.iter().map(|f| f.hash.clone()).collect()).await;
     let mut out = String::new();
     for (i, f) in files.into_iter().enumerate() {
         if f.name.is_empty() || f.name.len() > 4096 {
@@ -1124,12 +1159,13 @@ pub fn format_ed2k_links(files: Vec<Ed2kLinkFileInput>) -> Result<String, String
             let t = h.trim();
             (t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit())).then_some(t)
         });
-        out.push_str(&hash::format_ed2k_link_ext(
+        out.push_str(&hash::format_ed2k_link_with_mirrors(
             &f.name,
             f.size,
             &f.hash,
             None,
             ember,
+            mirrors.get(&f.hash.to_ascii_lowercase()).map_or(&[][..], Vec::as_slice),
             &[],
         ));
     }
@@ -1166,7 +1202,7 @@ fn link_web_sources(link: &str) -> Vec<String> {
     out
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub fn parse_ed2k_link(link: String) -> Result<Ed2kLinkInfo, String> {
     if link.len() > MAX_ED2K_LINK_LEN {
         return Err(coded_ctx(
@@ -1220,7 +1256,7 @@ pub struct Ed2kLinkBatch {
 /// as unrecognised `|`-segments that the tag loop skips in silence. A user who
 /// pasted ten links got one download and a success toast. Reporting the invalid
 /// and skipped counts here is what lets the caller say so out loud.
-#[tauri::command]
+#[ember_macros::command]
 pub fn parse_ed2k_links(text: String) -> Result<Ed2kLinkBatch, String> {
     if text.len() > MAX_ED2K_PASTE_BYTES {
         return Err(coded_ctx(
@@ -1232,23 +1268,23 @@ pub fn parse_ed2k_links(text: String) -> Result<Ed2kLinkBatch, String> {
     let mut links = Vec::new();
     let mut invalid = 0usize;
     let mut skipped = 0usize;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    for link in text.lines().flat_map(links_on_line) {
+        let link = link.trim();
+        if link.is_empty() {
             continue;
         }
         if links.len() >= MAX_ED2K_PASTE_LINKS {
             skipped += 1;
             continue;
         }
-        match hash::parse_ed2k_link_strict(line) {
+        match hash::parse_ed2k_link_strict(link) {
             Ok((name, size, hash, aich, ember)) => links.push(Ed2kLinkInfo {
                 name,
                 size,
                 hash,
                 aich,
                 ember,
-                web_sources: link_web_sources(line),
+                web_sources: link_web_sources(link),
             }),
             Err(_) => invalid += 1,
         }
@@ -1260,15 +1296,34 @@ pub fn parse_ed2k_links(text: String) -> Result<Ed2kLinkBatch, String> {
     })
 }
 
+/// The links on one line of pasted text. eMule splits a paste at every space
+/// (`AddEd2kLinksToDownload`), but a name here may hold raw spaces, so a line
+/// is split only where whitespace is followed by another link.
+fn links_on_line(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut starts: Vec<usize> = line
+        .char_indices()
+        .map(|(at, _)| at)
+        .filter(|&at| {
+            at > 0
+                && bytes[at - 1].is_ascii_whitespace()
+                && line[at..].get(..5).is_some_and(|scheme| scheme.eq_ignore_ascii_case("ed2k:"))
+        })
+        .collect();
+    starts.insert(0, 0);
+    starts.push(line.len());
+    starts.windows(2).map(|w| &line[w[0]..w[1]]).collect()
+}
+
 /// Build an ed2k link with optional AICH and/or our own endpoint as a source,
 /// matching eMule's "copy link" submenu variants. `aich_hash` is the 40-char
 /// hex AICH root from the library row (re-encoded to base32 for `h=`). When
 /// `with_sources` is set we append our reachable IP:port — this only makes
 /// sense with a HighID, so a firewalled client returns an error the UI can
 /// surface rather than emitting an unreachable source.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn build_ed2k_link(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     name: String,
     size: u64,
     file_hash: String,
@@ -1350,19 +1405,21 @@ pub async fn build_ed2k_link(
         }
     }
 
-    Ok(hash::format_ed2k_link_ext(
+    let mirrors = kept_mirrors(&state, vec![file_hash.clone()]).await;
+    Ok(hash::format_ed2k_link_with_mirrors(
         &name,
         size,
         &file_hash,
         aich.as_deref(),
         ember.as_deref(),
+        mirrors.get(&file_hash.to_ascii_lowercase()).map_or(&[][..], Vec::as_slice),
         &sources,
     ))
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_spam(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_name: String,
     file_size: u64,
@@ -1437,9 +1494,9 @@ pub async fn mark_spam(
 }
 
 /// Undo a [`mark_spam`], given the verdict it returned.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn undo_mark_spam(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     prior: crate::search::spam::PriorSpamVerdict,
 ) -> Result<(), String> {
@@ -1455,9 +1512,9 @@ pub async fn undo_mark_spam(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_not_spam(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
     if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
@@ -1495,12 +1552,144 @@ fn spawn_spam_filter_save(
     });
 }
 
-#[tauri::command]
+/// Take back the spam mark on a file and what it taught, leaving the file
+/// judged like any other whatever it was before the mark, as the learned
+/// spam data's Unmark does ([`SpamFilter::unmark_spam`]).
+#[ember_macros::command]
+pub async fn unmark_spam(
+    state: crate::host::State<'_, AppState>,
+    file_hash: String,
+) -> Result<(), String> {
+    if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
+        return Err(coded("search_invalid_file_hash", "Invalid file hash"));
+    }
+    let dirty = {
+        let mut spam = state.spam_filter.write().await;
+        spam.unmark_spam(&file_hash);
+        spam.is_dirty()
+    };
+    spawn_spam_filter_save(state.spam_filter.clone(), dirty);
+    Ok(())
+}
+
+/// Stop trusting a file marked not spam, or a finished download, so it is
+/// judged like any other file from then on.
+#[ember_macros::command]
+pub async fn forget_not_spam(
+    state: crate::host::State<'_, AppState>,
+    file_hash: String,
+) -> Result<(), String> {
+    if file_hash.len() != 32 || hex::decode(&file_hash).is_err() {
+        return Err(coded("search_invalid_file_hash", "Invalid file hash"));
+    }
+    let dirty = {
+        let mut spam = state.spam_filter.write().await;
+        spam.forget_not_spam(&file_hash);
+        spam.is_dirty()
+    };
+    spawn_spam_filter_save(state.spam_filter.clone(), dirty);
+    Ok(())
+}
+
+#[ember_macros::command]
 pub async fn get_spam_stats(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<crate::search::spam::SpamStats, String> {
     let spam = state.spam_filter.read().await;
     Ok(spam.stats())
+}
+
+/// The most entries [`get_learned_spam`] returns at once.
+const MAX_LEARNED_SPAM_PAGE: usize = 500;
+
+/// A page of one learned spam list.
+#[derive(serde::Serialize)]
+pub struct LearnedSpamPage {
+    pub entries: Vec<crate::search::spam::LearnedEntry>,
+    /// How many entries match the query.
+    pub matched: usize,
+    /// How many entries the list holds.
+    pub total: usize,
+}
+
+/// The entries of one learned spam list whose name, address or hash holds
+/// `query` (any case), newest first, `limit` of them from `offset`. A file the
+/// filter kept no name for takes the Library's, or failing that the download
+/// history's, where either has it.
+#[ember_macros::command]
+pub async fn get_learned_spam(
+    state: crate::host::State<'_, AppState>,
+    list: crate::search::spam::LearnedList,
+    query: String,
+    offset: usize,
+    limit: usize,
+) -> Result<LearnedSpamPage, String> {
+    let mut entries = state.spam_filter.read().await.learned(list);
+    let total = entries.len();
+    let unnamed = |e: &crate::search::spam::LearnedEntry| e.hash.is_some() && e.text.is_empty();
+    if entries.iter().any(unnamed) {
+        let index = state.local_index.read().await;
+        for entry in entries.iter_mut().filter(|e| e.text.is_empty()) {
+            let Some(hash) = &entry.hash else { continue };
+            let file = index
+                .get_by_hash(hash)
+                .or_else(|| index.get_by_hash(&hash.to_ascii_uppercase()));
+            if let Some(file) = file {
+                entry.text = file.name.clone();
+                if entry.size.is_none() && file.size > 0 {
+                    entry.size = Some(file.size);
+                }
+            }
+        }
+    }
+    let needle: String = query.trim().chars().take(MAX_SEARCH_FILTER_LEN).collect::<String>().to_lowercase();
+    // The download history is read for the names a search could match, or
+    // with none, only for the page shown.
+    if !needle.is_empty() {
+        name_from_download_history(&state, &mut entries).await;
+        entries.retain(|e| {
+            e.text.to_lowercase().contains(&needle) || e.hash.as_deref().is_some_and(|h| h.contains(&needle))
+        });
+    }
+    let matched = entries.len();
+    let mut entries: Vec<_> = entries
+        .into_iter()
+        .skip(offset)
+        .take(limit.clamp(1, MAX_LEARNED_SPAM_PAGE))
+        .collect();
+    if needle.is_empty() {
+        name_from_download_history(&state, &mut entries).await;
+    }
+    Ok(LearnedSpamPage { entries, matched, total })
+}
+
+/// Name the files among `entries` that have none yet, and give them a size,
+/// from the download history. A history that cannot be read leaves them
+/// unnamed: names are all it is read for.
+async fn name_from_download_history(state: &AppState, entries: &mut [crate::search::spam::LearnedEntry]) {
+    let hashes: Vec<String> = entries
+        .iter()
+        .filter(|e| e.text.is_empty())
+        .filter_map(|e| e.hash.clone())
+        .collect();
+    if hashes.is_empty() {
+        return;
+    }
+    let db = state.db.clone();
+    let history = tokio::task::spawn_blocking(move || db.download_history_names(&hashes))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    for entry in entries.iter_mut().filter(|e| e.text.is_empty()) {
+        let Some((name, size)) = entry.hash.as_ref().and_then(|h| history.get(&h.to_ascii_lowercase())) else {
+            continue;
+        };
+        entry.text = name.clone();
+        if entry.size.is_none() && *size > 0 {
+            entry.size = Some(*size);
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -1521,9 +1710,9 @@ pub struct SpamExplainResponse {
     pub reason_details: Vec<crate::search::spam::SpamReason>,
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn explain_spam_result(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_name: String,
     file_size: u64,
@@ -1702,8 +1891,8 @@ pub async fn explain_spam_result(
     })
 }
 
-#[tauri::command]
-pub async fn reset_spam_filter(state: tauri::State<'_, AppState>) -> Result<String, String> {
+#[ember_macros::command]
+pub async fn reset_spam_filter(state: crate::host::State<'_, AppState>) -> Result<String, String> {
     {
         let mut spam = state.spam_filter.write().await;
         spam.reset();
@@ -1717,9 +1906,9 @@ pub async fn reset_spam_filter(state: tauri::State<'_, AppState>) -> Result<Stri
 /// Re-score an existing search-result list under the current spam profile
 /// and community votes. Used when the user changes spam settings so rows
 /// already on screen pick up the new classification without a new search.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn rescore_search_results(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     mut results: Vec<SearchResult>,
     search_keywords: Vec<String>,
     search_query: Option<String>,
@@ -1805,9 +1994,9 @@ pub async fn rescore_search_results(
 
 /// Look up download history for a batch of file hashes.
 /// Returns a map of hash → status ("completed" or "cancelled").
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_download_history(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     hashes: Vec<String>,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     // Cap the batch size so the IPC frame and the SQL `IN (?,?,…)`
@@ -1839,9 +2028,9 @@ pub struct DownloadHistoryStats {
 }
 
 /// Return completed / cancelled / total download-history counts.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_download_history_stats(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<DownloadHistoryStats, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<DownloadHistoryStats> {
@@ -1865,11 +2054,63 @@ pub async fn get_download_history_stats(
     })
 }
 
+/// The most entries [`get_download_history_entries`] returns at once.
+const MAX_HISTORY_PAGE: usize = 500;
+
+/// A page of the download history.
+#[derive(serde::Serialize)]
+pub struct DownloadHistoryPage {
+    pub entries: Vec<crate::storage::database::DownloadHistoryEntry>,
+    /// How many entries match the status and the query.
+    pub matched: usize,
+}
+
+/// The download history's entries of `status` ("completed", "cancelled" or
+/// "all") whose name or hash holds `query` (any case), newest first, `limit`
+/// of them from `offset`.
+#[ember_macros::command]
+pub async fn get_download_history_entries(
+    state: crate::host::State<'_, AppState>,
+    status: String,
+    query: String,
+    offset: usize,
+    limit: usize,
+) -> Result<DownloadHistoryPage, String> {
+    if !matches!(status.as_str(), "all" | "completed" | "cancelled") {
+        return Err(coded_ctx("search_history_fetch_failed", "Failed to fetch history", format!("status {status}")));
+    }
+    let db = state.db.clone();
+    let entries = tokio::task::spawn_blocking(move || db.download_history_entries())
+        .await
+        .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
+        .map_err(|e| coded_ctx("search_history_fetch_failed", "Failed to fetch history", e))?;
+    Ok(history_page(entries, &status, &query, offset, limit))
+}
+
+fn history_page(
+    mut entries: Vec<crate::storage::database::DownloadHistoryEntry>,
+    status: &str,
+    query: &str,
+    offset: usize,
+    limit: usize,
+) -> DownloadHistoryPage {
+    let needle: String = query.trim().chars().take(MAX_SEARCH_FILTER_LEN).collect::<String>().to_lowercase();
+    entries.retain(|e| {
+        (status == "all" || e.status == status)
+            && (needle.is_empty()
+                || e.file_name.to_lowercase().contains(&needle)
+                || e.file_hash.to_lowercase().contains(&needle))
+    });
+    let matched = entries.len();
+    let entries = entries.into_iter().skip(offset).take(limit.clamp(1, MAX_HISTORY_PAGE)).collect();
+    DownloadHistoryPage { entries, matched }
+}
+
 /// Clear download history entries by status ("completed", "cancelled", or "all").
-#[tauri::command]
+#[ember_macros::command]
 pub async fn clear_download_history(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     status: String,
 ) -> Result<(), String> {
     let db = state.db.clone();
@@ -1909,14 +2150,16 @@ pub async fn clear_download_history(
 /// specific entry — use it when the UI surfaces a per-row "remove from
 /// history" action (e.g. a search-results context menu on a row the
 /// user has previously downloaded and wants re-surfaced as fresh).
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_download_history_entry(
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
 ) -> Result<(), String> {
     let _ = parse_exact_file_hash(&file_hash)?;
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || db.remove_download_history(&file_hash))
+    let hash = file_hash.clone();
+    let removed = tokio::task::spawn_blocking(move || db.remove_download_history(&file_hash))
         .await
         .map_err(|e| coded_ctx("search_task_failed", "Task failed", e))?
         .map_err(|e| {
@@ -1925,7 +2168,13 @@ pub async fn remove_download_history_entry(
                 "Failed to remove history entry",
                 e,
             )
-        })
+        })?;
+    // Search badges the file from its own copy of the history; Settings can
+    // remove one while Search is open.
+    if removed {
+        let _ = app.emit("download-history-removed", serde_json::json!({ "hash": hash }));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2042,6 +2291,36 @@ mod ed2k_paste_tests {
         assert_eq!(batch.skipped, 0);
         assert_eq!(batch.links[0].name, "a.bin");
         assert_eq!(batch.links[2].size, 3);
+    }
+
+    /// A result's album tag runs longer than any search term; the plan cuts
+    /// it rather than refusing the file.
+    #[tokio::test]
+    async fn a_long_album_tag_is_cut_not_refused() {
+        let seed = |album: String| RelatedSeedInput {
+            hash: Some("ab".repeat(16)),
+            name: Some("Artist - Song.mp3".to_string()),
+            artist: Some("Artist".to_string()),
+            album: Some(album),
+        };
+        let plan = plan_related_search(vec![seed("日本語のアルバム".repeat(20))]).await;
+        assert!(plan.is_ok(), "{plan:?}");
+    }
+
+    /// Links side by side on a line, as forum text gives them, each count; a
+    /// raw space inside a name does not split one.
+    #[test]
+    fn links_side_by_side_on_one_line_are_each_read() {
+        let text = format!(
+            "{} {}\tED2K://|file|with space.bin|4|{}|/",
+            link("a.bin", 1, 0xAA),
+            link("b.bin", 2, 0xBB),
+            "cc".repeat(16)
+        );
+        let batch = parse_ed2k_links(text).expect("parse");
+        let names: Vec<&str> = batch.links.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, ["a.bin", "b.bin", "with space.bin"]);
+        assert_eq!(batch.invalid, 0);
     }
 
     #[test]
@@ -2247,5 +2526,59 @@ mod result_attribution_tests {
             results[0].origin_server_ip.as_deref(),
             Some("198.51.100.7")
         );
+    }
+}
+
+#[cfg(test)]
+mod download_history_page_tests {
+    use super::*;
+    use crate::storage::database::DownloadHistoryEntry;
+
+    fn entry(hash: &str, name: &str, status: &str, timestamp: i64) -> DownloadHistoryEntry {
+        DownloadHistoryEntry {
+            file_hash: hash.into(),
+            file_name: name.into(),
+            file_size: 1,
+            status: status.into(),
+            timestamp,
+        }
+    }
+
+    fn names(page: &DownloadHistoryPage) -> Vec<&str> {
+        page.entries.iter().map(|e| e.file_name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_page_takes_its_status_and_any_case_of_a_name_or_hash() {
+        let history = || {
+            vec![
+                entry("AA11", "Écran Noir.mkv", "completed", 3),
+                entry("BB22", "Album.flac", "cancelled", 2),
+                entry("CC33", "écran blanc.mkv", "cancelled", 1),
+            ]
+        };
+        let all = history_page(history(), "all", "", 0, 100);
+        assert_eq!((names(&all), all.matched), (vec!["Écran Noir.mkv", "Album.flac", "écran blanc.mkv"], 3));
+        let cancelled = history_page(history(), "cancelled", "", 0, 100);
+        assert_eq!(names(&cancelled), vec!["Album.flac", "écran blanc.mkv"]);
+        let by_name = history_page(history(), "all", "  ÉCRAN ", 0, 100);
+        assert_eq!(names(&by_name), vec!["Écran Noir.mkv", "écran blanc.mkv"], "accents, any case, trimmed");
+        let by_hash = history_page(history(), "all", "bb2", 0, 100);
+        assert_eq!(names(&by_hash), vec!["Album.flac"]);
+        let both = history_page(history(), "completed", "écran", 0, 100);
+        assert_eq!(names(&both), vec!["Écran Noir.mkv"]);
+    }
+
+    #[test]
+    fn pages_follow_on_and_say_how_many_matched() {
+        let history: Vec<_> = (0..1200).map(|i| entry(&format!("{i:032X}"), &format!("file {i}"), "completed", -i)).collect();
+        let first = history_page(history.clone(), "all", "", 0, 100);
+        assert_eq!((first.entries.len(), first.matched), (100, 1200));
+        let last = history_page(history.clone(), "all", "", 1150, 100);
+        assert_eq!(names(&last).first(), Some(&"file 1150"));
+        assert_eq!(last.entries.len(), 50);
+        assert_eq!(history_page(history.clone(), "all", "", 0, 10_000).entries.len(), MAX_HISTORY_PAGE);
+        assert_eq!(history_page(history.clone(), "all", "", 0, 0).entries.len(), 1, "a page is never empty by its limit");
+        assert!(history_page(history, "all", "", 5_000, 100).entries.is_empty());
     }
 }

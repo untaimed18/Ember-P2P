@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures::FutureExt;
-use tauri::{AppHandle, Emitter, Manager};
+use crate::host::{AppHandle, Emitter, Manager};
 
 use crate::app_state::AppState;
 
@@ -120,7 +120,7 @@ fn update_due(record: &IpFilterRecord, now: i64) -> bool {
 
 /// Start the scheduler. Call once, after `AppState` is managed.
 pub fn spawn(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         loop {
             let result = std::panic::AssertUnwindSafe(run(app.clone()))
                 .catch_unwind()

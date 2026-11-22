@@ -133,16 +133,6 @@ pub(in crate::network) async fn on_udp_discovery_health_tick(
         }
     }
 
-    // Only the eD2K UDP-discovery diagnostics below are KAD-scoped.
-    // The friend relay-offer work above must not be: `stats.status`
-    // is advanced only by KAD paths, so an eD2K-only session (the
-    // default) sits at `Disconnected` for its whole life — and this
-    // gate then meant we never registered our own attestation hash,
-    // so every friend that tried to use us as a relay was answered
-    // with REJECT_AUTH, starving the one discovery channel that does
-    // not need a shared swarm.
-    if state.stats.status == NetworkStatus::Disconnected { return; }
-
     let cur = UdpDiscoveryHealthSnapshot {
         sent: state.udp_discovery_sent,
         send_errs: state.udp_discovery_send_errs,

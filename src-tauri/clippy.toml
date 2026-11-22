@@ -1,0 +1,27 @@
+# Every socket Ember opens goes through `src/net_bind.rs`, which keeps it on the
+# network interface Settings name and opens nothing while that interface is not
+# connected. Each of these would open one around it.
+disallowed-methods = [
+    { path = "std::net::TcpListener::bind", reason = "bind through net_bind, which keeps it on the chosen interface" },
+    { path = "std::net::TcpStream::connect", reason = "use net_bind::tcp_connect, which keeps it on the chosen interface" },
+    { path = "std::net::TcpStream::connect_timeout", reason = "use net_bind::tcp_connect, which keeps it on the chosen interface" },
+    { path = "std::net::UdpSocket::bind", reason = "use net_bind::std_udp, which keeps it on the chosen interface" },
+    { path = "tokio::net::TcpListener::bind", reason = "use net_bind::tcp_socket, which keeps it on the chosen interface" },
+    { path = "tokio::net::TcpSocket::bind", reason = "use net_bind::tcp_socket, which keeps it on the chosen interface" },
+    { path = "tokio::net::TcpSocket::connect", reason = "use net_bind::tcp_connect or a net_bind::tcp_socket, which keep it on the chosen interface" },
+    { path = "tokio::net::TcpStream::connect", reason = "use net_bind::tcp_connect, which keeps it on the chosen interface" },
+    { path = "tokio::net::UdpSocket::bind", reason = "use net_bind::udp, which keeps it on the chosen interface" },
+    { path = "socket2::Socket::bind", reason = "use net_bind::bind_socket, which keeps it on the chosen interface" },
+    { path = "reqwest::Client::new", reason = "use net_bind::http_client, which keeps it on the chosen interface" },
+    { path = "reqwest::Client::builder", reason = "use net_bind::http_client, which keeps it on the chosen interface" },
+    { path = "reqwest::ClientBuilder::new", reason = "use net_bind::http_client, which keeps it on the chosen interface" },
+    { path = "reqwest::get", reason = "use net_bind::http_client, which keeps it on the chosen interface" },
+    { path = "tokio::net::lookup_host", reason = "use net_bind::lookup_host, which sends no query while the chosen interface is not there" },
+    { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "use net_bind::lookup_host, which sends no query while the chosen interface is not there" },
+    { path = "quinn::Endpoint::client", reason = "make the socket with net_bind and use quinn::Endpoint::new" },
+    { path = "quinn::Endpoint::server", reason = "make the socket with net_bind and use quinn::Endpoint::new" },
+    { path = "tokio_tungstenite::connect_async", reason = "connect with net_bind::tcp_connect and use tokio_tungstenite::client_async_tls_with_config" },
+    { path = "tokio_tungstenite::connect_async_with_config", reason = "connect with net_bind::tcp_connect and use tokio_tungstenite::client_async_tls_with_config" },
+    { path = "tokio_tungstenite::connect_async_tls_with_config", reason = "connect with net_bind::tcp_connect and use tokio_tungstenite::client_async_tls_with_config" },
+    { path = "igd_next::aio::tokio::search_gateway", reason = "igd-next opens its own sockets; only UpnpMappings::discover may, and not while an interface is chosen" },
+]

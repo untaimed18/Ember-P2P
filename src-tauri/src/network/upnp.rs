@@ -489,7 +489,13 @@ impl UpnpMappings {
     }
 
     /// Find the gateway and cache it. On failure the retry backoff advances.
+    /// Never while Ember is kept on one interface: igd-next opens its own
+    /// sockets, which `net_bind` cannot place.
+    #[allow(clippy::disallowed_methods)]
     async fn discover(&mut self) -> bool {
+        if crate::net_bind::is_configured() {
+            return false;
+        }
         let options = igd_next::SearchOptions {
             timeout: Some(DISCOVERY_TIMEOUT),
             ..Default::default()
@@ -790,7 +796,7 @@ fn local_ipv4(gateway_addr: SocketAddr) -> Option<Ipv4Addr> {
 }
 
 fn route_local_ipv4(target: SocketAddr) -> Option<Ipv4Addr> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    let socket = crate::net_bind::std_udp(0).ok()?;
     socket.connect(target).ok()?;
     match socket.local_addr().ok()? {
         SocketAddr::V4(v4) => Some(*v4.ip()),

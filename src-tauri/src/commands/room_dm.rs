@@ -3,7 +3,7 @@
 //! frames themselves are `network::room_dm`.
 
 use rand::RngCore;
-use tauri::{Emitter, Manager};
+use crate::host::{Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
@@ -42,6 +42,9 @@ pub struct DmThreadInfo {
     pub can_send: bool,
     /// They are a friend: friend chat is the place to talk.
     pub is_friend: bool,
+    /// Their `ember2:` friend code, for the Add friend a conversation no room
+    /// carries offers. Empty for a key that has none.
+    pub friend_code: String,
 }
 
 fn member_key(member: &str) -> Result<[u8; 32], String> {
@@ -86,7 +89,7 @@ fn channel_key(channel_id: &str) -> Option<[u8; 16]> {
 
 /// A room both are in, `preferred` if it still is one: the room a
 /// conversation started in carries it while both remain.
-fn shared_room(db: &Database, member: &str, ours: &str, preferred: &str) -> Option<String> {
+pub(crate) fn shared_room(db: &Database, member: &str, ours: &str, preferred: &str) -> Option<String> {
     let rooms = db.rooms_shared_with(member, ours, DM_SHARED_ROOMS_LOOKED_AT).ok()?;
     rooms
         .iter()
@@ -158,8 +161,8 @@ fn send_frame(state: &AppState, channel_id: &str, member: [u8; 32], payload: DmP
 }
 
 /// Every conversation, newest first.
-#[tauri::command]
-pub async fn list_room_dm_threads(state: tauri::State<'_, AppState>) -> Result<Vec<DmThreadInfo>, String> {
+#[ember_macros::command]
+pub async fn list_room_dm_threads(state: crate::host::State<'_, AppState>) -> Result<Vec<DmThreadInfo>, String> {
     let db = state.db.clone();
     let ours = hex::encode(state.identity.ed25519_public_key);
     let now = chrono::Utc::now().timestamp();
@@ -173,6 +176,10 @@ pub async fn list_room_dm_threads(state: tauri::State<'_, AppState>) -> Result<V
                     DmThreadInfo {
                         can_send: shared_room(&db, &thread.member_pubkey, &ours, &thread.channel_id).is_some(),
                         is_friend: is_friend(&db, &key),
+                        friend_code: member_key(&thread.member_pubkey)
+                            .ok()
+                            .and_then(|key| crate::commands::channels::member_friend_code(&key))
+                            .unwrap_or_default(),
                         thread,
                     }
                 })
@@ -187,9 +194,9 @@ pub async fn list_room_dm_threads(state: tauri::State<'_, AppState>) -> Result<V
 /// A conversation's messages, oldest first: the newest `limit` before the
 /// message at `before` (its timestamp) and `before_seq` (its row), or the
 /// newest of all.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_room_dm_messages(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     member: String,
     before: Option<i64>,
     before_seq: Option<i64>,
@@ -207,9 +214,9 @@ pub async fn get_room_dm_messages(
 }
 
 /// Write to a member privately, through a room both are in.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn send_room_dm(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     member: String,
     text: String,
 ) -> Result<DmMessage, String> {
@@ -237,7 +244,7 @@ pub async fn send_room_dm(
     rand::rngs::OsRng.fill_bytes(&mut id);
     let message_id = hex::encode(id);
     let (task_member, task_text, task_id) = (member.clone(), text.clone(), message_id.clone());
-    let channel = blocking(
+    let (channel, ttl_secs) = blocking(
         move || {
             let channel = match send_route(&db, &key, &task_member, &ours, now)? {
                 Ok(channel) => channel,
@@ -265,13 +272,17 @@ pub async fn send_room_dm(
                 refund_dm_send(&channel);
             }
             recorded?;
-            Ok(Ok(channel))
+            let ttl_secs = db.dm_disappear_secs(&task_member)?;
+            if ttl_secs > 0 {
+                db.dm_set_sent_timer(&task_member, &task_id, ttl_secs)?;
+            }
+            Ok(Ok((channel, ttl_secs)))
         },
         "channels_dm_failed",
         "Could not send the message",
     )
     .await??;
-    send_frame(&state, &channel, key, DmPayload::Message { id, text: text.clone() });
+    send_message_frames(&state, &channel, key, id, text.clone(), ttl_secs);
     Ok(DmMessage {
         message_id,
         member_pubkey: member,
@@ -280,14 +291,63 @@ pub async fn send_room_dm(
         timestamp: now,
         status: "sending".into(),
         seq: 0,
+        ttl_secs,
+        expires_at: 0,
+        mailboxed: false,
     })
 }
 
+/// A message of ours, and its timer after it when it has one. Every attempt
+/// sends both: whichever copy of the message arrives, its timer follows.
+fn send_message_frames(state: &AppState, channel: &str, member: [u8; 32], id: [u8; 16], text: String, ttl_secs: i64) {
+    send_frame(state, channel, member, DmPayload::Message { id, text });
+    if ttl_secs > 0 {
+        let ttl_secs = u32::try_from(ttl_secs).unwrap_or(u32::MAX);
+        send_frame(state, channel, member, DmPayload::Expire { id, ttl_secs });
+    }
+}
+
+/// The disappearing-message timer chosen for the conversation with `member`,
+/// in seconds; 0 for none.
+#[ember_macros::command]
+pub async fn get_room_dm_disappear(state: crate::host::State<'_, AppState>, member: String) -> Result<i64, String> {
+    let member = member_hex(&member)?;
+    let db = state.db.clone();
+    blocking(move || db.dm_disappear_secs(&member), "channels_dm_failed", "Could not read private messages").await
+}
+
+/// Choose the timer for what is sent to `member` from now on: one of the
+/// choices friend chat offers, or 0 for none. Messages already sent keep theirs.
+#[ember_macros::command]
+pub async fn set_room_dm_disappear(
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
+    member: String,
+    ttl_secs: i64,
+) -> Result<(), String> {
+    let member = member_hex(&member)?;
+    let offered = ttl_secs == 0
+        || u32::try_from(ttl_secs).is_ok_and(|secs| crate::types::CHAT_DISAPPEAR_CHOICES.contains(&secs));
+    if !offered {
+        return Err(coded("channels_dm_failed", "Could not update private messages"));
+    }
+    let db = state.db.clone();
+    let task_member = member.clone();
+    blocking(
+        move || db.set_dm_disappear_secs(&task_member, ttl_secs),
+        "channels_dm_failed",
+        "Could not update private messages",
+    )
+    .await?;
+    let _ = app.emit(DM_THREAD_EVENT, serde_json::json!({ "member_pubkey": member }));
+    Ok(())
+}
+
 /// Accept or decline someone's first messages. They are told either way.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn answer_room_dm_request(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
     accept: bool,
 ) -> Result<(), String> {
@@ -316,16 +376,26 @@ pub async fn answer_room_dm_request(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_room_dm_read(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
 ) -> Result<(), String> {
     let member = member_hex(&member)?;
     let db = state.db.clone();
     let task_member = member.clone();
-    blocking(move || db.dm_mark_read(&task_member), "channels_dm_failed", "Could not update private messages").await?;
+    let now = chrono::Utc::now().timestamp();
+    // What they sent with a timer starts running once it has been read.
+    blocking(
+        move || {
+            db.dm_mark_read(&task_member)?;
+            db.dm_start_read_timers(&task_member, now)
+        },
+        "channels_dm_failed",
+        "Could not update private messages",
+    )
+    .await?;
     // The other window's counts follow from this.
     let _ = app.emit(DM_THREAD_EVENT, serde_json::json!({ "member_pubkey": member }));
     Ok(())
@@ -334,10 +404,10 @@ pub async fn mark_room_dm_read(
 /// Delete a conversation and everything in it, here only. A request deleted
 /// is declined, without telling its sender, and that refusal is answered
 /// with a decline if they write again while it holds.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_room_dm_thread(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
 ) -> Result<(), String> {
     let member = member_hex(&member)?;
@@ -353,10 +423,10 @@ pub async fn delete_room_dm_thread(
 /// already waiting: for a sender being ignored, who sees their messages go
 /// undelivered as if we were offline. Ignore them first, so nothing they
 /// send next opens a new one.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn drop_room_dm_request(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
 ) -> Result<(), String> {
     let key = member_key(&member)?;
@@ -375,10 +445,10 @@ pub async fn drop_room_dm_request(
 /// Try a message that was not delivered again, on the terms a new one meets:
 /// the same refusals, and a place in its room's [`DM_SEND_PER_ROOM_MINUTE`],
 /// handed back if it is not retried after all.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn retry_room_dm(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     member: String,
     message_id: String,
 ) -> Result<(), String> {
@@ -429,10 +499,10 @@ pub async fn retry_room_dm(
 /// is the one private messages are dropped by. In force when this returns,
 /// not only once the network loop takes up the settings, so a request
 /// dropped next cannot be reopened by a message already on its way.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_ignored_members(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     members: Vec<IgnoredMember>,
 ) -> Result<(), String> {
     let cleaned = clean_ignored_members(members);
@@ -493,8 +563,8 @@ pub(crate) fn clean_ignored_members(members: Vec<IgnoredMember>) -> Vec<IgnoredM
 
 /// Resend ours that have not been answered, and mark those tried for long
 /// enough as not delivered. Runs for the life of the app.
-pub fn spawn_resends(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
+pub fn spawn_resends(app: crate::host::AppHandle) {
+    crate::host::async_runtime::spawn(async move {
         loop {
             tokio::time::sleep(DM_RESEND_TICK).await;
             let Some(state) = app.try_state::<AppState>() else {
@@ -522,7 +592,13 @@ pub fn spawn_resends(app: tauri::AppHandle) {
                     .map(|resend| {
                         let room = shared_room(&db, &resend.member_pubkey, &ours, &resend.channel_id);
                         let channel = room.clone().unwrap_or_else(|| resend.channel_id.clone());
-                        let _ = db.dm_note_attempt(&resend.member_pubkey, &resend.message_id, &channel, next_attempt_at(now));
+                        let _ = db.dm_note_attempt(
+                            &resend.member_pubkey,
+                            &resend.message_id,
+                            &channel,
+                            next_attempt_at(now),
+                            now,
+                        );
                         (resend, room)
                     })
                     .collect::<Vec<_>>();
@@ -547,7 +623,7 @@ pub fn spawn_resends(app: tauri::AppHandle) {
                 ) else {
                     continue;
                 };
-                send_frame(&state, &room, key, DmPayload::Message { id, text: resend.text });
+                send_message_frames(&state, &room, key, id, resend.text, resend.ttl_secs);
             }
         }
     });

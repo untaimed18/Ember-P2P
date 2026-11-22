@@ -205,6 +205,9 @@ impl Drop for RelaySlot {
 }
 
 /// A slot to serve a relayed list in, or `None` while all are taken.
+// Rust 1.99 deprecates `fetch_update` for `try_update`, which is newer than
+// this crate's `rust-version`.
+#[allow(deprecated)]
 pub fn relay_slot() -> Option<RelaySlot> {
     RELAY_SESSIONS
         .fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |held| {

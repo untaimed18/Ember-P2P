@@ -7,6 +7,7 @@
 
 use rand::rngs::OsRng;
 use rand::RngCore;
+#[cfg(feature = "desktop")]
 use tauri_plugin_dialog::DialogExt;
 
 use crate::app_state::AppState;
@@ -70,15 +71,59 @@ pub(crate) fn clamp_file_name_keep_extension(name: &str, max: usize) -> String {
 /// webview sent would let anything that can run script in it read any file the
 /// user can and hand it to a friend. The same reason the room transfer picks
 /// its own file.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn pick_and_send_chat_attachment(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
     title: Option<String>,
 ) -> Result<Option<ChatAttachmentInfo>, String> {
     let dialog_title = super::picker_title(title, "Choose a file to send");
-    let friend = parse_friend(&user_hash_hex)?;
+    let friend = attachment_friend(&state, &user_hash_hex).await?;
+    let picker = app.clone();
+    let picked = tokio::task::spawn_blocking(move || {
+        picker
+            .dialog()
+            .file()
+            .set_title(dialog_title)
+            .blocking_pick_file()
+            .map(|file| {
+                file.into_path()
+                    .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))
+            })
+            .transpose()
+    })
+    .await
+    .map_err(|e| coded_ctx("peers_task_error", "Task error", e))??;
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    send_chat_attachment_from(&state, friend, picked).await.map(Some)
+}
+
+/// emberd: offer a friend a file sent from the browser's computer. It is
+/// kept on the server while the friend may still take it.
+#[ember_macros::command(server)]
+pub async fn send_chat_attachment_upload(
+    state: crate::host::State<'_, AppState>,
+    user_hash_hex: String,
+    upload: String,
+) -> Result<ChatAttachmentInfo, String> {
+    let friend = match attachment_friend(&state, &user_hash_hex).await {
+        Ok(friend) => friend,
+        Err(e) => {
+            crate::server::uploads::discard(&upload);
+            return Err(e);
+        }
+    };
+    let path = crate::server::uploads::keep(&upload)?;
+    send_chat_attachment_from(&state, friend, path).await
+}
+
+/// The friend `user_hash_hex` names, once a file may be offered to them: a
+/// friend, chat allowed, and the network ready to send.
+async fn attachment_friend(state: &AppState, user_hash_hex: &str) -> Result<[u8; 16], String> {
+    let friend = parse_friend(user_hash_hex)?;
     if !state.friend_hashes.read().await.contains(&friend) {
         return Err(coded("peers_not_friend", "Can only send files to friends"));
     }
@@ -98,26 +143,15 @@ pub async fn pick_and_send_chat_attachment(
     )
     .await?;
     await_reply(rx, "peers_no_response", "No response").await??;
+    Ok(friend)
+}
 
-    let picker = app.clone();
-    let picked = tokio::task::spawn_blocking(move || {
-        picker
-            .dialog()
-            .file()
-            .set_title(dialog_title)
-            .blocking_pick_file()
-            .map(|file| {
-                file.into_path()
-                    .map_err(|e| coded_ctx("peers_attach_failed", "Could not send that file", e))
-            })
-            .transpose()
-    })
-    .await
-    .map_err(|e| coded_ctx("peers_task_error", "Task error", e))??;
-    let Some(picked) = picked else {
-        return Ok(None);
-    };
-
+/// Offer `friend` the file at `picked`, chosen by the user.
+async fn send_chat_attachment_from(
+    state: &AppState,
+    friend: [u8; 16],
+    picked: std::path::PathBuf,
+) -> Result<ChatAttachmentInfo, String> {
     let prepared = tokio::task::spawn_blocking(move || {
         let canonical = picked
             .canonicalize()
@@ -180,14 +214,13 @@ pub async fn pick_and_send_chat_attachment(
         },
     )
     .await?;
-    let info = await_reply(rx, "peers_no_response", "No response").await??;
-    Ok(Some(info))
+    await_reply(rx, "peers_no_response", "No response").await?
 }
 
 /// Accept or decline a file a friend offered.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn respond_chat_attachment(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     xfer_id: String,
     accept: bool,
 ) -> Result<(), String> {
@@ -206,9 +239,9 @@ pub async fn respond_chat_attachment(
 }
 
 /// Stop a transfer in either direction, and tell the friend.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cancel_chat_attachment(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     xfer_id: String,
 ) -> Result<(), String> {
     let xfer_id = parse_xfer_id(&xfer_id)?;
@@ -222,9 +255,9 @@ pub async fn cancel_chat_attachment(
 }
 
 /// Try a transfer that ended without the file again, keeping its card.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn retry_chat_attachment(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     xfer_id: String,
 ) -> Result<(), String> {
     let xfer_id = parse_xfer_id(&xfer_id)?;
@@ -242,9 +275,9 @@ pub async fn retry_chat_attachment(
 /// Read straight from the database rather than through the network task: this
 /// is history, and a busy network loop is no reason for a conversation to open
 /// without its files.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn list_chat_attachments(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     user_hash_hex: String,
 ) -> Result<Vec<ChatAttachmentInfo>, String> {
     let friend = parse_friend(&user_hash_hex)?;
@@ -268,9 +301,9 @@ pub async fn list_chat_attachments(
 /// type whose content does not match its name, or an executable, is revealed
 /// rather than launched. A friend's file is still a file from somebody else's
 /// machine, and "open" on a disguised executable is how that goes wrong.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_chat_attachment(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     xfer_id: String,
     reveal: bool,
 ) -> Result<(), String> {
@@ -344,8 +377,8 @@ pub async fn open_chat_attachment(
 }
 
 /// Open the Chat Files folder itself.
-#[tauri::command]
-pub async fn open_chat_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn open_chat_files_folder(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     let dl_folder = state.config.read().await.settings.download_folder.clone();
     tokio::task::spawn_blocking(move || {
         let allowed = vec![dl_folder.clone()];

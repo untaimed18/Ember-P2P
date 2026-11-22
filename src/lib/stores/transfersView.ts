@@ -22,3 +22,7 @@ completedFirst.subscribe((value) => {
     /* storage disabled: the choice lasts for this session */
   }
 });
+
+/** The download another page asked Transfers to select and scroll to ("Show
+ *  in Transfers"), until Transfers has done it. */
+export const revealDownloadRequested = writable<string | null>(null);

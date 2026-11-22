@@ -503,6 +503,21 @@ pub fn format_ed2k_link_ext(
     ember_hex: Option<&str>,
     sources: &[(String, u16)],
 ) -> String {
+    format_ed2k_link_with_mirrors(name, size, hash, aich_hex, ember_hex, &[], sources)
+}
+
+/// [`format_ed2k_link_ext`] with `mirrors` as `s=` web sources, before the
+/// closing `/` where eMule reads them (`ED2KLink.cpp`). A `|` in a URL would
+/// end the field, so it goes out as `%7C`, which names the same resource.
+pub fn format_ed2k_link_with_mirrors(
+    name: &str,
+    size: u64,
+    hash: &str,
+    aich_hex: Option<&str>,
+    ember_hex: Option<&str>,
+    mirrors: &[String],
+    sources: &[(String, u16)],
+) -> String {
     let mut link = format!(
         "ed2k://|file|{}|{}|{}|",
         percent_encode_ed2k(name),
@@ -521,6 +536,11 @@ pub fn format_ed2k_link_ext(
     {
         link.push_str("eh=");
         link.push_str(&digest.to_lowercase());
+        link.push('|');
+    }
+    for mirror in mirrors {
+        link.push_str("s=");
+        link.push_str(&mirror.replace('|', "%7C"));
         link.push('|');
     }
     link.push('/');
@@ -623,6 +643,17 @@ fn aich_base32_to_hex(b32: &str) -> Option<String> {
 }
 
 pub fn percent_decode_str(s: &str) -> String {
+    String::from_utf8(percent_decode_bytes(s)).unwrap_or_else(|_| s.to_string())
+}
+
+/// A link's file name, decoded: escapes that do not make UTF-8 are read as
+/// Windows-1252, as eMule reads an old link's name in the ANSI code page
+/// (`OptUtf8ToStr`), rather than leaving the whole name encoded.
+fn percent_decode_name(s: &str) -> String {
+    crate::network::ed2k::server::decode_wire_text(&percent_decode_bytes(s))
+}
+
+fn percent_decode_bytes(s: &str) -> Vec<u8> {
     let mut result = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -639,7 +670,7 @@ pub fn percent_decode_str(s: &str) -> String {
         result.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+    result
 }
 
 fn strip_ed2k_wrapper(raw: &str) -> &str {
@@ -804,7 +835,7 @@ pub fn parse_ed2k_link_strict(link: &str) -> Result<ParsedEd2kLink, &'static str
         return Err("ed2k file name is too long");
     }
     // Sanitize after decoding: `%E2%80%AE` only becomes an RLO here.
-    let name = crate::security::sanitize_remote_text(&percent_decode_str(raw_name), 4096);
+    let name = crate::security::sanitize_remote_text(&percent_decode_name(raw_name), 4096);
     let size = parts
         .next()
         .ok_or("Missing ed2k file size")?
@@ -893,6 +924,16 @@ mod link_tests {
     const HASH: &str = "0123456789abcdef0123456789abcdef";
     // 20-byte AICH root (hex) -> known base32.
     const AICH_HEX: &str = "0000000000000000000000000000000000000000";
+
+    /// An old link's name escaped in Latin-1 reads as eMule reads it, and a
+    /// stray byte in a UTF-8 name costs only itself.
+    #[test]
+    fn a_latin1_escaped_name_decodes() {
+        let name = |raw: &str| parse_ed2k_link_strict(&format!("ed2k://|file|{raw}|1|{HASH}|/")).unwrap().0;
+        assert_eq!(name("Am%E9lie%20Poulain.avi"), "Amélie Poulain.avi");
+        assert_eq!(name("Caf%C3%A9%20%E9t%E9.avi"), "Café été.avi");
+        assert_eq!(name("Plain%20Name.avi"), "Plain Name.avi");
+    }
 
     #[test]
     fn base32_round_trips_aich() {
@@ -986,6 +1027,35 @@ mod link_tests {
         let named = format!("ed2k://|file|s=trick|9|{HASH}|/");
         assert!(ed2k_link_web_sources(&named).is_empty());
         assert!(ed2k_link_web_sources("ed2k://|server|1.2.3.4|4661|/").is_empty());
+    }
+
+    /// Kept mirrors go out where eMule and this parser read them, a `|` in
+    /// one cannot cut the link short, and sources still follow the `/`.
+    #[test]
+    fn mirrors_written_into_a_link_read_back_as_its_web_sources() {
+        let mirrors = vec![
+            "https://mirror.example/a.bin".to_string(),
+            "https://odd.example/a|b.bin".to_string(),
+        ];
+        let sources = vec![("1.2.3.4".to_string(), 4662)];
+        let link = format_ed2k_link_with_mirrors("a.bin", 9, HASH, None, None, &mirrors, &sources);
+        assert_eq!(
+            link,
+            format!(
+                "ed2k://|file|a.bin|9|{}|s=https://mirror.example/a.bin|s=https://odd.example/a%7Cb.bin|/|sources,1.2.3.4:4662|/",
+                HASH.to_uppercase()
+            )
+        );
+        assert_eq!(
+            ed2k_link_web_sources(&link),
+            vec!["https://mirror.example/a.bin", "https://odd.example/a%7Cb.bin"]
+        );
+        let (name, size, hash, _, _) = parse_ed2k_link_strict(&link).expect("parse");
+        assert_eq!((name.as_str(), size, hash.as_str()), ("a.bin", 9, HASH));
+        assert_eq!(
+            format_ed2k_link_with_mirrors("a.bin", 9, HASH, None, None, &[], &[]),
+            format_ed2k_link_ext("a.bin", 9, HASH, None, None, &[])
+        );
     }
 
     #[test]

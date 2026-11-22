@@ -6,7 +6,7 @@ use super::*;
 pub(in crate::network) async fn on_udp_mapping_keepalive_result(
     result: UdpMappingKeepaliveResult,
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     mapping_ka_cycle_success: &mut bool,
     tcp_map_ka_in_flight: bool,
     udp_map_ka_gen: &mut Option<u64>,
@@ -16,8 +16,8 @@ pub(in crate::network) async fn on_udp_mapping_keepalive_result(
 ) {
     // Flags/sender are keyed by this cycle's local generation.
     // `mapping_ka_generation` can be bumped by
-    // `reset_stun_keepalive_session` (STUN toggle / KAD
-    // disconnect) without touching those locals; a matching
+    // `reset_stun_keepalive_session` (the STUN toggle)
+    // without touching those locals; a matching
     // local generation must still release them so the timer
     // is not stuck until the 90s watchdog. Payload is applied
     // only while the global generation still matches, so a

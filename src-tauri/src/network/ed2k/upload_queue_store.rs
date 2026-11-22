@@ -207,6 +207,8 @@ fn from_saved(
         // Judged by the address it was last seen at, as a waiter that hung up
         // this session is; `restorable_ip` has already refused a stand-in.
         credit_ip: super::upload::queue_row_credit_ip(saved.last_ip),
+        // Unverified, so never dialled securely; the next session refills it.
+        ember_features: 0,
     })
 }
 
@@ -532,6 +534,7 @@ mod tests {
                 IpAddr::V4(v4) => v4.octets(),
                 IpAddr::V6(_) => [0; 4],
             }),
+            ember_features: 0,
         }
     }
 

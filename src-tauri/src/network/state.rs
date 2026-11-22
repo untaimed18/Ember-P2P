@@ -247,6 +247,9 @@ pub(super) struct NetworkState {
     /// getting that wrong puts answers to the previous query into the current
     /// tab. Carrying the id makes it a property of the packet instead.
     pub(super) udp_search_queue: VecDeque<(u64, Vec<u8>, std::net::SocketAddr)>,
+    /// The server a global search last reached, so the next sweep starts
+    /// after it (eMule `GetNextSearchServer` keeps its place the same way).
+    pub(super) udp_sweep_last_sent: Option<std::net::SocketAddr>,
     /// Source searches tied to pending downloads (search_id -> (transfer_id, file_hash_md4)).
     /// File hash is carried alongside so the search-completion handler can build
     /// CallbackReqs / inject sources without re-reading `pending_downloads`, which
@@ -349,6 +352,11 @@ pub(super) struct NetworkState {
     /// this `(target, peer)` pair. The count matters for eMule-style keyword
     /// batches split into multiple `PublishKeyReq` packets with the same target.
     pub(super) publish_pending: HashMap<(KadId, SocketAddr), (KadId, i64, bool, u32)>,
+    /// When a peer last confirmed a publish of each target, keyed
+    /// `(target, is_source)` as `publish_pending`'s values name them: what
+    /// lets the cleanup tell a publish nobody confirmed, which it redoes,
+    /// from one a peer or two left unanswered.
+    pub(super) publish_last_ack: HashMap<(KadId, bool), i64>,
     pub(super) publish_confirmed: u32,
     /// Diagnostic counters for `PublishRes` packet accounting. These let
     /// the `Publish cycle:` log line surface exactly where packets are
@@ -882,6 +890,10 @@ pub(super) struct NetworkState {
     /// download and UI source searches so its results can be harvested for
     /// Noise keys and then discarded — nobody is waiting on them.
     pub(super) ember_rendezvous_search: Option<SearchId>,
+    /// The addresses the last rendezvous lookup listed, so the bridge's debug
+    /// lines can follow each advert to a contact or to silence. An address
+    /// leaves when it first answers.
+    pub(super) ember_rendezvous_listed: HashSet<(Ipv4Addr, u16)>,
     /// Unix time the last rendezvous lookup started, to space out retries
     /// while the routing table is still empty. 0 = never.
     pub(super) ember_rendezvous_looked_up_at: i64,
@@ -1134,6 +1146,8 @@ pub(super) struct NetworkState {
     /// instead of printing a lifetime counter among per-cycle ones.
     pub(super) ember_publish_beat_acked: u32,
     pub(super) ember_publish_beat_failed: u32,
+    /// The storer's counters as of the previous store heartbeat.
+    pub(super) ember_store_beat: EmberStoreBeat,
     /// Per-peer rate limit for UDP EPX `ExchangeData` ingestion —
     /// `(accepted_count_in_window, window_start)`. Unlike TCP EPX, which
     /// resets `MAX_EPX_PACKETS_PER_CONNECTION` naturally when the TCP
@@ -1232,26 +1246,10 @@ pub(super) struct NetworkState {
     /// called by `OnAccept` shedding load), so a disconnected eMule keeps serving
     /// the peers that already hold a queue slot or know its address. Two earlier
     /// rules tried to raise this on disconnect and both stopped uploads that
-    /// should have kept running — see `NetworkCommand::KadDisconnect` and
-    /// `handle_server_disconnect`.
+    /// should have kept running — see `handle_server_disconnect`.
     ///
     /// Nothing clears it, because there is no path back from shutdown.
     pub(super) uploads_halted_for_shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /// The user asked activity to stop: set by an explicit `KadDisconnect`,
-    /// cleared by every path back off `Disconnected`.
-    ///
-    /// Deliberately not `uploads_halted_for_shutdown`, which answers a different
-    /// question — "are we still accepting inbound connections?" — and is raised
-    /// only by shutdown, which is not the user asking to go offline. This one is
-    /// only ever set by an explicit Disconnect, so it can
-    /// gate the outbound side: starting download workers, dialling friends, and
-    /// UDP server search, plus whether eD2K auto-reconnect may fire at all.
-    ///
-    /// Shared rather than a plain `bool` because friend dials outlive the
-    /// network task's borrow — one spawned before the click can still be
-    /// mid-handshake after it, and the session-insert path has to be able to
-    /// see that the answer changed underneath it.
-    pub(super) user_offline: Arc<std::sync::atomic::AtomicBool>,
     /// Whether we have successfully registered with the rendezvous server
     pub(super) rendezvous_registered: bool,
     /// Last successful `/register` had intro *and* every pairwise presence
@@ -1319,11 +1317,11 @@ pub(super) struct NetworkState {
     /// has superseded the task.
     pub(super) nat_probe_generation: u64,
     /// Invalidates mapping keep-alive (STUN/TCP-hold) cycle results that
-    /// arrive after a disconnect has superseded them — a `NetworkState`
-    /// field (not a loop-local) specifically so `NetworkCommand::KadDisconnect`
-    /// can bump it and stop a stale in-flight result from re-populating
+    /// arrive after a reset has superseded them — a `NetworkState` field (not
+    /// a loop-local) specifically so `reset_stun_keepalive_session` can bump
+    /// it and stop a stale in-flight result from re-populating
     /// `external_udp_port` / `stun_sourced_udp_port` / advertise ports right
-    /// after `reset_stun_keepalive_session` just cleared them.
+    /// after clearing them.
     pub(super) mapping_ka_generation: u64,
     /// Live-updated mirror of `nat_info` (plus the QUIC endpoint once
     /// available) shared with spawned friend-dial tasks via
@@ -1566,7 +1564,7 @@ pub(super) struct NetworkState {
     /// See [`note_channel_delivery`].
     pub(super) channel_delivery_notes: VecDeque<([u8; 16], [u8; 16], i64)>,
     /// Where a full verdict buffer is flushed from outside the tick.
-    pub(super) channel_delivery_sink: (Arc<Database>, tauri::AppHandle),
+    pub(super) channel_delivery_sink: (Arc<Database>, crate::host::AppHandle),
     /// Inbound `CHANNEL_MSG` timestamps keyed by the DHT hop's node id.
     pub(super) channel_gossip_from_times: HashMap<[u8; 16], VecDeque<std::time::Instant>>,
     /// Room row plus derived content keys, memoised for the packet paths.
@@ -1639,6 +1637,12 @@ pub(super) struct NetworkState {
     /// batches land in the order their lookups finished.
     pub(super) ember_channel_ingest:
         Option<tokio::task::JoinHandle<super::channel_membership::ChannelIngestResults>>,
+    /// The rooms whose moderation lookups `ember_channel_ingest` is writing,
+    /// and whether one of them counts as a read
+    /// (`channel_membership::moderation_look_answered`).
+    pub(super) ember_channel_ingest_moderation: HashMap<[u8; 16], bool>,
+    /// The same for lookups that have ended and wait for the next ingest.
+    pub(super) channel_moderation_look_read: HashMap<[u8; 16], bool>,
     /// Last presence FIND_VALUE start per channel.
     pub(super) channel_presence_fetch_at: HashMap<[u8; 16], i64>,
     /// The one room the user currently has open, if any.
@@ -1679,6 +1683,27 @@ pub(super) struct NetworkState {
     pub(super) channel_moderation_fetch_at: HashMap<[u8; 16], i64>,
     /// Last owner moderation STORE per channel.
     pub(super) channel_moderation_publish_at: HashMap<[u8; 16], i64>,
+    /// When the newest moderation lookup some peer answered began, per
+    /// channel: how fresh this device's view of the network's snapshot is.
+    pub(super) channel_moderation_looked_at: HashMap<[u8; 16], i64>,
+    /// When a due owner republish first asked for, or began waiting on, a
+    /// fresh look at the network's snapshot
+    /// (`channel_membership::owner_republish_read_gate`).
+    pub(super) channel_republish_read_asked: HashMap<[u8; 16], i64>,
+    /// How long a due owner republish has been putting itself off for want of
+    /// an answered look, and when it last did; cleared once it signs.
+    pub(super) channel_republish_deferred: HashMap<[u8; 16], (i64, i64)>,
+    /// The older epoch whose key records are being renewed, if any, and when
+    /// the rooms we own were last looked over for one
+    /// (`channel_membership::maybe_renew_retained_channel_epochs`).
+    pub(super) channel_retained_renewal: Option<super::channel_membership::RetainedEpochRenewal>,
+    pub(super) channel_retained_scan_at: i64,
+    /// The epoch the owner pass last re-sealed for each room we own, and when
+    /// (`channel_membership::maybe_publish_owned_channel_records`).
+    pub(super) channel_epoch_resealed: HashMap<[u8; 16], (i64, i64)>,
+    /// Owner moderation STOREs in flight, by publish id, so one that stores
+    /// nowhere is retried soon (`channel_membership::note_owner_snapshot_finished`).
+    pub(super) owner_snapshot_publishes: HashMap<u32, [u8; 16]>,
     /// Moderation lookups started per channel this session, which is what
     /// settings lookups ride: one on every third.
     pub(super) channel_moderation_passes: HashMap<[u8; 16], u64>,
@@ -1742,8 +1767,6 @@ pub(super) struct NetworkState {
     pub(super) local_ed25519_seed: [u8; 32],
     /// Ember Transfer: files we have offered or are sending, by transfer id.
     pub(super) xfer_send: HashMap<[u8; 16], ember::xfer::SendState>,
-    /// See [`super::channel_xfer::note_sealed_offer_reader`].
-    pub(super) sealed_offer_readers: super::channel_xfer::SealedOfferReaders,
     /// Ember Transfer: files we accepted and are pulling in.
     pub(super) xfer_recv: HashMap<[u8; 16], ember::xfer::RecvState>,
     /// Where [`finish_xfer_recv`] posts a verified transfer back to the event
@@ -1802,6 +1825,8 @@ pub(super) struct NetworkState {
     pub(super) xfer_offer_policy: &'static str,
     /// Read-only view of the friends list, for the `"friends"` offer policy.
     pub(super) xfer_friend_hashes: crate::app_state::SharedFriendHashes,
+    /// Room libraries: ours answered, theirs asked, files fetched from them.
+    pub(super) room_library: super::room_library::LibraryState,
     /// Chat attachments a friend has offered us that nobody has answered yet,
     /// with what accepting one needs. What its row does not hold is kept
     /// beside it, sealed, so a restart can bring it back: see
@@ -1844,11 +1869,14 @@ pub(super) struct NetworkState {
     /// In-flight FIND_VALUE of a content-key epoch record (`search_id` →
     /// channel + epoch).
     pub(super) ember_channel_epoch_searches: HashMap<u32, ([u8; 16], i64)>,
-    /// Epoch blobs accumulated for a room and epoch while a FIND_VALUE for it
-    /// is still in flight: one walk for the v2 key, one for the v1 key.
-    pub(super) ember_channel_epoch_buffer: HashMap<([u8; 16], i64), Vec<Vec<u8>>>,
-    /// Epoch blobs waiting to be opened and stored (async drain).
-    pub(super) ember_pending_channel_epoch: Vec<([u8; 16], i64, Vec<Vec<u8>>)>,
+    /// What the lookups of a room's epoch have gathered while one is still in
+    /// flight: one walk for the v2 key, one for the v1 key.
+    pub(super) ember_channel_epoch_buffer:
+        HashMap<([u8; 16], i64), super::channel_membership::EpochLookupHeld>,
+    /// Epoch blobs waiting to be opened and stored (async drain), and how the
+    /// lookups that found them ended.
+    pub(super) ember_pending_channel_epoch:
+        Vec<([u8; 16], i64, Vec<Vec<u8>>, super::channel_membership::EpochLookupEnd)>,
     /// Last epoch FIND_VALUE start per channel.
     ///
     /// Per channel rather than per (channel, epoch): we only ever chase the one
@@ -1856,6 +1884,12 @@ pub(super) struct NetworkState {
     /// a long-lived client accumulated an entry for every rotation a room had
     /// ever had, with nothing to remove them.
     pub(super) channel_epoch_fetch_at: HashMap<[u8; 16], i64>,
+    /// When an answered lookup of `(room, epoch)`, an epoch older than the one
+    /// the room had announced by then, last found nothing; it is passed over
+    /// until `channel_membership::CHANNEL_EPOCH_MISS_RETRY_SECS` after that.
+    /// Pruned past that on every lookup pass, so it holds at most the
+    /// retention window's epochs for each private room.
+    pub(super) channel_epoch_missed: HashMap<([u8; 16], i64), i64>,
     /// In-flight FIND_VALUE of a succession claim (`search_id` → channel).
     pub(super) ember_channel_claim_searches: HashMap<u32, [u8; 16]>,
     /// Claim blobs waiting to be verified against the owner's nomination.
@@ -1894,6 +1928,11 @@ pub(super) struct EmberSearchRequest {
     /// the search treats differently from a lost reply — see
     /// [`ember::dht::search::QueryFailure::HandshakeNeverCompleted`].
     pub(super) handshake_to: Option<(std::net::SocketAddr, [u8; 32])>,
+    /// When the sweep gives up on that handshake, for a query sent behind one:
+    /// a peer that has not answered it by then is not going to, and the query
+    /// fails then rather than at `deadline`. See
+    /// `ember_dht::EMBER_SEARCH_HANDSHAKE_TIMEOUT`.
+    pub(super) handshake_deadline: Option<std::time::Instant>,
     /// Where the query went. An answer is taken only from there: the reply's
     /// sender id is whatever key it was signed with, and a host holding many
     /// keys could otherwise answer for ones it had gossiped at addresses in

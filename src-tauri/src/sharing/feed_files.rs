@@ -85,12 +85,19 @@ pub fn hidden_share(ed2k_hash: &[u8; 16]) -> Option<HiddenShare> {
     hidden().read().get(ed2k_hash).and_then(|holders| served(holders)).cloned()
 }
 
-/// Every hidden share, once per list, for the Ember source publisher.
+/// Every hidden share, once per list, for the Ember source publisher: only
+/// those with a copy on disk, so a list deleted, or on a drive unplugged, is
+/// not offered to followers who would be refused it.
 pub fn hidden_shares() -> Vec<([u8; 16], HiddenShare)> {
     hidden()
         .read()
         .iter()
-        .filter_map(|(hash, holders)| served(holders).map(|share| (*hash, share.clone())))
+        .filter_map(|(hash, holders)| {
+            holders
+                .iter()
+                .find(|(_, share)| share.path.is_file())
+                .map(|(_, share)| (*hash, share.clone()))
+        })
         .collect()
 }
 
@@ -259,7 +266,6 @@ mod tests {
         let share = HiddenShare { path: PathBuf::from("x"), size: 3, name: "n".into(), ember_file_hash: "e".into() };
         share_hidden(hash, "a", share.clone());
         assert_eq!(hidden_share(&hash), Some(share.clone()));
-        assert!(hidden_shares().iter().any(|(h, _)| *h == hash));
         share_hidden(hash, "b", HiddenShare { path: PathBuf::from("y"), ..share.clone() });
         assert!(!unshare_hidden(&hash, "a"), "the other holder still serves it");
         assert_eq!(hidden_share(&hash).map(|s| s.path), Some(PathBuf::from("y")));
@@ -325,6 +331,10 @@ mod tests {
         assert!(hidden_shares().iter().any(|(h, s)| *h == hash && s.path == there));
         std::fs::remove_file(&there).unwrap();
         assert_eq!(hidden_share(&hash).map(|s| s.path), Some(gone), "none there: still the first");
+        assert!(
+            !hidden_shares().iter().any(|(h, _)| *h == hash),
+            "but not offered to the source publisher, with no copy to send"
+        );
         unshare_hidden(&hash, "first");
         unshare_hidden(&hash, "second");
         let _ = std::fs::remove_dir_all(&dir);

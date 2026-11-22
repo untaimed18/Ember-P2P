@@ -1,5 +1,5 @@
 //! Feeds: a publisher's signed, updatable list of files, which anyone can
-//! follow. See `docs/post-1.7.5.md`, "Follow a publisher (feeds)".
+//! follow. See `docs/archived-plans/post-1.7.5.md`, "Follow a publisher (feeds)".
 //!
 //! A feed is two things. Its **head** is a small record in the Ember DHT
 //! (`RECORD_TYPE_FEED`), signed by the publisher's identity and filed under

@@ -36,6 +36,8 @@ mod publishing;
 pub(crate) mod reachability;
 pub mod rendezvous;
 pub(crate) mod room_dm;
+mod room_dm_mail;
+pub(crate) mod room_library;
 mod search;
 mod server;
 mod settings;
@@ -67,9 +69,8 @@ use std::sync::Arc;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use futures::FutureExt;
-use tauri::{Emitter, Manager};
+use crate::host::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::TcpStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
@@ -119,9 +120,10 @@ use crate::storage::known_files::KnownFileList;
 use crate::storage::statistics::{StatsManager, TransferStats};
 
 use self::browse::{
-    bind_browse_request_to_session, browse_request_is_pending, cancel_browse_request,
-    complete_browse_request, dispatch_browse_head, enqueue_browse_request, remove_browse_request,
-    remove_browse_requests_for_session, send_browse_response_to_origin, PendingBrowseRequests,
+    announce_ember_features, bind_browse_request_to_session, browse_request_is_pending, browse_serve_allowed,
+    cancel_browse_request, complete_browse_request, dispatch_browse_head, enqueue_browse_request,
+    remove_browse_request, remove_browse_requests_for_session, send_browse_response_to_origin, set_browse_filter,
+    PendingBrowseRequests,
 };
 use self::command::handle_command;
 
@@ -134,7 +136,7 @@ use self::host_port_map::HostPortMap;
 use self::ember_publish::{
     ember_batch_ack_deadline, EmberBatchInFlight, EmberBatchPublisher, EmberFlushStats,
     EmberProxyBuddyPacer, EmberPublishAttempts, EmberPublishKind, EmberPublishPassStats, EmberRecordRef,
-    EMBER_BATCH_ACK_TIMEOUT, EMBER_BATCH_QUEUE_MAX, EMBER_FLUSH_INTERVAL,
+    EmberStoreBeat, EMBER_BATCH_ACK_TIMEOUT, EMBER_BATCH_QUEUE_MAX, EMBER_FLUSH_INTERVAL,
     EMBER_MAX_BATCH_FRAMES_PER_PEER, EMBER_PUBLISH_MAX_ATTEMPTS,
     EMBER_STORE_RECORDS_PER_PEER_PER_MIN, K_EMBER_REPLICAS,
 };
@@ -190,6 +192,7 @@ pub(crate) use self::downloads::{
 };
 pub(crate) use self::friends::{deliver_friend_request_verdict, FriendRequestVerdict};
 pub use self::search::SearchMoreOutcome;
+pub(crate) use self::search::clip_note_comment;
 pub use self::server::{clear_server_log_history, server_log_history, ServerLogLine};
 pub use self::state::{
     EmberMaintenanceResult, EmberPublishPending, EmberPublishResult, EmberValueLookupPending,
@@ -274,7 +277,7 @@ const RENDEZVOUS_REGISTER_WATCHDOG: std::time::Duration = std::time::Duration::f
 pub struct NetworkDeps {
     // --- Runtime handles ---
     /// Tauri handle used for event emission and resource/data path lookups.
-    pub app_handle: tauri::AppHandle,
+    pub app_handle: crate::host::AppHandle,
     /// Inbound commands from the Tauri command layer. Not clonable: the
     /// network task is the sole consumer, so `start_network` takes
     /// `NetworkDeps` by value.
@@ -335,6 +338,20 @@ pub struct NetworkDeps {
     pub comment_manager: Arc<RwLock<CommentManager>>,
 }
 
+/// A command that arrived while [`start_network`] waits to go online, taken
+/// into the settings it then starts on. Its caller saved the change and has
+/// been answered, so dropping it would leave the network on the old value
+/// while Settings shows the new one. Returns whether it was one of those.
+fn hold_settings_before_start(settings: &mut AppSettings, command: NetworkCommand) -> bool {
+    match command {
+        NetworkCommand::UpdateSettings { settings: new_settings } => *settings = *new_settings,
+        NetworkCommand::SetIpFilterEnabled { enabled } => settings.ip_filter_enabled = enabled,
+        NetworkCommand::SetBlockPrivateIps { block_private } => settings.block_private_ips = block_private,
+        _ => return false,
+    }
+    true
+}
+
 pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     let NetworkDeps {
         app_handle,
@@ -375,14 +392,43 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 match command {
                     Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
                     Some(NetworkCommand::StartupLibraryIndexed) => library_indexed_during_gate = true,
-                    Some(_) => {
-                        warn!("Dropping network command while security policy reset is unacknowledged");
+                    Some(command) => {
+                        if !hold_settings_before_start(&mut settings, command) {
+                            warn!("Dropping network command while security policy reset is unacknowledged");
+                        }
                     }
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
         }
     }
+    // Nor before the network interface Settings keep Ember on is there
+    // (`net_bind`): a VPN that connects after Ember starts brings it online
+    // then, and until it does nothing goes out by another way. Looked at here
+    // as well as by the watch in `lib.rs`, so going online waits on nothing
+    // else.
+    if crate::net_bind::binding() == crate::net_bind::Binding::Unavailable {
+        info!("Waiting for the chosen network interface before going online");
+    }
+    while crate::net_bind::binding() == crate::net_bind::Binding::Unavailable {
+        tokio::select! {
+            command = cmd_rx.recv() => {
+                match command {
+                    Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
+                    Some(NetworkCommand::StartupLibraryIndexed) => library_indexed_during_gate = true,
+                    Some(command) => {
+                        if !hold_settings_before_start(&mut settings, command) {
+                            debug!("Dropping network command while the chosen network interface is not connected");
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                let _ = tokio::task::spawn_blocking(crate::net_bind::refresh).await;
+            }
+        }
+    }
+    crate::net_bind::hold_address();
     // Taken after the policy wait, which drops commands: a line sent during it
     // never reaches the retry queue and belongs to the startup sweep.
     let channel_sweep_cutoff = chrono::Utc::now().timestamp();
@@ -445,8 +491,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         let _ = sock2.set_recv_buffer_size(8 * 1024 * 1024);
         let _ = sock2.set_send_buffer_size(2 * 1024 * 1024);
         sock2.set_nonblocking(true)?;
-        let addr: SocketAddr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), candidate);
-        if let Err(e) = sock2.bind(&socket2::SockAddr::from(addr)) {
+        if let Err(e) = crate::net_bind::bind_socket(&sock2, candidate) {
             last_bind_err = format!("port {candidate}: {e}");
             if candidate == udp_port {
                 warn!("UDP port {candidate} in use, trying fallback ports");
@@ -619,7 +664,9 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
 
     // Read once: gates the maintenance retries, the QUIC port mapping and the
     // shutdown teardown for the whole session, so a change applies at restart.
-    let upnp_enabled = settings.upnp_enabled;
+    // Off while Ember is kept on one interface: UPnP would ask the home router
+    // to open ports for traffic that leaves by the VPN instead.
+    let upnp_enabled = settings.upnp_enabled && !crate::net_bind::is_configured();
 
     // Defer UPnP gateway discovery/mapping and heavy disk loads until after
     // the event loop is running so splash IPC / GetNetworkStats are not
@@ -831,6 +878,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         crate::types::room_dm_policy_in_force(&settings.room_dm_policy),
         settings.ignored_members.as_deref(),
     );
+    room_dm::set_collects_room_mail(settings.chat_mailbox_enabled);
 
     let mut state = NetworkState {
         local_id,
@@ -841,15 +889,14 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         dht_store,
         stats: NetworkStats {
             // KAD always bootstraps on startup, so the node opens in
-            // `Connecting` rather than waiting to be asked. `Disconnected` is
-            // still reachable — an explicit `KadDisconnect` from the KAD
-            // Network page puts us there for the rest of the session — so
-            // every gate that checks for it below still earns its place.
+            // `Connecting` rather than waiting to be asked. Nothing moves it
+            // to `Disconnected` afterwards.
             status: NetworkStatus::Connecting,
             bound_udp_port: udp_port,
             session_tcp_port: tcp_port,
             session_udp_port: settings.udp_port,
-            session_upnp_enabled: upnp_enabled,
+            session_upnp_enabled: settings.upnp_enabled,
+            interface_bound: crate::net_bind::is_configured(),
             ..Default::default()
         },
         pending_keyword_searches: HashMap::new(),
@@ -864,6 +911,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         server_search_age: 0,
         server_udp_search_age: 0,
         udp_search_queue: VecDeque::new(),
+        udp_sweep_last_sent: None,
         download_source_searches: HashMap::new(),
         source_search_stream_cursor: HashMap::new(),
         evicted_kad_sources: Vec::new(),
@@ -898,6 +946,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         shared_nickname: Arc::new(tokio::sync::RwLock::new(settings.ed2k_nickname())),
         peer_nicknames: HashMap::new(),
         publish_pending: HashMap::new(),
+        publish_last_ack: HashMap::new(),
         publish_confirmed: 0,
         publish_res_plain_seen: 0,
         publish_res_obf_decoded: 0,
@@ -1049,6 +1098,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_session_dht_contacts: HostPortMap::new(),
         ember_rendezvous_published_at: 0,
         ember_rendezvous_search: None,
+        ember_rendezvous_listed: HashSet::new(),
         ember_rendezvous_looked_up_at: 0,
         ember_rendezvous_empty_streak: 0,
         ember_announced_at: HashMap::new(),
@@ -1106,6 +1156,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             ember_gossip_probe_window: (std::time::Instant::now(), 0),
             ember_publish_beat_acked: 0,
             ember_publish_beat_failed: 0,
+            ember_store_beat: EmberStoreBeat::default(),
         ember_udp_epx_rate: HashMap::new(),
         ember_udp_epx_req_rate: HashMap::new(),
         ember_diagnostics: EmberDiagnostics::default(),
@@ -1137,12 +1188,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // silently servable by any peer that remembered our IP:port from a
         // prior session while the UI still read "Disconnected". Now that KAD
         // always bootstraps there is no such session: startup is always a
-        // connect. `KadDisconnect` sets the flag, and `KadConnect` /
-        // `initiate_server_connect` clear it again.
+        // connect. Only shutdown raises it now.
         uploads_halted_for_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        // Starts false on purpose — see the field comment. "Has not connected
-        // yet" is not "was asked to go offline".
-        user_offline: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         rendezvous_registered: false,
         last_presence_blocked: false,
         rendezvous_register_generation: 0,
@@ -1241,6 +1288,8 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_channel_presence_buffer: HashMap::new(),
         ember_pending_channel_presence: Vec::new(),
         ember_channel_ingest: None,
+        ember_channel_ingest_moderation: HashMap::new(),
+        channel_moderation_look_read: HashMap::new(),
         channel_presence_fetch_at: HashMap::new(),
         channel_focused: None,
         channel_beacon_beat_at: HashMap::new(),
@@ -1252,6 +1301,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_pending_channel_moderation: Vec::new(),
         channel_moderation_fetch_at: HashMap::new(),
         channel_moderation_publish_at: HashMap::new(),
+        channel_moderation_looked_at: HashMap::new(),
+        channel_republish_read_asked: HashMap::new(),
+        channel_republish_deferred: HashMap::new(),
+        channel_retained_renewal: None,
+        channel_retained_scan_at: 0,
+        channel_epoch_resealed: HashMap::new(),
+        owner_snapshot_publishes: HashMap::new(),
         channel_moderation_passes: HashMap::new(),
         channel_settings_fetch_owed: HashSet::new(),
         ember_channel_settings_searches: HashMap::new(),
@@ -1274,7 +1330,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         channel_handoff_fetch_at: HashMap::new(),
         local_ed25519_seed: ed25519_secret_key,
         xfer_send: HashMap::new(),
-        sealed_offer_readers: Default::default(),
         xfer_recv: HashMap::new(),
         xfer_finish_tx,
         xfer_finish_in_flight: 0,
@@ -1294,6 +1349,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         xfer_upload_credit: 0,
         xfer_offer_policy: crate::types::channel_file_offers_in_force(&settings.channel_file_offers),
         xfer_friend_hashes: friend_hashes.clone(),
+        room_library: room_library::LibraryState::new(),
         attach_inbound: HashMap::new(),
         attach_held_sources: HashMap::new(),
         attach_waits_owed: HashMap::new(),
@@ -1310,6 +1366,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         ember_channel_epoch_buffer: HashMap::new(),
         ember_pending_channel_epoch: Vec::new(),
         channel_epoch_fetch_at: HashMap::new(),
+        channel_epoch_missed: HashMap::new(),
         ember_channel_claim_searches: HashMap::new(),
         ember_pending_channel_claim: Vec::new(),
         channel_return_held_since: HashMap::new(),
@@ -1329,6 +1386,17 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         // Offers still waiting on the user, back from what was kept beside
         // their rows: their senders hear of them when a session comes up.
         state.attach_inbound.extend(restored);
+    }
+    // Finished downloads from sessions long past, which the list no longer
+    // shows. Before the web sources load, which forgets theirs with them.
+    {
+        let db = db.clone();
+        match tokio::task::spawn_blocking(move || db.prune_finished_transfers()).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(removed)) => info!("Forgot {removed} finished download(s) from earlier sessions"),
+            Ok(Err(e)) => warn!("Could not forget old finished downloads: {e}"),
+            Err(e) => warn!("Finished download prune task failed: {e}"),
+        }
     }
     // Web sources downloads were added with, before any of them can start.
     ed2k::web_sources::set_enabled(settings.web_sources_enabled);
@@ -1790,39 +1858,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
             Err(e) => warn!("Could not load Ember key links: {e}"),
         }
-        // Ember credit records live in a separate v15 table, loaded the
-        // same way as the eMule table above.
-        if let Ok(records) = db.load_ember_credits() {
-            let loaded_count = records.len();
-            for (
-                pk,
-                up,
-                down,
-                last_up,
-                last_down,
-                completed,
-                total,
-                avg_speed,
-                last_seen,
-                verified,
-            ) in records
-            {
-                let mut record = ed2k::credits::EmberCreditRecord::new(pk);
-                record.uploaded = up;
-                record.downloaded = down;
-                record.last_upload_time = last_up;
-                record.last_download_time = last_down;
-                record.completed_sessions = completed;
-                record.total_sessions = total;
-                record.avg_upload_speed = avg_speed;
-                record.last_seen = last_seen;
-                record.ident_verified = verified;
-                cm.insert_loaded_ember_credit(record);
-            }
-            if loaded_count > 0 {
-                info!("Loaded {loaded_count} Ember credit records from database");
-            }
-        }
         let clients_met = data_dir.join("clients.met");
         crate::security::recover_interrupted_replace(&clients_met);
         if clients_met.exists() && cm.all_records().is_empty() {
@@ -1885,8 +1920,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // returned `Err` from `start_network` and surfaced a fatal network error
     // while the TCP listener stayed bound and accepting, with no event loop
     // left to coordinate it.
-    let mut server_udp =
-        ServerUdpSocket::from_socket(tokio::net::UdpSocket::bind("0.0.0.0:0").await?);
+    let mut server_udp = ServerUdpSocket::from_socket(crate::net_bind::udp(0).await?);
 
     // Defer auto-connect until the event loop is running (and, when needed,
     // until server.met bootstrap finishes). Starting the TCP login before the
@@ -1894,7 +1928,11 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // the server's HighID port-test against a not-yet-listening socket.
     // A restart for an update goes back to the server the user was on, whether
     // or not auto-connect is set: they were connected a minute ago.
+    #[cfg(feature = "desktop")]
     let mut resume_server = crate::auto_update::resume::take_resume_server();
+    // `emberd` installs no updates of its own, so it never restarts for one.
+    #[cfg(not(feature = "desktop"))]
+    let mut resume_server = None;
     let mut pending_auto_connect_server = settings.auto_connect_server || resume_server.is_some();
     // After a successful login, OP_OFFERFILES is queued into pending_offer_files
     // (declared with other deferred startup state) and drained one chunk/turn.
@@ -2964,52 +3002,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             }
         }
 
-        if state.stats.status == NetworkStatus::Disconnected {
-            // Ember-only nodes remain KAD-Disconnected permanently. Do not
-            // cancel an in-flight STUN probe that discovers `external_ip` for
-            // slice-9 source publish — clearing here every loop iteration
-            // would respawn forever and ignore every STUN reply as stale.
-            //
-            // Also don't stomp a probe that just started: this runs on EVERY
-            // loop iteration while disconnected (not just once on the
-            // disconnect transition), and STUN keepalive's own external-IP
-            // discovery can satisfy the NAT-probe trigger conditions before
-            // `KadConnect` ever flips status away from `Disconnected` (often
-            // within the same second at startup). Without this guard, each
-            // iteration here would reset `nat_probe_in_flight = false`,
-            // letting the catch-all trigger below immediately spawn a NEW
-            // probe and orphan the previous one's reply-routing channel —
-            // observed in practice as 3 probes spawned within ~40ms and a
-            // "STUN reply channel closed" error on the abandoned ones.
-            let probe_is_fresh = nat_probe_in_flight
-                && nat_probe_started_at
-                    .map(|t| t.elapsed() < NAT_PROBE_WATCHDOG)
-                    .unwrap_or(false);
-            if !settings.ember_native_enabled && !probe_is_fresh {
-                nat_probe_in_flight = false;
-                nat_probe_started_at = None;
-                nat_probe_packet_tx = None;
-            }
-            // Same trap as the NAT probe above, and for the same reason: once
-            // the user disconnects KAD the node is `Disconnected` for the rest
-            // of the session, so clearing unconditionally left the in-flight guard
-            // permanently false. The bootstrap timer then respawned
-            // registration every tick, each spawn bumped
-            // `rendezvous_register_generation`, and the result handler dropped
-            // every reply as stale — `rendezvous_registered` and
-            // `friend_presence_initial_done` could never latch and friends
-            // never saw us. Only give up on an attempt the watchdog would have
-            // abandoned anyway.
-            let register_is_fresh = rendezvous_register_in_flight
-                && rendezvous_register_started_at
-                    .map(|t| t.elapsed() < RENDEZVOUS_REGISTER_WATCHDOG)
-                    .unwrap_or(false);
-            if !register_is_fresh {
-                rendezvous_register_in_flight = false;
-                rendezvous_register_started_at = None;
-            }
-        }
-
         // Probe NAT when we already know an external IP (refine type), or when
         // Ember is on and we still lack one (STUN discovers the mapped address
         // so KAD-less HighID source publish can advertise a real IP).
@@ -3187,17 +3179,13 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                             ).await;
                         }
                     } else {
-                        // Always dispatch: this handler owns eD2K peer UDP as
-                        // well as KAD, and it gates the KAD half on connection
-                        // state itself. Only the KAD accounting is conditional.
-                        if state.stats.status != NetworkStatus::Disconnected {
-                            last_kad_activity_at = monotonic_secs();
-                            stats_manager.add_overhead(
-                                crate::storage::statistics::OverheadCategory::Kad,
-                                crate::storage::statistics::OverheadDirection::Download,
-                                len as u64,
-                            );
-                        }
+                        // This handler owns eD2K peer UDP as well as KAD.
+                        last_kad_activity_at = monotonic_secs();
+                        stats_manager.add_overhead(
+                            crate::storage::statistics::OverheadCategory::Kad,
+                            crate::storage::statistics::OverheadDirection::Download,
+                            len as u64,
+                        );
                         handle_udp_packet(
                             &udp_socket,
                             data,
@@ -3615,7 +3603,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // sent — not 60s later.
             _ = publish_health_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let cur = PublishHealthSnapshot {
                     confirmed: state.publish_confirmed,
                     pending: state.publish_pending.len(),
@@ -3753,7 +3740,6 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
             // eMule Consolidate: merge sparse sibling leaf zones every 45 minutes
             _ = consolidate_timer.tick() => {
                 let __panic_result = std::panic::AssertUnwindSafe(async {
-                if state.stats.status == NetworkStatus::Disconnected { return; }
                 let merged = state.routing_table.consolidate();
                 if merged > 0 {
                     debug!("Consolidated {merged} zone pairs");
@@ -3796,6 +3782,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                         // visibility is in the periodic discovery health log.
                         debug!("UDP global search send_to {addr} failed: {e}");
                     } else {
+                        state.udp_sweep_last_sent = Some(addr);
                         // eMule SentUDPRequestNotification: only accept replies
                         // from IPs we successfully queried this search.
                         if let (Some(active), IpAddr::V4(ip)) =

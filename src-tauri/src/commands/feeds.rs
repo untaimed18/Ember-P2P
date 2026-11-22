@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use tauri::{Emitter, Manager};
+use crate::host::{Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{bounded_send, coded, coded_ctx};
@@ -106,6 +106,16 @@ fn publish_unreachable() -> String {
     coded("feeds_publish_unreachable", "Could not reach the Ember network to publish the feed. Try again in a minute.")
 }
 
+/// A head sent that too few nodes confirmed in time: it may well be stored,
+/// and is kept to be sent again by itself (`keep_pending`), so trying again
+/// is not the user's to do.
+fn publish_unconfirmed() -> String {
+    coded(
+        "feeds_publish_unconfirmed",
+        "The feed was sent, but too few nodes confirmed it in time. Ember sends it again by itself.",
+    )
+}
+
 fn hex_salt(salt: &str) -> Result<FeedSalt, String> {
     let mut out = [0u8; 16];
     hex::decode_to_slice(salt.trim(), &mut out).map_err(|_| coded("feeds_not_found", "That feed could not be found"))?;
@@ -119,7 +129,7 @@ fn hex_publisher(publisher: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-fn feeds_dir(app: &tauri::AppHandle) -> PathBuf {
+fn feeds_dir(app: &crate::host::AppHandle) -> PathBuf {
     feed_files::feeds_dir(&crate::storage::paths::resolve_data_dir_with_app(app))
 }
 
@@ -415,7 +425,7 @@ async fn count_followers(state: &AppState, dir: &Path, feed: &OwnFeed) -> Option
 
 /// Count the followers of the published feed of ours counted longest ago, if
 /// one is due, and say so to the page.
-async fn count_due_followers(app: &tauri::AppHandle, state: &AppState, own: &[OwnFeed], now: i64) {
+async fn count_due_followers(app: &crate::host::AppHandle, state: &AppState, own: &[OwnFeed], now: i64) {
     let due = {
         let mut counts = follower_counts().lock();
         counts.retain(|salt, _| own.iter().any(|feed| feed.salt == *salt));
@@ -447,7 +457,7 @@ fn counting_followers() -> &'static std::sync::Arc<std::sync::atomic::AtomicBool
 
 /// Save the downloads followers made from us since the last tick, and say
 /// so to the page for each feed they were of.
-async fn record_feed_downloads(app: &tauri::AppHandle, state: &AppState, now: i64) {
+async fn record_feed_downloads(app: &crate::host::AppHandle, state: &AppState, now: i64) {
     let downloads = crate::network::feed_direct::take_downloads();
     if downloads.is_empty() {
         return;
@@ -476,7 +486,7 @@ async fn record_feed_downloads(app: &tauri::AppHandle, state: &AppState, now: i6
     crate::network::feed_direct::requeue_downloads(downloads);
     // One retry waiting at a time, however many saves fail meanwhile.
     if !DOWNLOADS_RETRY_DUE.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        tauri::async_runtime::spawn(async {
+        crate::host::async_runtime::spawn(async {
             tokio::time::sleep(DOWNLOADS_RETRY).await;
             DOWNLOADS_RETRY_DUE.store(false, std::sync::atomic::Ordering::Release);
             crate::network::feed_direct::downloads_noted().notify_one();
@@ -488,8 +498,8 @@ async fn record_feed_downloads(app: &tauri::AppHandle, state: &AppState, now: i6
 const DOWNLOADS_RETRY: Duration = Duration::from_secs(30);
 static DOWNLOADS_RETRY_DUE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[tauri::command]
-pub async fn list_my_feeds(state: tauri::State<'_, AppState>) -> Result<Vec<OwnFeedInfo>, String> {
+#[ember_macros::command]
+pub async fn list_my_feeds(state: crate::host::State<'_, AppState>) -> Result<Vec<OwnFeedInfo>, String> {
     let db = state.db.clone();
     let feeds = blocking(move || db.feeds_own(), "feeds_failed", "Could not read feeds").await?;
     let mut out = Vec::with_capacity(feeds.len());
@@ -510,9 +520,9 @@ fn checked_details(title: &str, description: &str) -> Result<(String, String), S
 
 /// Start a feed, `listed` in the public index or found only by its link.
 /// Nothing is published until [`publish_feed`].
-#[tauri::command]
+#[ember_macros::command]
 pub async fn create_feed(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     title: String,
     description: String,
     listed: bool,
@@ -545,9 +555,9 @@ pub struct FeedDetails {
     pub description: String,
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_feed_details(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     salt: String,
     title: String,
     description: String,
@@ -571,10 +581,10 @@ pub async fn set_feed_details(
 /// List a feed of ours in the public index, or take it out. A published
 /// feed's listing, or its withdrawal, goes out at once; one not yet
 /// published is listed when it is.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_feed_listed(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     salt: String,
     listed: bool,
 ) -> Result<OwnFeedInfo, String> {
@@ -722,9 +732,9 @@ pub struct SavedFeedItems {
 /// item then has at least one source, and a BLAKE3 a follower can check.
 /// An item no longer shared with everyone is left out, not the whole save
 /// refused, as a publish would leave it out.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_feed_items(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     salt: String,
     items: Vec<FeedItemInput>,
 ) -> Result<SavedFeedItems, String> {
@@ -835,9 +845,9 @@ pub struct AddedFeedItems {
 /// Add files from the Library to the end of a feed's items, for the Library's
 /// "Add to feed". Saved as an edit is: the feed shows as changed until it is
 /// published from the Feeds page.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn add_feed_items(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     salt: String,
     ed2ks: Vec<String>,
 ) -> Result<AddedFeedItems, String> {
@@ -1091,10 +1101,10 @@ fn open_list_collection(publisher: &str, salt: &str, bytes: &[u8]) -> Option<Col
 
 /// Write the feed's list, serve it, and publish a head naming it. Holds
 /// [`publish_lock`] throughout, so two publishes never cross.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn publish_feed(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     salt: String,
 ) -> Result<OwnFeedInfo, String> {
     let salt_bytes = hex_salt(&salt)?;
@@ -1221,7 +1231,7 @@ pub async fn publish_feed(
         Placed::Unknown => {
             keep_pending(&state, &owner, &feed, &held, new_list.clone(), &published).await;
             refresh_served_files(&state).await;
-            return Err(publish_unreachable());
+            return Err(publish_unconfirmed());
         }
     }
 
@@ -1535,8 +1545,8 @@ fn tombstone_of(feed: &OwnFeed, now: i64, now_ms: u64) -> Option<DeletedFeed> {
 /// past its last (see [`send_tombstone`]), which followers take as its end;
 /// followers keep what they hold. A feed listed in the public index is
 /// withdrawn from it by the service's tick, daily until its listing lapses.
-#[tauri::command]
-pub async fn delete_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState>, salt: String) -> Result<(), String> {
+#[ember_macros::command]
+pub async fn delete_feed(app: crate::host::AppHandle, state: crate::host::State<'_, AppState>, salt: String) -> Result<(), String> {
     let salt = hex::encode(hex_salt(&salt)?);
     let _publishing = publish_lock().lock().await;
     let dir = feeds_dir(&app);
@@ -1566,7 +1576,7 @@ pub async fn delete_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState
     // One that does not get through is due again within minutes.
     if let Some(tombstone) = tombstone {
         let app = app.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             if let Some(state) = app.try_state::<AppState>() {
                 send_tombstone(&state, &salt, tombstone.sequence, &tombstone.title).await;
             }
@@ -1687,16 +1697,16 @@ fn followed_info(feed: FollowedFeed) -> FollowedFeedInfo {
     FollowedFeedInfo { feed, link, activity, already_following: false }
 }
 
-#[tauri::command]
-pub async fn list_followed_feeds(state: tauri::State<'_, AppState>) -> Result<Vec<FollowedFeedInfo>, String> {
+#[ember_macros::command]
+pub async fn list_followed_feeds(state: crate::host::State<'_, AppState>) -> Result<Vec<FollowedFeedInfo>, String> {
     let db = state.db.clone();
     let feeds = blocking(move || db.feeds_followed(), "feeds_failed", "Could not read feeds").await?;
     Ok(feeds.into_iter().map(followed_info).collect())
 }
 
 /// Follow the feed a link names, and look for its head at once.
-#[tauri::command]
-pub async fn follow_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState>, link: String) -> Result<FollowedFeedInfo, String> {
+#[ember_macros::command]
+pub async fn follow_feed(app: crate::host::AppHandle, state: crate::host::State<'_, AppState>, link: String) -> Result<FollowedFeedInfo, String> {
     let link = FeedLink::parse(&link).ok_or_else(|| coded("feeds_bad_link", "That is not a feed link"))?;
     if link.publisher == state.identity.ed25519_public_key {
         return Err(coded("feeds_own", "That is one of your own feeds"));
@@ -1717,7 +1727,7 @@ pub async fn follow_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState
     let feed = feed.ok_or_else(|| coded("feeds_failed", "Could not follow the feed"))?;
     if added {
         let looked = app.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             if let Some(state) = looked.try_state::<AppState>() {
                 look_up_head(&looked, &state, &publisher, &salt).await;
             }
@@ -1727,13 +1737,103 @@ pub async fn follow_feed(app: tauri::AppHandle, state: tauri::State<'_, AppState
     Ok(FollowedFeedInfo { already_following: !added, ..followed_info(feed) })
 }
 
+/// The feeds a friend publishes, as far as this device knows them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FriendFeeds {
+    /// The friend's Ed25519 key, which Discover filters a publisher by.
+    pub publisher: String,
+    /// Their feeds this device follows or Discover has found.
+    pub known: usize,
+}
+
+/// Each friend whose key this device holds, by friend hash, with the feeds of
+/// theirs it already knows. From the local cache alone: finding feeds no walk
+/// has seen is Discover's work, which the friend's card leads to.
+#[ember_macros::command]
+pub async fn friends_feeds(state: crate::host::State<'_, AppState>) -> Result<HashMap<String, FriendFeeds>, String> {
+    let db = state.db.clone();
+    let now = chrono::Utc::now().timestamp();
+    blocking(
+        move || {
+            let mut known: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+            for feed in db.feeds_followed()? {
+                known.entry(feed.publisher).or_default().insert(feed.salt);
+            }
+            for feed in db.feeds_discovered(now, FEED_LISTING_TTL_SECS)? {
+                known.entry(feed.publisher).or_default().insert(feed.salt);
+            }
+            Ok(db
+                .get_friend_public_keys()?
+                .into_iter()
+                .map(|(hash, key)| {
+                    let publisher = hex::encode(key);
+                    let count = known.get(&publisher).map_or(0, |salts| salts.len());
+                    (hex::encode(hash), FriendFeeds { publisher, known: count })
+                })
+                .collect())
+        },
+        "feeds_failed",
+        "Could not read feeds",
+    )
+    .await
+}
+
+/// What a feed link in a message can say about its feed from what this
+/// device already holds: one of ours, one followed, or one Discover found.
+/// Nothing is looked up on the network for it, so a card for a feed never
+/// seen costs nothing and tells nobody it was shown.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FeedLinkInfo {
+    /// The link as Ember writes it.
+    pub link: String,
+    pub publisher: String,
+    pub salt: String,
+    /// Empty when this device has not seen the feed.
+    pub title: String,
+    pub description: String,
+    pub item_count: i64,
+    pub following: bool,
+    pub own: bool,
+}
+
+#[ember_macros::command]
+pub async fn describe_feed_link(state: crate::host::State<'_, AppState>, link: String) -> Result<FeedLinkInfo, String> {
+    let parsed = FeedLink::parse(&link).ok_or_else(|| coded("feeds_bad_link", "That is not a feed link"))?;
+    let (publisher, salt) = (hex::encode(parsed.publisher), hex::encode(parsed.salt));
+    let own = parsed.publisher == state.identity.ed25519_public_key;
+    let db = state.db.clone();
+    let (key_pub, key_salt) = (publisher.clone(), salt.clone());
+    let now = chrono::Utc::now().timestamp();
+    let (known, following) = blocking(
+        move || {
+            if own {
+                let feed = db.feeds_own()?.into_iter().find(|f| f.salt == key_salt);
+                return Ok((feed.map(|f| (f.title, f.description, f.item_count)), false));
+            }
+            if let Some(f) = db.feed_followed(&key_pub, &key_salt)? {
+                return Ok((Some((f.title, f.description, f.item_count)), true));
+            }
+            let feed = db
+                .feeds_discovered(now, FEED_LISTING_TTL_SECS)?
+                .into_iter()
+                .find(|f| f.publisher == key_pub && f.salt == key_salt);
+            Ok((feed.map(|f| (f.title, f.description, f.item_count)), false))
+        },
+        "feeds_failed",
+        "Could not read feeds",
+    )
+    .await?;
+    let (title, description, item_count) = known.unwrap_or_default();
+    Ok(FeedLinkInfo { link: parsed.format(), publisher, salt, title, description, item_count, following, own })
+}
+
 /// Look again now, rather than at the next half hour, and fetch its list at
 /// once if it is owed one, even while resting after a fetch gave up or after
 /// its list did not match: the user asked. What the lookup came to.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn refresh_feed(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: String,
 ) -> Result<LookupOutcome, String> {
@@ -1747,7 +1847,7 @@ pub async fn refresh_feed(
     // the fetch Retry starts.
     if unsourced().lock().contains(&key) {
         reaching().lock().1.remove(&key);
-        tauri::async_runtime::spawn(reach_publisher(app.clone(), publisher.clone(), salt.clone()));
+        crate::host::async_runtime::spawn(reach_publisher(app.clone(), publisher.clone(), salt.clone()));
     }
     if outcome != LookupOutcome::Updated {
         gave_up().lock().remove(&(publisher.clone(), salt.clone()));
@@ -1766,9 +1866,9 @@ pub async fn refresh_feed(
     Ok(outcome)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_feed_items(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: String,
 ) -> Result<Vec<FollowedItemInfo>, String> {
@@ -2061,11 +2161,45 @@ fn auto_takes(feed: &FollowedFeed, item: &FollowedItem) -> bool {
         && !item.removed
 }
 
+/// The file types a follower may limit auto-download to, as eD2K type terms
+/// (`search::index::infer_file_type`). Programs and disc images are not
+/// among them: auto-download never takes those (`auto_download_refuses`).
+const AUTO_TYPES: [&str; 5] = ["Video", "Audio", "Image", "Doc", "Arc"];
+
+/// `types` as [`FollowedFeed::auto_types`] keeps them: the known ones, once
+/// each, in [`AUTO_TYPES`] order. Empty, as for no choice, takes every type.
+fn auto_types_saved(types: &[String]) -> String {
+    AUTO_TYPES
+        .iter()
+        .filter(|known| types.iter().any(|t| t == *known))
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Whether a file named `name` is of a type `feed`'s auto-download takes.
+/// Only [`AUTO_TYPES`] count, as on the Feeds page, so a value naming none of
+/// them takes every type, as the page says.
+fn auto_takes_type(feed: &FollowedFeed, name: &str) -> bool {
+    let mut chosen = feed.auto_types.split(',').filter(|t| AUTO_TYPES.contains(t)).peekable();
+    if chosen.peek().is_none() {
+        return true;
+    }
+    let extension = Path::new(name.trim_end_matches(['.', ' ']))
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    let kind = crate::search::index::infer_file_type(extension);
+    chosen.any(|t| t == kind)
+}
+
 /// Why auto-download is holding `item` back, if a cap or its type is why.
 fn auto_hold_reason(feed: &FollowedFeed, item: &FeedItem, spent: i64) -> Option<&'static str> {
     const MIB: i64 = 1024 * 1024;
     if auto_download_refuses(&item.name) {
         Some("risky")
+    } else if !auto_takes_type(feed, &item.name) {
+        Some("type")
     } else if feed.auto_max_item_mib != 0 && item.size > feed.auto_max_item_mib.saturating_mul(MIB) {
         Some("too_large")
     } else if feed.auto_max_day_mib != 0 && spent.saturating_add(item.size) > feed.auto_max_day_mib.saturating_mul(MIB) {
@@ -2089,9 +2223,9 @@ pub struct FollowedItemInfo {
     pub status: ItemStatus,
     /// Of a download on its way, 0 to 100.
     pub progress: f64,
-    /// Why auto-download has not started it: `risky`, `too_large`,
-    /// `day_limit`, `disk` (too little free space, or none could be read) or
-    /// `spam`.
+    /// Why auto-download has not started it: `risky`, `type` (not one of the
+    /// types it takes), `too_large`, `day_limit`, `disk` (too little free
+    /// space, or none could be read) or `spam`.
     pub held: Option<&'static str>,
     /// Its download, while it is in the transfer list.
     pub transfer: Option<ItemTransfer>,
@@ -2141,10 +2275,10 @@ impl ItemTransfer {
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn mark_feed_read(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: String,
 ) -> Result<(), String> {
@@ -2161,28 +2295,31 @@ fn auto_cap(mib: i64) -> i64 {
     mib.clamp(0, 1 << 30)
 }
 
-/// Auto-download for one feed: off by default, and bounded per item and per
-/// 24 hours by the caps given, each 0 for no limit. Returns the feed as
+/// Auto-download for one feed: off by default, bounded per item and per 24
+/// hours by the caps given, each 0 for no limit, and taking only `types` of
+/// [`AUTO_TYPES`], or every type when none is given. Returns the feed as
 /// saved.
-#[tauri::command]
+#[ember_macros::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn set_feed_auto_download(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: String,
     enabled: bool,
     max_item_mib: i64,
     max_day_mib: i64,
+    types: Vec<String>,
 ) -> Result<FollowedFeedInfo, String> {
     let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
     let db = state.db.clone();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
     let now = chrono::Utc::now().timestamp();
+    let types = auto_types_saved(&types);
     let feed = blocking(
         move || {
             let (item, day) = (auto_cap(max_item_mib), auto_cap(max_day_mib));
-            if !db.feed_set_auto_download(&key_pub, &key_salt, enabled, item, day, now)? {
+            if !db.feed_set_auto_download(&key_pub, &key_salt, enabled, item, day, &types, now)? {
                 return Ok(None);
             }
             db.feed_followed(&key_pub, &key_salt)
@@ -2192,6 +2329,47 @@ pub async fn set_feed_auto_download(
     )
     .await?
     .ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
+    let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": publisher, "salt": salt }));
+    Ok(followed_info(feed))
+}
+
+/// "Share files from this feed", off by default: its downloads, partial and
+/// finished, are advertised and served as any download is, and its folder is
+/// shared (`sharing::feed_shares`). Off again, they are private once more and
+/// a folder Ember shared for it is taken back; one the user shared stays.
+/// Returns the feed as saved.
+#[ember_macros::command]
+pub async fn set_feed_share_files(
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
+    publisher: String,
+    salt: String,
+    share: bool,
+) -> Result<FollowedFeedInfo, String> {
+    let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
+    let db = state.db.clone();
+    let (key_pub, key_salt) = (publisher.clone(), salt.clone());
+    let (feed, sharing) = blocking(
+        move || {
+            if !db.feed_set_share_files(&key_pub, &key_salt, share)? {
+                return Ok(None);
+            }
+            // Its folder now, if no download has given it one, so the folder
+            // is shared from before its first file.
+            if let Some(feed) = db.feed_followed(&key_pub, &key_salt)?.filter(|feed| share && feed.folder.is_empty()) {
+                let on_disk = crate::sharing::feed_downloads::folders_on_disk();
+                db.feed_followed_folder(&key_pub, &key_salt, &feed.title, &on_disk)?;
+            }
+            let sharing = db.feed_sharing_folders()?;
+            Ok(db.feed_followed(&key_pub, &key_salt)?.map(|feed| (feed, sharing)))
+        },
+        "feeds_failed",
+        "Could not save the feed",
+    )
+    .await?
+    .ok_or_else(|| coded("feeds_not_found", "That feed could not be found"))?;
+    crate::sharing::feed_downloads::set_sharing(sharing);
+    crate::sharing::feed_shares::reconcile(&app, std::slice::from_ref(&feed.folder)).await;
     let _ = app.emit(FEEDS_CHANGED_EVENT, serde_json::json!({ "publisher": publisher, "salt": salt }));
     Ok(followed_info(feed))
 }
@@ -2210,10 +2388,10 @@ fn unfinished_downloads(manager: &crate::sharing::manager::TransferManager) -> i
 /// arrived of it go, and the item shows as cancelled. Only this feed's own
 /// download is cancelled: one the user started from Transfers is theirs, and
 /// another followed feed's is that feed's.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cancel_feed_download(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: String,
     ed2k: String,
@@ -2256,10 +2434,10 @@ pub async fn cancel_feed_download(
 }
 
 /// Start downloads of some of a feed's items, by hand.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn download_feed_items(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: String,
     ed2ks: Vec<String>,
@@ -2298,12 +2476,15 @@ pub async fn download_feed_items(
 /// `sharing::feed_downloads`), and is streamed from the publisher first,
 /// friend or not; a friend's last address is tried at once (see
 /// `network::feed_direct`).
-async fn start_item_download(app: &tauri::AppHandle, feed: &FollowedFeed, item: &FeedItem) -> Result<(), String> {
+async fn start_item_download(app: &crate::host::AppHandle, feed: &FollowedFeed, item: &FeedItem) -> Result<(), String> {
     let state = app.state::<AppState>();
     let db = state.db.clone();
     let (publisher, salt, title) = (feed.publisher.clone(), feed.salt.clone(), feed.title.clone());
     let folder = blocking(
-        move || db.feed_followed_folder(&publisher, &salt, &title),
+        move || {
+            let on_disk = crate::sharing::feed_downloads::folders_on_disk();
+            db.feed_followed_folder(&publisher, &salt, &title, &on_disk)
+        },
         "feeds_failed",
         "Could not read feeds",
     )
@@ -2317,11 +2498,7 @@ async fn start_item_download(app: &tauri::AppHandle, feed: &FollowedFeed, item: 
     // Not handed over as a peer to dial over eD2K: the stream asks it first,
     // and every network is asked, the friends' path with them, if it fails.
     let friend_tcp = match &friend {
-        Some((_, Some((ip, port)))) => ip
-            .parse::<std::net::Ipv4Addr>()
-            .ok()
-            .filter(|ip| *port != 0 && !ip.is_unspecified() && !ip.is_multicast() && !ip.is_broadcast())
-            .map(|ip| std::net::SocketAddr::from((ip, *port))),
+        Some((_, Some((ip, port)))) => crate::network::feed_direct::friend_tcp(ip, *port),
         _ => None,
     };
     let started = crate::commands::transfers::start_download_to(
@@ -2375,8 +2552,8 @@ const HOLD_GRACE: Duration = Duration::from_secs(10);
 /// however it was begun, and the moment one is let go ask every network for
 /// its sources, rather than leave it to their next sweeps, the slowest of
 /// which is half an hour.
-fn spawn_hold_watcher(app: tauri::AppHandle) {
-    tauri::async_runtime::spawn(async move {
+fn spawn_hold_watcher(app: crate::host::AppHandle) {
+    crate::host::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(HOLD_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -2415,7 +2592,7 @@ fn item_reach_due(key: &[u8; 32]) -> bool {
 /// Reach the publisher with `key` by a hole punch, through the feed `salt`'s
 /// presence, and stream every download of its feeds that has no source from
 /// it (see `network::feed_direct::punched`).
-async fn reach_for_items(app: tauri::AppHandle, key: [u8; 32], salt: [u8; 16]) {
+async fn reach_for_items(app: crate::host::AppHandle, key: [u8; 32], salt: [u8; 16]) {
     let Some(state) = app.try_state::<AppState>() else {
         item_reaches().lock().remove(&key);
         return;
@@ -2442,7 +2619,7 @@ async fn reach_for_items(app: tauri::AppHandle, key: [u8; 32], salt: [u8; 16]) {
     }
 }
 
-async fn watch_holds(app: &tauri::AppHandle, state: &AppState) {
+async fn watch_holds(app: &crate::host::AppHandle, state: &AppState) {
     use crate::network::feed_direct::{self, Poll};
     use TransferStatus as S;
     let watched = feed_direct::watched();
@@ -2481,7 +2658,7 @@ async fn watch_holds(app: &tauri::AppHandle, state: &AppState) {
         if counting && sending == 0 && now.saturating_duration_since(begun) >= ITEM_REACH_AFTER {
             if let Some((key, salt)) = feed_direct::needs_publisher(&transfer_id) {
                 if item_reach_due(&key) {
-                    tauri::async_runtime::spawn(reach_for_items(app.clone(), key, salt));
+                    crate::host::async_runtime::spawn(reach_for_items(app.clone(), key, salt));
                 }
             }
         }
@@ -2504,8 +2681,8 @@ async fn watch_holds(app: &tauri::AppHandle, state: &AppState) {
 /// first has been downloaded. Under the current download folder, unless its
 /// files are only under an earlier one, where they finished before the
 /// download folder was changed.
-#[tauri::command]
-pub async fn open_feed_folder(state: tauri::State<'_, AppState>, publisher: String, salt: String) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn open_feed_folder(state: crate::host::State<'_, AppState>, publisher: String, salt: String) -> Result<(), String> {
     let (publisher, salt) = (hex::encode(hex_publisher(&publisher)?), hex::encode(hex_salt(&salt)?));
     let db = state.db.clone();
     let feed = blocking(move || db.feed_followed(&publisher, &salt), "feeds_failed", "Could not read feeds")
@@ -2543,8 +2720,8 @@ pub async fn open_feed_folder(state: tauri::State<'_, AppState>, publisher: Stri
 
 /// Open the Feeds folder of the current download folder, creating it if
 /// nothing has landed there yet.
-#[tauri::command]
-pub async fn open_feed_files_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn open_feed_files_folder(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     let root = state.config.read().await.settings.download_folders().current;
     tokio::task::spawn_blocking(move || {
         let dir = crate::security::filesystem::prepare_approved_subdir(
@@ -2563,10 +2740,10 @@ pub async fn open_feed_files_folder(state: tauri::State<'_, AppState>) -> Result
 
 /// Open a followed feed's file in its default app, as Transfers' Open does:
 /// a type that could run something is shown in its folder instead.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_feed_item(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: String,
     ed2k: String,
@@ -2588,10 +2765,10 @@ pub async fn open_feed_item(
 }
 
 /// Show a followed feed's file in the file manager.
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn show_feed_item(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: String,
     ed2k: String,
@@ -2709,10 +2886,10 @@ async fn feed_item_file(state: &AppState, publisher: &str, salt: &str, ed2k: &st
 
 /// Stop following a feed: its list stops being served and is deleted, and
 /// its items are forgotten. Downloaded files stay.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn unfollow_feed(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: String,
 ) -> Result<(), String> {
@@ -2731,19 +2908,21 @@ pub async fn unfollow_feed(
     let dir = feeds_dir(&app);
     let db = state.db.clone();
     let (key_pub, key_salt) = (publisher.clone(), salt.clone());
-    let (released, folder) = blocking(
+    let (released, folder, shared, sharing) = blocking(
         move || {
             let mut released = None;
             let mut folder = String::new();
+            let mut shared = false;
             if let Some(feed) = db.feed_followed(&key_pub, &key_salt)? {
                 if let Ok(hash) = hex_to16(&feed.held_ed2k) {
                     released = release_list(&hash, &followed_owner(&key_pub, &key_salt));
                 }
                 folder = feed.folder;
+                shared = feed.share_files;
             }
             remove_followed_files(&dir, &key_pub, &key_salt, None);
             db.feed_unfollow(&key_pub, &key_salt)?;
-            Ok((released, folder))
+            Ok((released, folder, shared, db.feed_sharing_folders()?))
         },
         "feeds_failed",
         "Could not unfollow the feed",
@@ -2751,6 +2930,11 @@ pub async fn unfollow_feed(
     .await?;
     drop(followed);
     withdraw_lists(&state, released).await;
+    // Its files stop being shared with it, but where the user shares them too.
+    if shared {
+        crate::sharing::feed_downloads::set_sharing(sharing);
+        crate::sharing::feed_shares::reconcile(&app, std::slice::from_ref(&folder)).await;
+    }
     // Its unfinished downloads go with it: they are shown nowhere but the
     // feed's page, so left running they could be neither seen nor stopped.
     // What finished stays in its folder.
@@ -2797,7 +2981,7 @@ pub enum LookupOutcome {
 
 /// Look up a followed feed's head and take up a newer one, starting the
 /// fetch of its list.
-async fn look_up_head(app: &tauri::AppHandle, state: &AppState, publisher: &str, salt: &str) -> LookupOutcome {
+async fn look_up_head(app: &crate::host::AppHandle, state: &AppState, publisher: &str, salt: &str) -> LookupOutcome {
     let (Ok(publisher_key), Ok(salt_bytes)) = (hex_to32(publisher), hex_to16(salt)) else {
         return LookupOutcome::NotFound;
     };
@@ -2985,7 +3169,7 @@ impl Drop for LookedAt {
 /// held. At most one per feed per [`PUSHED_HEAD_INTERVAL`]: a friend
 /// pushing head after head would otherwise start and give up a fetch for
 /// each.
-async fn on_pushed_head(app: &tauri::AppHandle, state: &AppState, from: [u8; 32], blob: Vec<u8>) {
+async fn on_pushed_head(app: &crate::host::AppHandle, state: &AppState, from: [u8; 32], blob: Vec<u8>) {
     let Some(record) = SignedRecord::from_value_blob(&blob) else {
         return;
     };
@@ -3086,7 +3270,7 @@ fn followed_lock() -> &'static tokio::sync::Mutex<()> {
 
 /// Take up `head` if newer than the one held, and fetch its list. Whether
 /// it was newer.
-async fn take_head(app: &tauri::AppHandle, state: &AppState, publisher: &str, salt: &str, head: FeedHead) -> bool {
+async fn take_head(app: &crate::host::AppHandle, state: &AppState, publisher: &str, salt: &str, head: FeedHead) -> bool {
     let followed = followed_lock().lock().await;
     let now = chrono::Utc::now().timestamp();
     let db = state.db.clone();
@@ -3137,7 +3321,7 @@ async fn take_head(app: &tauri::AppHandle, state: &AppState, publisher: &str, sa
 
 /// Fetch the list a followed feed's head names, if it is owed one: none
 /// held for this head, not broken, and not resting after a fetch gave up.
-async fn fetch_owed(app: &tauri::AppHandle, state: &AppState, publisher: &str, salt: &str, now: i64) {
+async fn fetch_owed(app: &crate::host::AppHandle, state: &AppState, publisher: &str, salt: &str, now: i64) {
     let resting = gave_up()
         .lock()
         .get(&(publisher.to_string(), salt.to_string()))
@@ -3285,7 +3469,7 @@ impl Drop for ReachRunning {
 
 /// Reach the publisher of a followed feed through the rendezvous server for
 /// the list its head names, and take it up as a fetched one would be.
-async fn reach_publisher(app: tauri::AppHandle, publisher: String, salt: String) {
+async fn reach_publisher(app: crate::host::AppHandle, publisher: String, salt: String) {
     let key = (publisher.clone(), salt.clone());
     if !reaching().lock().0.insert(key.clone()) {
         return;
@@ -3339,7 +3523,7 @@ async fn reach_publisher(app: tauri::AppHandle, publisher: String, salt: String)
 /// Take up a list fetched from its publisher by [`reach_publisher`] for
 /// `reached`'s head: in place of the fetch still looking for sources, as
 /// that fetch's own completion would be.
-async fn take_reached_list(app: &tauri::AppHandle, state: &AppState, reached: &FollowedFeed, bytes: Vec<u8>) {
+async fn take_reached_list(app: &crate::host::AppHandle, state: &AppState, reached: &FollowedFeed, bytes: Vec<u8>) {
     let followed = followed_lock().lock().await;
     let db = state.db.clone();
     let (key_pub, key_salt) = (reached.publisher.clone(), reached.salt.clone());
@@ -3417,7 +3601,7 @@ async fn friend_source(state: &AppState, publisher: &str) -> Option<([u8; 16], O
 /// an older list is given up: its sources may well have moved on. Called
 /// with [`followed_lock`] held; a list held already is taken up at once,
 /// and returned for [`after_list`] once the lock is let go.
-async fn start_fetch(app: &tauri::AppHandle, state: &AppState, feed: &FollowedFeed) -> Option<TakenList> {
+async fn start_fetch(app: &crate::host::AppHandle, state: &AppState, feed: &FollowedFeed) -> Option<TakenList> {
     if feed.sequence <= 0 || feed.list_sequence == feed.sequence || feed.deleted {
         return None;
     }
@@ -3600,7 +3784,7 @@ async fn cancel_fetch(state: &AppState, transfer_id: &str) {
     let db = state.db.clone();
     let roots = state.config.read().await.settings.download_roots();
     let id = transfer_id.to_string();
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         if sent {
             let _ = tokio::time::timeout(crate::commands::errors::CMD_REPLY_TIMEOUT, ack_rx).await;
         }
@@ -3609,7 +3793,7 @@ async fn cancel_fetch(state: &AppState, transfer_id: &str) {
 }
 
 /// A list arrived (or failed to).
-async fn on_fetch_done(app: &tauri::AppHandle, state: &AppState, transfer_id: String, outcome: FetchOutcome) {
+async fn on_fetch_done(app: &crate::host::AppHandle, state: &AppState, transfer_id: String, outcome: FetchOutcome) {
     let followed = followed_lock().lock().await;
     let fetch = fetching().lock().remove(&transfer_id);
     let feed = match &fetch {
@@ -3732,7 +3916,7 @@ enum Took {
 /// Take up a list that arrived for `feed`'s current head: check it, work out
 /// what is new, and serve it in place of the one held. Called with
 /// [`followed_lock`] held; what it added is returned for [`after_list`].
-async fn take_list_held(app: &tauri::AppHandle, state: &AppState, feed: FollowedFeed, path: PathBuf) -> Option<TakenList> {
+async fn take_list_held(app: &crate::host::AppHandle, state: &AppState, feed: FollowedFeed, path: PathBuf) -> Option<TakenList> {
     let dir = feeds_dir(app);
     let db = state.db.clone();
     let task_feed = feed.clone();
@@ -3819,7 +4003,7 @@ async fn take_list_held(app: &tauri::AppHandle, state: &AppState, feed: Followed
 /// Start what auto-download allows of what a list added, and say so once
 /// the items it started are marked. Not under [`followed_lock`]: starting
 /// downloads is no part of keeping a feed's files in step.
-async fn after_list(app: &tauri::AppHandle, state: &AppState, list: TakenList) {
+async fn after_list(app: &crate::host::AppHandle, state: &AppState, list: TakenList) {
     if list.added.is_empty() {
         return;
     }
@@ -4088,7 +4272,7 @@ const AUTO_RETRY_SECS: i64 = 10 * 60;
 /// to take and has not started, at most every [`AUTO_RETRY_SECS`]. A feed
 /// turned on before the window was kept starts it now, rather than taking
 /// every file it was ever listed.
-async fn retry_auto_downloads(app: &tauri::AppHandle, state: &AppState, followed: &[FollowedFeed], now: i64) {
+async fn retry_auto_downloads(app: &crate::host::AppHandle, state: &AppState, followed: &[FollowedFeed], now: i64) {
     static LAST: std::sync::OnceLock<parking_lot::Mutex<HashMap<(String, String), i64>>> = std::sync::OnceLock::new();
     for feed in followed.iter().filter(|feed| feed.auto_download && !feed.deleted) {
         let key = (feed.publisher.clone(), feed.salt.clone());
@@ -4124,7 +4308,7 @@ async fn retry_auto_downloads(app: &tauri::AppHandle, state: &AppState, followed
 /// Start what auto-download allows of a list's new items, by the feed's
 /// settings as they are now rather than when the list was asked for.
 /// Returns how many it started.
-async fn auto_download(app: &tauri::AppHandle, state: &AppState, publisher: &str, salt: &str, added: &[FeedItem]) -> usize {
+async fn auto_download(app: &crate::host::AppHandle, state: &AppState, publisher: &str, salt: &str, added: &[FeedItem]) -> usize {
     let _pass = auto_download_lock().lock().await;
     let now = chrono::Utc::now().timestamp();
     let db = state.db.clone();
@@ -4307,7 +4491,7 @@ fn list_is_sealed(path: &Path) -> bool {
 /// A list an earlier build wrote in the clear is no longer served, and is
 /// deleted: what it names is no longer told to whoever asks for its hash. A
 /// feed of ours published with one is published again, sealed.
-async fn reshare_held(app: &tauri::AppHandle, state: &AppState) {
+async fn reshare_held(app: &crate::host::AppHandle, state: &AppState) {
     let dir = feeds_dir(app);
     let db = state.db.clone();
     let author = state.config.read().await.settings.channel_username.trim().to_string();
@@ -4566,7 +4750,7 @@ fn republished(placed: Placed, sent_pending: bool) -> Republished {
 /// between wins. A feed with no head to send is not looked up, and waits
 /// [`REPUBLISH_SECS`] or a publish. One that does not get through is tried
 /// again after [`REPUBLISH_RETRY_SECS`].
-async fn republish(app: &tauri::AppHandle, state: &AppState, salt: &str, now: i64) {
+async fn republish(app: &crate::host::AppHandle, state: &AppState, salt: &str, now: i64) {
     let retry = || republish_retry().lock().insert(salt.to_string(), now + REPUBLISH_RETRY_SECS);
     let Ok(salt_bytes) = hex_to16(salt) else {
         retry();
@@ -4689,7 +4873,7 @@ fn waiting_fast(feed: &FollowedFeed, now: i64) -> bool {
     feed.sequence == 0 && !elapsed(now, feed.followed_at, WAITING_FAST_FOR_SECS)
 }
 
-async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
+async fn on_tick(app: &crate::host::AppHandle, state: &AppState) {
     use futures::StreamExt;
     let now = chrono::Utc::now().timestamp();
     // What each fetch holds now, then those that have stalled, given up on
@@ -4730,7 +4914,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
     }
     for (publisher, salt) in sourceless {
         if reach_due(&publisher, &salt) {
-            tauri::async_runtime::spawn(reach_publisher(app.clone(), publisher, salt));
+            crate::host::async_runtime::spawn(reach_publisher(app.clone(), publisher, salt));
         }
     }
     for (id, fetch) in stale {
@@ -4761,7 +4945,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
     // Deleted feeds' tombstones, off the tick: each waits on the network.
     if !sending_tombstones().swap(true, std::sync::atomic::Ordering::AcqRel) {
         let app = app.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             let _done = ClearOnDrop(sending_tombstones().clone());
             if let Some(state) = app.try_state::<AppState>() {
                 send_due_tombstones(&state, now).await;
@@ -4776,7 +4960,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
     if let Some(feed) = due {
         if !republishing().swap(true, std::sync::atomic::Ordering::AcqRel) {
             let (app, salt) = (app.clone(), feed.salt.clone());
-            tauri::async_runtime::spawn(async move {
+            crate::host::async_runtime::spawn(async move {
                 let _done = ClearOnDrop(republishing().clone());
                 if let Some(state) = app.try_state::<AppState>() {
                     republish(&app, &state, &salt, now).await;
@@ -4788,7 +4972,7 @@ async fn on_tick(app: &tauri::AppHandle, state: &AppState) {
     if !counting_followers().swap(true, std::sync::atomic::Ordering::AcqRel) {
         let app = app.clone();
         let own = own.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             let _done = ClearOnDrop(counting_followers().clone());
             if let Some(state) = app.try_state::<AppState>() {
                 count_due_followers(&app, &state, &own, now).await;
@@ -4864,15 +5048,15 @@ impl Drop for ClearOnDrop {
 /// Run one of the service's handlers in a task of its own and wait for it:
 /// a panic in it is logged, and the worker that called it takes the next.
 async fn handle_caught(what: &str, handler: impl std::future::Future<Output = ()> + Send + 'static) {
-    if let Err(error) = tauri::async_runtime::spawn(handler).await {
+    if let Err(error) = crate::host::async_runtime::spawn(handler).await {
         tracing::error!("feeds: handling {what} failed: {error}");
     }
 }
 
 /// Keep feeds current for the life of the app.
-pub fn spawn_feeds(app: tauri::AppHandle) {
+pub fn spawn_feeds(app: crate::host::AppHandle) {
     spawn_hold_watcher(app.clone());
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         let mut reports = feed_files::listen_for_fetches();
         let mut pushed = feed_files::listen_for_pushed_heads();
         // Long enough for the network to come up.
@@ -4884,7 +5068,7 @@ pub fn spawn_feeds(app: tauri::AppHandle) {
         // a worker of its own: a list can start up to 2,000 downloads, and
         // pushed heads are dropped while their worker is behind.
         let worker = app.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             while let Some((id, outcome)) = reports.recv().await {
                 let app = worker.clone();
                 handle_caught("a list fetch's end", async move {
@@ -4896,7 +5080,7 @@ pub fn spawn_feeds(app: tauri::AppHandle) {
             }
         });
         let worker = app.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::host::async_runtime::spawn(async move {
             while let Some((from, blob)) = pushed.recv().await {
                 let app = worker.clone();
                 handle_caught("a pushed head", async move {
@@ -4924,7 +5108,7 @@ pub fn spawn_feeds(app: tauri::AppHandle) {
                         continue;
                     }
                     let (app, ticking) = (app.clone(), ticking.clone());
-                    tauri::async_runtime::spawn(async move {
+                    crate::host::async_runtime::spawn(async move {
                         // Cleared however the tick ends, a panic included.
                         let _ticked = ClearOnDrop(ticking);
                         if let Some(state) = app.try_state::<AppState>() {
@@ -4968,6 +5152,8 @@ mod tests {
             auto_since: 0,
             seen_at: 0,
             deleted: false,
+            share_files: false,
+            auto_types: String::new(),
         }
     }
 
@@ -5548,6 +5734,30 @@ mod tests {
         assert_eq!(auto_hold_reason(&feed, &item("track.flac", 60), 100 * MIB), Some("day_limit"));
         assert_eq!(auto_hold_reason(&feed, &item("track.flac", 50), 100 * MIB), None, "exactly at the day's cap");
         assert_eq!(auto_hold_reason(&followed(0, 0), &item("huge.mkv", 4000), i64::MAX), None, "no caps");
+    }
+
+    /// A follower can limit auto-download to some types: a file of another is
+    /// held back, saying so, while a program is still held as risky, as it is
+    /// whatever was chosen. No choice takes every type.
+    #[test]
+    fn auto_download_takes_only_the_types_chosen() {
+        let chosen = |types: &[&str]| FollowedFeed {
+            auto_types: auto_types_saved(&types.iter().map(|t| t.to_string()).collect::<Vec<_>>()),
+            ..followed(0, 0)
+        };
+        let video = chosen(&["Video"]);
+        assert_eq!(auto_hold_reason(&video, &item("Show.S01E01.mkv", 1), 0), None);
+        assert_eq!(auto_hold_reason(&video, &item("track.flac", 1), 0), Some("type"));
+        assert_eq!(auto_hold_reason(&video, &item("README", 1), 0), Some("type"), "no type is not video");
+        assert_eq!(auto_hold_reason(&video, &item("setup.exe", 1), 0), Some("risky"));
+        assert_eq!(auto_hold_reason(&chosen(&[]), &item("track.flac", 1), 0), None, "no choice takes every type");
+        let category = FollowedFeed { auto_types: "Movies".to_string(), ..followed(0, 0) };
+        assert_eq!(auto_hold_reason(&category, &item("track.flac", 1), 0), None, "nothing known is no choice");
+        assert_eq!(
+            chosen(&["Arc", "Pro", "Video", "Video", "nonsense"]).auto_types,
+            "Video,Arc",
+            "known types only, once each, in a fixed order"
+        );
     }
 
     #[test]

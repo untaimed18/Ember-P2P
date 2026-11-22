@@ -16,6 +16,8 @@
   import { initFinishAction } from '$lib/stores/finishAction';
   import { startUserActivityReporting } from '$lib/userActivity';
   import { startClipboardWatch } from '$lib/clipboardWatch';
+  import { startIpFilterWatch } from '$lib/ipFilterWatch';
+  import { startNetworkBindWatch } from '$lib/networkBindWatch';
   import { notify } from '$lib/notifications';
   import { formatBytes } from '$lib/utils';
 
@@ -80,6 +82,10 @@
   import { applyUpdateResume, initUpdateResume } from '$lib/updateResume';
   import { isChatWindow } from '$lib/windowRole';
   import { noteUiActivity, startStallDetector } from '$lib/uiStall';
+  import { isServer } from '$lib/runtime';
+  import { eventsConnected } from '$lib/runtime/web/event';
+  import ServerLogin from '$lib/components/ServerLogin.svelte';
+  import ServerConfirm from '$lib/components/ServerConfirm.svelte';
 
   /** This document is the popped-out chat window, which draws the chat and
    *  nothing else of the shell. Fixed for the life of the document. */
@@ -94,7 +100,9 @@
   // re-running this on the fresh document.
   applyDocumentLang();
 
-  let { children } = $props();
+  let { children, data } = $props();
+  /** emberd, and this browser is not signed in: the page is the login. */
+  const serverLogin = $derived(isServer ? data?.serverLogin : undefined);
   let initialized = $state(false);
   let initError = $state('');
   let splashVisible = $state(true);
@@ -329,6 +337,7 @@
     // The chat window's shell starts what it needs itself.
     if (chatWindow) return;
     initTheme();
+    if (serverLogin) return cleanupTheme;
     const stopStallDetector = startStallDetector();
     const stopToastAreaSync = syncToastAreasWithSettings();
     const splashStartedAt = performance.now();
@@ -352,7 +361,9 @@
     let unlistenQuitRequested: UnlistenFn | null = null;
     let unlistenSilentUpdate: UnlistenFn | null = null;
     let unlistenFinishAction: UnlistenFn | null = null;
-    const stopActivityReporting = startUserActivityReporting();
+    // Idle detection, the clipboard, the tray, updates, the pop-out chat and
+    // the close dialog are the desktop app's: emberd has none of them.
+    const stopActivityReporting = isServer ? () => {} : startUserActivityReporting();
     let unlistenClose: UnlistenFn | null = null;
     let unlistenConfigCorrupt: UnlistenFn | null = null;
     let unlistenDbCorrupt: UnlistenFn | null = null;
@@ -366,13 +377,17 @@
     let unlistenDropRejected: UnlistenFn | null = null;
     let unlistenDownloadFolder: UnlistenFn | null = null;
     let unlistenDiskSpace: UnlistenFn | null = null;
-    const stopClipboardWatch = startClipboardWatch();
+    const stopClipboardWatch = isServer ? () => {} : startClipboardWatch();
+    const stopIpFilterWatch = startIpFilterWatch();
+    const stopNetworkBindWatch = startNetworkBindWatch();
     let stopChatPopout: (() => void) | null = null;
 
-    void initChatPopoutMain().then((stop) => {
-      if (mounted) stopChatPopout = stop;
-      else stop();
-    });
+    if (!isServer) {
+      void initChatPopoutMain().then((stop) => {
+        if (mounted) stopChatPopout = stop;
+        else stop();
+      });
+    }
 
     // Last-resort floor for promise rejections nothing else caught. Every
     // `invoke()` rejects whenever its Rust command returns `Err`, so a call
@@ -395,7 +410,7 @@
     // Register before consuming the native latch. A close can be prevented by
     // Tauri before this async registration resolves; the backend records that
     // request so it is still surfaced exactly once after the listener is live.
-    void (async () => {
+    if (!isServer) void (async () => {
       try {
         const fn = await listen('close-requested', () => {
           if (!mounted) return;
@@ -524,7 +539,9 @@
       void getSecurityPolicyState()
         .then((status) => {
           if (mounted && status.resetRequired) {
-            policyResetReason = status.reason || m.layout_policy_reset_unknown_reason();
+            // The backend's reason is untranslated diagnostic text.
+            if (status.reason) console.warn('Security policy reset required:', status.reason);
+            policyResetReason = m.layout_policy_reset_unknown_reason();
           }
         })
         .catch((e) => console.error('Failed to read security-policy state:', e));
@@ -587,30 +604,32 @@
     // for as long as Ember stays open (release builds only); they have no
     // setting. Their results are applied exactly as a silent check's would
     // be, and surface non-blockingly via <UpdateNotice />.
-    listen('ember:updater-check-result', () => {
-      if (mounted) void loadLastBackgroundCheckResult();
-    })
-      .then((fn) => {
-        if (!mounted) {
-          fn();
-          return;
-        }
-        unlistenUpdateCheck = fn;
-        void loadLastBackgroundCheckResult();
+    if (!isServer) {
+      listen('ember:updater-check-result', () => {
+        if (mounted) void loadLastBackgroundCheckResult();
       })
-      .catch((e) => console.error('Failed to register updater-check-result listener:', e));
+        .then((fn) => {
+          if (!mounted) {
+            fn();
+            return;
+          }
+          unlistenUpdateCheck = fn;
+          void loadLastBackgroundCheckResult();
+        })
+        .catch((e) => console.error('Failed to register updater-check-result listener:', e));
 
-    // The tray menu is built by the backend, which cannot know the language.
-    void setTrayLabels({
-      show: m.tray_show(),
-      quit: m.tray_quit(),
-      cancelUpdate: m.tray_cancel_update({ time: '{time}' }),
-      pauseAll: m.tray_pause_all(),
-      resumeAll: m.tray_resume_all(),
-      altSpeed: m.tray_alt_speed(),
-      cancelExit: m.tray_cancel_exit(),
-      cancelSleep: m.tray_cancel_sleep(),
-    }).catch((e) => console.error('Failed to set the tray labels:', e));
+      // The tray menu is built by the backend, which cannot know the language.
+      void setTrayLabels({
+        show: m.tray_show(),
+        quit: m.tray_quit(),
+        cancelUpdate: m.tray_cancel_update({ time: '{time}' }),
+        pauseAll: m.tray_pause_all(),
+        resumeAll: m.tray_resume_all(),
+        altSpeed: m.tray_alt_speed(),
+        cancelExit: m.tray_cancel_exit(),
+        cancelSleep: m.tray_cancel_sleep(),
+      }).catch((e) => console.error('Failed to set the tray labels:', e));
+    }
 
     // The tray and the status bar save speed limits without the Settings page.
     // Fetched rather than taken from the event: a forged one with a huge
@@ -633,21 +652,23 @@
       .then((fn) => { if (mounted) unlistenQuitRequested = fn; else fn(); })
       .catch((e) => console.error('Failed to register quit-requested listener:', e));
 
-    // An update restart asks for the page and search tabs just before it shuts
-    // Ember down, so the launch after it can put them back.
-    initUpdateResume()
-      .then((fn) => { if (mounted) unlistenUpdateResume = fn; else fn(); })
-      .catch((e) => console.error('Failed to register update-resume listener:', e));
+    if (!isServer) {
+      // An update restart asks for the page and search tabs just before it
+      // shuts Ember down, so the launch after it can put them back.
+      initUpdateResume()
+        .then((fn) => { if (mounted) unlistenUpdateResume = fn; else fn(); })
+        .catch((e) => console.error('Failed to register update-resume listener:', e));
 
-    // Silent updates: the countdown dialog, the desktop warning and the
-    // Settings card all read this.
-    initSilentUpdate()
-      .then((fn) => { if (mounted) unlistenSilentUpdate = fn; else fn(); })
-      .catch((e) => console.error('Failed to register silent-update listener:', e));
+      // Silent updates: the countdown dialog, the desktop warning and the
+      // Settings card all read this.
+      initSilentUpdate()
+        .then((fn) => { if (mounted) unlistenSilentUpdate = fn; else fn(); })
+        .catch((e) => console.error('Failed to register silent-update listener:', e));
 
-    initFinishAction()
-      .then((fn) => { if (mounted) unlistenFinishAction = fn; else fn(); })
-      .catch((e) => console.error('Failed to register finish-action listener:', e));
+      initFinishAction()
+        .then((fn) => { if (mounted) unlistenFinishAction = fn; else fn(); })
+        .catch((e) => console.error('Failed to register finish-action listener:', e));
+    }
 
     // Downloads re-queue on their own once the folder is fixed, so without this
     // the only sign of a folder Ember cannot write is rows that never start.
@@ -825,8 +846,10 @@
           // Coming back from an update restart: the page and search tabs the
           // session had, and — for a silent update — whether it landed.
           // Nothing to do on an ordinary launch.
-          void applyUpdateResume();
-          void reportUpdateOutcome();
+          if (!isServer) {
+            void applyUpdateResume();
+            void reportUpdateOutcome();
+          }
 
           // Did the last install actually happen? A
           // hand-off to the installer ends this process, so if the installer
@@ -838,7 +861,7 @@
           // overwriting the result, because ordering the two cannot: an
           // in-flight guard that holds a result arriving while this call runs,
           // and `takeStagedSnapshot`, for every check after that.
-          if (!import.meta.env.DEV) {
+          if (!import.meta.env.DEV && !isServer) {
             handoffCheckTimer = window.setTimeout(() => {
               if (mounted) void checkUpdateHandoff();
             }, 1500);
@@ -911,12 +934,16 @@
       if (unlistenDownloadFolder) unlistenDownloadFolder();
       if (unlistenDiskSpace) unlistenDiskSpace();
       stopClipboardWatch();
+      stopIpFilterWatch();
+      stopNetworkBindWatch();
       stopChatPopout?.();
     };
   });
 </script>
 
-{#if chatWindow}
+{#if serverLogin}
+<ServerLogin session={serverLogin} />
+{:else if chatWindow}
 <ErrorBoundary variant="window" title={m.chat_dock_render_error()}>
   <ChatWindowShell />
 </ErrorBoundary>
@@ -974,7 +1001,7 @@
     </main>
     <StatusBar />
   </div>
-  {#if initialized && !initError && !showWizard}
+  {#if initialized && !initError && !showWizard && !isServer}
     <!-- Non-blocking auto-update banner, driven by the shared updater store. -->
     <UpdateNotice />
     <SilentUpdateCountdown />
@@ -1005,12 +1032,19 @@
      it is not a containing block for the toast's `position: fixed`. -->
 <Toast />
 
-<CloseAppDialog
-  bind:open={showCloseDialog}
-  onhide={handleCloseToTray}
-  onexit={handleCloseExit}
-  oncancel={handleCloseCancel}
-/>
+{#if isServer}
+  <ServerConfirm />
+  {#if !$eventsConnected}
+    <div class="server-reconnecting" role="status">{m.server_reconnecting()}</div>
+  {/if}
+{:else}
+  <CloseAppDialog
+    bind:open={showCloseDialog}
+    onhide={handleCloseToTray}
+    onexit={handleCloseExit}
+    oncancel={handleCloseCancel}
+  />
+{/if}
 
 <ConfirmDialog
   bind:open={dropPrompt.open}
@@ -1090,6 +1124,20 @@
 {/if}
 
 <style>
+  .server-reconnecting {
+    position: fixed;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9000;
+    padding: 8px 16px;
+    border-radius: var(--radius-pill);
+    background: var(--warning);
+    color: var(--on-warning);
+    font-size: var(--font-size-sm);
+    box-shadow: var(--shadow-md);
+  }
+
   .skip-to-content {
     position: absolute;
     top: -40px;

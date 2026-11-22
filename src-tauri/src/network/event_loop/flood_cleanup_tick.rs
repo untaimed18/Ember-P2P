@@ -5,7 +5,7 @@ use super::*;
 pub(in crate::network) async fn on_flood_cleanup_tick(
     state: &mut NetworkState,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     banned_ips_sync_in_flight: &mut bool,
     banned_ips_sync_tx: &mpsc::UnboundedSender<Option<BannedIpsSyncInputs>>,
 ) {
@@ -25,6 +25,7 @@ pub(in crate::network) async fn on_flood_cleanup_tick(
         Ok(Err(e)) => debug!("Disappearing-message sweep failed: {e}"),
         Err(e) => debug!("Disappearing-message sweep panicked: {e}"),
     }
+    crate::network::room_dm::expire_private_messages(db, app_handle).await;
 
     // Chat attachments nobody answered, on the same half-minute: an offer
     // lapses five minutes after it went, and an open conversation shows it

@@ -70,6 +70,7 @@
   import { toastsFor } from '$lib/stores/toast';
   const { addActionToast, toast: toastInfo, toastSuccess, toastError, toastWarning } = toastsFor('library');
   import { networkStats, relatedSearchSupported, serverStatus } from '$lib/stores/network';
+  import { unpublishedText } from '$lib/publishState';
   import {
     formatSize,
     formatNumber,
@@ -84,6 +85,7 @@
   import { prefersReducedMotion } from 'svelte/motion';
 
   import { listen } from '@tauri-apps/api/event';
+  import { invoke } from '@tauri-apps/api/core';
   import LibraryVirtualTable from '$lib/components/LibraryVirtualTable.svelte';
   import LibraryMediaPlayer from '$lib/components/LibraryMediaPlayer.svelte';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -111,6 +113,8 @@
   import { openChatFilesFolder } from '$lib/api/friends';
   import { openChannelFilesFolder } from '$lib/api/channels';
   import { openFeedFilesFolder } from '$lib/api/feeds';
+  import { isServer } from '$lib/runtime';
+  import { saveToThisComputer } from '$lib/runtime/web/files';
   import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
@@ -874,15 +878,19 @@
 
   // Match backend `security::normalize_match_path` / `normalize_path_key`:
   // Windows filesystems are case-insensitive, so folder filters must be too.
+  // emberd's paths are its own computer's, whatever the browser runs on.
   const IS_WINDOWS =
+    !isServer &&
     typeof navigator !== 'undefined' &&
     (/Win/i.test(navigator.platform) || /Windows/i.test(navigator.userAgent));
   // Linux does not get the in-app player at all: WebKitGTK hands a custom
   // scheme to GStreamer, which has no source element for `ember-media://`, so
   // the element can only ever fail. Rather than mount it and show a playback
   // error, every media file on Linux goes straight to the desktop's own
-  // player — see `inAppPlayerKind` and `openSharedFile`.
+  // player — see `inAppPlayerKind` and `openSharedFile`. emberd's browser
+  // plays over plain HTTP.
   const IS_LINUX_DESKTOP =
+    !isServer &&
     typeof navigator !== 'undefined' &&
     /Linux/i.test(navigator.userAgent) &&
     !/Android/i.test(navigator.userAgent);
@@ -924,6 +932,19 @@
 
   function pathsEqualForFolder(a: string, b: string): boolean {
     return normalizePathForMatch(a) === normalizePathForMatch(b);
+  }
+
+  /** The shared folders emberd's config file names: only the file takes one
+   *  off the list. */
+  let configSharedFolders = $state<string[]>([]);
+  onMount(() => {
+    if (!isServer) return;
+    invoke<{ shared_folders: string[] } | null>('server_overview')
+      .then((overview) => (configSharedFolders = overview?.shared_folders ?? []))
+      .catch((e) => console.error('Failed to read the folders emberd shares by config:', e));
+  });
+  function sharedByConfig(folder: string): boolean {
+    return configSharedFolders.some((named) => pathsEqualForFolder(named, folder));
   }
 
   function parentFolderName(path: string): string {
@@ -1281,20 +1302,24 @@
       return;
     }
     try {
-      await openSharedFileCommand(path);
+      if (isServer) await saveToThisComputer(path);
+      else await openSharedFileCommand(path);
     } catch (e: unknown) {
       toastError(toErr(e));
     }
   }
 
+  /** Out of Ember's own player: to the default app on the desktop; on emberd,
+   *  saved to the computer the browser is on. */
   async function openSharedFileExternally(path: string) {
     // Stop in-app playback before handing media to the OS player, so the two
     // do not play over each other. Any other file leaves it playing.
-    if (playableKind(fileByPath.get(path)?.extension || extensionFromPath(path))) {
+    if (!isServer && playableKind(fileByPath.get(path)?.extension || extensionFromPath(path))) {
       playerStopToken += 1;
     }
     try {
-      await openSharedFileCommand(path);
+      if (isServer) await saveToThisComputer(path);
+      else await openSharedFileCommand(path);
     } catch (e: unknown) {
       toastError(toErr(e));
     }
@@ -2990,6 +3015,11 @@
    * `relatedSearchSupported`.
    */
   let relatedSearchReady = $derived($serverStatus === 'connected' && $relatedSearchSupported !== false);
+  let publishNetworks = $derived({
+    kad: $networkStats.status === 'connected',
+    server: $serverStatus === 'connected',
+    ember: ($networkStats.ember_dht_verified_contacts ?? 0) > 0,
+  });
   let ctxPrioritySub = $state(false);
   let ctxCopySub = $state(false);
   let ctxSendSub = $state(false);
@@ -4470,6 +4500,7 @@
       <button type="button" onclick={handleAddFolder}>{m.library_add_folder()}</button>
       <span class="header-divider" aria-hidden="true"></span>
     {/if}
+    {#if !isServer}
     <!-- Files people handed you, kept apart from Downloads and not shared. -->
     <button
       type="button"
@@ -4505,6 +4536,7 @@
       {m.library_feed_files()}
     </button>
     <span class="header-divider" aria-hidden="true"></span>
+    {/if}
     <button class="ghost" onclick={handleOpenCollection} disabled={collectionLoading}>
       {#if collectionLoading}
         <span class="spinner xs current" aria-hidden="true"></span> {m.library_opening()}
@@ -4512,7 +4544,9 @@
         {m.library_open_collection()}
       {/if}
     </button>
-    <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
+    {#if !isServer}
+      <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
+    {/if}
     <button class="ghost" onclick={() => (categoriesOpen = true)} title={m.transfers_categories_subtitle()}>{m.library_categories_button()}</button>
     <button class="ghost" onclick={handleReload} disabled={reloading}>{m.library_reload()}</button>
   </div>
@@ -5012,18 +5046,20 @@
 {/if}
 
 {#snippet openFolderButton(folder: string)}
-  <button
-    type="button"
-    class="tree-btn tree-open"
-    onclick={(e) => { e.stopPropagation(); void openTreeFolder(folder); }}
-    title={m.library_open_this_folder()}
-    aria-label={m.library_open_this_folder()}
-  >
-    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M2 6.2h12.4L13 12.4a1 1 0 0 1-1 .8H3.4a1 1 0 0 1-1-.7z"/>
-      <path d="M2 6.2 3.3 4.4A1 1 0 0 1 4.1 4h2.1L7.6 5.4H12"/>
-    </svg>
-  </button>
+  {#if !isServer}
+    <button
+      type="button"
+      class="tree-btn tree-open"
+      onclick={(e) => { e.stopPropagation(); void openTreeFolder(folder); }}
+      title={m.library_open_this_folder()}
+      aria-label={m.library_open_this_folder()}
+    >
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M2 6.2h12.4L13 12.4a1 1 0 0 1-1 .8H3.4a1 1 0 0 1-1-.7z"/>
+        <path d="M2 6.2 3.3 4.4A1 1 0 0 1 4.1 4h2.1L7.6 5.4H12"/>
+      </svg>
+    </button>
+  {/if}
 {/snippet}
 
 {#snippet globeIcon(off: boolean)}
@@ -5202,6 +5238,7 @@
                 >
                   {@render globeIcon(true)}
                 </button>
+                {#if !sharedByConfig(folder)}
                 <button
                   type="button"
                   class="tree-btn tree-remove"
@@ -5216,6 +5253,7 @@
                     <path d="M5.5 9h5"/>
                   </svg>
                 </button>
+                {/if}
               </span>
             {/if}
           </span>
@@ -5585,7 +5623,9 @@
           <button class="tb-btn" disabled={bulkBusy || checkedTaggableCount === 0} onclick={() => bulkEmberTag(true)} title={checkedTaggableCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_tag_title()}>{m.library_bulk_tag()}</button>
         {/if}
         <button class="tb-btn" disabled={checkedHashedCount === 0} onclick={bulkCopyLinks} title={checkedHashedCount === 0 ? m.library_bulk_need_hashed() : m.library_bulk_copy_links_title()}>{m.library_copy_links()}</button>
-        <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
+        {#if !isServer}
+          <button class="tb-btn" onclick={openCreateDialogFromSelection} title={m.library_bulk_new_collection_title()}>{m.library_bulk_new_collection()}</button>
+        {/if}
         <span class="bulk-spacer"></span>
         {#if bulkProgress}
           <span class="bulk-progress" role="status">
@@ -5663,24 +5703,26 @@
               <path d="M13 3L7 9"/>
               <path d="M7 3H3.5A1.5 1.5 0 0 0 2 4.5v7A1.5 1.5 0 0 0 3.5 13h7A1.5 1.5 0 0 0 12 11.5V8"/>
             </svg>
-            {m.library_open_externally()}
+            {isServer ? m.server_save_to_computer() : m.library_open_externally()}
           </button>
         {:else}
-          <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void openSharedFile(f.path); }} title={m.library_open_file_title()}>
+          <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void openSharedFile(f.path); }} title={isServer ? undefined : m.library_open_file_title()}>
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
               <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
               <path d="M6 8.5l2 2 2-2"/>
               <line x1="8" y1="5" x2="8" y2="10.5"/>
             </svg>
-            {m.library_open_file()}
+            {isServer ? m.server_save_to_computer() : m.library_open_file()}
           </button>
         {/if}
-        <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void openSharedFolder(f.path); }} title={m.library_open_folder_title()}>
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
-            <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
-          </svg>
-          {m.library_open_folder()}
-        </button>
+        {#if !isServer}
+          <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void openSharedFolder(f.path); }} title={m.library_open_folder_title()}>
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+              <path d="M2 2.5h4.5l1.5 2H14v9H2z"/>
+            </svg>
+            {m.library_open_folder()}
+          </button>
+        {/if}
         {#if selectedFile.hash}
           <button class="drawer-action-btn" onclick={() => { const f = selectedFile; if (f) void drawerCopyLink(f); }}>
             {#if drawerCopied === 'link'}
@@ -5800,7 +5842,7 @@
                   {#if selectedFile.aich_hash}<span class="meta-badge meta-badge-aich" title={m.library_aich_available()}>AICH</span>{/if}
                 </span>
                 {#if !selectedFile.shared_kad && !selectedFile.shared_ed2k && !selectedFile.shared_ember}
-                  <span class="shared-status">{m.library_not_published_yet()}</span>
+                  <span class="shared-status">{unpublishedText(selectedFile.friends_only, publishNetworks)}</span>
                 {/if}
               {:else}
                 <span class="shared-status">{m.common_pending()}</span>
@@ -6072,8 +6114,10 @@
       <bdi dir="auto">{ctxMenu.file.name}</bdi>
     </div>
     <button class="ctx-item" role="menuitem" onclick={() => ctxAction('properties')}>{m.library_properties()}</button>
-    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>{m.library_open_file()}</button>
-    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>{m.library_open_folder()}</button>
+    <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_file')}>{isServer ? m.server_save_to_computer() : m.library_open_file()}</button>
+    {#if !isServer}
+      <button class="ctx-item" role="menuitem" onclick={() => ctxAction('open_folder')}>{m.library_open_folder()}</button>
+    {/if}
     <button
       class="ctx-item"
       role="menuitem"
@@ -6360,7 +6404,9 @@
           onclick={() => ctxAction('friends_only')}
           title={m.library_friends_only_hint()}
         >{multi
-          ? m.library_ctx_friends_only_count({ count: formatNumber(ctxMenu.file.friends_only ? checkedUnrestrictCount : checkedRestrictCount) })
+          ? ctxMenu.file.friends_only
+            ? m.library_ctx_share_everyone_count({ count: formatNumber(checkedUnrestrictCount) })
+            : m.library_ctx_friends_only_count({ count: formatNumber(checkedRestrictCount) })
           : m.library_friends_only_toggle()}</button>
         <button class="ctx-item" role="menuitem" disabled={bulkLocked} onclick={() => ctxAction('unshare')}>
           {multi ? m.library_ctx_unshare_count({ count: formatNumber(checkedUnshareCount) }) : m.library_bulk_unshare()}
@@ -6386,7 +6432,9 @@
     <div class="ctx-header" role="presentation">
       <bdi dir="auto">{fc.folder.split(/[\\/]/).filter(Boolean).pop() || fc.folder}</bdi>
     </div>
-    <button class="ctx-item" role="menuitem" onclick={() => folderCtxAction('open')}>{m.library_open_this_folder()}</button>
+    {#if !isServer}
+      <button class="ctx-item" role="menuitem" onclick={() => folderCtxAction('open')}>{m.library_open_this_folder()}</button>
+    {/if}
     <button class="ctx-item" role="menuitem" onclick={() => folderCtxAction('copy_path')}>{m.library_meta_copy_path()}</button>
     {#if fc.isShare}
       {#if unapprovedFolders.some((f) => pathsEqualForFolder(f, fc.folder))}

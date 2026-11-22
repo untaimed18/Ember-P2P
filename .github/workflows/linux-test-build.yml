@@ -12,26 +12,30 @@ name: Linux test build
 # a tester reports is the distro or Ember. It never touches a signing key, never
 # creates a release, and only runs when someone asks it to.
 #
-# Two jobs, because the distro an AppImage is built on decides what it can run
-# on. glibc is the one thing an AppImage does not bundle, and it is only
-# forwards compatible.
+# Three jobs, because the distro a package is built on decides what it can run
+# on. glibc is the one thing an AppImage does not bundle, a `.deb` links the
+# host's, and glibc is only forwards compatible.
 #
-#   ubuntu-2204  The glibc baseline (2.35) Tauri recommends for shipping, and
-#                the same runner `check-linux` compiles on. Runs on anything
-#                that old or newer, so this is the artifact to give a tester.
-#   debian-13    Matches an LMDE 7 / Debian 13 tester exactly, bundling that
-#                distro's WebKitGTK rather than 22.04's. Worth having only to
+#   ubuntu-2204  The .deb as the release builds it, on the glibc baseline
+#                (2.35) Tauri recommends for shipping and the runner
+#                `check-linux` compiles on. Installs on anything that old or
+#                newer.
+#   ubuntu-2404  The AppImage as the release builds it: glibc 2.39, with
+#                Ubuntu 24.04's WebKitGTK. Runs on Ubuntu 24.04, Debian 13,
+#                Fedora 40 and newer.
+#   debian-13    Both, matching an LMDE 7 / Debian 13 tester exactly, the
+#                AppImage bundling that distro's WebKitGTK. Worth having only to
 #                isolate whether a rendering fault is the bundled WebKit or
 #                Ember itself. Do not hand it to anyone on an older distro; it
 #                will not start there.
 #
-# `createUpdaterArtifacts` is forced off for both. tauri.conf.json enables it
-# for the signed Windows release, and with no signing key here the bundler would
+# `createUpdaterArtifacts` is forced off for all three. tauri.conf.json enables
+# it for the signed release, and with no signing key here the bundler would
 # fail at the updater step after paying for a full compile.
 #
-# `APPIMAGE_EXTRACT_AND_RUN` is set because the bundler runs linuxdeploy, which
-# is itself an AppImage and therefore wants FUSE. The container has none, and
-# setting it everywhere keeps the two jobs building the same way.
+# `APPIMAGE_EXTRACT_AND_RUN` is set wherever an AppImage is built, because the
+# bundler runs linuxdeploy, which is itself an AppImage and therefore wants
+# FUSE. Neither the runner nor the container has it.
 
 on:
   workflow_dispatch:
@@ -45,8 +49,64 @@ concurrency:
 
 jobs:
   ubuntu-2204:
-    name: AppImage on Ubuntu 22.04 (portable)
+    name: .deb on Ubuntu 22.04 (as released)
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-08-05
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            pkg-config \
+            file \
+            xdg-utils \
+            desktop-file-utils
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build the .deb
+        run: |
+          npm run tauri build -- --bundles deb \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload the .deb
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ember-linux-ubuntu2204-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 14
+
+  ubuntu-2404:
+    name: AppImage on Ubuntu 24.04 (as released)
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
       contents: read
@@ -91,20 +151,18 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build packages
+      - name: Build the AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
-          npm run tauri build -- --bundles appimage,deb \
+          npm run tauri build -- --bundles appimage \
             --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      - name: Upload packages
+      - name: Upload the AppImage
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ember-linux-ubuntu2204
-          path: |
-            src-tauri/target/release/bundle/appimage/*.AppImage
-            src-tauri/target/release/bundle/deb/*.deb
+          name: ember-linux-ubuntu2404-appimage
+          path: src-tauri/target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
           retention-days: 14
 

@@ -3,6 +3,9 @@ import * as m from '$lib/paraglide/messages';
 import type { AppSettings, FriendOverrides, FriendStatus, WebService } from '$lib/types';
 import { flushToastActionsBeforeExit } from '$lib/stores/toast';
 import { withTimeout } from '$lib/utils';
+import { isServer } from '$lib/runtime';
+import { openInNewTab } from '$lib/runtime/web/links';
+import { pickAndUpload } from '$lib/runtime/web/files';
 
 export type SettingsUpdateOutcome = 'applied' | 'restart_required' | 'deferred';
 export type LiveApplyOutcome = 'applied' | 'deferred' | 'failed';
@@ -17,6 +20,7 @@ export interface LaunchSettings {
   tcp_port: number;
   udp_port: number;
   upnp_enabled: boolean;
+  bind_interface: string;
 }
 
 export async function getLaunchSettings(): Promise<LaunchSettings> {
@@ -242,17 +246,20 @@ export async function takePendingKnownMetNotice(): Promise<{ reset: boolean } | 
 export type EmberLink = 'website' | 'github' | 'reddit' | 'guide';
 
 export async function openEmberLink(target: EmberLink): Promise<void> {
+  if (isServer) return openInNewTab(invoke('ember_link_address', { target }));
   return invoke('open_ember_link', { target });
 }
 
 /** Open `version`'s notes on the website. The backend builds the address from
  *  the version's digits alone. */
 export async function openReleaseNotes(version: string): Promise<void> {
+  if (isServer) return openInNewTab(invoke('release_notes_address', { version }));
   return invoke('open_release_notes', { version });
 }
 
 /** Open the project's Buy Me a Coffee page. The address is fixed in the backend. */
 export async function openSupportPage(): Promise<void> {
+  if (isServer) return openInNewTab(invoke('support_page_address'));
   return invoke('open_support_page');
 }
 
@@ -280,6 +287,7 @@ export type EmberShareTarget =
   | 'email';
 
 export async function openEmberShare(target: EmberShareTarget, text: string): Promise<void> {
+  if (isServer) return openInNewTab(invoke('ember_share_address', { target, text }));
   return invoke('open_ember_share', { target, text });
 }
 
@@ -324,6 +332,9 @@ export async function openWebService(
   fileName: string,
   fileSize: number,
 ): Promise<void> {
+  if (isServer) {
+    return openInNewTab(invoke('web_service_address', { serviceIndex, fileHash, fileName, fileSize }));
+  }
   return invoke('open_web_service', {
     serviceIndex,
     fileHash,
@@ -342,6 +353,10 @@ export async function openWebService(
  * would not be.
  */
 export async function importWebServicesFile(): Promise<WebService[] | null> {
+  if (isServer) {
+    const upload = await pickAndUpload('.dat,.txt');
+    return upload ? invoke('import_webservices_upload', { upload }) : null;
+  }
   return invoke('pick_and_import_webservices_file', { title: m.picker_webservices() });
 }
 

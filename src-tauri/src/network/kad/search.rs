@@ -49,6 +49,31 @@ const MAX_SEARCH_RESULT_ENTRIES: usize = 5000;
 /// answer that is still arriving, and the duplicates use up
 /// `MAX_SEARCH_RESULT_ENTRIES` and the per-peer page budget.
 pub const SEARCH_RESULT_PAGE_SIZE: usize = 300;
+/// Whether `entry` answers a search of `search_type`. A `SearchRes` names only
+/// its target, and a file's source search and its notes search share that
+/// target (eMule runs one search per target, so never has to tell): a source
+/// carries its type, a note a rating or a description, which no note is
+/// published without.
+fn answers_search_type(search_type: &SearchType, entry: &SearchResultEntry) -> bool {
+    let has = |id: u8, name: &str| {
+        entry.tags.iter().any(|tag| match &tag.name {
+            TagName::Id(n) => *n == id,
+            TagName::Str(s) => s == name,
+        })
+    };
+    let source = has(TAG_SOURCETYPE, "sourcetype");
+    let note = has(TAG_DESCRIPTION, "description") || has(TAG_FILERATING, "filerating");
+    match search_type {
+        SearchType::FindNotes { .. } => note && !source,
+        SearchType::FindSource { .. } => source || !note,
+        _ => true,
+    }
+}
+
+/// Pages one contact is asked for in a search.
+const MAX_PAGES_PER_PEER: u16 = 3;
+/// Entries one contact's answers can add to a search: what its pages hold.
+const MAX_ENTRIES_PER_CONTACT: usize = SEARCH_RESULT_PAGE_SIZE * MAX_PAGES_PER_PEER as usize;
 /// eMule caps a FindBuddy search at `SEARCHFINDBUDDY` (10) distinct
 /// contacts queried. Both the stop-querying check and the reservation
 /// cap below must use this same value — a previous `+ 1` fudge factor
@@ -244,6 +269,9 @@ pub struct SearchState {
     /// lists an entry once per answer, so a repeat is the same page arriving
     /// again (a late answer to a request that was retried) and is not counted.
     answered_entries: HashMap<KadId, HashSet<KadId>>,
+    /// Entries each contact's answers added to `results`, against
+    /// `MAX_ENTRIES_PER_CONTACT`.
+    entries_kept_from: HashMap<KadId, usize>,
     /// Publish candidates the outbound governor held back. Left out of
     /// `next_publish_candidates` so they do not fill every batch while their
     /// budget refills; the completion pass still tries them once.
@@ -321,6 +349,7 @@ impl SearchState {
             search_requests_out: HashMap::new(),
             search_request_addrs: HashMap::new(),
             answered_entries: HashMap::new(),
+            entries_kept_from: HashMap::new(),
             publish_deferred: HashSet::new(),
             find_buddy_sent: HashSet::new(),
             store_acks_received: 0,
@@ -897,34 +926,54 @@ impl SearchState {
     /// the source counts are accumulated. We keep all entries so that
     /// `convert_search_results()` can properly sum TAG_SOURCES across nodes.
     pub fn handle_search_results(&mut self, from: &KadId, entries: Vec<SearchResultEntry>) {
+        let arrived = entries.len();
+        let entries: Vec<SearchResultEntry> = entries
+            .into_iter()
+            .filter(|entry| answers_search_type(&self.search_type, entry))
+            .collect();
+        if arrived > 0 && entries.is_empty() {
+            // All of it for the other search on this file.
+            return;
+        }
         self.fetched.insert(*from);
         self.pending.remove(from);
         self.pending_times.remove(from);
         self.store_pending.remove(from);
         self.store_pending_times.remove(from);
-        self.last_result_at = Some(chrono::Utc::now().timestamp());
 
         let mut count = 0usize;
         let before = self.results.len();
         let keyword = matches!(self.search_type, SearchType::FindKeyword);
         let answered = self.answered_entries.entry(*from).or_default();
+        let kept = self.entries_kept_from.entry(*from).or_insert(0);
         for entry in entries {
-            if answered.contains(&entry.id) {
+            if !answered.insert(entry.id) {
                 continue;
             }
             count += 1;
-            if self.results.len() < MAX_SEARCH_RESULT_ENTRIES {
-                if keyword
-                    && crate::network::kad_search::is_usable_keyword_answer(
-                        &entry,
-                        self.answer_filter.as_ref(),
-                    )
-                {
+            // A keyword answer nobody will be shown takes no room: kept, a
+            // node answering with junk filled the cap and ended the search.
+            // Nor does one node get more of it than its pages hold.
+            if keyword
+                && !crate::network::kad_search::is_usable_keyword_answer(
+                    &entry,
+                    self.answer_filter.as_ref(),
+                )
+            {
+                continue;
+            }
+            if self.results.len() < MAX_SEARCH_RESULT_ENTRIES && *kept < MAX_ENTRIES_PER_CONTACT {
+                if keyword {
                     self.usable_results += 1;
                 }
-                answered.insert(entry.id);
+                *kept += 1;
                 self.results.push(entry);
             }
+        }
+        // Answers still arriving hold the search open; the same page sent
+        // again, by a node retrying or stalling, does not.
+        if count > 0 || arrived == 0 {
+            self.last_result_at = Some(chrono::Utc::now().timestamp());
         }
         if before < MAX_SEARCH_RESULT_ENTRIES && self.results.len() >= MAX_SEARCH_RESULT_ENTRIES {
             info!(
@@ -934,7 +983,6 @@ impl SearchState {
             );
         }
 
-        const MAX_PAGES_PER_PEER: u16 = 3;
         // Against the *running* total for this peer's current page, not this one
         // datagram's count: the responder fragments a page to fit
         // `UDP_KAD_MAXFRAGMENT`, so a single packet carries roughly 20 entries and
@@ -2053,7 +2101,7 @@ mod tests {
             })
             .collect();
         state.handle_search_results(&kad_id(2), junk);
-        assert_eq!(state.results.len(), KEYWORD_SEARCH_STOP_THRESHOLD);
+        assert!(state.results.is_empty(), "none of these is kept");
         assert!(!state.stop_querying, "none of these is an answer eMule counts");
         assert!(state.result_quota_reached_at.is_none());
 
@@ -2420,11 +2468,66 @@ mod tests {
         );
     }
 
+    /// A file's source search and notes search hear the same answers; each
+    /// takes only its own.
     #[test]
-    fn junk_filling_the_storage_cap_stops_querying() {
+    fn sources_and_notes_on_one_file_go_to_their_own_searches() {
+        let tagged = |i: usize, id: u8, value: TagValue| SearchResultEntry {
+            id: entry_id(i),
+            tags: vec![KadTag { name: TagName::Id(id), value }],
+        };
+        let sources: Vec<_> = (0..60).map(|i| tagged(i, TAG_SOURCETYPE, TagValue::Uint8(1))).collect();
+        let notes: Vec<_> = (100..110)
+            .map(|i| tagged(i, TAG_DESCRIPTION, TagValue::String("fine copy".into())))
+            .collect();
+
+        let mut find_notes = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindNotes { file_size: 1 });
+        find_notes.handle_search_results(&kad_id(2), sources.clone());
+        assert!(find_notes.results.is_empty());
+        assert!(!find_notes.fetched.contains(&kad_id(2)), "not an answer to this search");
+        find_notes.handle_search_results(&kad_id(2), notes.clone());
+        assert_eq!(find_notes.results.len(), notes.len());
+
+        let mut find_source = SearchState::new(SearchId(2), near_kad_id(0), SearchType::FindSource { file_size: 1 });
+        find_source.handle_search_results(&kad_id(2), notes);
+        assert!(find_source.results.is_empty());
+        find_source.handle_search_results(&kad_id(2), sources.clone());
+        assert_eq!(find_source.results.len(), sources.len());
+    }
+
+    /// A page sent again does not keep a search waiting for more.
+    #[test]
+    fn a_repeated_page_does_not_hold_the_search_open() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        let page = result_entries(20);
+        state.handle_search_results(&kad_id(2), page.clone());
+        let then = chrono::Utc::now().timestamp() - 30;
+        state.last_result_at = Some(then);
+        state.handle_search_results(&kad_id(2), page);
+        assert_eq!(state.last_result_at, Some(then));
+    }
+
+    /// Answers nobody will be shown take no room, so a node answering with
+    /// junk cannot end the search; nor can one node fill what it may keep.
+    #[test]
+    fn junk_and_one_flooding_node_cannot_fill_the_storage_cap() {
         let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
         state.handle_search_results(&kad_id(2), bare_entries(MAX_SEARCH_RESULT_ENTRIES));
-        assert_eq!(state.usable_results, 0);
+        assert!(state.results.is_empty());
+        assert!(!state.stop_querying);
+
+        state.handle_search_results(&kad_id(3), result_entries(MAX_SEARCH_RESULT_ENTRIES));
+        assert_eq!(state.results.len(), MAX_ENTRIES_PER_CONTACT);
+    }
+
+    /// Many nodes' answers together fill the cap, and nothing past it is kept.
+    #[test]
+    fn nothing_past_the_storage_cap_is_kept() {
+        let mut state = SearchState::new(SearchId(1), near_kad_id(0), SearchType::FindKeyword);
+        for node in 10..20u8 {
+            state.handle_search_results(&kad_id(node), result_entries(MAX_ENTRIES_PER_CONTACT));
+        }
+        assert_eq!(state.results.len(), MAX_SEARCH_RESULT_ENTRIES);
         assert!(state.stop_querying);
         assert!(state.next_to_query().is_empty());
     }

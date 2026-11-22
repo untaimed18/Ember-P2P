@@ -11,7 +11,7 @@ use super::*;
 /// as public. That held every session until the file was repaired by hand,
 /// with a log line as the only sign. Latched for the frontend to take, and the
 /// event delayed like the config and database notices.
-fn notify_catalog_unreadable(app_handle: &tauri::AppHandle) {
+fn notify_catalog_unreadable(app_handle: &crate::host::AppHandle) {
     crate::commands::settings::raise_known_met_notice(false);
     let app_handle = app_handle.clone();
     tokio::spawn(async move {
@@ -25,7 +25,7 @@ fn notify_catalog_unreadable(app_handle: &tauri::AppHandle) {
 /// user shared it themselves, which otherwise looked like a Library emptied
 /// for no reason. Asked after the delay: the share-intent store that decides
 /// it is initialized in the background and may not have yet.
-fn notify_catalog_reset_if_lost(app_handle: &tauri::AppHandle) {
+fn notify_catalog_reset_if_lost(app_handle: &crate::host::AppHandle) {
     let app_handle = app_handle.clone();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -41,7 +41,7 @@ pub(in crate::network) async fn apply_deferred_disk_loads(
     state: &mut NetworkState,
     local_index: &Arc<RwLock<LocalIndex>>,
     settings: &AppSettings,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     transfer_manager: &Arc<RwLock<TransferManager>>,
     known_files: &mut KnownFileList,
     shared_friends_only_hashes: &upload_server::SharedFriendsOnlyHashes,

@@ -6,9 +6,8 @@ use super::*;
 pub(in crate::network) async fn on_buddy_tick(
     udp_socket: &Arc<UdpSocket>,
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
-    if state.stats.status == NetworkStatus::Disconnected { return; }
     let tcp_fw = state.firewall_checker.tcp_status();
     let udp_fw = state.firewall_checker.udp_status();
     // eMule (ClientList.cpp:604-629): a buddy is only useful while we

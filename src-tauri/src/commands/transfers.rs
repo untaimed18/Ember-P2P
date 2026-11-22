@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tauri::{Emitter, Manager};
+use crate::host::{Emitter, Manager};
 
 use crate::app_state::AppState;
 use crate::commands::errors::{await_reply, bounded_send, coded, coded_ctx, CMD_REPLY_TIMEOUT};
@@ -114,7 +114,7 @@ pub(crate) fn transfer_status_key(status: &TransferStatus) -> &'static str {
 /// visually stuck on Paused/Stopped. Also reused by the network loop to
 /// announce queued→active/searching promotions in real time.
 pub(crate) fn emit_transfer_status(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     transfer_id: &str,
     status: &TransferStatus,
 ) {
@@ -129,7 +129,7 @@ pub(crate) fn emit_transfer_status(
 
 /// One `transfer-status-batch` event for a batch command instead of a
 /// `transfer-status` per row. Carries the same `{id, status}` items.
-pub(crate) fn emit_transfer_statuses(app: &tauri::AppHandle, statuses: &[(String, TransferStatus)]) {
+pub(crate) fn emit_transfer_statuses(app: &crate::host::AppHandle, statuses: &[(String, TransferStatus)]) {
     if statuses.is_empty() {
         return;
     }
@@ -536,7 +536,7 @@ struct ReviveLink {
 /// `None` when `transfer_id` is not a Failed download Resume may continue
 /// (any more).
 async fn revive_failed_download(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     transfer_id: &str,
     link: Option<ReviveLink>,
@@ -570,7 +570,7 @@ async fn revive_failed_download(
         transfer_id_short(transfer_id)
     );
     persist_transfer_status(state, transfer_id, &row.status).await;
-    if !crate::sharing::feed_downloads::is_private(transfer_id) {
+    if !crate::sharing::feed_downloads::is_feed_download(transfer_id) {
         let _ = app.emit("transfer-started", &row);
     }
     let Some(link) = link else {
@@ -618,7 +618,7 @@ async fn revive_failed_download(
 /// `Ok(false)` when `transfer_id` is no Failed download, for the ordinary
 /// resume to handle.
 async fn resume_failed_download(
-    app: &tauri::AppHandle,
+    app: &crate::host::AppHandle,
     state: &AppState,
     transfer_id: &str,
 ) -> Result<bool, String> {
@@ -1577,10 +1577,10 @@ pub struct AddedWebSources {
 /// and kept across restarts. The main window's alone: it has Ember fetch
 /// addresses from the internet, and the chat window imports the module its
 /// wrapper is in, so the denied list cannot name it.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn add_transfer_web_sources(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
     urls: Vec<String>,
 ) -> Result<AddedWebSources, String> {
@@ -1667,10 +1667,10 @@ fn register_web_source_lines(
     (result, registered)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn start_download(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_name: String,
     file_size: u64,
@@ -1761,8 +1761,8 @@ fn hold_for_publisher(feed: Option<&FeedStart>, transfer_id: &str, file_hash: &s
 /// the list is left as it is: the user's own.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn start_download_to(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     file_hash: String,
     file_name: String,
     file_size: u64,
@@ -1991,7 +1991,7 @@ pub(crate) async fn start_download_to(
                     friend_ember_hash,
                     add_paused,
                 };
-                let was_feed_download = crate::sharing::feed_downloads::is_private(&failed_id);
+                let was_feed_download = crate::sharing::feed_downloads::is_feed_download(&failed_id);
                 if let Some(folder) = &feed_folder {
                     mark_feed_download(&state, &failed_id, folder).await?;
                 }
@@ -2059,7 +2059,7 @@ pub(crate) async fn start_download_to(
     let (active_now, existing_id) = queued?;
     if let Some(existing_id) = existing_id {
         attach_link_web_sources(&state, &file_hash, web_sources).await;
-        let in_feed = crate::sharing::feed_downloads::is_private(&existing_id);
+        let in_feed = crate::sharing::feed_downloads::is_feed_download(&existing_id);
         return Ok(StartDownloadResponse {
             transfer_id: existing_id,
             already_queued: true,
@@ -2156,9 +2156,9 @@ pub(crate) async fn start_download_to(
 
 /// Consume the startup overflow count once so the app shell can present a
 /// user-visible migration notice without repeating it on every route change.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn take_pending_download_overflow_notice(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<usize, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.acknowledge_pending_download_overflow())
@@ -2223,10 +2223,10 @@ const HELD_PAUSE_RELEASE: std::time::Duration = std::time::Duration::from_secs(1
 /// pause before a cancel the user can still undo, so Undo finds its slot free
 /// and the download running again rather than queued behind one started in
 /// its place. The cancel promotes once it goes through.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn pause_transfers_batch(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     transfer_ids: Vec<String>,
     hold: Option<bool>,
 ) -> Result<(), String> {
@@ -2251,7 +2251,7 @@ pub async fn pause_transfers_batch(
             // reloaded under its toast), the slots are not left empty for
             // good. After an Undo they are taken again, and this finds none.
             let app = app.clone();
-            tauri::async_runtime::spawn(async move {
+            crate::host::async_runtime::spawn(async move {
                 tokio::time::sleep(HELD_PAUSE_RELEASE).await;
                 let Some(state) = app.try_state::<AppState>() else {
                     return;
@@ -2365,10 +2365,10 @@ async fn start_held_over(state: &AppState, ids: &[String]) -> Vec<String> {
     restarted
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn resume_transfers_batch(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
@@ -2446,10 +2446,10 @@ pub async fn resume_transfers_batch(
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn stop_transfers_batch(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     check_batch_size(&transfer_ids)?;
@@ -2551,10 +2551,10 @@ fn send_cancel_teardown_later(
     });
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn cancel_transfers_batch(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -2686,10 +2686,10 @@ pub async fn cancel_transfers_batch(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn pause_transfer(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
     if is_completing(&state, &transfer_id).await {
@@ -2737,10 +2737,10 @@ pub async fn pause_transfer(
 
 /// eMule "Stop": removes from active download without deleting files.
 /// Different from Pause - a stopped file won't automatically resume.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn stop_transfer(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
     if is_completing(&state, &transfer_id).await {
@@ -2873,9 +2873,9 @@ fn resolve_transfer_reveal_path(
     })
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_transfer_file_location(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
     let (transfer, dl_folders) = {
@@ -2911,8 +2911,8 @@ pub async fn open_transfer_file_location(
 /// a download has no `Downloads/` yet, because it is created when the first file
 /// lands there, and refusing to open a folder we are about to create ourselves
 /// would be a confusing answer to a reasonable request.
-#[tauri::command]
-pub async fn open_downloads_folder(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command(desktop)]
+pub async fn open_downloads_folder(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     let dl_folder = {
         let cfg = state.config.read().await;
         cfg.settings.download_folder.clone()
@@ -2955,10 +2955,10 @@ pub async fn open_downloads_folder(state: tauri::State<'_, AppState>) -> Result<
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command(desktop)]
 pub async fn open_file(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -3019,10 +3019,10 @@ pub async fn open_file(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn resume_transfer(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
     // `resume` refuses this too; said here so the click is not silently lost.
@@ -3117,11 +3117,11 @@ pub struct FinishedDeleteReport {
 /// the Library has hashed it, its hash. A file already gone just takes the row
 /// with it. When the user keeps a file the Recycle Bin would not take, the
 /// rest are left alone too, as the Library's bulk delete does.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn delete_finished_downloads(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     transfer_ids: Vec<String>,
 ) -> Result<FinishedDeleteReport, String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -3240,10 +3240,10 @@ pub async fn delete_finished_downloads(
     Ok(report)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn remove_transfer(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<(), String> {
     crate::commands::chat_window::require_main_window(&window)?;
@@ -3360,8 +3360,8 @@ pub(crate) async fn discard_transfer(state: &AppState, transfer_id: String, keep
     Ok(())
 }
 
-#[tauri::command]
-pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Transfer>, String> {
+#[ember_macros::command]
+pub async fn get_transfers(state: crate::host::State<'_, AppState>) -> Result<Vec<Transfer>, String> {
     let manager = state.transfer_manager.read().await;
     // A fetch for the feeds code is not one of the user's downloads, and a
     // feed's files are shown on the Feeds page instead.
@@ -3370,7 +3370,7 @@ pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Tran
         .into_iter()
         .filter(|t| {
             !crate::sharing::feed_files::is_internal_fetch(&t.id)
-                && !crate::sharing::feed_downloads::is_private(&t.id)
+                && !crate::sharing::feed_downloads::is_feed_download(&t.id)
         })
         .collect())
 }
@@ -3378,9 +3378,9 @@ pub async fn get_transfers(state: tauri::State<'_, AppState>) -> Result<Vec<Tran
 /// What changed since the caller's last answer, for the Transfers poll: only
 /// rows whose payload differs, the ids that left, and the revision to pass
 /// next time. `since: 0` (or a revision from another run) returns every row.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_transfers_since(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     epoch: Option<u64>,
     since: u64,
 ) -> Result<crate::sharing::manager::TransferDelta, String> {
@@ -3392,9 +3392,9 @@ pub async fn get_transfers_since(
 /// window. Read on demand rather than carried on every transfers poll, because
 /// a per-part bitmap on every tick would be paid for by every user who never
 /// opens the window.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_download_file_details(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<crate::types::DownloadFileDetails, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3414,9 +3414,9 @@ pub async fn get_download_file_details(
 /// "Queued" tab in the transfers/uploads pane. Each row already carries
 /// resolved file name + credit info so the frontend doesn't need any
 /// follow-up commands per row.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_upload_queue(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<Vec<UploadQueueClient>, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -3434,9 +3434,9 @@ pub async fn get_upload_queue(
 /// Snapshot of every persisted SecIdent credit record. Backs the
 /// "Known Clients" tab — this is the lifetime view of every peer
 /// we've ever traded credit with, sorted by most-recently-seen.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_known_clients(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<crate::types::KnownClientsSnapshot, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -3456,9 +3456,9 @@ pub async fn get_known_clients(
 /// The tab labels carry these, so they are polled on whichever tab is showing;
 /// `get_known_clients` is far too expensive to run for two integers. See
 /// `NetworkCommand::GetKnownClientCounts`.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_known_client_counts(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<crate::types::KnownClientCounts, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     state
@@ -3473,9 +3473,9 @@ pub async fn get_known_client_counts(
     .await
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_transfer_priority(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
     priority: String,
 ) -> Result<(), String> {
@@ -3529,8 +3529,8 @@ pub async fn set_transfer_priority(
 
 /// The downloads waiting in the download queue, front first. A paused row
 /// that was running is not among them: it keeps its place among the running.
-#[tauri::command]
-pub async fn get_download_queue_ids(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+#[ember_macros::command]
+pub async fn get_download_queue_ids(state: crate::host::State<'_, AppState>) -> Result<Vec<String>, String> {
     Ok(state
         .transfer_manager
         .read()
@@ -3544,9 +3544,9 @@ pub async fn get_download_queue_ids(state: tauri::State<'_, AppState>) -> Result
 
 /// Move queued downloads to the front or the back of the download queue.
 /// Returns how many were waiting there to be moved.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn move_transfers_in_queue(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_ids: Vec<String>,
     to_front: bool,
 ) -> Result<u32, String> {
@@ -3569,6 +3569,12 @@ pub async fn move_transfers_in_queue(
 pub(crate) async fn persist_download_order(state: &AppState) {
     let order: Vec<String> = {
         let manager = state.transfer_manager.read().await;
+        // Until last session's downloads are back in the manager (the network
+        // may still be waiting for its interface), its list is not the order:
+        // saving it would clear the order every row has.
+        if !manager.restored {
+            return;
+        }
         let mut running: Vec<&Transfer> = manager
             .active
             .values()
@@ -3632,10 +3638,10 @@ struct FinishedToMove {
 /// moves once at the end rather than once per file. `move_finished: false`
 /// relabels finished downloads and leaves their files, as removing a category
 /// does.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_transfers_category(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     transfer_ids: Vec<String>,
     category: String,
     move_finished: Option<bool>,
@@ -3673,7 +3679,7 @@ pub async fn set_transfers_category(
             manager.set_category(id, &category);
             // A feed's file stays in its feed folder: a category folder is in
             // `Downloads`, which may be shared.
-            if !move_finished.unwrap_or(true) || crate::sharing::feed_downloads::is_private(id) {
+            if !move_finished.unwrap_or(true) || crate::sharing::feed_downloads::is_feed_download(id) {
                 continue;
             }
             let Some(t) = manager.get_transfer(id).filter(|t| {
@@ -3924,9 +3930,9 @@ pub(crate) async fn follow_renamed_finished_download(
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn rename_transfer(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
     file_name: String,
 ) -> Result<String, String> {
@@ -4051,9 +4057,9 @@ async fn restore_transfer_file_name(state: &AppState, transfer_id: &str, previou
     }
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_preview_priority(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
     enabled: bool,
 ) -> Result<(), String> {
@@ -4088,8 +4094,8 @@ pub async fn set_preview_priority(
 /// pause may interleave; last command wins per transfer. Callers should
 /// debounce in the UI rather than expect a transactional guarantee.
 pub async fn pause_all_transfers(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<(), String> {
     let (paused, pause_ids) = {
         let mut manager = state.transfer_manager.write().await;
@@ -4153,8 +4159,8 @@ pub async fn pause_all_transfers(
 /// Resume every paused / stopped download. See pause_all_transfers for the
 /// same eventual-consistency caveat.
 pub async fn resume_all_transfers(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
 ) -> Result<(), String> {
     let (outcome, rediscover) = {
         let mut manager = state.transfer_manager.write().await;
@@ -4210,9 +4216,9 @@ pub async fn resume_all_transfers(
     Ok(())
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn get_transfer_sources(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<Vec<crate::types::SourceInfo>, String> {
     let manager = state.transfer_manager.read().await;
@@ -4221,9 +4227,9 @@ pub async fn get_transfer_sources(
 
 /// Clear completed rows: every one, or only those in `transfer_ids`. A listed
 /// row that is not completed (any more) is left alone.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn clear_completed(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     transfer_ids: Option<Vec<String>>,
 ) -> Result<u32, String> {
     let only = match transfer_ids {
@@ -4272,16 +4278,16 @@ pub async fn clear_completed(
     // folder at a time per row, a share that does not answer held the list
     // for minutes and a blocking thread for every row.
     let db = state.db.clone();
-    tauri::async_runtime::spawn(async move {
+    crate::host::async_runtime::spawn(async move {
         cleanup_partial_files_many(&db, &dl_roots, &ids).await;
     });
     Ok(count)
 }
 
-#[tauri::command]
+#[ember_macros::command]
 pub async fn recover_archive(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, AppState>,
+    window: crate::host::WebviewWindow,
+    state: crate::host::State<'_, AppState>,
     transfer_id: String,
 ) -> Result<String, String> {
     crate::commands::chat_window::require_main_window(&window)?;

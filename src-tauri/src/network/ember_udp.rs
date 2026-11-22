@@ -157,7 +157,7 @@ pub(super) async fn handle_ember_native_udp(
     source_manager: &Arc<RwLock<SourceManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     if let Err(p) = std::panic::AssertUnwindSafe(handle_ember_native_udp_inner(
@@ -192,7 +192,7 @@ pub(super) async fn handle_ember_native_udp_inner(
     source_manager: &Arc<RwLock<SourceManager>>,
     local_index: &Arc<RwLock<LocalIndex>>,
     db: &Arc<Database>,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     bandwidth_limiter: &Arc<BandwidthLimiter>,
 ) {
     let outcome = state.ember_transport.dispatch_incoming(data, from);

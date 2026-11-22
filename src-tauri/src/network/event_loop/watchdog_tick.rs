@@ -7,7 +7,7 @@ use super::*;
 #[allow(clippy::too_many_arguments)]
 pub(in crate::network) async fn on_watchdog_tick(
     state: &mut NetworkState,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
     shared_server_addr: &Arc<RwLock<Option<SocketAddr>>>,
     cache_write_handle: &Option<tokio::task::JoinHandle<()>>,
     known2_save_in_flight: bool,

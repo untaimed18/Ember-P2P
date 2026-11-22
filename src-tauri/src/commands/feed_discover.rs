@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tauri::Emitter;
+use crate::host::Emitter;
 
 use crate::app_state::AppState;
 use crate::commands::errors::{coded, coded_ctx};
@@ -286,10 +286,10 @@ fn cap_per_publisher(mut feeds: Vec<DiscoveredFeed>) -> Vec<DiscoveredFeed> {
 /// Walk the public feed index and return the feeds listed in it. Each shard
 /// is emitted on [`FEEDS_FOUND_EVENT`] as it lands; the return value is the
 /// whole set, which is cached for the next open.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn discover_feeds(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
     walk: String,
 ) -> Result<Vec<DiscoveredFeedInfo>, String> {
     use futures::StreamExt;
@@ -370,8 +370,8 @@ pub async fn discover_feeds(
 
 /// The feeds the last Discover walk found, from the local cache, for the
 /// page to show while a walk runs.
-#[tauri::command]
-pub async fn cached_discovered_feeds(state: tauri::State<'_, AppState>) -> Result<Vec<DiscoveredFeedInfo>, String> {
+#[ember_macros::command]
+pub async fn cached_discovered_feeds(state: crate::host::State<'_, AppState>) -> Result<Vec<DiscoveredFeedInfo>, String> {
     let local = Local::read(&state).await?;
     let now = chrono::Utc::now().timestamp();
     let db = state.db.clone();
@@ -387,9 +387,9 @@ pub async fn cached_discovered_feeds(state: tauri::State<'_, AppState>) -> Resul
 
 /// Hide a feed from Discover, or with no `salt` every feed of its publisher;
 /// with `hidden` false, show it again.
-#[tauri::command]
+#[ember_macros::command]
 pub async fn set_discovered_feed_hidden(
-    state: tauri::State<'_, AppState>,
+    state: crate::host::State<'_, AppState>,
     publisher: String,
     salt: Option<String>,
     hidden: bool,
@@ -414,8 +414,8 @@ pub async fn set_discovered_feed_hidden(
 }
 
 /// How many feeds and publishers are hidden from Discover.
-#[tauri::command]
-pub async fn hidden_discovered_feed_count(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+#[ember_macros::command]
+pub async fn hidden_discovered_feed_count(state: crate::host::State<'_, AppState>) -> Result<usize, String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.feeds_hidden().map(|hidden| hidden.len()))
         .await
@@ -424,8 +424,8 @@ pub async fn hidden_discovered_feed_count(state: tauri::State<'_, AppState>) -> 
 }
 
 /// Show every hidden feed and publisher in Discover again.
-#[tauri::command]
-pub async fn clear_hidden_discovered_feeds(state: tauri::State<'_, AppState>) -> Result<(), String> {
+#[ember_macros::command]
+pub async fn clear_hidden_discovered_feeds(state: crate::host::State<'_, AppState>) -> Result<(), String> {
     let db = state.db.clone();
     tokio::task::spawn_blocking(move || db.feeds_hidden_clear())
         .await

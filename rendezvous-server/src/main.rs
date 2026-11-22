@@ -1491,6 +1491,9 @@ struct RelayQueueReceiver {
 impl RelayQueueSender {
     async fn send(&self, frame: Vec<u8>) -> Result<(), ()> {
         let len = frame.len();
+        // Rust 1.99 deprecates `fetch_update` for `try_update`, which is newer
+        // than this crate's `rust-version`.
+        #[allow(deprecated)]
         let reserved = self
             .queued_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
@@ -3968,6 +3971,8 @@ async fn protocol_v4() -> Json<serde_json::Value> {
 /// pre-body gate reads, whether or not it is probed. The hourly probe budget
 /// is charged only for a probe, and its 429 says `"reason": "hourly"` so the
 /// client can tell it from the general one, which passes within a minute.
+// The error is the HTTP response itself, built once and handed to axum.
+#[allow(clippy::result_large_err)]
 async fn reachability_v4(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -4366,8 +4371,15 @@ async fn delete_channel_v4(
     if records_new_tombstone && !check_channel_create_rate_limit(&state, client_ip).await {
         return StatusCode::TOO_MANY_REQUESTS;
     }
+    // Kept with the tombstone, so a member's app can check the deletion
+    // against the room's own key instead of taking this server's word.
+    let proof = registry::DeleteProof {
+        pubkey: hex::encode(pubkey),
+        ts: body.ts,
+        sig: hex::encode(sig),
+    };
     let mut registry = state.channels_registry.write().await;
-    let result = registry.delete_channel(&channel_hex, &hex::encode(pubkey));
+    let result = registry.delete_channel_signed(&channel_hex, &hex::encode(pubkey), proof);
     let durable_generation = registry.durable_generation();
     drop(registry);
     acknowledge_registry_write(&state, result, durable_generation).await
@@ -4609,6 +4621,56 @@ async fn channel_deleted_v4(
         .flatten();
     Ok(Json(serde_json::json!({
         "ids": ids,
+        "next": next,
+    })))
+}
+
+/// Signed deletes returned per `/v4/channels/deleted/proofs` page. One is
+/// about 280 bytes of JSON, so a full page stays inside the client's 256 KiB
+/// response bound.
+const MAX_DELETE_PROOFS_PER_PAGE: usize = 500;
+
+/// The owners' signed deletes, paged by channel id like
+/// `/v4/channels/deleted`.
+///
+/// Whole pages rather than a lookup by id: a member asking for the rooms it
+/// was in would tell this server which rooms those are, private ones
+/// included. A client reads these only while it holds a room the tombstone
+/// list names that it has not yet seen proved.
+async fn channel_deleted_proofs_v4(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<DeletedIdsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let client_ip = extract_client_ip(&headers, addr);
+    if !check_rate_limit(&state, client_ip).await {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if query.after.as_deref().is_some_and(|cursor| {
+        cursor.len() > 64 || !cursor.bytes().all(|b| b.is_ascii_hexdigit())
+    }) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let registry = state.channels_registry.read().await;
+    let page = registry.deleted_proofs_page(query.after.as_deref(), MAX_DELETE_PROOFS_PER_PAGE);
+    drop(registry);
+    let next = (page.len() == MAX_DELETE_PROOFS_PER_PAGE)
+        .then(|| page.last().map(|(id, _)| id.clone()))
+        .flatten();
+    let proofs: Vec<serde_json::Value> = page
+        .into_iter()
+        .map(|(channel_id, proof)| {
+            serde_json::json!({
+                "channel_id": channel_id,
+                "pubkey": proof.pubkey,
+                "ts": proof.ts,
+                "sig": proof.sig,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "proofs": proofs,
         "next": next,
     })))
 }
@@ -6916,6 +6978,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v2/punch/ack", post(legacy_punch_gone))
         .route("/v4/channels/directory", get(channel_directory_v4))
         .route("/v4/channels/deleted", get(channel_deleted_v4))
+        .route("/v4/channels/deleted/proofs", get(channel_deleted_proofs_v4))
         .route("/v2/relay-tickets/offer", post(legacy_punch_gone))
         .route("/v2/relay-tickets/poll", post(legacy_punch_gone))
         .route("/v3/relay-tickets/poll", post(legacy_punch_gone))
@@ -11368,6 +11431,28 @@ mod relay_ticket_tests {
         .expect("deleted");
         let ids = gone.0["ids"].as_array().unwrap();
         assert!(ids.iter().any(|v| v.as_str() == Some(&hex::encode(public_id))));
+        // The owner's signed delete is served with it, and checks out against
+        // the room's key; the forged one above left nothing behind.
+        let proofs = channel_deleted_proofs_v4(
+            State(state.clone()),
+            ConnectInfo(addr),
+            HeaderMap::new(),
+            Query(DeletedIdsQuery { after: None }),
+        )
+        .await
+        .expect("proofs");
+        let proofs = proofs.0["proofs"].as_array().unwrap().clone();
+        assert_eq!(proofs.len(), 1);
+        let served = &proofs[0];
+        assert_eq!(served["channel_id"].as_str(), Some(hex::encode(public_id).as_str()));
+        assert_eq!(served["pubkey"].as_str(), Some(hex::encode(public_pk).as_str()));
+        let served_ts = served["ts"].as_i64().unwrap();
+        let served_sig = decode_hex_sig(served["sig"].as_str().unwrap()).unwrap();
+        assert!(ed25519_verify(
+            &public_pk,
+            &build_channel_delete_v4_msg(&public_id, &public_pk, served_ts),
+            &served_sig
+        ));
 
         let reuse_key = ed25519_dalek::SigningKey::from_bytes(&[0xF6; 32]);
         let reuse_pk = reuse_key.verifying_key().to_bytes();

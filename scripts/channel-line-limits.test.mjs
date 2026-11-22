@@ -49,15 +49,11 @@ for (const name of ["CHANNEL_LINE_MAX_TEXT_BYTES", "CHANNEL_EDIT_MAX_TEXT_BYTES"
   });
 }
 
-test("REPLY_REFERENCE_BYTES is Rust's REPLY_TRAILER_BYTES", () => {
-  const chars = rustChannel.match(/pub const REPLY_TRAILER_CHARS: usize = ([\d+ ]+);/);
-  assert.ok(chars, "network/ember/channel.rs no longer declares REPLY_TRAILER_CHARS as a sum");
-  const perChar = rustChannel.match(
-    /pub const REPLY_TRAILER_BYTES: usize = REPLY_TRAILER_CHARS \* (\d+);/,
-  );
-  assert.ok(perChar, "network/ember/channel.rs no longer derives REPLY_TRAILER_BYTES from REPLY_TRAILER_CHARS");
-  const sum = chars[1].split("+").reduce((total, term) => total + Number(term.trim()), 0);
-  assert.equal(tsConst("REPLY_REFERENCE_BYTES"), sum * Number(perChar[1]));
+test("REPLY_REFERENCE_BYTES is Rust's CHAT_V2_REPLY_BYTES", () => {
+  const terms = rustChannel.match(/pub const CHAT_V2_REPLY_BYTES: usize = ([\d+ ]+);/);
+  assert.ok(terms, "network/ember/channel.rs no longer declares CHAT_V2_REPLY_BYTES as a sum");
+  const sum = terms[1].split("+").reduce((total, term) => total + Number(term.trim()), 0);
+  assert.equal(tsConst("REPLY_REFERENCE_BYTES"), sum);
 });
 
 test("the room composer and editor measure against these limits", () => {

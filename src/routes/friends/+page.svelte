@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getFriends, addFriend, removeFriend, blockFriend, unblockFriend, getBlockedFriends, isChatLocked, updateFriendNickname, getMyEmberHash, resetFriendCode, acceptFriendRequest, rejectFriendRequest, retryFriendSearch, type FriendInfo, type FriendRequestInfo, type BlockedInfo } from '$lib/api/friends';
+  import { friendsFeeds } from '$lib/api/feeds';
   import { carriesIntroSecret, friendHashFromCode, isAcceptedFriendInput } from '$lib/friendCode';
   import { kadRecheckFirewall } from '$lib/api/kad';
   import ConfirmDialog from '$lib/components/ConfirmDialog.svelte';
@@ -12,7 +13,7 @@
   import { fade, fly } from 'svelte/transition';
   import { flip } from 'svelte/animate';
   import { prefersReducedMotion } from 'svelte/motion';
-  import { toastError, toastWarning } from '$lib/stores/toast';
+  import { toast, toastError, toastWarning } from '$lib/stores/toast';
   import { copyToClipboard, formatBytes, formatCalendarDate } from '$lib/utils';
   import * as m from '$lib/paraglide/messages';
   import { alreadyQueuedText } from '$lib/alreadyQueued';
@@ -33,6 +34,7 @@
     isDiscoverable as isDiscoverableStore,
     discoverabilityFailed as discoverabilityFailedStore,
     clearUnread,
+    markAllFriendChatsRead,
     beginFriendRequestMutation,
     endFriendRequestMutation,
     dropFriendRequest,
@@ -62,21 +64,15 @@
   import IconX from '$lib/components/IconX.svelte';
   import IconGear from '$lib/components/IconGear.svelte';
   import FriendSettingsDialog from '$lib/components/FriendSettingsDialog.svelte';
-  import { chatAllowedWith, friendNameTooLong, friendOverrides, FRIEND_NAME_MAX_CHARS } from '$lib/friendSettings';
+  import { OpenFriend } from '$lib/openFriend.svelte';
+  import { chatAllowedWith, chatOffByFriendSetting, friendNameTooLong, friendOverrides, FRIEND_NAME_MAX_CHARS } from '$lib/friendSettings';
 
   let friends: FriendInfo[] = $derived($friendsListStore);
   function chatDisabledFor(hash: string): boolean {
     return !chatAllowedWith($appSettings, hash);
   }
   /** The friend whose settings dialog is open. */
-  let settingsFor: FriendInfo | null = $state(null);
-  $effect(() => {
-    const open = settingsFor;
-    if (!open) return;
-    const fresh = $friendsListStore.find((f) => f.user_hash === open.user_hash);
-    if (!fresh) settingsFor = null;
-    else if (fresh !== open) settingsFor = fresh;
-  });
+  const settingsFor = new OpenFriend(() => $friendsListStore);
   /** Whether a friend has any setting of their own, for the dot on the gear. */
   function hasOverrides(hash: string): boolean {
     return Object.keys(friendOverrides($appSettings, hash)).length > 0;
@@ -100,6 +96,9 @@
   let showAddForm = $state(false);
   let newHash = $state('');
   let newNickname = $state('');
+  /** The name a link filled in, which is the one they go by: added as it
+   *  stands, it is kept as theirs, not as the user's own label. */
+  let linkedName: string | null = null;
   let addError: string | null = $state(null);
 
   let confirmRemoveOpen = $state(false);
@@ -255,6 +254,22 @@
   // can momentarily hold a hash that isn't in the current friend list, which
   // would inflate the header count.
   let onlineFriendCount = $derived(friends.filter(f => isFriendOnline(f.user_hash)).length);
+  let anyUnread = $derived(friends.some((f) => (unreadCounts.get(f.user_hash.toLowerCase()) ?? 0) > 0));
+  let markingAllRead = $state(false);
+
+  async function markAllRead() {
+    if (markingAllRead) return;
+    markingAllRead = true;
+    try {
+      // What is left unread is disappearing messages nobody has opened.
+      if ((await markAllFriendChatsRead()) > 0) toast(m.friends_mark_all_read_kept());
+    } catch (e) {
+      console.warn('Friends: mark all as read failed', e);
+      toastError(translateError(e, m.friends_mark_all_read_failed()));
+    } finally {
+      markingAllRead = false;
+    }
+  }
 
   function openChat(f: FriendInfo) {
     if (chatDisabledFor(f.user_hash)) return;
@@ -264,6 +279,20 @@
     // other pages. Unread is cleared only after mark-as-read succeeds,
     // so a failed IPC cannot hide a badge for messages that are still unread.
     openChatTab(f.user_hash, f.nickname || f.user_hash.slice(0, 8) + '\u2026');
+  }
+
+  /** Each friend's key and the feeds of theirs this device knows, by hash. */
+  let friendFeeds = $state<Record<string, { publisher: string; known: number }>>({});
+
+  function loadFriendFeeds() {
+    friendsFeeds()
+      .then((found) => { if (!destroyed) friendFeeds = found; })
+      .catch((e) => console.warn('friends: failed to read their feeds:', e));
+  }
+
+  /** Discover, showing this friend's feeds only. */
+  function openFriendFeeds(publisher: string) {
+    void goto(`/feeds?publisher=${encodeURIComponent(publisher)}`).catch(() => {});
   }
 
   function openBrowse(f: FriendInfo) {
@@ -425,15 +454,22 @@
   $effect(() => {
     const addParam = $page.url.searchParams.get('add');
     if (!addParam) return;
+    const nameParam = [...($page.url.searchParams.get('name') ?? '').trim()]
+      .slice(0, FRIEND_NAME_MAX_CHARS)
+      .join('')
+      .trim();
     showAddForm = true;
     untrack(() => {
-      if (newHash.trim() !== addParam.trim()) newNickname = '';
+      if (nameParam) newNickname = nameParam;
+      else if (newHash.trim() !== addParam.trim()) newNickname = '';
     });
+    linkedName = nameParam || null;
     newHash = addParam;
     addError = null;
     untrack(() => {
       const next = new URL($page.url);
       next.searchParams.delete('add');
+      next.searchParams.delete('name');
       void goto(`${next.pathname}${next.search}${next.hash}`, {
         replaceState: true,
         keepFocus: true,
@@ -447,6 +483,7 @@
     loadFriends();
     loadBlocked();
     loadMyHash();
+    loadFriendFeeds();
     isChatLocked()
       .then(v => { if (!destroyed) chatLocked = v; })
       .catch((e) => {
@@ -725,7 +762,8 @@
       const before = new Set(friends.map((f) => f.user_hash.toLowerCase()));
       // For a public key, re-adding an existing friend is an upsert rather than
       // an error, so the only way to tell it apart is whether a row appeared.
-      await addFriend(hash, nick || undefined);
+      await addFriend(hash, nick || undefined, nick !== '' && nick === linkedName);
+      linkedName = null;
       if (updatedFriend) {
         failedSearchToastsShown.delete(updatedFriend.user_hash.toLowerCase());
         flash(m.friends_code_updated({
@@ -860,7 +898,8 @@
   /** The open settings dialog and the chat tab keep their own copy of the
    *  name; the list and the name cache follow the store. */
   function showFriendName(hash: string, nick: string, alias: string) {
-    if (settingsFor?.user_hash === hash) settingsFor = { ...settingsFor, nickname: nick, alias };
+    const open = settingsFor.current;
+    if (open?.user_hash === hash) settingsFor.current = { ...open, nickname: nick, alias };
     renameChatTab(hash, nick || hash.slice(0, 8) + '\u2026');
   }
 
@@ -1024,11 +1063,11 @@
   onclose={closeBrowse}
 />
 
-{#if settingsFor}
+{#if settingsFor.current}
   <FriendSettingsDialog
-    friend={settingsFor}
+    friend={settingsFor.current}
     onrename={renameFriend}
-    onclose={() => (settingsFor = null)}
+    onclose={() => (settingsFor.current = null)}
   />
 {/if}
 
@@ -1038,6 +1077,15 @@
     <span class="beta-badge">{m.common_beta()}</span>
   </h2>
   <div class="header-actions">
+    {#if anyUnread}
+      <button
+        class="ghost"
+        title={m.friends_mark_all_read_title()}
+        disabled={markingAllRead}
+        aria-busy={markingAllRead ? 'true' : undefined}
+        onclick={markAllRead}
+      >{markingAllRead ? m.friends_marking_all_read() : m.friends_mark_all_read()}</button>
+    {/if}
     <button class="ghost" onclick={() => void refreshAll()} disabled={loading}>{m.common_refresh()}</button>
   </div>
 </div>
@@ -1481,6 +1529,7 @@
       {@const truncatedId = `${f.user_hash.slice(0, 8)}\u2026${f.user_hash.slice(-6)}`}
       {@const lastAddr = f.last_ip && f.last_port > 0 ? `${f.last_ip}:${f.last_port}` : (f.last_ip || '')}
       {@const shortName = f.nickname || f.user_hash.slice(0, 8)}
+      {@const feeds = friendFeeds[f.user_hash.toLowerCase()]}
       <div class="friend-card" class:editing={editingHash === f.user_hash}>
         <div class="card-avatar">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1581,6 +1630,16 @@
           {#if f.mutual && !isOnline && legacyStrandedFriends.has(f.user_hash.toLowerCase())}
             <span class="card-legacy-hint">{m.friends_legacy_stranded_hint()}</span>
           {/if}
+          {#if (feeds?.known ?? 0) > 0 && feeds}
+            <button type="button" class="card-feeds-link" onclick={() => openFriendFeeds(feeds.publisher)}>
+              {plural(feeds.known, {
+                one: () => m.friends_feeds_known_one({ count: feeds.known }),
+                oneShowsCount: true,
+                few: () => m.friends_feeds_known_few({ count: feeds.known }),
+                other: () => m.friends_feeds_known_other({ count: feeds.known }),
+              })}
+            </button>
+          {/if}
         </div>
 
         <div class="card-controls">
@@ -1589,7 +1648,9 @@
             onclick={() => openChat(f)}
             disabled={chatDisabledFor(f.user_hash)}
             title={chatDisabledFor(f.user_hash)
-              ? m.chat_dock_chat_disabled()
+              ? chatOffByFriendSetting($appSettings, f.user_hash)
+                ? m.chat_dock_chat_disabled_friend()
+                : m.chat_dock_chat_disabled()
               : isOnline ? m.friends_encrypted_chat_title() : m.friends_action_chat()}
           >
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1614,7 +1675,7 @@
             class="card-settings-btn"
             class:has-overrides={hasOverrides(f.user_hash)}
             disabled={!$appSettings}
-            onclick={() => (settingsFor = f)}
+            onclick={() => (settingsFor.current = f)}
             title={hasOverrides(f.user_hash)
               ? m.friend_settings_open_custom({ name: shortName })
               : m.friend_settings_open({ name: shortName })}
@@ -1651,6 +1712,14 @@
                     ? m.friends_action_browse_files()
                     : m.friends_action_browse_offline()}
               >{m.friends_action_browse_files()}</button>
+              {#if feeds}
+                <button
+                  type="button"
+                  role="menuitem"
+                  onclick={(e) => { closeCardMenu(e.currentTarget); openFriendFeeds(feeds.publisher); }}
+                  title={m.friends_action_feeds_title()}
+                >{m.friends_action_feeds()}</button>
+              {/if}
               {#if f.mutual && !isOnline}
                 <button
                   type="button"
@@ -2281,6 +2350,21 @@
     line-height: 1.35;
   }
 
+  .card-feeds-link {
+    align-self: flex-start;
+    padding: 0;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: var(--font-size-xs);
+    color: var(--accent);
+    cursor: pointer;
+  }
+
+  .card-feeds-link:hover {
+    text-decoration: underline;
+  }
+
   .status-online {
     color: var(--success);
     font-weight: 600;
@@ -2854,11 +2938,11 @@
   }
 
   /* Verification badges on incoming friend requests. "Verified"
-     means the peer advertised an Ed25519 pubkey whose BLAKE3 prefix
-     matches their claimed ember_hash (offline identity binding).
-     "Unverified" means no pubkey was advertised or the binding
-     check failed; users should only accept from people they
-     recognise until the full challenge-response runs on accept. */
+     means the request arrived on a secure-v2 session, whose Noise IK
+     handshake proved the peer holds the key behind its ember_hash.
+     "Unverified" means it came in on a plain eD2K session, where
+     nothing proves that; users should only accept from people they
+     recognise. */
   .request-badge {
     display: inline-flex;
     align-items: center;

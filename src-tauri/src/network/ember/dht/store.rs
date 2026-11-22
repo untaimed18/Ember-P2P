@@ -848,6 +848,10 @@ pub struct DhtStore {
     /// scan; under-estimating would refuse a key we should have taken, so the
     /// direction matters.
     furthest_key_distance: Option<[u8; 16]>,
+    /// Ed25519 checks `store_record` has made, so a test can see a caller's
+    /// proof spare one.
+    #[cfg(test)]
+    pub(super) signature_checks: u64,
 }
 
 /// XOR distance between two 128-bit ids.
@@ -879,6 +883,8 @@ impl DhtStore {
             per_key_cap_rejections: 0,
             unparseable_rejections: 0,
             furthest_key_distance: None,
+            #[cfg(test)]
+            signature_checks: 0,
         }
     }
 
@@ -1253,8 +1259,20 @@ impl DhtStore {
         self.store_record(key, data, signature, attributed_ip, false)
     }
 
+    /// [`Self::store_attributed`] for a record [`CheckedRecord::verify`] has
+    /// already checked, which is not checked again.
+    pub fn store_checked(
+        &mut self,
+        key: [u8; 16],
+        record: CheckedRecord,
+        attributed_ip: Option<std::net::Ipv4Addr>,
+    ) -> bool {
+        self.store_record(key, record.data, record.signature, attributed_ip, true)
+    }
+
     /// [`Self::store_attributed`], skipping the signature check only when
-    /// `signature_checked` — which only [`VerifiedRecords`] can vouch for.
+    /// `signature_checked` — which only [`VerifiedRecords`] and
+    /// [`CheckedRecord`] can vouch for.
     fn store_record(
         &mut self,
         key: [u8; 16],
@@ -1339,6 +1357,10 @@ impl DhtStore {
         let now_unix = chrono::Utc::now().timestamp();
         if !self.admit_created_at(&key, created_at, ttl_secs, now_unix) {
             return false;
+        }
+        #[cfg(test)]
+        {
+            self.signature_checks += u64::from(!signature_checked);
         }
         if !signature_checked && !verify_record_signature(&data, &signature, &publisher_key) {
             self.signature_rejections = self.signature_rejections.saturating_add(1);
@@ -2481,10 +2503,6 @@ fn signed_identity_from_record_data(data: &[u8]) -> Option<([u8; 16], [u8; 32], 
     Some((key, publisher_key, created_at))
 }
 
-/// Verify an Ed25519 signature over `data` with `publisher_key`.
-/// Returns false on any failure (malformed key, malformed sig, or
-/// signature mismatch). Uses the same strict verify as frame / record
-/// parse paths so weak-key forgeries cannot sneak in via `store` alone.
 /// Persisted records whose signatures have been checked, under the author their
 /// own body names.
 ///
@@ -2518,6 +2536,30 @@ impl VerifiedRecords {
     }
 }
 
+/// A record whose signature has been checked under the author its own body
+/// names: the check [`DhtStore::store_checked`] would otherwise make again.
+///
+/// Built only by [`Self::verify`], as [`VerifiedRecords`] is. The inbound
+/// STORE path has to verify a record before the rules that read its signed
+/// fields, and handing the store this rather than the bare bytes is what
+/// spares a second Ed25519 check per record without letting an unchecked
+/// one in.
+pub struct CheckedRecord {
+    data: Vec<u8>,
+    signature: [u8; 64],
+}
+
+impl CheckedRecord {
+    pub fn verify(data: Vec<u8>, signature: [u8; 64]) -> Option<Self> {
+        let (_, author, _) = signed_identity_from_record_data(&data)?;
+        verify_record_signature(&data, &signature, &author).then_some(Self { data, signature })
+    }
+}
+
+/// Verify an Ed25519 signature over `data` with `publisher_key`.
+/// Returns false on any failure (malformed key, malformed sig, or
+/// signature mismatch). Uses the same strict verify as frame / record
+/// parse paths so weak-key forgeries cannot sneak in via `store` alone.
 fn verify_record_signature(data: &[u8], signature: &[u8; 64], publisher_key: &[u8; 32]) -> bool {
     let Some(vk) = crypto::verifying_key_from_bytes(publisher_key) else {
         return false;
@@ -3193,10 +3235,36 @@ mod tests {
         assert!(store.store(key, data.clone(), sig));
         assert_eq!(store.total_records(), 1);
         assert_eq!(store.key_count(), 1);
+        assert_eq!(store.signature_checks, 1);
 
         let records = store.get(&key).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].data, data);
+    }
+
+    /// Only a record whose signature holds is a [`CheckedRecord`], and the
+    /// store takes one without checking it again.
+    #[test]
+    fn a_checked_record_is_stored_without_a_second_check() {
+        let mut store = DhtStore::new();
+        let key = [1u8; 16];
+        let (sk, _) = keypair();
+        let (data, sig) = signed_body(key, &[42], &sk);
+        let mut forged = sig;
+        forged[0] ^= 1;
+        assert!(CheckedRecord::verify(data.clone(), forged).is_none());
+        let (other, _) = keypair();
+        let mut misattributed = data.clone();
+        misattributed[73..105].copy_from_slice(&other.verifying_key().to_bytes());
+        assert!(
+            CheckedRecord::verify(misattributed, sig).is_none(),
+            "checked under the author the body names"
+        );
+
+        let checked = CheckedRecord::verify(data.clone(), sig).expect("a good signature");
+        assert!(store.store_checked(key, checked, None));
+        assert_eq!(store.signature_checks, 0);
+        assert_eq!(store.get(&key).unwrap()[0].data, data);
     }
 
     #[test]

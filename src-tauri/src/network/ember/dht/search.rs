@@ -312,8 +312,9 @@ const MAX_PAGES_PER_NODE_EXHAUSTED: u8 = (MAX_SEARCH_RESULTS / RECORDS_PER_UNFRA
 /// before its own stale-round rule may fire.
 const MIN_RESPONSES_TO_CONVERGE: usize = K_BUCKET_SIZE / 2;
 
-/// How long a keyword walk whose k closest live contacts have all answered may
-/// go without taking a new record before it ends.
+/// How long a keyword walk, or a value lookup marked as settling
+/// ([`IterativeSearch::mark_settling_lookup`]), whose k closest live contacts
+/// have all answered may go without taking a new record before it ends.
 ///
 /// A keyword record lives on the k nodes closest to its key, so once those have
 /// answered, and the session peers pinned for their own records have too, what
@@ -649,6 +650,23 @@ fn single_word_share(record: &SearchResultRecord) -> Option<(ShareKey, [u8; 32])
     Some(((Responder::of(record.from_node, record.from_subnet), file, digest), publisher))
 }
 
+/// `records` with each responder held to its share of every file across them
+/// all, as [`IterativeSearch::absorb_results`] holds it once a finished walk
+/// joins its search: for the rows of several walks folded while they run.
+pub fn within_shares<'a, T>(
+    records: impl Iterator<Item = (&'a SearchResultRecord, T)>,
+) -> impl Iterator<Item = (&'a SearchResultRecord, T)> {
+    let mut counted: HashMap<ShareKey, HashSet<[u8; 32]>> = HashMap::new();
+    records.filter(move |(record, _)| {
+        let Some((share, publisher)) = single_word_share(record) else {
+            return true;
+        };
+        let publishers = counted.entry(share).or_default();
+        publishers.contains(&publisher)
+            || (publishers.len() < MAX_PUBLISHERS_PER_FILE_PER_NODE && publishers.insert(publisher))
+    })
+}
+
 /// An active iterative search.
 pub struct IterativeSearch {
     pub id: u32,
@@ -813,6 +831,9 @@ pub struct IterativeSearch {
     absorbed_count: usize,
     /// A user keyword search, as [`Self::mark_keyword_lookup`] records.
     keyword_lookup: bool,
+    /// A value lookup that may end as a keyword walk does, as
+    /// [`Self::mark_settling_lookup`] records.
+    settles: bool,
     /// When this walk last took a record, against [`KEYWORD_SETTLE_SECS`].
     last_new_record: Instant,
     /// Nodes whose first query carried the primary key alone — see
@@ -933,6 +954,7 @@ impl IterativeSearch {
             branch_walks: Vec::new(),
             absorbed_count: 0,
             keyword_lookup: false,
+            settles: false,
             last_new_record: Instant::now(),
             broad_nodes: HashSet::new(),
             absorbed_nodes: 0,
@@ -946,10 +968,23 @@ impl IterativeSearch {
     /// dropped as it arrives rather than charged to the result budget, and the
     /// walk may end once its neighbourhood has settled (see
     /// [`KEYWORD_SETTLE_SECS`]). The other value lookups share this type and
-    /// keep exhausting their shortlist: a source or channel lookup is after
-    /// every copy there is of one key's records.
+    /// take every record type; those not marked settling
+    /// ([`Self::mark_settling_lookup`]) keep exhausting their shortlist.
     pub fn mark_keyword_lookup(&mut self) {
         self.keyword_lookup = true;
+    }
+
+    /// Let this value lookup end once its neighbourhood has settled, as a
+    /// keyword walk does (see [`KEYWORD_SETTLE_SECS`]), rather than walk its
+    /// whole shortlist.
+    ///
+    /// For lookups after records stored on the k nodes closest to their key,
+    /// which those nodes hold once they have answered: a file's sources and a
+    /// room's presence. Not for a lookup whose empty answer is read as "there
+    /// is none" (a room's moderation, settings, handoff or claim), which keeps
+    /// asking every node it can before it concludes that.
+    pub fn mark_settling_lookup(&mut self) {
+        self.settles = true;
     }
 
     /// Whether [`Self::mark_keyword_lookup`] was called.
@@ -993,7 +1028,11 @@ impl IterativeSearch {
                 if !publishers.contains(&publisher) && publishers.len() >= MAX_PUBLISHERS_PER_FILE_PER_NODE {
                     continue;
                 }
-                publishers.insert(publisher);
+                // Charged where this search's own walk reads it too, or a
+                // responder could give the rest of the walk five more.
+                if publishers.insert(publisher) {
+                    *self.publishers_taken.entry(share).or_insert(0) += 1;
+                }
             }
             self.seen_results.insert(blob_digest);
             self.result_slots.insert(blob_digest, self.results.len());
@@ -2418,7 +2457,7 @@ impl IterativeSearch {
             return;
         }
 
-        if self.keyword_walk_settled() {
+        if self.walk_settled() {
             trace!(
                 "Search {}: its neighbourhood has answered and nothing new arrived for {KEYWORD_SETTLE_SECS}s",
                 self.id
@@ -2473,16 +2512,16 @@ impl IterativeSearch {
             .all(|entry| entry.state == NodeState::Responded)
     }
 
-    /// Whether a keyword walk may end before its shortlist is exhausted: see
-    /// [`KEYWORD_SETTLE_SECS`].
+    /// Whether a keyword walk, or a value lookup marked settling, may end
+    /// before its shortlist is exhausted: see [`KEYWORD_SETTLE_SECS`].
     ///
     /// Pages and referrals are records and descent still owed by nodes that
     /// have answered, parked pages included, so any of them holds the walk
     /// open. A pinned session peer has to have answered or failed wherever it
     /// sorts, since it is on the shortlist for records the neighbourhood of the
     /// key does not hold.
-    fn keyword_walk_settled(&self) -> bool {
-        self.keyword_lookup
+    fn walk_settled(&self) -> bool {
+        (self.keyword_lookup || self.settles)
             && self.search_type == SearchType::FindValue
             && self.page_queue.is_empty()
             && self.parked_pages.is_empty()
@@ -6491,7 +6530,7 @@ mod tests {
     /// k where the trim keeps them, and the `record_at`th answer carrying a new
     /// record. Each answer is made with the quiet time reading `quiet_since`.
     /// Returns how many queries were answered.
-    fn walk_past_the_neighbourhood(keyword_lookup: bool, quiet_since: Instant, record_at: Option<usize>) -> usize {
+    fn walk_past_the_neighbourhood(walk: Walk, quiet_since: Instant, record_at: Option<usize>) -> usize {
         let target = keyword_target("ubuntu");
         let mut rt = RoutingTable::new(make_id(0x00), false);
         for distance in 0x40..0x40 + K_BUCKET_SIZE as u8 {
@@ -6500,8 +6539,10 @@ mod tests {
         let mut sm = SearchManager::new();
         let sid = sm.start_find_value(target, vec![], &rt).expect("slot");
         let search = sm.get_mut(sid).unwrap();
-        if keyword_lookup {
-            search.mark_keyword_lookup();
+        match walk {
+            Walk::Keyword => search.mark_keyword_lookup(),
+            Walk::Settling => search.mark_settling_lookup(),
+            Walk::Exhaustive => {}
         }
         let mut leads: Vec<EmberContact> = (2..6).map(|d| at_distance(target, d, false)).collect();
         let mut asked = 0usize;
@@ -6525,27 +6566,37 @@ mod tests {
         asked
     }
 
+    #[derive(Clone, Copy)]
+    enum Walk {
+        Keyword,
+        Settling,
+        Exhaustive,
+    }
+
     /// Records live on the k nodes closest to their key. Once those have
-    /// answered and nothing new has come in for a while, a keyword walk ends
-    /// instead of asking the farther seeds the trim keeps. A record taken
-    /// restarts the quiet time, as does any answer arriving while it is short;
-    /// other value lookups always exhaust.
+    /// answered and nothing new has come in for a while, a keyword walk, and
+    /// a source or presence lookup marked settling, ends instead of asking the
+    /// farther seeds the trim keeps. A record taken restarts the quiet time, as
+    /// does any answer arriving while it is short; other value lookups always
+    /// exhaust.
     #[test]
     fn a_keyword_walk_ends_once_its_neighbourhood_has_answered_and_gone_quiet() {
         let every_entry = K_BUCKET_SIZE + 4;
         let quiet = Instant::now()
             .checked_sub(std::time::Duration::from_secs(KEYWORD_SETTLE_SECS + 1))
             .expect("the clock reaches back that far");
-        let settled = walk_past_the_neighbourhood(true, quiet, None);
-        assert_eq!(settled, K_BUCKET_SIZE, "the k closest, and no farther");
+        for walk in [Walk::Keyword, Walk::Settling] {
+            let settled = walk_past_the_neighbourhood(walk, quiet, None);
+            assert_eq!(settled, K_BUCKET_SIZE, "the k closest, and no farther");
 
-        // A record from the last of the k closest restarts the quiet time, so
-        // the walk goes on to the farther seeds rather than ending on it.
-        let restarted = walk_past_the_neighbourhood(true, quiet, Some(K_BUCKET_SIZE));
-        assert!(restarted > settled, "asked {restarted}");
+            // A record from the last of the k closest restarts the quiet time, so
+            // the walk goes on to the farther seeds rather than ending on it.
+            let restarted = walk_past_the_neighbourhood(walk, quiet, Some(K_BUCKET_SIZE));
+            assert!(restarted > settled, "asked {restarted}");
 
-        assert_eq!(walk_past_the_neighbourhood(true, Instant::now(), None), every_entry);
-        assert_eq!(walk_past_the_neighbourhood(false, quiet, None), every_entry);
+            assert_eq!(walk_past_the_neighbourhood(walk, Instant::now(), None), every_entry);
+        }
+        assert_eq!(walk_past_the_neighbourhood(Walk::Exhaustive, quiet, None), every_entry);
     }
 
     /// The nodes a search reports having asked never drop: not when a node is
@@ -6832,5 +6883,32 @@ mod tests {
             let key = SigningKey::from_bytes(&[over; 32]).verifying_key().to_bytes();
             assert!(!publishers.contains(&key), "publisher {over} is past the host's share");
         }
+
+        // The search's own walk goes on reading what absorbing charged.
+        let (key, _) = single_word_share(&from(0x40, 1, by_publisher("ubuntu", 1, FILE, DIGEST))).unwrap();
+        assert_eq!(search.publishers_taken.get(&key), Some(&MAX_PUBLISHERS_PER_FILE_PER_NODE));
+    }
+
+    /// Rows folded from walks still running hold a responder to one share
+    /// across them, as absorbing does once they finish.
+    #[test]
+    fn walks_folded_while_running_give_a_responder_one_share() {
+        const FILE: [u8; 16] = [0x22; 16];
+        const DIGEST: [u8; 32] = [0x78; 32];
+        let share = MAX_PUBLISHERS_PER_FILE_PER_NODE as u8;
+        let record = |keyword: &str, publisher: u8| SearchResultRecord {
+            data: by_publisher(keyword, publisher, FILE, DIGEST),
+            from_node: make_id(0x40),
+            confirmed_by: None,
+            from_subnet: Some(1),
+            confirmed_subnet: None,
+            from_local_store: false,
+        };
+        let walks: Vec<SearchResultRecord> = (1..=share)
+            .map(|p| record("ubuntu", p))
+            .chain((1..=share + 3).map(|p| record("linux", p)))
+            .collect();
+        let kept = within_shares(walks.iter().map(|r| (r, ()))).count();
+        assert_eq!(kept, 2 * usize::from(share), "repeats of counted publishers, and none past them");
     }
 }

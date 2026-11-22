@@ -43,7 +43,8 @@ export interface UpdaterState {
   total: number | null;
   /** Human-readable error from the last failed check/download. */
   error: string | null;
-  /** Set when the user dismisses the banner for this epoch/version identity. */
+  /** Set when the user dismisses the banner for this epoch/version identity,
+   *  or for the release {@link systemTooOld} names. */
   dismissed: boolean;
   /** `stalled` only: the staged installer is still present and still matches
    *  its signed hash, so offering to run it again is worth doing. When false
@@ -61,14 +62,24 @@ export interface UpdaterState {
   /** Manifest existed but `latest.json.sig` did not. Survives silent checks
    *  so Settings does not look current. */
   signatureMissing: boolean;
-  /** A newer release whose AppImage needs a newer glibc than this system has.
-   *  Not an error: this install cannot take it, and is told where to go. */
+  /** A newer release whose package for this install needs a newer glibc than
+   *  this system has. Not an error: this install cannot take it, and is told
+   *  where to go. */
   systemTooOld: SystemTooOld | null;
 }
 
 export interface SystemTooOld {
   version: string;
   glibc: string;
+  package: 'appimage' | 'deb';
+}
+
+/** What to tell a user whose system cannot run the new release's package. An
+ *  AppImage can be swapped for the `.deb`, which runs on an older glibc; a
+ *  `.deb` has nowhere older to go. */
+export function systemTooOldMessage(tooOld: SystemTooOld): string {
+  const params = { version: tooOld.version, glibc: tooOld.glibc };
+  return tooOld.package === 'deb' ? m.updater_system_too_old_deb(params) : m.updater_system_too_old(params);
 }
 
 interface UpdateHandoffReport {
@@ -174,6 +185,32 @@ function recordDismissedUpdate(securityEpoch: number, version: string): void {
       DISMISSED_UPDATE_STORAGE_KEY,
       JSON.stringify({ securityEpoch, version } satisfies DismissedUpdateIdentity),
     );
+  } catch {
+    // The store's `dismissed` flag still hides it until the next check.
+  }
+}
+
+// A release this system cannot run is dismissed until a newer one is out, not
+// until the next start as an offer is: brought back at every launch, it would
+// repeat news the user can act on only by changing package or distribution.
+// Settings → About goes on saying it.
+const DISMISSED_TOO_OLD_STORAGE_KEY = 'ember.updater.dismissedSystemTooOld';
+
+function systemTooOldIdentity(tooOld: SystemTooOld): string {
+  return `${tooOld.package}:${tooOld.version}`;
+}
+
+function isSystemTooOldDismissed(tooOld: SystemTooOld): boolean {
+  try {
+    return localStorage.getItem(DISMISSED_TOO_OLD_STORAGE_KEY) === systemTooOldIdentity(tooOld);
+  } catch {
+    return false;
+  }
+}
+
+function recordSystemTooOldDismissed(tooOld: SystemTooOld): void {
+  try {
+    localStorage.setItem(DISMISSED_TOO_OLD_STORAGE_KEY, systemTooOldIdentity(tooOld));
   } catch {
     // The store's `dismissed` flag still hides it until the next check.
   }
@@ -398,7 +435,12 @@ async function applyCheckResult(
       restoreStaged(staged);
       return false;
     }
-    updater.set({ ...INITIAL, phase: 'idle', systemTooOld: result.systemTooOld });
+    updater.set({
+      ...INITIAL,
+      phase: 'idle',
+      systemTooOld: result.systemTooOld,
+      dismissed: isSystemTooOldDismissed(result.systemTooOld),
+    });
     return false;
   }
   if (result.signatureMissing) {
@@ -687,6 +729,7 @@ export function dismissNotice(): void {
     if (!s.fromHandoff && s.version && s.securityEpoch !== null) {
       recordDismissedUpdate(s.securityEpoch, s.version);
     }
+    if (s.systemTooOld) recordSystemTooOldDismissed(s.systemTooOld);
     return { ...s, dismissed: true };
   });
 }

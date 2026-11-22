@@ -8,7 +8,7 @@ pub(in crate::network) async fn on_server_tcp_source_tick(
     transfer_manager: &Arc<RwLock<TransferManager>>,
     source_manager: &Arc<RwLock<SourceManager>>,
     stats_manager: &mut StatsManager,
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::host::AppHandle,
 ) {
     if state.server_connection.is_none() { return; }
     // Shares the frame budget with the starved re-ask and warm-start

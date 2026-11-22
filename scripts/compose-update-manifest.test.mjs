@@ -74,7 +74,11 @@ test("the composed manifest takes the Linux targets and hardens end to end", () 
   const { fixture, windowsDir, linuxDir, artifacts } = releaseFixture();
   try {
     const manifest = compose(windowsDir);
-    addLinuxPlatforms({ manifest, bundles: collectLinuxBundles({ directory: linuxDir }) });
+    addLinuxPlatforms({
+      manifest,
+      bundles: collectLinuxBundles({ directory: linuxDir }),
+      appimageMinGlibc: "2.39",
+    });
     assert.equal(
       manifest.platforms["linux-x86_64-deb"].url,
       `${base}/Ember_1.2.3_amd64.deb`,

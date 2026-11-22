@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
+import { isServer } from '$lib/runtime';
+import { pickAndUpload } from '$lib/runtime/web/files';
 
 export interface ChannelInfo {
   channel_id: string;
@@ -36,6 +38,10 @@ export interface ChannelInfo {
   in_room: boolean;
   /** Owner has permanently deleted this room. */
   deleted: boolean;
+  /** The registry lists this room, which we do not own, as deleted, and no
+   *  signed delete from its owner has been seen yet. It cannot be joined; it
+   *  can be removed from the list. Absent from older backends. */
+  deleted_by_owner?: boolean;
   /** Only the owner may hand out invites. A guard against a careless re-share,
    *  not against a member who patches their client — they hold the key too. */
   invites_owner_only: boolean;
@@ -314,24 +320,24 @@ export async function sendChannelMessage(
   return invoke('send_channel_message', { channelId, message, replyTo: replyTo ?? null });
 }
 
-/** UTF-8 bytes a reply's signed reference adds to the message on the wire.
- *  Mirrors `REPLY_TRAILER_BYTES` in `src-tauri/src/network/ember/channel.rs`;
+/** Bytes a reply's signed reference adds to the frame a room line goes out in.
+ *  Mirrors `CHAT_V2_REPLY_BYTES` in `src-tauri/src/network/ember/channel.rs`;
  *  every room line limit counts it, so a reply leaves this much less room. */
-export const REPLY_REFERENCE_BYTES = 136;
+export const REPLY_REFERENCE_BYTES = 19;
 
-/** The longest room line, in UTF-8 bytes of what was typed, that always goes
- *  out. Its sealed frame has to fit one datagram through a relay hop, which
- *  stops well short of the 4096-byte text cap, and the backend refuses a
- *  longer one with `channels_message_too_long_to_send`. Emoji joiners do not
- *  travel in that frame, so a line typed with them can be slightly longer. A
- *  reply leaves `REPLY_REFERENCE_BYTES` less. Mirrors
- *  `CHANNEL_LINE_MAX_TEXT_BYTES` in `src-tauri/src/commands/channels.rs`. */
-export const CHANNEL_LINE_MAX_TEXT_BYTES = 3728;
+/** The longest room line, in UTF-8 bytes of what was typed, that goes out.
+ *  Its sealed frame has to fit one datagram through a relay hop, which stops
+ *  well short of the 4096-byte text cap, and the backend refuses a longer one
+ *  with `channels_message_too_long_to_send`. The frame carries the text as
+ *  typed, emoji joiners included. A reply leaves `REPLY_REFERENCE_BYTES`
+ *  less. Mirrors `CHANNEL_LINE_MAX_TEXT_BYTES` in
+ *  `src-tauri/src/commands/channels.rs`. */
+export const CHANNEL_LINE_MAX_TEXT_BYTES = 3704;
 
 /** `CHANNEL_LINE_MAX_TEXT_BYTES` for a revision, whose frame also carries the
- *  line's id and both its times. A revised reply keeps its reference, so it too
+ *  line's original time. A revised reply keeps its reference, so it too
  *  leaves `REPLY_REFERENCE_BYTES` less. Mirrors `CHANNEL_EDIT_MAX_TEXT_BYTES`. */
-export const CHANNEL_EDIT_MAX_TEXT_BYTES = 3696;
+export const CHANNEL_EDIT_MAX_TEXT_BYTES = 3693;
 
 export async function markChannelMessagesRead(channelId: string): Promise<void> {
   return invoke('mark_channel_messages_read', { channelId });
@@ -577,7 +583,12 @@ export type ChannelTransferStatus =
   | 'busy'
   | 'too_large'
   | 'not_allowed'
-  | 'source_gone';
+  | 'source_gone'
+  // A file asked for from a member's room library: waiting for a free
+  // transfer, asked for, or one they could not send.
+  | 'queued'
+  | 'requested'
+  | 'unavailable';
 
 export interface ChannelTransferInfo {
   xfer_id: string;
@@ -590,9 +601,6 @@ export interface ChannelTransferInfo {
   status: ChannelTransferStatus;
   /** A program, shortcut or script, or one named like a document. */
   risky?: boolean;
-  /** An offer we sent that nobody has said they could read, waiting on the
-   *  user to decide whether to send the standard one. */
-  awaiting_consent?: boolean;
 }
 
 /** Offer one file to one member. Returns the transfer id, or `null` if the
@@ -605,6 +613,10 @@ export async function pickAndOfferChannelTransfer(
   channelId: string,
   memberPubkey: string,
 ): Promise<string | null> {
+  if (isServer) {
+    const upload = await pickAndUpload();
+    return upload ? invoke('offer_channel_transfer_upload', { channelId, memberPubkey, upload }) : null;
+  }
   return invoke('pick_and_offer_channel_transfer', {
     channelId,
     memberPubkey,
@@ -618,12 +630,6 @@ export async function respondChannelTransfer(xferId: string, accept: boolean): P
 
 export async function cancelChannelTransfer(xferId: string): Promise<void> {
   return invoke('cancel_channel_transfer', { xferId });
-}
-
-/** Send the standard offer for a file whose private one went unanswered. The
- *  members it is forwarded through can read the file's name and size. */
-export async function sendChannelTransferStandardOffer(xferId: string): Promise<void> {
-  return invoke('send_channel_transfer_standard_offer', { xferId });
 }
 
 export async function listChannelTransfers(): Promise<ChannelTransferInfo[]> {
