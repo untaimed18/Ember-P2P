@@ -2851,6 +2851,7 @@
   "wizard_summary_import_no": "Aucun",
   "emule_import_detecting": "Recherche d'eMule…",
   "emule_import_none_found": "Aucun paramètre eMule ou aMule n'a été trouvé aux emplacements habituels. Choisissez le dossier s'il se trouve ailleurs.",
+  "emule_import_none_found_server": "Aucun paramètre eMule ou aMule n'a été trouvé aux emplacements habituels du serveur.",
   "emule_import_choose": "Choisir le dossier…",
   "emule_import_reading": "Lecture du dossier eMule…",
   "emule_import_read_failed": "Le dossier eMule n'a pas pu être lu.",

@@ -2851,6 +2851,7 @@
   "wizard_summary_import_no": "無",
   "emule_import_detecting": "正在尋找 eMule…",
   "emule_import_none_found": "在常用位置找不到 eMule 或 aMule 的設定。如果在其他位置，請選擇該資料夾。",
+  "emule_import_none_found_server": "在伺服器的常用位置找不到 eMule 或 aMule 的設定。",
   "emule_import_choose": "選擇資料夾…",
   "emule_import_reading": "正在讀取 eMule 資料夾…",
   "emule_import_read_failed": "無法讀取 eMule 資料夾。",

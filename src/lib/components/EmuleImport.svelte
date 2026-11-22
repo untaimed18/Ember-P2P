@@ -365,7 +365,7 @@
             {m.emule_import_found({ client: preview.source.client === 'amule' ? 'aMule' : 'eMule' })}
           </span>
         {:else if !detecting && installs.length === 0}
-          <span class="hint">{m.emule_import_none_found()}</span>
+          <span class="hint">{isServer ? m.emule_import_none_found_server() : m.emule_import_none_found()}</span>
         {/if}
       </div>
       {#if preview && emuleRunning}
@@ -397,7 +397,7 @@
     <p class="hint">{m.emule_import_detecting()}</p>
   {:else}
     {#if installs.length === 0}
-      <p class="hint">{m.emule_import_none_found()}</p>
+      <p class="hint">{isServer ? m.emule_import_none_found_server() : m.emule_import_none_found()}</p>
     {/if}
     <div class="sources">
       {#if installs.length > 1 || (installs.length === 1 && !preview)}

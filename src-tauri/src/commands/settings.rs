@@ -3549,10 +3549,13 @@ fn hand_to_browser(_url: &str) -> Result<(), String> {
 /// Bin; see the gate in `update_settings`. False for a dismissed or closed
 /// dialog, so anything other than an explicit yes keeps the bin.
 async fn confirm_permanent_delete(app: &crate::host::AppHandle) -> bool {
-    let prompt = "Files you delete from the Library, and finished downloads you cancel, will be deleted permanently instead of going to the Recycle Bin.\n\nThey cannot be recovered afterwards.";
+    use crate::commands::sharing::TRASH_NAME;
+    let prompt = format!(
+        "Files you delete from the Library, and finished downloads you cancel, will be deleted permanently instead of going to the {TRASH_NAME}.\n\nThey cannot be recovered afterwards."
+    );
     crate::host::confirm(
         app,
-        crate::host::Confirm::new("Delete files permanently?", prompt, "Delete permanently", "Keep using the Recycle Bin"),
+        crate::host::Confirm::new("Delete files permanently?", prompt, "Delete permanently", format!("Keep using the {TRASH_NAME}")),
     )
     .await
 }

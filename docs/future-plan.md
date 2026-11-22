@@ -211,8 +211,6 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
     is what the switch is for, so move the release fetch out of the desktop
     updater.
   - *Watch the clipboard for ed2k links*: never started in the browser.
-  - The setup wizard still shows the eMule import step on emberd, where the
-    folder picker is hidden and `emule_import_none_found` says to choose one.
   - Library Delete on emberd goes to the user's trash, which nothing on a
     server empties. 1.8.0 stops walks entering `.Trash*` folders, so a file
     deleted from a mount's top folder is no longer shared again, but the
@@ -297,10 +295,6 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   for "share"; de `Kürzlich` and pl `Ugruntowany` for the KAD contact types
   *Recent* and *Established*; and es and ru, whose word for a channel ban is
   the one for blocking a friend.
-- **Missing `_few` plural forms.** `emule_import_servers_*`,
-  `emule_import_folder_subfolders_*` and `layout_channels_recovered_*` have
-  `_one` and `_other` only, so Russian and Polish show the wrong form for 2
-  to 4. Add the variant and pass it in the `plural()` call.
 - **`channels_deleted_elsewhere_body` is half a sentence** shown after the
   channel's name in bold, which several languages cannot word that way. Give
   it a `{name}` and draw the bold part inside it.
@@ -337,12 +331,6 @@ than a release candidate should take. What was fixed then is in commit
   room this way. Chosen in 1.8.0 so a deleted room cannot come back; the
   alternative keeps the walk-out and the *Deleted by its owner* label but
   lets members back in until a proof removes the room.
-- **Library fetches and ordinary file offers share receive slots unevenly.**
-  The fetch scheduler counts requested fetches as holding a receive slot, but
-  `xfer_accept_refusal` (`channel_xfer.rs`) does not, so accepting ordinary
-  offers can take the slot a fetch is waiting with, and its file then fails
-  as busy. Count `room_library.held_receives()` there for ordinary accepts,
-  without the fetch's own accept counting itself.
 - **One member can stall room-mail collection.** Past the 120 stored an hour
   from one sender, that member's entries come back `Later`, and `left_behind`
   ends the batch; if the server's oldest 32 are all theirs, other
@@ -390,13 +378,17 @@ than a release candidate should take. What was fixed then is in commit
 
 **Wording the 1.8.0 audit left:**
 
-- The native dialogs say "Recycle Bin" on Linux and macOS too
-  (`commands/sharing.rs` around 3497, `commands/settings.rs` around 3551),
-  where the rest of Ember says Trash.
-- The eD2K server log on the eD2K Servers page is English with raw OS errors,
-  and says "Added 1 servers" (`network/event_loop/server_connect_result.rs`
-  and `server_tick.rs`, through `emit_server_log` in `network/server.rs`). The eMule import's "cannot be Ember's download folder"
-  error is English too (`emule_import/mod.rs`).
+- The page texts name the bin "Recycle Bin (Trash)" in the delete
+  confirmations and "Recycle Bin" alone elsewhere (the finished-download
+  toasts and button, the permanent-delete confirmations,
+  `error_sharing_delete_declined`, the Delete shortcut), on every platform.
+  The native dialogs name it by platform (`TRASH_NAME`). Most languages use
+  one word for both; English, Spanish and Chinese do not, so a platform-aware
+  wording needs a placeholder or a second set of strings.
+- The eD2K server log on the eD2K Servers page is English with raw OS errors
+  (`emit_server_log` in `network/server.rs`, called across
+  `network/event_loop/`). The eMule import's "cannot be Ember's download
+  folder" error is English too (`emule_import/mod.rs`).
 - Three file pickers have no translated title and English filter names: the
   IP filter (`commands/security.rs`), the backup save and open
   (`commands/backup.rs`) and the media player (`commands/settings.rs`).

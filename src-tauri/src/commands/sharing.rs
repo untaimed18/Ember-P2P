@@ -3464,7 +3464,7 @@ pub(crate) async fn recycle_library_file(
             if crate::security::filesystem::object_identity(&verified)? != identity {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    "the file changed before it could be moved to the Recycle Bin",
+                    format!("the file changed before it could be moved to the {TRASH_NAME}"),
                 ));
             }
             move_to_trash(&verified).map_err(std::io::Error::other)
@@ -3491,10 +3491,10 @@ pub(crate) async fn recycle_library_file(
     let recycle_error = recycle_error
         .map(|e| e.to_string())
         .unwrap_or_else(|| "it is on a network location".to_string());
-    tracing::warn!("Could not move {} to the Recycle Bin: {recycle_error}", path.display());
+    tracing::warn!("Could not move {} to the {TRASH_NAME}: {recycle_error}", path.display());
 
     let prompt = format!(
-        "This file cannot be moved to the Recycle Bin{}:\n\n{}\n\nDelete it permanently? This cannot be undone.",
+        "This file cannot be moved to the {TRASH_NAME}{}:\n\n{}\n\nDelete it permanently? This cannot be undone.",
         if on_network { " (it is on a network location)" } else { "" },
         crate::commands::settings::elide_for_dialog(&path.to_string_lossy())
     );
@@ -3511,6 +3511,9 @@ pub(crate) async fn recycle_library_file(
     }
     delete_file_with_retry(path, allowed_roots, expected, 6, 250).await
 }
+
+/// What the native dialogs call the bin [`move_to_trash`] sends files to.
+pub(crate) const TRASH_NAME: &str = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
 
 /// Into the Recycle Bin / Trash. On macOS through `NSFileManager`, not the
 /// crate's default of scripting the Finder, which needs an Apple Events

@@ -58,6 +58,11 @@ pub(super) fn emit_server_log(app: &crate::host::AppHandle, message: &str) {
     let _ = app.emit("server-log", record_server_log(message));
 }
 
+/// The log line for servers taken from a server's list.
+pub(super) fn added_servers_line(added: usize, from: &str) -> String {
+    format!("Added {added} {} from {from}", if added == 1 { "server" } else { "servers" })
+}
+
 /// The retained log, oldest first.
 pub fn server_log_history() -> Vec<ServerLogLine> {
     SERVER_LOG.lock().iter().cloned().collect()
@@ -900,6 +905,12 @@ pub(super) fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> 
 #[cfg(test)]
 mod reconnect_backoff_tests {
     use super::*;
+
+    #[test]
+    fn one_added_server_is_not_servers() {
+        assert_eq!(added_servers_line(1, "connected server"), "Added 1 server from connected server");
+        assert_eq!(added_servers_line(3, "server list update"), "Added 3 servers from server list update");
+    }
 
     /// A server that accepts the login and kicks us 20 s later: each redial
     /// has to wait longer than the last, and auto-reconnect gives up after

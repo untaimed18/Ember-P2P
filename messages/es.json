@@ -2851,6 +2851,7 @@
   "wizard_summary_import_no": "Ninguna",
   "emule_import_detecting": "Buscando eMule…",
   "emule_import_none_found": "No se encontraron ajustes de eMule ni de aMule en las ubicaciones habituales. Elige la carpeta si la tuya está en otro sitio.",
+  "emule_import_none_found_server": "No se encontraron ajustes de eMule ni de aMule en las ubicaciones habituales del servidor.",
   "emule_import_choose": "Elegir carpeta…",
   "emule_import_reading": "Leyendo la carpeta de eMule…",
   "emule_import_read_failed": "No se pudo leer la carpeta de eMule.",

@@ -2851,6 +2851,7 @@
   "wizard_summary_import_no": "Nessuna",
   "emule_import_detecting": "Ricerca di eMule…",
   "emule_import_none_found": "Nessuna impostazione di eMule o aMule trovata nei percorsi abituali. Scegli la cartella se la tua si trova altrove.",
+  "emule_import_none_found_server": "Nessuna impostazione di eMule o aMule trovata nei percorsi abituali del server.",
   "emule_import_choose": "Scegli cartella…",
   "emule_import_reading": "Lettura della cartella di eMule…",
   "emule_import_read_failed": "Impossibile leggere la cartella di eMule.",

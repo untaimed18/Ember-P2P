@@ -1587,8 +1587,12 @@ fn xfer_accept_refusal(
     // queued prompts on top of an already busy receiver could all be accepted
     // and land as seven concurrent downloads — each holding an open file
     // handle and a request window the tick budget was never sized for.
-    // Accepts still readying their part file are about to become receives.
-    if state.xfer_recv.len() + state.xfer_accepting.len() >= ember::channel::XFER_MAX_ACTIVE {
+    // Accepts still readying their part file are about to become receives,
+    // and library fetches already asked for hold one for the offer they wait
+    // on. A fetch's own accept is not among those: claiming its offer took
+    // the fetch off that list.
+    let held = state.xfer_recv.len() + state.xfer_accepting.len() + state.room_library.held_receives();
+    if held >= ember::channel::XFER_MAX_ACTIVE {
         return Some(XferAcceptRefusal::Busy);
     }
     // No longer in the room it came from — left, deleted, or walked out when

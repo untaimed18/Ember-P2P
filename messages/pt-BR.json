@@ -2851,6 +2851,7 @@
   "wizard_summary_import_no": "Nenhuma",
   "emule_import_detecting": "Procurando o eMule…",
   "emule_import_none_found": "Nenhuma configuração do eMule ou aMule foi encontrada nos locais habituais. Escolha a pasta se a sua estiver em outro lugar.",
+  "emule_import_none_found_server": "Nenhuma configuração do eMule ou aMule foi encontrada nos locais habituais do servidor.",
   "emule_import_choose": "Escolher pasta…",
   "emule_import_reading": "Lendo a pasta do eMule…",
   "emule_import_read_failed": "Não foi possível ler a pasta do eMule.",

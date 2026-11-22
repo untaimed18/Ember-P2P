@@ -2851,6 +2851,7 @@
   "wizard_summary_import_no": "Нет",
   "emule_import_detecting": "Поиск eMule…",
   "emule_import_none_found": "В обычных местах не найдены настройки eMule или aMule. Выберите папку, если она находится в другом месте.",
+  "emule_import_none_found_server": "В обычных местах на сервере не найдены настройки eMule или aMule.",
   "emule_import_choose": "Выбрать папку…",
   "emule_import_reading": "Чтение папки eMule…",
   "emule_import_read_failed": "Не удалось прочитать папку eMule.",

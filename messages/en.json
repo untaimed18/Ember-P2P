@@ -2851,6 +2851,7 @@
   "wizard_summary_import_no": "None",
   "emule_import_detecting": "Looking for eMule…",
   "emule_import_none_found": "No eMule or aMule settings were found in the usual places. Choose the folder if yours is elsewhere.",
+  "emule_import_none_found_server": "No eMule or aMule settings were found in the usual places on the server.",
   "emule_import_choose": "Choose folder…",
   "emule_import_reading": "Reading the eMule folder…",
   "emule_import_read_failed": "The eMule folder could not be read.",

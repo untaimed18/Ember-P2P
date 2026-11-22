@@ -331,7 +331,7 @@ impl LibraryState {
             .collect()
     }
 
-    fn held_receives(&self) -> usize {
+    pub(super) fn held_receives(&self) -> usize {
         self.pulls.values().filter(|pull| pull.holds_a_receive()).count()
     }
 
@@ -1189,6 +1189,7 @@ mod tests {
             panic!("the offer of a fetch asked for is ours");
         };
         assert_eq!(pull.name, "file 1.flac");
+        assert_eq!(library.held_receives(), 0, "its accept counts as a receive from here on, not the fetch");
         assert!(matches!(library.claim(ROOM, OWNER, first), OfferClaim::None), "claimed once");
     }
 

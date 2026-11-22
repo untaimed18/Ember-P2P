@@ -65,7 +65,7 @@ pub(in crate::network) async fn on_server_tick(
                                 &mut state.ip_filter,
                             );
                             if added > 0 {
-                                emit_server_log(app_handle, &format!("Added {added} servers from server list update"));
+                                emit_server_log(app_handle, &added_servers_line(added, "server list update"));
                                 let met_path = state.data_dir.join("server.met");
                                 spawn_save_server_met(&state.server_list, met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
                             }
