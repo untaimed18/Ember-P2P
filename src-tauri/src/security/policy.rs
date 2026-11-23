@@ -16,6 +16,9 @@ pub struct PolicyResetScope {
 pub struct SecurityPolicyStatus {
     pub loaded: bool,
     pub reset_required: bool,
+    /// Diagnostic text, which can hold a path: logged when the gate closes,
+    /// and kept from the page, which reads `scope` for what was reset.
+    #[serde(skip_serializing)]
     pub reason: Option<String>,
     pub scope: PolicyResetScope,
 }
@@ -181,6 +184,21 @@ mod tests {
         assert_eq!(after.reset_required, before.reset_required);
         assert_eq!(after.reason, before.reason);
         assert!(!dir.join("security_policy_reset.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The page is told what was reset, never the diagnostic text, which can
+    /// hold a path.
+    #[test]
+    fn the_status_the_page_reads_carries_no_reason() {
+        let scope = PolicyResetScope { reset_bans: true, reset_reputation: false };
+        let dir = test_dir("no-reason");
+        let gate = SecurityPolicyGate::blocked(dir.clone(), "could not read C:\\Users\\someone\\x.db", scope);
+        let sent = serde_json::to_value(gate.status()).unwrap();
+        assert!(sent.get("reason").is_none(), "{sent}");
+        assert_eq!(sent["resetRequired"], true);
+        assert_eq!(sent["scope"]["resetBans"], true);
+        assert!(gate.status().reason.is_some(), "kept for the log and the acknowledgement file");
         let _ = std::fs::remove_dir_all(dir);
     }
 

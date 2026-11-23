@@ -2340,7 +2340,8 @@
     try {
       const size = formatSize(totalBytes);
       const count = formatNumber(targets.length);
-      const question = $appSettings?.delete_permanently
+      // emberd deletes outright: nothing on a server empties its trash.
+      const question = isServer || $appSettings?.delete_permanently
         ? plural(targets.length, {
             one: () => m.library_confirm_delete_one_permanent({ size, count }),
             // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
@@ -3675,7 +3676,7 @@
     deletingPaths.add(f.path);
     try {
       const confirmed = await askConfirm(
-        $appSettings?.delete_permanently
+        isServer || $appSettings?.delete_permanently
           ? m.library_confirm_delete_single_permanent({ name: f.name })
           : m.library_confirm_delete_single({ name: f.name }),
         m.library_delete_file_title(),

@@ -127,6 +127,15 @@ export function reachableWithoutUpnp(
   return stats.tcp_status === 'Open' || stats.ed2k_low_id === false;
 }
 
+/** The firewall verdict rests on a check: KAD's TCP check has answered, or an
+ *  eD2K server gave a HighID or LowID. Until then `firewalled` is only a guess
+ *  from whether UPnP mapped. */
+export function firewallVerdictKnown(
+  stats: Pick<NetworkStats, 'tcp_status' | 'ed2k_low_id'>,
+): boolean {
+  return stats.tcp_status === 'Open' || stats.tcp_status === 'Firewalled' || typeof stats.ed2k_low_id === 'boolean';
+}
+
 // How long a failed first UPnP result waits for that proof before it warns.
 // The firewall check and an eD2K login normally settle within a minute or two
 // of start-up, so a user who forwards ports by hand (often through a VPN)

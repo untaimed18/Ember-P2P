@@ -40,7 +40,7 @@ export interface IpFilterApplyResult {
 export interface SecurityPolicyState {
   loaded: boolean;
   resetRequired: boolean;
-  reason?: string;
+  scope: { resetBans: boolean; resetReputation: boolean };
 }
 
 export async function getSecurityPolicyState(): Promise<SecurityPolicyState> {

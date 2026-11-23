@@ -7,8 +7,9 @@ license = "GPL-3.0-only"
 edition = "2021"
 default-run = "ember"
 # `str::floor_char_boundary` (used in the ed2k collection parser and the
-# comment store) was stabilized in Rust 1.91. `rusqlite` 0.40's bundled
-# `libsqlite3-sys` additionally needs `cfg_select` (stable in 1.94+).
+# comment store) was stabilized in Rust 1.91. The floor is 1.94, where it was
+# set for `rusqlite` 0.40's `libsqlite3-sys`; nothing has been built on an
+# older toolchain since.
 rust-version = "1.94"
 
 [workspace]
@@ -101,7 +102,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs", "signal"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 blake3 = "1"
 # NFKC for Ember DHT keyword keys and for search spam-filter name matching.
 # The copy `url`/`idna` already link; only `compiled_data` is enabled, which is

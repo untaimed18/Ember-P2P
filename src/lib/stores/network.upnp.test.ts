@@ -30,6 +30,7 @@ import * as m from '$lib/paraglide/messages';
 import { addToast, removeToast, toastSuccess } from '$lib/stores/toast';
 import {
   cleanupNetworkStore,
+  firewallVerdictKnown,
   initNetworkStore,
   networkStats,
   reachableWithoutUpnp,
@@ -67,6 +68,17 @@ describe('reachableWithoutUpnp', () => {
     expect(reachableWithoutUpnp({ tcp_status: 'Unknown', ed2k_low_id: false })).toBe(true);
     expect(reachableWithoutUpnp({ tcp_status: 'Firewalled', ed2k_low_id: true })).toBe(false);
     expect(reachableWithoutUpnp({ tcp_status: 'Unknown', ed2k_low_id: undefined })).toBe(false);
+  });
+});
+
+describe('firewallVerdictKnown', () => {
+  it('waits for the firewall check or a server ID, either way', () => {
+    expect(firewallVerdictKnown({ tcp_status: 'Unknown', ed2k_low_id: null })).toBe(false);
+    expect(firewallVerdictKnown({ tcp_status: '', ed2k_low_id: undefined })).toBe(false);
+    expect(firewallVerdictKnown({ tcp_status: 'Firewalled', ed2k_low_id: null })).toBe(true);
+    expect(firewallVerdictKnown({ tcp_status: 'Open', ed2k_low_id: null })).toBe(true);
+    expect(firewallVerdictKnown({ tcp_status: 'Unknown', ed2k_low_id: true })).toBe(true);
+    expect(firewallVerdictKnown({ tcp_status: 'Unknown', ed2k_low_id: false })).toBe(true);
   });
 });
 

@@ -1317,11 +1317,9 @@ pub(crate) fn setup(app: &crate::host::AppHandle) -> Result<(), Box<dyn std::err
     let security_policy = Arc::new(if policy_failures.is_empty() {
         security::policy::SecurityPolicyGate::ready(data_dir.clone())
     } else {
-        security::policy::SecurityPolicyGate::blocked(
-            data_dir.clone(),
-            policy_failures.join("; "),
-            policy_scope,
-        )
+        let reason = policy_failures.join("; ");
+        tracing::warn!("Security policy reset required: {reason}");
+        security::policy::SecurityPolicyGate::blocked(data_dir.clone(), reason, policy_scope)
     });
 
     let spam_data_dir = storage::paths::resolve_data_dir_with_app(&app_handle);
@@ -2609,7 +2607,12 @@ pub(crate) fn setup(app: &crate::host::AppHandle) -> Result<(), Box<dyn std::err
         drop(scan_guard);
         startup_cancel_flags.write().await.remove("__startup__");
         if !reconcile_shared_files(&net_tx).await {
-            tracing::warn!("Startup shared-file reconciliation failed");
+            // The network holds it until then (`start_network`).
+            if net_bind::binding() == net_bind::Binding::Unavailable {
+                tracing::info!("Startup shared-file reconciliation runs once the chosen network interface is connected");
+            } else {
+                tracing::warn!("Startup shared-file reconciliation failed");
+            }
         } else if !was_cancelled {
             // known.met now owns everything hashed this pass — sweep
             // handed-off (or stale pre-fix) pending intents so they

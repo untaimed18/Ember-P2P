@@ -5633,11 +5633,28 @@ pub async fn start_upload_server(
 ) -> anyhow::Result<()> {
     // SO_REUSEADDR so the NATMAP-style TCP mapping hold can bind the same
     // local port for outbound keep-alive connects without conflicting.
-    let listener = {
-        let sock = crate::net_bind::tcp_socket(tcp_port, true)
-            .map_err(|e| anyhow::anyhow!("TCP bind {tcp_port} failed: {e}"))?;
+    let mut waited_for_interface = false;
+    let listener = loop {
+        let sock = match crate::net_bind::tcp_socket(tcp_port, true) {
+            Ok(sock) => sock,
+            // Not a port in use: the chosen interface went between the
+            // network's wait for it and this bind. Without a listener the
+            // session would have no inbound TCP at all.
+            Err(e) if crate::net_bind::interface_away(&e) => {
+                if halted_for_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if !waited_for_interface {
+                    warn!("TCP port {tcp_port}: the chosen network interface is not connected; listening once it is");
+                    waited_for_interface = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                continue;
+            }
+            Err(e) => anyhow::bail!("TCP bind {tcp_port} failed: {e}"),
+        };
         match sock.listen(1024) {
-            Ok(l) => l,
+            Ok(l) => break l,
             Err(e) => {
                 tracing::error!(
                     "TCP port {tcp_port} is already in use: {e}. Peer-to-peer uploads will not work."

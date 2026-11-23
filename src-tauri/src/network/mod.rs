@@ -386,12 +386,18 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
     // The startup scan's one-shot signal is kept rather than dropped: restored
     // upload waiters would otherwise wait out the fallback.
     let mut library_indexed_during_gate = false;
+    // A shared-file reconcile asked for during either wait, run first once the
+    // loop starts: the startup scan sends its own while a VPN Ember waits for
+    // is still down, and nothing would reconcile again until a share changed.
+    // Each is a full pass, so the latest is the one kept.
+    let mut held_reconcile: Option<NetworkCommand> = None;
     while !security_policy.is_loaded() {
         tokio::select! {
             command = cmd_rx.recv() => {
                 match command {
                     Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
                     Some(NetworkCommand::StartupLibraryIndexed) => library_indexed_during_gate = true,
+                    Some(command @ NetworkCommand::SharedFilesChangedAck { .. }) => held_reconcile = Some(command),
                     Some(command) => {
                         if !hold_settings_before_start(&mut settings, command) {
                             warn!("Dropping network command while security policy reset is unacknowledged");
@@ -416,6 +422,7 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
                 match command {
                     Some(NetworkCommand::Shutdown { .. }) | None => return Ok(()),
                     Some(NetworkCommand::StartupLibraryIndexed) => library_indexed_during_gate = true,
+                    Some(command @ NetworkCommand::SharedFilesChangedAck { .. }) => held_reconcile = Some(command),
                     Some(command) => {
                         if !hold_settings_before_start(&mut settings, command) {
                             debug!("Dropping network command while the chosen network interface is not connected");
@@ -2664,8 +2671,12 @@ pub async fn start_network(deps: NetworkDeps) -> anyhow::Result<()> {
         const MAX_COMMANDS_PER_ITERATION: usize = 128;
         let mut shutting_down = false;
         for _ in 0..MAX_COMMANDS_PER_ITERATION {
-            let Ok(cmd) = cmd_rx.try_recv() else {
-                break;
+            let cmd = match held_reconcile.take() {
+                Some(cmd) => cmd,
+                None => match cmd_rx.try_recv() {
+                    Ok(cmd) => cmd,
+                    Err(_) => break,
+                },
             };
             match cmd {
                 NetworkCommand::Shutdown { deadline } => {

@@ -4007,7 +4007,8 @@
             </div>
             <!-- Turning it on raises a native confirmation from the backend;
                  declining it leaves the save holding the Recycle Bin, which
-                 the switch then shows again. -->
+                 the switch then shows again. emberd always deletes outright. -->
+            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="delete-permanently-label" for="delete-permanently-switch">{m.settings_delete_permanently()}</label>
@@ -4020,6 +4021,7 @@
                 ariaDescribedby="delete-permanently-hint"
               />
             </div>
+            {/if}
             <!-- emberd's pages do not watch the clipboard (+layout.svelte). -->
             {#if !isServer}
             <div class="field toggle-row">

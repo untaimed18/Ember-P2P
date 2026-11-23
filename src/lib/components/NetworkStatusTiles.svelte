@@ -10,7 +10,7 @@
    * KAD's narrow right-hand column.
    */
   import { goto } from '$app/navigation';
-  import { networkStats } from '$lib/stores/network';
+  import { firewallVerdictKnown, networkStats } from '$lib/stores/network';
   import { appSettings } from '$lib/stores/settings';
   import { firewallStatusText } from '$lib/i18n';
   import * as m from '$lib/paraglide/messages';
@@ -68,7 +68,7 @@
       <span class="stat-label">{kadSourced ? m.kad_stat_firewall_kad() : m.kad_stat_firewall()}</span>
       {#if $networkStats.status === 'disconnected'}
         <span class="badge tone-muted"><span class="badge-glyph" aria-hidden="true">?</span> {m.common_unknown()}</span>
-      {:else if $networkStats.status === 'connecting'}
+      {:else if $networkStats.status === 'connecting' || ($networkStats.firewalled && !firewallVerdictKnown($networkStats))}
         <span class="badge tone-muted"><span class="badge-glyph" aria-hidden="true">&#x25CB;</span> {m.kad_checking()}</span>
       {:else}
         <span

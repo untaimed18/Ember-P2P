@@ -337,6 +337,9 @@ the desktop app, from opening the same data.
   In-app pop-ups stay.
 - Watching the clipboard for links, and `ed2k://` links from other programs:
   pasting into the page, which reads the browser's clipboard.
+- The Recycle Bin or Trash: deleting a file in the Library, or a finished
+  download's file, deletes it outright, and the confirmation says so, as
+  nothing on a server empties a trash.
 - Keeping the computer awake, and *When downloads finish*.
 - *Open file*, *Show in folder*, *Open log folder* and the external player:
   *Save to this computer*, the in-page player, and the log path shown in

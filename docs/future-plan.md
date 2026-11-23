@@ -13,38 +13,27 @@ what was decided along the way. The overlay's design record (decisions,
 known limits, closed work) stays in [`ember-dht.md`](ember-dht.md), and the
 Channels formats in [`channels-format.md`](channels-format.md).
 
-## 1. Before 1.8.0 ships
+## 1. What reports on 1.8.0 will show
 
-1.8.0's Channels cut-over is built: the v2 chat frames go out alone with the
-display flag, private membership records go out in v2 alone but for the
-owner's own key copy, each owned private room is rotated once
-(`take_channel_cut_over_rotations`) and once more where members were still on
-1.7.x (`take_channel_relink_rotation`), the owned-rooms list is padded, and
-room transfers send sealed offers only. Owners also renew the older epochs a
-room keeps, and derive every rotated key from the room's seed so two devices
-owning a room stay on one key. The 1.7 sending paths are gone; reading 15,
-19, v1 records and plain offers stays. The detail is in `channels-format.md`,
-"The cut-over in 1.8.0", "The transition, and the cut-over in 1.8.0" and
-"Two devices owning a room".
+1.8.0 shipped on November 22, 2026. Its signed `latest.json` is as planned:
+the Windows installer and MSI; the AppImage under
+`linux-x86_64-appimage-glibc` alone, with a `min_glibc` of 2.39 and no plain
+`linux-x86_64-appimage`; and the `.deb`, still built on Ubuntu 22.04, under
+`linux-x86_64-deb`. What only users' machines can show, as reports come in:
 
-The release notes are in `docs/index.html`; check the date against the tag.
-The runs between two machines once planned here are not to be made (see
-"Two-machine runs before 1.8.0" under Considered and dropped).
-
-The AppImage built on Ubuntu 24.04 was checked on a local build made with the
-release job's command (Ubuntu 24.04 under WSL): the runner records glibc
-2.39; the most any of its binaries asks for is `GLIBC_2.39`, by `ember`
-itself; FreeType is not bundled; and `add-linux-platforms.mjs`, run on that
-file, writes `linux-x86_64-appimage-glibc` with a `min_glibc` of 2.39 and no
-plain `linux-x86_64-appimage`. On Ubuntu 22.04 it does not start (`GLIBC_2.38`
-not found), which is what the gated entry keeps from 1.7.x installs there. On
-24.04 with a COLRv1 emoji font in place, as Fedora 40 and later have, it
-starts and logs that the host FreeType 2.13.2 matches the bundled WebKit, so
-fonts are left as they are. What only the tagged release can show: a 1.7.8
-AppImage taking the update from the signed `latest.json` on 24.04, and on
-22.04 saying it needs glibc 2.39; and an emoji drawn in the window on Fedora
-itself, which WSL could not run here. `linux-test-build.yml` builds the same
-AppImage on demand for the last.
+- **The Channels cut-over.** Each owned private channel is rotated once
+  (`take_channel_cut_over_rotations`) and again where members were still on
+  1.7.x (`take_channel_relink_rotation`). A member on 1.7.4 or earlier cannot
+  read a private channel once its owner has updated, as the release notes
+  say. The detail is in `channels-format.md`, "The cut-over in 1.8.0".
+- **The AppImage on Linux.** A 1.7.8 AppImage taking the update on Ubuntu
+  24.04, one on 22.04 saying it needs glibc 2.39, and an emoji drawn in the
+  window on Fedora, which WSL could not run here. `linux-test-build.yml`
+  builds the same AppImage on demand.
+- **The features tested only in code** (see "Two-machine runs before 1.8.0"
+  under Considered and dropped): channel mail, disappearing private
+  messages, the secure slot grant, searching all of a friend's files, and
+  sharing a feed's files with the publisher offline.
 
 ## 2. Privacy
 
@@ -210,15 +199,6 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
     `commands/updater.rs`, which emberd does not build. A server that stays on
     is what the switch is for, so move the release fetch out of the desktop
     updater.
-  - *Watch the clipboard for ed2k links*: never started in the browser.
-  - Library Delete on emberd goes to the user's trash, which nothing on a
-    server empties. 1.8.0 stops walks entering `.Trash*` folders, so a file
-    deleted from a mount's top folder is no longer shared again, but the
-    space is not freed. Deleting outright on emberd (with its confirmation
-    saying so) is the likely answer.
-  - `get_security_policy_state` and the `security-policy-reset-required` event
-    still carry the backend's raw reason, which can hold a path; the page
-    only logs it now. Send a code instead.
 
 ## 6. Code health
 
@@ -240,36 +220,16 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   each night from a new seed (`soak.yml`, `src-tauri/src/fuzz.rs`). Still missing: a
   build left running against the live network, and the same kind of test for
   the record store and the KAD routing table.
-- **Dependency advisories left open at 1.8.0** (`cargo audit --file
-  src-tauri/Cargo.lock`; the rendezvous server's lock was clean):
-  - *SQLite* (RUSTSEC-2026-0459): the SQLite `libsqlite3-sys` 0.38 bundles
-    returns stale page-cache memory for a crafted database opened beside a
-    `-wal` of another page size. Local only, a malicious backup being the way
-    in. Fixed by `rusqlite` 0.41 (`libsqlite3-sys` 0.39, SQLite 3.54); a minor
-    API bump across the database layer, so run both builds' full suites on
-    Windows and Linux after it. Decided at 1.8.0 to take it after the release.
-  - *`rsa` 0.9* (RUSTSEC-2023-0071, the Marvin timing attack): the SecIdent
-    signatures any eMule peer can ask for are made with it. Hard to use over
-    the internet's noise, and 0.10 is a new API (`crypto-bigint`), so it waits
-    for a release with room to test SecIdent against eMule again.
-  - *`zip` 4.6*, pulled in by `tauri-plugin-updater` 2.14.x, has six open
-    advisories. Four are in `ZipArchive::extract` (SUID bits, symlinks out of
-    the folder, permissions through symlinks, an abort on a large symlink
-    entry), the only `zip` call the plugin makes, and only on an update
-    archive whose minisign signature checked out, so only a signed release
-    could use them. The other two, `ZipStreamReader` names and AES entries
-    returned unchecked, are in APIs the plugin does not call.
-    `.cargo/audit.toml` accepts the first three; add RUSTSEC-2026-0429, -0545
-    and -0548 with the same reasoning, or `cargo audit` from `src-tauri`
-    fails. Take the plugin release that moves to `zip` 9, or turn off its
-    default `zip` feature once every platform's update artifact is known to
-    need none of it.
-  - Unmaintained, nothing to fix yet: `chrono`, `paste`, `proc-macro-error`,
-    `zbus_names` and `zvariant` (through the notification and single-instance
-    plugins), and `glib` 0.18 marked unsound (through WebKitGTK).
-    `async-executor` 1.14.0, through `zbus`, has been yanked; a lock update
-    moves it. `cargo audit` in `ci.yml` would catch the next one when it lands
-    rather than at a release.
+- **The dependency advisory still open.** *`rsa` 0.9* (RUSTSEC-2023-0071,
+  the Marvin timing attack, accepted in `.cargo/audit.toml`): the SecIdent
+  signatures any eMule peer can ask for are made with it. Hard to use over
+  the internet's noise. 0.10 is out and is a new API (`crypto-bigint`).
+  SecIdent signs with PKCS#1 v1.5, which gives the same bytes for the same key
+  and message, so tests can pin today's signatures and prove 0.10 makes the
+  same ones without an eMule peer. CI's `audit` job fails on any advisory not
+  accepted there; warnings for unmaintained crates (`chrono`, `paste`,
+  `proc-macro-error`, `zbus_names`, `zvariant`, and `glib` 0.18 marked
+  unsound) do not.
 - **Find out why most known peers show verification as Needed.** SecureIdent is
   per session, which explains part of it. Run 30 to 60 minutes with
   `RUST_LOG=info,ember_lib::network::ed2k::transfer=debug` and compare each
@@ -323,19 +283,6 @@ than a release candidate should take. What was fixed then is in commit
 - **Two owning devices, evicted rows.** In a room past 256 members an
   unbanned member's row can be evicted, and an old cached snapshot that still
   banned them would ban them again. It errs toward keeping someone banned.
-- **The unsigned deleted list blocks rejoining.** A room the rendezvous
-  server lists as deleted walks its members out and refuses re-entry and new
-  invites (`refuse_deleted_channel`, `enter_stored_channel`) until a complete
-  list no longer names it, though only a verified delete proof removes its
-  history. A buggy or compromised server could lock members out of a private
-  room this way. Chosen in 1.8.0 so a deleted room cannot come back; the
-  alternative keeps the walk-out and the *Deleted by its owner* label but
-  lets members back in until a proof removes the room.
-- **One member can stall room-mail collection.** Past the 120 stored an hour
-  from one sender, that member's entries come back `Later`, and `left_behind`
-  ends the batch; if the server's oldest 32 are all theirs, other
-  conversations' mail waits for the hour (`room_dm_mail.rs`, `collect`).
-  Fetch a member who is full apart, or leave their boxes out of the batch.
 - **The "Ember Network is off" branches are dead.** The network is always on
   (`ember_native_enabled` is forced true on load and save), so `emberOff` on
   the Channels and Feeds pages is never true, and `channels_disabled_*`,
@@ -345,36 +292,6 @@ than a release candidate should take. What was fixed then is in commit
   (`commands/channels.rs`, `channel_recovery.rs`, `network/command.rs`).
   About twenty conditions on those two pages read it, with more in Search,
   the sidebar and the Library; take them out with the keys.
-
-**Feeds and the Library:**
-
-- **A partly shared parent folder.** When a download folder, or a folder
-  holding it, is shared with only some files picked (or as an eMule flat
-  share), *Share files from this feed* adds nothing (`feed_shares::plan`
-  counts that share as covering the feed's folder) and the walk then refuses
-  `Feeds/<feed>`, so the feed's finished files are never offered. Adding the
-  folder as a root of its own breaks the no-overlap rule; add it to that
-  share's allowlist instead.
-
-**Network:**
-
-- **The interface flapping just after the wait.** If the chosen interface goes
-  away again between the wait ending (`hold_address`) and the upload listener
-  binding, the bind fails with `AddrNotAvailable`, is reported as "TCP port
-  already in use", and is never retried, so the session has no inbound TCP.
-  The separate QUIC socket has the same window. Wait for the interface and
-  retry when `net_bind` is configured, or at least say the interface is not
-  connected.
-- **Other commands sent during that wait are still dropped.** 1.8.0 keeps the
-  settings ones (`hold_settings_before_start`); the rest are answered or
-  failed as before. The shared-file reconcile at startup sends one
-  (`SharedFilesChangedAck`), so `reconcile_shared_files` logs "Startup
-  shared-file reconciliation failed" when Ember starts with its VPN down;
-  harmless, as the network reads the index when it starts.
-- **The KAD firewall tile says Firewalled before anything checked.** It does so
-  as soon as KAD connects whenever UPnP did not map, while the TCP tile beside
-  it still says Unknown (`NetworkStatusTiles.svelte`, `kad_firewall_*`). Show
-  *Checking…* until KAD's TCP check has answered.
 
 **Wording the 1.8.0 audit left:**
 
@@ -399,6 +316,17 @@ than a release candidate should take. What was fixed then is in commit
 ## Considered and dropped
 
 Taken off the plan, with why, so they are not added back without a new reason.
+
+- **Letting members back into a channel the server lists as deleted.** A
+  channel on the rendezvous server's deleted list walks its members out and
+  refuses re-entry and new invites (`refuse_deleted_channel`,
+  `enter_stored_channel`) until a complete list no longer names it, though
+  only a verified delete proof removes its history. A buggy or compromised
+  server could lock members out of a private channel that way. Kept after
+  1.8.0, as chosen there: a deleted channel cannot come back.
+- **Watching the clipboard for ed2k links on emberd.** The clipboard is the
+  server's, not the user's, and a page may read the browser's only on a click.
+  The switch stays hidden in emberd's Settings.
 
 - **Accepting only a member's known public address for a room transfer**
   (`post-1.7.0.md` item 4). Ember holds no STUN reading for other members and

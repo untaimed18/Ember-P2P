@@ -4554,7 +4554,7 @@
 
   /** The prompt's line about finished downloads whose file is deleted. */
   function deleteFinishedMessage(count: number, name: string): string {
-    const permanently = $appSettings?.delete_permanently === true;
+    const permanently = deletesPermanently();
     if (count === 1 && name) {
       return permanently
         ? m.transfers_confirm_delete_finished_permanent_named({ name })
@@ -4571,6 +4571,12 @@
           // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
           other: () => m.transfers_confirm_delete_finished_bin_other({ count: formatNumber(count) }),
         });
+  }
+
+  /** Whether deleting a file skips the Recycle Bin: the user's choice, and
+   *  always on emberd, where nothing on a server empties its trash. */
+  function deletesPermanently(): boolean {
+    return isServer || $appSettings?.delete_permanently === true;
   }
 
   /** Delete the files of finished downloads and take them off the list. Not
@@ -4592,7 +4598,7 @@
           checkedDownloadIds = checkedDownloadIds.filter((id) => !removed.has(id));
         }
         if (focusedDlId && removed.has(focusedDlId)) focusedDlId = null;
-        const permanently = $appSettings?.delete_permanently === true;
+        const permanently = deletesPermanently();
         showInfo(permanently
           ? plural(removed.size, {
               one: () => m.transfers_deleted_finished_permanent_one({ count: formatNumber(removed.size) }),
@@ -8016,7 +8022,7 @@
       : '',
   ].filter(Boolean).join('\n\n')}
   confirmLabel={confirmBatchCancel.count === 0
-    ? ($appSettings?.delete_permanently ? m.transfers_confirm_delete_finished_permanent_label() : m.transfers_confirm_delete_finished_bin_label())
+    ? (deletesPermanently() ? m.transfers_confirm_delete_finished_permanent_label() : m.transfers_confirm_delete_finished_bin_label())
     : m.transfers_confirm_batch_cancel_label()}
   danger={true}
   onconfirm={async () => {

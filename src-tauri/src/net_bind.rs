@@ -138,6 +138,17 @@ pub fn status() -> BindingStatus {
     }
 }
 
+fn interface_away_for(configured: bool, error: &io::Error) -> bool {
+    configured && error.kind() == io::ErrorKind::AddrNotAvailable
+}
+
+/// A bind that failed because the chosen interface is away, not because of
+/// its port: one that went between the network's wait for it and the bind.
+/// Worth trying again once the watch in `lib.rs` sees it back.
+pub fn interface_away(error: &io::Error) -> bool {
+    interface_away_for(is_configured(), error)
+}
+
 fn unavailable() -> io::Error {
     io::Error::new(
         io::ErrorKind::AddrNotAvailable,
@@ -520,6 +531,19 @@ mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::AddrNotAvailable);
         let found: Vec<SocketAddr> = lookup_host_for(Binding::Bound(VPN), "127.0.0.1:80").await.unwrap().collect();
         assert_eq!(found, vec!["127.0.0.1:80".parse::<SocketAddr>().unwrap()]);
+    }
+
+    /// A listener bound to an address this computer does not have fails as
+    /// the interface being away, which is worth waiting out; a port in use,
+    /// or no interface chosen, is not.
+    #[test]
+    fn a_bind_to_an_address_that_went_is_the_interface_away() {
+        // TEST-NET-1, assigned to no interface anywhere.
+        let gone = std::net::TcpListener::bind((Ipv4Addr::new(192, 0, 2, 1), 0)).unwrap_err();
+        assert!(interface_away_for(true, &gone), "{gone:?}");
+        assert!(!interface_away_for(false, &gone));
+        assert!(interface_away_for(true, &unavailable()));
+        assert!(!interface_away_for(true, &io::Error::from(io::ErrorKind::AddrInUse)));
     }
 
     /// The address a disconnected VPN adapter keeps is not one to bind to,
