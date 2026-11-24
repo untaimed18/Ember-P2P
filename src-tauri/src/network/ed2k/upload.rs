@@ -6701,6 +6701,15 @@ impl UploadHandler {
         download_restricted_by_friend(&mgr, &hex::encode(file_hash))
     }
 
+    /// `file_hash` cannot be served to this peer, and not because the
+    /// friends-only catalog is still loading: until it lands every indexed
+    /// file is refused to strangers alike, which passes. Gone means a
+    /// download cancelled here, a file deleted or unshared, or one now
+    /// restricted, which the peer is told alike.
+    async fn upload_file_gone(&self, file_hash: &[u8; 16], peer: PeerFileAccess) -> bool {
+        friends_only_snapshot_ready(&self.friends_only_hashes) && self.resolve_upload_file(file_hash, peer).await.is_none()
+    }
+
     /// Charge a file request we could not serve — answered with
     /// `OP_FILEREQANSNOFIL`, or an `OP_REQUESTPARTS` switch to the file that
     /// ended the slot with `OP_OUTOFPARTREQS` — to the hash-probe counter
@@ -10756,7 +10765,7 @@ impl UploadHandler {
                                 // this periodic rank/grant path respects the same TTL as
                                 // STARTUPLOADREQ; otherwise a peer that only holds the TCP
                                 // session open can live in the queue past the 1-hour cap.
-                                let best_identity = {
+                                let best = {
                                     let cm = self.credit_manager.read().await;
                                     let idx_snap = self.local_index.read().await;
                                     let mut queue = self.upload_queue.lock().await;
@@ -10772,8 +10781,40 @@ impl UploadHandler {
                                         &slot_holders,
                                         |e| e.current_addr.is_some(),
                                     )
-                                    .map(|(e, _)| e.identity.clone())
+                                    .map(|(e, _)| (e.identity.clone(), e.file_hash))
                                 };
+                                let (best_identity, best_file) = best.unzip();
+
+                                // Our turn, for a file that went while we
+                                // waited: dropped rather than granted, as the
+                                // push-grant dial drops such a waiter, and
+                                // told so, so that it stops asking. Granted,
+                                // its first part request would end the slot.
+                                let waited_for_gone_file = match best_file {
+                                    Some(file) if best_identity.as_ref() == Some(queued_key) => {
+                                        self.upload_file_gone(&file, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated })
+                                            .await
+                                    }
+                                    _ => false,
+                                };
+                                if let (true, Some(file)) = (waited_for_gone_file, best_file) {
+                                    self.upload_queue.lock().await.retain(|e| {
+                                        e.identity != *queued_key
+                                            || !queue_row_owned_by_session(
+                                                e.current_addr,
+                                                e.tcp_port,
+                                                peer_addr,
+                                                hello_caps.tcp_port,
+                                            )
+                                    });
+                                    write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_FILEREQANSNOFIL, &file).await?;
+                                    queued_identity = None;
+                                    if current_file_hash == Some(file) {
+                                        current_file_hash = None;
+                                        total_size = 0;
+                                    }
+                                    continue;
+                                }
 
                                 if best_identity.is_some() {
                                     // Reserve the slot atomically BEFORE removing the
@@ -12272,6 +12313,21 @@ impl UploadHandler {
                         queue_join_inherited = false;
                         self.slot_rates.lock().remove(&peer_addr);
                         rate_tracker = SessionRateTracker::new();
+                        // The slot's own file went, not a switch to one this
+                        // peer may not have: it is told so, as a fresh request
+                        // for it would be, and drops us as a source. Queued
+                        // again it would win the next slot only to be refused
+                        // again, a row flashing up in Uploads each time.
+                        if !refused_switch
+                            && self
+                                .upload_file_gone(&hash, PeerFileAccess { ember_hash: peer_ember_hash, secure_v2_authenticated })
+                                .await
+                        {
+                            write_packet_async(&mut writer, OP_EDONKEYHEADER, OP_FILEREQANSNOFIL, &hash).await?;
+                            current_file_hash = None;
+                            total_size = 0;
+                            continue;
+                        }
                         if self
                             .requeue_after_slot(
                                 &queue_identity,
