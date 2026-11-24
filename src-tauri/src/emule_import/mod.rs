@@ -868,6 +868,25 @@ pub fn stage(
     result
 }
 
+/// eMule's Incoming folder, chosen as Ember's download folder, is one the
+/// settings refuse (a drive root or a system folder). Its own error, so the
+/// page can say so in the user's language.
+#[derive(Debug)]
+pub struct IncomingFolderRefused(pub String);
+
+impl std::fmt::Display for IncomingFolderRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "eMule's Incoming folder ({}) cannot be Ember's download folder: a drive root or a \
+             system folder is refused; leave that option off and choose the download folder in Settings",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for IncomingFolderRefused {}
+
 /// eMule's Incoming folder, as the download folder an import would set.
 fn incoming_download_folder(scan: &Scan) -> Option<String> {
     scan.prefs
@@ -889,11 +908,7 @@ fn stage_scan(
     if selection.incoming_as_download_folder {
         if let Some(folder) = incoming_download_folder(scan) {
             if crate::commands::settings::validate_download_folder(&folder).is_err() {
-                anyhow::bail!(
-                    "eMule's Incoming folder ({folder}) cannot be Ember's download folder: \
-                     a drive root or a system folder is refused; leave that option off and \
-                     choose the download folder in Settings"
-                );
+                return Err(IncomingFolderRefused(folder).into());
             }
         }
     }
@@ -1173,6 +1188,37 @@ pub fn discard(data_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// eMule's Incoming folder at a drive root, chosen as the download
+    /// folder, is refused before anything is staged, with an error of its own
+    /// the command turns into a translated one.
+    #[test]
+    fn an_incoming_folder_the_settings_refuse_is_its_own_error() {
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        let scan = Scan {
+            token: 1,
+            config_dir: std::env::temp_dir(),
+            prefs: formats::EmulePrefs { incoming_dir: Some(PathBuf::from(root)), ..Default::default() },
+            user_hash: None,
+            keypair: None,
+            credits: Vec::new(),
+            known_met: None,
+            known_files: 0,
+            known2: None,
+            known2_sets: 0,
+            folders: Vec::new(),
+            downloads: Vec::new(),
+            server_met: None,
+            nodes_dat: None,
+            ipfilter: None,
+        };
+        let selection = EmuleImportSelection { token: 1, incoming_as_download_folder: true, ..Default::default() };
+        let untouched = std::env::temp_dir().join("ember-emule-import-refused-never-created");
+        let error = stage_scan(&untouched, "", &selection, &scan, &mut |_| {}).unwrap_err();
+        let refused = error.downcast_ref::<IncomingFolderRefused>().expect("its own error");
+        assert_eq!(refused.0, root);
+        assert!(!untouched.exists(), "nothing staged");
+    }
 
     fn part_met(hash: [u8; 16], name: &str, size: u64) -> Vec<u8> {
         let mut buf = vec![0xE0];

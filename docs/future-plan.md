@@ -220,16 +220,6 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   each night from a new seed (`soak.yml`, `src-tauri/src/fuzz.rs`). Still missing: a
   build left running against the live network, and the same kind of test for
   the record store and the KAD routing table.
-- **The dependency advisory still open.** *`rsa` 0.9* (RUSTSEC-2023-0071,
-  the Marvin timing attack, accepted in `.cargo/audit.toml`): the SecIdent
-  signatures any eMule peer can ask for are made with it. Hard to use over
-  the internet's noise. 0.10 is out and is a new API (`crypto-bigint`).
-  SecIdent signs with PKCS#1 v1.5, which gives the same bytes for the same key
-  and message, so tests can pin today's signatures and prove 0.10 makes the
-  same ones without an eMule peer. CI's `audit` job fails on any advisory not
-  accepted there; warnings for unmaintained crates (`chrono`, `paste`,
-  `proc-macro-error`, `zbus_names`, `zvariant`, and `glib` 0.18 marked
-  unsound) do not.
 - **Find out why most known peers show verification as Needed.** SecureIdent is
   per session, which explains part of it. Run 30 to 60 minutes with
   `RUST_LOG=info,ember_lib::network::ed2k::transfer=debug` and compare each
@@ -249,15 +239,15 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   about 240, in all nine translations, by machine and checked by script only
   (placeholders, completeness, no word for "room" left). Most at risk: the
   grammatical gender every "channel" sentence changed in es, it, pt-BR, ru
-  and pl (`channels_deleted_elsewhere_body` and the `Transferred` badge
-  follow a name whose gender changed); Chinese, which calls the Library
+  and pl (the `Transferred` badge follows a name whose gender changed);
+  Chinese, which calls the Library
   文件库, 资源库 and 媒体库 in different places, and zh-TW's 共享 against 分享
   for "share"; de `Kürzlich` and pl `Ugruntowany` for the KAD contact types
   *Recent* and *Established*; and es and ru, whose word for a channel ban is
-  the one for blocking a friend.
-- **`channels_deleted_elsewhere_body` is half a sentence** shown after the
-  channel's name in bold, which several languages cannot word that way. Give
-  it a `{name}` and draw the bold part inside it.
+  the one for blocking a friend. Since then, new in every language by
+  machine: the deleted-elsewhere banner as a whole sentence, the eMule
+  import's refused Incoming folder, the file pickers' titles and filter
+  names, and the Linux wording of the delete texts (`*_trash`).
 
 ## 8. Left from the 1.8.0 checks
 
@@ -295,20 +285,9 @@ than a release candidate should take. What was fixed then is in commit
 
 **Wording the 1.8.0 audit left:**
 
-- The page texts name the bin "Recycle Bin (Trash)" in the delete
-  confirmations and "Recycle Bin" alone elsewhere (the finished-download
-  toasts and button, the permanent-delete confirmations,
-  `error_sharing_delete_declined`, the Delete shortcut), on every platform.
-  The native dialogs name it by platform (`TRASH_NAME`). Most languages use
-  one word for both; English, Spanish and Chinese do not, so a platform-aware
-  wording needs a placeholder or a second set of strings.
 - The eD2K server log on the eD2K Servers page is English with raw OS errors
   (`emit_server_log` in `network/server.rs`, called across
-  `network/event_loop/`). The eMule import's "cannot be Ember's download
-  folder" error is English too (`emule_import/mod.rs`).
-- Three file pickers have no translated title and English filter names: the
-  IP filter (`commands/security.rs`), the backup save and open
-  (`commands/backup.rs`) and the media player (`commands/settings.rs`).
+  `network/event_loop/`).
 - Spellings still split across the English: "this computer" and "this
   device", "your library" and "your Library", "checked" and "ticked",
   British and American spellings, and "Failed to…" beside "Could not…".

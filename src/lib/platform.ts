@@ -1,5 +1,13 @@
 /** Platform helpers for keyboard-shortcut chrome (tooltips, ARIA, cheat-sheet). */
 import * as m from '$lib/paraglide/messages';
+import { isServer } from '$lib/runtime';
+
+/** Whether deleted files go to the Recycle Bin, as Windows calls it, rather
+ *  than the Trash. emberd's files are on its server, which runs Linux,
+ *  whatever the browser looking at them runs. */
+export function binIsRecycleBin(): boolean {
+  return !isServer && typeof navigator !== 'undefined' && /Windows/.test(navigator.userAgent);
+}
 
 export function isApplePlatform(): boolean {
   return typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/.test(navigator.platform);

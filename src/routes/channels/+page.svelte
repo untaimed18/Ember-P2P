@@ -61,7 +61,7 @@
   } from '$lib/xferRate';
   import { toastsFor } from '$lib/stores/toast';
   const { toast, toastError, toastSuccess } = toastsFor('channels');
-  import { translateError } from '$lib/i18n';
+  import { aroundPlaceholder, translateError } from '$lib/i18n';
   import { isServer } from '$lib/runtime';
   import { plural } from '$lib/plural';
   import {
@@ -3378,14 +3378,12 @@
   {/if}
 
   {#each deletedElsewhere as room (room.channel_id)}
+    {@const [before, after] = aroundPlaceholder((name) => m.channels_deleted_elsewhere_body({ name }))}
     <!-- The registry says this room was deleted, but this device still runs
          it: a restore from an older backup, or a delete on another device.
          The registry's word alone never removes it; the owner does. -->
     <div class="banner deleted-elsewhere-banner" role="status">
-      <span>
-        <strong><bdi dir="auto">{room.name}</bdi></strong>
-        {m.channels_deleted_elsewhere_body()}
-      </span>
+      <span>{before}<strong><bdi dir="auto">{room.name}</bdi></strong>{after}</span>
       <div class="banner-actions">
         <button class="ghost" onclick={() => askRemoveDeletedElsewhere(room)} disabled={answeringDeleted !== null}>
           {answeringDeleted === room.channel_id ? m.common_loading() : m.channels_deleted_elsewhere_delete()}

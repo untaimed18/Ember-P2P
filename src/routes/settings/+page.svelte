@@ -170,6 +170,7 @@
   import { networkStats } from '$lib/stores/network';
   import { isShortcutLetter } from '$lib/shortcutKey';
   import { isServer } from '$lib/runtime';
+  import { binIsRecycleBin } from '$lib/platform';
   import { changePassword, logOut } from '$lib/runtime/web/session';
   import { askForBrowserNotifications, browserNotificationState } from '$lib/notifications';
 
@@ -4012,7 +4013,7 @@
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="delete-permanently-label" for="delete-permanently-switch">{m.settings_delete_permanently()}</label>
-                <span class="hint" id="delete-permanently-hint">{m.settings_delete_permanently_hint()}</span>
+                <span class="hint" id="delete-permanently-hint">{binIsRecycleBin() ? m.settings_delete_permanently_hint() : m.settings_delete_permanently_hint_trash()}</span>
               </div>
               <ToggleSwitch
                 id="delete-permanently-switch"

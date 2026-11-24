@@ -656,7 +656,7 @@ mod tests {
     fn emule_cryptkey() -> Vec<u8> {
         use base64::Engine as _;
         use rsa::pkcs8::EncodePrivateKey;
-        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 384).unwrap();
+        let key = rsa::PrivateKey::new_unchecked(&mut getrandom_sys::SysRng, 384).unwrap();
         let encoded = base64::engine::general_purpose::STANDARD.encode(key.to_pkcs8_der().unwrap().as_bytes());
         // Crypto++ breaks its base64 every 72 columns.
         encoded

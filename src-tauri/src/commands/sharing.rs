@@ -3506,12 +3506,25 @@ pub(crate) async fn recycle_library_file(
     )
     .await;
     if !confirmed {
+        // A code per platform, as the page names the bin by platform.
+        #[cfg(windows)]
         return Err(coded(
             "sharing_delete_declined",
             "The file was kept: it could not go to the Recycle Bin",
         ));
+        #[cfg(not(windows))]
+        return Err(coded(
+            "sharing_delete_declined_trash",
+            "The file was kept: it could not go to the Trash",
+        ));
     }
     delete_file_with_retry(path, allowed_roots, expected, 6, 250).await
+}
+
+/// Whether a [`recycle_library_file`] error is the user keeping the file at
+/// the delete-permanently question, under either platform's code.
+pub(crate) fn delete_was_declined(error: &str) -> bool {
+    error.contains("\"sharing_delete_declined\"") || error.contains("\"sharing_delete_declined_trash\"")
 }
 
 /// What the native dialogs call the bin [`move_to_trash`] sends files to.
@@ -10615,6 +10628,18 @@ pub async fn open_shared_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Keep file" stops a batch of deletes under either platform's code.
+    #[test]
+    fn a_kept_file_is_told_from_other_delete_failures_on_either_platform() {
+        let declined = coded("sharing_delete_declined", "kept");
+        let declined_trash = coded("sharing_delete_declined_trash", "kept");
+        assert!(delete_was_declined(&declined));
+        assert!(delete_was_declined(&declined_trash));
+        assert!(!delete_was_declined(&coded("sharing_invalid_path", "Invalid or changed path")));
+        let lookalike = r#"{"__coded":true,"code":"sharing_delete_declined_elsewhere","message":"not ours"}"#;
+        assert!(!delete_was_declined(lookalike));
+    }
 
     /// A withdrawal that meets a full command channel is delivered once there
     /// is room, without holding up the action that asked for it.

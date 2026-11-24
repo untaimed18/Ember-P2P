@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 import type { AntiLeechSnapshot, AntiLeechReplaceResult } from '$lib/types';
 import { isServer } from '$lib/runtime';
 import { pickAndUpload } from '$lib/runtime/web/files';
@@ -132,7 +133,7 @@ export async function pickAndImportIpfilterFile(): Promise<IpFilterApplyResult |
     const upload = await pickAndUpload('.dat,.txt,.gz,.zip,.p2p,.p2b');
     return upload ? invoke('import_ipfilter_upload', { upload }) : null;
   }
-  return invoke('pick_and_import_ipfilter_file');
+  return invoke('pick_and_import_ipfilter_file', { title: m.picker_ipfilter(), filter: m.picker_filter_ipfilter() });
 }
 
 // ----- Anti-leech client filter ------------------------------------

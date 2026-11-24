@@ -440,8 +440,13 @@ pub async fn pick_preview_player(
     app: crate::host::AppHandle,
     window: crate::host::WebviewWindow,
     title: Option<String>,
+    filter: Option<String>,
 ) -> Result<Option<String>, String> {
     let dialog_title = super::picker_title(title, "Choose a media player for Preview");
+    #[cfg(target_os = "windows")]
+    let filter_name = super::picker_title(filter, "Programs");
+    #[cfg(not(target_os = "windows"))]
+    let _ = filter;
     if window.label() != "main" {
         return Err(coded(
             "settings_preview_player_picker_failed",
@@ -465,7 +470,7 @@ pub async fn pick_preview_player(
         // directly, and a bundle needs `open -a`. Supporting bundles means
         // teaching both ends, not just loosening this guard.
         #[cfg(target_os = "windows")]
-        let dialog = dialog.add_filter("Programs", &["exe", "com", "bat", "cmd"]);
+        let dialog = dialog.add_filter(filter_name, &["exe", "com", "bat", "cmd"]);
         dialog
             .blocking_pick_file()
             .map(|file| {
@@ -3780,15 +3785,17 @@ pub async fn web_service_address(
 pub async fn pick_and_import_webservices_file(
     app: crate::host::AppHandle,
     title: Option<String>,
+    filter: Option<String>,
 ) -> Result<Option<Vec<crate::webservices::WebService>>, String> {
     let dialog_title = super::picker_title(title, "Choose an eMule webservices.dat");
+    let filter_name = super::picker_title(filter, "eMule web services");
     let picker = app.clone();
     let selected = tokio::task::spawn_blocking(move || {
         picker
             .dialog()
             .file()
             .set_title(dialog_title)
-            .add_filter("eMule web services", &["dat", "txt"])
+            .add_filter(filter_name, &["dat", "txt"])
             .blocking_pick_file()
             .map(|file| {
                 file.into_path().map_err(|e| {

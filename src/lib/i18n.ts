@@ -276,6 +276,21 @@ function withoutEmptyDetail(text: string): string {
     .trim();
 }
 
+/** Stands in for a placeholder a page draws as markup of its own. */
+const MARKUP_SLOT = '\u{E001}';
+
+/**
+ * A message with one placeholder the page draws itself (a name in bold, say),
+ * as the text before it and after it, so each translation puts it wherever
+ * its grammar wants. `render` fills the placeholder with what it is given.
+ */
+export function aroundPlaceholder(render: (slot: string) => string): [string, string] {
+  const text = render(MARKUP_SLOT);
+  const at = text.indexOf(MARKUP_SLOT);
+  if (at < 0) return ['', ` ${text}`];
+  return [text.slice(0, at), text.slice(at + MARKUP_SLOT.length)];
+}
+
 /**
  * Map a Tauri command error onto a translated message.
  *

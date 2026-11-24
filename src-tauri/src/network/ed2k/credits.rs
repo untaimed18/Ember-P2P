@@ -2368,16 +2368,36 @@ fn read_identity_section(data: &[u8], offset: usize) -> Vec<([u8; 16], String, S
     out
 }
 
+/// What SecIdent takes from a peer: eMule's 384-bit keys, up to the ceiling
+/// `rsa` 0.9 held. `rsa`'s own decoders refuse anything under 1024 bits.
+const SECIDENT_KEY_BITS: std::ops::RangeInclusive<usize> = 384..=4096;
+
+/// A SecIdent public key from PKCS#1 `RSAPublicKey` DER, as eMule sends it,
+/// or the SPKI that wraps it, as Ember does, and whether it came as SPKI.
+fn decode_secident_public_key(der: &[u8]) -> Option<(rsa::PublicKey, bool)> {
+    use rsa::pkcs8::der::asn1::AsUintRef;
+    use rsa::pkcs8::der::Decode;
+
+    let (pkcs1, spki) = match rsa::pkcs8::SubjectPublicKeyInfoRef::from_der(der) {
+        Ok(info) if info.algorithm.oid == rsa::pkcs1::ALGORITHM_OID => (info.subject_public_key.as_bytes()?, true),
+        Ok(_) => return None,
+        Err(_) => (der, false),
+    };
+    let key = rsa::pkcs1::RsaPublicKeyRef::from_der(pkcs1).ok()?;
+    let uint = |bytes: &[u8]| rsa::BoxedUint::from_be_slice(bytes, u32::try_from(bytes.len()).ok()?.checked_mul(8)?).ok();
+    let n = uint(key.modulus.as_uint_ref().as_bytes())?;
+    let e = uint(key.public_exponent.as_uint_ref().as_bytes())?;
+    Some((rsa::PublicKey::new_with_size_limits(n, e, SECIDENT_KEY_BITS).ok()?, spki))
+}
+
 fn generate_rsa_keypair() -> (Vec<u8>, Vec<u8>) {
     use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
-    use rsa::RsaPrivateKey;
 
-    let mut rng = rand::thread_rng();
     // 384-bit RSA matches eMule's SecureIdent key size for wire-level compatibility.
     // This is intentionally low by modern standards; it provides credit-abuse
     // deterrence rather than strong cryptographic security.
     let bits = 384;
-    let private_key = match RsaPrivateKey::new(&mut rng, bits) {
+    let private_key = match rsa::PrivateKey::new_unchecked(&mut getrandom_sys::SysRng, bits) {
         Ok(k) => k,
         Err(e) => {
             tracing::error!("RSA keygen failed: {e}, credits will be disabled");
@@ -2430,7 +2450,7 @@ pub(crate) fn decode_emule_cryptkey(raw: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     use rsa::pkcs1::DecodeRsaPrivateKey;
     use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
     use rsa::traits::PublicKeyParts;
-    use rsa::RsaPrivateKey;
+    use rsa::PrivateKey;
 
     let der = if raw.first() == Some(&0x30) {
         raw.to_vec()
@@ -2442,8 +2462,8 @@ pub(crate) fn decode_emule_cryptkey(raw: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
             .collect();
         base64::engine::general_purpose::STANDARD.decode(text).ok()?
     };
-    let key = RsaPrivateKey::from_pkcs8_der(&der)
-        .or_else(|_| RsaPrivateKey::from_pkcs1_der(&der))
+    let key = PrivateKey::from_pkcs8_der(&der)
+        .or_else(|_| PrivateKey::from_pkcs1_der(&der))
         .ok()?;
     if key.size() * 8 != 384 {
         return None;
@@ -2475,16 +2495,13 @@ pub(crate) fn encode_keypair_file(public_der: &[u8], private_der: &[u8]) -> anyh
 /// original bytes alone if the key parses as neither (likely corrupt,
 /// caller will regenerate).
 fn normalize_public_key_to_spki(pub_der: &[u8]) -> Option<Vec<u8>> {
-    use rsa::pkcs1::DecodeRsaPublicKey;
-    use rsa::pkcs8::{DecodePublicKey, EncodePublicKey};
-    use rsa::RsaPublicKey;
+    use rsa::pkcs8::EncodePublicKey;
 
-    if RsaPublicKey::from_public_key_der(pub_der).is_ok() {
+    let (key, spki) = decode_secident_public_key(pub_der)?;
+    if spki {
         return Some(pub_der.to_vec());
     }
-    let key = RsaPublicKey::from_pkcs1_der(pub_der).ok()?;
-    let spki = key.to_public_key_der().ok()?;
-    Some(spki.as_ref().to_vec())
+    Some(key.to_public_key_der().ok()?.as_ref().to_vec())
 }
 
 /// The longest peer key a SecIdent answer signs over, the one-byte length its
@@ -2519,20 +2536,14 @@ fn sign_challenge(
 fn secident_rsa_sign(private_key_der: &[u8], msg: &[u8]) -> Vec<u8> {
     use rsa::pkcs1v15::SigningKey;
     use rsa::pkcs8::DecodePrivateKey;
-    use rsa::signature::SignerMut;
-    use rsa::RsaPrivateKey;
-    use sha1::Sha1;
+    use rsa::signature::Signer;
 
-    let key = match RsaPrivateKey::from_pkcs8_der(private_key_der) {
+    let key = match rsa::PrivateKey::from_pkcs8_der(private_key_der) {
         Ok(k) => k,
         Err(_) => return Vec::new(),
     };
-    let mut signing_key = SigningKey::<Sha1>::new(key);
-    match signing_key.try_sign(msg) {
-        Ok(sig) => {
-            let bytes: Box<[u8]> = sig.into();
-            bytes.into_vec()
-        }
+    match SigningKey::<sha1_rsa::Sha1>::new(key).try_sign(msg) {
+        Ok(sig) => Box::<[u8]>::from(sig).into_vec(),
         Err(_) => Vec::new(),
     }
 }
@@ -2540,23 +2551,16 @@ fn secident_rsa_sign(private_key_der: &[u8], msg: &[u8]) -> Vec<u8> {
 /// Check a [`secident_rsa_sign`] signature against a peer's SecIdent public
 /// key, PKCS#1 DER as eMule sends it or SPKI.
 pub(super) fn secident_rsa_verify(public_key_der: &[u8], msg: &[u8], signature: &[u8]) -> bool {
-    use rsa::pkcs1::DecodeRsaPublicKey;
     use rsa::pkcs1v15::{Signature, VerifyingKey};
     use rsa::signature::Verifier;
-    use rsa::RsaPublicKey;
-    use sha1::Sha1;
 
-    let key = match RsaPublicKey::from_pkcs1_der(public_key_der).or_else(|_| {
-        use rsa::pkcs8::DecodePublicKey;
-        RsaPublicKey::from_public_key_der(public_key_der)
-    }) {
-        Ok(k) => k,
-        Err(_) => return false,
+    let Some((key, _)) = decode_secident_public_key(public_key_der) else {
+        return false;
     };
     let Ok(sig) = Signature::try_from(signature) else {
         return false;
     };
-    VerifyingKey::<Sha1>::new(key).verify(msg, &sig).is_ok()
+    VerifyingKey::<sha1_rsa::Sha1>::new(key).verify(msg, &sig).is_ok()
 }
 
 fn verify_challenge(
@@ -3255,8 +3259,8 @@ mod tests {
 
         // A round-trip through the decoder we actually use on verify must work:
         // this is the same path eMule takes before it tries to crypto-verify us.
-        use rsa::pkcs8::DecodePublicKey;
-        rsa::RsaPublicKey::from_public_key_der(&pub_der).expect("generated key must parse as SPKI");
+        let (_, spki) = decode_secident_public_key(&pub_der).expect("generated key must parse");
+        assert!(spki, "and parse as SPKI");
     }
 
     /// Confirm `normalize_public_key_to_spki` upgrades a legacy
@@ -3267,11 +3271,8 @@ mod tests {
     #[test]
     fn normalize_pkcs1_public_key_to_spki() {
         use rsa::pkcs1::EncodeRsaPublicKey;
-        use rsa::pkcs8::DecodePublicKey;
-        use rsa::RsaPrivateKey;
 
-        let mut rng = rand::thread_rng();
-        let private_key = RsaPrivateKey::new(&mut rng, 384).expect("keygen");
+        let private_key = rsa::PrivateKey::new_unchecked(&mut getrandom_sys::SysRng, 384).expect("keygen");
         let pkcs1 = private_key
             .to_public_key()
             .to_pkcs1_der()
@@ -3279,12 +3280,15 @@ mod tests {
             .as_ref()
             .to_vec();
         assert!(
-            rsa::RsaPublicKey::from_public_key_der(&pkcs1).is_err(),
+            decode_secident_public_key(&pkcs1).is_some_and(|(_, spki)| !spki),
             "test fixture precondition: raw PKCS#1 must NOT parse as SPKI",
         );
 
         let spki = normalize_public_key_to_spki(&pkcs1).expect("normalisation returned None");
-        rsa::RsaPublicKey::from_public_key_der(&spki).expect("normalised key must parse as SPKI");
+        assert!(
+            decode_secident_public_key(&spki).is_some_and(|(_, spki)| spki),
+            "normalised key must parse as SPKI"
+        );
         assert_ne!(spki, pkcs1, "normalisation must actually re-encode the key");
 
         // A key that's already SPKI should come back byte-identical.
@@ -4653,7 +4657,7 @@ mod tests {
             unique_nanos(),
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 384).unwrap();
+        let key = rsa::PrivateKey::new_unchecked(&mut getrandom_sys::SysRng, 384).unwrap();
         let b64 = base64::engine::general_purpose::STANDARD
             .encode(key.to_pkcs8_der().unwrap().as_bytes());
         let wrapped: String = b64
@@ -4673,8 +4677,57 @@ mod tests {
         again.load_or_create_keypair(&dir);
         assert_eq!(again.our_public_key(), adopted.as_slice(), "rewritten in Ember's layout");
 
-        let bits_512 = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 512).unwrap();
+        let bits_512 = rsa::PrivateKey::new_unchecked(&mut getrandom_sys::SysRng, 512).unwrap();
         assert!(decode_emule_cryptkey(bits_512.to_pkcs8_der().unwrap().as_bytes()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One 384-bit key and what SecIdent made of it with `rsa` 0.9, the bytes
+    /// eMule peers have been verifying. PKCS#1 v1.5 signs deterministically,
+    /// so a library change that alters any of these would break SecIdent with
+    /// every peer that already holds our key.
+    mod secident_vectors {
+        pub const PKCS8: &str = "3082010c020100300d06092a864886f70d01010105000481f73081f4020100023100c201232e325e8d105ea5ba60f62bec18a5939921e0a7eef43e5317f029993a3ea4b27bab8d4160e25e1e95b40c8113c30203010001023100bfe4d01f89c2ec551cc960a937d60a19f6ed1fb2dabc4125ac1ba573f1c60fa1e7bd64bdce7792377417f54d9a7da641021900d117dd8294e277dfb53d88bdf22889a08b4a8845d533d1f5021900ed86badb2e4ff30649882be8e2c2c7362c1cf6d1c46263d7021900a84ccc58421cb39e5654cc4f0faebf70810da1f88baea54d021900ae9184a72de46872487ca1f8e91fca15905a41346e26f9c502186b6d7eb978d4a005c57838bae5605fc9fce44199a7e1e351";
+        pub const PKCS1_PRIVATE: &str = "3081f4020100023100c201232e325e8d105ea5ba60f62bec18a5939921e0a7eef43e5317f029993a3ea4b27bab8d4160e25e1e95b40c8113c30203010001023100bfe4d01f89c2ec551cc960a937d60a19f6ed1fb2dabc4125ac1ba573f1c60fa1e7bd64bdce7792377417f54d9a7da641021900d117dd8294e277dfb53d88bdf22889a08b4a8845d533d1f5021900ed86badb2e4ff30649882be8e2c2c7362c1cf6d1c46263d7021900a84ccc58421cb39e5654cc4f0faebf70810da1f88baea54d021900ae9184a72de46872487ca1f8e91fca15905a41346e26f9c502186b6d7eb978d4a005c57838bae5605fc9fce44199a7e1e351";
+        pub const PKCS1_PUBLIC: &str = "3038023100c201232e325e8d105ea5ba60f62bec18a5939921e0a7eef43e5317f029993a3ea4b27bab8d4160e25e1e95b40c8113c30203010001";
+        pub const SPKI: &str = "304c300d06092a864886f70d0101010500033b003038023100c201232e325e8d105ea5ba60f62bec18a5939921e0a7eef43e5317f029993a3ea4b27bab8d4160e25e1e95b40c8113c30203010001";
+        pub const MESSAGE: &[u8] = b"SecIdent challenge vector";
+        pub const SIGNATURE: &str = "7bfdb88e1d3af3a7b87d11b9214f3587f9be2212075bf81a88fb204282bdaa29468aaa516287ee6c0cd83388e452c467";
+        pub const CHALLENGE_SIGNATURE: &str = "861e6a20c302ad4b14e048efe48bdc6f0ab193613471cbb9ce6f8edfc17c0f5751a4e94792708d9efa9de18754be174e";
+    }
+
+    #[test]
+    fn secident_keys_and_signatures_stay_byte_for_byte_what_peers_verify() {
+        use base64::Engine as _;
+        use secident_vectors::*;
+        let unhex = |s: &str| hex::decode(s).unwrap();
+        let (pkcs8, spki, pkcs1_public) = (unhex(PKCS8), unhex(SPKI), unhex(PKCS1_PUBLIC));
+
+        // cryptkey.dat as eMule writes it, and the converted forms accepted.
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&pkcs8);
+        let wrapped: String = b64.as_bytes().chunks(72).map(|line| format!("{}\n", String::from_utf8_lossy(line))).collect();
+        for raw in [pkcs8.clone(), unhex(PKCS1_PRIVATE), wrapped.into_bytes()] {
+            assert_eq!(decode_emule_cryptkey(&raw), Some((spki.clone(), pkcs8.clone())));
+        }
+        assert_eq!(normalize_public_key_to_spki(&pkcs1_public).as_deref(), Some(spki.as_slice()));
+        assert_eq!(normalize_public_key_to_spki(&spki).as_deref(), Some(spki.as_slice()));
+
+        let signature = unhex(SIGNATURE);
+        assert_eq!(secident_rsa_sign(&pkcs8, MESSAGE), signature);
+        assert_eq!(sign_challenge(&pkcs8, &spki, 0x1234_5678, 0x0A0B_0C0D, Some(2)), unhex(CHALLENGE_SIGNATURE));
+        assert!(secident_rsa_verify(&spki, MESSAGE, &signature), "SPKI, as Ember sends its key");
+        assert!(secident_rsa_verify(&pkcs1_public, MESSAGE, &signature), "PKCS#1, as eMule sends its key");
+        assert!(!secident_rsa_verify(&spki, b"another message", &signature));
+        let mut forged = signature.clone();
+        forged[0] ^= 1;
+        assert!(!secident_rsa_verify(&spki, MESSAGE, &forged));
+
+        // A key made now is the same size, fits eMule's 80-byte limit, and
+        // its signatures verify.
+        let (fresh_public, fresh_private) = generate_rsa_keypair();
+        assert!(fresh_public.len() <= 80, "{} bytes", fresh_public.len());
+        let (fresh_spki, _) = decode_emule_cryptkey(&fresh_private).expect("a 384-bit key");
+        assert_eq!(fresh_spki, fresh_public);
+        assert!(secident_rsa_verify(&fresh_public, MESSAGE, &secident_rsa_sign(&fresh_private, MESSAGE)));
     }
 }

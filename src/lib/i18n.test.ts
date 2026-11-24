@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { codedErrorOf, translateError } from './i18n';
+import { aroundPlaceholder, codedErrorOf, translateError } from './i18n';
+import * as m from '$lib/paraglide/messages';
 
 /** The envelope `commands::errors` puts on the wire. */
 function coded(code: string, message: string, context?: string): string {
@@ -72,5 +73,18 @@ describe('translateError', () => {
   it('uses the caller fallback only when there is no string at all', () => {
     expect(translateError(null, 'could not send')).toBe('could not send');
     expect(translateError('real text', 'could not send')).toBe('real text');
+  });
+});
+
+describe('aroundPlaceholder', () => {
+  it('splits a message where the translation put the placeholder', () => {
+    expect(aroundPlaceholder((name) => `Le salon ${name} est supprimé.`)).toEqual(['Le salon ', ' est supprimé.']);
+    expect(aroundPlaceholder((name) => `${name} is deleted.`)).toEqual(['', ' is deleted.']);
+    const [before, after] = aroundPlaceholder((name) => m.channels_deleted_elsewhere_body({ name }));
+    expect(before + 'Music' + after).toBe(m.channels_deleted_elsewhere_body({ name: 'Music' }));
+  });
+
+  it('keeps the text after the markup when a message has lost its placeholder', () => {
+    expect(aroundPlaceholder(() => 'is deleted.')).toEqual(['', ' is deleted.']);
   });
 });

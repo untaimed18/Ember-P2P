@@ -115,6 +115,7 @@
   import { openFeedFilesFolder } from '$lib/api/feeds';
   import { isServer } from '$lib/runtime';
   import { saveToThisComputer } from '$lib/runtime/web/files';
+  import { binIsRecycleBin } from '$lib/platform';
   import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
@@ -2340,20 +2341,33 @@
     try {
       const size = formatSize(totalBytes);
       const count = formatNumber(targets.length);
+      const recycleBin = binIsRecycleBin();
       // emberd deletes outright: nothing on a server empties its trash.
       const question = isServer || $appSettings?.delete_permanently
-        ? plural(targets.length, {
-            one: () => m.library_confirm_delete_one_permanent({ size, count }),
-            // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
-            few: () => m.library_confirm_delete_few_permanent({ count, size }),
-            other: () => m.library_confirm_delete_other_permanent({ count, size }),
-          })
-        : plural(targets.length, {
-            one: () => m.library_confirm_delete_one({ size, count }),
-            // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
-            few: () => m.library_confirm_delete_few({ count, size }),
-            other: () => m.library_confirm_delete_other({ count, size }),
-          });
+        ? plural(targets.length, recycleBin
+          ? {
+              one: () => m.library_confirm_delete_one_permanent({ size, count }),
+              // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
+              few: () => m.library_confirm_delete_few_permanent({ count, size }),
+              other: () => m.library_confirm_delete_other_permanent({ count, size }),
+            }
+          : {
+              one: () => m.library_confirm_delete_one_permanent_trash({ size, count }),
+              few: () => m.library_confirm_delete_few_permanent_trash({ count, size }),
+              other: () => m.library_confirm_delete_other_permanent_trash({ count, size }),
+            })
+        : plural(targets.length, recycleBin
+          ? {
+              one: () => m.library_confirm_delete_one({ size, count }),
+              // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
+              few: () => m.library_confirm_delete_few({ count, size }),
+              other: () => m.library_confirm_delete_other({ count, size }),
+            }
+          : {
+              one: () => m.library_confirm_delete_one_trash({ size, count }),
+              few: () => m.library_confirm_delete_few_trash({ count, size }),
+              other: () => m.library_confirm_delete_other_trash({ count, size }),
+            });
       const hidden = hiddenByFilters(targets);
       const confirmed = await askConfirm(
         hidden.length > 0 ? `${question}\n\n${deleteHiddenNote(hidden)}` : question,
@@ -2377,7 +2391,8 @@
           // "Keep file" in the backend's delete-permanently question (a file
           // the Recycle Bin will not take): the rest are very likely in the
           // same place, so stop rather than ask again for every one of them.
-          if (codedErrorOf(e)?.code === 'sharing_delete_declined') break;
+          const code = codedErrorOf(e)?.code;
+          if (code === 'sharing_delete_declined' || code === 'sharing_delete_declined_trash') break;
         }
         bulkProgress = { done: index + 1, total: targets.length };
       }
@@ -3677,8 +3692,12 @@
     try {
       const confirmed = await askConfirm(
         isServer || $appSettings?.delete_permanently
-          ? m.library_confirm_delete_single_permanent({ name: f.name })
-          : m.library_confirm_delete_single({ name: f.name }),
+          ? (binIsRecycleBin()
+            ? m.library_confirm_delete_single_permanent({ name: f.name })
+            : m.library_confirm_delete_single_permanent_trash({ name: f.name }))
+          : binIsRecycleBin()
+            ? m.library_confirm_delete_single({ name: f.name })
+            : m.library_confirm_delete_single_trash({ name: f.name }),
         m.library_delete_file_title(),
         { confirmLabel: m.common_delete() },
       );

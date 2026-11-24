@@ -117,7 +117,7 @@ chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 md4 = "0.10"
 md-5 = "0.10"
-sha1 = { version = "0.10", features = ["oid"] }
+sha1 = "0.10"
 digest = "0.10"
 byteorder = "1"
 rand = "0.8"
@@ -176,7 +176,13 @@ arboard = { version = "3", default-features = false, features = ["wayland-data-c
 # GitHub Releases, verifies the bundle against the minisign `pubkey` in
 # tauri.conf.json, downloads, and relaunches via tauri-plugin-process.
 tauri-plugin-updater = { version = "2", optional = true }
-rsa = "0.9"
+# eMule's SecIdent, RSA-384 with PKCS#1 v1.5 over SHA-1. `hazmat` is what
+# still makes keys under 1024 bits, and `credits.rs` decodes peers' keys with
+# a size floor of its own; `sha1` and `getrandom` here are the digest and
+# system RNG of the generation `rsa` 0.10 is built on.
+rsa = { version = "0.10", features = ["pkcs1v15", "hazmat"] }
+sha1-rsa = { package = "sha1", version = "0.11", default-features = false, features = ["oid"] }
+getrandom-sys = { package = "getrandom", version = "0.4", features = ["sys_rng"] }
 num-bigint-dig = "0.8"
 opener = { version = "0.9", optional = true }
 crc32fast = "1"
@@ -309,12 +315,26 @@ windows-sys = { version = "0.61", features = [
 # pushes the network event loop past the 15s `SharedFilesChangedAck` budget in
 # `reconcile_shared_files`, so a dev run logs a reconciliation failure that a
 # release build never sees. Optimizing only these crates leaves our own code at
-# `opt-level = 0` and fully debuggable.
+# `opt-level = 0`.
 [profile.dev.package.curve25519-dalek]
 opt-level = 3
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Line numbers are what a panic's backtrace needs. Full debug info made each
+# debug build of this crate several gigabytes, and the check, test and emberd
+# builds beside it multiplied that until the build folders ran to hundreds of
+# gigabytes. Dependencies carry none. Test builds inherit the first, and are
+# given the second themselves.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.test.package."*"]
+debug = false
 
 [profile.release]
 strip = true

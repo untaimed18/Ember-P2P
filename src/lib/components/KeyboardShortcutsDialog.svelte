@@ -6,7 +6,7 @@
   import * as m from '$lib/paraglide/messages';
   import { NAV_SHORTCUT_LIMIT, navShortcutDigit, visibleNavItems } from '$lib/navItems';
   import { appSettings } from '$lib/stores/settings';
-  import { shortcutAltSymbol, shortcutModSymbol } from '$lib/platform';
+  import { binIsRecycleBin, shortcutAltSymbol, shortcutModSymbol } from '$lib/platform';
   import IconX from './IconX.svelte';
   import { fade, scale } from 'svelte/transition';
   import { prefersReducedMotion } from 'svelte/motion';
@@ -136,7 +136,10 @@
         { keys: [modifierKey, 'C'], label: () => m.shortcuts_library_copy_links() },
         { keys: [m.shortcuts_key_enter()], label: () => m.shortcuts_library_open() },
         { keys: ['F2'], label: () => m.shortcuts_library_rename() },
-        { keys: [m.shortcuts_key_delete()], label: () => m.shortcuts_library_delete() },
+        {
+          keys: [m.shortcuts_key_delete()],
+          label: () => (binIsRecycleBin() ? m.shortcuts_library_delete() : m.shortcuts_library_delete_trash()),
+        },
         { keys: [m.shortcuts_key_space()], label: () => m.shortcuts_library_toggle_check() },
         { keys: ['↑ / ↓'], label: () => m.shortcuts_library_navigate() },
         { keys: [m.shortcuts_key_shift(), '↑ / ↓'], label: () => m.shortcuts_search_extend() },

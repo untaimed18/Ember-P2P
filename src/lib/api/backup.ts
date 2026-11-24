@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import * as m from '$lib/paraglide/messages';
 import { isServer } from '$lib/runtime';
 import { saveFrom, uploadFile } from '$lib/runtime/web/files';
 
@@ -64,7 +65,12 @@ export async function exportBackup(
     saveFrom('/api/backup');
     return summary;
   }
-  return invoke('export_backup', { passphrase, webviewPrefs });
+  return invoke('export_backup', {
+    passphrase,
+    webviewPrefs,
+    title: m.picker_backup_save(),
+    filter: m.picker_filter_backup(),
+  });
 }
 
 /** emberd: send a backup from the browser's computer, chosen for restore as
@@ -80,7 +86,7 @@ export async function takePendingRestoredPrefs(): Promise<Record<string, string>
 
 /** Native open-dialog for restore. Returns the display path, or null if cancelled. */
 export async function pickBackupFile(): Promise<string | null> {
-  return invoke('pick_backup_file');
+  return invoke('pick_backup_file', { title: m.picker_backup_open(), filter: m.picker_filter_backup() });
 }
 
 /** Forget a previously picked restore file. */

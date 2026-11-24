@@ -141,7 +141,14 @@ pub async fn stage_emule_import(
     })
     .await
     .map_err(task_failed)?
-    .map_err(|e| coded_ctx("emule_import_stage_failed", "Could not prepare the import", e))
+    .map_err(|e| match e.downcast_ref::<emule_import::IncomingFolderRefused>() {
+        Some(refused) => coded_ctx(
+            "emule_import_incoming_refused",
+            "eMule's Incoming folder cannot be Ember's download folder",
+            &refused.0,
+        ),
+        None => coded_ctx("emule_import_stage_failed", "Could not prepare the import", e),
+    })
 }
 
 /// Undo a staged import before it is applied, putting moved downloads back.
