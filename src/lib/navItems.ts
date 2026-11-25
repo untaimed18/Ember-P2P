@@ -80,26 +80,8 @@ export const navItems: NavItem[] = [
 ];
 
 /**
- * The nav as the sidebar actually renders it. Channels and Feeds are dropped
- * when the Ember overlay is off, because neither page has anything to show
- * without it.
- *
- * Exported (rather than derived in the sidebar) because Alt+N is positional:
- * the cheat-sheet has to number the *same* list the shortcut handler walks.
- * Deriving it twice is how the sheet came to advertise Alt+8 → Channels on a
- * profile where Alt+8 went to Statistics.
- */
-export function visibleNavItems(emberNativeEnabled: boolean | undefined): NavItem[] {
-  return emberNativeEnabled === false
-    ? navItems.filter((item) => item.id !== 'channels' && item.id !== 'feeds')
-    : navItems;
-}
-
-/**
  * How many entries get an Alt+N shortcut. Alt+1..9 map to the first nine
- * items; Alt+0 maps to the tenth. Which page that is depends on how many
- * entries are visible, so always number against `visibleNavItems()` rather
- * than the full list.
+ * items; Alt+0 maps to the tenth.
  *
  * Anything past the tenth is click-only, which is why Settings — last, and
  * frequently visited — gets `Ctrl/Cmd+,` instead (see `Sidebar.svelte`).

@@ -335,8 +335,6 @@ export interface NetworkStats {
   public_udp_port?: number;
   public_tcp_port?: number;
   tcp_mapping_hold_ok?: boolean;
-  /** Ember-native Noise overlay enabled — drives the status-bar Ember dot. */
-  ember_native_enabled: boolean;
   /** Live Ember DHT routing-table contacts for the status-bar peer count. */
   ember_dht_contacts: number;
   /** Contacts that have answered us. Used for connected vs still-joining. */
@@ -396,7 +394,6 @@ export interface EmberDiagnostics {
   friend_xfer_inbound_declined?: number;
   relay_sessions_active: number;
   relay_bytes_relayed: number;
-  ember_native_enabled: boolean;
   ember_sessions: number;
   ember_pings_sent: number;
   ember_pings_received: number;
@@ -773,7 +770,21 @@ export interface ServerLogLine {
   seq: number;
   /** Epoch milliseconds the backend recorded the line. */
   at: number;
+  /** The line in English, shown when there is nothing for `key`. */
   message: string;
+  /** The `server_log_<key>` message to show, filled from `args` and, for its
+   *  `{reason}`, from `reason`. Built by `log_line` in `network/server.rs`. */
+  key?: string;
+  args?: Record<string, string>;
+  reason?: ServerLogReason;
+}
+
+/** Why a server connection failed or ended: the `server_log_reason_<key>`
+ *  message when the backend could tell, and the error as it came, in English,
+ *  either way. */
+export interface ServerLogReason {
+  key?: string;
+  detail: string;
 }
 
 /** Row in the upload-pane "Queued" tab. Mirrors `crate::types::UploadQueueClient`

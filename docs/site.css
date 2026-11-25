@@ -615,6 +615,7 @@ pre code { background: none; padding: 0; color: var(--text-2); }
 .doc-table td { padding: 10px 14px; border-bottom: 1px solid var(--border); color: var(--text-2); vertical-align: top; }
 .doc-table tr:last-child td { border-bottom: none; }
 .doc-table th + th, .doc-table td + td { border-left: 1px solid var(--border); }
+.key-table td:not(:last-child) code { overflow-wrap: normal; }
 
 .callout {
   border: 1px solid var(--border);

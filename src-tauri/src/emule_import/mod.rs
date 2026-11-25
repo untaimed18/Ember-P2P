@@ -70,6 +70,8 @@ pub enum FolderStatus {
     /// Holds a folder Ember already shares. Ember's shares do not overlap, and
     /// taking this one would widen that share past any files it was limited to.
     ContainsShared,
+    /// emberd: outside its `browse_under` folders ([`ScanContext::bounds`]).
+    OutsideServer,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +93,9 @@ pub enum DownloadStatus {
     AlreadyHave,
     /// Held open by eMule, which is still running.
     InUse,
+    /// emberd: its `.part` is outside the eMule folder and the `browse_under`
+    /// folders ([`ScanContext::bounds`]).
+    OutsideServer,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -355,6 +360,19 @@ pub struct ScanContext {
     pub shared_folders: Vec<String>,
     pub downloading: HashSet<[u8; 16]>,
     pub library: HashSet<[u8; 16]>,
+    /// emberd: its `browse_under` folders, the only ones an import may share,
+    /// or take downloads from besides the eMule folder's own. Its download
+    /// folder is its config's, so eMule's Incoming folder cannot become it.
+    /// `None` on the desktop, where the user picked every folder involved.
+    pub bounds: Option<Vec<PathBuf>>,
+}
+
+/// Whether `path`, canonical, lies in one of `roots`.
+fn within(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| {
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        path.starts_with(&root)
+    })
 }
 
 struct ScannedDownload {
@@ -381,6 +399,8 @@ struct Scan {
     server_met: Option<PathBuf>,
     nodes_dat: Option<PathBuf>,
     ipfilter: Option<PathBuf>,
+    /// Scanned within [`ScanContext::bounds`]: never sets the download folder.
+    bounded: bool,
 }
 
 fn existing(path: PathBuf) -> Option<PathBuf> {
@@ -492,7 +512,22 @@ pub fn scan(source_id: u32, ctx: &ScanContext) -> anyhow::Result<EmulePreview> {
         })
         .collect();
 
-    let downloads = scan_downloads(&prefs.temp_dirs, ctx);
+    let mut downloads = scan_downloads(&prefs.temp_dirs, ctx);
+    if let Some(roots) = ctx.bounds.as_deref() {
+        // eMule's install folder holds its config and Temp folders; aMule's
+        // folder is its config folder, whose parent is the whole home.
+        let own = match client {
+            EmuleClient::Emule => base_dir.clone(),
+            EmuleClient::Amule => config_dir.clone(),
+        };
+        let roots: Vec<PathBuf> = roots.iter().cloned().chain([own]).collect();
+        for download in &mut downloads {
+            let part = download.part.canonicalize().unwrap_or_else(|_| download.part.clone());
+            if download.status != DownloadStatus::MissingData && !within(&part, &roots) {
+                download.status = DownloadStatus::OutsideServer;
+            }
+        }
+    }
     let download_folder = PathBuf::from(&ctx.download_folder);
     let download_previews = downloads
         .iter()
@@ -552,7 +587,7 @@ pub fn scan(source_id: u32, ctx: &ScanContext) -> anyhow::Result<EmulePreview> {
     };
     // The incoming folder came out of a folder the user picked, so the wizard
     // and Settings may offer it as the download folder like a picked one.
-    if let Some(incoming) = prefs.incoming_dir.as_ref() {
+    if let Some(incoming) = prefs.incoming_dir.as_ref().filter(|_| ctx.bounds.is_none()) {
         crate::commands::settings::remember_picked_download_root(incoming);
     }
     *last_scan().lock().unwrap_or_else(|e| e.into_inner()) = Some(Scan {
@@ -571,6 +606,7 @@ pub fn scan(source_id: u32, ctx: &ScanContext) -> anyhow::Result<EmulePreview> {
         server_met,
         nodes_dat,
         ipfilter,
+        bounded: ctx.bounds.is_some(),
     });
     Ok(preview)
 }
@@ -606,6 +642,10 @@ fn classify_shared_folders(
             continue;
         }
         if out.iter().any(|(p, _)| *p == canonical) {
+            continue;
+        }
+        if ctx.bounds.as_deref().is_some_and(|roots| !within(&canonical, roots)) {
+            out.push((canonical, FolderStatus::OutsideServer));
             continue;
         }
         let sensitive = crate::sharing::path_has_sensitive_component(&canonical);
@@ -868,6 +908,25 @@ pub fn stage(
     result
 }
 
+/// eMule's Incoming folder, chosen as Ember's download folder, is one the
+/// settings refuse (a drive root or a system folder). Its own error, so the
+/// page can say so in the user's language.
+#[derive(Debug)]
+pub struct IncomingFolderRefused(pub String);
+
+impl std::fmt::Display for IncomingFolderRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "eMule's Incoming folder ({}) cannot be Ember's download folder: a drive root or a \
+             system folder is refused; leave that option off and choose the download folder in Settings",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for IncomingFolderRefused {}
+
 /// eMule's Incoming folder, as the download folder an import would set.
 fn incoming_download_folder(scan: &Scan) -> Option<String> {
     scan.prefs
@@ -883,17 +942,14 @@ fn stage_scan(
     scan: &Scan,
     progress: &mut dyn FnMut(StageProgress),
 ) -> anyhow::Result<StageSummary> {
+    let incoming_as_download_folder = selection.incoming_as_download_folder && !scan.bounded;
     // Checked before anything is staged or discarded. Applied at the next
     // launch, a folder the settings refuse fails the whole settings step there,
     // and the nickname, ports and shared folders go with it.
-    if selection.incoming_as_download_folder {
+    if incoming_as_download_folder {
         if let Some(folder) = incoming_download_folder(scan) {
             if crate::commands::settings::validate_download_folder(&folder).is_err() {
-                anyhow::bail!(
-                    "eMule's Incoming folder ({folder}) cannot be Ember's download folder: \
-                     a drive root or a system folder is refused; leave that option off and \
-                     choose the download folder in Settings"
-                );
+                return Err(IncomingFolderRefused(folder).into());
             }
         }
     }
@@ -1026,7 +1082,7 @@ fn stage_scan(
         manifest.settings.max_sources_per_file = prefs.max_sources_per_file;
         manifest.settings.obfuscation_enabled = prefs.obfuscation;
     }
-    if selection.incoming_as_download_folder {
+    if incoming_as_download_folder {
         manifest.settings.download_folder = incoming_download_folder(scan);
     }
 
@@ -1173,6 +1229,38 @@ pub fn discard(data_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// eMule's Incoming folder at a drive root, chosen as the download
+    /// folder, is refused before anything is staged, with an error of its own
+    /// the command turns into a translated one.
+    #[test]
+    fn an_incoming_folder_the_settings_refuse_is_its_own_error() {
+        let root = if cfg!(windows) { "C:\\" } else { "/" };
+        let scan = Scan {
+            token: 1,
+            config_dir: std::env::temp_dir(),
+            prefs: formats::EmulePrefs { incoming_dir: Some(PathBuf::from(root)), ..Default::default() },
+            user_hash: None,
+            keypair: None,
+            credits: Vec::new(),
+            known_met: None,
+            known_files: 0,
+            known2: None,
+            known2_sets: 0,
+            folders: Vec::new(),
+            downloads: Vec::new(),
+            server_met: None,
+            nodes_dat: None,
+            ipfilter: None,
+            bounded: false,
+        };
+        let selection = EmuleImportSelection { token: 1, incoming_as_download_folder: true, ..Default::default() };
+        let untouched = std::env::temp_dir().join("ember-emule-import-refused-never-created");
+        let error = stage_scan(&untouched, "", &selection, &scan, &mut |_| {}).unwrap_err();
+        let refused = error.downcast_ref::<IncomingFolderRefused>().expect("its own error");
+        assert_eq!(refused.0, root);
+        assert!(!untouched.exists(), "nothing staged");
+    }
 
     fn part_met(hash: [u8; 16], name: &str, size: u64) -> Vec<u8> {
         let mut buf = vec![0xE0];

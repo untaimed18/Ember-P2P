@@ -159,7 +159,9 @@ jobs:
       NEWEST: ${{ needs.find.outputs.newest }}
     steps:
       # `X.Y` and `latest` move only to the newest release, so republishing an
-      # older one leaves them where they are.
+      # older one leaves them where they are. The list carries no annotations:
+      # `docker push` stores each machine's image in Docker's own format, whose
+      # manifest lists cannot hold them, and each image has the same as labels.
       - name: Tag the image
         run: |
           image="ghcr.io/${OWNER,,}/emberd"
@@ -169,7 +171,5 @@ jobs:
           fi
           printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           docker buildx imagetools create "${tags[@]}" \
-            --annotation "index:org.opencontainers.image.source=https://github.com/$GH_REPO" \
-            --annotation "index:org.opencontainers.image.version=$VERSION" \
             "$image:$VERSION-amd64" "$image:$VERSION-arm64"
           docker logout ghcr.io

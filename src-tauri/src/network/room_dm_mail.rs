@@ -133,8 +133,13 @@ async fn collect(
         }
     }
     'chunks: for chunk in all.chunks(BOXES_PER_FETCH) {
+        let mut asking = chunk.to_vec();
+        let mut held_back: HashSet<usize> = HashSet::new();
         for _ in 0..FETCH_PAGES_PER_ROUND {
-            let page = match rendezvous::chat_mailbox_fetch(base_url, chunk).await {
+            if asking.is_empty() {
+                break;
+            }
+            let page = match rendezvous::chat_mailbox_fetch(base_url, &asking).await {
                 Ok(page) => page,
                 Err(e) => {
                     debug!("Room mail: collect failed: {e}");
@@ -163,7 +168,7 @@ async fn collect(
                             }
                             Received::Dropped => {}
                             Received::Later => {
-                                left_behind = true;
+                                held_back.insert(index);
                                 continue;
                             }
                         }
@@ -208,8 +213,17 @@ async fn collect(
             if !page.more || left_behind {
                 break;
             }
+            without_held_back(&mut asking, &boxes, &held_back);
         }
     }
+}
+
+/// Leave out of the rest of a round's fetches the boxes of members whose
+/// entries came back for later, past what they may leave in an hour: still on
+/// the server, they would fill the first page of every fetch, and the other
+/// conversations' mail would wait out their hour.
+fn without_held_back(asking: &mut Vec<[u8; 32]>, boxes: &HashMap<[u8; 32], usize>, held_back: &HashSet<usize>) {
+    asking.retain(|mailbox| boxes.get(mailbox).is_none_or(|index| !held_back.contains(index)));
 }
 
 /// What became of a message a member left for us.
@@ -456,5 +470,30 @@ mod tests {
         assert_eq!(received(DmIncoming::Full, false), Received::Later, "the hour passes");
         assert_eq!(received(DmIncoming::Full, true), Received::Dropped, "a request may never be answered");
         assert_eq!(received(DmIncoming::Capped, false), Received::Dropped);
+    }
+
+    /// A member past their hourly allowance is left out of the rest of the
+    /// round, and everyone else is still asked for.
+    #[test]
+    fn a_member_held_back_does_not_hold_back_the_others() {
+        let pubkey = |n: u8| ed25519_dalek::SigningKey::from_bytes(&[n; 32]).verifying_key().to_bytes();
+        let (seed, us) = ([0x11; 32], pubkey(0x11));
+        let members = [pubkey(1), pubkey(2), pubkey(3)];
+        let mut boxes = HashMap::new();
+        let mut asking = Vec::new();
+        for (index, member) in members.iter().enumerate() {
+            for d in 100..100 + BOX_DAYS as i64 {
+                let mailbox = derive_room_dm_mailbox_box(&seed, member, &us, d).unwrap();
+                boxes.insert(mailbox, index);
+                asking.push(mailbox);
+            }
+        }
+        without_held_back(&mut asking, &boxes, &HashSet::new());
+        assert_eq!(asking.len(), 3 * BOX_DAYS, "nobody held back, nothing left out");
+        without_held_back(&mut asking, &boxes, &HashSet::from([1]));
+        assert_eq!(asking.len(), 2 * BOX_DAYS);
+        assert!(asking.iter().all(|mailbox| boxes[mailbox] != 1));
+        without_held_back(&mut asking, &boxes, &HashSet::from([0, 1, 2]));
+        assert!(asking.is_empty(), "with everyone held back the round stops");
     }
 }

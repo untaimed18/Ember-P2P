@@ -2039,3 +2039,233 @@ mod find_closest_tests {
         );
     }
 }
+
+/// The per-address and per-/24 counts are kept by hand on every path that adds,
+/// moves or drops a contact (splits, consolidation and the verified-for-
+/// unverified swap included), and admission reads them, so a drift silently
+/// refuses honest contacts or retires eMule's limits.
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+    use rand::Rng;
+
+    /// Check the zone tree's shape and that every contact sits in the leaf its
+    /// distance from us leads to, collecting the contacts as it goes.
+    fn walk<'a>(
+        zone: &'a RoutingZone,
+        path: &mut Vec<usize>,
+        local: &KadId,
+        out: &mut Vec<&'a KadContact>,
+    ) -> Option<String> {
+        if zone.level as usize != path.len() {
+            return Some(format!("a zone {} deep says it is at level {}", path.len(), zone.level));
+        }
+        match (&zone.bin, &zone.children) {
+            (Some(bin), None) => {
+                if bin.len() > K_BUCKET_SIZE {
+                    return Some(format!("a bin at level {} holds {}", zone.level, bin.len()));
+                }
+                for c in &bin.contacts {
+                    let distance = local.xor_distance(&c.id);
+                    if let Some(level) = (0..path.len()).find(|&l| distance.get_bit_number(l as u32) != path[l]) {
+                        return Some(format!("{} sits on the wrong side at level {level}", c.id));
+                    }
+                    out.push(c);
+                }
+                None
+            }
+            (None, Some(children)) => {
+                for (side, child) in [(0, &children.0), (1, &children.1)] {
+                    let mut index = zone.zone_index;
+                    index.shift_left(1);
+                    if side != 0 {
+                        index.add_u32(1);
+                    }
+                    if child.zone_index != index {
+                        return Some(format!("a child at level {} has the wrong zone index", child.level));
+                    }
+                    path.push(side);
+                    let wrong = walk(child, path, local, out);
+                    path.pop();
+                    if wrong.is_some() {
+                        return wrong;
+                    }
+                }
+                None
+            }
+            _ => Some(format!("a zone at level {} is neither one leaf nor one branch", zone.level)),
+        }
+    }
+
+    /// Everything the table holds true about itself, against a recount: the
+    /// tree's shape and placement, nobody resident twice or resident at all
+    /// when `insert` would refuse them, and the per-address and per-/24 counts
+    /// equal to the residents and within eMule's limits.
+    fn table_disagreement(rt: &RoutingTable) -> Option<String> {
+        let mut contacts = Vec::new();
+        if let Some(wrong) = walk(&rt.root, &mut Vec::new(), &rt.local_id, &mut contacts) {
+            return Some(wrong);
+        }
+        let mut ids = HashSet::new();
+        let mut by_ip: HashMap<Ipv4Addr, u32> = HashMap::new();
+        let mut by_subnet: HashMap<u32, u32> = HashMap::new();
+        for c in &contacts {
+            if !ids.insert(c.id) {
+                return Some(format!("{} is resident twice", c.id));
+            }
+            if c.id == KadId::zero() || c.id == rt.local_id {
+                return Some(format!("{} is resident, which it never may be", c.id));
+            }
+            if c.is_udp_firewalled() || c.udp_port == 0 || !c.is_kad2() {
+                return Some(format!("{} is resident although insert refuses it", c.id));
+            }
+            if rt.ip_gate.admits(c.ip) != dht_common::Admission::Allowed {
+                return Some(format!("{} is resident at {}, which the IP policy refuses", c.id, c.ip));
+            }
+            *by_ip.entry(c.ip).or_default() += 1;
+            *by_subnet.entry(subnet_key(c.ip)).or_default() += 1;
+        }
+        if by_ip != rt.global_ip_count {
+            return Some("the per-address counts disagree with the residents".into());
+        }
+        if by_subnet != rt.global_subnet_count {
+            return Some("the per-/24 counts disagree with the residents".into());
+        }
+        if let Some((ip, n)) = by_ip.iter().find(|(_, n)| **n > MAX_CONTACTS_IP) {
+            return Some(format!("{n} contacts share {ip}"));
+        }
+        let crowded = by_subnet
+            .iter()
+            .find(|(snet, n)| **n > MAX_CONTACTS_SUBNET && !ip_filter::is_lan_ip(Ipv4Addr::from(**snet)));
+        if let Some((snet, n)) = crowded {
+            return Some(format!("{n} contacts share the /24 of {}", Ipv4Addr::from(*snet)));
+        }
+        if rt.len() != contacts.len() {
+            return Some(format!("{} counted, {} resident", rt.len(), contacts.len()));
+        }
+        None
+    }
+
+    /// Any sequence of what the table is asked to do keeps it true to itself
+    /// (see `table_disagreement`), and a lookup answers exactly the nearest
+    /// live contacts it may use, nearest first. Ids sit near ours so zones
+    /// split deep, addresses come from a few /24s so the address and subnet
+    /// limits bind, and each run ends emptying the table so zones merge again.
+    #[test]
+    fn kad_routing_table_invariants_hold() {
+        let mut rng = crate::fuzz::rng(0x4B4D_7AB1);
+        let our_ip = Ipv4Addr::new(203, 0, 113, 7);
+        let mut deepest = 0;
+        let mut merged = 0;
+        for round in 0..crate::fuzz::rounds(30) {
+            let local = KadId(rng.r#gen());
+            let mut rt = RoutingTable::new(local, rng.gen_bool(0.5));
+            for step in 0..400 {
+                let now = chrono::Utc::now().timestamp();
+                let mut distance = [0u8; 16];
+                distance[0] = [0x80, 0x81, 0xC0, 0x40, 0x20, 0x10, 0x08, 0x01, 0x00][rng.gen_range(0..9)];
+                distance[1] = rng.gen_range(0..40);
+                let id = local.xor_distance(&KadId(distance));
+                let ip = match rng.gen_range(0..10) {
+                    0 => Ipv4Addr::new(192, 168, 1, rng.gen_range(1..30)),
+                    1 => Ipv4Addr::new(0, 0, 0, rng.gen_range(1..4)),
+                    _ => Ipv4Addr::new([80, 81, 82][rng.gen_range(0..3)], 1, rng.gen_range(0..3), rng.gen_range(1..30)),
+                };
+                let contact = KadContact {
+                    id,
+                    ip,
+                    udp_port: [4672, 4672, 4673, 0, 53][rng.gen_range(0..5)],
+                    tcp_port: 4662,
+                    version: [
+                        KADEMLIA_VERSION1_46C,
+                        KADEMLIA_VERSION2_47A,
+                        KADEMLIA_VERSION5_48A,
+                        KADEMLIA_VERSION8_49B,
+                        KADEMLIA_VERSION9_50A,
+                        KADEMLIA_VERSION9_50A,
+                    ][rng.gen_range(0..6)],
+                    last_seen: now - rng.gen_range(0..7_200),
+                    verified: rng.gen_bool(0.5),
+                    contact_type: rng.gen_range(CONTACT_TYPE_ACTIVE..=CONTACT_TYPE_DEAD),
+                    udp_key: rng
+                        .gen_bool(0.2)
+                        .then(|| KadUDPKey::received(rng.gen_range(1..4), u32::from(our_ip))),
+                    kad_options: [0, 0, 0, 0x01, 0x02][rng.gen_range(0..5)],
+                    created_at: [0, now, now - 4_000, now - 8_000][rng.gen_range(0..4)],
+                    expires_at: [0, now - 1, now + 600][rng.gen_range(0..3)],
+                    last_type_set: 0,
+                    received_hello: rng.gen_bool(0.3),
+                };
+                // The last stretch of a run mostly removes, or the table only
+                // ever fills and no zone is ever consolidated.
+                let op = if step >= 250 && rng.gen_bool(0.5) { 7 } else { rng.gen_range(0..16) };
+                match op {
+                    0..=5 => {
+                        rt.insert(contact);
+                    }
+                    6 => {
+                        rt.insert_if_new(contact);
+                    }
+                    7 => {
+                        let resident: Vec<KadId> = rt.all_contacts().map(|c| c.id).collect();
+                        let gone = if resident.is_empty() || rng.gen_bool(0.3) {
+                            id
+                        } else {
+                            resident[rng.gen_range(0..resident.len())]
+                        };
+                        rt.remove(&gone);
+                    }
+                    8 => rt.mark_verified(&id),
+                    9 => {
+                        rt.mark_verified_from(&id, ip);
+                    }
+                    10 => {
+                        // What a run of unanswered probes leaves behind.
+                        if let Some(c) = rt.get_contact_mut(&id) {
+                            c.contact_type = CONTACT_TYPE_DEAD;
+                            c.expires_at = now - 1;
+                        }
+                    }
+                    11 => {
+                        rt.remove_stale(rng.gen_range(0..7_200));
+                    }
+                    12 => {
+                        rt.remove_dead_contacts();
+                    }
+                    13 => {
+                        rt.get_contacts_to_probe();
+                    }
+                    14 => merged += rt.consolidate(),
+                    _ => match rng.gen_range(0..4) {
+                        0 => rt.set_block_private_ips(rng.gen_bool(0.5)),
+                        1 => rt.set_external_ip(rng.gen_bool(0.5).then_some(our_ip)),
+                        2 => rt.mark_contacts_in_use(&[id]),
+                        _ => rt.release_contacts_in_use(&[id]),
+                    },
+                }
+                if let Some(wrong) = table_disagreement(&rt) {
+                    panic!("round {round}, step {step}: {wrong}");
+                }
+                deepest = deepest.max(rt.root.deepest_leaf_level());
+
+                let target = KadId(rng.r#gen());
+                let found: Vec<KadId> = rt
+                    .find_closest(&target, K_BUCKET_SIZE)
+                    .iter()
+                    .map(|c| target.xor_distance(&c.id))
+                    .collect();
+                let verified_only = rt.verified_len() > 0;
+                let mut expected: Vec<KadId> = rt
+                    .all_contacts()
+                    .filter(|c| !c.is_dead() && (c.verified || !verified_only))
+                    .map(|c| target.xor_distance(&c.id))
+                    .collect();
+                expected.sort();
+                expected.truncate(K_BUCKET_SIZE);
+                assert_eq!(found, expected, "round {round}, step {step}: not the nearest live contacts, nearest first");
+            }
+        }
+        assert!(deepest >= KBASE as u32, "no sequence split the zones near us deeper than {deepest}");
+        assert!(merged > 0, "no sequence consolidated a zone");
+    }
+}

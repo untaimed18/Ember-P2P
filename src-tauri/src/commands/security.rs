@@ -1065,13 +1065,18 @@ pub async fn update_ipfilter_from_url(
 pub async fn pick_and_import_ipfilter_file(
     app: crate::host::AppHandle,
     state: crate::host::State<'_, AppState>,
+    title: Option<String>,
+    filter: Option<String>,
 ) -> Result<Option<IpFilterApplyResult>, String> {
+    let dialog_title = super::picker_title(title, "Choose an IP filter file");
+    let filter_name = super::picker_title(filter, "IP filter files");
     let picker = app.clone();
     let selected = tokio::task::spawn_blocking(move || {
         picker
             .dialog()
             .file()
-            .add_filter("IP Filter", &["dat", "txt", "gz", "zip", "p2p", "p2b"])
+            .set_title(dialog_title)
+            .add_filter(filter_name, &["dat", "txt", "gz", "zip", "p2p", "p2b"])
             .blocking_pick_file()
             .map(|file| {
                 file.into_path()

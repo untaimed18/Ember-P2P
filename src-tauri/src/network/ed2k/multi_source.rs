@@ -2646,6 +2646,9 @@ enum InSessionRequeueResult {
     Disconnected(String),
     /// Other sources finished the file while we waited.
     FileComplete,
+    /// The peer said it no longer has the file (`OP_FILEREQANSNOFIL`), as
+    /// one does whose download of it was cancelled.
+    NoFile,
 }
 
 /// Wait on the SAME TCP connection that just signalled `OP_OUTOFPARTREQS`
@@ -2653,6 +2656,7 @@ enum InSessionRequeueResult {
 /// the peer to either:
 ///   * promote us with `OP_ACCEPTUPLOADREQ` → `Promoted`
 ///   * reject us with `OP_QUEUEFULL` → `Timeout`
+///   * say it no longer has `file_hash` (`OP_FILEREQANSNOFIL`) → `NoFile`
 ///   * stay silent past the deadline → `Timeout`
 ///   * close the TCP socket → `Disconnected`
 ///
@@ -2669,6 +2673,7 @@ enum InSessionRequeueResult {
 /// uploader dials us (or we reask) when our turn comes.
 async fn try_in_session_requeue<R>(
     reader: &mut R,
+    file_hash: &[u8; 16],
     timeout_secs: u64,
     control: &TransferControl,
     tracker: &Arc<RwLock<PartTracker>>,
@@ -2713,6 +2718,9 @@ where
         }
         if proto == OP_EMULEPROT && opcode == OP_QUEUEFULL {
             return InSessionRequeueResult::Timeout("peer queue is full".to_string());
+        }
+        if proto == OP_EDONKEYHEADER && opcode == OP_FILEREQANSNOFIL && _payload.get(..16) == Some(&file_hash[..]) {
+            return InSessionRequeueResult::NoFile;
         }
         // Anything else (queue-rank updates, comment packets, EPX
         // re-sends, etc.) is just noise during the re-queue wait —
@@ -9616,6 +9624,13 @@ async fn download_parts_from_source(
                 emit_source!("queued", last_rank, 0u64);
                 anyhow::bail!("peer has no free upload slots (OutOfPartReqs)");
             }
+            // Our turn came for a file the peer no longer has, as when its
+            // download of it was cancelled while we waited.
+            if proto == OP_EDONKEYHEADER && opcode == OP_FILEREQANSNOFIL && payload.get(..16) == Some(&file_hash[..]) {
+                peer_conn.held.set_awaiting_grant(false);
+                set_queued_at_peer(false);
+                anyhow::bail!("peer does not have the file any more (FileNotFound while queued)");
+            }
             if take_hashset_answer(
                 proto,
                 opcode,
@@ -12633,7 +12648,7 @@ async fn download_parts_from_source(
         }
 
         let requeue_outcome =
-            try_in_session_requeue(&mut *reader, requeue_timeout_secs, &control, &tracker).await;
+            try_in_session_requeue(&mut *reader, file_hash, requeue_timeout_secs, &control, &tracker).await;
 
         match requeue_outcome {
             InSessionRequeueResult::Promoted => {
@@ -12703,6 +12718,20 @@ async fn download_parts_from_source(
                 );
                 set_queued_at_peer(false);
                 break 'session_loop;
+            }
+            InSessionRequeueResult::NoFile => {
+                info!(
+                    "DIAG: source {} ({}) no longer has the file (FileNotFound while queued)",
+                    _src_idx, addr,
+                );
+                set_queued_at_peer(false);
+                if queued_guard.armed {
+                    queued_guard.armed = false;
+                    queued_count.fetch_sub(1, Ordering::Relaxed);
+                }
+                // Worded as the transfer loop's, which `classify_error`
+                // files as the peer no longer having the file.
+                anyhow::bail!("peer does not have the file any more (FileNotFound while queued)");
             }
             InSessionRequeueResult::Disconnected(reason) => {
                 info!(
@@ -16461,6 +16490,31 @@ mod packet_framing_tests {
         out.push(opcode);
         out.extend_from_slice(payload);
         out
+    }
+
+    /// Rotated out with `OP_OUTOFPARTREQS`, then told the uploader no longer
+    /// has the file, as one whose download of it was cancelled says: the wait
+    /// ends there and the source is dropped, rather than waiting out its
+    /// timeout. A not-found naming another file is not about ours.
+    #[tokio::test]
+    async fn a_requeue_wait_ends_when_the_uploader_no_longer_has_the_file() {
+        use crate::network::ed2k::messages::{OP_EDONKEYHEADER, OP_FILEREQANSNOFIL};
+        let file = [0x42; 16];
+        let path = std::env::temp_dir().join(format!("ember-ms-requeue-nofile-{}.part", std::process::id()));
+        let tracker = Arc::new(RwLock::new(PartTracker::new(crate::network::ed2k::hash::PARTSIZE * 2, &path)));
+        let control = TransferControl::new();
+
+        let other_file = frame(OP_EDONKEYHEADER, OP_FILEREQANSNOFIL, &[0x43; 16]);
+        let mut reader = std::io::Cursor::new(other_file.clone());
+        let outcome = try_in_session_requeue(&mut reader, &file, 30, &control, &tracker).await;
+        assert!(matches!(outcome, InSessionRequeueResult::Disconnected(_)), "read past it to the end");
+
+        let mut stream = other_file;
+        stream.extend(frame(OP_EDONKEYHEADER, OP_FILEREQANSNOFIL, &file));
+        let mut reader = std::io::Cursor::new(stream);
+        let outcome = try_in_session_requeue(&mut reader, &file, 30, &control, &tracker).await;
+        assert!(matches!(outcome, InSessionRequeueResult::NoFile));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

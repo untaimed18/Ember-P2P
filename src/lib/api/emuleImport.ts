@@ -16,7 +16,9 @@ export type EmuleFolderStatus =
   | 'missing'
   | 'covered'
   | 'already_shared'
-  | 'contains_shared';
+  | 'contains_shared'
+  /** emberd: outside its `browse_under` folders. */
+  | 'outside_server';
 
 export interface EmuleSharedFolder {
   path: string;
@@ -32,7 +34,9 @@ export type EmuleDownloadStatus =
   | 'missing_data'
   | 'already_downloading'
   | 'already_have'
-  | 'in_use';
+  | 'in_use'
+  /** emberd: the `.part` is outside the eMule folder and `browse_under`. */
+  | 'outside_server';
 
 export interface EmuleDownload {
   name: string;
@@ -132,6 +136,12 @@ export async function detectEmuleInstalls(): Promise<EmuleInstall[]> {
 /** Native folder picker; `null` when cancelled. */
 export async function pickEmuleFolder(): Promise<EmuleInstall | null> {
   return invoke('pick_emule_folder', { title: m.picker_emule_folder() });
+}
+
+/** emberd: an eMule or aMule folder on the server, typed in the page, under
+ *  one of its `browse_under` folders. */
+export async function chooseEmuleFolderPath(path: string): Promise<EmuleInstall> {
+  return invoke('choose_emule_folder_path', { path });
 }
 
 export async function previewEmuleImport(sourceId: number): Promise<EmulePreview> {

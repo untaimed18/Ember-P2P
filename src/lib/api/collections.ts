@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { takeBackPendingCancels } from '$lib/stores/pendingCancels';
 import { isServer } from '$lib/runtime';
-import { pickAndUpload } from '$lib/runtime/web/files';
+import { pickAndUpload, saveOffered } from '$lib/runtime/web/files';
 
 export interface CollectionFile {
   name: string;
@@ -37,13 +37,18 @@ export async function pickAndLoadCollection(): Promise<Collection | null> {
   return invoke('pick_and_load_collection');
 }
 
-/** Opens a native save dialog and writes the collection to its selected path. */
+/** Opens a native save dialog and writes the collection to its selected path.
+ *  On emberd the browser saves it instead, to the computer it runs on. */
 export async function createCollectionWithDialog(
   name: string,
   author: string,
   files: CollectionFile[],
   binary: boolean
 ): Promise<string | null> {
+  if (isServer) {
+    saveOffered(await invoke<string>('create_collection_for_download', { name, author, files, binary }));
+    return name;
+  }
   return invoke('create_collection_with_dialog', { name, author, files, binary });
 }
 

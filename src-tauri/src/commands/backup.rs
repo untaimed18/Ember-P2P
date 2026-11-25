@@ -1197,13 +1197,20 @@ fn ensure_backup_extension(mut path: PathBuf) -> PathBuf {
 }
 
 #[cfg(feature = "desktop")]
-async fn pick_backup_save_path(app: &crate::host::AppHandle) -> Result<Option<PathBuf>, String> {
+async fn pick_backup_save_path(
+    app: &crate::host::AppHandle,
+    title: Option<String>,
+    filter: Option<String>,
+) -> Result<Option<PathBuf>, String> {
     let default_name = backup_file_name();
+    let dialog_title = super::picker_title(title, "Save the backup");
+    let filter_name = super::picker_title(filter, "Ember backups");
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
         app.dialog()
             .file()
-            .add_filter("Ember Backup", &[BACKUP_EXTENSION])
+            .set_title(dialog_title)
+            .add_filter(filter_name, &[BACKUP_EXTENSION])
             .set_file_name(default_name)
             .blocking_save_file()
             .map(|file| {
@@ -1217,12 +1224,19 @@ async fn pick_backup_save_path(app: &crate::host::AppHandle) -> Result<Option<Pa
 }
 
 #[cfg(feature = "desktop")]
-async fn pick_backup_open_path(app: &crate::host::AppHandle) -> Result<Option<PathBuf>, String> {
+async fn pick_backup_open_path(
+    app: &crate::host::AppHandle,
+    title: Option<String>,
+    filter: Option<String>,
+) -> Result<Option<PathBuf>, String> {
+    let dialog_title = super::picker_title(title, "Choose a backup to restore");
+    let filter_name = super::picker_title(filter, "Ember backups");
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
         app.dialog()
             .file()
-            .add_filter("Ember Backup", &[BACKUP_EXTENSION])
+            .set_title(dialog_title)
+            .add_filter(filter_name, &[BACKUP_EXTENSION])
             .blocking_pick_file()
             .map(|file| {
                 file.into_path()
@@ -1300,12 +1314,14 @@ pub async fn export_backup(
     state: crate::host::State<'_, AppState>,
     passphrase: String,
     webview_prefs: Option<WebviewPrefs>,
+    title: Option<String>,
+    filter: Option<String>,
 ) -> Result<Option<BackupSummary>, String> {
     validate_passphrase(&passphrase)?;
     if let Some(prefs) = &webview_prefs {
         validate_webview_prefs(prefs)?;
     }
-    let Some(picked) = pick_backup_save_path(&app).await? else {
+    let Some(picked) = pick_backup_save_path(&app, title, filter).await? else {
         return Ok(None);
     };
     let dest = validate_destination(&ensure_backup_extension(picked))?;
@@ -1418,8 +1434,10 @@ pub(crate) async fn choose_uploaded_backup(state: &AppState, path: &Path) -> Res
 pub async fn pick_backup_file(
     app: crate::host::AppHandle,
     state: crate::host::State<'_, AppState>,
+    title: Option<String>,
+    filter: Option<String>,
 ) -> Result<Option<String>, String> {
-    let Some(picked) = pick_backup_open_path(&app).await? else {
+    let Some(picked) = pick_backup_open_path(&app, title, filter).await? else {
         return Ok(None);
     };
     let source = validate_source(&picked)?;

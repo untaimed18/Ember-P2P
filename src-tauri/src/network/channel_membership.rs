@@ -1267,8 +1267,9 @@ mod channel_settings_schedule_tests {
     /// An owner's republish signs only after a fresh look at the network's
     /// snapshot has been written, asks for one when it has none, and puts
     /// itself off a few minutes when none is answered in time, signing
-    /// regardless only once it has been put off for a republish interval;
-    /// never over an answer in hand that is not written yet.
+    /// regardless only once it has been put off for a republish interval, and
+    /// then without the rotation it may owe; never over an answer in hand that
+    /// is not written yet.
     #[test]
     fn an_owner_republish_signs_after_a_fresh_look() {
         use super::{owner_republish_read_gate as gate, OwnerRepublishRead as Read};
@@ -1291,7 +1292,7 @@ mod channel_settings_schedule_tests {
         // off for a republish interval; an answer in hand is written first.
         assert_eq!(gate(None, Some(now - wait), 0, true, false, now), Read::Defer);
         assert_eq!(gate(None, Some(now - wait), defer_max - 1, false, false, now), Read::Defer);
-        assert_eq!(gate(None, Some(now - wait), defer_max, false, false, now), Read::Ready);
+        assert_eq!(gate(None, Some(now - wait), defer_max, false, false, now), Read::ReadyUnread);
         assert_eq!(gate(None, Some(now - wait), defer_max, true, true, now), Read::Wait);
         assert_eq!(gate(Some(now - wait), Some(now - wait), 0, false, false, now), Read::Ready, "answered since");
     }
@@ -5206,9 +5207,10 @@ const OWNER_REPUBLISH_READ_FRESH_SECS: i64 = 30;
 /// itself off a few minutes ([`OwnerRepublishRead::Defer`]).
 const OWNER_REPUBLISH_READ_WAIT_SECS: i64 = 120;
 /// How long a republish puts itself off for want of an answered look before it
-/// signs regardless: one republish interval, well inside the life of the copy
-/// the network holds. Past it the room's renewal, its registry name and its
-/// directory entry with it, cannot wait on a network that answers nobody.
+/// signs regardless ([`OwnerRepublishRead::ReadyUnread`]): one republish
+/// interval, well inside the life of the copy the network holds. Past it the
+/// room's renewal, its registry name and its directory entry with it, cannot
+/// wait on a network that answers nobody.
 const OWNER_REPUBLISH_DEFER_MAX_SECS: i64 = ember::channel::MODERATION_REPUBLISH_SECS;
 
 /// What an owner's due republish does about its view of the snapshot the
@@ -5217,6 +5219,13 @@ const OWNER_REPUBLISH_DEFER_MAX_SECS: i64 = ember::channel::MODERATION_REPUBLISH
 enum OwnerRepublishRead {
     /// Sign now.
     Ready,
+    /// Sign now, with no look answered for a republish interval: the room's
+    /// renewal cannot wait on a network that answers nobody. A rotation owed
+    /// still waits, as it does for an owner's edit
+    /// ([`owner_rotation_waits_for_first_read`]): minted from a view this old,
+    /// its epoch could be one another device of this identity already minted,
+    /// the same key, sealed to whoever that rotation left out.
+    ReadyUnread,
     /// A look is running or its answer is not written yet.
     Wait,
     /// Start a look, then wait for it.
@@ -5262,7 +5271,7 @@ fn owner_republish_read_gate(
     }
     if asked_at.is_some_and(|asked| now.saturating_sub(asked) >= OWNER_REPUBLISH_READ_WAIT_SECS) {
         return if deferred_for >= OWNER_REPUBLISH_DEFER_MAX_SECS {
-            OwnerRepublishRead::Ready
+            OwnerRepublishRead::ReadyUnread
         } else {
             OwnerRepublishRead::Defer
         };
@@ -5437,7 +5446,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
             now,
         );
         match read {
-            OwnerRepublishRead::Ready => {
+            OwnerRepublishRead::Ready | OwnerRepublishRead::ReadyUnread => {
                 state.channel_republish_read_asked.remove(&channel_id);
                 state.channel_republish_deferred.remove(&channel_id);
             }
@@ -5489,7 +5498,7 @@ pub(super) async fn maybe_publish_owned_channel_records(
         // so the common path does not copy the row.
         let mut ch = std::borrow::Cow::Borrowed(ch);
         let rotation_owed = private && db.channel_rotate_is_pending(&ch.channel_id).unwrap_or(false);
-        let rotated = if rotation_owed && rotation_can_be_announced(state) {
+        let rotated = if rotation_owed && read == OwnerRepublishRead::Ready && rotation_can_be_announced(state) {
             // Past the newest epoch the room has announced, not just the one
             // held here: another device of ours may have rotated, and its key
             // for that epoch, which this one would derive again, already went
@@ -5632,8 +5641,8 @@ pub(super) async fn maybe_publish_owned_channel_records(
         };
         {
             // A rotation owed and not made (too few contacts to announce it,
-            // or its epoch taken meanwhile) is tried again in minutes, not at
-            // the next republish hours away.
+            // its epoch taken meanwhile, or no look answered) is tried again
+            // in minutes, not at the next republish hours away.
             let next = if rotation_owed && rotated.is_none() {
                 owner_snapshot_retry_stamp(now)
             } else {

@@ -173,8 +173,7 @@
   // Source exchange rides the Ember overlay, not KAD. Keying this off
   // `stats.status` (the KAD light) made the Ember tooltip say "network
   // offline" while Ember itself was connected.
-  function epxStatus(stats: typeof $networkStats): 'active' | 'idle' | 'inactive' {
-    if (!stats.ember_native_enabled) return 'inactive';
+  function epxStatus(stats: typeof $networkStats): 'active' | 'idle' {
     return stats.ember_peers > 0 ? 'active' : 'idle';
   }
 
@@ -183,8 +182,7 @@
   function emberDhtStatus(
     stats: typeof $networkStats,
     timedOut: boolean,
-  ): 'connected' | 'connecting' | 'no_peers' | 'disconnected' {
-    if (!stats.ember_native_enabled) return 'disconnected';
+  ): 'connected' | 'connecting' | 'no_peers' {
     if ((stats.ember_dht_verified_contacts ?? 0) > 0) return 'connected';
     return timedOut ? 'no_peers' : 'connecting';
   }
@@ -232,7 +230,6 @@
   // word order.
   function epxTitle(stats: typeof $networkStats): string {
     const status = epxStatus(stats);
-    if (status === 'inactive') return m.statusbar_epx_title_offline();
     if (status === 'idle') return m.statusbar_epx_title_idle();
     const p = stats.ember_peers;
     const s = stats.epx_sources_received;

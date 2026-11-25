@@ -61,7 +61,7 @@
   } from '$lib/xferRate';
   import { toastsFor } from '$lib/stores/toast';
   const { toast, toastError, toastSuccess } = toastsFor('channels');
-  import { translateError } from '$lib/i18n';
+  import { aroundPlaceholder, translateError } from '$lib/i18n';
   import { isServer } from '$lib/runtime';
   import { plural } from '$lib/plural';
   import {
@@ -96,6 +96,7 @@
     listChannelMembers,
     markChannelMessagesRead,
     openChannelFilesFolder,
+    saveChannelTransfer,
     channelPresenceConfig,
     setChannelFocus,
     pickAndOfferChannelTransfer,
@@ -531,7 +532,6 @@
   let sendingTo = $state<string[]>([]);
   let addingFriend = $state<string[]>([]);
 
-  let emberOff = $derived($appSettings?.ember_native_enabled === false);
   let selected = $derived(
     channelList.find((c) => c.channel_id === selectedId && c.in_room) ?? null,
   );
@@ -2288,7 +2288,6 @@
     // those runs stack up and each one re-issues the whole set of lookups.
     // The Find button is a separate flag: a background walk must not lock it,
     // and a click during one should still report emptiness when that walk ends.
-    if (emberOff) return;
     if (gatherInFlight) {
       if (notifyEmpty) {
         pendingNotifyEmpty = true;
@@ -3262,14 +3261,14 @@
     {/if}
   </div>
   <div class="header-actions">
-    <button class="ghost" onclick={handleDiscover} disabled={discovering || emberOff}>
+    <button class="ghost" onclick={handleDiscover} disabled={discovering}>
       {discovering ? m.channels_discovering() : m.channels_discover()}
     </button>
     <button
       class="ghost"
       class:active-toggle={composeMode === 'join'}
       onclick={() => toggleCompose('join')}
-      disabled={emberOff || (needsUsername && composeMode !== 'join')}
+      disabled={needsUsername && composeMode !== 'join'}
       title={needsUsername && composeMode !== 'join' ? m.channels_username_required() : undefined}
     >
       {composeMode === 'join' ? m.common_cancel() : m.channels_join_title()}
@@ -3278,7 +3277,7 @@
       class="add-btn primary"
       class:active-toggle={composeMode === 'create'}
       onclick={() => toggleCompose('create')}
-      disabled={emberOff || (needsUsername && composeMode !== 'create')}
+      disabled={needsUsername && composeMode !== 'create'}
       title={needsUsername && composeMode !== 'create' ? m.channels_username_required() : undefined}
     >
       {composeMode === 'create' ? m.common_cancel() : m.channels_create()}
@@ -3378,14 +3377,12 @@
   {/if}
 
   {#each deletedElsewhere as room (room.channel_id)}
+    {@const [before, after] = aroundPlaceholder((name) => m.channels_deleted_elsewhere_body({ name }))}
     <!-- The registry says this room was deleted, but this device still runs
          it: a restore from an older backup, or a delete on another device.
          The registry's word alone never removes it; the owner does. -->
     <div class="banner deleted-elsewhere-banner" role="status">
-      <span>
-        <strong><bdi dir="auto">{room.name}</bdi></strong>
-        {m.channels_deleted_elsewhere_body()}
-      </span>
+      <span>{before}<strong><bdi dir="auto">{room.name}</bdi></strong>{after}</span>
       <div class="banner-actions">
         <button class="ghost" onclick={() => askRemoveDeletedElsewhere(room)} disabled={answeringDeleted !== null}>
           {answeringDeleted === room.channel_id ? m.common_loading() : m.channels_deleted_elsewhere_delete()}
@@ -3397,1538 +3394,1542 @@
     </div>
   {/each}
 
-  {#if emberOff}
-    <div class="banner" role="status">
-      <strong>{m.channels_disabled_title()}</strong>
-      {m.channels_disabled_body()}
+  {#if needsUsername}
+    <form
+      class="add-form"
+      onsubmit={(e) => {
+        e.preventDefault();
+        handleClaimUsername();
+      }}
+    >
+      <p class="form-title">{m.channels_username_title()}</p>
+      <p class="form-hint">{m.channels_username_hint()}</p>
+      <div class="add-form-inner">
+        <input
+          value={usernameDraft}
+          placeholder={m.channels_username_placeholder()}
+          maxlength={CHANNEL_USERNAME_MAX}
+          spellcheck="false"
+          autocomplete="username"
+          autocapitalize="off"
+          aria-label={m.channels_username_aria()}
+          use:autoFocus
+          oninput={(e) => {
+            usernameDraft = sanitizeChannelUsernameInput(e.currentTarget.value);
+          }}
+        />
+        <button type="submit" disabled={!isValidChannelUsername(usernameDraft) || claimingUsername}>
+          {claimingUsername ? m.channels_saving() : m.channels_username_save()}
+        </button>
+      </div>
+    </form>
+  {:else if composeMode === 'create'}
+    <form
+      class="add-form"
+      onsubmit={(e) => {
+        e.preventDefault();
+        handleCreate();
+      }}
+    >
+      <p class="form-title">{m.channels_create_title()}</p>
+      <div class="add-form-inner">
+        <input
+          bind:value={createName}
+          placeholder={m.channels_name_placeholder()}
+          maxlength={CHANNEL_NAME_MAX}
+          aria-label={m.channels_name_placeholder()}
+          use:autoFocus
+        />
+        <!-- The field simply stops accepting input at the cap, which reads as
+             a broken key without a count next to it. `maxlength` already
+             tells a screen reader the limit, so this is for the eye only. -->
+        <span class="name-count" class:over={createNameTooLong} aria-hidden="true">{[...createName].length}/{CHANNEL_NAME_MAX}</span>
+        <ToggleSwitch bind:checked={createPrivate} label={m.channels_private_label()} />
+        <button type="submit" disabled={!createName.trim() || createNameTooLong || creating}>{creating ? m.channels_creating() : m.channels_create()}</button>
+      </div>
+      {#if createNameTooLong}
+        <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
+      {/if}
+      <div class="create-language">
+        <span class="create-language-label" aria-hidden="true">{m.channels_language_label()}</span>
+        <ChannelLanguagePicker bind:value={createLanguage} disabled={creating} />
+      </div>
+      <!-- Said at the moment the choice is made, not buried in a panel. A
+           public room's content key is derived from the address in its
+           public listing, so discovering the room is the same as being able
+           to read it — which changes what people put in one. -->
+      {#if !createPrivate}
+        <p class="form-hint public-readable">{m.channels_public_readable()}</p>
+      {/if}
+    </form>
+  {:else if composeMode === 'join'}
+    <form
+      class="add-form"
+      onsubmit={(e) => {
+        e.preventDefault();
+        handleJoin();
+      }}
+    >
+      <p class="form-title">{m.channels_join_title()}</p>
+      <div class="add-form-inner">
+        <input
+          class="join-input"
+          bind:value={joinUri}
+          placeholder={m.channels_join_placeholder()}
+          aria-label={m.channels_join_title()}
+          spellcheck="false"
+          autocomplete="off"
+          use:autoFocus
+        />
+        <button type="submit" disabled={!joinUri.trim() || joiningForm}>{joiningForm ? m.channels_joining() : m.channels_join()}</button>
+      </div>
+    </form>
+  {/if}
+
+  {#if directoryList.length === 0 && !channelsLoaded}
+    <!-- Nothing on screen and no successful load yet: still working, or it
+         failed. Either way this is not an empty directory, and offering the
+         "create your first room" pitch to someone whose rooms simply have
+         not arrived tells them their rooms are gone. -->
+    <div class="empty-state">
+      {#if error}
+        <p class="empty-title">{m.channels_load_failed()}</p>
+        <button class="empty-action" onclick={() => void loadChannels()} disabled={loading}>
+          {loading ? m.common_loading() : m.common_retry()}
+        </button>
+      {:else}
+        <div class="spinner lg"></div>
+        <p>{m.common_loading()}</p>
+      {/if}
+    </div>
+  {:else if directoryList.length === 0 && ((gatherInFlight && !directorySearched) || discovering)}
+    <div class="empty-state" role="status">
+      <div class="spinner lg"></div>
+      <p>{m.channels_looking_for_rooms()}</p>
+    </div>
+  {:else if directoryList.length === 0}
+    <div class="empty-state">
+      <div class="empty-icon">
+        <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M8 14h32v22H8z"/>
+          <path d="M8 14l16 10 16-10"/>
+          <circle cx="36" cy="12" r="4"/>
+        </svg>
+      </div>
+      <p class="empty-title">{m.channels_empty_title()}</p>
+      <p class="empty-sub">{m.channels_empty()}</p>
+      <!--
+        Same gate as the header buttons, and for the same reason: while a
+        username is still required the form below is the username form, so
+        setting `composeMode` here changed nothing on screen and the click
+        read as broken — then produced a create/join form out of nowhere
+        once a name was finally saved. Routed through `toggleCompose` so
+        there is one place that decides what these do.
+      -->
+      <div class="empty-actions">
+        <button
+          class="empty-action"
+          onclick={() => toggleCompose('create')}
+          disabled={needsUsername}
+          title={needsUsername ? m.channels_username_required() : undefined}
+        >{m.channels_create()}</button>
+        <button
+          class="ghost"
+          onclick={() => toggleCompose('join')}
+          disabled={needsUsername}
+          title={needsUsername ? m.channels_username_required() : undefined}
+        >{m.channels_join_title()}</button>
+        <button class="ghost" onclick={handleDiscover} disabled={discovering}>{m.channels_discover()}</button>
+      </div>
     </div>
   {:else}
-    {#if needsUsername}
-      <form
-        class="add-form"
-        onsubmit={(e) => {
-          e.preventDefault();
-          handleClaimUsername();
-        }}
+    <div
+      class="workspace"
+      bind:this={workspaceEl}
+      style:--list-width="{listWidth}px"
+      class:list-snapping={listWidthSnapping}
+      class:has-members={!!selected}
+      class:members-open={membersOpen && !!selected}
+      class:list-collapsed={listCollapsed && !!selected}
+    >
+      <aside
+        class="list-pane"
+        class:hidden-when-chat={!!selected}
+        inert={listCollapsed && !!selected}
       >
-        <p class="form-title">{m.channels_username_title()}</p>
-        <p class="form-hint">{m.channels_username_hint()}</p>
-        <div class="add-form-inner">
-          <input
-            value={usernameDraft}
-            placeholder={m.channels_username_placeholder()}
-            maxlength={CHANNEL_USERNAME_MAX}
-            spellcheck="false"
-            autocomplete="username"
-            autocapitalize="off"
-            aria-label={m.channels_username_aria()}
-            use:autoFocus
-            oninput={(e) => {
-              usernameDraft = sanitizeChannelUsernameInput(e.currentTarget.value);
-            }}
-          />
-          <button type="submit" disabled={!isValidChannelUsername(usernameDraft) || claimingUsername}>
-            {claimingUsername ? m.channels_saving() : m.channels_username_save()}
-          </button>
-        </div>
-      </form>
-    {:else if composeMode === 'create'}
-      <form
-        class="add-form"
-        onsubmit={(e) => {
-          e.preventDefault();
-          handleCreate();
-        }}
-      >
-        <p class="form-title">{m.channels_create_title()}</p>
-        <div class="add-form-inner">
-          <input
-            bind:value={createName}
-            placeholder={m.channels_name_placeholder()}
-            maxlength={CHANNEL_NAME_MAX}
-            aria-label={m.channels_name_placeholder()}
-            use:autoFocus
-          />
-          <!-- The field simply stops accepting input at the cap, which reads as
-               a broken key without a count next to it. `maxlength` already
-               tells a screen reader the limit, so this is for the eye only. -->
-          <span class="name-count" class:over={createNameTooLong} aria-hidden="true">{[...createName].length}/{CHANNEL_NAME_MAX}</span>
-          <ToggleSwitch bind:checked={createPrivate} label={m.channels_private_label()} />
-          <button type="submit" disabled={!createName.trim() || createNameTooLong || creating}>{creating ? m.channels_creating() : m.channels_create()}</button>
-        </div>
-        {#if createNameTooLong}
-          <p class="form-hint name-too-long" role="status">{m.channels_name_too_long_bytes()}</p>
-        {/if}
-        <div class="create-language">
-          <span class="create-language-label" aria-hidden="true">{m.channels_language_label()}</span>
-          <ChannelLanguagePicker bind:value={createLanguage} disabled={creating} />
-        </div>
-        <!-- Said at the moment the choice is made, not buried in a panel. A
-             public room's content key is derived from the address in its
-             public listing, so discovering the room is the same as being able
-             to read it — which changes what people put in one. -->
-        {#if !createPrivate}
-          <p class="form-hint public-readable">{m.channels_public_readable()}</p>
-        {/if}
-      </form>
-    {:else if composeMode === 'join'}
-      <form
-        class="add-form"
-        onsubmit={(e) => {
-          e.preventDefault();
-          handleJoin();
-        }}
-      >
-        <p class="form-title">{m.channels_join_title()}</p>
-        <div class="add-form-inner">
-          <input
-            class="join-input"
-            bind:value={joinUri}
-            placeholder={m.channels_join_placeholder()}
-            aria-label={m.channels_join_title()}
-            spellcheck="false"
-            autocomplete="off"
-            use:autoFocus
-          />
-          <button type="submit" disabled={!joinUri.trim() || joiningForm}>{joiningForm ? m.channels_joining() : m.channels_join()}</button>
-        </div>
-      </form>
-    {/if}
-
-    {#if directoryList.length === 0 && !channelsLoaded}
-      <!-- Nothing on screen and no successful load yet: still working, or it
-           failed. Either way this is not an empty directory, and offering the
-           "create your first room" pitch to someone whose rooms simply have
-           not arrived tells them their rooms are gone. -->
-      <div class="empty-state">
-        {#if error}
-          <p class="empty-title">{m.channels_load_failed()}</p>
-          <button class="empty-action" onclick={() => void loadChannels()} disabled={loading}>
-            {loading ? m.common_loading() : m.common_retry()}
-          </button>
-        {:else}
-          <div class="spinner lg"></div>
-          <p>{m.common_loading()}</p>
-        {/if}
-      </div>
-    {:else if directoryList.length === 0 && ((gatherInFlight && !directorySearched) || discovering)}
-      <div class="empty-state" role="status">
-        <div class="spinner lg"></div>
-        <p>{m.channels_looking_for_rooms()}</p>
-      </div>
-    {:else if directoryList.length === 0}
-      <div class="empty-state">
-        <div class="empty-icon">
-          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M8 14h32v22H8z"/>
-            <path d="M8 14l16 10 16-10"/>
-            <circle cx="36" cy="12" r="4"/>
-          </svg>
-        </div>
-        <p class="empty-title">{m.channels_empty_title()}</p>
-        <p class="empty-sub">{m.channels_empty()}</p>
-        <!--
-          Same gate as the header buttons, and for the same reason: while a
-          username is still required the form below is the username form, so
-          setting `composeMode` here changed nothing on screen and the click
-          read as broken — then produced a create/join form out of nowhere
-          once a name was finally saved. Routed through `toggleCompose` so
-          there is one place that decides what these do.
-        -->
-        <div class="empty-actions">
-          <button
-            class="empty-action"
-            onclick={() => toggleCompose('create')}
-            disabled={needsUsername}
-            title={needsUsername ? m.channels_username_required() : undefined}
-          >{m.channels_create()}</button>
-          <button
-            class="ghost"
-            onclick={() => toggleCompose('join')}
-            disabled={needsUsername}
-            title={needsUsername ? m.channels_username_required() : undefined}
-          >{m.channels_join_title()}</button>
-          <button class="ghost" onclick={handleDiscover} disabled={discovering}>{m.channels_discover()}</button>
-        </div>
-      </div>
-    {:else}
-      <div
-        class="workspace"
-        bind:this={workspaceEl}
-        style:--list-width="{listWidth}px"
-        class:list-snapping={listWidthSnapping}
-        class:has-members={!!selected}
-        class:members-open={membersOpen && !!selected}
-        class:list-collapsed={listCollapsed && !!selected}
-      >
-        <aside
-          class="list-pane"
-          class:hidden-when-chat={!!selected}
-          inert={listCollapsed && !!selected}
-        >
-          {#if directoryList.length > 0}
-            <div class="search-wrap">
-              <span class="search-icon" aria-hidden="true">
-                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
-                  <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
-                </svg>
-              </span>
-              <input
-                type="text"
-                class="search-input"
-                bind:value={listQuery}
-                bind:this={listSearchEl}
-                placeholder={m.channels_list_search_placeholder()}
-                aria-label={m.channels_list_search_placeholder()}
-                aria-keyshortcuts={`${shortcutModAria()}+K`}
-                oninput={() => (listHighlightId = null)}
-                onblur={() => (listHighlightId = null)}
-                onkeydown={onListSearchKeydown}
-              />
-              {#if !listQuery}
-                <span class="search-kbd" aria-hidden="true"><kbd>{shortcutModSymbol()}</kbd><kbd>K</kbd></span>
-              {/if}
-              {#if listQuery}
-                <button type="button" class="search-clear" onclick={() => (listQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}><IconX size={12} /></button>
-              {/if}
-              <!-- The arrow keys move a highlight the search box cannot
-                   describe on its own, so the room under it is read out. -->
-              <span class="sr-only" aria-live="polite">{highlightedRow?.name ?? ''}</span>
-            </div>
-          {/if}
-          <div class="list-scroll" bind:this={listScrollEl}>
-            {#snippet markAllReadAction()}
-              {#if unreadJoinedIds.length > 0}
-                <button
-                  type="button"
-                  class="list-section-action"
-                  title={m.channels_mark_all_read_title()}
-                  disabled={markingAllRead}
-                  aria-busy={markingAllRead ? 'true' : undefined}
-                  onclick={markAllRead}
-                >{markingAllRead ? m.channels_marking_all_read() : m.channels_mark_all_read()}</button>
-              {/if}
-            {/snippet}
-            <!-- "Mark all rooms as read" rides on the first of your sections.
-                 While a search hides every joined room, a plain "Your rooms"
-                 header keeps it, so it does not come and go with the query. -->
-            {#if roomSections.yoursPublic.length > 0}
-              <div class="list-section">
-                <h3 class="list-section-label" id="rooms-section-yours-public">
-                  {m.channels_section_yours_public()}<span class="list-section-count" aria-hidden="true">{roomSections.yoursPublic.length}</span>
-                </h3>
-                {@render markAllReadAction()}
-              </div>
-              <div role="list" aria-labelledby="rooms-section-yours-public">
-                {#each roomSections.yoursPublic as ch (ch.channel_id)}
-                  {@render roomRow(ch)}
-                {/each}
-              </div>
+        {#if directoryList.length > 0}
+          <div class="search-wrap">
+            <span class="search-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+                <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
+              </svg>
+            </span>
+            <input
+              type="text"
+              class="search-input"
+              bind:value={listQuery}
+              bind:this={listSearchEl}
+              placeholder={m.channels_list_search_placeholder()}
+              aria-label={m.channels_list_search_placeholder()}
+              aria-keyshortcuts={`${shortcutModAria()}+K`}
+              oninput={() => (listHighlightId = null)}
+              onblur={() => (listHighlightId = null)}
+              onkeydown={onListSearchKeydown}
+            />
+            {#if !listQuery}
+              <span class="search-kbd" aria-hidden="true"><kbd>{shortcutModSymbol()}</kbd><kbd>K</kbd></span>
             {/if}
-            {#if roomSections.yoursPrivate.length > 0}
-              <div class="list-section">
-                <h3 class="list-section-label" id="rooms-section-yours-private">
-                  {m.channels_section_yours_private()}<span class="list-section-count" aria-hidden="true">{roomSections.yoursPrivate.length}</span>
-                </h3>
-                {#if roomSections.yoursPublic.length === 0}{@render markAllReadAction()}{/if}
-              </div>
-              <div role="list" aria-labelledby="rooms-section-yours-private">
-                {#each roomSections.yoursPrivate as ch (ch.channel_id)}
-                  {@render roomRow(ch)}
-                {/each}
-              </div>
+            {#if listQuery}
+              <button type="button" class="search-clear" onclick={() => (listQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}><IconX size={12} /></button>
             {/if}
-            {#if roomSections.yours.length === 0 && unreadJoinedIds.length > 0}
-              <div class="list-section">
-                <h3 class="list-section-label">{m.channels_section_yours()}</h3>
-                {@render markAllReadAction()}
-              </div>
-            {/if}
-            {#if roomSections.discover.length > 0}
-              <div class="list-section discover-section" class:after-yours={roomSections.yours.length > 0}>
-                <h3 class="list-section-label" id="rooms-section-discover">
-                  {m.channels_section_discover()}<span class="list-section-count" aria-hidden="true">{discoverShown.length}</span>
-                </h3>
-              </div>
-              <div role="list" aria-labelledby="rooms-section-discover">
-                {#each discoverShown as ch (ch.channel_id)}
-                  {@render roomRow(ch)}
-                {/each}
-              </div>
-              {#if likelySpam.length > 0}
-                <div class="likely-spam-row">
-                  <span class="muted">{showLikelySpam
-                    ? m.channels_likely_spam_shown()
-                    : plural(likelySpam.length, {
-                        one: () => m.channels_likely_spam_hidden_one({ count: likelySpam.length }),
-                        oneShowsCount: true,
-                        other: () => m.channels_likely_spam_hidden_other({ count: likelySpam.length }),
-                      })}</span>
-                  <button
-                    type="button"
-                    class="ghost"
-                    aria-expanded={showLikelySpam}
-                    onclick={() => (showLikelySpam = !showLikelySpam)}
-                  >{showLikelySpam ? m.channels_likely_spam_hide() : m.channels_likely_spam_show()}</button>
-                </div>
-              {/if}
-            {/if}
-            {#if visibleChannels.length === 0}
-              <p class="muted list-empty">{m.channels_no_matches()}</p>
-            {/if}
+            <!-- The arrow keys move a highlight the search box cannot
+                 describe on its own, so the room under it is read out. -->
+            <span class="sr-only" aria-live="polite">{highlightedRow?.name ?? ''}</span>
           </div>
-        </aside>
-
-        {#snippet roomRow(ch: ChannelInfo)}
-                {@const memberCount = directoryMemberCount(ch)}
-                <!-- A room whose ownership moved is dimmed and badged; opening
-                     it shows the successor banner that explains it. -->
-                <div
-                  class="chan-row"
-                  role="listitem"
-                  class:active={ch.in_room && ch.channel_id === selectedId}
-                  class:discover={!ch.in_room}
-                  class:highlighted={highlightedRow?.channel_id === ch.channel_id}
-                  class:joining={joiningIds.includes(ch.channel_id)}
-                  class:just-joined={ch.in_room && ch.channel_id === justJoinedId}
-                  class:fresh-listing={!ch.in_room && freshListings.includes(ch.channel_id)}
-                  class:moved={!!ch.successor_id}
-                  class:likely-spam={likelySpamIds.has(ch.channel_id)}
-                  class:has-unread={ch.in_room
-                    && ch.unread > 0
-                    && unreadBadgeTone(
-                      notifyLevelOf($effectiveNotifyLevels, ch.channel_id),
-                      $channelUnreadMentions.includes(ch.channel_id),
-                    ) === 'loud'}
-                  data-room-id={ch.channel_id}
-                  title={ch.successor_id
-                    ? m.channels_transferred_badge()
-                    : likelySpamIds.has(ch.channel_id)
-                      ? m.channels_likely_spam_title()
-                      : undefined}
-                  oncontextmenu={ch.in_room ? openCardMenu : undefined}
-                >
-                  <button
-                    type="button"
-                    class="chan-row-main"
-                    aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
-                    aria-haspopup={ch.in_room ? undefined : 'dialog'}
-                    aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
-                    disabled={!ch.in_room && (joiningIds.includes(ch.channel_id) || !!ch.deleted_by_owner)}
-                    onclick={() => {
-                      if (ch.in_room) void selectChannel(ch.channel_id);
-                      else if (!ch.deleted_by_owner) previewId = ch.channel_id;
-                    }}
-                  >
-                    <div
-                      class="chan-avatar"
-                      class:private={ch.visibility === 'private'}
-                      aria-hidden="true"
-                    >
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
-                      </svg>
-                      {#if ch.visibility === 'private'}
-                        <span class="lock-dot">
-                          <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                            <rect x="2.5" y="5.5" width="7" height="5" rx="1"/>
-                            <path d="M4 5.5V4a2 2 0 014 0v1.5"/>
-                          </svg>
-                        </span>
-                      {/if}
-                    </div>
-                    <!-- Name, member count, action. Topic and the
-                         Public/Private badge are gone: the room is identified
-                         by its name, and everything else about it is one click
-                         away inside. -->
-                    <span class="chan-title">
-                      <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
-                      {#if isChannelLanguage(ch.language)}
-                        {@const languageName = channelLanguageName(ch.language)}
-                        <img
-                          class="chan-flag"
-                          src={channelLanguageFlagSrc(ch.language)}
-                          alt={m.channels_language_flag_title({ language: languageName })}
-                          title={m.channels_language_flag_title({ language: languageName })}
-                        />
-                      {/if}
-                      <!-- Said, not only dimmed: a faded row with its reason in a
-                           tooltip read as broken to anyone not hovering it. -->
-                      {#if ch.successor_id}
-                        <span class="badge sm tone-muted chan-moved-badge">{m.channels_transferred_badge()}</span>
-                      {/if}
-                      {#if !ch.in_room && ch.deleted_by_owner}
-                        <span class="badge sm tone-muted chan-moved-badge" title={m.channels_deleted_by_owner_title()}>{m.channels_deleted_by_owner_badge()}</span>
-                      {/if}
-                    </span>
-                    {#if ch.in_room && favouriteSet.has(ch.channel_id)}
-                      <span class="chan-fav" role="img" title={m.channels_favourite_badge()} aria-label={m.channels_favourite_badge()}>
-                        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                          <path d="M8 1.8l1.85 3.75 4.15.6-3 2.92.7 4.13L8 11.25 4.3 13.2l.7-4.13-3-2.92 4.15-.6z"/>
-                        </svg>
-                      </span>
-                    {/if}
-                    {#if ch.in_room && ch.channel_id in $channelSnoozes}
-                      {@const snoozeLabel = m.channels_snoozed_until({ time: snoozeEndLabel($channelSnoozes[ch.channel_id]) })}
-                      <span class="chan-snooze" role="img" title={snoozeLabel} aria-label={snoozeLabel}>
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M13 9.6A5.5 5.5 0 016.4 3a5.5 5.5 0 106.6 6.6z"/>
-                        </svg>
-                      </span>
-                    {/if}
-                    {#if memberCount !== null}
-                      {@const count = memberCount}
-                      <!-- Joined rooms show who is here now but rank on the
-                           whole roster, so the label names both; otherwise a
-                           3 sitting above a 5 reads as a broken sort. -->
-                      {@const countLabel = ch.in_room
-                        ? m.channels_members_here_of_total({ present: count, total: Math.max(ch.roster_count, count) })
-                        : plural(count, {
-                            one: () => m.channels_members_one({ count }),
-                            oneShowsCount: true,
-                            few: () => m.channels_members_few({ count }),
-                            other: () => m.channels_members_n({ count }),
-                          })}
-                      <span class="chan-members" title={countLabel} aria-label={countLabel}>
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <circle cx="6" cy="6" r="2.2"/>
-                          <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
-                          <circle cx="11.5" cy="6.5" r="1.7"/>
-                          <path d="M11.2 13c.9-.7 1.5-1.8 1.5-3"/>
-                        </svg>
-                        {count}
-                      </span>
-                    {/if}
-                    {#if ch.in_room && ch.unread > 0}
-                      {@const mentioned = $channelUnreadMentions.includes(ch.channel_id)}
-                      <!-- A bare number beside a room name says nothing on its
-                           own to a screen reader. Grey when the room's level
-                           would not interrupt for what it holds; see
-                           `unreadBadgeTone`. -->
-                      <!-- Redrawn per count, so a climb plays the bump; see `badgesLive`. -->
-                      {#key ch.unread}
-                      <span
-                        class="count-pill unread"
-                        class:bump={badgesLive}
-                        class:silenced={unreadBadgeTone(notifyLevelOf($effectiveNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
-                        aria-label={mentioned
-                          ? m.channels_unread_mention_aria({ count: ch.unread })
-                          : plural(ch.unread, {
-                              one: () => m.channels_unread_title_one({ count: ch.unread }),
-                              oneShowsCount: true,
-                              few: () => m.channels_unread_title_few({ count: ch.unread }),
-                              other: () => m.channels_unread_title_other({ count: ch.unread }),
-                            })}
-                      >{#if mentioned}<span class="unread-at" aria-hidden="true">@</span>{/if}{ch.unread > 99 ? '99+' : ch.unread}</span>
-                      {/key}
-                    {/if}
-                  </button>
-                  <div class="chan-door-col">
-                    {#if ch.in_room}
-                      {@const rowLevel = notifyLevelOf($channelNotifyLevels, ch.channel_id)}
-                      {@const rowFavourite = favouriteSet.has(ch.channel_id)}
-                      <details class="card-more row-more" ontoggle={placeRowMenu}>
-                        <summary
-                          class="card-more-btn"
-                          title={m.channels_room_options({ name: ch.name })}
-                          aria-haspopup="menu"
-                          aria-label={m.channels_room_options({ name: ch.name })}
-                        >
-                          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                            <circle cx="3.5" cy="8" r="1.4"/>
-                            <circle cx="8" cy="8" r="1.4"/>
-                            <circle cx="12.5" cy="8" r="1.4"/>
-                          </svg>
-                        </summary>
-                        <div class="card-more-menu" role="menu">
-                          <button
-                            type="button"
-                            role="menuitem"
-                            tabindex="-1"
-                            onclick={(e) => { closeCardMenu(e.currentTarget); toggleChannelFavourite(ch.channel_id); }}
-                          >{rowFavourite ? m.channels_favourite_remove() : m.channels_favourite_add()}</button>
-                          <div class="menu-sep" role="separator"></div>
-                          {@render notifyChoices(ch.channel_id, rowLevel)}
-                          <!-- Last and on its own: a red button on every row made
-                               walking out the loudest thing in the list. It still
-                               asks before it goes. -->
-                          <div class="menu-sep" role="separator"></div>
-                          <button
-                            type="button"
-                            role="menuitem"
-                            tabindex="-1"
-                            class="menu-item-danger"
-                            disabled={joiningIds.includes(ch.channel_id)}
-                            onclick={(e) => { closeCardMenu(e.currentTarget); requestLeave(ch.channel_id); }}
-                          >{m.channels_leave()}</button>
-                        </div>
-                      </details>
-                    {:else if ch.deleted_by_owner}
-                      <!-- Nothing to join: its owner deleted it. Removing it is
-                           what is left to do here. -->
-                      <button
-                        type="button"
-                        class="chan-forget"
-                        title={m.channels_forget()}
-                        aria-label={m.channels_forget_aria({ name: ch.name })}
-                        disabled={forgettingIds.includes(ch.channel_id)}
-                        onclick={() => requestForget(ch.channel_id)}
-                      >
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M2.5 4.5h11"/>
-                          <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
-                          <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
-                        </svg>
-                      </button>
-                    {:else}
-                      <button
-                        type="button"
-                        class="chan-door chan-join"
-                        disabled={joiningIds.includes(ch.channel_id) || needsUsername}
-                        title={needsUsername ? m.channels_username_required() : undefined}
-                        aria-label={joiningIds.includes(ch.channel_id) ? undefined : m.channels_join_room_aria({ name: ch.name })}
-                        onclick={() => joinCard(ch)}
-                      >{joiningIds.includes(ch.channel_id)
-                        ? m.channels_joining()
-                        : m.channels_join()}</button>
-                      {#if !ch.is_owner}
-                        {@const stored = storedChannelIds.has(ch.channel_id)}
-                        <button
-                          type="button"
-                          class="chan-forget"
-                          class:hide-listing={!stored}
-                          title={stored ? m.channels_forget() : m.channels_hide_listing()}
-                          aria-label={stored
-                            ? m.channels_forget_aria({ name: ch.name })
-                            : m.channels_hide_listing_aria({ name: ch.name })}
-                          disabled={forgettingIds.includes(ch.channel_id)
-                            || joiningIds.includes(ch.channel_id)}
-                          onclick={() => requestForget(ch.channel_id)}
-                        >
-                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                            {#if stored}
-                              <path d="M2.5 4.5h11"/>
-                              <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
-                              <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
-                            {:else}
-                              <path d="M1.8 8S4 3.8 8 3.8 14.2 8 14.2 8 12 12.2 8 12.2 1.8 8 1.8 8z"/>
-                              <circle cx="8" cy="8" r="1.9"/>
-                              <path d="M2.5 2.5l11 11"/>
-                            {/if}
-                          </svg>
-                        </button>
-                      {/if}
-                    {/if}
-                  </div>
-                </div>
-        {/snippet}
-
-        {#snippet notifyChoices(channelId: string, current: ChannelNotifyLevel)}
-          <div role="group" aria-label={m.channels_notify_heading()}>
-            <span class="menu-heading" aria-hidden="true">{m.channels_notify_heading()}</span>
-            {#each NOTIFY_CHOICES as choice (choice.level)}
+        {/if}
+        <div class="list-scroll" bind:this={listScrollEl}>
+          {#snippet markAllReadAction()}
+            {#if unreadJoinedIds.length > 0}
               <button
                 type="button"
-                role="menuitemradio"
-                tabindex="-1"
-                class="menu-radio"
-                aria-checked={current === choice.level}
-                onclick={(e) => {
-                  closeCardMenu(e.currentTarget);
-                  setChannelNotifyLevel(channelId, choice.level);
-                  // Picking a level is asking to hear the room that way now.
-                  endChannelSnooze(channelId);
-                }}
-              >
-                <svg class="menu-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  {#if current === choice.level}<path d="M3.5 8.5l3 3 6-7"/>{/if}
-                </svg>
-                {choice.label()}
-              </button>
-            {/each}
-          </div>
-          {@const until = snoozedUntil($channelSnoozes, channelId)}
-          <!-- A room already set to Nothing has no alerts left to hold back. -->
-          {#if until !== null || current !== 'none'}
-            {@const snoozeHeading = until !== null
-              ? m.channels_snoozed_until({ time: snoozeEndLabel(until) })
-              : m.channels_snooze_heading()}
-            <div class="menu-sep" role="separator"></div>
-            <div role="group" aria-label={snoozeHeading}>
-              <span class="menu-heading" aria-hidden="true">{snoozeHeading}</span>
-              {#if until !== null}
-                <button
-                  type="button"
-                  role="menuitem"
-                  tabindex="-1"
-                  onclick={(e) => { closeCardMenu(e.currentTarget); endChannelSnooze(channelId); }}
-                >{m.channels_snooze_end()}</button>
-              {/if}
-              {#each SNOOZE_CHOICES as option (option.choice)}
-                <button
-                  type="button"
-                  role="menuitem"
-                  tabindex="-1"
-                  onclick={(e) => { closeCardMenu(e.currentTarget); snoozeChannel(channelId, option.choice); }}
-                >{option.label()}</button>
+                class="list-section-action"
+                title={m.channels_mark_all_read_title()}
+                disabled={markingAllRead}
+                aria-busy={markingAllRead ? 'true' : undefined}
+                onclick={markAllRead}
+              >{markingAllRead ? m.channels_marking_all_read() : m.channels_mark_all_read()}</button>
+            {/if}
+          {/snippet}
+          <!-- "Mark all rooms as read" rides on the first of your sections.
+               While a search hides every joined room, a plain "Your rooms"
+               header keeps it, so it does not come and go with the query. -->
+          {#if roomSections.yoursPublic.length > 0}
+            <div class="list-section">
+              <h3 class="list-section-label" id="rooms-section-yours-public">
+                {m.channels_section_yours_public()}<span class="list-section-count" aria-hidden="true">{roomSections.yoursPublic.length}</span>
+              </h3>
+              {@render markAllReadAction()}
+            </div>
+            <div role="list" aria-labelledby="rooms-section-yours-public">
+              {#each roomSections.yoursPublic as ch (ch.channel_id)}
+                {@render roomRow(ch)}
               {/each}
             </div>
           {/if}
-          <!-- These levels govern toasts; a desktop notification also needs
-               the room-message switch in Settings, which is off by default,
-               so "Mentions only" otherwise reads as a promise it cannot keep. -->
-          {#if roomDesktopAlertsOff && current !== 'none'}
-            <div class="menu-sep" role="separator"></div>
-            <button
-              type="button"
-              role="menuitem"
-              tabindex="-1"
-              class="menu-note"
-              onclick={(e) => {
-                closeCardMenu(e.currentTarget);
-                void goto('/settings?section=notifications').catch((err) => console.warn('Failed to open settings:', err));
-              }}
-            >
-              <span>{m.channels_notify_desktop_off()}</span>
-              <span class="menu-note-action">{m.channels_notify_desktop_off_action({ setting: m.settings_notify_channel_message() })}</span>
-            </button>
-          {/if}
-        {/snippet}
-
-        <section class="conversation-pane" class:hidden-when-list={!selected} bind:this={conversationEl}>
-          {#if !selected}
-            <div class="empty-state compact">
-              <div class="empty-icon">
-                <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M8 14h32v22H8z"/>
-                  <path d="M8 14l16 10 16-10"/>
-                </svg>
-              </div>
-              <p class="empty-title">{m.channels_select_title()}</p>
-              <p class="empty-sub">{m.channels_no_selection()}</p>
-              <!-- The keys that move between rooms, said where nobody has
-                   opened one yet: otherwise they are only in the ? sheet. -->
-              {#if joinedInOrder.length > 0}
-                <dl class="room-shortcuts" aria-label={m.shortcuts_section_channels()}>
-                  {#each roomShortcutHints as hint (hint.keys.join('+'))}
-                    <div class="room-shortcut">
-                      <dt>
-                        {#each hint.keys as key, i (i)}{#if i > 0}<span class="kbd-plus" aria-hidden="true">+</span>{/if}<kbd>{key}</kbd>{/each}
-                      </dt>
-                      <dd>{hint.label()}</dd>
-                    </div>
-                  {/each}
-                </dl>
-                <p class="room-shortcuts-more"><kbd>?</kbd> {m.shortcuts_show_shortcuts()}</p>
-              {/if}
+          {#if roomSections.yoursPrivate.length > 0}
+            <div class="list-section">
+              <h3 class="list-section-label" id="rooms-section-yours-private">
+                {m.channels_section_yours_private()}<span class="list-section-count" aria-hidden="true">{roomSections.yoursPrivate.length}</span>
+              </h3>
+              {#if roomSections.yoursPublic.length === 0}{@render markAllReadAction()}{/if}
             </div>
-          {:else}
-            <header class="conv-header">
-              <button class="back-btn" onclick={clearSelection} aria-label={m.common_back()}>
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M10 3L5 8l5 5"/>
-                </svg>
-              </button>
-              <button
-                class="icon-btn list-toggle"
-                class:on={!listCollapsed}
-                onclick={() => (listCollapsed = !listCollapsed)}
-                title={listCollapsed ? m.channels_show_list() : m.channels_hide_list()}
-                aria-pressed={!listCollapsed}
-                aria-label={listCollapsed ? m.channels_show_list() : m.channels_hide_list()}
-              >
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                  <rect x="2" y="3" width="12" height="10" rx="1.5"/>
-                  <path d="M6.5 3v10"/>
-                </svg>
-              </button>
-              <div
-                class="chan-avatar sm"
-                class:private={selected.visibility === 'private'}
-                aria-hidden="true"
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
-                </svg>
-                {#if selected.visibility === 'private'}
-                  <span class="lock-dot">
-                    <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-                      <rect x="2.5" y="5.5" width="7" height="5" rx="1"/>
-                      <path d="M4 5.5V4a2 2 0 014 0v1.5"/>
-                    </svg>
-                  </span>
-                {/if}
+            <div role="list" aria-labelledby="rooms-section-yours-private">
+              {#each roomSections.yoursPrivate as ch (ch.channel_id)}
+                {@render roomRow(ch)}
+              {/each}
+            </div>
+          {/if}
+          {#if roomSections.yours.length === 0 && unreadJoinedIds.length > 0}
+            <div class="list-section">
+              <h3 class="list-section-label">{m.channels_section_yours()}</h3>
+              {@render markAllReadAction()}
+            </div>
+          {/if}
+          {#if roomSections.discover.length > 0}
+            <div class="list-section discover-section" class:after-yours={roomSections.yours.length > 0}>
+              <h3 class="list-section-label" id="rooms-section-discover">
+                {m.channels_section_discover()}<span class="list-section-count" aria-hidden="true">{discoverShown.length}</span>
+              </h3>
+            </div>
+            <div role="list" aria-labelledby="rooms-section-discover">
+              {#each discoverShown as ch (ch.channel_id)}
+                {@render roomRow(ch)}
+              {/each}
+            </div>
+            {#if likelySpam.length > 0}
+              <div class="likely-spam-row">
+                <span class="muted">{showLikelySpam
+                  ? m.channels_likely_spam_shown()
+                  : plural(likelySpam.length, {
+                      one: () => m.channels_likely_spam_hidden_one({ count: likelySpam.length }),
+                      oneShowsCount: true,
+                      other: () => m.channels_likely_spam_hidden_other({ count: likelySpam.length }),
+                    })}</span>
+                <button
+                  type="button"
+                  class="ghost"
+                  aria-expanded={showLikelySpam}
+                  onclick={() => (showLikelySpam = !showLikelySpam)}
+                >{showLikelySpam ? m.channels_likely_spam_hide() : m.channels_likely_spam_show()}</button>
               </div>
-              <div class="conv-heading">
-                <div class="conv-title">
-                  <h3><bdi dir="auto">{selected.name}</bdi></h3>
-                  {#if isChannelLanguage(selected.language)}
-                    {@const languageName = channelLanguageName(selected.language)}
-                    <img
-                      class="conv-flag"
-                      src={channelLanguageFlagSrc(selected.language)}
-                      alt={m.channels_language_flag_title({ language: languageName })}
-                      title={m.channels_language_flag_title({ language: languageName })}
-                    />
-                  {/if}
-                  <!-- Facts about the room, beside its name: kept apart from the
-                       buttons on the right so nothing here reads as pressable.
-                       Shown to everyone: an owner or moderator still needs to
-                       know that nobody else can answer here. -->
-                  <span class="conv-status">
-                    {#if selected.announce_only}
-                      <span
-                        class="enc-lock"
-                        role="img"
-                        title={m.channels_announce_badge_title()}
-                        aria-label={m.channels_announce_badge_title()}
-                      >
-                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M2.5 6.5v3h2l4.5 3V3.5l-4.5 3z"/>
-                          <path d="M11.5 5.5a3.5 3.5 0 0 1 0 5"/>
+            {/if}
+          {/if}
+          {#if visibleChannels.length === 0}
+            <p class="muted list-empty">{m.channels_no_matches()}</p>
+          {/if}
+        </div>
+      </aside>
+
+      {#snippet roomRow(ch: ChannelInfo)}
+              {@const memberCount = directoryMemberCount(ch)}
+              <!-- A room whose ownership moved is dimmed and badged; opening
+                   it shows the successor banner that explains it. -->
+              <div
+                class="chan-row"
+                role="listitem"
+                class:active={ch.in_room && ch.channel_id === selectedId}
+                class:discover={!ch.in_room}
+                class:highlighted={highlightedRow?.channel_id === ch.channel_id}
+                class:joining={joiningIds.includes(ch.channel_id)}
+                class:just-joined={ch.in_room && ch.channel_id === justJoinedId}
+                class:fresh-listing={!ch.in_room && freshListings.includes(ch.channel_id)}
+                class:moved={!!ch.successor_id}
+                class:likely-spam={likelySpamIds.has(ch.channel_id)}
+                class:has-unread={ch.in_room
+                  && ch.unread > 0
+                  && unreadBadgeTone(
+                    notifyLevelOf($effectiveNotifyLevels, ch.channel_id),
+                    $channelUnreadMentions.includes(ch.channel_id),
+                  ) === 'loud'}
+                data-room-id={ch.channel_id}
+                title={ch.successor_id
+                  ? m.channels_transferred_badge()
+                  : likelySpamIds.has(ch.channel_id)
+                    ? m.channels_likely_spam_title()
+                    : undefined}
+                oncontextmenu={ch.in_room ? openCardMenu : undefined}
+              >
+                <button
+                  type="button"
+                  class="chan-row-main"
+                  aria-current={ch.in_room && ch.channel_id === selectedId ? 'true' : undefined}
+                  aria-haspopup={ch.in_room ? undefined : 'dialog'}
+                  aria-busy={!ch.in_room && joiningIds.includes(ch.channel_id) ? 'true' : undefined}
+                  disabled={!ch.in_room && (joiningIds.includes(ch.channel_id) || !!ch.deleted_by_owner)}
+                  onclick={() => {
+                    if (ch.in_room) void selectChannel(ch.channel_id);
+                    else if (!ch.deleted_by_owner) previewId = ch.channel_id;
+                  }}
+                >
+                  <div
+                    class="chan-avatar"
+                    class:private={ch.visibility === 'private'}
+                    aria-hidden="true"
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
+                    </svg>
+                    {#if ch.visibility === 'private'}
+                      <span class="lock-dot">
+                        <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                          <rect x="2.5" y="5.5" width="7" height="5" rx="1"/>
+                          <path d="M4 5.5V4a2 2 0 014 0v1.5"/>
                         </svg>
                       </span>
                     {/if}
-                    <span class="enc-lock" role="img" title={selectedEncTitle} aria-label={selectedEncTitle}>
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
-                        <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
+                  </div>
+                  <!-- Name, member count, action. Topic and the
+                       Public/Private badge are gone: the room is identified
+                       by its name, and everything else about it is one click
+                       away inside. -->
+                  <span class="chan-title">
+                    <span class="chan-name"><bdi dir="auto">{ch.name}</bdi></span>
+                    {#if isChannelLanguage(ch.language)}
+                      {@const languageName = channelLanguageName(ch.language)}
+                      <img
+                        class="chan-flag"
+                        src={channelLanguageFlagSrc(ch.language)}
+                        alt={m.channels_language_flag_title({ language: languageName })}
+                        title={m.channels_language_flag_title({ language: languageName })}
+                      />
+                    {/if}
+                    <!-- Said, not only dimmed: a faded row with its reason in a
+                         tooltip read as broken to anyone not hovering it. -->
+                    {#if ch.successor_id}
+                      <span class="badge sm tone-muted chan-moved-badge">{m.channels_transferred_badge()}</span>
+                    {/if}
+                    {#if !ch.in_room && ch.deleted_by_owner}
+                      <span class="badge sm tone-muted chan-moved-badge" title={m.channels_deleted_by_owner_title()}>{m.channels_deleted_by_owner_badge()}</span>
+                    {/if}
+                  </span>
+                  {#if ch.in_room && favouriteSet.has(ch.channel_id)}
+                    <span class="chan-fav" role="img" title={m.channels_favourite_badge()} aria-label={m.channels_favourite_badge()}>
+                      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                        <path d="M8 1.8l1.85 3.75 4.15.6-3 2.92.7 4.13L8 11.25 4.3 13.2l.7-4.13-3-2.92 4.15-.6z"/>
                       </svg>
                     </span>
-                  </span>
-                </div>
-                {#if selected.topic.trim()}
-                  <p class="topic has-topic" title={selected.topic}>
-                    <span class="topic-mark" aria-hidden="true">#</span>
-                    <bdi dir="auto">{selected.topic}</bdi>
-                  </p>
-                {:else}
-                  <p class="topic">{selected.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}</p>
-                {/if}
-              </div>
-              <div class="conv-actions">
-                {#if selectedPrivate}
-                  <button
-                    class="icon-btn library-btn"
-                    class:on={librarySettingsOpen}
-                    class:shared={ownLibraryOpen[selectedChannelId] === true}
-                    onclick={() => (librarySettingsOpen = true)}
-                    title={ownLibraryOpen[selectedChannelId] ? m.channels_library_button_open() : m.channels_library()}
-                    aria-haspopup="dialog"
-                    aria-expanded={librarySettingsOpen}
-                    aria-label={ownLibraryOpen[selectedChannelId] ? m.channels_library_button_open() : m.channels_library()}
-                  >
-                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <path d="M4 4.5h4v15H4zM10 4.5h4v15h-4z" />
-                      <path d="m16 5.2 3.8-1 3.4 14.4-3.8 1z" />
-                    </svg>
-                    {#if ownLibraryOpen[selectedChannelId]}
-                      <span class="library-dot" aria-hidden="true"></span>
-                    {/if}
-                  </button>
-                {/if}
-                {#if selected.is_owner}
-                  <button
-                    class="icon-btn"
-                    class:on={roomInfoOpen}
-                    onclick={() => (roomInfoOpen = true)}
-                    title={m.channels_room_settings()}
-                    aria-haspopup="dialog"
-                    aria-expanded={roomInfoOpen}
-                    aria-label={m.channels_room_settings()}
-                  >
-                    <IconGear size={18} />
-                  </button>
-                {/if}
-                <button
-                  class="icon-btn members-toggle"
-                  class:on={membersOpen}
-                  bind:this={membersToggleEl}
-                  onclick={() => void setMembersOpen(!membersOpen)}
-                  title={membersToggleLabel}
-                  aria-pressed={membersOpen}
-                  aria-label={membersToggleLabel}
-                >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <circle cx="6" cy="6" r="2.2"/>
-                    <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
-                    <circle cx="11.5" cy="6.5" r="1.7"/>
-                    <path d="M11.2 13c.9-.7 1.5-1.8 1.5-3"/>
-                  </svg>
-                  {#if !membersOpen && roomOffersWaiting > 0}
-                    <span class="toggle-badge" aria-hidden="true">{roomOffersWaiting}</span>
+                  {/if}
+                  {#if ch.in_room && ch.channel_id in $channelSnoozes}
+                    {@const snoozeLabel = m.channels_snoozed_until({ time: snoozeEndLabel($channelSnoozes[ch.channel_id]) })}
+                    <span class="chan-snooze" role="img" title={snoozeLabel} aria-label={snoozeLabel}>
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M13 9.6A5.5 5.5 0 016.4 3a5.5 5.5 0 106.6 6.6z"/>
+                      </svg>
+                    </span>
+                  {/if}
+                  {#if memberCount !== null}
+                    {@const count = memberCount}
+                    <!-- Joined rooms show who is here now but rank on the
+                         whole roster, so the label names both; otherwise a
+                         3 sitting above a 5 reads as a broken sort. -->
+                    {@const countLabel = ch.in_room
+                      ? m.channels_members_here_of_total({ present: count, total: Math.max(ch.roster_count, count) })
+                      : plural(count, {
+                          one: () => m.channels_members_one({ count }),
+                          oneShowsCount: true,
+                          few: () => m.channels_members_few({ count }),
+                          other: () => m.channels_members_n({ count }),
+                        })}
+                    <span class="chan-members" title={countLabel} aria-label={countLabel}>
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="6" cy="6" r="2.2"/>
+                        <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
+                        <circle cx="11.5" cy="6.5" r="1.7"/>
+                        <path d="M11.2 13c.9-.7 1.5-1.8 1.5-3"/>
+                      </svg>
+                      {count}
+                    </span>
+                  {/if}
+                  {#if ch.in_room && ch.unread > 0}
+                    {@const mentioned = $channelUnreadMentions.includes(ch.channel_id)}
+                    <!-- A bare number beside a room name says nothing on its
+                         own to a screen reader. Grey when the room's level
+                         would not interrupt for what it holds; see
+                         `unreadBadgeTone`. -->
+                    <!-- Redrawn per count, so a climb plays the bump; see `badgesLive`. -->
+                    {#key ch.unread}
+                    <span
+                      class="count-pill unread"
+                      class:bump={badgesLive}
+                      class:silenced={unreadBadgeTone(notifyLevelOf($effectiveNotifyLevels, ch.channel_id), mentioned) === 'quiet'}
+                      aria-label={mentioned
+                        ? m.channels_unread_mention_aria({ count: ch.unread })
+                        : plural(ch.unread, {
+                            one: () => m.channels_unread_title_one({ count: ch.unread }),
+                            oneShowsCount: true,
+                            few: () => m.channels_unread_title_few({ count: ch.unread }),
+                            other: () => m.channels_unread_title_other({ count: ch.unread }),
+                          })}
+                    >{#if mentioned}<span class="unread-at" aria-hidden="true">@</span>{/if}{ch.unread > 99 ? '99+' : ch.unread}</span>
+                    {/key}
                   {/if}
                 </button>
-                {#if selectedWelcomeHidden}
-                  <!-- The way back to a welcome the reader hid. Only here while
-                       it is hidden, so it costs the header nothing otherwise. -->
-                  <button
-                    class="icon-btn"
-                    onclick={() => toggleWelcomeFold(selected.channel_id, selected.welcome)}
-                    title={m.channels_welcome_show()}
-                    aria-label={m.channels_welcome_show()}
-                  >
-                    <!-- A note rather than a megaphone: the megaphone beside the
-                         room's name says the room is announcement-only. -->
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <path d="M2.5 3.5h11v7.5H7l-3 2.5V11H2.5z"/>
-                      <path d="M5 6.2h6M5 8.6h4"/>
-                    </svg>
-                  </button>
-                {/if}
-                <button
-                  class="icon-btn"
-                  class:on={searchOpen}
-                  onclick={() => {
-                    searchOpen = !searchOpen;
-                    if (!searchOpen) resetSearch();
-                  }}
-                  title={m.channels_search_room()}
-                  aria-pressed={searchOpen}
-                  aria-label={m.channels_search_room()}
-                >
-                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
-                  </svg>
-                </button>
-                <details class="card-more notify-more">
-                  <summary
-                    class="icon-btn"
-                    class:on={selectedNotifyLevel !== 'all' || selectedSnoozedUntil !== null}
-                    title={bellTitle}
-                    aria-haspopup="menu"
-                    aria-label={bellTitle}
-                  >
-                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <path d="M6.2 12.2a1.9 1.9 0 003.6 0"/>
-                      <path d="M3.6 12.2h8.8l-1.1-1.6V7.4a3.3 3.3 0 00-6.6 0v3.2z"/>
-                      {#if selectedSnoozedUntil !== null}
-                        <path d="M11.2 1.6h3.2l-3.2 3.6h3.2"/>
-                      {:else if selectedNotifyLevel === 'none'}
-                        <path d="M2.6 2.6l10.8 10.8"/>
-                      {:else if selectedNotifyLevel === 'mentions'}
-                        <circle cx="12.6" cy="3.4" r="1.9" fill="currentColor" stroke="none"/>
-                      {/if}
-                    </svg>
-                  </summary>
-                  <div class="card-more-menu" role="menu">
-                    {@render notifyChoices(selectedChannelId, selectedNotifyLevel)}
-                  </div>
-                </details>
-                <!-- Splits the four view toggles from the two actions that
-                     actually change something. -->
-                <span class="conv-actions-sep" aria-hidden="true"></span>
-                <!-- Unavailable with the reason rather than failing after the
-                     click: the backend refuses non-owners here. -->
-                <button
-                  class="ghost conv-action"
-                  disabled={copyingInvite}
-                  aria-disabled={invitesClosed ? 'true' : undefined}
-                  aria-describedby={invitesClosed ? 'copy-invite-why' : undefined}
-                  title={invitesClosed ? m.error_channels_invites_owner_only() : undefined}
-                  onclick={() => {
-                    if (invitesClosed) toast(m.error_channels_invites_owner_only());
-                    else void handleCopyInvite();
-                  }}
-                >{copyingInvite ? m.channels_copying_invite() : m.channels_invite()}</button>
-                {#if invitesClosed}
-                  <span class="sr-only" id="copy-invite-why">{m.error_channels_invites_owner_only()}</span>
-                {/if}
-                <!-- Delete room used to sit here, identical red text one gap
-                     away from Leave. Only one of the two can be undone, so it
-                     moved in beside the owner's other room settings. -->
-                <span class="conv-actions-sep before-leave" aria-hidden="true"></span>
-                <button class="conv-action conv-leave" onclick={() => requestLeave(selected.channel_id)}>{m.channels_leave()}</button>
-              </div>
-            </header>
-            {#if selected.welcome.trim() && !selectedWelcomeHidden}
-              <div class="welcome-banner" role="note">
-                <p><bdi dir="auto">{selected.welcome}</bdi></p>
-                <button
-                  type="button"
-                  class="welcome-toggle"
-                  title={m.channels_welcome_hide()}
-                  aria-label={m.channels_welcome_hide()}
-                  onclick={() => toggleWelcomeFold(selected.channel_id, selected.welcome)}
-                >
-                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
-                    <path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>
-                  </svg>
-                </button>
-              </div>
-            {/if}
-            {#if selected.successor_id}
-              <div class="successor-banner" role="status">
-                <span>{m.channels_successor_banner()}</span>
-                <button
-                  class="ghost"
-                  onclick={openSuccessor}
-                  disabled={openingSuccessor}
-                  aria-busy={openingSuccessor ? 'true' : undefined}
-                >{openingSuccessor ? m.channels_opening_successor() : m.channels_open_successor()}</button>
-              </div>
-            {:else if transferPendingTo}
-              <div class="successor-banner" role="status">
-                <span>{m.channels_transfer_started()}</span>
-              </div>
-            {/if}
-            {#if selected.newer_key}
-              <div class="key-behind-banner newer-banner" role="status">
-                <div class="newer-text">
-                  <strong>{m.channels_newer_key()}</strong>
-                  <span>{m.channels_newer_key_body()}</span>
-                </div>
-                <span class="newer-actions">{@render updateAction()}</span>
-              </div>
-            {:else if selected.key_behind}
-              <div class="key-behind-banner" role="status">
-                <strong>{m.channels_key_behind()}</strong>
-                <span>{m.channels_key_behind_body()}</span>
-              </div>
-            {/if}
-            {#if selected.newer_lines > 0 || selected.newer_envelope}
-              <div class="successor-banner" role="status">
-                <span>
-                  {#if selected.newer_lines > 0}{newerLinesLabel}{/if}
-                  {#if selected.newer_envelope}{m.channels_newer_envelope()}{/if}
-                </span>
-                <span class="newer-actions">
-                  <!-- One update button per room: the key banner above has it. -->
-                  {#if !selected.newer_key}
-                    {@render updateAction()}
-                  {/if}
-                  <button
-                    type="button"
-                    class="ghost"
-                    disabled={dismissingNewer}
-                    onclick={() => void dismissNewer(selected.channel_id)}
-                  >{m.common_dismiss()}</button>
-                </span>
-              </div>
-            {/if}
-            <!-- Accept and Deny live in the members pane's transfer drawer. An
-                 arriving offer opens it on wide windows; where it stays shut
-                 (narrow, or closed by the user) this says a file is waiting. -->
-            {#if roomOffersWaiting > 0 && !membersOpen}
-              <div class="offers-banner" role="status">
-                <span>{roomOffersLabel}</span>
-                <button type="button" class="ghost" onclick={reviewRoomOffers}>{m.channels_offers_review()}</button>
-              </div>
-            {/if}
-            {#if successorPromptShown}
-              <div class="successor-banner successor-prompt" role="status">
-                <span>{m.channels_successor_prompt()}</span>
-                <span class="newer-actions">
-                  <button type="button" class="ghost" onclick={() => openRoomSettings('succession')}>
-                    {m.channels_successor_prompt_choose()}
-                  </button>
-                  <button type="button" class="ghost" onclick={() => dismissSuccessorPrompt(selected.channel_id)}>
-                    {m.channels_successor_prompt_later()}
-                  </button>
-                </span>
-              </div>
-            {/if}
-            {#if !selected.is_owner && !selected.successor_id && nomineeNotice}
-              <div class="successor-banner" role="status">
-                <span>{nomineeNotice}</span>
-                {#if selected.can_claim}
-                  <button class="ghost" disabled={claiming} onclick={() => (claimOpen = true)}>
-                    {claiming ? m.channels_taking_over() : m.channels_claim_ownership()}
-                  </button>
-                {/if}
-              </div>
-            {/if}
-            <!-- Everyone sees the room's rule, not just the owner who set it:
-                 a wait nobody announced reads as the app dropping messages.
-                 Owners and moderators are exempt, so it says so rather than
-                 implying a limit they will never hit. -->
-            {#if selected.slow_mode_secs > 0}
-              <p class="room-notice" role="status">
-                {selected.is_owner || selected.you_are_moderator
-                  ? m.channels_slow_mode_notice_exempt({
-                      wait: slowModeLabel(selected.slow_mode_secs),
-                    })
-                  : m.channels_slow_mode_notice({
-                      wait: slowModeLabel(selected.slow_mode_secs),
-                    })}
-              </p>
-            {/if}
-            {#if searchOpen}
-              <form
-                class="room-search"
-                onsubmit={(e) => {
-                  e.preventDefault();
-                  runSearch();
-                }}
-              >
-                <input
-                  bind:value={searchQuery}
-                  bind:this={roomSearchEl}
-                  placeholder={m.channels_search_placeholder()}
-                  aria-label={m.channels_search_room()}
-                  use:autoFocus
-                  onkeydown={(e) => {
-                    if (e.key !== 'Escape') return;
-                    e.preventDefault();
-                    e.stopPropagation();
-                    resetSearch();
-                  }}
-                />
-                <button type="submit" disabled={!searchQuery.trim() || searching}>
-                  {searching ? m.channels_searching() : m.common_search()}
-                </button>
-              </form>
-              {#if searchRan}
-                <div class="search-results" aria-live="polite">
-                  {#if searchError}
-                    <p class="muted list-empty">{searchError}</p>
-                  {:else if visibleSearchHits.length === 0}
-                    <p class="muted list-empty">{m.channels_search_none()}</p>
+                <div class="chan-door-col">
+                  {#if ch.in_room}
+                    {@const rowLevel = notifyLevelOf($channelNotifyLevels, ch.channel_id)}
+                    {@const rowFavourite = favouriteSet.has(ch.channel_id)}
+                    <details class="card-more row-more" ontoggle={placeRowMenu}>
+                      <summary
+                        class="card-more-btn"
+                        title={m.channels_room_options({ name: ch.name })}
+                        aria-haspopup="menu"
+                        aria-label={m.channels_room_options({ name: ch.name })}
+                      >
+                        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                          <circle cx="3.5" cy="8" r="1.4"/>
+                          <circle cx="8" cy="8" r="1.4"/>
+                          <circle cx="12.5" cy="8" r="1.4"/>
+                        </svg>
+                      </summary>
+                      <div class="card-more-menu" role="menu">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          tabindex="-1"
+                          onclick={(e) => { closeCardMenu(e.currentTarget); toggleChannelFavourite(ch.channel_id); }}
+                        >{rowFavourite ? m.channels_favourite_remove() : m.channels_favourite_add()}</button>
+                        <div class="menu-sep" role="separator"></div>
+                        {@render notifyChoices(ch.channel_id, rowLevel)}
+                        <!-- Last and on its own: a red button on every row made
+                             walking out the loudest thing in the list. It still
+                             asks before it goes. -->
+                        <div class="menu-sep" role="separator"></div>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          tabindex="-1"
+                          class="menu-item-danger"
+                          disabled={joiningIds.includes(ch.channel_id)}
+                          onclick={(e) => { closeCardMenu(e.currentTarget); requestLeave(ch.channel_id); }}
+                        >{m.channels_leave()}</button>
+                      </div>
+                    </details>
+                  {:else if ch.deleted_by_owner}
+                    <!-- Nothing to join: its owner deleted it. Removing it is
+                         what is left to do here. -->
+                    <button
+                      type="button"
+                      class="chan-forget"
+                      title={m.channels_forget()}
+                      aria-label={m.channels_forget_aria({ name: ch.name })}
+                      disabled={forgettingIds.includes(ch.channel_id)}
+                      onclick={() => requestForget(ch.channel_id)}
+                    >
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M2.5 4.5h11"/>
+                        <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
+                        <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
+                      </svg>
+                    </button>
                   {:else}
-                    {#each visibleSearchHits as hit (hit.id)}
+                    <button
+                      type="button"
+                      class="chan-door chan-join"
+                      disabled={joiningIds.includes(ch.channel_id) || needsUsername}
+                      title={needsUsername ? m.channels_username_required() : undefined}
+                      aria-label={joiningIds.includes(ch.channel_id) ? undefined : m.channels_join_room_aria({ name: ch.name })}
+                      onclick={() => joinCard(ch)}
+                    >{joiningIds.includes(ch.channel_id)
+                      ? m.channels_joining()
+                      : m.channels_join()}</button>
+                    {#if !ch.is_owner}
+                      {@const stored = storedChannelIds.has(ch.channel_id)}
                       <button
                         type="button"
-                        class="search-hit"
-                        title={m.channels_search_open_hit()}
-                        onclick={() => focusHit(hit.id)}
+                        class="chan-forget"
+                        class:hide-listing={!stored}
+                        title={stored ? m.channels_forget() : m.channels_hide_listing()}
+                        aria-label={stored
+                          ? m.channels_forget_aria({ name: ch.name })
+                          : m.channels_hide_listing_aria({ name: ch.name })}
+                        disabled={forgettingIds.includes(ch.channel_id)
+                          || joiningIds.includes(ch.channel_id)}
+                        onclick={() => requestForget(ch.channel_id)}
                       >
-                        <span class="search-hit-who">
-                          <bdi dir="auto">{memberNames[hit.sender_pubkey] || shortId(hit.sender_pubkey)}</bdi>
-                        </span>
-                        <span class="search-hit-text"><bdi dir="auto">{hit.message}</bdi></span>
-                        <span class="search-hit-when">{formatRelativeTime(hit.timestamp, presenceNow)}</span>
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          {#if stored}
+                            <path d="M2.5 4.5h11"/>
+                            <path d="M6.5 4.5V3a1 1 0 011-1h1a1 1 0 011 1v1.5"/>
+                            <path d="M4 4.5l.7 8.1a1 1 0 001 .9h4.6a1 1 0 001-.9l.7-8.1"/>
+                          {:else}
+                            <path d="M1.8 8S4 3.8 8 3.8 14.2 8 14.2 8 12 12.2 8 12.2 1.8 8 1.8 8z"/>
+                            <circle cx="8" cy="8" r="1.9"/>
+                            <path d="M2.5 2.5l11 11"/>
+                          {/if}
+                        </svg>
                       </button>
-                    {/each}
-                  {/if}
-                </div>
-              {/if}
-            {/if}
-            <div class="transcript">
-              {#if joinWelcome && joinWelcome.id === selected.channel_id}
-                <!-- Floats over the top of the transcript and lets every click
-                     through, so it never stands between the reader and the room.
-                     Local, so leaving the room takes it at once rather than
-                     holding the pane open for its exit. -->
-                <div class="join-welcome-wrap" aria-hidden="true">
-                  <div
-                    class="join-welcome"
-                    out:fly={{ y: -10, duration: prefersReducedMotion.current ? 0 : 280 }}
-                  >
-                    <div class="join-welcome-badge">
-                      <span class="join-welcome-ring"></span>
-                      {#each JOIN_SPARKS as spark, i (i)}
-                        <span
-                          class="join-spark"
-                          class:alt={i % 2 === 1}
-                          style:--spark-angle="{spark.angle}deg"
-                          style:--spark-delay="{spark.delay}ms"
-                        ></span>
-                      {/each}
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
-                      </svg>
-                    </div>
-                    <div class="join-welcome-text">
-                      <strong>
-                        <bdi dir="auto">{m.channels_joined_title({ room: joinWelcome?.name ?? '' })}</bdi>
-                        {#if joinWelcome && isChannelLanguage(joinWelcome.language)}
-                          <img class="join-welcome-flag" src={channelLanguageFlagSrc(joinWelcome.language)} alt="" />
-                        {/if}
-                      </strong>
-                      <span>{m.channels_joined_body()}</span>
-                    </div>
-                  </div>
-                </div>
-              {/if}
-              <ChatConversation
-                friendHash=""
-                friendName={selectedName}
-                channelId={selectedChannelId}
-                youAreBanned={selectedBanned}
-                youAreKeyBehind={selectedKeyBehind}
-                slowModeSecs={selectedSlowMode}
-                announceOnly={selectedAnnounceBlocked}
-                pinnedMsgIds={selected?.pinned_msg_ids ?? []}
-                canPin={selected?.is_owner ?? false}
-                onchannelupdate={replaceChannel}
-                memberNames={memberNames}
-                ignoredSenders={roomIgnoredKeys}
-                mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
-                mentionCandidates={mentionCandidates}
-                focusRequest={transcriptFocus}
-                onfocusmissing={() => toast(m.channels_search_unavailable())}
-                historyStartNote={selectedHistoryNote}
-              />
-            </div>
-          {/if}
-        </section>
-
-        {#if selected}
-          <div class="members-slot" bind:this={membersSlotEl}>
-          <button
-            class="members-backdrop"
-            type="button"
-            onclick={() => void setMembersOpen(false)}
-            aria-label={m.channels_hide_members()}
-            tabindex={membersOpen ? 0 : -1}
-            inert={!membersOpen}
-          ></button>
-          <aside class="members-pane" aria-hidden={!membersOpen} inert={!membersOpen}>
-            <div class="members-header">
-              <span class="members-label">{m.channels_members()}</span>
-              <!-- Only once the roster is in hand. Falling back to the stored
-                   count put a stale number beside a body that said Loading. -->
-              {#if members.length > 0}
-                {#key memberCountBump}
-                  <span class="members-count" class:bump={memberCountBump > 0}>{members.length}</span>
-                {/key}
-              {/if}
-              <button
-                class="icon-btn members-close"
-                bind:this={membersCloseEl}
-                onclick={() => void setMembersOpen(false)}
-                aria-label={m.channels_hide_members()}
-              >
-                <IconX size={14} />
-              </button>
-            </div>
-            {#if membersLoading && members.length === 0}
-              {@render memberSkeleton()}
-            {:else if membersError && members.length === 0}
-              <div class="members-empty">
-                <p class="muted list-empty">{m.channels_members_failed()}</p>
-                <button type="button" class="ghost" onclick={() => void refreshMembers(selected.channel_id)}>
-                  {m.common_retry()}
-                </button>
-              </div>
-            {:else if members.length === 0 && membersFor !== selectedId}
-              {@render memberSkeleton()}
-            {:else if members.length === 0}
-              <p class="muted list-empty">{m.channels_members_empty()}</p>
-            {:else}
-              {#if members.length >= MEMBER_FILTER_FROM || memberQuery}
-                <div class="search-wrap member-filter">
-                  <span class="search-icon" aria-hidden="true">
-                    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
-                      <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
-                    </svg>
-                  </span>
-                  <input
-                    type="text"
-                    class="search-input"
-                    bind:value={memberQuery}
-                    placeholder={m.channels_members_filter()}
-                    aria-label={m.channels_members_filter()}
-                    spellcheck="false"
-                    autocomplete="off"
-                    onkeydown={(e) => {
-                      if (e.key !== 'Escape' || !memberQuery) return;
-                      e.preventDefault();
-                      e.stopPropagation();
-                      memberQuery = '';
-                    }}
-                  />
-                  {#if memberQuery}
-                    <button type="button" class="search-clear" onclick={() => (memberQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}><IconX size={12} /></button>
-                  {/if}
-                </div>
-              {/if}
-              {#if shownMembers.length === 0}
-                <p class="muted list-empty">{m.channels_members_no_match()}</p>
-              {/if}
-              <ul class="member-list">
-                {#each shownMembers as mem (mem.member_pubkey)}
-                  {@const presence = presenceOf(mem, presenceNow)}
-                  {@const presenceLabel =
-                    presence === 'online' ? m.channels_member_online() : m.channels_member_away()}
-                  {@const friendRelation = memberFriendRelation(mem)}
-                  {@const ignoreScope = ignoreScopeFor($ignoredMembers, mem.member_pubkey, selectedId)}
-                  {@const arriving = arrivedMembers.includes(mem.member_pubkey)}
-                  <li
-                    class:banned={mem.banned}
-                    class:arrived={arriving}
-                    in:memberArrive={{ arriving }}
-                    oncontextmenu={memberHasMenu(mem) ? openCardMenu : undefined}
-                  >
-                    <div
-                      class="member-avatar"
-                      class:present={presence === 'online'}
-                      class:away={presence === 'away'}
-                    >
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <circle cx="12" cy="8" r="4"/>
-                        <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
-                      </svg>
-                      <!-- Pops in when someone comes online while the list is
-                           open; drawn still as the list itself first appears. -->
-                      {#if presence !== 'offline'}
-                        <span
-                          class="present-dot"
-                          class:away={presence === 'away'}
-                          role="img"
-                          title={presenceLabel}
-                          aria-label={presenceLabel}
-                          in:scale={{ start: 0, duration: membersSettled && !prefersReducedMotion.current ? 320 : 0, easing: backOut }}
-                        ></span>
-                      {/if}
-                    </div>
-                    <div class="member-identity">
-                      <span class="member-name-row">
-                        <span class="member-name" title={roomMemberLabel(mem)}>
-                          <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
-                        </span>
-                        {#if isChannelLanguage(mem.language)}
-                          {#each [mem.language, ...(isChannelLanguage(mem.language2) && mem.language2 !== mem.language ? [mem.language2] : [])] as code (code)}
-                            {@const languageName = channelLanguageName(code)}
-                            <img
-                              class="member-flag"
-                              src={channelLanguageFlagSrc(code)}
-                              alt={m.channels_member_language({ language: languageName })}
-                              title={m.channels_member_language({ language: languageName })}
-                            />
-                          {/each}
-                        {/if}
-                      </span>
-                      <span class="member-badges">
-                        {#if isChannelOwner(mem)}
-                          <span class="badge owner">{m.channels_owner()}</span>
-                        {:else if mem.moderator}
-                          <span class="badge">{m.channels_moderator_badge()}</span>
-                        {/if}
-                        {#if mem.banned}
-                          <span class="badge banned">{m.channels_banned_badge()}</span>
-                        {/if}
-                        {#if ignoreScope !== 'none'}
-                          <span class="badge">{ignoreScope === 'room'
-                            ? m.channels_ignored_room_badge()
-                            : m.channels_ignored_badge()}</span>
-                        {/if}
-                        {#if presence !== 'online' && mem.last_seen > 0}
-                          <span class="member-seen">
-                            {m.channels_member_last_seen({
-                              when: formatRelativeTime(mem.last_seen, presenceNow),
-                            })}
-                          </span>
-                        {/if}
-                      </span>
-                    </div>
-                    {#if memberHasMenu(mem)}
-                      {@const sendFileBlocked = selectedBanned
-                        ? m.channels_you_are_banned()
-                        : mem.banned
-                          ? m.channels_send_file_member_banned()
-                          : sendingTo.includes(mem.member_pubkey)
-                            ? m.channels_send_file_busy()
-                            : null}
-                      {@const dmBlocked = selectedBanned
-                        ? m.channels_you_are_banned()
-                        : mem.banned
-                          ? m.channels_dm_member_banned()
-                          : friendRelation === 'mutual'
-                            ? m.channels_dm_is_friend()
-                            : ignoreScope !== 'none'
-                              ? m.channels_dm_ignored()
-                              : $appSettings?.room_dm_policy === 'off'
-                                ? m.channels_dm_policy_off()
-                                : null}
-                      {@const browseBlocked = selectedBanned
-                        ? m.channels_you_are_banned()
-                        : mem.banned
-                          ? m.channels_send_file_member_banned()
-                          : !selectedLibraryMembers.has(mem.member_pubkey.toLowerCase())
-                            ? m.channels_library_member_closed()
-                            : null}
-                      <details class="card-more">
-                        <summary class="card-more-btn" title={m.common_more()} aria-haspopup="menu" aria-label={m.common_more()}>
-                          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
-                            <circle cx="3.5" cy="8" r="1.4"/>
-                            <circle cx="8" cy="8" r="1.4"/>
-                            <circle cx="12.5" cy="8" r="1.4"/>
-                          </svg>
-                        </summary>
-                        <!-- Unavailable items stay in the arrow-key walk with
-                             their reason said beside them, not only on hover. -->
-                        <div class="card-more-menu" role="menu">
-                          <button
-                            type="button"
-                            role="menuitem"
-                            tabindex="-1"
-                            aria-disabled={sendFileBlocked ? 'true' : undefined}
-                            aria-describedby={sendFileBlocked ? `member-file-why-${mem.member_pubkey}` : undefined}
-                            onclick={(e) => { if (sendFileBlocked) return; closeCardMenu(e.currentTarget); handleSendFile(mem); }}
-                          >{m.channels_send_file()}{#if sendFileBlocked}<span class="menu-reason" id="member-file-why-{mem.member_pubkey}" aria-hidden="true">{sendFileBlocked}</span>{/if}</button>
-                          {#if selectedPrivate}
-                            <button
-                              type="button"
-                              role="menuitem"
-                              tabindex="-1"
-                              aria-disabled={browseBlocked ? 'true' : undefined}
-                              aria-describedby={browseBlocked ? `member-library-why-${mem.member_pubkey}` : undefined}
-                              onclick={(e) => { if (browseBlocked) return; closeCardMenu(e.currentTarget); openLibraryBrowser(mem); }}
-                            >{m.channels_library_browse()}{#if browseBlocked}<span class="menu-reason" id="member-library-why-{mem.member_pubkey}" aria-hidden="true">{browseBlocked}</span>{/if}</button>
-                          {/if}
-                          <button
-                            type="button"
-                            role="menuitem"
-                            tabindex="-1"
-                            aria-disabled={dmBlocked ? 'true' : undefined}
-                            aria-describedby={dmBlocked ? `member-dm-why-${mem.member_pubkey}` : undefined}
-                            onclick={(e) => { if (dmBlocked) return; closeCardMenu(e.currentTarget); openPrivateChat(mem.member_pubkey, mem.nickname || roomMemberLabel(mem)); }}
-                          >{m.channels_dm_message_privately()}{#if dmBlocked}<span class="menu-reason" id="member-dm-why-{mem.member_pubkey}" aria-hidden="true">{dmBlocked}</span>{/if}</button>
-                          <button
-                            type="button"
-                            role="menuitem"
-                            tabindex="-1"
-                            disabled={addingFriend.includes(mem.member_pubkey) || friendRelation !== 'none'}
-                            onclick={(e) => { closeCardMenu(e.currentTarget); handleAddFriend(mem); }}
-                          >{friendRelation === 'mutual'
-                            ? m.channels_friend_action_already()
-                            : friendRelation === 'listed'
-                              ? m.channels_friend_action_pending()
-                              : friendRelation === 'incoming'
-                                ? m.channels_friend_action_incoming()
-                                : m.channels_add_friend()}</button>
-                          <!-- Two scopes, because the same person can be
-                               tiresome in one room and worth reading in
-                               another. A global ignore hides the per-room
-                               item: narrowing it there would read as
-                               "un-ignore", which is what the entry below is
-                               for. -->
-                          {#if ignoreScope !== 'global'}
-                            <button
-                              type="button"
-                              role="menuitem"
-                              tabindex="-1"
-                              disabled={!selectedId}
-                              onclick={(e) => { closeCardMenu(e.currentTarget); if (selectedId) toggleMemberIgnoreInChannel(mem.member_pubkey, selectedId, mem.nickname); }}
-                            >{ignoreScope === 'room'
-                              ? m.channels_unignore_room()
-                              : m.channels_ignore_room()}</button>
-                          {/if}
-                          <button
-                            type="button"
-                            role="menuitem"
-                            tabindex="-1"
-                            onclick={(e) => {
-                              closeCardMenu(e.currentTarget);
-                              if (ignoreScope === 'global') toggleMemberIgnore(mem.member_pubkey, mem.nickname);
-                              else void ignoreEverywhereSilently(mem.member_pubkey, mem.nickname);
-                            }}
-                          >{ignoreScope === 'global'
-                            ? m.channels_unignore()
-                            : m.channels_ignore_everywhere()}</button>
-                          {#if canModerate}
-                            {#if mem.banned}
-                              <button
-                                type="button"
-                                role="menuitem"
-                                tabindex="-1"
-                                disabled={moderationBusy}
-                                onclick={(e) => { closeCardMenu(e.currentTarget); handleUnban(mem.member_pubkey); }}
-                              >{m.channels_unban()}</button>
-                            {:else if !isChannelOwner(mem)}
-                              <button
-                                type="button"
-                                role="menuitem"
-                                tabindex="-1"
-                                class="menu-item-danger"
-                                disabled={moderationBusy}
-                                onclick={(e) => { closeCardMenu(e.currentTarget); requestBan(mem); }}
-                              >{m.channels_ban()}</button>
-                            {/if}
-                          {/if}
-                          {#if selected.is_owner && !mem.banned && !selected.successor_id}
-                            {#if mem.moderator}
-                              <button
-                                type="button"
-                                role="menuitem"
-                                tabindex="-1"
-                                disabled={moderationBusy}
-                                onclick={(e) => { closeCardMenu(e.currentTarget); requestRemoveModerator(mem); }}
-                              >{m.channels_remove_moderator()}</button>
-                            {:else}
-                              <button
-                                type="button"
-                                role="menuitem"
-                                tabindex="-1"
-                                disabled={moderationBusy}
-                                onclick={(e) => { closeCardMenu(e.currentTarget); handleAddModerator(mem.member_pubkey); }}
-                              >{m.channels_add_moderator()}</button>
-                            {/if}
-                            {#if !transferPendingTo || transferPendingTo === mem.member_pubkey}
-                              <button
-                                type="button"
-                                role="menuitem"
-                                tabindex="-1"
-                                class="menu-item-danger"
-                                disabled={moderationBusy}
-                                onclick={(e) => { closeCardMenu(e.currentTarget); requestTransfer(mem); }}
-                              >{m.channels_transfer_ownership()}</button>
-                            {/if}
-                          {/if}
-                        </div>
-                      </details>
                     {/if}
-                  </li>
-                {/each}
-              </ul>
-            {/if}
-            {#if roomTransfers.length > 0}
-              <section
-                class="xfer-drawer"
-                aria-label={m.channels_xfer_panel_title()}
-                transition:fly={{ y: 24, duration: prefersReducedMotion.current ? 0 : 180 }}
-              >
-                <button
-                  type="button"
-                  class="xfer-drawer-head"
-                  aria-expanded={!xferCollapsed}
-                  aria-controls={xferCollapsed ? undefined : 'xfer-drawer-body'}
-                  title={xferCollapsed ? m.channels_xfer_show_panel() : m.channels_xfer_hide_panel()}
-                  onclick={() => (xferCollapsed = !xferCollapsed)}
-                >
-                  <svg class="xfer-drawer-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M5 13V3M2.5 5.5 5 3l2.5 2.5"/>
-                    <path d="M11 3v10M8.5 10.5 11 13l2.5-2.5"/>
-                  </svg>
-                  <span class="members-label">{m.channels_xfer_panel_title()}</span>
-                  <span class="xfer-drawer-count">{roomTransfers.length}</span>
-                  {#if roomXferRate > 0}
-                    <span class="xfer-drawer-rate">{formatLiveSpeed(roomXferRate)}</span>
                   {/if}
-                  <svg class="xfer-drawer-chevron" class:flipped={xferCollapsed} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="m4 6 4 4 4-4"/>
-                  </svg>
-                </button>
-                {#if !xferCollapsed}
-                  <!-- Polite, not assertive: an arriving offer is worth announcing
-                       but must not cut across whatever is being read. The
-                       per-second numbers are hidden from it; the progress bar
-                       carries the figure for anyone who asks. -->
-                  <div id="xfer-drawer-body" class="xfer-drawer-body" aria-live="polite" transition:slide={{ duration: prefersReducedMotion.current ? 0 : 180 }}>
-                    {#each roomTransfers as t (t.xfer_id)}
-                      {@const tone = xferTone(t)}
-                      {@const pct = xferPct(t)}
-                      {@const rate = t.status === 'active' ? xferRate(xferSamples, t.xfer_id, xferNow) : 0}
-                      {@const left = xferSecondsLeft(t.size, t.transferred, rate)}
-                      {@const busy = respondingTo.includes(t.xfer_id)}
-                      <article class="xfer-card tone-{tone}" transition:slide={{ duration: prefersReducedMotion.current ? 0 : 180 }}>
-                        <div class="xfer-card-top">
-                          <span class="xfer-dir" class:send={t.direction === 'send'} aria-hidden="true">
-                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                              {#if t.direction === 'send'}
-                                <path d="M8 12.5v-9M4.5 7 8 3.5 11.5 7"/>
-                              {:else}
-                                <path d="M8 3.5v9M4.5 9 8 12.5 11.5 9"/>
-                              {/if}
-                            </svg>
-                          </span>
-                          <div class="xfer-text">
-                            <span class="xfer-name" title={t.name}><bdi dir="auto">{t.name}</bdi></span>
-                            <span class="xfer-meta">
-                              {#if tone === 'moving' && t.transferred > 0}
-                                {formatBytes(t.transferred)} / {formatBytes(t.size)}
-                              {:else}
-                                {formatBytes(t.size)}
-                              {/if}
-                            </span>
-                          </div>
-                        </div>
-                        {#if t.direction === 'receive' && t.risky}
-                          <p class="file-risk" role="note">
-                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                              <path d="M8 1.8 14.6 13.5H1.4z"/>
-                              <path d="M8 6.2v3.4M8 11.6v.1"/>
-                            </svg>
-                            <span>{m.common_risky_file()}</span>
-                          </p>
-                        {/if}
-                        <p class="xfer-status">{transferLabel(t)}</p>
-                        {#if t.status === 'accepted' || t.status === 'active'}
-                          <div
-                            class="xfer-progress"
-                            class:indeterminate={t.transferred === 0}
-                            role="progressbar"
-                            aria-label={t.name}
-                            aria-valuemin="0"
-                            aria-valuemax={t.size}
-                            aria-valuenow={Math.min(t.transferred, t.size)}
-                            aria-valuetext="{pct}%"
-                          >
-                            <div class="xfer-progress-fill" style="width: {pct}%"></div>
-                          </div>
-                          <div class="xfer-stats" aria-hidden="true">
-                            {#if t.transferred === 0}
-                              <span>{m.channels_xfer_starting()}</span>
-                            {:else}
-                              <span class="xfer-pct">{pct}%</span>
-                              {#if rate > 0}
-                                <span class="xfer-speed">{formatLiveSpeed(rate)}</span>
-                              {/if}
-                              {#if left !== null}
-                                <span class="xfer-left">
-                                  {m.channels_xfer_time_left({ time: formatDurationSecs(left) })}
-                                </span>
-                              {/if}
-                            {/if}
-                          </div>
-                        {/if}
-                        {#if t.status === 'awaiting'}
-                          <!-- Accepting while banned pulls room traffic we have no
-                               business receiving, and the backend refuses it.
-                               Denying stays open: that is how the offer clears. -->
-                          <div class="xfer-actions two">
-                            <button
-                              type="button"
-                              class="primary"
-                              disabled={busy || selectedBanned}
-                              onclick={() => handleRespondTransfer(t.xfer_id, true)}
-                            >
-                              {m.channels_xfer_accept()}
-                            </button>
-                            <button
-                              type="button"
-                              class="secondary"
-                              disabled={busy}
-                              onclick={() => handleRespondTransfer(t.xfer_id, false)}
-                            >
-                              {m.channels_xfer_decline()}
-                            </button>
-                          </div>
-                        {:else if tone === 'moving'}
-                          <div class="xfer-actions">
-                            <button
-                              type="button"
-                              class="ghost xfer-cancel"
-                              disabled={busy}
-                              onclick={() => handleCancelTransfer(t.xfer_id)}
-                            >
-                              {m.common_cancel()}
-                            </button>
-                          </div>
-                        {:else if t.status === 'complete' && t.direction === 'receive' && !isServer}
-                          <div class="xfer-actions">
-                            <button
-                              type="button"
-                              class="secondary"
-                              onclick={() =>
-                                void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
-                            >
-                              {m.chat_attach_show()}
-                            </button>
-                          </div>
-                        {/if}
-                      </article>
-                    {/each}
-                  </div>
-                {/if}
-              </section>
+                </div>
+              </div>
+      {/snippet}
+
+      {#snippet notifyChoices(channelId: string, current: ChannelNotifyLevel)}
+        <div role="group" aria-label={m.channels_notify_heading()}>
+          <span class="menu-heading" aria-hidden="true">{m.channels_notify_heading()}</span>
+          {#each NOTIFY_CHOICES as choice (choice.level)}
+            <button
+              type="button"
+              role="menuitemradio"
+              tabindex="-1"
+              class="menu-radio"
+              aria-checked={current === choice.level}
+              onclick={(e) => {
+                closeCardMenu(e.currentTarget);
+                setChannelNotifyLevel(channelId, choice.level);
+                // Picking a level is asking to hear the room that way now.
+                endChannelSnooze(channelId);
+              }}
+            >
+              <svg class="menu-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                {#if current === choice.level}<path d="M3.5 8.5l3 3 6-7"/>{/if}
+              </svg>
+              {choice.label()}
+            </button>
+          {/each}
+        </div>
+        {@const until = snoozedUntil($channelSnoozes, channelId)}
+        <!-- A room already set to Nothing has no alerts left to hold back. -->
+        {#if until !== null || current !== 'none'}
+          {@const snoozeHeading = until !== null
+            ? m.channels_snoozed_until({ time: snoozeEndLabel(until) })
+            : m.channels_snooze_heading()}
+          <div class="menu-sep" role="separator"></div>
+          <div role="group" aria-label={snoozeHeading}>
+            <span class="menu-heading" aria-hidden="true">{snoozeHeading}</span>
+            {#if until !== null}
+              <button
+                type="button"
+                role="menuitem"
+                tabindex="-1"
+                onclick={(e) => { closeCardMenu(e.currentTarget); endChannelSnooze(channelId); }}
+              >{m.channels_snooze_end()}</button>
             {/if}
-          </aside>
+            {#each SNOOZE_CHOICES as option (option.choice)}
+              <button
+                type="button"
+                role="menuitem"
+                tabindex="-1"
+                onclick={(e) => { closeCardMenu(e.currentTarget); snoozeChannel(channelId, option.choice); }}
+              >{option.label()}</button>
+            {/each}
           </div>
         {/if}
-      </div>
-    {/if}
+        <!-- These levels govern toasts; a desktop notification also needs
+             the room-message switch in Settings, which is off by default,
+             so "Mentions only" otherwise reads as a promise it cannot keep. -->
+        {#if roomDesktopAlertsOff && current !== 'none'}
+          <div class="menu-sep" role="separator"></div>
+          <button
+            type="button"
+            role="menuitem"
+            tabindex="-1"
+            class="menu-note"
+            onclick={(e) => {
+              closeCardMenu(e.currentTarget);
+              void goto('/settings?section=notifications').catch((err) => console.warn('Failed to open settings:', err));
+            }}
+          >
+            <span>{m.channels_notify_desktop_off()}</span>
+            <span class="menu-note-action">{m.channels_notify_desktop_off_action({ setting: m.settings_notify_channel_message() })}</span>
+          </button>
+        {/if}
+      {/snippet}
+
+      <section class="conversation-pane" class:hidden-when-list={!selected} bind:this={conversationEl}>
+        {#if !selected}
+          <div class="empty-state compact">
+            <div class="empty-icon">
+              <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8 14h32v22H8z"/>
+                <path d="M8 14l16 10 16-10"/>
+              </svg>
+            </div>
+            <p class="empty-title">{m.channels_select_title()}</p>
+            <p class="empty-sub">{m.channels_no_selection()}</p>
+            <!-- The keys that move between rooms, said where nobody has
+                 opened one yet: otherwise they are only in the ? sheet. -->
+            {#if joinedInOrder.length > 0}
+              <dl class="room-shortcuts" aria-label={m.shortcuts_section_channels()}>
+                {#each roomShortcutHints as hint (hint.keys.join('+'))}
+                  <div class="room-shortcut">
+                    <dt>
+                      {#each hint.keys as key, i (i)}{#if i > 0}<span class="kbd-plus" aria-hidden="true">+</span>{/if}<kbd>{key}</kbd>{/each}
+                    </dt>
+                    <dd>{hint.label()}</dd>
+                  </div>
+                {/each}
+              </dl>
+              <p class="room-shortcuts-more"><kbd>?</kbd> {m.shortcuts_show_shortcuts()}</p>
+            {/if}
+          </div>
+        {:else}
+          <header class="conv-header">
+            <button class="back-btn" onclick={clearSelection} aria-label={m.common_back()}>
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10 3L5 8l5 5"/>
+              </svg>
+            </button>
+            <button
+              class="icon-btn list-toggle"
+              class:on={!listCollapsed}
+              onclick={() => (listCollapsed = !listCollapsed)}
+              title={listCollapsed ? m.channels_show_list() : m.channels_hide_list()}
+              aria-pressed={!listCollapsed}
+              aria-label={listCollapsed ? m.channels_show_list() : m.channels_hide_list()}
+            >
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="2" y="3" width="12" height="10" rx="1.5"/>
+                <path d="M6.5 3v10"/>
+              </svg>
+            </button>
+            <div
+              class="chan-avatar sm"
+              class:private={selected.visibility === 'private'}
+              aria-hidden="true"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
+              </svg>
+              {#if selected.visibility === 'private'}
+                <span class="lock-dot">
+                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="2.5" y="5.5" width="7" height="5" rx="1"/>
+                    <path d="M4 5.5V4a2 2 0 014 0v1.5"/>
+                  </svg>
+                </span>
+              {/if}
+            </div>
+            <div class="conv-heading">
+              <div class="conv-title">
+                <h3><bdi dir="auto">{selected.name}</bdi></h3>
+                {#if isChannelLanguage(selected.language)}
+                  {@const languageName = channelLanguageName(selected.language)}
+                  <img
+                    class="conv-flag"
+                    src={channelLanguageFlagSrc(selected.language)}
+                    alt={m.channels_language_flag_title({ language: languageName })}
+                    title={m.channels_language_flag_title({ language: languageName })}
+                  />
+                {/if}
+                <!-- Facts about the room, beside its name: kept apart from the
+                     buttons on the right so nothing here reads as pressable.
+                     Shown to everyone: an owner or moderator still needs to
+                     know that nobody else can answer here. -->
+                <span class="conv-status">
+                  {#if selected.announce_only}
+                    <span
+                      class="enc-lock"
+                      role="img"
+                      title={m.channels_announce_badge_title()}
+                      aria-label={m.channels_announce_badge_title()}
+                    >
+                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M2.5 6.5v3h2l4.5 3V3.5l-4.5 3z"/>
+                        <path d="M11.5 5.5a3.5 3.5 0 0 1 0 5"/>
+                      </svg>
+                    </span>
+                  {/if}
+                  <span class="enc-lock" role="img" title={selectedEncTitle} aria-label={selectedEncTitle}>
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="3.5" y="7" width="9" height="6.5" rx="1.5"/>
+                      <path d="M5.5 7V5.5a2.5 2.5 0 0 1 5 0V7"/>
+                    </svg>
+                  </span>
+                </span>
+              </div>
+              {#if selected.topic.trim()}
+                <p class="topic has-topic" title={selected.topic}>
+                  <span class="topic-mark" aria-hidden="true">#</span>
+                  <bdi dir="auto">{selected.topic}</bdi>
+                </p>
+              {:else}
+                <p class="topic">{selected.visibility === 'private' ? m.channels_private_badge() : m.channels_public_badge()}</p>
+              {/if}
+            </div>
+            <div class="conv-actions">
+              {#if selectedPrivate}
+                <button
+                  class="icon-btn library-btn"
+                  class:on={librarySettingsOpen}
+                  class:shared={ownLibraryOpen[selectedChannelId] === true}
+                  onclick={() => (librarySettingsOpen = true)}
+                  title={ownLibraryOpen[selectedChannelId] ? m.channels_library_button_open() : m.channels_library()}
+                  aria-haspopup="dialog"
+                  aria-expanded={librarySettingsOpen}
+                  aria-label={ownLibraryOpen[selectedChannelId] ? m.channels_library_button_open() : m.channels_library()}
+                >
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 4.5h4v15H4zM10 4.5h4v15h-4z" />
+                    <path d="m16 5.2 3.8-1 3.4 14.4-3.8 1z" />
+                  </svg>
+                  {#if ownLibraryOpen[selectedChannelId]}
+                    <span class="library-dot" aria-hidden="true"></span>
+                  {/if}
+                </button>
+              {/if}
+              {#if selected.is_owner}
+                <button
+                  class="icon-btn"
+                  class:on={roomInfoOpen}
+                  onclick={() => (roomInfoOpen = true)}
+                  title={m.channels_room_settings()}
+                  aria-haspopup="dialog"
+                  aria-expanded={roomInfoOpen}
+                  aria-label={m.channels_room_settings()}
+                >
+                  <IconGear size={18} />
+                </button>
+              {/if}
+              <button
+                class="icon-btn members-toggle"
+                class:on={membersOpen}
+                bind:this={membersToggleEl}
+                onclick={() => void setMembersOpen(!membersOpen)}
+                title={membersToggleLabel}
+                aria-pressed={membersOpen}
+                aria-label={membersToggleLabel}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="6" cy="6" r="2.2"/>
+                  <path d="M2 13c0-2.2 1.8-4 4-4s4 1.8 4 4"/>
+                  <circle cx="11.5" cy="6.5" r="1.7"/>
+                  <path d="M11.2 13c.9-.7 1.5-1.8 1.5-3"/>
+                </svg>
+                {#if !membersOpen && roomOffersWaiting > 0}
+                  <span class="toggle-badge" aria-hidden="true">{roomOffersWaiting}</span>
+                {/if}
+              </button>
+              {#if selectedWelcomeHidden}
+                <!-- The way back to a welcome the reader hid. Only here while
+                     it is hidden, so it costs the header nothing otherwise. -->
+                <button
+                  class="icon-btn"
+                  onclick={() => toggleWelcomeFold(selected.channel_id, selected.welcome)}
+                  title={m.channels_welcome_show()}
+                  aria-label={m.channels_welcome_show()}
+                >
+                  <!-- A note rather than a megaphone: the megaphone beside the
+                       room's name says the room is announcement-only. -->
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2.5 3.5h11v7.5H7l-3 2.5V11H2.5z"/>
+                    <path d="M5 6.2h6M5 8.6h4"/>
+                  </svg>
+                </button>
+              {/if}
+              <button
+                class="icon-btn"
+                class:on={searchOpen}
+                onclick={() => {
+                  searchOpen = !searchOpen;
+                  if (!searchOpen) resetSearch();
+                }}
+                title={m.channels_search_room()}
+                aria-pressed={searchOpen}
+                aria-label={m.channels_search_room()}
+              >
+                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
+                </svg>
+              </button>
+              <details class="card-more notify-more">
+                <summary
+                  class="icon-btn"
+                  class:on={selectedNotifyLevel !== 'all' || selectedSnoozedUntil !== null}
+                  title={bellTitle}
+                  aria-haspopup="menu"
+                  aria-label={bellTitle}
+                >
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M6.2 12.2a1.9 1.9 0 003.6 0"/>
+                    <path d="M3.6 12.2h8.8l-1.1-1.6V7.4a3.3 3.3 0 00-6.6 0v3.2z"/>
+                    {#if selectedSnoozedUntil !== null}
+                      <path d="M11.2 1.6h3.2l-3.2 3.6h3.2"/>
+                    {:else if selectedNotifyLevel === 'none'}
+                      <path d="M2.6 2.6l10.8 10.8"/>
+                    {:else if selectedNotifyLevel === 'mentions'}
+                      <circle cx="12.6" cy="3.4" r="1.9" fill="currentColor" stroke="none"/>
+                    {/if}
+                  </svg>
+                </summary>
+                <div class="card-more-menu" role="menu">
+                  {@render notifyChoices(selectedChannelId, selectedNotifyLevel)}
+                </div>
+              </details>
+              <!-- Splits the four view toggles from the two actions that
+                   actually change something. -->
+              <span class="conv-actions-sep" aria-hidden="true"></span>
+              <!-- Unavailable with the reason rather than failing after the
+                   click: the backend refuses non-owners here. -->
+              <button
+                class="ghost conv-action"
+                disabled={copyingInvite}
+                aria-disabled={invitesClosed ? 'true' : undefined}
+                aria-describedby={invitesClosed ? 'copy-invite-why' : undefined}
+                title={invitesClosed ? m.error_channels_invites_owner_only() : undefined}
+                onclick={() => {
+                  if (invitesClosed) toast(m.error_channels_invites_owner_only());
+                  else void handleCopyInvite();
+                }}
+              >{copyingInvite ? m.channels_copying_invite() : m.channels_invite()}</button>
+              {#if invitesClosed}
+                <span class="sr-only" id="copy-invite-why">{m.error_channels_invites_owner_only()}</span>
+              {/if}
+              <!-- Delete room used to sit here, identical red text one gap
+                   away from Leave. Only one of the two can be undone, so it
+                   moved in beside the owner's other room settings. -->
+              <span class="conv-actions-sep before-leave" aria-hidden="true"></span>
+              <button class="conv-action conv-leave" onclick={() => requestLeave(selected.channel_id)}>{m.channels_leave()}</button>
+            </div>
+          </header>
+          {#if selected.welcome.trim() && !selectedWelcomeHidden}
+            <div class="welcome-banner" role="note">
+              <p><bdi dir="auto">{selected.welcome}</bdi></p>
+              <button
+                type="button"
+                class="welcome-toggle"
+                title={m.channels_welcome_hide()}
+                aria-label={m.channels_welcome_hide()}
+                onclick={() => toggleWelcomeFold(selected.channel_id, selected.welcome)}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+                  <path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>
+                </svg>
+              </button>
+            </div>
+          {/if}
+          {#if selected.successor_id}
+            <div class="successor-banner" role="status">
+              <span>{m.channels_successor_banner()}</span>
+              <button
+                class="ghost"
+                onclick={openSuccessor}
+                disabled={openingSuccessor}
+                aria-busy={openingSuccessor ? 'true' : undefined}
+              >{openingSuccessor ? m.channels_opening_successor() : m.channels_open_successor()}</button>
+            </div>
+          {:else if transferPendingTo}
+            <div class="successor-banner" role="status">
+              <span>{m.channels_transfer_started()}</span>
+            </div>
+          {/if}
+          {#if selected.newer_key}
+            <div class="key-behind-banner newer-banner" role="status">
+              <div class="newer-text">
+                <strong>{m.channels_newer_key()}</strong>
+                <span>{m.channels_newer_key_body()}</span>
+              </div>
+              <span class="newer-actions">{@render updateAction()}</span>
+            </div>
+          {:else if selected.key_behind}
+            <div class="key-behind-banner" role="status">
+              <strong>{m.channels_key_behind()}</strong>
+              <span>{m.channels_key_behind_body()}</span>
+            </div>
+          {/if}
+          {#if selected.newer_lines > 0 || selected.newer_envelope}
+            <div class="successor-banner" role="status">
+              <span>
+                {#if selected.newer_lines > 0}{newerLinesLabel}{/if}
+                {#if selected.newer_envelope}{m.channels_newer_envelope()}{/if}
+              </span>
+              <span class="newer-actions">
+                <!-- One update button per room: the key banner above has it. -->
+                {#if !selected.newer_key}
+                  {@render updateAction()}
+                {/if}
+                <button
+                  type="button"
+                  class="ghost"
+                  disabled={dismissingNewer}
+                  onclick={() => void dismissNewer(selected.channel_id)}
+                >{m.common_dismiss()}</button>
+              </span>
+            </div>
+          {/if}
+          <!-- Accept and Deny live in the members pane's transfer drawer. An
+               arriving offer opens it on wide windows; where it stays shut
+               (narrow, or closed by the user) this says a file is waiting. -->
+          {#if roomOffersWaiting > 0 && !membersOpen}
+            <div class="offers-banner" role="status">
+              <span>{roomOffersLabel}</span>
+              <button type="button" class="ghost" onclick={reviewRoomOffers}>{m.channels_offers_review()}</button>
+            </div>
+          {/if}
+          {#if successorPromptShown}
+            <div class="successor-banner successor-prompt" role="status">
+              <span>{m.channels_successor_prompt()}</span>
+              <span class="newer-actions">
+                <button type="button" class="ghost" onclick={() => openRoomSettings('succession')}>
+                  {m.channels_successor_prompt_choose()}
+                </button>
+                <button type="button" class="ghost" onclick={() => dismissSuccessorPrompt(selected.channel_id)}>
+                  {m.channels_successor_prompt_later()}
+                </button>
+              </span>
+            </div>
+          {/if}
+          {#if !selected.is_owner && !selected.successor_id && nomineeNotice}
+            <div class="successor-banner" role="status">
+              <span>{nomineeNotice}</span>
+              {#if selected.can_claim}
+                <button class="ghost" disabled={claiming} onclick={() => (claimOpen = true)}>
+                  {claiming ? m.channels_taking_over() : m.channels_claim_ownership()}
+                </button>
+              {/if}
+            </div>
+          {/if}
+          <!-- Everyone sees the room's rule, not just the owner who set it:
+               a wait nobody announced reads as the app dropping messages.
+               Owners and moderators are exempt, so it says so rather than
+               implying a limit they will never hit. -->
+          {#if selected.slow_mode_secs > 0}
+            <p class="room-notice" role="status">
+              {selected.is_owner || selected.you_are_moderator
+                ? m.channels_slow_mode_notice_exempt({
+                    wait: slowModeLabel(selected.slow_mode_secs),
+                  })
+                : m.channels_slow_mode_notice({
+                    wait: slowModeLabel(selected.slow_mode_secs),
+                  })}
+            </p>
+          {/if}
+          {#if searchOpen}
+            <form
+              class="room-search"
+              onsubmit={(e) => {
+                e.preventDefault();
+                runSearch();
+              }}
+            >
+              <input
+                bind:value={searchQuery}
+                bind:this={roomSearchEl}
+                placeholder={m.channels_search_placeholder()}
+                aria-label={m.channels_search_room()}
+                use:autoFocus
+                onkeydown={(e) => {
+                  if (e.key !== 'Escape') return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  resetSearch();
+                }}
+              />
+              <button type="submit" disabled={!searchQuery.trim() || searching}>
+                {searching ? m.channels_searching() : m.common_search()}
+              </button>
+            </form>
+            {#if searchRan}
+              <div class="search-results" aria-live="polite">
+                {#if searchError}
+                  <p class="muted list-empty">{searchError}</p>
+                {:else if visibleSearchHits.length === 0}
+                  <p class="muted list-empty">{m.channels_search_none()}</p>
+                {:else}
+                  {#each visibleSearchHits as hit (hit.id)}
+                    <button
+                      type="button"
+                      class="search-hit"
+                      title={m.channels_search_open_hit()}
+                      onclick={() => focusHit(hit.id)}
+                    >
+                      <span class="search-hit-who">
+                        <bdi dir="auto">{memberNames[hit.sender_pubkey] || shortId(hit.sender_pubkey)}</bdi>
+                      </span>
+                      <span class="search-hit-text"><bdi dir="auto">{hit.message}</bdi></span>
+                      <span class="search-hit-when">{formatRelativeTime(hit.timestamp, presenceNow)}</span>
+                    </button>
+                  {/each}
+                {/if}
+              </div>
+            {/if}
+          {/if}
+          <div class="transcript">
+            {#if joinWelcome && joinWelcome.id === selected.channel_id}
+              <!-- Floats over the top of the transcript and lets every click
+                   through, so it never stands between the reader and the room.
+                   Local, so leaving the room takes it at once rather than
+                   holding the pane open for its exit. -->
+              <div class="join-welcome-wrap" aria-hidden="true">
+                <div
+                  class="join-welcome"
+                  out:fly={{ y: -10, duration: prefersReducedMotion.current ? 0 : 280 }}
+                >
+                  <div class="join-welcome-badge">
+                    <span class="join-welcome-ring"></span>
+                    {#each JOIN_SPARKS as spark, i (i)}
+                      <span
+                        class="join-spark"
+                        class:alt={i % 2 === 1}
+                        style:--spark-angle="{spark.angle}deg"
+                        style:--spark-delay="{spark.delay}ms"
+                      ></span>
+                    {/each}
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M8.5 3.5L7 20.5M17 3.5l-1.5 17M3.5 9h17M3 15h17"/>
+                    </svg>
+                  </div>
+                  <div class="join-welcome-text">
+                    <strong>
+                      <bdi dir="auto">{m.channels_joined_title({ room: joinWelcome?.name ?? '' })}</bdi>
+                      {#if joinWelcome && isChannelLanguage(joinWelcome.language)}
+                        <img class="join-welcome-flag" src={channelLanguageFlagSrc(joinWelcome.language)} alt="" />
+                      {/if}
+                    </strong>
+                    <span>{m.channels_joined_body()}</span>
+                  </div>
+                </div>
+              </div>
+            {/if}
+            <ChatConversation
+              friendHash=""
+              friendName={selectedName}
+              channelId={selectedChannelId}
+              youAreBanned={selectedBanned}
+              youAreKeyBehind={selectedKeyBehind}
+              slowModeSecs={selectedSlowMode}
+              announceOnly={selectedAnnounceBlocked}
+              pinnedMsgIds={selected?.pinned_msg_ids ?? []}
+              canPin={selected?.is_owner ?? false}
+              onchannelupdate={replaceChannel}
+              memberNames={memberNames}
+              ignoredSenders={roomIgnoredKeys}
+              mentionName={$appSettings?.channel_username || $appSettings?.nickname || ''}
+              mentionCandidates={mentionCandidates}
+              focusRequest={transcriptFocus}
+              onfocusmissing={() => toast(m.channels_search_unavailable())}
+              historyStartNote={selectedHistoryNote}
+            />
+          </div>
+        {/if}
+      </section>
+
+      {#if selected}
+        <div class="members-slot" bind:this={membersSlotEl}>
+        <button
+          class="members-backdrop"
+          type="button"
+          onclick={() => void setMembersOpen(false)}
+          aria-label={m.channels_hide_members()}
+          tabindex={membersOpen ? 0 : -1}
+          inert={!membersOpen}
+        ></button>
+        <aside class="members-pane" aria-hidden={!membersOpen} inert={!membersOpen}>
+          <div class="members-header">
+            <span class="members-label">{m.channels_members()}</span>
+            <!-- Only once the roster is in hand. Falling back to the stored
+                 count put a stale number beside a body that said Loading. -->
+            {#if members.length > 0}
+              {#key memberCountBump}
+                <span class="members-count" class:bump={memberCountBump > 0}>{members.length}</span>
+              {/key}
+            {/if}
+            <button
+              class="icon-btn members-close"
+              bind:this={membersCloseEl}
+              onclick={() => void setMembersOpen(false)}
+              aria-label={m.channels_hide_members()}
+            >
+              <IconX size={14} />
+            </button>
+          </div>
+          {#if membersLoading && members.length === 0}
+            {@render memberSkeleton()}
+          {:else if membersError && members.length === 0}
+            <div class="members-empty">
+              <p class="muted list-empty">{m.channels_members_failed()}</p>
+              <button type="button" class="ghost" onclick={() => void refreshMembers(selected.channel_id)}>
+                {m.common_retry()}
+              </button>
+            </div>
+          {:else if members.length === 0 && membersFor !== selectedId}
+            {@render memberSkeleton()}
+          {:else if members.length === 0}
+            <p class="muted list-empty">{m.channels_members_empty()}</p>
+          {:else}
+            {#if members.length >= MEMBER_FILTER_FROM || memberQuery}
+              <div class="search-wrap member-filter">
+                <span class="search-icon" aria-hidden="true">
+                  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+                    <circle cx="8.5" cy="8.5" r="5.5"/><line x1="12.5" y1="12.5" x2="17" y2="17"/>
+                  </svg>
+                </span>
+                <input
+                  type="text"
+                  class="search-input"
+                  bind:value={memberQuery}
+                  placeholder={m.channels_members_filter()}
+                  aria-label={m.channels_members_filter()}
+                  spellcheck="false"
+                  autocomplete="off"
+                  onkeydown={(e) => {
+                    if (e.key !== 'Escape' || !memberQuery) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    memberQuery = '';
+                  }}
+                />
+                {#if memberQuery}
+                  <button type="button" class="search-clear" onclick={() => (memberQuery = '')} title={m.search_bar_clear()} aria-label={m.search_bar_clear()}><IconX size={12} /></button>
+                {/if}
+              </div>
+            {/if}
+            {#if shownMembers.length === 0}
+              <p class="muted list-empty">{m.channels_members_no_match()}</p>
+            {/if}
+            <ul class="member-list">
+              {#each shownMembers as mem (mem.member_pubkey)}
+                {@const presence = presenceOf(mem, presenceNow)}
+                {@const presenceLabel =
+                  presence === 'online' ? m.channels_member_online() : m.channels_member_away()}
+                {@const friendRelation = memberFriendRelation(mem)}
+                {@const ignoreScope = ignoreScopeFor($ignoredMembers, mem.member_pubkey, selectedId)}
+                {@const arriving = arrivedMembers.includes(mem.member_pubkey)}
+                <li
+                  class:banned={mem.banned}
+                  class:arrived={arriving}
+                  in:memberArrive={{ arriving }}
+                  oncontextmenu={memberHasMenu(mem) ? openCardMenu : undefined}
+                >
+                  <div
+                    class="member-avatar"
+                    class:present={presence === 'online'}
+                    class:away={presence === 'away'}
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <circle cx="12" cy="8" r="4"/>
+                      <path d="M4 21c0-4.418 3.582-8 8-8s8 3.582 8 8"/>
+                    </svg>
+                    <!-- Pops in when someone comes online while the list is
+                         open; drawn still as the list itself first appears. -->
+                    {#if presence !== 'offline'}
+                      <span
+                        class="present-dot"
+                        class:away={presence === 'away'}
+                        role="img"
+                        title={presenceLabel}
+                        aria-label={presenceLabel}
+                        in:scale={{ start: 0, duration: membersSettled && !prefersReducedMotion.current ? 320 : 0, easing: backOut }}
+                      ></span>
+                    {/if}
+                  </div>
+                  <div class="member-identity">
+                    <span class="member-name-row">
+                      <span class="member-name" title={roomMemberLabel(mem)}>
+                        <bdi dir="auto">{roomMemberLabel(mem)}</bdi>
+                      </span>
+                      {#if isChannelLanguage(mem.language)}
+                        {#each [mem.language, ...(isChannelLanguage(mem.language2) && mem.language2 !== mem.language ? [mem.language2] : [])] as code (code)}
+                          {@const languageName = channelLanguageName(code)}
+                          <img
+                            class="member-flag"
+                            src={channelLanguageFlagSrc(code)}
+                            alt={m.channels_member_language({ language: languageName })}
+                            title={m.channels_member_language({ language: languageName })}
+                          />
+                        {/each}
+                      {/if}
+                    </span>
+                    <span class="member-badges">
+                      {#if isChannelOwner(mem)}
+                        <span class="badge owner">{m.channels_owner()}</span>
+                      {:else if mem.moderator}
+                        <span class="badge">{m.channels_moderator_badge()}</span>
+                      {/if}
+                      {#if mem.banned}
+                        <span class="badge banned">{m.channels_banned_badge()}</span>
+                      {/if}
+                      {#if ignoreScope !== 'none'}
+                        <span class="badge">{ignoreScope === 'room'
+                          ? m.channels_ignored_room_badge()
+                          : m.channels_ignored_badge()}</span>
+                      {/if}
+                      {#if presence !== 'online' && mem.last_seen > 0}
+                        <span class="member-seen">
+                          {m.channels_member_last_seen({
+                            when: formatRelativeTime(mem.last_seen, presenceNow),
+                          })}
+                        </span>
+                      {/if}
+                    </span>
+                  </div>
+                  {#if memberHasMenu(mem)}
+                    {@const sendFileBlocked = selectedBanned
+                      ? m.channels_you_are_banned()
+                      : mem.banned
+                        ? m.channels_send_file_member_banned()
+                        : sendingTo.includes(mem.member_pubkey)
+                          ? m.channels_send_file_busy()
+                          : null}
+                    {@const dmBlocked = selectedBanned
+                      ? m.channels_you_are_banned()
+                      : mem.banned
+                        ? m.channels_dm_member_banned()
+                        : friendRelation === 'mutual'
+                          ? m.channels_dm_is_friend()
+                          : ignoreScope !== 'none'
+                            ? m.channels_dm_ignored()
+                            : $appSettings?.room_dm_policy === 'off'
+                              ? m.channels_dm_policy_off()
+                              : null}
+                    {@const browseBlocked = selectedBanned
+                      ? m.channels_you_are_banned()
+                      : mem.banned
+                        ? m.channels_send_file_member_banned()
+                        : !selectedLibraryMembers.has(mem.member_pubkey.toLowerCase())
+                          ? m.channels_library_member_closed()
+                          : null}
+                    <details class="card-more">
+                      <summary class="card-more-btn" title={m.common_more()} aria-haspopup="menu" aria-label={m.common_more()}>
+                        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                          <circle cx="3.5" cy="8" r="1.4"/>
+                          <circle cx="8" cy="8" r="1.4"/>
+                          <circle cx="12.5" cy="8" r="1.4"/>
+                        </svg>
+                      </summary>
+                      <!-- Unavailable items stay in the arrow-key walk with
+                           their reason said beside them, not only on hover. -->
+                      <div class="card-more-menu" role="menu">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          tabindex="-1"
+                          aria-disabled={sendFileBlocked ? 'true' : undefined}
+                          aria-describedby={sendFileBlocked ? `member-file-why-${mem.member_pubkey}` : undefined}
+                          onclick={(e) => { if (sendFileBlocked) return; closeCardMenu(e.currentTarget); handleSendFile(mem); }}
+                        >{m.channels_send_file()}{#if sendFileBlocked}<span class="menu-reason" id="member-file-why-{mem.member_pubkey}" aria-hidden="true">{sendFileBlocked}</span>{/if}</button>
+                        {#if selectedPrivate}
+                          <button
+                            type="button"
+                            role="menuitem"
+                            tabindex="-1"
+                            aria-disabled={browseBlocked ? 'true' : undefined}
+                            aria-describedby={browseBlocked ? `member-library-why-${mem.member_pubkey}` : undefined}
+                            onclick={(e) => { if (browseBlocked) return; closeCardMenu(e.currentTarget); openLibraryBrowser(mem); }}
+                          >{m.channels_library_browse()}{#if browseBlocked}<span class="menu-reason" id="member-library-why-{mem.member_pubkey}" aria-hidden="true">{browseBlocked}</span>{/if}</button>
+                        {/if}
+                        <button
+                          type="button"
+                          role="menuitem"
+                          tabindex="-1"
+                          aria-disabled={dmBlocked ? 'true' : undefined}
+                          aria-describedby={dmBlocked ? `member-dm-why-${mem.member_pubkey}` : undefined}
+                          onclick={(e) => { if (dmBlocked) return; closeCardMenu(e.currentTarget); openPrivateChat(mem.member_pubkey, mem.nickname || roomMemberLabel(mem)); }}
+                        >{m.channels_dm_message_privately()}{#if dmBlocked}<span class="menu-reason" id="member-dm-why-{mem.member_pubkey}" aria-hidden="true">{dmBlocked}</span>{/if}</button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          tabindex="-1"
+                          disabled={addingFriend.includes(mem.member_pubkey) || friendRelation !== 'none'}
+                          onclick={(e) => { closeCardMenu(e.currentTarget); handleAddFriend(mem); }}
+                        >{friendRelation === 'mutual'
+                          ? m.channels_friend_action_already()
+                          : friendRelation === 'listed'
+                            ? m.channels_friend_action_pending()
+                            : friendRelation === 'incoming'
+                              ? m.channels_friend_action_incoming()
+                              : m.channels_add_friend()}</button>
+                        <!-- Two scopes, because the same person can be
+                             tiresome in one room and worth reading in
+                             another. A global ignore hides the per-room
+                             item: narrowing it there would read as
+                             "un-ignore", which is what the entry below is
+                             for. -->
+                        {#if ignoreScope !== 'global'}
+                          <button
+                            type="button"
+                            role="menuitem"
+                            tabindex="-1"
+                            disabled={!selectedId}
+                            onclick={(e) => { closeCardMenu(e.currentTarget); if (selectedId) toggleMemberIgnoreInChannel(mem.member_pubkey, selectedId, mem.nickname); }}
+                          >{ignoreScope === 'room'
+                            ? m.channels_unignore_room()
+                            : m.channels_ignore_room()}</button>
+                        {/if}
+                        <button
+                          type="button"
+                          role="menuitem"
+                          tabindex="-1"
+                          onclick={(e) => {
+                            closeCardMenu(e.currentTarget);
+                            if (ignoreScope === 'global') toggleMemberIgnore(mem.member_pubkey, mem.nickname);
+                            else void ignoreEverywhereSilently(mem.member_pubkey, mem.nickname);
+                          }}
+                        >{ignoreScope === 'global'
+                          ? m.channels_unignore()
+                          : m.channels_ignore_everywhere()}</button>
+                        {#if canModerate}
+                          {#if mem.banned}
+                            <button
+                              type="button"
+                              role="menuitem"
+                              tabindex="-1"
+                              disabled={moderationBusy}
+                              onclick={(e) => { closeCardMenu(e.currentTarget); handleUnban(mem.member_pubkey); }}
+                            >{m.channels_unban()}</button>
+                          {:else if !isChannelOwner(mem)}
+                            <button
+                              type="button"
+                              role="menuitem"
+                              tabindex="-1"
+                              class="menu-item-danger"
+                              disabled={moderationBusy}
+                              onclick={(e) => { closeCardMenu(e.currentTarget); requestBan(mem); }}
+                            >{m.channels_ban()}</button>
+                          {/if}
+                        {/if}
+                        {#if selected.is_owner && !mem.banned && !selected.successor_id}
+                          {#if mem.moderator}
+                            <button
+                              type="button"
+                              role="menuitem"
+                              tabindex="-1"
+                              disabled={moderationBusy}
+                              onclick={(e) => { closeCardMenu(e.currentTarget); requestRemoveModerator(mem); }}
+                            >{m.channels_remove_moderator()}</button>
+                          {:else}
+                            <button
+                              type="button"
+                              role="menuitem"
+                              tabindex="-1"
+                              disabled={moderationBusy}
+                              onclick={(e) => { closeCardMenu(e.currentTarget); handleAddModerator(mem.member_pubkey); }}
+                            >{m.channels_add_moderator()}</button>
+                          {/if}
+                          {#if !transferPendingTo || transferPendingTo === mem.member_pubkey}
+                            <button
+                              type="button"
+                              role="menuitem"
+                              tabindex="-1"
+                              class="menu-item-danger"
+                              disabled={moderationBusy}
+                              onclick={(e) => { closeCardMenu(e.currentTarget); requestTransfer(mem); }}
+                            >{m.channels_transfer_ownership()}</button>
+                          {/if}
+                        {/if}
+                      </div>
+                    </details>
+                  {/if}
+                </li>
+              {/each}
+            </ul>
+          {/if}
+          {#if roomTransfers.length > 0}
+            <section
+              class="xfer-drawer"
+              aria-label={m.channels_xfer_panel_title()}
+              transition:fly={{ y: 24, duration: prefersReducedMotion.current ? 0 : 180 }}
+            >
+              <button
+                type="button"
+                class="xfer-drawer-head"
+                aria-expanded={!xferCollapsed}
+                aria-controls={xferCollapsed ? undefined : 'xfer-drawer-body'}
+                title={xferCollapsed ? m.channels_xfer_show_panel() : m.channels_xfer_hide_panel()}
+                onclick={() => (xferCollapsed = !xferCollapsed)}
+              >
+                <svg class="xfer-drawer-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M5 13V3M2.5 5.5 5 3l2.5 2.5"/>
+                  <path d="M11 3v10M8.5 10.5 11 13l2.5-2.5"/>
+                </svg>
+                <span class="members-label">{m.channels_xfer_panel_title()}</span>
+                <span class="xfer-drawer-count">{roomTransfers.length}</span>
+                {#if roomXferRate > 0}
+                  <span class="xfer-drawer-rate">{formatLiveSpeed(roomXferRate)}</span>
+                {/if}
+                <svg class="xfer-drawer-chevron" class:flipped={xferCollapsed} viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="m4 6 4 4 4-4"/>
+                </svg>
+              </button>
+              {#if !xferCollapsed}
+                <!-- Polite, not assertive: an arriving offer is worth announcing
+                     but must not cut across whatever is being read. The
+                     per-second numbers are hidden from it; the progress bar
+                     carries the figure for anyone who asks. -->
+                <div id="xfer-drawer-body" class="xfer-drawer-body" aria-live="polite" transition:slide={{ duration: prefersReducedMotion.current ? 0 : 180 }}>
+                  {#each roomTransfers as t (t.xfer_id)}
+                    {@const tone = xferTone(t)}
+                    {@const pct = xferPct(t)}
+                    {@const rate = t.status === 'active' ? xferRate(xferSamples, t.xfer_id, xferNow) : 0}
+                    {@const left = xferSecondsLeft(t.size, t.transferred, rate)}
+                    {@const busy = respondingTo.includes(t.xfer_id)}
+                    <article class="xfer-card tone-{tone}" transition:slide={{ duration: prefersReducedMotion.current ? 0 : 180 }}>
+                      <div class="xfer-card-top">
+                        <span class="xfer-dir" class:send={t.direction === 'send'} aria-hidden="true">
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            {#if t.direction === 'send'}
+                              <path d="M8 12.5v-9M4.5 7 8 3.5 11.5 7"/>
+                            {:else}
+                              <path d="M8 3.5v9M4.5 9 8 12.5 11.5 9"/>
+                            {/if}
+                          </svg>
+                        </span>
+                        <div class="xfer-text">
+                          <span class="xfer-name" title={t.name}><bdi dir="auto">{t.name}</bdi></span>
+                          <span class="xfer-meta">
+                            {#if tone === 'moving' && t.transferred > 0}
+                              {formatBytes(t.transferred)} / {formatBytes(t.size)}
+                            {:else}
+                              {formatBytes(t.size)}
+                            {/if}
+                          </span>
+                        </div>
+                      </div>
+                      {#if t.direction === 'receive' && t.risky}
+                        <p class="file-risk" role="note">
+                          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <path d="M8 1.8 14.6 13.5H1.4z"/>
+                            <path d="M8 6.2v3.4M8 11.6v.1"/>
+                          </svg>
+                          <span>{m.common_risky_file()}</span>
+                        </p>
+                      {/if}
+                      <p class="xfer-status">{transferLabel(t)}</p>
+                      {#if t.status === 'accepted' || t.status === 'active'}
+                        <div
+                          class="xfer-progress"
+                          class:indeterminate={t.transferred === 0}
+                          role="progressbar"
+                          aria-label={t.name}
+                          aria-valuemin="0"
+                          aria-valuemax={t.size}
+                          aria-valuenow={Math.min(t.transferred, t.size)}
+                          aria-valuetext="{pct}%"
+                        >
+                          <div class="xfer-progress-fill" style="width: {pct}%"></div>
+                        </div>
+                        <div class="xfer-stats" aria-hidden="true">
+                          {#if t.transferred === 0}
+                            <span>{m.channels_xfer_starting()}</span>
+                          {:else}
+                            <span class="xfer-pct">{pct}%</span>
+                            {#if rate > 0}
+                              <span class="xfer-speed">{formatLiveSpeed(rate)}</span>
+                            {/if}
+                            {#if left !== null}
+                              <span class="xfer-left">
+                                {m.channels_xfer_time_left({ time: formatDurationSecs(left) })}
+                              </span>
+                            {/if}
+                          {/if}
+                        </div>
+                      {/if}
+                      {#if t.status === 'awaiting'}
+                        <!-- Accepting while banned pulls room traffic we have no
+                             business receiving, and the backend refuses it.
+                             Denying stays open: that is how the offer clears. -->
+                        <div class="xfer-actions two">
+                          <button
+                            type="button"
+                            class="primary"
+                            disabled={busy || selectedBanned}
+                            onclick={() => handleRespondTransfer(t.xfer_id, true)}
+                          >
+                            {m.channels_xfer_accept()}
+                          </button>
+                          <button
+                            type="button"
+                            class="secondary"
+                            disabled={busy}
+                            onclick={() => handleRespondTransfer(t.xfer_id, false)}
+                          >
+                            {m.channels_xfer_decline()}
+                          </button>
+                        </div>
+                      {:else if tone === 'moving'}
+                        <div class="xfer-actions">
+                          <button
+                            type="button"
+                            class="ghost xfer-cancel"
+                            disabled={busy}
+                            onclick={() => handleCancelTransfer(t.xfer_id)}
+                          >
+                            {m.common_cancel()}
+                          </button>
+                        </div>
+                      {:else if t.status === 'complete' && t.direction === 'receive' && !isServer}
+                        <div class="xfer-actions">
+                          <button
+                            type="button"
+                            class="secondary"
+                            onclick={() =>
+                              void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
+                          >
+                            {m.chat_attach_show()}
+                          </button>
+                        </div>
+                      {:else if t.status === 'complete' && t.direction === 'receive'}
+                        <div class="xfer-actions">
+                          <button
+                            type="button"
+                            class="secondary"
+                            onclick={() =>
+                              void saveChannelTransfer(t.xfer_id).catch((e) => toastError(translateError(e)))}
+                          >
+                            {m.server_save_to_computer()}
+                          </button>
+                        </div>
+                      {/if}
+                    </article>
+                  {/each}
+                </div>
+              {/if}
+            </section>
+          {/if}
+        </aside>
+        </div>
+      {/if}
+    </div>
   {/if}
 </div>
 

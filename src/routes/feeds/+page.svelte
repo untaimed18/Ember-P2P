@@ -29,6 +29,7 @@
     markFeedRead,
     openFeedFolder,
     openFeedItem,
+    saveFeedItem,
     publishFeed,
     refreshFeed,
     setDiscoveredFeedHidden,
@@ -78,7 +79,6 @@
     startDiscoverWalk,
   } from '$lib/stores/feeds';
   import { noteUiActivity } from '$lib/uiStall';
-  import { appSettings } from '$lib/stores/settings';
   import { toastsFor } from '$lib/stores/toast';
   const { addActionToast, toastError, toastSuccess, toastWarning } = toastsFor('feeds');
   import { menuKeydown } from '$lib/a11y';
@@ -103,7 +103,6 @@
   type Tab = 'following' | 'discover' | 'mine';
   /** The tab left open on the last visit; Discover's walk starts on mount. */
   let tab = $state<Tab>(feedsPageMemory.tab);
-  let emberOff = $derived($appSettings?.ember_native_enabled === false);
   /** The inline card for following a link or starting a feed. */
   let compose = $state<'follow' | 'create' | null>(null);
   let listQuery = $state('');
@@ -366,7 +365,7 @@
    *  its publisher may have stopped publishing it. Not while we were the
    *  ones offline, which `checked_at` (an answered lookup) rules out. */
   const notSeen = (f: FollowedFeed) =>
-    !emberOff && !noList(f) && f.seen_at > 0 && f.checked_at - f.seen_at >= NOT_SEEN_SECS;
+    !noList(f) && f.seen_at > 0 && f.checked_at - f.seen_at >= NOT_SEEN_SECS;
 
   /** The line under a followed feed's name in the list. */
   function followedSub(f: FollowedFeed): string {
@@ -1073,10 +1072,7 @@
   function stateText(f: FollowedFeed): StripState | null {
     // Nothing more will come of a deleted feed: its own notice says so.
     if (f.deleted) return null;
-    const strip = feedState(f);
-    // Nothing runs while the network is off: no spinner promising otherwise.
-    if (strip?.busy && emberOff) return { text: m.feeds_state_paused_off(), warn: true, busy: false, retry: false };
-    return strip;
+    return feedState(f);
   }
 
   /** `spoken`, when set, is what a screen reader is told instead of `text`:
@@ -1330,7 +1326,7 @@
 
   /** Walk the index, or take in the walk running since an earlier visit. */
   async function walkDiscover() {
-    if (discovering || emberOff || destroyed) return;
+    if (discovering || destroyed) return;
     const { walk, result } = startDiscoverWalk();
     discoverWalk = walk;
     discovering = true;
@@ -2116,7 +2112,7 @@
         {compose === 'follow' ? m.common_cancel() : m.feeds_follow_a_feed()}
       </button>
     {:else if tab === 'discover'}
-      <button type="button" class="secondary refresh-btn" disabled={discovering || emberOff} onclick={() => void walkDiscover()}>
+      <button type="button" class="secondary refresh-btn" disabled={discovering} onclick={() => void walkDiscover()}>
         {#if discovering}
           <span class="spinner xs" aria-hidden="true"></span>
           {m.feeds_discover_searching()}
@@ -2147,12 +2143,6 @@
     {/if}
   </div>
 </div>
-
-{#if emberOff}
-  <div class="warning-banner" role="status">
-    <span><strong>{m.channels_disabled_title()}</strong> · {m.feeds_disabled_body()}</span>
-  </div>
-{/if}
 
 <div class="page-content feeds-page">
   {#key tab}
@@ -2334,7 +2324,7 @@
                           type="button"
                           class="icon-btn"
                           class:spinning={refreshing}
-                          disabled={refreshing || emberOff}
+                          disabled={refreshing}
                           title={m.feeds_refresh()}
                           aria-label={m.feeds_refresh()}
                           onclick={() => void refreshSelected()}
@@ -2396,7 +2386,7 @@
                         <span class="state-text">{strip.text}</span>
                       {/if}
                       {#if strip.retry}
-                        <button type="button" class="pill-btn strip-btn" disabled={refreshing || emberOff} onclick={() => void refreshSelected()}>
+                        <button type="button" class="pill-btn strip-btn" disabled={refreshing} onclick={() => void refreshSelected()}>
                           {m.common_retry()}
                         </button>
                       {/if}
@@ -2619,6 +2609,18 @@
                                   <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
                                 </svg>
                               </button>
+                            {:else}
+                              <button
+                                type="button"
+                                class="icon-btn"
+                                title={m.server_save_to_computer()}
+                                aria-label={m.server_save_named({ name: item.name })}
+                                onclick={() => void openItem(item, saveFeedItem)}
+                              >
+                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                  <path d="M8 2.5v8"/><path d="M4.5 7 8 10.5 11.5 7"/><path d="M2.5 13.5h11"/>
+                                </svg>
+                              </button>
                             {/if}
                           </div>
                         {:else if item.status === 'downloading' || item.status === 'queued' || item.status === 'paused'}
@@ -2739,27 +2741,6 @@
                     <span class="skel skel-line" style:width="55%"></span>
                   </div>
                 {/each}
-              </div>
-            </div>
-          </div>
-        {:else if discovered.length === 0 && emberOff && !discovering}
-          <div class="empty-card">
-            <div class="empty-state">
-              <span class="empty-glyph">{@render feedGlyph()}</span>
-              <p class="empty-title">{m.channels_disabled_title()}</p>
-              <p class="empty-sub">{m.feeds_discover_off_body()}</p>
-              <div class="empty-actions">
-                <button type="button" class="primary empty-action" onclick={() => void goto('/ember').catch(() => {})}>
-                  {m.settings_open_page({ page: m.nav_ember_network() })}
-                </button>
-                <button
-                  type="button"
-                  class="secondary empty-action"
-                  onclick={() => {
-                    setTab('following');
-                    compose = 'follow';
-                  }}
-                >{m.feeds_follow_a_feed()}</button>
               </div>
             </div>
           </div>
@@ -3017,7 +2998,7 @@
                       {feed.published_at > 0
                         ? m.feeds_published_short({ when: ago(feed.published_at) })
                         : m.feeds_items_count({ count: formatNumber(feed.items.length) })}
-                      {#if feed.published_at > 0 && (feed.followers || !emberOff)}
+                      {#if feed.published_at > 0}
                         <span aria-hidden="true"> · </span>{feed.followers ? followersText(feed.followers) : m.feeds_followers_counting()}
                       {/if}
                       {#if feed.listed && feed.published_at > 0}<span aria-hidden="true"> · </span>{m.feeds_badge_listed()}{/if}
@@ -3074,8 +3055,7 @@
                         <span class="has-hint" title={m.feeds_followers_hint({ when: ago(mineFeed.followers.checked_at) })}>
                           {followersText(mineFeed.followers)}
                         </span>
-                      {:else if mineFeed.published_at > 0 && !emberOff}
-                        <!-- Not counted yet: nothing is counted while the network is off. -->
+                      {:else if mineFeed.published_at > 0}
                         <span aria-hidden="true">·</span>
                         <span>{m.feeds_followers_counting()}</span>
                       {/if}
@@ -3147,7 +3127,7 @@
                   </span>
                   <ToggleSwitch
                     checked={listedSwitch}
-                    disabled={listing || busy || (emberOff && mineFeed.published_at > 0)}
+                    disabled={listing || busy}
                     ariaLabel={m.feeds_listed_toggle()}
                     onchange={(on) => void toggleListed(on)}
                   />
@@ -3264,8 +3244,8 @@
                 </div>
 
                 <footer class="editor-foot">
-                  <p class="hint" class:up-to-date={upToDate} class:publish-off={emberOff && !upToDate} id="feeds-publish-hint">
-                    {upToDate ? m.feeds_publish_up_to_date_title() : emberOff ? m.feeds_disabled_body() : m.feeds_publish_public_hint()}
+                  <p class="hint" class:up-to-date={upToDate} id="feeds-publish-hint">
+                    {upToDate ? m.feeds_publish_up_to_date_title() : m.feeds_publish_public_hint()}
                   </p>
                   <div class="editor-foot-actions">
                     <button
@@ -3280,8 +3260,8 @@
                     <button
                       type="button"
                       class="primary"
-                      disabled={busy || emberOff || upToDate || titleMissing}
-                      aria-describedby={titleMissing ? 'feeds-title-required' : upToDate || emberOff ? 'feeds-publish-hint' : undefined}
+                      disabled={busy || upToDate || titleMissing}
+                      aria-describedby={titleMissing ? 'feeds-title-required' : upToDate ? 'feeds-publish-hint' : undefined}
                       onclick={() => void publish()}
                     >
                       {#if publishing}
@@ -3925,10 +3905,6 @@
   .detail-meta .unsaved {
     color: var(--badge-warning-text);
     font-weight: 600;
-  }
-
-  .hint.publish-off {
-    color: var(--badge-warning-text);
   }
 
   .status-dot {

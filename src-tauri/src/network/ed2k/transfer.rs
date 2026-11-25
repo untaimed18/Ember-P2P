@@ -1788,6 +1788,11 @@ mod tests {
                 Permanent,
                 C::RemoteMissingFile,
             ),
+            (
+                "peer does not have the file any more (FileNotFound while queued)",
+                Permanent,
+                C::RemoteMissingFile,
+            ),
             ("FileReqAnsNoFil", Permanent, C::RemoteMissingFile),
             (EMBER_BLAKE3_MISMATCH_MSG, Permanent, C::EmberContentHashMismatch),
             (

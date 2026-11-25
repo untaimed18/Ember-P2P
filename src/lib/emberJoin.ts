@@ -20,7 +20,7 @@ export const EMBER_JOIN_DWELL_MS = 10_000;
 
 export interface EmberJoinTracker {
   /** Feed one readiness sample. */
-  update(enabled: boolean, verified: number, now?: number): void;
+  update(verified: number, now?: number): void;
   /** Cancel the pending timeout. */
   stop(): void;
 }
@@ -48,15 +48,7 @@ export function createEmberJoinTracker(onChange: (timedOut: boolean) => void): E
   }
 
   return {
-    update(enabled, verified, now = Date.now()) {
-      if (!enabled) {
-        clearTimer();
-        joinSince = null;
-        joinedSince = null;
-        setExpired(false);
-        return;
-      }
-
+    update(verified, now = Date.now()) {
       if (verified > 0) {
         if (joinedSince === null) joinedSince = now;
         // Stop the timer straight away so a join in progress cannot flash the

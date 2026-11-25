@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
 import { isServer } from '$lib/runtime';
-import { pickAndUpload } from '$lib/runtime/web/files';
+import { pickAndUpload, saveOffered } from '$lib/runtime/web/files';
 
 export interface ChannelInfo {
   channel_id: string;
@@ -686,5 +686,11 @@ export async function confirmRoomDeletedElsewhere(channelId: string, del: boolea
  *  unlike `Downloads`. */
 export async function openChannelFilesFolder(): Promise<void> {
   return invoke('open_channel_files_folder');
+}
+
+/** emberd: save a file received in a room, or fetched from its library, to
+ *  this browser's computer. */
+export async function saveChannelTransfer(xferId: string): Promise<void> {
+  saveOffered(await invoke<string>('save_channel_transfer', { xferId }));
 }
 

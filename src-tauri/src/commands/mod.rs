@@ -18,13 +18,16 @@ pub(crate) fn js_safe_token() -> u64 {
 const MAX_PICKER_TITLE_CHARS: usize = 120;
 
 /// The title for a native file or folder picker: the renderer's translation,
-/// or `fallback` when it sent none. Control characters are dropped and the
-/// length capped, since whatever arrives is drawn in OS chrome.
+/// or `fallback` when it sent none. Control, invisible and direction-override
+/// characters are dropped, as from an error's context, and the length capped,
+/// since whatever arrives is drawn in OS chrome.
 pub(crate) fn picker_title(title: Option<String>, fallback: &str) -> String {
     title
         .map(|t| {
             t.chars()
-                .filter(|c| !c.is_control())
+                .filter(|c| {
+                    !c.is_control() && !matches!(*c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2066..=0x2069 | 0xFEFF)
+                })
                 .take(MAX_PICKER_TITLE_CHARS)
                 .collect::<String>()
                 .trim()
@@ -44,6 +47,7 @@ mod tests {
         assert_eq!(picker_title(Some("   ".into()), "Choose"), "Choose");
         assert_eq!(picker_title(Some("Datei wählen".into()), "Choose"), "Datei wählen");
         assert_eq!(picker_title(Some("a\nb\u{7}c".into()), "Choose"), "abc");
+        assert_eq!(picker_title(Some("\u{202E}exe.txt\u{2066}\u{200B}".into()), "Choose"), "exe.txt");
         assert_eq!(picker_title(Some("x".repeat(500)), "Choose").chars().count(), 120);
     }
 

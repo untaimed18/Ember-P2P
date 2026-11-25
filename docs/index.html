@@ -24,6 +24,7 @@
     <nav class="header-nav" aria-label="Primary">
       <a href="index.html#features" class="nav-opt">Features</a>
       <a href="guide.html">Guide</a>
+      <a href="emberd.html" class="nav-opt">emberd</a>
       <a href="index.html#releases" class="nav-opt">Releases</a>
       <a href="guide.html#faq" class="nav-opt">FAQ</a>
       <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener" class="icon-link nav-opt" aria-label="Ember on GitHub"><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a>
@@ -176,6 +177,7 @@
       </div>
       <p class="meta">Windows 10 or 11, 64-bit &middot; Linux x86-64: the <code>.deb</code> with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later), the AppImage with glibc 2.39 or newer (Ubuntu 24.04, Debian 13, Fedora 40 and later) and FUSE 2 &middot; <a href="guide.html#installation">System requirements and updates</a></p>
       <!-- downloads:end -->
+      <p class="meta" style="margin-top: 10px;">For a home server, a NAS or Docker: <a href="emberd.html">emberd</a>, Ember with no window, driven from a web browser.</p>
     </div>
   </section>
 
@@ -186,6 +188,58 @@
           <h2>Release notes</h2>
           <p>Every Ember release, newest first. These are the same notes published on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
         </div>
+
+        <article class="release" id="release-1-8-1">
+              <div class="release-header">
+                <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.8.1" target="_blank" rel="noopener">Ember v1.8.1</a></h3>
+                <time class="release-date" datetime="2026-11-25">November 25, 2026</time>
+              </div>
+              <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.8.1" target="_blank" rel="noopener"><code>v1.8.1</code></a></p>
+              <div class="release-notes">
+                <p>Cancelling a download that others were taking parts of now stops their uploads at once, Ember no longer uses any library with a published security advisory, and the eD2K server log and the rest of the wording the 1.8.0 checks left are in all ten languages. And emberd catches up with the desktop app: it saves every file it keeps to your computer, makes collections, imports from an eMule folder you name, and shares every Ember release.</p>
+
+                <h4>Before you upgrade</h4>
+
+                <ul>
+                  <li><strong>The Ember DHT wire version is unchanged at version 4, and no channel format changes,</strong> so 1.8.1 works with everyone 1.8.0 works with</li>
+                  <li><strong>Secure identification is unchanged on the wire.</strong> Ember&rsquo;s new RSA library makes the same keys and signatures byte for byte, so eMule and Ember peers that already know you see no difference</li>
+                </ul>
+
+                <h4>What&rsquo;s New</h4>
+
+                <h5>emberd</h5>
+                <ul>
+                  <li><strong>Save to this computer for every file emberd keeps:</strong> a followed feed&rsquo;s files, a friend&rsquo;s attachments, and files received in a channel or fetched from its library, where the desktop app has <em>Open</em> and <em>Show in folder</em></li>
+                  <li><strong>Create a collection</strong> in the Library; the browser saves it</li>
+                  <li><strong>Import from an eMule or aMule folder you name,</strong> under the folders the config lists in <code>browse_under</code>. An import on emberd shares only folders under <code>browse_under</code>, takes unfinished downloads only from those or the eMule folder itself, and leaves the download folder to the config. Before, an import found in the usual places was not held to these</li>
+                  <li><strong>Share every Ember release,</strong> in Settings &gt; About: emberd checks for a new release each hour, as the desktop app does, and shares its installers, collection and notes once each checks out against the release signature</li>
+                </ul>
+
+                <h4>What&rsquo;s Fixed</h4>
+
+                <ul>
+                  <li><strong>Uploads:</strong> cancelling a download that other users were taking parts of from you stops their uploads at once; the upload used to show and vanish five to ten times first. A peer asking for a file you cancelled, deleted, unshared or made friends-only is told you no longer have it, rather than being put back in the queue for it</li>
+                  <li><strong>Downloads:</strong> Ember stops waiting in a peer&rsquo;s queue as soon as that peer says it no longer has the file, and drops it as a source, as eMule does</li>
+                  <li><strong>KAD:</strong> the firewall tile says <em>Checking</em> until KAD&rsquo;s own check or an eD2K server&rsquo;s answer settles it, rather than <em>Firewalled</em> from what UPnP reported alone</li>
+                  <li><strong>Connect through:</strong> an interface that drops just as Ember goes online is waited for again, rather than reported as the TCP port being in use, which left the session without incoming connections. Shared folders due to be checked while Ember waits for the interface are checked once it is back, and the log no longer calls that a failure</li>
+                  <li><strong>Channels:</strong> a member past the hour&rsquo;s mail allowance no longer holds up the mail of every other conversation. The notice for a channel deleted on another of your devices reads as one sentence with the channel&rsquo;s name in bold, in every language</li>
+                  <li><strong>Channels you own on two devices:</strong> when the two devices&rsquo; bans together come to more than the 12 a channel carries, the oldest are lifted on both, as the members see it, rather than on one device alone. A device that has not heard from the network for six hours still renews the channel, but changes a private channel&rsquo;s key only once it has, so it cannot use a key the other device already did. And a member you unbanned stays unbanned when the member list is full</li>
+                  <li><strong>eD2K Servers:</strong> the server log is in your language, and says why a connection failed or ended (the server refused it, did not answer, could not be found, and so on) rather than giving the operating system&rsquo;s error. Pointing at a line shows the error as it came. What a server writes itself is shown as it sent it</li>
+                  <li><strong>Feeds:</strong> <em>Share files from this feed</em> works when the download folder is shared only in part or without its subfolders: the feed&rsquo;s folder joins your shared folders and leaves them when the feed stops sharing, and cannot be unshared by hand meanwhile</li>
+                  <li><strong>Deleting files:</strong> Ember names the Trash on Linux and the Recycle Bin on Windows. emberd deletes files outright, since nothing empties a trash on a server, and its pages say so</li>
+                  <li><strong>emberd&rsquo;s Docker image:</strong> 1.8.0&rsquo;s was pushed for each machine on its own but never joined into one, so <code>docker pull ghcr.io/untaimed18/emberd</code> found nothing. From 1.8.1 it is published as <code>latest</code>, <code>1.8</code> and <code>1.8.1</code>, for x86-64 and ARM64 alike</li>
+                  <li><strong>eMule import:</strong> an Incoming folder Ember cannot use as its download folder says so in your language, rather than in English inside <em>Could not prepare the import</em></li>
+                  <li><strong>File pickers:</strong> the windows for choosing an IP filter, a backup, a media player or a web services list have translated titles and file types</li>
+                  <li><strong>Security:</strong> new versions of SQLite, the updater&rsquo;s zip library and two smaller libraries close their published advisories, and secure identification moves to a new RSA library that closes the Marvin timing attack (RUSTSEC-2023-0071). Every build is now checked for new advisories</li>
+                  <li><strong>Security page:</strong> the security policy&rsquo;s state no longer carries Ember&rsquo;s internal error text to the page, where it could include a file path; it goes to the log</li>
+                </ul>
+
+                <p class="full-changelog">
+                  <strong>Full Changelog</strong>
+                  <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.8.0...v1.8.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.8.0...v1.8.1</a>
+                </p>
+              </div>
+            </article>
 
         <article class="release" id="release-1-8-0">
               <div class="release-header">
@@ -3514,6 +3568,7 @@
     <div>&copy; 2025&ndash;2026 Ember. Released under the GPLv3 License.</div>
     <nav class="footer-links" aria-label="Footer">
       <a href="guide.html">Guide</a>
+      <a href="emberd.html">emberd</a>
       <a href="index.html#releases">Release notes</a>
       <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener">GitHub</a>
       <a href="https://github.com/untaimed18/Ember-P2P/issues" target="_blank" rel="noopener">Report an issue</a>

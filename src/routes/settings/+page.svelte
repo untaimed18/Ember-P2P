@@ -170,6 +170,7 @@
   import { networkStats } from '$lib/stores/network';
   import { isShortcutLetter } from '$lib/shortcutKey';
   import { isServer } from '$lib/runtime';
+  import { binIsRecycleBin } from '$lib/platform';
   import { changePassword, logOut } from '$lib/runtime/web/session';
   import { askForBrowserNotifications, browserNotificationState } from '$lib/notifications';
 
@@ -241,12 +242,13 @@
   // Silent updates. `supported` is the backend's answer for this install;
   // the status line describes what the saved setting is doing right now.
   // Sharing every release starts with the next update check, which can be an
-  // hour away: run one as soon as the setting is saved on.
+  // hour away: run one as soon as the setting is saved on. emberd, which has
+  // no update check, starts its own when the setting is saved.
   let seedingWasOn: boolean | null = null;
   $effect(() => {
     const on = $appSettings?.seed_ember_releases;
     if (on === undefined) return;
-    if (seedingWasOn === false && on) void checkForUpdates({ silent: true });
+    if (seedingWasOn === false && on && !isServer) void checkForUpdates({ silent: true });
     seedingWasOn = on;
   });
   const silentSupported = $derived($silentUpdate?.supported ?? false);
@@ -4007,11 +4009,12 @@
             </div>
             <!-- Turning it on raises a native confirmation from the backend;
                  declining it leaves the save holding the Recycle Bin, which
-                 the switch then shows again. -->
+                 the switch then shows again. emberd always deletes outright. -->
+            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="delete-permanently-label" for="delete-permanently-switch">{m.settings_delete_permanently()}</label>
-                <span class="hint" id="delete-permanently-hint">{m.settings_delete_permanently_hint()}</span>
+                <span class="hint" id="delete-permanently-hint">{binIsRecycleBin() ? m.settings_delete_permanently_hint() : m.settings_delete_permanently_hint_trash()}</span>
               </div>
               <ToggleSwitch
                 id="delete-permanently-switch"
@@ -4020,6 +4023,7 @@
                 ariaDescribedby="delete-permanently-hint"
               />
             </div>
+            {/if}
             <!-- emberd's pages do not watch the clipboard (+layout.svelte). -->
             {#if !isServer}
             <div class="field toggle-row">
@@ -6224,9 +6228,6 @@
             </div>
             {/if}
 
-            <!-- Releases are fetched by the desktop app's updater, which emberd
-                 does not have. -->
-            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="seed-releases-label" for="seed-releases-switch">{m.settings_seed_ember_releases()}</label>
@@ -6239,7 +6240,6 @@
                 ariaDescribedby="seed-releases-hint"
               />
             </div>
-            {/if}
           </div>
         </div>
       </section>

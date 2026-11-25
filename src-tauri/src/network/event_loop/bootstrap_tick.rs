@@ -560,9 +560,12 @@ pub(in crate::network) async fn on_bootstrap_tick(
 
     // Register with the rendezvous server as soon as we have a
     // confirmed external IP so other Ember clients can find us.
+    // Not while the chosen interface is away: the QUIC endpoint made here is
+    // made once, and would be made without its socket.
     if !state.friend_presence_initial_done
         && state.external_ip.is_some()
         && !*rendezvous_register_in_flight
+        && crate::net_bind::binding() != crate::net_bind::Binding::Unavailable
     {
         // Initialize the LowID-to-LowID connection broker
         // **before** registering with rendezvous. Rendezvous
@@ -754,6 +757,17 @@ pub(in crate::network) async fn on_bootstrap_tick(
                                     });
                                 }));
                             }
+                        }
+                        // Gone in the seconds before the watch saw it: this
+                        // tick ends here, and the next makes the endpoint
+                        // once the interface is back.
+                        Err(e)
+                            if e.chain()
+                                .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                                .any(crate::net_bind::interface_away) =>
+                        {
+                            tracing::warn!("Broker: the chosen network interface went before QUIC could bind; trying again once it is back");
+                            return;
                         }
                         Err(e) => {
                             tracing::warn!("Broker: failed to create QUIC endpoint: {e}");

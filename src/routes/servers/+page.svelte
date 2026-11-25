@@ -35,6 +35,7 @@
   import { toastError } from '$lib/stores/toast';
   import { serverStatus } from '$lib/stores/network';
   import { serverLog, appendServerLog, clearServerLog } from '$lib/stores/serverLog';
+  import { serverLogDetail, serverLogText } from '$lib/serverLogText';
   import IconX from '$lib/components/IconX.svelte';
   import { TableWindow } from '$lib/tableWindow.svelte';
   import { pickBestServer } from '$lib/bestServer';
@@ -1562,9 +1563,9 @@
         <span class="log-placeholder">{m.servers_log_placeholder()}</span>
       {:else}
         {#each $serverLog as entry (entry.id)}
-          <div class="log-line">
+          <div class="log-line" title={serverLogDetail(entry)}>
             <span class="log-time">{formatLogTime(entry.at)}</span>
-            <bdi dir="auto">{entry.message}</bdi>
+            <bdi dir="auto">{serverLogText(entry)}</bdi>
           </div>
         {/each}
       {/if}

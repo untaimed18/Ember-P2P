@@ -29,6 +29,7 @@
   import { startRelatedSearch } from '$lib/relatedSearch';
   import { previewFile } from '$lib/api/preview';
   import { isServer } from '$lib/runtime';
+  import { binIsRecycleBin } from '$lib/platform';
   import { saveToThisComputer } from '$lib/runtime/web/files';
   import { addFriend, getFriends } from '$lib/api/friends';
   import { beginFriendsListFetch, commitFriendsList } from '$lib/stores/friends';
@@ -4554,23 +4555,37 @@
 
   /** The prompt's line about finished downloads whose file is deleted. */
   function deleteFinishedMessage(count: number, name: string): string {
-    const permanently = $appSettings?.delete_permanently === true;
+    const permanently = deletesPermanently();
+    const recycleBin = binIsRecycleBin();
     if (count === 1 && name) {
-      return permanently
-        ? m.transfers_confirm_delete_finished_permanent_named({ name })
-        : m.transfers_confirm_delete_finished_bin_named({ name });
+      if (permanently) return m.transfers_confirm_delete_finished_permanent_named({ name });
+      return recycleBin
+        ? m.transfers_confirm_delete_finished_bin_named({ name })
+        : m.transfers_confirm_delete_finished_trash_named({ name });
     }
+    const n = formatNumber(count);
     return permanently
       ? plural(count, {
-          one: () => m.transfers_confirm_delete_finished_permanent_one({ count: formatNumber(count) }),
+          one: () => m.transfers_confirm_delete_finished_permanent_one({ count: n }),
           // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
-          other: () => m.transfers_confirm_delete_finished_permanent_other({ count: formatNumber(count) }),
+          other: () => m.transfers_confirm_delete_finished_permanent_other({ count: n }),
         })
-      : plural(count, {
-          one: () => m.transfers_confirm_delete_finished_bin_one({ count: formatNumber(count) }),
-          // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
-          other: () => m.transfers_confirm_delete_finished_bin_other({ count: formatNumber(count) }),
-        });
+      : plural(count, recycleBin
+        ? {
+            one: () => m.transfers_confirm_delete_finished_bin_one({ count: n }),
+            // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
+            other: () => m.transfers_confirm_delete_finished_bin_other({ count: n }),
+          }
+        : {
+            one: () => m.transfers_confirm_delete_finished_trash_one({ count: n }),
+            other: () => m.transfers_confirm_delete_finished_trash_other({ count: n }),
+          });
+  }
+
+  /** Whether deleting a file skips the Recycle Bin: the user's choice, and
+   *  always on emberd, where nothing on a server empties its trash. */
+  function deletesPermanently(): boolean {
+    return isServer || $appSettings?.delete_permanently === true;
   }
 
   /** Delete the files of finished downloads and take them off the list. Not
@@ -4592,18 +4607,24 @@
           checkedDownloadIds = checkedDownloadIds.filter((id) => !removed.has(id));
         }
         if (focusedDlId && removed.has(focusedDlId)) focusedDlId = null;
-        const permanently = $appSettings?.delete_permanently === true;
+        const permanently = deletesPermanently();
         showInfo(permanently
           ? plural(removed.size, {
               one: () => m.transfers_deleted_finished_permanent_one({ count: formatNumber(removed.size) }),
               oneShowsCount: true,
               other: () => m.transfers_deleted_finished_permanent_other({ count: formatNumber(removed.size) }),
             })
-          : plural(removed.size, {
-              one: () => m.transfers_deleted_finished_bin_one({ count: formatNumber(removed.size) }),
-              oneShowsCount: true,
-              other: () => m.transfers_deleted_finished_bin_other({ count: formatNumber(removed.size) }),
-            }));
+          : plural(removed.size, binIsRecycleBin()
+            ? {
+                one: () => m.transfers_deleted_finished_bin_one({ count: formatNumber(removed.size) }),
+                oneShowsCount: true,
+                other: () => m.transfers_deleted_finished_bin_other({ count: formatNumber(removed.size) }),
+              }
+            : {
+                one: () => m.transfers_deleted_finished_trash_one({ count: formatNumber(removed.size) }),
+                oneShowsCount: true,
+                other: () => m.transfers_deleted_finished_trash_other({ count: formatNumber(removed.size) }),
+              }));
       }
       if (report.failed.length > 0) {
         const more = report.failed.length > 1 ? m.transfers_batch_failed_more({ count: report.failed.length - 1 }) : '';
@@ -8016,7 +8037,11 @@
       : '',
   ].filter(Boolean).join('\n\n')}
   confirmLabel={confirmBatchCancel.count === 0
-    ? ($appSettings?.delete_permanently ? m.transfers_confirm_delete_finished_permanent_label() : m.transfers_confirm_delete_finished_bin_label())
+    ? (deletesPermanently()
+      ? m.transfers_confirm_delete_finished_permanent_label()
+      : binIsRecycleBin()
+        ? m.transfers_confirm_delete_finished_bin_label()
+        : m.transfers_confirm_delete_finished_trash_label())
     : m.transfers_confirm_batch_cancel_label()}
   danger={true}
   onconfirm={async () => {

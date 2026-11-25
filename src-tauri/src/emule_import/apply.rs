@@ -656,7 +656,7 @@ mod tests {
     fn emule_cryptkey() -> Vec<u8> {
         use base64::Engine as _;
         use rsa::pkcs8::EncodePrivateKey;
-        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 384).unwrap();
+        let key = rsa::PrivateKey::new_unchecked(&mut getrandom_sys::SysRng, 384).unwrap();
         let encoded = base64::engine::general_purpose::STANDARD.encode(key.to_pkcs8_der().unwrap().as_bytes());
         // Crypto++ breaks its base64 every 72 columns.
         encoded
@@ -898,6 +898,84 @@ mod tests {
         )
         .unwrap();
         (root, part, data, downloads, preview)
+    }
+
+    /// On emberd an import keeps to its `browse_under` folders: a shared folder
+    /// or a download outside them is shown as such and never staged, and
+    /// eMule's Incoming folder never becomes the download folder, which is the
+    /// config's.
+    #[test]
+    fn an_import_on_emberd_keeps_to_its_browse_under_folders() {
+        let _serial = serial();
+        let root = scratch("bounded");
+        let allowed = root.join("allowed");
+        let emule = allowed.join("eMule").join("config");
+        let temp = allowed.join("eMule").join("Temp");
+        let incoming = allowed.join("eMule").join("Incoming");
+        let shared = allowed.join("Shared");
+        let elsewhere = root.join("elsewhere");
+        let elsewhere_temp = elsewhere.join("Temp");
+        let data = root.join("data");
+        let downloads = root.join("dl");
+        for dir in [&emule, &temp, &incoming, &shared, &elsewhere_temp, &data, &downloads] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            emule.join("preferences.ini"),
+            format!(
+                "[eMule]\nIncomingDir={}\nTempDir={}\nTempDirs={}\n",
+                incoming.display(),
+                temp.display(),
+                elsewhere_temp.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(emule.join("shareddir.dat"), format!("{}\n{}\n", shared.display(), elsewhere.display())).unwrap();
+        for (dir, hash, name) in [(&temp, 0x71, "inside.iso"), (&elsewhere_temp, 0x72, "outside.iso")] {
+            let part = dir.join("001.part");
+            std::fs::write(&part, vec![1u8; 500]).unwrap();
+            let mut tracker = PartTracker::new(500, &part);
+            tracker.set_file_hash([hash; 16]);
+            tracker.set_file_name(name);
+            tracker.save();
+        }
+
+        let source = register_source(&emule).unwrap();
+        let preview = scan(
+            source.id,
+            &ScanContext {
+                data_dir: data.clone(),
+                bounds: Some(vec![allowed.clone()]),
+                ..ScanContext::default()
+            },
+        )
+        .unwrap();
+        let status_of = |name: &str| preview.downloads.iter().find(|d| d.name == name).map(|d| d.status);
+        assert_eq!(status_of("inside.iso"), Some(DownloadStatus::Ready));
+        assert_eq!(status_of("outside.iso"), Some(DownloadStatus::OutsideServer));
+        let folder_status = |dir: &PathBuf| {
+            let shown = crate::commands::share_browser::display_fs_path(&dir.canonicalize().unwrap());
+            preview.shared_folders.iter().find(|f| f.path == shown).map(|f| f.status)
+        };
+        assert_eq!(folder_status(&shared), Some(FolderStatus::Ready));
+        assert_eq!(folder_status(&elsewhere), Some(FolderStatus::OutsideServer));
+
+        let selection = EmuleImportSelection {
+            token: preview.token,
+            incoming_as_download_folder: true,
+            shared_folders: (0..preview.shared_folders.len()).collect(),
+            downloads: (0..preview.downloads.len()).collect(),
+            ..EmuleImportSelection::default()
+        };
+        let summary = stage(&data, &downloads.to_string_lossy(), &selection, &mut |_| {}).unwrap();
+        assert_eq!(summary.downloads, 1, "only the download inside");
+        let manifest = read_manifest(&data).unwrap();
+        assert!(manifest.settings.download_folder.is_none(), "the config's download folder stays");
+        let outside = elsewhere.canonicalize().unwrap().to_string_lossy().into_owned();
+        assert!(!manifest.shared_folders.contains(&outside));
+        assert!(elsewhere_temp.join("001.part").exists(), "the download outside stays where it is");
+        discard(&data).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

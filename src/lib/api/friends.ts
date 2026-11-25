@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import * as m from '$lib/paraglide/messages';
 import type { FriendStatus } from '$lib/types';
 import { isServer } from '$lib/runtime';
-import { pickAndUpload } from '$lib/runtime/web/files';
+import { pickAndUpload, saveOffered } from '$lib/runtime/web/files';
 
 export interface FriendInfo {
   user_hash: string;
@@ -323,6 +323,11 @@ export async function listChatAttachments(userHashHex: string): Promise<ChatAtta
 /** Open a received file, or with `reveal` show it in its folder. */
 export async function openChatAttachment(xferId: string, reveal: boolean): Promise<void> {
   return invoke('open_chat_attachment', { xferId, reveal });
+}
+
+/** emberd: save a received file to this browser's computer. */
+export async function saveChatAttachment(xferId: string): Promise<void> {
+  saveOffered(await invoke<string>('save_chat_attachment', { xferId }));
 }
 
 export async function openChatFilesFolder(): Promise<void> {

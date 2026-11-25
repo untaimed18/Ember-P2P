@@ -3433,6 +3433,8 @@ pub(crate) fn file_in_shared_folders(file_path: &str, shared_folders: &[String])
 /// it deleted outright, and then only after a native confirmation the
 /// renderer can neither draw nor answer. `permanently` is the user's Settings
 /// choice to skip the bin, which itself took a native confirmation to make.
+/// emberd always deletes outright, and its pages say so: a file put in a
+/// server's trash is never emptied, so its space would never come back.
 pub(crate) async fn recycle_library_file(
     app: &crate::host::AppHandle,
     path: &std::path::Path,
@@ -3440,7 +3442,7 @@ pub(crate) async fn recycle_library_file(
     expected: &crate::security::filesystem::ObjectIdentity,
     permanently: bool,
 ) -> Result<(), String> {
-    if permanently {
+    if permanently || cfg!(feature = "server") {
         return delete_file_with_retry(path, allowed_roots, expected, 6, 250).await;
     }
     // A network share has no Recycle Bin, and the shell then deletes for good
@@ -3504,12 +3506,25 @@ pub(crate) async fn recycle_library_file(
     )
     .await;
     if !confirmed {
+        // A code per platform, as the page names the bin by platform.
+        #[cfg(windows)]
         return Err(coded(
             "sharing_delete_declined",
             "The file was kept: it could not go to the Recycle Bin",
         ));
+        #[cfg(not(windows))]
+        return Err(coded(
+            "sharing_delete_declined_trash",
+            "The file was kept: it could not go to the Trash",
+        ));
     }
     delete_file_with_retry(path, allowed_roots, expected, 6, 250).await
+}
+
+/// Whether a [`recycle_library_file`] error is the user keeping the file at
+/// the delete-permanently question, under either platform's code.
+pub(crate) fn delete_was_declined(error: &str) -> bool {
+    error.contains("\"sharing_delete_declined\"") || error.contains("\"sharing_delete_declined_trash\"")
 }
 
 /// What the native dialogs call the bin [`move_to_trash`] sends files to.
@@ -8114,6 +8129,36 @@ pub(crate) async fn offer_all_in_folder(
     Ok(paths)
 }
 
+/// Put `folder` on the list of the folder shared in part that holds it, and
+/// offer what is in it. Whether the list grew: false when no shared folder
+/// holds it, or the one that does has no list (shared whole) or names it.
+pub(crate) async fn list_in_shared_folder(
+    app: crate::host::AppHandle,
+    state: &AppState,
+    folder: &str,
+) -> Result<bool, String> {
+    let holder = {
+        let config = state.config.read().await;
+        config
+            .settings
+            .shared_folders
+            .iter()
+            .find(|shared| crate::security::path_within_dir(folder, shared))
+            .cloned()
+    };
+    let Some(holder) = holder else {
+        return Ok(false);
+    };
+    let before = FolderListsBefore::take(state).await;
+    let entries = [folder.to_string()];
+    if !extend_folder_allowlist(state, &holder, &entries, true).await? {
+        return Ok(false);
+    }
+    admit_known_files(&app, state, &before, &entries).await;
+    offer_all_in_folder(app, state, folder).await?;
+    Ok(true)
+}
+
 /// What the partly shared folders offer now, their withheld files counted.
 async fn folder_offers(state: &AppState) -> crate::sharing::indexer::AllowlistOffers {
     let config = state.config.read().await;
@@ -10002,6 +10047,16 @@ pub async fn unshare_folder(
     state: crate::host::State<'_, AppState>,
     path: String,
 ) -> Result<(), String> {
+    unshare_folder_as(app, state, path, FolderRemoval::User).await
+}
+
+/// [`unshare_folder`], saying who stops offering the folder.
+pub(crate) async fn unshare_folder_as(
+    app: crate::host::AppHandle,
+    state: crate::host::State<'_, AppState>,
+    path: String,
+    by: FolderRemoval,
+) -> Result<(), String> {
     // The allowlist and row changes below are drive-aware, so a request naming
     // a drive that is not shared would otherwise lift every allowlist on it.
     {
@@ -10011,6 +10066,14 @@ pub async fn unshare_folder(
                 "sharing_folder_not_shared",
                 "Folder is not in a shared folder",
                 &path,
+            ));
+        }
+        // A feed's folder on a partly shared folder's list: the feed's next
+        // reconcile would put it back.
+        if by == FolderRemoval::User && crate::commands::settings::is_feed_share_folder(&config.settings, &path) {
+            return Err(coded(
+                "sharing_feed_folder_managed",
+                "This feed's folder is shared because sharing is on for the feed; turn it off on the Feeds page",
             ));
         }
     }
@@ -10565,6 +10628,18 @@ pub async fn open_shared_folder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Keep file" stops a batch of deletes under either platform's code.
+    #[test]
+    fn a_kept_file_is_told_from_other_delete_failures_on_either_platform() {
+        let declined = coded("sharing_delete_declined", "kept");
+        let declined_trash = coded("sharing_delete_declined_trash", "kept");
+        assert!(delete_was_declined(&declined));
+        assert!(delete_was_declined(&declined_trash));
+        assert!(!delete_was_declined(&coded("sharing_invalid_path", "Invalid or changed path")));
+        let lookalike = r#"{"__coded":true,"code":"sharing_delete_declined_elsewhere","message":"not ours"}"#;
+        assert!(!delete_was_declined(lookalike));
+    }
 
     /// A withdrawal that meets a full command channel is delivered once there
     /// is room, without holding up the action that asked for it.

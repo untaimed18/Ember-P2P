@@ -307,7 +307,42 @@ pub async fn open_chat_attachment(
     xfer_id: String,
     reveal: bool,
 ) -> Result<(), String> {
-    let xfer_id = parse_xfer_id(&xfer_id)?;
+    let (canonical, name) = received_attachment(&state, &xfer_id).await?;
+    tokio::task::spawn_blocking(move || {
+        if reveal {
+            return crate::security::filesystem::reveal_in_file_manager(&canonical).map_err(|e| {
+                coded_ctx("transfers_open_explorer_failed", "Failed to reveal file", e)
+            });
+        }
+        if crate::security::filesystem::passive_type_agrees(&name, &canonical) {
+            crate::security::filesystem::open_with_default_app(&canonical)
+                .map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
+        } else {
+            crate::security::filesystem::reveal_in_file_manager(&canonical).map_err(|e| {
+                coded_ctx(
+                    "transfers_reveal_unsafe_file_failed",
+                    "This file type was revealed instead of opened",
+                    e,
+                )
+            })
+        }
+    })
+    .await
+    .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?
+}
+
+/// emberd: a received file, left for the browser to save (`server::saved`),
+/// found as [`open_chat_attachment`] finds it.
+#[ember_macros::command(server)]
+pub async fn save_chat_attachment(state: crate::host::State<'_, AppState>, xfer_id: String) -> Result<String, String> {
+    let (canonical, name) = received_attachment(&state, &xfer_id).await?;
+    crate::server::saved::offer_file(canonical, &name).await
+}
+
+/// A finished received attachment's file, re-resolved now and confined to the
+/// Chat Files it landed in, with the name it was sent under.
+async fn received_attachment(state: &AppState, xfer_id: &str) -> Result<(std::path::PathBuf, String), String> {
+    let xfer_id = parse_xfer_id(xfer_id)?;
     let row = {
         let db = state.db.clone();
         let id = hex::encode(xfer_id);
@@ -354,23 +389,7 @@ pub async fn open_chat_attachment(
                 "Invalid or changed download path",
             ));
         }
-        if reveal {
-            return crate::security::filesystem::reveal_in_file_manager(&canonical).map_err(|e| {
-                coded_ctx("transfers_open_explorer_failed", "Failed to reveal file", e)
-            });
-        }
-        if crate::security::filesystem::passive_type_agrees(&name, &canonical) {
-            crate::security::filesystem::open_with_default_app(&canonical)
-                .map_err(|e| coded_ctx("transfers_open_file_failed", "Failed to open file", e))
-        } else {
-            crate::security::filesystem::reveal_in_file_manager(&canonical).map_err(|e| {
-                coded_ctx(
-                    "transfers_reveal_unsafe_file_failed",
-                    "This file type was revealed instead of opened",
-                    e,
-                )
-            })
-        }
+        Ok((canonical, name))
     })
     .await
     .map_err(|e| coded_ctx("peers_task_error", "Task error", e))?

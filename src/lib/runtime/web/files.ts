@@ -30,6 +30,12 @@ export async function saveToThisComputer(path: string): Promise<void> {
   saveFrom(url);
 }
 
+/** emberd: save what a command left for this browser under `id`
+ *  (`server::saved`). Fetched once, at once. */
+export function saveOffered(id: string): void {
+  saveFrom(`/api/saved/${encodeURIComponent(id)}`);
+}
+
 /** Send a file from this computer to `emberd` at `url`: what it answered
  *  with, or a rejection with the coded error it refused with. */
 export async function uploadFile(url: string, file: File): Promise<unknown> {

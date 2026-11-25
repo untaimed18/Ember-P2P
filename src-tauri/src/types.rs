@@ -715,9 +715,6 @@ pub struct NetworkStats {
     /// Whether the last TCP mapping hold (reuseaddr connect) succeeded.
     #[serde(default)]
     pub tcp_mapping_hold_ok: bool,
-    /// Whether Ember-native (Noise DHT) is enabled — status-bar EmberDHT dot.
-    #[serde(default)]
-    pub ember_native_enabled: bool,
     /// Live Ember DHT routing-table contacts — status-bar EmberDHT peer count.
     #[serde(default)]
     pub ember_dht_contacts: u32,
@@ -774,9 +771,9 @@ pub struct NetworkStats {
 }
 
 /// Diagnostic counters for the Ember mesh (EPX, LowID broker). Surfaced
-/// via `get_ember_diagnostics`; status-bar gauges (`ember_native_enabled`,
-/// `ember_dht_contacts`, `ember_dht_verified_contacts`) also live on
-/// `NetworkStats` for the hot poll path.
+/// via `get_ember_diagnostics`; status-bar gauges (`ember_dht_contacts`,
+/// `ember_dht_verified_contacts`) also live on `NetworkStats` for the hot
+/// poll path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EmberDiagnostics {
     /// Source-exchange events accepted from a connected Ember peer this session.
@@ -826,9 +823,6 @@ pub struct EmberDiagnostics {
     /// Total bytes this node has relayed for other peers this session
     /// (in-flight sessions plus completed ones).
     pub relay_bytes_relayed: u64,
-    /// Whether the Ember-native Noise transport is currently routing
-    /// UDP packets (mirrors `AppSettings::ember_native_enabled`).
-    pub ember_native_enabled: bool,
     /// Established Noise sessions held by `EmberTransport`.
     pub ember_sessions: u32,
     /// `EmberControlMessage::Ping` packets we sent over the transport
@@ -1520,7 +1514,6 @@ impl Default for NetworkStats {
             public_udp_port: 0,
             public_tcp_port: 0,
             tcp_mapping_hold_ok: false,
-            ember_native_enabled: true,
             ember_dht_contacts: 0,
             ember_dht_verified_contacts: 0,
             secident_status: String::from("unavailable"),

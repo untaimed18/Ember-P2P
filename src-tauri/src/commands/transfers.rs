@@ -3224,7 +3224,7 @@ pub async fn delete_finished_downloads(
             Err(e) => {
                 // "Keep file" at the delete-permanently question: the rest are
                 // very likely in the same place, so stop rather than ask again.
-                let declined = e.contains("\"sharing_delete_declined\"");
+                let declined = crate::commands::sharing::delete_was_declined(&e);
                 report.failed.push(e);
                 if declined {
                     break;

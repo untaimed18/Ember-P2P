@@ -38,6 +38,9 @@ const MAX_CHANNEL_CACHE_ROWS: i64 = 500;
 /// owner re-offers only after an offer lapses or is withdrawn, so a record it
 /// can still adopt is one of the last few.
 const HANDOFF_SUPERSEDED_SEEDS_KEPT: i64 = 3;
+/// Lifted bans a room's roster keeps through eviction, newest first: two
+/// snapshots' worth, since a stale snapshot can name at most one's.
+const LIFTED_BANS_KEPT_FROM_EVICTION: usize = 2 * crate::network::ember::dht::publish::CHANNEL_BAN_LIST_MAX;
 /// A cached listing this old has been absent from the DHT for many times the
 /// index record's own lifetime, so offering it would only send the user at a
 /// room that no longer answers.
@@ -13554,8 +13557,14 @@ impl Database {
         // mop, and this device would stop honouring their ban gossip until the
         // next snapshot arrived. Both lists are bounded by the record that
         // carries them, so exempting them cannot stop eviction from working.
-        // Past the cap we only drop stale rows that are neither, never the
-        // local user, and never a still-fresh honest peer — a flood of
+        // The newest lifted bans stay as well: an unban is dated on its row,
+        // and with the row gone an older snapshot of the owner's that still
+        // bans them, from another of the owner's devices, would ban them
+        // again (`take_owned_snapshot_bans_locked`). Only the newest, since a
+        // moderator's unban gossip can name anyone; an older one evicted
+        // errs toward the ban.
+        // Past the cap we only drop stale rows that are none of these, never
+        // the local user, and never a still-fresh honest peer — a flood of
         // newcomers is refused instead.
         let live: i64 = tx.query_row(
             "SELECT COUNT(*) FROM channel_members
@@ -13574,10 +13583,23 @@ impl Database {
                        AND member_pubkey != ?2
                        AND (?3 IS NULL OR member_pubkey != ?3)
                        AND last_seen < ?4
+                       AND rowid NOT IN (
+                           SELECT rowid FROM channel_members
+                            WHERE channel_id = ?1 AND banned = 0 AND ban_revised_at > 0
+                            ORDER BY ban_revised_at DESC, member_pubkey
+                            LIMIT ?6
+                       )
                      ORDER BY last_seen ASC, member_pubkey ASC
                      LIMIT ?5
                  )",
-                params![channel_id, member_pubkey, local_pubkey, cutoff, extra],
+                params![
+                    channel_id,
+                    member_pubkey,
+                    local_pubkey,
+                    cutoff,
+                    extra,
+                    LIFTED_BANS_KEPT_FROM_EVICTION as i64
+                ],
             )?;
             let live: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM channel_members
@@ -14334,7 +14356,7 @@ impl Database {
             return Ok(false);
         }
         Self::ensure_channel_owner_bans_locked(tx)?;
-        let mut banned = false;
+        let mut taken = Vec::new();
         for pk in snapshot.banned_pubkeys.iter().take(32) {
             if snapshot.owner_pubkey == Some(pk) {
                 continue;
@@ -14356,17 +14378,64 @@ impl Database {
                     "INSERT OR IGNORE INTO channel_owner_bans (channel_id, member_pubkey) VALUES (?1, ?2)",
                     params![channel_id, hex_pk],
                 )?;
-                banned = true;
+                taken.push(hex_pk);
             }
         }
-        if banned {
+        if taken.is_empty() {
+            return Ok(false);
+        }
+        // Each device's bans fit a snapshot, and both together may not.
+        Self::lift_owned_bans_past_cap_locked(tx, channel_id, timestamp)?;
+        let mut still_banned = false;
+        for hex_pk in &taken {
+            still_banned |= tx.query_row(
+                "SELECT banned FROM channel_members WHERE channel_id = ?1 AND member_pubkey = ?2",
+                params![channel_id, hex_pk],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
+        }
+        if still_banned {
             tx.execute(
                 "UPDATE channels SET rotate_pending = 1
                  WHERE channel_id = ?1 AND visibility = 'private' AND key_epoch >= ?2",
                 params![channel_id, epoch],
             )?;
         }
-        Ok(banned)
+        Ok(true)
+    }
+
+    /// Lift, on a room this device owns, the bans past the
+    /// `CHANNEL_BAN_LIST_MAX` its snapshot carries: the oldest decisions,
+    /// exactly those [`Self::list_banned_channel_pubkeys`] leaves out and this
+    /// device's next republish therefore lifts for the room. Kept banned here,
+    /// they would be banned on this device alone and left out of every key it
+    /// seals, while every member had them back. Dated `stamp`, or their own
+    /// decision if that is later, as an owner's unban is. Returns how many.
+    fn lift_owned_bans_past_cap_locked(tx: &Connection, channel_id: &str, stamp: i64) -> anyhow::Result<usize> {
+        let cap = crate::network::ember::dht::publish::CHANNEL_BAN_LIST_MAX;
+        let lifted = tx.execute(
+            &format!(
+                "UPDATE channel_members SET banned = 0, ban_revised_at = MAX(ban_revised_at, ?2)
+                 WHERE channel_id = ?1 AND banned = 1 AND member_pubkey NOT IN (
+                     SELECT member_pubkey FROM channel_members
+                      WHERE channel_id = ?1 AND banned = 1
+                      ORDER BY ban_revised_at DESC, member_pubkey
+                      LIMIT {cap}
+                 )"
+            ),
+            params![channel_id, stamp],
+        )?;
+        if lifted > 0 {
+            Self::ensure_channel_owner_bans_locked(tx)?;
+            tx.execute(
+                "DELETE FROM channel_owner_bans WHERE channel_id = ?1 AND member_pubkey NOT IN (
+                     SELECT member_pubkey FROM channel_members WHERE channel_id = ?1 AND banned = 1
+                 )",
+                params![channel_id],
+            )?;
+            tracing::warn!("Channel {channel_id}: lifted the oldest {lifted} ban(s), past the {cap} a snapshot carries");
+        }
+        Ok(lifted)
     }
 
     fn banned_channel_members_locked(
@@ -14717,6 +14786,11 @@ impl Database {
                  WHERE channel_id = ?1 AND member_pubkey = lower(?2)",
                 params![channel_id, hex_owner],
             )?;
+        }
+        // A delegated moderator's bans dated after the snapshot stay beside it,
+        // and on a room this device owns the two together may not fit the next.
+        if is_owner {
+            Self::lift_owned_bans_past_cap_locked(tx, channel_id, timestamp)?;
         }
         // Which bans now stand on the owner's word: those this snapshot carried
         // and that took (a newer moderator unban outranks it), and none that no
@@ -21122,6 +21196,126 @@ mod tests {
 
         assert!(!db.ingest_channel_moderation(&id, &banning, at + 150, &[1; 64]).unwrap());
         assert_eq!(ban_state(&db, &id, &x_hex), (true, at + 150), "banned again since");
+        drop_handoff_test_db(db, path);
+    }
+
+    /// Bans past the ones a snapshot carries, which only this identity's two
+    /// devices together can reach, are lifted here too, oldest first: kept,
+    /// they would stand on this device alone while its next snapshot lifts
+    /// them for the room. A snapshot taken whole beside a moderator's later
+    /// bans is held to the same cap.
+    #[test]
+    fn an_owned_channel_holds_no_more_bans_than_a_snapshot_carries() {
+        use crate::network::ember::channel::ChannelIdentity;
+        use crate::network::ember::dht::publish::CHANNEL_BAN_LIST_MAX as CAP;
+
+        let (db, path) = handoff_test_db("ban-cap");
+        let owned_room = || {
+            let room = ChannelIdentity::generate();
+            let id = hex::encode(room.channel_id);
+            db.insert_channel(&id, &hex::encode(room.pubkey), "Ours", "private", true, Some(&room.seed()), Some(&[7; 32]))
+                .unwrap();
+            db.insert_channel_key_epoch(&id, 2, &[2; 32]).unwrap();
+            id
+        };
+        let banned_here = |id: &str| -> Vec<[u8; 32]> {
+            let mut held: Vec<[u8; 32]> = db
+                .list_channel_members(id)
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.banned)
+                .map(|m| <[u8; 32]>::try_from(hex::decode(&m.member_pubkey).unwrap()).unwrap())
+                .collect();
+            held.sort();
+            held
+        };
+        let carried = |id: &str| {
+            let mut list = db.list_banned_channel_pubkeys(id).unwrap();
+            list.sort();
+            list
+        };
+        fn banning(bans: &[[u8; 32]]) -> ModerationSnapshot<'_> {
+            ModerationSnapshot {
+                banned_pubkeys: bans,
+                key_epoch: Some(2),
+                ..topic_only("")
+            }
+        }
+        let at = 1_700_000_000i64;
+
+        // Eight banned on each device while neither had seen the other's.
+        let ours: Vec<[u8; 32]> = (1..=8u8).map(|n| [n; 32]).collect();
+        let theirs: Vec<[u8; 32]> = (0x41..=0x48u8).map(|n| [n; 32]).collect();
+        let merged = owned_room();
+        db.commit_owner_channel_moderation(&merged, &banning(&ours), &NO_POLICY, at + 60)
+            .unwrap()
+            .unwrap();
+        db.clear_channel_rotate_pending(&merged).unwrap();
+        assert!(!db.ingest_channel_moderation(&merged, &banning(&theirs), at, &[1; 64]).unwrap());
+        let held = banned_here(&merged);
+        assert_eq!(held.len(), CAP, "no more than a snapshot carries");
+        assert_eq!(held, carried(&merged), "what this device's next snapshot carries");
+        assert!(ours.iter().all(|pk| held.contains(pk)), "its own, decided later, stand");
+        assert!(db.channel_rotate_is_pending(&merged).unwrap(), "those it took may have had the key");
+        db.ingest_channel_moderation(&merged, &banning(&theirs), at, &[1; 64]).unwrap();
+        assert_eq!(banned_here(&merged), held, "the same snapshot again bans none it lifted");
+
+        let beside = owned_room();
+        db.commit_owner_channel_moderation(&beside, &topic_only(""), &NO_POLICY, at)
+            .unwrap()
+            .unwrap();
+        let gossip: Vec<[u8; 32]> = (0x81..=0x86u8).map(|n| [n; 32]).collect();
+        for (n, pk) in gossip.iter().enumerate() {
+            assert!(db.apply_channel_ban_action(&beside, &hex::encode(pk), true, at + 10 + n as i64).unwrap());
+        }
+        let ten: Vec<[u8; 32]> = (0xA1..=0xAAu8).map(|n| [n; 32]).collect();
+        assert!(db.ingest_channel_moderation(&beside, &banning(&ten), at + 5, &[1; 64]).unwrap());
+        let held = banned_here(&beside);
+        assert_eq!(held.len(), CAP);
+        assert_eq!(held, carried(&beside));
+        assert!(gossip.iter().all(|pk| held.contains(pk)), "the moderator's, dated later, stand");
+        drop_handoff_test_db(db, path);
+    }
+
+    /// A member the owner unbanned keeps their row when the roster fills, so a
+    /// snapshot of the owner's signed before the unban that still bans them,
+    /// from another of the owner's devices, does not ban them again.
+    #[test]
+    fn an_owner_unban_outlasts_roster_eviction() {
+        use crate::network::ember::channel::{ChannelIdentity, CHANNEL_MEMBERS_MAX};
+
+        let (db, path) = handoff_test_db("unban-eviction");
+        let room = ChannelIdentity::generate();
+        let id = hex::encode(room.channel_id);
+        db.insert_channel(&id, &hex::encode(room.pubkey), "Ours", "private", true, Some(&room.seed()), Some(&[7; 32]))
+            .unwrap();
+        db.insert_channel_key_epoch(&id, 2, &[2; 32]).unwrap();
+        let x = [0x58u8; 32];
+        let x_hex = hex::encode(x);
+        let banning = ModerationSnapshot {
+            banned_pubkeys: std::slice::from_ref(&x),
+            key_epoch: Some(2),
+            ..topic_only("")
+        };
+        let at = 1_700_000_000i64;
+        let banned_at = db.commit_owner_channel_moderation(&id, &banning, &NO_POLICY, at).unwrap().unwrap();
+        let unbanned_at = db
+            .commit_owner_channel_moderation(&id, &topic_only(""), &NO_POLICY, at + 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ban_state(&db, &id, &x_hex), (false, unbanned_at));
+
+        // Members last seen long ago fill the roster, and newcomers go past it.
+        for n in 0..CHANNEL_MEMBERS_MAX + 8 {
+            db.upsert_channel_member(&id, &format!("{:064x}", n + 1), "member", at + n as i64, None)
+                .unwrap();
+        }
+        let members = db.list_channel_members(&id).unwrap();
+        assert!(members.iter().any(|m| m.member_pubkey == x_hex), "kept through eviction");
+        assert!(members.iter().all(|m| m.member_pubkey != format!("{:064x}", 1)), "evicted in its place");
+
+        assert!(!db.ingest_channel_moderation(&id, &banning, banned_at, &[1; 64]).unwrap());
+        assert_eq!(ban_state(&db, &id, &x_hex), (false, unbanned_at), "unbanned since");
         drop_handoff_test_db(db, path);
     }
 

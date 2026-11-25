@@ -115,6 +115,7 @@
   import { openFeedFilesFolder } from '$lib/api/feeds';
   import { isServer } from '$lib/runtime';
   import { saveToThisComputer } from '$lib/runtime/web/files';
+  import { binIsRecycleBin } from '$lib/platform';
   import { inertBackground, inertDuringOutro, trapTabKey } from '$lib/a11y';
   import { ctxMenuPosition, ctxSubmenuPlacement } from '$lib/actions/ctxMenu';
   import { hoverSubmenus } from '$lib/hoverSubmenus';
@@ -2340,19 +2341,33 @@
     try {
       const size = formatSize(totalBytes);
       const count = formatNumber(targets.length);
-      const question = $appSettings?.delete_permanently
-        ? plural(targets.length, {
-            one: () => m.library_confirm_delete_one_permanent({ size, count }),
-            // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
-            few: () => m.library_confirm_delete_few_permanent({ count, size }),
-            other: () => m.library_confirm_delete_other_permanent({ count, size }),
-          })
-        : plural(targets.length, {
-            one: () => m.library_confirm_delete_one({ size, count }),
-            // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
-            few: () => m.library_confirm_delete_few({ count, size }),
-            other: () => m.library_confirm_delete_other({ count, size }),
-          });
+      const recycleBin = binIsRecycleBin();
+      // emberd deletes outright: nothing on a server empties its trash.
+      const question = isServer || $appSettings?.delete_permanently
+        ? plural(targets.length, recycleBin
+          ? {
+              one: () => m.library_confirm_delete_one_permanent({ size, count }),
+              // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
+              few: () => m.library_confirm_delete_few_permanent({ count, size }),
+              other: () => m.library_confirm_delete_other_permanent({ count, size }),
+            }
+          : {
+              one: () => m.library_confirm_delete_one_permanent_trash({ size, count }),
+              few: () => m.library_confirm_delete_few_permanent_trash({ count, size }),
+              other: () => m.library_confirm_delete_other_permanent_trash({ count, size }),
+            })
+        : plural(targets.length, recycleBin
+          ? {
+              one: () => m.library_confirm_delete_one({ size, count }),
+              // Not `oneShowsCount`: the singular speaks of one file, so Russian 21, 31, … take `other`.
+              few: () => m.library_confirm_delete_few({ count, size }),
+              other: () => m.library_confirm_delete_other({ count, size }),
+            }
+          : {
+              one: () => m.library_confirm_delete_one_trash({ size, count }),
+              few: () => m.library_confirm_delete_few_trash({ count, size }),
+              other: () => m.library_confirm_delete_other_trash({ count, size }),
+            });
       const hidden = hiddenByFilters(targets);
       const confirmed = await askConfirm(
         hidden.length > 0 ? `${question}\n\n${deleteHiddenNote(hidden)}` : question,
@@ -2376,7 +2391,8 @@
           // "Keep file" in the backend's delete-permanently question (a file
           // the Recycle Bin will not take): the rest are very likely in the
           // same place, so stop rather than ask again for every one of them.
-          if (codedErrorOf(e)?.code === 'sharing_delete_declined') break;
+          const code = codedErrorOf(e)?.code;
+          if (code === 'sharing_delete_declined' || code === 'sharing_delete_declined_trash') break;
         }
         bulkProgress = { done: index + 1, total: targets.length };
       }
@@ -3045,8 +3061,6 @@
 
   /** This identity's feeds, for "Add to feed"; `null` while they load. */
   let myFeeds: { salt: string; title: string; item_count: number }[] | null = $state(null);
-  /** Feeds exist only while Ember is on. */
-  let feedsAvailable = $derived($appSettings?.ember_native_enabled === true);
 
   async function loadMyFeeds() {
     myFeeds = null;
@@ -3675,9 +3689,13 @@
     deletingPaths.add(f.path);
     try {
       const confirmed = await askConfirm(
-        $appSettings?.delete_permanently
-          ? m.library_confirm_delete_single_permanent({ name: f.name })
-          : m.library_confirm_delete_single({ name: f.name }),
+        isServer || $appSettings?.delete_permanently
+          ? (binIsRecycleBin()
+            ? m.library_confirm_delete_single_permanent({ name: f.name })
+            : m.library_confirm_delete_single_permanent_trash({ name: f.name }))
+          : binIsRecycleBin()
+            ? m.library_confirm_delete_single({ name: f.name })
+            : m.library_confirm_delete_single_trash({ name: f.name }),
         m.library_delete_file_title(),
         { confirmLabel: m.common_delete() },
       );
@@ -4544,9 +4562,7 @@
         {m.library_open_collection()}
       {/if}
     </button>
-    {#if !isServer}
-      <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
-    {/if}
+    <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
     <button class="ghost" onclick={() => (categoriesOpen = true)} title={m.transfers_categories_subtitle()}>{m.library_categories_button()}</button>
     <button class="ghost" onclick={handleReload} disabled={reloading}>{m.library_reload()}</button>
   </div>
@@ -6105,7 +6121,7 @@
   {@const moveTargets = categoryMoveTargets(ctxMenu.file)}
   {@const tagAddTargets = emberTagTargets(ctxMenu.file, true)}
   {@const tagRemoveTargets = emberTagTargets(ctxMenu.file, false)}
-  {@const feedTargetCount = feedsAvailable ? feedTargets(ctxMenu.file).length : 0}
+  {@const feedTargetCount = feedTargets(ctxMenu.file).length}
   {@const multi = ctxActsOnChecked(ctxMenu.file)}
   {@const bulkLocked = multi && bulkBusy}
   <!-- `bulkLocked`: the bulk actions drop a request made while another runs. -->
@@ -6194,7 +6210,7 @@
         {/if}
       </div>
     {/if}
-    {#if feedsAvailable && feedTargetCount > 0}
+    {#if feedTargetCount > 0}
       <!-- Only for files a feed can list: shared with everyone, with their
            Ember digest. Added as an edit; the feed is published from Feeds. -->
       <div

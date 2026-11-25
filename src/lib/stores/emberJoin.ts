@@ -11,7 +11,7 @@ import { createEmberJoinTracker } from '$lib/emberJoin';
 export const emberJoinTimedOut = readable(false, (set) => {
   const tracker = createEmberJoinTracker(set);
   const unsubscribe = networkStats.subscribe((stats) => {
-    tracker.update(!!stats.ember_native_enabled, stats.ember_dht_verified_contacts ?? 0);
+    tracker.update(stats.ember_dht_verified_contacts ?? 0);
   });
   return () => {
     unsubscribe();

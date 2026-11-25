@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>emberd — Ember on a server</title>
+  <meta name="description" content="emberd runs Ember on a home server, a NAS or in Docker, with no screen, and is driven from a web browser. Install it, set it up and use it from anywhere.">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0b1220" media="(prefers-color-scheme: dark)">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="emberd — Ember on a server">
+  <meta property="og:description" content="emberd runs Ember on a home server, a NAS or in Docker, with no screen, and is driven from a web browser.">
+  <meta property="og:image" content="https://www.emberp2p.org/icon.png">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="stylesheet" href="site.css">
+</head>
+<body>
+<a href="#main" class="skip-link">Skip to content</a>
+
+<header class="site-header">
+  <div class="header-inner wide">
+    <button class="mobile-toggle" type="button" onclick="toggleSidebar()" aria-label="Open menu" aria-expanded="false" aria-controls="sidebar">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 7h18M3 12h18M3 17h18"/></svg>
+    </button>
+    <a href="index.html" class="brand"><img src="favicon.png" alt=""><span>EMBER</span></a>
+    <nav class="header-nav" aria-label="Primary">
+      <a href="index.html#features" class="nav-opt">Features</a>
+      <a href="guide.html">Guide</a>
+      <a href="emberd.html" class="nav-opt" aria-current="page">emberd</a>
+      <a href="index.html#releases" class="nav-opt">Releases</a>
+      <a href="guide.html#faq" class="nav-opt">FAQ</a>
+      <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener" class="icon-link nav-opt" aria-label="Ember on GitHub"><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a>
+      <a href="index.html#download" class="nav-cta">Download</a>
+    </nav>
+  </div>
+</header>
+
+<div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
+
+<aside class="sidebar" id="sidebar" aria-label="On this page">
+  <nav class="sidebar-nav">
+
+    <div class="toc-section">
+      <span class="toc-heading">Basics</span>
+      <a href="#overview" class="toc-link">What emberd is</a>
+      <a href="#what-you-get" class="toc-link toc-child">What you get</a>
+      <a href="#requirements" class="toc-link toc-child">Requirements</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Install</span>
+      <a href="#install-deb" class="toc-link">Debian &amp; Ubuntu (.deb)</a>
+      <a href="#install-tarball" class="toc-link">Any Linux (tarball)</a>
+      <a href="#install-docker" class="toc-link">Docker</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Set up</span>
+      <a href="#first-visit" class="toc-link">The first visit</a>
+      <a href="#configuration" class="toc-link">The config file</a>
+      <a href="#folders" class="toc-link toc-child">Folders</a>
+      <a href="#remote" class="toc-link">Using it from another computer</a>
+      <a href="#ports" class="toc-link">Ports and High ID</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Use</span>
+      <a href="#web-interface" class="toc-link">The web interface</a>
+      <a href="#differences" class="toc-link toc-child">What works differently</a>
+      <a href="#ctl" class="toc-link">emberd ctl</a>
+      <a href="#moving" class="toc-link">Moving from the desktop app</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Look after it</span>
+      <a href="#updating" class="toc-link">Updating</a>
+      <a href="#backups" class="toc-link">Backups</a>
+      <a href="#security" class="toc-link">Security</a>
+      <a href="#troubleshooting" class="toc-link">Troubleshooting</a>
+    </div>
+
+    <div class="toc-section">
+      <span class="toc-heading">Help</span>
+      <a href="#faq" class="toc-link">FAQ</a>
+      <a href="guide.html" class="toc-link">The Ember Guide</a>
+      <a href="https://github.com/untaimed18/Ember-P2P/issues" class="toc-link" target="_blank" rel="noopener">Report an issue</a>
+    </div>
+
+  </nav>
+</aside>
+
+<div class="layout">
+<main class="main prose" id="main">
+
+  <div class="page-intro">
+    <h1 class="page-title">emberd</h1>
+    <p class="page-lede">Ember on a server: a home server, a NAS or a Docker container, with no screen, driven from a web browser on any computer or phone. New here? Start with <a href="#install-deb">installing it</a>, then <a href="#first-visit">the first visit</a>.</p>
+  </div>
+
+  <section id="overview">
+    <h2>What emberd is</h2>
+    <p><code>emberd</code> is Ember without a window. It is built from the same code as the desktop app and released with it, under the same version, so it shares and downloads exactly as Ember does, on the same networks: eD2K servers, KAD and the <a href="guide.html#ember">Ember Network</a>. It keeps running when nobody is logged in, as a systemd service or in a Docker container, and you use it from a web browser, the way aMule&rsquo;s <code>amuled</code> is used with <code>amuleweb</code>.</p>
+    <p>Run it where a computer stays on: downloads carry on while your own computer sleeps, your shares stay available, and friends, channels and feeds reach you at any hour. Open its address in a browser to search, download, chat or change a setting, then close the tab; emberd carries on.</p>
+
+    <h3 id="what-you-get">What you get</h3>
+    <ul>
+      <li><strong>Everything the desktop app does,</strong> except what needs a window: search and the spam filter, downloads and uploads, the Library and hashing, friends and chat, channels and private messages, feeds, the IP filter, statistics, the Connection Doctor and <em>Connect through</em>.</li>
+      <li><strong>The desktop app&rsquo;s own pages, in your browser,</strong> behind a password. Controls that mean nothing on a server are hidden; the few that need another form have one (see <a href="#differences">What works differently</a>).</li>
+      <li><strong>Files come to the computer you are browsing from:</strong> <em>Save to this computer</em> downloads a finished file through the browser, and audio and video play in the page.</li>
+      <li><strong>A command line,</strong> <a href="#ctl"><code>emberd ctl</code></a>, for downloads and searches from a shell or a script.</li>
+      <li><strong>One config file</strong> for what the desktop app asks for with its folder pickers: the download folder, the shared folders, and where the web interface listens.</li>
+    </ul>
+
+    <h3 id="requirements">Requirements</h3>
+    <ul>
+      <li><strong>Linux on x86-64 or ARM64</strong> with glibc 2.35 or newer: Ubuntu 22.04, Debian 12 and their successors, including a Raspberry Pi 4 or 5 on a 64-bit system. Or any x86-64 or ARM64 machine that runs Docker, as many NAS systems do.</li>
+      <li><strong>Nothing else to install.</strong> emberd needs no display, GTK or WebKit, only the system&rsquo;s CA certificates.</li>
+      <li><strong>A modern browser</strong> on whatever you use it from.</li>
+    </ul>
+    <p>Every release carries emberd beside the desktop app on the <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" target="_blank" rel="noopener">Releases page</a>: <code>emberd_&lt;version&gt;_amd64.deb</code> and <code>_arm64.deb</code>, <code>emberd-&lt;version&gt;-linux-x86_64.tar.gz</code> and <code>-aarch64.tar.gz</code>, and <code>emberd-&lt;version&gt;-SHA256SUMS</code> to check them against. The Docker image is <code>ghcr.io/untaimed18/emberd</code>.</p>
+  </section>
+
+  <hr>
+
+  <section id="install-deb">
+    <h2>Debian &amp; Ubuntu (.deb)</h2>
+    <p>Download the <code>.deb</code> for your machine, <code>amd64</code> for x86-64 or <code>arm64</code> for ARM, from the <a href="https://github.com/untaimed18/Ember-P2P/releases/latest" target="_blank" rel="noopener">latest release</a>, then:</p>
+    <pre><code>sudo apt install ./emberd_*_amd64.deb
+sudo nano /etc/emberd/emberd.toml       # the folders, and where it listens
+sudo systemctl enable --now emberd
+journalctl -u emberd                    # the setup code for the first visit</code></pre>
+    <p>The package installs emberd in <code>/opt/emberd</code> with <code>emberd</code> on your path, makes an <code>emberd</code> user and its systemd service, and does <em>not</em> start the service, so you can set your folders in <a href="#configuration"><code>/etc/emberd/emberd.toml</code></a> before Ember joins any network. Ember keeps its data in <code>/var/lib/emberd/data</code>; unless the config names a download folder, downloads go to <code>/var/lib/emberd/Downloads/Ember</code>.</p>
+    <p>Removing the package stops emberd. Purging it still leaves Ember&rsquo;s data, identity and downloads in <code>/var/lib/emberd</code>, so nothing you have is lost by accident.</p>
+  </section>
+
+  <hr>
+
+  <section id="install-tarball">
+    <h2>Any Linux (tarball)</h2>
+    <p>Download the tarball for your machine, <code>x86_64</code> or <code>aarch64</code>, and unpack it to <code>/opt/emberd</code>, so that <code>/opt/emberd/emberd</code> sits beside its <code>web/</code> and <code>resources/</code> folders. Then set up the user and the service, and set your folders before the first start:</p>
+    <pre><code>sudo mkdir -p /opt/emberd
+sudo tar -xzf emberd-*-linux-$(uname -m).tar.gz -C /opt/emberd --strip-components=1
+sudo useradd --system --home-dir /var/lib/emberd --shell /usr/sbin/nologin emberd
+sudo ln -s /opt/emberd/emberd /usr/local/bin/emberd
+sudo install -Dm644 /opt/emberd/emberd.service /etc/systemd/system/emberd.service
+sudo install -Dm644 /opt/emberd/emberd.toml /etc/emberd/emberd.toml
+sudo nano /etc/emberd/emberd.toml       # the folders, and where it listens
+sudo systemctl daemon-reload
+sudo systemctl enable --now emberd
+journalctl -u emberd</code></pre>
+    <p>Data and downloads go to the same places as with the <code>.deb</code>. Without systemd, run <code>/opt/emberd/emberd</code> as an ordinary user: it keeps its data in that user&rsquo;s home folder, and <code>emberd --help</code> lists its options.</p>
+  </section>
+
+  <hr>
+
+  <section id="install-docker">
+    <h2>Docker</h2>
+    <pre><code>docker run -d --name emberd --restart unless-stopped \
+  -p 4711:4711 -p 4662:4662/tcp -p 4662:4662/udp -p 4672:4672/udp \
+  -v emberd-data:/data -v /srv/downloads:/downloads \
+  ghcr.io/untaimed18/emberd
+docker logs emberd                      # the setup code for the first visit</code></pre>
+    <p>The image runs on x86-64 and ARM64 alike and is tagged with each version, its <code>major.minor</code>, and <code>latest</code>. Ember&rsquo;s data lives in the <code>/data</code> volume and downloads go to <code>/downloads</code>. The container runs as user ID 1000, so a folder you mount for downloads has to be writable by that ID.</p>
+    <p>To share a folder, mount it and name it: <code>-v /srv/music:/shared/music:ro -e EMBERD_SHARED_DIRS=/shared/music</code>. Every setting in the config file has an environment variable (see <a href="#configuration">The config file</a>), so a container needs no file at all. With Docker Compose:</p>
+    <pre><code>services:
+  emberd:
+    image: ghcr.io/untaimed18/emberd
+    container_name: emberd
+    restart: unless-stopped
+    ports:
+      - "4711:4711"
+      - "4662:4662/tcp"
+      - "4662:4662/udp"
+      - "4672:4672/udp"
+    volumes:
+      - emberd-data:/data
+      - /srv/downloads:/downloads
+      - /srv/music:/shared/music:ro
+    environment:
+      EMBERD_SHARED_DIRS: /shared/music
+volumes:
+  emberd-data:</code></pre>
+    <div class="callout-warn callout">
+      <p><strong>As written, these examples open the web interface to your whole network over plain HTTP.</strong> Inside the container it listens on every address, so that Docker can publish it at all, and <code>-p 4711:4711</code> publishes it on every address of the host. That suits a home network you trust. Otherwise publish it as <code>-p 127.0.0.1:4711:4711</code>, for the host alone, and reach it through HTTPS or a VPN, as in <a href="#remote">Using it from another computer</a>.</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <section id="first-visit">
+    <h2>The first visit</h2>
+    <p>On its first start emberd writes a setup code to its log (<code>journalctl -u emberd</code> or <code>docker logs emberd</code>), and to <code>emberd-setup-code</code> in its data folder:</p>
+    <pre><code>No password is set for the web interface yet. Open http://localhost:4711
+and enter this setup code to choose one: 2BLD-WZ8J</code></pre>
+    <ol class="steps-list">
+      <li>
+        <strong>Open the address</strong><br>
+        <span style="color: var(--text-secondary)">On the server itself that is <code>http://localhost:4711</code>. From another computer, see <a href="#remote">Using it from another computer</a> first.</span>
+      </li>
+      <li>
+        <strong>Enter the setup code and choose a password</strong><br>
+        <span style="color: var(--text-secondary)">Case and the dash do not matter. The code proves that whoever chooses the password can read the server&rsquo;s log, so nobody else on your network can claim a fresh install before you.</span>
+      </li>
+      <li>
+        <strong>Use Ember</strong><br>
+        <span style="color: var(--text-secondary)">You are signed in to the same pages as the desktop app. KAD and the Ember Network connect on their own; eD2K servers are yours to choose, as on the desktop. See <a href="guide.html#getting-started">Getting started</a> in the Guide.</span>
+      </li>
+    </ol>
+    <p>To set or reset the password from a shell instead, stop emberd and run <code>emberd passwd</code> as the user it runs as, or <code>emberd passwd --stdin</code> to read it from a pipe:</p>
+    <pre><code>sudo systemctl stop emberd
+sudo -u emberd emberd passwd
+sudo systemctl start emberd</code></pre>
+  </section>
+
+  <hr>
+
+  <section id="configuration">
+    <h2>The config file</h2>
+    <p>emberd reads <code>/etc/emberd/emberd.toml</code> if it exists, or the file <code>--config</code> or <code>EMBERD_CONFIG</code> names. Every key is optional, and an environment variable wins over the file. Change it, then restart emberd (<code>sudo systemctl restart emberd</code>). A key emberd does not know stops it with an error rather than being ignored, so a typing mistake cannot go unnoticed.</p>
+    <pre><code>data_dir = "/var/lib/emberd/data"
+
+[web]
+listen = "127.0.0.1:4711"
+# tls_cert = "/etc/emberd/cert.pem"
+# tls_key = "/etc/emberd/key.pem"
+
+[folders]
+download = "/srv/emberd/downloads"
+shared = ["/srv/media/music", "/srv/media/films"]
+browse_under = ["/srv/media"]</code></pre>
+    <table class="doc-table key-table">
+      <thead>
+        <tr><th>Key and variable</th><th>What it sets</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>data_dir</code><br><code>EMBER_DATA_DIR</code></td><td>Where Ember keeps its identity, settings, library and database</td></tr>
+        <tr><td><code>key_file</code><br><code>EMBERD_KEY_FILE</code></td><td>The file Ember&rsquo;s identity and keys are sealed with; made on first start, in the data folder unless set</td></tr>
+        <tr><td><code>web.listen</code><br><code>EMBERD_LISTEN</code></td><td>Where the web interface listens; <code>127.0.0.1:4711</code>, this computer only, unless set</td></tr>
+        <tr><td><code>web.tls_cert</code><br><code>EMBERD_TLS_CERT</code></td><td>A certificate, as a PEM file, to serve HTTPS; set with <code>tls_key</code></td></tr>
+        <tr><td><code>web.tls_key</code><br><code>EMBERD_TLS_KEY</code></td><td>The certificate&rsquo;s private key, as a PEM file</td></tr>
+        <tr><td><code>folders.download</code><br><code>EMBERD_DOWNLOAD_DIR</code></td><td>Where downloads are saved</td></tr>
+        <tr><td><code>folders.shared</code><br><code>EMBERD_SHARED_DIRS</code></td><td>Folders always shared in full</td></tr>
+        <tr><td><code>folders.browse_under</code><br><code>EMBERD_BROWSE_UNDER</code></td><td>Folders the web interface may browse to share more from, and import from</td></tr>
+      </tbody>
+    </table>
+    <p>The folder variables take a list separated by <code>:</code>. Everything else is set in the web interface&rsquo;s Settings, as in the desktop app. Settings &gt; <em>This server</em> shows what the config file set and where emberd keeps its data, and has <em>Restart emberd</em> for after you change it.</p>
+
+    <h3 id="folders">Folders</h3>
+    <p>On the desktop you pick folders in a dialog. On a server, the config file names them, and the web interface can change only what the config lets it:</p>
+    <ul>
+      <li><strong>The download folder</strong> is the config&rsquo;s alone. It is where files from strangers are written, so a browser cannot move it.</li>
+      <li><strong>Shared folders</strong> listed under <code>shared</code> are always shared; to stop sharing one, take it out of the config.</li>
+      <li><strong><code>browse_under</code></strong> names the folders the web interface may look inside. From there you can share more folders and unshare them again, add a channel library, and import from an eMule or aMule folder. Nothing outside them can be reached from the browser, whatever a page sends. Without <code>browse_under</code>, the web interface shares only what <code>shared</code> names.</li>
+    </ul>
+    <p>Folders have to be full paths, outside the data folder, and outside system and private folders: no folder on the way to one may be named <code>etc</code>, <code>usr</code>, <code>bin</code>, <code>var</code>, <code>tmp</code>, <code>temp</code>, <code>proc</code>, <code>.ssh</code>, <code>.config</code>, <code>AppData</code> or the like, except the folders leading to the home folder. These are the desktop app&rsquo;s own rules, checked at start, so a folder they refuse stops emberd with its name in the log.</p>
+  </section>
+
+  <hr>
+
+  <section id="remote">
+    <h2>Using it from another computer</h2>
+    <p>By default the web interface listens on <code>127.0.0.1:4711</code>, the server itself only. To use it from your laptop or phone, either:</p>
+    <ul>
+      <li><strong>give it a certificate,</strong> so it serves HTTPS itself, and let it listen on the network: <code>listen = "0.0.0.0:4711"</code>, <code>tls_cert</code> and <code>tls_key</code> in <code>[web]</code>; or</li>
+      <li><strong>put it behind a reverse proxy</strong> on the same machine that serves HTTPS, and leave emberd listening on <code>127.0.0.1</code>. The proxy must pass on the host the browser asked for, as <code>Host</code> or <code>X-Forwarded-Host</code>, and forward WebSocket upgrades for <code>/api/events</code>, since emberd checks every request&rsquo;s origin against it.</li>
+    </ul>
+    <p>On a home network you trust, <code>listen = "0.0.0.0:4711"</code> alone also works, over plain HTTP; see the warning below.</p>
+    <p>For nginx:</p>
+    <pre><code>location / {
+    proxy_pass http://127.0.0.1:4711;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}</code></pre>
+    <p>For Apache, use <code>ProxyPreserveHost On</code> and proxy WebSocket upgrades for <code>/api/events</code> too.</p>
+    <div class="callout-warn callout">
+      <p><strong>Plain HTTP over a network sends your password unencrypted.</strong> It still works, as many home setups need, but emberd warns in its log at every start and its sign-in page says so. Use HTTPS, a reverse proxy, or a VPN such as WireGuard or Tailscale to reach your home network, before you open the web interface to anything you do not trust. Never forward port 4711 from the internet to plain HTTP.</p>
+    </div>
+    <p>Browser notifications need HTTPS or <code>localhost</code> too: with either, turn them on in Settings and the browser shows Ember&rsquo;s notifications while the page is open.</p>
+  </section>
+
+  <hr>
+
+  <section id="ports">
+    <h2>Ports and High ID</h2>
+    <p>emberd uses the same ports as the desktop app, and they matter the same way: other people can only reach you directly, for a <a href="guide.html#highid">High ID</a> and faster downloads, if these reach the server.</p>
+    <table class="doc-table">
+      <thead>
+        <tr><th>Port</th><th>Protocol</th><th>Used for</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>4662</td><td>TCP</td><td>Peer-to-peer file transfers, eD2K and Ember alike</td></tr>
+        <tr><td>4672</td><td>UDP</td><td>KAD, the Ember Network and Ember&rsquo;s QUIC transport</td></tr>
+        <tr><td>4662</td><td>UDP</td><td>QUIC for relays that dial your TCP port number over UDP</td></tr>
+        <tr><td>4711</td><td>TCP</td><td>The web interface, for you alone: never forward it from the internet</td></tr>
+      </tbody>
+    </table>
+    <p>Forward 4662 TCP, 4672 UDP and 4662 UDP on your router to the server, or turn on UPnP in Settings &gt; Network. In Docker, publish them as in <a href="#install-docker">the example</a>; UPnP usually cannot find the router from inside Docker&rsquo;s default bridge network, so forward them by hand there. If you change the ports in Settings &gt; Network, change them on the router and in Docker&rsquo;s <code>-p</code> options too. The <a href="guide.html#connection-doctor">connection doctor</a> at the top of Settings &gt; Network says what is in the way.</p>
+  </section>
+
+  <hr>
+
+  <section id="web-interface">
+    <h2>The web interface</h2>
+    <p>The pages are the desktop app&rsquo;s, so the <a href="guide.html">Ember Guide</a> covers everything on them: search, transfers, the Library, friends, channels, feeds and Settings. A sign-in lasts 30 days in that browser. Settings &gt; <em>This server</em> signs a browser out, or changes the password, which signs out every other browser.</p>
+
+    <h3 id="differences">What works differently</h3>
+    <ul>
+      <li><strong>Opening files.</strong> Where the desktop app has <em>Open</em> and <em>Show in folder</em>, emberd has <em>Save to this computer</em>: for files in the Library, finished downloads, followed feeds&rsquo; files, friends&rsquo; attachments and files received in channels. Audio and video play in the page.</li>
+      <li><strong>Picking files.</strong> A backup, an IP filter, a collection, a web services list, or a file to send to a friend or a channel comes from the computer you are browsing from. A collection made in the Library is saved by the browser.</li>
+      <li><strong>Picking folders.</strong> Folders come from <a href="#folders">the config file</a>, or from inside <code>browse_under</code>. To import from eMule or aMule, emberd looks in their usual places on the server, or you type the folder, which has to be under <code>browse_under</code>.</li>
+      <li><strong>Deleting files</strong> deletes them outright, and says so first, since nothing on a server ever empties a trash.</li>
+      <li><strong>Notifications</strong> show in the browser while the page is open, once allowed in Settings.</li>
+      <li><strong>Links.</strong> Paste <code>ed2k://</code> links into the page, or add them with <a href="#ctl"><code>emberd ctl add</code></a>.</li>
+      <li><strong>Not on a server:</strong> the tray, starting at login (the service or Docker&rsquo;s restart policy does that), the popped-out chat window, watching the clipboard, keeping the computer awake, <em>When downloads finish</em>, and dragging files onto the Library.</li>
+    </ul>
+    <p><strong>Share every file of each new release</strong>, in Settings &gt; About, works as on the desktop: emberd checks for a new Ember release every hour and shares its installers, collection and notes once each checks out against the release signature, helping others get Ember when GitHub is out of reach.</p>
+  </section>
+
+  <hr>
+
+  <section id="ctl">
+    <h2>emberd ctl</h2>
+    <p><code>emberd ctl</code> manages downloads and searches from a shell or a script, on the same server:</p>
+    <table class="doc-table key-table">
+      <thead>
+        <tr><th>emberd ctl &hellip;</th><th>What it does</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>status</code></td><td>Connections, speeds and downloads</td></tr>
+        <tr><td><code>list</code></td><td>Downloads, each with its ID</td></tr>
+        <tr><td><code>add&nbsp;LINK...</code></td><td>Download <code>ed2k://</code> links; with <code>-</code>, or none, the links are read from standard input</td></tr>
+        <tr><td><code>pause&nbsp;ID...</code></td><td>Pause downloads, or every one with <code>all</code></td></tr>
+        <tr><td><code>resume&nbsp;ID...</code></td><td>Resume them, or <code>all</code></td></tr>
+        <tr><td><code>stop&nbsp;ID...</code></td><td>Stop them, keeping what arrived, or <code>all</code></td></tr>
+        <tr><td><code>cancel&nbsp;ID...</code></td><td>Cancel them and delete what arrived</td></tr>
+        <tr><td><code>search&nbsp;WORDS...</code></td><td>Search, and print what was found as <code>ed2k://</code> links to add. <code>--type</code> is <code>audio</code>, <code>video</code>, <code>image</code>, <code>program</code>, <code>document</code>, <code>archive</code>, <code>iso</code> or <code>collection</code>; <code>--method</code> is <code>global</code> (the default), <code>server</code>, <code>kad</code> or <code>ember</code>; <code>--limit</code> caps the results</td></tr>
+      </tbody>
+    </table>
+    <p>An ID is the one <code>list</code> shows, or the start of it, or the start of the file&rsquo;s eD2K hash. <code>--json</code> prints emberd&rsquo;s answer as it came, for scripts, and <code>emberd ctl --help</code> lists everything. For example:</p>
+    <pre><code>sudo -u emberd emberd ctl search --type video --limit 5 big buck bunny
+sudo -u emberd emberd ctl add 'ed2k://|file|...|/'
+sudo -u emberd emberd ctl pause all</code></pre>
+    <p>Put a link in single quotes, as above: the <code>|</code> in it means something else to the shell.</p>
+    <p>Run it as the <code>emberd</code> user, as above, or join its group once (<code>sudo usermod -aG emberd $USER</code>, then log in again) and run it as yourself. In Docker: <code>docker exec emberd /opt/emberd/emberd ctl status</code>.</p>
+    <div class="callout-warn callout">
+      <p><strong>The <code>emberd</code> group is as good as the password.</strong> <code>emberd ctl</code> talks to emberd over a local socket that needs no password, and whoever can open it can do anything the web interface can. Add only accounts you would give the password to.</p>
+    </div>
+  </section>
+
+  <hr>
+
+  <section id="moving">
+    <h2>Moving from the desktop app</h2>
+    <p>A backup carries your desktop Ember over to emberd: your identity and user hash, upload credits, friends, chat history, known files, transfer list and settings. Friends see the same you, and your standing on the network comes along.</p>
+    <ol class="steps-list">
+      <li>
+        <strong>Make a backup on the desktop</strong><br>
+        <span style="color: var(--text-secondary)">In the desktop app, Settings &gt; Backup &amp; import. Choose a passphrase and create the <code>.emberbackup</code> file.</span>
+      </li>
+      <li>
+        <strong>Restore it on emberd</strong><br>
+        <span style="color: var(--text-secondary)">In emberd&rsquo;s Settings &gt; Backup &amp; import, send the file from the computer you are browsing from, enter the passphrase, and restart emberd when it asks. The page reconnects once it is back.</span>
+      </li>
+      <li>
+        <strong>Retire the desktop copy</strong><br>
+        <span style="color: var(--text-secondary)">From then on, use that identity on emberd only, and keep the desktop app closed or give it a fresh profile.</span>
+      </li>
+    </ol>
+    <p>The files you share and part-finished downloads are not in a backup: copy them to the server and name their folders in <a href="#folders">the config</a>. From eMule or aMule, Settings &gt; Backup &amp; import brings over their shared folders, hashes, credits, identity, unfinished downloads and servers, as on the desktop, within the folders the config allows.</p>
+  </section>
+
+  <hr>
+
+  <section id="updating">
+    <h2>Updating</h2>
+    <p>emberd does not update itself: update it the way you installed it. Each release carries a new emberd beside the desktop app, and the <a href="index.html#releases">release notes</a> cover both.</p>
+    <ul>
+      <li><strong>.deb:</strong> install the new package over the old one with <code>sudo apt install ./emberd_*_amd64.deb</code>. A running emberd is restarted.</li>
+      <li><strong>Tarball:</strong> unpack the new one over <code>/opt/emberd</code> and <code>sudo systemctl restart emberd</code>.</li>
+      <li><strong>Docker:</strong> <code>docker pull ghcr.io/untaimed18/emberd</code>, then remove and re-create the container with the same command (with Compose, <code>docker compose pull &amp;&amp; docker compose up -d</code>). Your data stays in its volume.</li>
+    </ul>
+    <p>Ember saves everything and stops cleanly whenever the service or container stops, so an update loses nothing.</p>
+  </section>
+
+  <hr>
+
+  <section id="backups">
+    <h2>Backups</h2>
+    <p>Settings &gt; Backup &amp; import makes a backup encrypted with a passphrase you choose, and your browser saves it to the computer you are browsing from. It holds your identity, credits, friends and settings, as on the desktop, and restores on emberd or on a desktop Ember. A lost passphrase cannot be recovered.</p>
+    <p>To back up the server itself instead, keep a copy of the data folder (<code>/var/lib/emberd/data</code>, or the <code>/data</code> volume) <em>together with</em> its key file, <code>emberd-secret.key</code> in that folder unless <code>key_file</code> moved it. The key file seals Ember&rsquo;s identity and keys at rest; without it, the data folder cannot be read.</p>
+  </section>
+
+  <hr>
+
+  <section id="security">
+    <h2>Security</h2>
+    <ul>
+      <li><strong>One password,</strong> of at least 8 characters, stored only as an Argon2id hash. Wrong passwords slow down: three are free, then each address waits twice as long as the last time, up to five minutes, even for the right one. Behind a reverse proxy every browser comes from the proxy&rsquo;s address, so they share one count.</li>
+      <li><strong>Sessions</strong> are kept in an <code>HttpOnly</code>, <code>SameSite=Strict</code> cookie, <code>Secure</code> under HTTPS, and last 30 days at most. Every request is checked: one from another website is refused, and one that changes anything must carry a header that a form on another site cannot send.</li>
+      <li><strong>The browser cannot reach outside your folders.</strong> It can share only what the config names or what is under <code>browse_under</code>, and it cannot move the download folder.</li>
+      <li><strong>Your identity is sealed at rest</strong> with emberd&rsquo;s own key file, readable by emberd alone.</li>
+      <li><strong>Scripts</strong> can call the same interface with the API token in <code>emberd-cli-token</code> in the data folder, as a <code>Bearer</code> token. Changing the password replaces it.</li>
+      <li><strong>On the server itself,</strong> the <code>emberd</code> user and the members of its group can run <a href="#ctl"><code>emberd ctl</code></a> without the password, so treat them as you would the password.</li>
+    </ul>
+  </section>
+
+  <hr>
+
+  <section id="troubleshooting">
+    <h2>Troubleshooting</h2>
+    <ul>
+      <li><strong>Read the log first:</strong> <code>journalctl -u emberd -f</code>, or <code>docker logs -f emberd</code>. emberd says there why it will not start, which folder a rule refused, or what it could not reach.</li>
+      <li><strong>The page does not load from another computer.</strong> emberd listens on <code>127.0.0.1</code> unless told otherwise; see <a href="#remote">Using it from another computer</a>. Behind a proxy, check that it passes the host and forwards WebSockets.</li>
+      <li><strong>&ldquo;That request came from another site&rdquo;</strong> means a reverse proxy is not passing the host the browser asked for: <code>proxy_set_header Host $host;</code> in nginx, <code>ProxyPreserveHost On</code> in Apache.</li>
+      <li><strong>Forgotten password.</strong> Stop emberd and run <code>emberd passwd</code>, as in <a href="#first-visit">The first visit</a>.</li>
+      <li><strong>Low ID.</strong> Forward the ports in <a href="#ports">Ports and High ID</a>, then see the Connection Doctor in Settings &gt; Network.</li>
+      <li><strong>Downloads cannot be saved, in Docker.</strong> The download folder on the host has to be writable by user ID 1000.</li>
+      <li><strong>Lost the connection to emberd</strong> on the page means emberd stopped or is restarting. The page reconnects by itself once it is back.</li>
+    </ul>
+  </section>
+
+  <hr>
+
+  <section id="faq">
+    <h2>FAQ</h2>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Can I run emberd and the desktop app at the same time?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Yes, each with its own identity: a fresh emberd starts as a new Ember, just as a fresh desktop install does. If you move your desktop identity onto emberd with a backup, use it there only from then on.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Does emberd run on Windows or macOS?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">emberd is released for Linux on x86-64 and ARM64, as packages and as a Docker image. On a Windows computer that stays on, the desktop app does the same job: it starts at login, sits in the tray and updates itself.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Will the desktop app offer emberd as an update, or the other way round?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">No. They are separate programs, released together under the same version. The desktop app is never offered emberd as an update, and emberd is updated the way it was installed: see <a href="#updating">Updating</a>.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Can I use it from my phone?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Yes, in the phone&rsquo;s browser. Reach the server over your home network, or from outside through a VPN or HTTPS, as in <a href="#remote">Using it from another computer</a>.</div>
+    </div>
+
+    <div class="faq-item">
+      <button class="faq-q" type="button" aria-expanded="false" onclick="toggleFaq(this)">
+        Do I keep my eMule credits?
+        <svg class="faq-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
+      <div class="faq-a">Yes, if you bring them: an import from eMule or aMule, or a restored desktop Ember backup, carries your identity and credits onto emberd. See <a href="#moving">Moving from the desktop app</a>.</div>
+    </div>
+  </section>
+
+</main>
+</div>
+
+<footer class="site-footer guide-footer">
+  <div class="footer-inner">
+    <div>&copy; 2025&ndash;2026 Ember. Released under the GPLv3 License.</div>
+    <nav class="footer-links" aria-label="Footer">
+      <a href="guide.html">Guide</a>
+      <a href="emberd.html">emberd</a>
+      <a href="index.html#releases">Release notes</a>
+      <a href="https://github.com/untaimed18/Ember-P2P" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/untaimed18/Ember-P2P/issues" target="_blank" rel="noopener">Report an issue</a>
+    </nav>
+  </div>
+</footer>
+
+<button class="back-to-top" id="backToTop" type="button" onclick="window.scrollTo({top:0})" aria-label="Back to top">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><polyline points="18 15 12 9 6 15"/></svg>
+</button>
+
+<script>
+(function() {
+  var sidebar = document.getElementById('sidebar');
+  var overlay = document.getElementById('overlay');
+  var menuBtn = document.querySelector('.mobile-toggle');
+
+  function setSidebar(open) {
+    sidebar.classList.toggle('open', open);
+    overlay.classList.toggle('open', open);
+    menuBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    menuBtn.setAttribute('aria-label', open ? 'Close menu' : 'Open menu');
+  }
+  window.toggleSidebar = function() { setSidebar(!sidebar.classList.contains('open')); };
+  window.toggleFaq = function(btn) {
+    var item = btn.parentElement;
+    var open = !item.classList.contains('open');
+    item.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  };
+  document.addEventListener('keydown', function(e) { if (e.key === 'Escape') setSidebar(false); });
+
+  var tocLinks = Array.prototype.slice.call(document.querySelectorAll('.toc-link[href^="#"]'));
+  tocLinks.forEach(function(link) { link.addEventListener('click', function() { setSidebar(false); }); });
+  var targets = tocLinks.map(function(link) {
+    return { el: document.getElementById(link.getAttribute('href').slice(1)), link: link };
+  }).filter(function(t) { return t.el; });
+
+  var lastActive = null;
+  function updateActive() {
+    var active = null;
+    for (var i = targets.length - 1; i >= 0; i--) {
+      if (targets[i].el.getBoundingClientRect().top <= 120) { active = targets[i].link; break; }
+    }
+    if (active === lastActive) return;
+    lastActive = active;
+    tocLinks.forEach(function(l) { l.classList.remove('active'); });
+    if (active) {
+      active.classList.add('active');
+      if (typeof active.scrollIntoView === 'function') active.scrollIntoView({ block: 'nearest' });
+    }
+  }
+  window.addEventListener('scroll', updateActive, { passive: true });
+  updateActive();
+
+  var header = document.querySelector('.site-header');
+  var btt = document.getElementById('backToTop');
+  function updateChrome() {
+    header.classList.toggle('scrolled', window.scrollY > 8);
+    if (btt) btt.classList.toggle('visible', window.scrollY > 600);
+  }
+  window.addEventListener('scroll', updateChrome, { passive: true });
+  updateChrome();
+})();
+</script>
+
+</body>
+</html>

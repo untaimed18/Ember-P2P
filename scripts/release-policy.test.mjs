@@ -892,6 +892,26 @@ test("emberd's image is pushed only from a published release's tarball", () => {
   }
 });
 
+test("emberd's joined image carries no annotations its machines' images cannot hold", () => {
+  const joinLine = '          docker buildx imagetools create "${tags[@]}" \\\n';
+  const annotated = joinLine + '            --annotation "index:org.opencontainers.image.version=$VERSION" \\\n';
+  const fixture = imageFixture(joinLine, annotated);
+  try {
+    assert.throws(
+      () => verifyWorkflow({ root: fixture }),
+      /the joined image cannot carry annotations while each machine's image is pushed in Docker's format/,
+    );
+    const path = join(fixture, ".github/workflows/emberd-image.yml");
+    const build = '            --tag "emberd:$VERSION" .\n';
+    const source = readFileSync(path, "utf8");
+    assert.ok(source.includes(build), `emberd-image.yml no longer contains: ${build}`);
+    writeFileSync(path, source.replace(build, `            --output type=docker,oci-mediatypes=true \\\n${build}`));
+    verifyWorkflow({ root: fixture });
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test("each Linux format is built on its own runner, and the AppImage's glibc reaches the manifest", () => {
   for (const [from, to, expected] of [
     [

@@ -4,6 +4,7 @@
     CHAT_ATTACHMENT_TERMINAL,
     cancelChatAttachment,
     openChatAttachment,
+    saveChatAttachment,
     respondChatAttachment,
     retryChatAttachment,
     type ChatAttachment,
@@ -313,6 +314,15 @@
         disabled={busy}
         onclick={() => run(() => openChatAttachment(attachment.xfer_id, true))}
       >{m.chat_attach_show()}</button>
+    </div>
+  {:else if attachment.has_file}
+    <div class="attach-actions">
+      <button
+        type="button"
+        class="attach-primary"
+        disabled={busy}
+        onclick={() => run(() => saveChatAttachment(attachment.xfer_id))}
+      >{m.server_save_to_computer()}</button>
     </div>
   {/if}
 

@@ -2783,6 +2783,19 @@ pub async fn show_feed_item(
     .map_err(|e| coded_ctx("feeds_task_error", "Task error", e))?
 }
 
+/// emberd: a followed feed's file, left for the browser to save
+/// (`server::saved`), found as [`open_feed_item`] finds it.
+#[ember_macros::command(server)]
+pub async fn save_feed_item(
+    state: crate::host::State<'_, AppState>,
+    publisher: String,
+    salt: String,
+    ed2k: String,
+) -> Result<String, String> {
+    let (path, declared) = feed_item_file(&state, &publisher, &salt, &ed2k).await?;
+    crate::server::saved::offer_file(path, &declared).await
+}
+
 /// The file a followed feed's item is on disk, where its row shows it done
 /// or in the Library (see [`get_feed_items`]), checked as Transfers' and the
 /// Library's Open check theirs, and the name it was declared under, for the

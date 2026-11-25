@@ -512,14 +512,13 @@
     if (method === 'kad') return m.search_network_need_kad_hint();
     if (method === 'server') return m.search_network_need_server_hint();
     if (method === 'ember') {
-      if (!emberEnabled) return m.search_network_need_ember_hint();
       if (emberContacts === 0 && !emberJoinTimedOut) {
         return m.search_network_ember_joining_hint();
       }
       return m.search_network_need_ember_hint();
     }
     // Global with neither eMule net up: Ember may still be usable.
-    if (emberEnabled && !kadUpLive && !serverUpLive) {
+    if (!kadUpLive && !serverUpLive) {
       return emberContacts === 0 && !emberJoinTimedOut
         ? m.search_network_ember_joining_hint()
         : m.search_network_global_ember_only_hint();
@@ -1448,23 +1447,17 @@
   }
 
   let searchTimeoutSecs = $state(120);
-  let emberEnabled = $derived(!!$appSettings?.ember_native_enabled);
   let emberContacts = $state(0);
   let emberJoinTimedOut = $state(false);
   let emberJoinActiveSince = $state<number | null>(null);
   let emberDiagnosticsStale = $state(false);
-  let emberSearchUsable = $derived(emberEnabled && emberContacts > 0);
-  // The Ember option is not rendered while Ember is off, so a method restored
-  // from storage or a tab would leave the dropdown blank and Search disabled.
-  $effect(() => {
-    if ($appSettings && !emberEnabled && searchMethod === 'ember') searchMethod = 'global';
-  });
+  let emberSearchUsable = $derived(emberContacts > 0);
   // A wedged diagnostics poll leaves `emberContacts` at whatever it last was —
   // 0 for the whole session if the very first poll never landed. Gating submit
   // on that number then disables Search and blames the DHT for having no
   // peers, with a restart as the only way out. Once readiness is unknown,
   // let the search through and let the backend answer.
-  let emberReadinessUnknown = $derived(emberEnabled && emberDiagnosticsStale);
+  let emberReadinessUnknown = $derived(emberDiagnosticsStale);
   let emberSearchAllowed = $derived(emberSearchUsable || emberReadinessUnknown);
   let searchSubmitBlocked = $derived(
     (searchMethod === 'ember' && !emberSearchAllowed)
@@ -1477,12 +1470,6 @@
   );
 
   function recomputeEmberJoinState() {
-    if (!emberEnabled) {
-      emberJoinActiveSince = null;
-      emberJoinTimedOut = false;
-      emberContacts = 0;
-      return;
-    }
     if (emberContacts > 0) {
       emberJoinActiveSince = null;
       emberJoinTimedOut = false;
@@ -1497,13 +1484,12 @@
   }
 
   $effect(() => {
-    // Re-arm joining UX when Ember becomes usable (mirrors /ember). The three
-    // reads above are the whole intended dependency set; the recompute reads
+    // Re-arm joining UX when Ember becomes usable (mirrors /ember). The two
+    // reads below are the whole intended dependency set; the recompute reads
     // the same state it writes, so keep its reads out of the graph. It settles
     // today only because every write lands on an unchanged primitive — one
     // branch assigning a fresh `Date.now()` on the settled path would make
     // this a hard update-depth loop.
-    void emberEnabled;
     void emberContacts;
     void emberDiagnosticsStale;
     untrack(recomputeEmberJoinState);
@@ -1542,8 +1528,8 @@
         console.warn('search: getSettings failed', e);
       });
 
-    // Poll Ember DHT contact count while Ember is enabled so the readiness
-    // strip can show "joining" vs "ready" without navigating to /ember.
+    // Poll Ember DHT contact count so the readiness strip can show "joining"
+    // vs "ready" without navigating to /ember.
     let emberPoll: ReturnType<typeof setInterval> | undefined;
     let joinPoll: ReturnType<typeof setInterval> | undefined;
     // Tolerate transient blips the way /ember does — one lost poll is not a
@@ -1561,10 +1547,6 @@
     let emberDiagInFlight = false;
     let emberDiagMissedWhileHidden = false;
     const refreshEmber = () => {
-      if (!$appSettings?.ember_native_enabled) {
-        emberContacts = 0;
-        return;
-      }
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
         emberDiagMissedWhileHidden = true;
         return;
@@ -2831,16 +2813,16 @@
       }
     }
     // Gate by the selected search method — KAD-only needs KAD, server-only
-    // needs the eD2K server, Ember-only needs Ember enabled, global needs
+    // needs the eD2K server, Ember-only needs Ember peers, global needs
     // any of KAD / server / Ember.
     const kadUp = $networkStats.status === 'connected';
     const serverUp = $serverStatus === 'connected';
-    const emberJoining = emberEnabled && emberContacts === 0 && !emberJoinTimedOut;
+    const emberJoining = emberContacts === 0 && !emberJoinTimedOut;
     // Unknown readiness counts as allowed here for the same reason it does in
     // `searchSubmitBlocked`: refusing would report "no peers" for what is
     // really a dead diagnostics command.
     const emberReady = emberSearchAllowed;
-    const emberNoPeers = emberEnabled && emberContacts === 0 && emberJoinTimedOut;
+    const emberNoPeers = emberContacts === 0 && emberJoinTimedOut;
     const methodAllowed =
       method === 'kad' ? kadUp :
       method === 'server' ? serverUp :
@@ -4725,15 +4707,13 @@
       searchMethod = chosenSearchMethod = v;
       stagedExtension = '';
     }}
-    title={emberEnabled ? m.search_method_title() : m.search_method_title_no_ember()}
-    aria-label={emberEnabled ? m.search_method_title() : m.search_method_title_no_ember()}
+    title={m.search_method_title()}
+    aria-label={m.search_method_title()}
   >
     <option value="global">{m.search_method_global()}</option>
     <option value="kad">{m.search_method_kad_only()}</option>
     <option value="server">{m.search_method_server_only()}</option>
-    {#if emberEnabled}
-      <option value="ember">{m.search_method_ember_only()}</option>
-    {/if}
+    <option value="ember">{m.search_method_ember_only()}</option>
   </select>
   <label class="search-type-field" title={m.search_filetype_search_for_title()}>
     <span class="search-type-label">{m.search_filetype_search_for()}</span>
@@ -4754,7 +4734,7 @@
       {#if searchMethod === 'kad' || searchMethod === 'ember' || searchMethod === 'global'}
         <p class="search-syntax-ed2k">{m.search_query_syntax_extensions()}</p>
       {/if}
-      {#if searchMethod === 'ember' || (searchMethod === 'global' && emberEnabled)}
+      {#if searchMethod === 'ember' || searchMethod === 'global'}
         <p class="search-syntax-ember">
           <span class="search-syntax-ember-tag">{m.search_origin_ember()}</span>
           <span>{m.search_query_syntax_hint_ember()}</span>
@@ -5097,26 +5077,18 @@
     </div>
   {:else if (searchMethod === 'kad' && $networkStats.status !== 'connected')
     || (searchMethod === 'server' && $serverStatus !== 'connected')
-    || (searchMethod === 'ember' && (!emberEnabled || (emberContacts === 0 && !emberJoinTimedOut)))
+    || (searchMethod === 'ember' && emberContacts === 0 && !emberJoinTimedOut)
     || (searchMethod === 'global'
       && $networkStats.status !== 'connected'
       && $serverStatus !== 'connected'
-      && emberEnabled
       && (emberContacts === 0 ? !emberJoinTimedOut : true))}
     <div class="search-readiness-hint" role="status">
       {searchNetworkHint(searchMethod)}
     </div>
   {:else if (searchMethod === 'ember' || (searchMethod === 'global' && !kadUpLive && !serverUpLive))
-    && emberEnabled && emberContacts === 0 && emberJoinTimedOut}
+    && emberContacts === 0 && emberJoinTimedOut}
     <div class="search-readiness-hint search-readiness-muted" role="status">
       {m.search_network_ember_no_peers_hint()}
-    </div>
-  {:else if searchMethod === 'global'
-    && $networkStats.status !== 'connected'
-    && $serverStatus !== 'connected'
-    && !emberEnabled}
-    <div class="search-readiness-hint" role="status">
-      {m.search_network_disconnected_hint()}
     </div>
   {:else if $networkStats.degraded && $networkStats.degraded_reason}
     <div class="search-readiness-hint search-readiness-muted" role="status">
