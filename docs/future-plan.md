@@ -247,7 +247,8 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   the one for blocking a friend. Since then, new in every language by
   machine: the deleted-elsewhere banner as a whole sentence, the eMule
   import's refused Incoming folder, the file pickers' titles and filter
-  names, and the Linux wording of the delete texts (`*_trash`).
+  names, the Linux wording of the delete texts (`*_trash`), and the eD2K
+  server log (`server_log_*`, the reasons as `server_log_reason_*`).
 
 ## 8. Left from the 1.8.0 checks
 
@@ -256,29 +257,8 @@ it: each is low in severity, needs unusual conditions, or needs more change
 than a release candidate should take. What was fixed then is in commit
 `929f0c57` and the wording pass in `2fccc83d`.
 
-**Channels** (rooms in the code):
-
-- **Two owning devices, past the ban cap.** 1.8.0 merges the bans of a
-  snapshot this device does not take (`take_owned_snapshot_bans_locked`) and
-  dates owner unbans. If the two devices' bans together pass the 12 a snapshot
-  carries, a republish drops the oldest and lifts them for the room. Refuse a
-  ban past the cap, or rotate and carry the newest.
-- **Two owning devices, the 6-hour republish.** An ordinary edit or a rotation
-  no longer goes ahead without an answered read, but the owner pass still
-  signs after `owner_republish_read_gate` has deferred for 6 hours. Owing a
-  rotation then, it could mint an epoch number the other device already used.
-  Apply the rotation rule (`owner_rotation_waits_for_first_read`) there too.
-  A ban lifted this way is now taken back once the device reads the other's
-  snapshot.
-- **Two owning devices, evicted rows.** In a room past 256 members an
-  unbanned member's row can be evicted, and an old cached snapshot that still
-  banned them would ban them again. It errs toward keeping someone banned.
-
 **Wording the 1.8.0 audit left:**
 
-- The eD2K server log on the eD2K Servers page is English with raw OS errors
-  (`emit_server_log` in `network/server.rs`, called across
-  `network/event_loop/`).
 - Spellings still split across the English: "this computer" and "this
   device", "your library" and "your Library", "checked" and "ticked",
   British and American spellings, and "Failed to…" beside "Could not…".

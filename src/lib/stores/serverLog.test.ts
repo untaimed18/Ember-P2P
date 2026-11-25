@@ -111,4 +111,14 @@ describe('appendServerLog', () => {
 
     expect(get(serverLog)).toHaveLength(0);
   });
+
+  it('keeps what the line is rendered from, live and replayed', () => {
+    // The page renders the line in the current locale from these, so a
+    // replay that kept only the English would show it untranslated.
+    const parts = { key: 'failed', args: { addr: '192.0.2.1:4661' }, reason: { key: 'refused', detail: 'raw' } };
+    appendServerLog('Connection failed (raw).', { ...line(1, 1_000, 'Connection failed (raw).'), ...parts });
+    hydrateServerLog([{ ...line(2, 2_000, 'Connection failed (raw).'), ...parts }]);
+
+    for (const entry of get(serverLog)) expect(entry).toMatchObject(parts);
+  });
 });

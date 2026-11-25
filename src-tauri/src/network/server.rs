@@ -17,7 +17,305 @@ pub struct ServerLogLine {
     /// so replayed lines keep the time they happened rather than the time they
     /// were read back.
     pub at: i64,
+    /// The line in English, shown when the page has nothing for `key`.
     pub message: String,
+    /// The `server_log_<key>` message the page shows, filled from `args` and,
+    /// for its `{reason}`, from `reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<&'static str>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub args: std::collections::BTreeMap<&'static str, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ServerLogReason>,
+}
+
+/// Why a server connection failed or ended: the `server_log_reason_<key>`
+/// message when Ember can tell, and the error as it came, in English, either
+/// way, which the page shows when there is no key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ServerLogReason {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<&'static str>,
+    pub detail: String,
+}
+
+impl ServerLogReason {
+    pub(super) fn of(error: &str) -> Self {
+        Self {
+            key: server_error_cause(error),
+            detail: error.to_string(),
+        }
+    }
+}
+
+/// The OS error code an `io::Error` rendered into `error` as `(os error N)`,
+/// which decodes the same way on every platform.
+fn os_error_code(error: &str) -> Option<i32> {
+    error
+        .rsplit_once("(os error ")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .and_then(|(code, _)| code.parse::<i32>().ok())
+}
+
+/// What a server connection error comes down to, as the
+/// `server_log_reason_<key>` the page says it with, or `None` when Ember
+/// cannot tell and the error is shown as it came.
+///
+/// The connect task and the session hand back only an error's text, so this
+/// reads the OS's own code where there is one, and otherwise the sentences
+/// Ember's own errors are written in.
+fn server_error_cause(error: &str) -> Option<&'static str> {
+    use std::io::ErrorKind;
+    if let Some(code) = os_error_code(error) {
+        // Windows' resolver failures have no `ErrorKind` of their own.
+        if matches!(code, 11001 | 11002 | 11004) {
+            return Some("dns");
+        }
+        let kind = match std::io::Error::from_raw_os_error(code).kind() {
+            ErrorKind::ConnectionRefused => Some("refused"),
+            ErrorKind::TimedOut => Some("timed_out"),
+            ErrorKind::ConnectionReset => Some("reset"),
+            ErrorKind::ConnectionAborted => Some("aborted"),
+            ErrorKind::HostUnreachable => Some("host_unreachable"),
+            ErrorKind::NetworkUnreachable | ErrorKind::NetworkDown => Some("network_down"),
+            ErrorKind::BrokenPipe | ErrorKind::NotConnected => Some("lost"),
+            _ => None,
+        };
+        if kind.is_some() {
+            return kind;
+        }
+    }
+    const CAUSES: &[(&str, &str)] = &[
+        ("blocked by ip filter", "ip_filter"),
+        ("blocked by the ip filter", "ip_filter"),
+        ("no longer in the server list", "not_listed"),
+        ("has moved", "moved"),
+        ("after moving moments ago", "moved"),
+        ("failed to lookup address", "dns"),
+        ("no ipv4 address", "dns"),
+        ("rejected login", "rejected"),
+        ("login did not complete", "no_login"),
+        ("login sequence did not complete", "no_login"),
+        ("user disconnected", "you"),
+        ("no server activity", "silent"),
+        ("without a live session", "lost"),
+        ("without an id", "bad_reply"),
+        ("parse panicked", "bad_reply"),
+        // Before "closed connection": the login's own read timing out is
+        // reported as the server having closed it after so many packets.
+        ("timed out", "timed_out"),
+        ("deadline has elapsed", "timed_out"),
+        ("closed connection", "closed"),
+        ("early eof", "closed"),
+        ("reader stopped", "closed"),
+        ("write failed", "lost"),
+        ("writer stopped", "lost"),
+        ("could not reach", "host_unreachable"),
+        ("no last server in the list", "no_server"),
+        ("server.met", "server_met"),
+    ];
+    let text = error.to_ascii_lowercase();
+    CAUSES
+        .iter()
+        .find(|(phrase, _)| text.contains(phrase))
+        .map(|(_, key)| *key)
+}
+
+/// What a server log line says, in English and as the message the page
+/// translates it from. Built by [`log_line`], which keeps each key beside the
+/// arguments its message takes.
+#[derive(Debug, Clone)]
+pub(super) struct ServerLogText {
+    message: String,
+    key: Option<&'static str>,
+    args: std::collections::BTreeMap<&'static str, String>,
+    reason: Option<ServerLogReason>,
+}
+
+impl ServerLogText {
+    fn line(key: &'static str, message: String) -> Self {
+        Self {
+            message,
+            key: Some(key),
+            args: std::collections::BTreeMap::new(),
+            reason: None,
+        }
+    }
+
+    fn arg(mut self, name: &'static str, value: impl ToString) -> Self {
+        self.args.insert(name, value.to_string());
+        self
+    }
+
+    fn because(mut self, error: &str) -> Self {
+        self.reason = Some(ServerLogReason::of(error));
+        self
+    }
+}
+
+/// A line with no message of its own, shown as written.
+impl From<&str> for ServerLogText {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.to_string(),
+            key: None,
+            args: std::collections::BTreeMap::new(),
+            reason: None,
+        }
+    }
+}
+
+/// Every line Ember writes to the server log. Each is the
+/// `server_log_<name>` message, taking these arguments and, where the line
+/// says why, a `{reason}` (`server_log_reason_*`).
+pub(super) mod log_line {
+    use super::ServerLogText as Text;
+    use crate::network::ed2k::server::ServerMessageLine;
+
+    pub(crate) fn connecting(addr: &str) -> Text {
+        Text::line("connecting", format!("Connecting to {addr}…")).arg("addr", addr)
+    }
+
+    pub(crate) fn trying_encrypted(addr: &str) -> Text {
+        Text::line("trying_encrypted", format!("Trying an encrypted connection to {addr}…")).arg("addr", addr)
+    }
+
+    pub(crate) fn encrypted_established() -> Text {
+        Text::line("encrypted_established", "Encrypted connection established".into())
+    }
+
+    pub(crate) fn encrypted_failed(port: u16) -> Text {
+        Text::line(
+            "encrypted_failed",
+            format!("Encrypted connection failed, trying plain TCP on port {port}…"),
+        )
+        .arg("port", port)
+    }
+
+    pub(crate) fn tcp_established() -> Text {
+        Text::line("tcp_established", "TCP connection established".into())
+    }
+
+    pub(crate) fn sending_login(port: u16) -> Text {
+        Text::line("sending_login", format!("Sending the login (client TCP port {port})…")).arg("port", port)
+    }
+
+    pub(crate) fn encrypted_login_failed(error: &str) -> Text {
+        Text::line(
+            "encrypted_login_failed",
+            format!("Encrypted login failed ({error}), trying plain TCP…"),
+        )
+        .because(error)
+    }
+
+    pub(crate) fn sending_plain_login(port: u16) -> Text {
+        Text::line("sending_plain_login", format!("Sending the login over plain TCP (port {port})…")).arg("port", port)
+    }
+
+    /// `id` is `HighID` or `LowID`, which eMule and Ember call them in every
+    /// language.
+    pub(crate) fn connected(server: &str, users: u32, files: u32, id: &str) -> Text {
+        Text::line(
+            "connected",
+            format!("Connected to {server} ({users} users, {files} files, {id})"),
+        )
+        .arg("server", server)
+        .arg("users", users)
+        .arg("files", files)
+        .arg("id", id)
+    }
+
+    pub(crate) fn reassigned(id: &str, client_id: u32) -> Text {
+        Text::line("reassigned", format!("The server assigned a new {id} ({client_id})"))
+            .arg("id", id)
+            .arg("client_id", client_id)
+    }
+
+    pub(crate) fn added_from_update(count: usize) -> Text {
+        Text::line("added_from_update", format!("Servers added from a server list update: {count}")).arg("count", count)
+    }
+
+    pub(crate) fn added_from_server(count: usize) -> Text {
+        Text::line("added_from_server", format!("Servers added from the connected server: {count}")).arg("count", count)
+    }
+
+    pub(crate) fn moved(addr: &str, new_addr: &str) -> Text {
+        Text::line("moved", format!("Server {addr} has moved to {new_addr}."))
+            .arg("addr", addr)
+            .arg("new_addr", new_addr)
+    }
+
+    pub(crate) fn blocked(addr: &str) -> Text {
+        Text::line("blocked", format!("Server {addr} is blocked by the IP filter")).arg("addr", addr)
+    }
+
+    pub(crate) fn not_connecting(addr: &str, reason: &str) -> Text {
+        Text::line("not_connecting", format!("Not connecting to {addr}: {reason}."))
+            .arg("addr", addr)
+            .because(reason)
+    }
+
+    pub(crate) fn disconnecting() -> Text {
+        Text::line("disconnecting", "Disconnecting from the current server…".into())
+    }
+
+    pub(crate) fn disconnected(reason: &str) -> Text {
+        Text::line("disconnected", format!("Server disconnected: {reason}")).because(reason)
+    }
+
+    pub(crate) fn failed(error: &str) -> Text {
+        Text::line("failed", format!("Connection failed ({error}).")).because(error)
+    }
+
+    pub(crate) fn retrying(error: &str, attempt: u32, attempts: u32) -> Text {
+        Text::line(
+            "retrying",
+            format!("Connection failed ({error}); retrying the preferred server ({attempt}/{attempts})…"),
+        )
+        .arg("attempt", attempt)
+        .arg("attempts", attempts)
+        .because(error)
+    }
+
+    pub(crate) fn retrying_later(error: &str, minutes: u64) -> Text {
+        Text::line(
+            "retrying_later",
+            format!("Connection failed ({error}); retrying the preferred server in {minutes} min…"),
+        )
+        .arg("minutes", minutes)
+        .because(error)
+    }
+
+    pub(crate) fn retrying_network_down(error: &str, seconds: u64) -> Text {
+        Text::line(
+            "retrying_network_down",
+            format!("Connection failed ({error}); no network, retrying in {seconds} s…"),
+        )
+        .arg("seconds", seconds)
+        .because(error)
+    }
+
+    pub(crate) fn auto_connect_failed(detail: &str) -> Text {
+        Text::line(
+            "auto_connect_failed",
+            format!("Auto-connect gave up ({detail}). Connect to a server from this page."),
+        )
+        .because(detail)
+    }
+
+    pub(crate) fn connection_error(error: &str) -> Text {
+        Text::line("connection_error", format!("Connection error: {error}")).because(error)
+    }
+
+    /// The server's own words, with what eMule calls the line.
+    pub(crate) fn server_message(line: &ServerMessageLine) -> Text {
+        let (key, text) = match line {
+            ServerMessageLine::Info(text) => ("server_message", text),
+            ServerMessageLine::Warning(text) => ("server_warning", text),
+            ServerMessageLine::Error(text) => ("server_error", text),
+        };
+        Text::line(key, line.log_line()).arg("text", text)
+    }
 }
 
 /// Lines kept for replay. Matches `MAX_ENTRIES` in `stores/serverLog.ts`;
@@ -39,12 +337,15 @@ pub(super) static SERVER_LOG: std::sync::LazyLock<parking_lot::Mutex<VecDeque<Se
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(VecDeque::new()));
 
 /// Record a line in the replay buffer and return it, ready to emit.
-pub(super) fn record_server_log(message: &str) -> ServerLogLine {
+pub(super) fn record_server_log(text: ServerLogText) -> ServerLogLine {
     static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let line = ServerLogLine {
         seq: NEXT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         at: chrono::Utc::now().timestamp_millis(),
-        message: message.to_string(),
+        message: text.message,
+        key: text.key,
+        args: text.args,
+        reason: text.reason,
     };
     let mut log = SERVER_LOG.lock();
     if log.len() >= SERVER_LOG_HISTORY {
@@ -54,13 +355,8 @@ pub(super) fn record_server_log(message: &str) -> ServerLogLine {
     line
 }
 
-pub(super) fn emit_server_log(app: &crate::host::AppHandle, message: &str) {
-    let _ = app.emit("server-log", record_server_log(message));
-}
-
-/// The log line for servers taken from a server's list.
-pub(super) fn added_servers_line(added: usize, from: &str) -> String {
-    format!("Added {added} {} from {from}", if added == 1 { "server" } else { "servers" })
+pub(super) fn emit_server_log(app: &crate::host::AppHandle, text: ServerLogText) {
+    let _ = app.emit("server-log", record_server_log(text));
 }
 
 /// The retained log, oldest first.
@@ -133,22 +429,16 @@ pub(super) async fn try_connect_server(
                 .find(|addr| addr.is_ipv4())
                 .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for {ip}:{enc_port}"))?;
             info!("Trying encrypted DH connection to server {ip}:{enc_port}");
-            emit_server_log(
-                app,
-                &format!("Trying encrypted connection to {ip}:{enc_port}..."),
-            );
+            emit_server_log(app, log_line::trying_encrypted(&format!("{ip}:{enc_port}")));
             match Ed2kServerConnection::connect_encrypted(enc_addr).await {
                 Ok(conn) => {
                     info!("Encrypted DH connection to server {ip}:{enc_port} established");
-                    emit_server_log(app, "Encrypted connection established");
+                    emit_server_log(app, log_line::encrypted_established());
                     return Ok((conn, enc_addr));
                 }
                 Err(e) => {
                     debug!("Encrypted DH connection to server {ip}:{enc_port} failed: {e}, falling back to plain");
-                    emit_server_log(
-                        app,
-                        &format!("Encrypted connection failed, trying plain TCP on port {port}..."),
-                    );
+                    emit_server_log(app, log_line::encrypted_failed(port));
                 }
             }
         } else {
@@ -163,7 +453,7 @@ pub(super) async fn try_connect_server(
         .ok_or_else(|| anyhow::anyhow!("No IPv4 address found for {ip}:{port}"))?;
     let conn = Ed2kServerConnection::connect(addr).await?;
     info!("Plain TCP connection to server {ip}:{port} established");
-    emit_server_log(app, "TCP connection established");
+    emit_server_log(app, log_line::tcp_established());
     Ok((conn, addr))
 }
 
@@ -244,7 +534,7 @@ pub(super) async fn handle_server_disconnect(
     reason: &str,
 ) {
     debug!("Server connection lost: {reason}");
-    emit_server_log(app_handle, &format!("Server disconnected: {reason}"));
+    emit_server_log(app_handle, log_line::disconnected(reason));
     if state.server_connected {
         let session_secs = state
             .server_logged_in_at
@@ -327,10 +617,7 @@ pub(super) async fn disconnect_connected_server_if_ip_filtered(
     let ip = ipv4.to_string();
     let port = addr.port();
     warn!("Server {ip}:{port} blocked by IP filter, disconnecting");
-    emit_server_log(
-        app_handle,
-        &format!("Server {ip}:{port} blocked by IP filter"),
-    );
+    emit_server_log(app_handle, log_line::blocked(&format!("{ip}:{port}")));
     handle_server_disconnect(
         state,
         shared_server_addr,
@@ -457,32 +744,23 @@ pub(super) fn server_auto_reconnect_gives_up(failures: u32, settings: &AppSettin
 /// the raw OS code as `(os error N)`, which decodes the same way on every
 /// platform.
 pub(super) fn server_connect_error_is_network_down(error: &str) -> bool {
-    error
-        .rsplit_once("(os error ")
-        .and_then(|(_, rest)| rest.split_once(')'))
-        .and_then(|(code, _)| code.parse::<i32>().ok())
-        .is_some_and(|code| {
-            matches!(
-                std::io::Error::from_raw_os_error(code).kind(),
-                std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::NetworkDown
-            )
-        })
+    os_error_code(error).is_some_and(|code| {
+        matches!(
+            std::io::Error::from_raw_os_error(code).kind(),
+            std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::NetworkDown
+        )
+    })
 }
 
 /// Server log line for a failed attempt on the preferred server that will be
 /// retried after `wait_secs`.
-fn server_retry_log_line(error: &str, attempt: u32, wait_secs: u64, network_down: bool) -> String {
+fn server_retry_log_line(error: &str, attempt: u32, wait_secs: u64, network_down: bool) -> ServerLogText {
     if network_down {
-        format!("Connection failed ({error}); network unreachable, retrying in {wait_secs}s...")
+        log_line::retrying_network_down(error, wait_secs)
     } else if attempt < AUTO_CONNECT_MAX_FAILURES {
-        format!(
-            "Connection failed ({error}); retrying preferred server ({attempt}/{AUTO_CONNECT_MAX_FAILURES})..."
-        )
+        log_line::retrying(error, attempt, AUTO_CONNECT_MAX_FAILURES)
     } else {
-        format!(
-            "Connection failed ({error}); retrying preferred server in {} min...",
-            wait_secs.div_ceil(60)
-        )
+        log_line::retrying_later(error, wait_secs.div_ceil(60))
     }
 }
 
@@ -514,12 +792,9 @@ pub(super) fn record_server_connect_failure(
     let gives_up = server_auto_reconnect_gives_up(attempt, settings);
     if state.server_auto_reconnect && is_preferred && !gives_up {
         let wait_secs = server_reconnect_wait_secs(attempt, network_down);
-        emit_server_log(
-            app_handle,
-            &server_retry_log_line(error, attempt, wait_secs, network_down),
-        );
+        emit_server_log(app_handle, server_retry_log_line(error, attempt, wait_secs, network_down));
     } else {
-        emit_server_log(app_handle, &format!("Connection failed ({error})."));
+        emit_server_log(app_handle, log_line::failed(error));
     }
     if state.server_auto_reconnect && gives_up {
         abandon_server_auto_reconnect(
@@ -533,10 +808,7 @@ pub(super) fn record_server_connect_failure(
 
 pub(super) fn emit_server_auto_connect_failed(app_handle: &crate::host::AppHandle, detail: &str) {
     warn!("eD2K auto-connect abandoned: {detail}");
-    emit_server_log(
-        app_handle,
-        &format!("Auto-connect failed ({detail}). Please connect to a server manually."),
-    );
+    emit_server_log(app_handle, log_line::auto_connect_failed(detail));
     let _ = app_handle.emit(
         "server-auto-connect-failed",
         serde_json::json!({ "detail": detail }),
@@ -585,7 +857,7 @@ pub(super) async fn initiate_server_connect(
     // current session as it was.
     if let Some(reason) = server_dial_refusal(state, settings, &ip, port) {
         warn!("Not connecting to {ip}:{port}: {reason}");
-        emit_server_log(app_handle, &format!("Not connecting to {ip}:{port}: {reason}."));
+        emit_server_log(app_handle, log_line::not_connecting(&format!("{ip}:{port}"), &reason.to_string()));
         return Err(reason);
     }
     state.server_auto_reconnect = true;
@@ -606,7 +878,7 @@ pub(super) async fn initiate_server_connect(
     // Either half alone still means a session to end: a panic in the server
     // tick can leave the flag up with the connection gone.
     let tcp_port = if state.server_connected || state.server_connection.is_some() {
-        emit_server_log(app_handle, "Disconnecting from current server...");
+        emit_server_log(app_handle, log_line::disconnecting());
         drop(state.server_connection.take());
         state.server_connected = false;
         state.server_addr = None;
@@ -634,7 +906,7 @@ pub(super) async fn initiate_server_connect(
         *shared_server_addr.write().await = Some(SocketAddr::new(ip_addr, port));
     }
     info!("Connecting to ed2k server {ip}:{port} (background)...");
-    emit_server_log(app_handle, &format!("Connecting to {ip}:{port}..."));
+    emit_server_log(app_handle, log_line::connecting(&format!("{ip}:{port}")));
     state.stats.server_status = "connecting".to_string();
     let _ = app_handle.emit(
         "server-status-changed",
@@ -665,18 +937,12 @@ pub(super) async fn initiate_server_connect(
             )
             .await
             .map_err(|e| format!("Connect failed: {e}"))?;
-            emit_server_log(
-                &app_for_connect,
-                &format!("Sending login request (client TCP port {tcp_port})..."),
-            );
+            emit_server_log(&app_for_connect, log_line::sending_login(tcp_port));
             match conn.login(&user_hash, &nickname, tcp_port).await {
                 Ok(session) => Ok((conn, session, resolved_addr)),
                 Err(login_err) if conn.is_encrypted() => {
                     debug!("Encrypted login to {ip_clone}:{port} failed: {login_err}, falling back to plain TCP");
-                    emit_server_log(
-                        &app_for_connect,
-                        &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
-                    );
+                    emit_server_log(&app_for_connect, log_line::encrypted_login_failed(&login_err.to_string()));
                     drop(conn);
                     let plain_addr = crate::net_bind::lookup_host((ip_clone.as_str(), port))
                         .await
@@ -688,10 +954,7 @@ pub(super) async fn initiate_server_connect(
                     let mut plain_conn = Ed2kServerConnection::connect(plain_addr)
                         .await
                         .map_err(|e| format!("Plain fallback connect failed: {e}"))?;
-                    emit_server_log(
-                        &app_for_connect,
-                        &format!("Sending login over plain TCP (port {tcp_port})..."),
-                    );
+                    emit_server_log(&app_for_connect, log_line::sending_plain_login(tcp_port));
                     match plain_conn.login(&user_hash, &nickname, tcp_port).await {
                         Ok(session) => Ok((plain_conn, session, plain_addr)),
                         Err(e) => Err(format!("Plain TCP login failed: {e}")),
@@ -906,10 +1169,151 @@ pub(super) fn connected_server_info(state: &NetworkState) -> Option<ServerInfo> 
 mod reconnect_backoff_tests {
     use super::*;
 
+    fn english_messages() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str(include_str!("../../../messages/en.json")).expect("en.json parses")
+    }
+
+    fn placeholders(text: &str) -> std::collections::BTreeSet<String> {
+        text.split('{')
+            .skip(1)
+            .filter_map(|rest| rest.split_once('}').map(|(name, _)| name.to_string()))
+            .collect()
+    }
+
+    /// Every server log line is a `server_log_*` message taking exactly the
+    /// arguments the line carries, with `{reason}` where it says why, and every
+    /// such message is a line Ember writes.
     #[test]
-    fn one_added_server_is_not_servers() {
-        assert_eq!(added_servers_line(1, "connected server"), "Added 1 server from connected server");
-        assert_eq!(added_servers_line(3, "server list update"), "Added 3 servers from server list update");
+    fn every_server_log_line_is_a_message_with_its_arguments() {
+        use crate::network::ed2k::server::ServerMessageLine;
+        let en = english_messages();
+        let error = "Connect failed: deadline has elapsed";
+        let lines = [
+            log_line::connecting("192.0.2.1:4661"),
+            log_line::trying_encrypted("192.0.2.1:4662"),
+            log_line::encrypted_established(),
+            log_line::encrypted_failed(4661),
+            log_line::tcp_established(),
+            log_line::sending_login(4662),
+            log_line::encrypted_login_failed(error),
+            log_line::sending_plain_login(4662),
+            log_line::connected("A server", 10, 20, "HighID"),
+            log_line::reassigned("LowID", 7),
+            log_line::added_from_update(2),
+            log_line::added_from_server(3),
+            log_line::moved("192.0.2.1:4661", "192.0.2.2:4661"),
+            log_line::blocked("192.0.2.1:4661"),
+            log_line::not_connecting("192.0.2.1:4661", &ServerDialRefusal::BlockedByIpFilter.to_string()),
+            log_line::disconnecting(),
+            log_line::disconnected("User disconnected"),
+            log_line::failed(error),
+            log_line::retrying(error, 1, AUTO_CONNECT_MAX_FAILURES),
+            log_line::retrying_later(error, 5),
+            log_line::retrying_network_down(error, 30),
+            log_line::auto_connect_failed("server.met download failed"),
+            log_line::connection_error("task 7 panicked"),
+            log_line::server_message(&ServerMessageLine::Info("Welcome".into())),
+            log_line::server_message(&ServerMessageLine::Warning("Full".into())),
+            log_line::server_message(&ServerMessageLine::Error("Banned".into())),
+        ];
+        let mut written = std::collections::BTreeSet::new();
+        for line in &lines {
+            let key = format!("server_log_{}", line.key.expect("every line has a message"));
+            let text = en
+                .get(&key)
+                .and_then(|value| value.as_str())
+                .unwrap_or_else(|| panic!("{key} is not in en.json"));
+            let mut args: std::collections::BTreeSet<String> = line.args.keys().map(|name| name.to_string()).collect();
+            if line.reason.is_some() {
+                args.insert("reason".to_string());
+            }
+            assert_eq!(placeholders(text), args, "{key}");
+            written.insert(key);
+        }
+        let messages: std::collections::BTreeSet<String> = en
+            .keys()
+            .filter(|key| key.starts_with("server_log_") && !key.starts_with("server_log_reason_"))
+            .cloned()
+            .collect();
+        assert_eq!(messages, written, "every server_log_ message is a line Ember writes");
+    }
+
+    /// The error text the connect task and the session hand back comes down
+    /// to the cause the page names, from the OS's code where there is one and
+    /// Ember's own sentences otherwise, and to none where it would be a guess.
+    #[test]
+    fn a_server_error_is_read_for_its_cause() {
+        use std::io::ErrorKind;
+        let cases: Vec<(String, Option<&str>)> = vec![
+            (os_error_text(ErrorKind::ConnectionRefused), Some("refused")),
+            (os_error_text(ErrorKind::TimedOut), Some("timed_out")),
+            ("Connect failed: deadline has elapsed".into(), Some("timed_out")),
+            ("Login failed: server login write timed out".into(), Some("timed_out")),
+            (
+                "Login failed: Server closed connection after 1 packet(s): server read timed out (TimedOut)".into(),
+                Some("timed_out"),
+            ),
+            (os_error_text(ErrorKind::ConnectionReset), Some("reset")),
+            (os_error_text(ErrorKind::ConnectionAborted), Some("aborted")),
+            (os_error_text(ErrorKind::HostUnreachable), Some("host_unreachable")),
+            ("could not reach preferred server 192.0.2.1:4661".into(), Some("host_unreachable")),
+            (os_error_text(ErrorKind::NetworkUnreachable), Some("network_down")),
+            (os_error_text(ErrorKind::BrokenPipe), Some("lost")),
+            ("server write failed, stream unusable: server writer stopped".into(), Some("lost")),
+            ("watchdog: server marked connected without a live session".into(), Some("lost")),
+            (
+                "Login failed: Server closed connection after 3 packet(s): early eof (UnexpectedEof)".into(),
+                Some("closed"),
+            ),
+            ("server reader stopped".into(), Some("closed")),
+            ("Connect failed: failed to lookup address information: Name or service not known".into(), Some("dns")),
+            ("Connect failed: No IPv4 address found for example.org:4661".into(), Some("dns")),
+            ("Connect failed: No such host is known. (os error 11001)".into(), Some("dns")),
+            ("the server has moved".into(), Some("moved")),
+            ("its hostname now points to 192.0.2.2, after moving moments ago".into(), Some("moved")),
+            ("blocked by IP filter".into(), Some("ip_filter")),
+            (
+                format!("preferred server 192.0.2.1:4661: {}", ServerDialRefusal::BlockedByIpFilter),
+                Some("ip_filter"),
+            ),
+            (ServerDialRefusal::NotInList.to_string(), Some("not_listed")),
+            ("Login failed: Server rejected login".into(), Some("rejected")),
+            ("Login failed: server rejected login (client_id=0)".into(), Some("rejected")),
+            (
+                "Login failed: Login did not complete within 30s (2 packet(s) received, no IDCHANGE)".into(),
+                Some("no_login"),
+            ),
+            (
+                "Login failed: Login sequence did not complete after 50 packets (no IDCHANGE received)".into(),
+                Some("no_login"),
+            ),
+            ("User disconnected".into(), Some("you")),
+            ("watchdog: no server activity for 120s".into(), Some("silent")),
+            ("Login failed: server sent an ID change without an ID (2 bytes)".into(), Some("bad_reply")),
+            ("server packet 0x38 parse panicked: index out of bounds".into(), Some("bad_reply")),
+            (
+                "no last server in the list, no High priority server, and eMule Sunrise missing or Low priority".into(),
+                Some("no_server"),
+            ),
+            ("server.met download failed".into(), Some("server_met")),
+            ("downloaded server.met could not be parsed".into(), Some("server_met")),
+            ("server connection task failed".into(), None),
+            ("Connect failed: something no one has seen".into(), None),
+        ];
+        for (error, cause) in &cases {
+            assert_eq!(server_error_cause(error), *cause, "{error}");
+        }
+        let en = english_messages();
+        let named: std::collections::BTreeSet<String> = cases
+            .iter()
+            .filter_map(|(_, cause)| cause.map(|cause| format!("server_log_reason_{cause}")))
+            .collect();
+        let messages: std::collections::BTreeSet<String> =
+            en.keys().filter(|key| key.starts_with("server_log_reason_")).cloned().collect();
+        assert_eq!(messages, named, "a message for every cause, and a cause for every message");
+        for key in &messages {
+            assert!(placeholders(en[key].as_str().unwrap_or_default()).is_empty(), "{key} takes nothing");
+        }
     }
 
     /// A server that accepts the login and kicks us 20 s later: each redial

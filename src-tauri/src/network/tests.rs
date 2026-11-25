@@ -36,8 +36,8 @@ fn the_server_log_replays_its_last_lines_and_forgets_them_when_cleared() {
     clear_server_log_history();
     assert!(server_log_history().is_empty());
 
-    let first = record_server_log("connecting");
-    let second = record_server_log("connected");
+    let first = record_server_log("connecting".into());
+    let second = record_server_log("connected".into());
     assert!(
         second.seq > first.seq,
         "sequence numbers order the replay and identify a line the \
@@ -56,7 +56,7 @@ fn the_server_log_replays_its_last_lines_and_forgets_them_when_cleared() {
     // Past the cap the oldest go, so a long-running session cannot grow
     // this without bound.
     for i in 0..SERVER_LOG_HISTORY {
-        record_server_log(&format!("line {i}"));
+        record_server_log(format!("line {i}").as_str().into());
     }
     let history = server_log_history();
     assert_eq!(history.len(), SERVER_LOG_HISTORY);
@@ -74,7 +74,7 @@ fn the_server_log_replays_its_last_lines_and_forgets_them_when_cleared() {
     clear_server_log_history();
     assert!(server_log_history().is_empty());
     assert!(
-        record_server_log("after clear").seq > second.seq,
+        record_server_log("after clear".into()).seq > second.seq,
         "sequence numbers keep counting across a clear, so a line recorded \
          after one cannot collide with a line the frontend still holds"
     );

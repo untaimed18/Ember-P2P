@@ -1,9 +1,10 @@
 import { writable } from 'svelte/store';
-import type { ServerLogLine } from '$lib/types';
+import type { ServerLogLine, ServerLogReason } from '$lib/types';
 
 /** One line of eD2K server activity, as emitted by the backend's
- *  `emit_server_log`. `at` is kept separate from `message` so the view can
- *  render it in the user's current locale and re-render it if that changes. */
+ *  `emit_server_log`. `at`, and the backend's `key`, `args` and `reason`, are
+ *  kept rather than a finished string so the view renders the line in the
+ *  user's current locale (`serverLogText`) and again if that changes. */
 export interface ServerLogEntry {
   /** Monotonic within a session; only used as an `{#each}` key. Two messages
    *  can share a millisecond, so the timestamp cannot serve as one. */
@@ -13,9 +14,24 @@ export interface ServerLogEntry {
    *  was read back; arrival time for lines the UI writes itself. */
   at: number;
   message: string;
+  key?: string;
+  args?: Record<string, string>;
+  reason?: ServerLogReason;
   /** Backend sequence number, absent on lines the UI wrote itself. Used to
    *  recognise a replayed line as one already held. */
   seq?: number;
+}
+
+function entryOf(message: string, line: ServerLogLine | undefined, at: number): ServerLogEntry {
+  return {
+    id: nextId++,
+    at,
+    message,
+    key: line?.key,
+    args: line?.args,
+    reason: line?.reason,
+    seq: line?.seq,
+  };
 }
 
 /**
@@ -36,8 +52,8 @@ export interface ServerLogEntry {
 export const serverLog = writable<ServerLogEntry[]>([]);
 
 /** Lines kept before the oldest are dropped. Matches `SERVER_LOG_HISTORY` in
- *  `src-tauri/src/network/mod.rs`; there is no point retaining more there than
- *  is shown here. */
+ *  `src-tauri/src/network/server.rs`; there is no point retaining more there
+ *  than is shown here. */
 const MAX_ENTRIES = 200;
 
 let nextId = 1;
@@ -56,12 +72,7 @@ function capped(entries: ServerLogEntry[]): ServerLogEntry[] {
  */
 export function appendServerLog(message: string, line?: ServerLogLine): void {
   if (!message) return;
-  const entry: ServerLogEntry = {
-    id: nextId++,
-    at: line?.at ?? Date.now(),
-    message,
-    seq: line?.seq,
-  };
+  const entry = entryOf(message, line, line?.at ?? Date.now());
   serverLog.update((entries) => capped([...entries, entry]));
 }
 
@@ -80,7 +91,7 @@ export function hydrateServerLog(history: ServerLogLine[]): void {
     const merged = [...entries];
     for (const line of history) {
       if (held.has(line.seq)) continue;
-      merged.push({ id: nextId++, at: line.at, message: line.message, seq: line.seq });
+      merged.push(entryOf(line.message, line, line.at));
     }
     merged.sort((a, b) => a.at - b.at || (a.seq ?? 0) - (b.seq ?? 0));
     return capped(merged);

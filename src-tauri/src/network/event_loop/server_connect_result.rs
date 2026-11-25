@@ -45,7 +45,7 @@ pub(in crate::network) async fn on_server_connect_result(
                         && !state.ip_filter.ranges_ready();
                     if !skip_fail_closed && state.ip_filter.is_blocked(ipv4) {
                         warn!("Server {ip}:{port} blocked by IP filter, disconnecting");
-                        emit_server_log(app_handle, &format!("Server {ip}:{port} blocked by IP filter"));
+                        emit_server_log(app_handle, log_line::blocked(&format!("{ip}:{port}")));
                         drop(conn);
                         state.server_list.record_failure(&ip, port, false);
                         let met_path = state.data_dir.join("server.met");
@@ -79,7 +79,7 @@ pub(in crate::network) async fn on_server_connect_result(
             let addr = SocketAddr::new(addr.ip(), port);
 
             for motd in &session.motd_messages {
-                emit_server_log(app_handle, &motd.log_line());
+                emit_server_log(app_handle, log_line::server_message(motd));
             }
             if let Some(host) = &session.dyn_host {
                 if state.server_list.set_dyn_host(&ip, port, host) {
@@ -96,11 +96,15 @@ pub(in crate::network) async fn on_server_connect_result(
             info!("Connected to ed2k server: {} ({} users, {} files, {} id={})",
                 session.server_name, session.user_count, session.file_count,
                 id_type, our_id);
-            emit_server_log(app_handle, &format!(
-                "Connected to {} ({} users, {} files, {})",
-                if session.server_name.is_empty() { &ip } else { &session.server_name },
-                session.user_count, session.file_count, id_type,
-            ));
+            emit_server_log(
+                app_handle,
+                log_line::connected(
+                    if session.server_name.is_empty() { &ip } else { &session.server_name },
+                    session.user_count,
+                    session.file_count,
+                    id_type,
+                ),
+            );
             state.low_id = is_low;
             state.server_client_id = session.client_id;
             state.server_login_tcp_port = Some(login_tcp_port);
@@ -290,7 +294,7 @@ pub(in crate::network) async fn on_server_connect_result(
                         &mut state.ip_filter,
                     );
                     if added > 0 {
-                        emit_server_log(app_handle, &added_servers_line(added, "connected server"));
+                        emit_server_log(app_handle, log_line::added_from_server(added));
                         let met_path = state.data_dir.join("server.met");
                         spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);
                     }
@@ -482,7 +486,7 @@ pub(in crate::network) async fn on_server_connect_result(
         }
         Err(e) => {
             warn!("Server connection task panicked: {e}");
-            emit_server_log(app_handle, &format!("Connection error: {e}"));
+            emit_server_log(app_handle, log_line::connection_error(&e.to_string()));
             state.server_reconnect_failures =
                 state.server_reconnect_failures.saturating_add(1);
             state.server_reconnect_network_down = false;
@@ -533,7 +537,7 @@ async fn follow_moved_server(
     }
     state.server_last_moved_at = Some(std::time::Instant::now());
     info!("Server {ip}:{port} has moved to {new_ip}:{port}");
-    emit_server_log(app_handle, &format!("Server {ip}:{port} has moved to {new_ip}:{port}."));
+    emit_server_log(app_handle, log_line::moved(&format!("{ip}:{port}"), &format!("{new_ip}:{port}")));
     if state.server_list.move_server(ip, port, new_ip) {
         let met_path = state.data_dir.join("server.met");
         spawn_save_server_met(&state.server_list, met_path, &state.server_met_save_generation, &state.server_met_save_lock);

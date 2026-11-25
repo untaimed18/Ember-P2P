@@ -65,7 +65,7 @@ pub(in crate::network) async fn on_server_tick(
                                 &mut state.ip_filter,
                             );
                             if added > 0 {
-                                emit_server_log(app_handle, &added_servers_line(added, "server list update"));
+                                emit_server_log(app_handle, log_line::added_from_update(added));
                                 let met_path = state.data_dir.join("server.met");
                                 spawn_save_server_met(&state.server_list, met_path.clone(), &state.server_met_save_generation, &state.server_met_save_lock);
                             }
@@ -669,7 +669,7 @@ pub(in crate::network) async fn on_server_tick(
                             ed2k::server::ServerMessageLine::Info(_) => info!("Server message: {line:?}"),
                             _ => warn!("Server message: {line:?}"),
                         }
-                        emit_server_log(app_handle, &line.log_line());
+                        emit_server_log(app_handle, log_line::server_message(&line));
                     }
                     ed2k::server::ServerEvent::DynHost(host) => {
                         if let Some((ip, port)) = connected_server_list_key(state) {
@@ -866,10 +866,7 @@ pub(in crate::network) async fn on_server_tick(
                             "Server OP_IDCHANGE: {} id={client_id} (was_low={was_low})",
                             id_type
                         );
-                        emit_server_log(
-                            app_handle,
-                            &format!("Server reassigned {id_type} ({client_id})"),
-                        );
+                        emit_server_log(app_handle, log_line::reassigned(id_type, client_id));
                         if !is_low && client_id >= ed2k::server::LOWID_THRESHOLD {
                             if state.firewalled || was_low {
                                 info!("Mid-session HighID confirms TCP port is open");
@@ -1260,7 +1257,7 @@ pub(in crate::network) async fn on_server_tick(
             }
             info!("Auto-connecting to ed2k server {addr_str} (background, attempt {}, backoff {backoff_secs}s, plain={force_plain})",
                 state.server_reconnect_failures + 1);
-            emit_server_log(app_handle, &format!("Connecting to {addr_str}..."));
+            emit_server_log(app_handle, log_line::connecting(&addr_str));
             state.stats.server_status = "connecting".to_string();
             let _ = app_handle.emit("server-status-changed", serde_json::json!({ "status": "connecting" }));
             let app_for_auto = app_handle.clone();
@@ -1288,18 +1285,12 @@ pub(in crate::network) async fn on_server_tick(
                     )
                     .await
                     .map_err(|e| format!("Connect failed: {e}"))?;
-                    emit_server_log(
-                        &app_for_auto,
-                        &format!("Sending login request (client TCP port {tcp_port})..."),
-                    );
+                    emit_server_log(&app_for_auto, log_line::sending_login(tcp_port));
                     match conn.login(&user_hash, &nickname, tcp_port).await {
                         Ok(session) => Ok((conn, session, resolved_addr)),
                         Err(login_err) if conn.is_encrypted() => {
                             debug!("Encrypted login to {ip}:{port} failed: {login_err}, falling back to plain TCP");
-                            emit_server_log(
-                                &app_for_auto,
-                                &format!("Encrypted login failed ({login_err}), trying plain TCP..."),
-                            );
+                            emit_server_log(&app_for_auto, log_line::encrypted_login_failed(&login_err.to_string()));
                             drop(conn);
                             let plain_addr = crate::net_bind::lookup_host((ip.as_str(), port))
                                 .await
@@ -1311,10 +1302,7 @@ pub(in crate::network) async fn on_server_tick(
                             let mut plain_conn = Ed2kServerConnection::connect(plain_addr)
                                 .await
                                 .map_err(|e| format!("Plain fallback connect failed: {e}"))?;
-                            emit_server_log(
-                                &app_for_auto,
-                                &format!("Sending login over plain TCP (port {tcp_port})..."),
-                            );
+                            emit_server_log(&app_for_auto, log_line::sending_plain_login(tcp_port));
                             match plain_conn.login(&user_hash, &nickname, tcp_port).await {
                                 Ok(session) => Ok((plain_conn, session, plain_addr)),
                                 Err(e) => Err(format!("Plain TCP login failed: {e}")),
