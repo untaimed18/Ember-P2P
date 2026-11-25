@@ -718,6 +718,14 @@ export function verifyWorkflow({ root = scriptRoot } = {}) {
       `${imagePath}: emberd's image must be made from the release's tarball, checked against its SHA-256, and not compiled`,
     );
   }
+  // `docker push` stores each machine's image in Docker's own format, and a
+  // manifest list of those cannot carry annotations: the join fails on them.
+  const publishJob = releaseJobs(imageWorkflow).get("publish") ?? "";
+  if (/--annotation\b/.test(publishJob) && !/oci-mediatypes=true/.test(imageJob)) {
+    errors.push(
+      `${imagePath}: the joined image cannot carry annotations while each machine's image is pushed in Docker's format`,
+    );
+  }
 
   const policyGate = signJob.indexOf("Re-verify release policy before secrets");
   const firstSecret = signJob.indexOf("secrets.");

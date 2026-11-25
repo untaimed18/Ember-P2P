@@ -2833,7 +2833,7 @@ impl EmberDht {
     /// The media-carrying variant below is what production publishes go
     /// through; this one is reached only by the `debug_assertions` harness
     /// publish command and by the tests, so it is gated with them.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     pub fn build_keyword_record(
         &self,
         keyword: &str,

@@ -2460,17 +2460,17 @@ fn parse_key32(label: &str, hex_str: &str) -> Result<[u8; 32], String> {
 /// an outbound probe of private or special-use infrastructure.
 ///
 /// These three are reachable only from the harness commands, all of which are
-/// `debug_assertions`-only, so they are gated with them. The guard is not
-/// thereby weakened: the only callers it ever protected are the commands a
-/// release build no longer has.
+/// `debug_assertions`-only, so they are gated with them, and the check itself
+/// with its tests too. The guard is not thereby weakened: the only callers it
+/// ever protected are the commands a release build no longer has.
 #[cfg(debug_assertions)]
 fn ember_harness_mode() -> bool {
     cfg!(debug_assertions) || std::env::var_os("EMBER_HARNESS").is_some()
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 fn require_public_ember_peer_ip_for_mode(
-    ip: IpAddr,
+    ip: std::net::IpAddr,
     harness_mode: bool,
     message: &'static str,
 ) -> Result<(), String> {
