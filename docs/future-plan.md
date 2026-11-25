@@ -214,12 +214,12 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   pacing are covered: `a_private_message_goes_end_to_end_between_two_members`,
   `dm_pacing_invariants_hold`). The receiver's events need an `AppHandle`,
   which Tauri's `test` feature provides.
-- **Overnight runs of Ember itself, and property tests for more of it.** The
-  fuzz loops and the `*_invariants_hold` property tests (the Ember routing
-  table, the batch publisher, private-message pacing) run 200 times longer
-  each night from a new seed (`soak.yml`, `src-tauri/src/fuzz.rs`). Still missing: a
-  build left running against the live network, and the same kind of test for
-  the record store and the KAD routing table.
+- **Overnight runs of Ember itself.** The fuzz loops and the
+  `*_invariants_hold` property tests (the Ember routing table and record
+  store, the KAD routing table, the batch publisher, private-message pacing)
+  run 200 times longer each night from a new seed (`soak.yml`,
+  `src-tauri/src/fuzz.rs`). Still missing: a build left running against the
+  live network.
 - **Find out why most known peers show verification as Needed.** SecureIdent is
   per session, which explains part of it. Run 30 to 60 minutes with
   `RUST_LOG=info,ember_lib::network::ed2k::transfer=debug` and compare each
@@ -273,15 +273,6 @@ than a release candidate should take. What was fixed then is in commit
 - **Two owning devices, evicted rows.** In a room past 256 members an
   unbanned member's row can be evicted, and an old cached snapshot that still
   banned them would ban them again. It errs toward keeping someone banned.
-- **The "Ember Network is off" branches are dead.** The network is always on
-  (`ember_native_enabled` is forced true on load and save), so `emberOff` on
-  the Channels and Feeds pages is never true, and `channels_disabled_*`,
-  `feeds_disabled_body`, `feeds_state_paused_off` and
-  `feeds_discover_off_body` are never shown. The same goes for the
-  `channels_ember_disabled` error the Rust side still returns
-  (`commands/channels.rs`, `channel_recovery.rs`, `network/command.rs`).
-  About twenty conditions on those two pages read it, with more in Search,
-  the sidebar and the Library; take them out with the keys.
 
 **Wording the 1.8.0 audit left:**
 
@@ -306,6 +297,14 @@ Taken off the plan, with why, so they are not added back without a new reason.
 - **Watching the clipboard for ed2k links on emberd.** The clipboard is the
   server's, not the user's, and a page may read the browser's only on a click.
   The switch stays hidden in emberd's Settings.
+- **Taking the Ember network's off state out of the Rust side too.** 1.8.1
+  took it out of the pages, which no longer hide, disable or explain anything
+  for an Ember network that is off. The Rust side still checks
+  `ember_native_enabled`, which is forced on at load and on every save, in
+  about eighty places across the network loop, publishing and channel
+  membership, and still has the `channels_ember_disabled` error. Removing
+  them would mean around 150 edits in the busiest code for no change anyone
+  would see, and they are where an off switch would act if one ever came back.
 
 - **Accepting only a member's known public address for a room transfer**
   (`post-1.7.0.md` item 4). Ember holds no STUN reading for other members and

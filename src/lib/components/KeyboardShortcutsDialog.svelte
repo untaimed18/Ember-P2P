@@ -4,8 +4,7 @@
   // Grouped by scope so users can quickly scan to the shortcuts that
   // apply to where they are in the app.
   import * as m from '$lib/paraglide/messages';
-  import { NAV_SHORTCUT_LIMIT, navShortcutDigit, visibleNavItems } from '$lib/navItems';
-  import { appSettings } from '$lib/stores/settings';
+  import { NAV_SHORTCUT_LIMIT, navItems, navShortcutDigit } from '$lib/navItems';
   import { binIsRecycleBin, shortcutAltSymbol, shortcutModSymbol } from '$lib/platform';
   import IconX from './IconX.svelte';
   import { fade, scale } from 'svelte/transition';
@@ -60,28 +59,17 @@
   // page was added in the middle and three rows started naming the wrong key.
   // Alt+1..9 then Alt+0 cover the first ten items; anything past that is
   // click-only and is left out.
-  //
-  // Numbered against the *visible* nav, not the full list: Channels is hidden
-  // when the Ember overlay is off, which shifts every entry below it up one.
-  // Reading `navItems` here made the sheet promise Alt+8 → Channels on a
-  // profile where Alt+8 went to Statistics, and Alt+0 → Security where it
-  // actually went to Settings.
-  let navShortcuts: Shortcut[] = $derived(
-    visibleNavItems($appSettings?.ember_native_enabled)
-      .slice(0, NAV_SHORTCUT_LIMIT)
-      .map((item, i) => ({
-        keys: [altKey, navShortcutDigit(i) ?? String(i + 1)],
-        label: () => m.shortcuts_jump_to({ page: item.label() }),
-      })),
-  );
+  const navShortcuts: Shortcut[] = navItems
+    .slice(0, NAV_SHORTCUT_LIMIT)
+    .map((item, i) => ({
+      keys: [altKey, navShortcutDigit(i) ?? String(i + 1)],
+      label: () => m.shortcuts_jump_to({ page: item.label() }),
+    }));
 
-  // Settings sits past the Alt+1..0 range whenever all twelve entries are
-  // visible (Ember on), so it carries its own conventional key. With Ember off
-  // ten are, and Alt+0 reaches it. Listed only when the positional map doesn't
-  // already reach it, to keep one row per destination.
-  let settingsHasNavDigit = $derived(
-    navShortcuts.length >= visibleNavItems($appSettings?.ember_native_enabled).length,
-  );
+  // Settings sits past the Alt+1..0 range, so it carries its own conventional
+  // key. Listed only when the positional map doesn't already reach it, to keep
+  // one row per destination.
+  const settingsHasNavDigit = navShortcuts.length >= navItems.length;
 
   // Group/shortcut labels are stored as thunks so the table re-
   // renders in the active locale on each open without us needing

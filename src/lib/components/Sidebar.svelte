@@ -19,13 +19,11 @@
     navGroupLabel,
     navIndexFromShortcutEvent,
     navShortcutDigit,
-    visibleNavItems,
     type NavGroup,
     type NavItem,
   } from '$lib/navItems';
   import { shortcutModAria, shortcutModSymbol } from '$lib/platform';
   import { isShortcutLetter } from '$lib/shortcutKey';
-  import { appSettings } from '$lib/stores/settings';
   import { reloadAfterToastActions, runLatestUndo, toastError } from '$lib/stores/toast';
   import { openSupportPage } from '$lib/api/settings';
   import { translateError } from '$lib/i18n';
@@ -42,16 +40,13 @@
       toastError(translateError(e));
     }
   }
-  // Shared with the keyboard cheat-sheet so Alt+N is numbered against the
-  // list the user can actually see.
-  let visibleNav = $derived(visibleNavItems($appSettings?.ember_native_enabled));
 
   /**
    * The nav split into its titled runs, each entry keeping the index it has in
    * the flat list.
    *
    * The index has to travel with the item because Alt+N is numbered against
-   * the flat order — `navShortcutDigit` takes a position in `visibleNav`, not
+   * the flat order — `navShortcutDigit` takes a position in `navItems`, not
    * a position within a group.
    *
    * Grouping in the markup rather than by watching for a change of group
@@ -61,15 +56,15 @@
    * list items was `aria-hidden`, which hid the grouping from exactly the
    * users who cannot see the layout expressing it.
    */
-  let navRuns = $derived.by(() => {
+  const navRuns = (() => {
     const runs: { group: NavGroup; entries: { item: NavItem; index: number }[] }[] = [];
-    visibleNav.forEach((item, index) => {
+    navItems.forEach((item, index) => {
       const open = runs[runs.length - 1];
       if (open && open.group === item.group) open.entries.push({ item, index });
       else runs.push({ group: item.group, entries: [{ item, index }] });
     });
     return runs;
-  });
+  })();
 
   // Persist collapsed state across sessions. Read synchronously on
   // script init so the first render doesn't briefly flash expanded
@@ -379,9 +374,9 @@
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (isTypingTarget(e.target)) return;
     const idx = navIndexFromShortcutEvent(e);
-    if (idx === null || idx >= visibleNav.length) return;
+    if (idx === null || idx >= navItems.length) return;
     e.preventDefault();
-    navigateTo(visibleNav[idx].href);
+    navigateTo(navItems[idx].href);
   }
 
   onMount(() => {

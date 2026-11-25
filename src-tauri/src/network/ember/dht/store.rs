@@ -2300,6 +2300,15 @@ impl DhtStore {
     /// rather than a claim.
     #[cfg(test)]
     fn assert_publisher_index_consistent(&self) {
+        if let Some(wrong) = self.publisher_index_disagreement() {
+            panic!("{wrong}");
+        }
+    }
+
+    /// What [`Self::assert_publisher_index_consistent`] would fail on, for a
+    /// caller that reports where in a sequence the index drifted.
+    #[cfg(test)]
+    fn publisher_index_disagreement(&self) -> Option<String> {
         let mut expected: HashMap<[u8; 32], PublisherLoad> = HashMap::new();
         for records in self.entries.values() {
             let mut counted: HashSet<[u8; 32]> = HashSet::new();
@@ -2312,22 +2321,30 @@ impl DhtStore {
                 }
             }
         }
-        assert_eq!(
-            self.publisher_index.load.len(),
-            expected.len(),
-            "the index tracks {} publishers, the store holds records from {}",
-            self.publisher_index.load.len(),
-            expected.len()
-        );
+        if self.publisher_index.load.len() != expected.len() {
+            return Some(format!(
+                "the index tracks {} publishers, the store holds records from {}",
+                self.publisher_index.load.len(),
+                expected.len()
+            ));
+        }
         for (publisher, want) in &expected {
             let got = self.publisher_index.load.get(publisher).copied();
-            assert_eq!(
-                got,
-                Some(*want),
-                "index drifted for publisher {}",
-                hex::encode(publisher)
-            );
+            if got != Some(*want) {
+                return Some(format!(
+                    "index drifted for publisher {}: {got:?}, recounted {want:?}",
+                    hex::encode(publisher)
+                ));
+            }
         }
+        let over = expected.keys().filter(|p| self.publisher_index.over_share(p)).count();
+        if self.publisher_index.over_share != over {
+            return Some(format!(
+                "{} publishers counted over their share, {over} recounted",
+                self.publisher_index.over_share
+            ));
+        }
+        None
     }
 
     /// Snapshot of live keys for the diagnostic UI. Sorted by record count
@@ -5512,5 +5529,187 @@ mod tests {
         store.expire();
         assert_eq!(store.byte_len(), record_cost(source.data.len()), "and given back when it goes");
         store.assert_publisher_index_consistent();
+    }
+
+    /// What the store keeps by hand, against a recount: the publisher index,
+    /// the byte total, no key held empty or past the key budget, one record per
+    /// publisher and file under a key, and a furthest-key bound that never
+    /// under-estimates (see `furthest_key_distance`).
+    fn store_disagreement(store: &DhtStore) -> Option<String> {
+        if let Some(wrong) = store.publisher_index_disagreement() {
+            return Some(wrong);
+        }
+        let mut bytes = 0usize;
+        for (key, records) in &store.entries {
+            if records.is_empty() {
+                return Some(format!("{} is held with nothing under it", hex::encode(key)));
+            }
+            let mut seen = HashSet::new();
+            for r in records {
+                if !seen.insert((r.publisher_key, file_hash_from_record_data(&r.data))) {
+                    return Some(format!(
+                        "{} holds two records from one publisher for one file",
+                        hex::encode(key)
+                    ));
+                }
+                bytes += resident_cost(r);
+            }
+        }
+        if store.bytes != bytes {
+            return Some(format!("{} bytes counted, {bytes} resident", store.bytes));
+        }
+        if store.entries.len() > store.key_budget {
+            return Some(format!(
+                "{} keys held against a budget of {}",
+                store.entries.len(),
+                store.key_budget
+            ));
+        }
+        if let (Some(bound), Some(local)) = (store.furthest_key_distance, store.local_id) {
+            for (key, records) in &store.entries {
+                if key_is_displaceable(records) && xor_distance(&local.0, key) > bound {
+                    return Some(format!(
+                        "{} may be given up but lies past the cached bound",
+                        hex::encode(key)
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// Any sequence of what the store is asked to do keeps it true to itself
+    /// (see `store_disagreement`). Keys, publishers and files come from small
+    /// pools and the budgets and shares are shrunk, so that records replace one
+    /// another, keys fill and are given up, the byte budget evicts, and
+    /// publishers go over their share and back.
+    #[test]
+    fn record_store_invariants_hold() {
+        use rand::Rng;
+        let mut rng = crate::fuzz::rng(0x5707_E5E7);
+        let now = now_ts();
+        let publishers: Vec<SigningKey> = (1..=5u8).map(|n| SigningKey::from_bytes(&[n; 32])).collect();
+        let keys: Vec<[u8; 16]> = (0..20u8)
+            .map(|i| {
+                let mut key = [0u8; 16];
+                key[0] = [0x01, 0x03, 0x10, 0x40, 0x80, 0xC0, 0xFF][usize::from(i) % 7];
+                key[1] = i;
+                key
+            })
+            .collect();
+        // Signed once and replayed, since `store_checked` and `restore_verified`
+        // take records already checked: an Ed25519 signature per step would
+        // spend the loop on signing rather than on the store's bookkeeping.
+        let pool: Vec<([u8; 16], Vec<u8>, [u8; 64])> = (0..400)
+            .map(|_| {
+                let key = keys[rng.gen_range(0..keys.len())];
+                let sk = &publishers[rng.gen_range(0..publishers.len())];
+                let kind = [RECORD_TYPE_KEYWORD, RECORD_TYPE_KEYWORD, RECORD_TYPE_FEED, 0xEE][rng.gen_range(0..4)];
+                let mut data = padded_for(key, &[kind, rng.gen_range(0..6)]);
+                if rng.gen_bool(0.3) {
+                    data[33] = 1;
+                }
+                if rng.gen_bool(0.3) {
+                    let name = b"alpha beta gamma";
+                    data[113..115].copy_from_slice(&(name.len() as u16).to_le_bytes());
+                    data.extend_from_slice(name);
+                }
+                data.resize(data.len() + rng.gen_range(0..64), 0);
+                let created_at = match rng.gen_range(0..10) {
+                    0 => now + rng.gen_range(1..600),
+                    1 => now - 2 * 24 * 3600,
+                    _ => now - rng.gen_range(0..3_600),
+                };
+                let data = stamped(data, sk.verifying_key().to_bytes(), created_at);
+                let signature = sign(sk, &data);
+                (key, data, signature)
+            })
+            .collect();
+        let unit = record_cost(super::super::messages::MIN_STORE_RECORD_BYTES);
+        let mut saw_full = false;
+        let mut saw_crowding = false;
+        for round in 0..crate::fuzz::rounds(30) {
+            let mut store = DhtStore::new();
+            if rng.gen_bool(0.8) {
+                store.set_local_id(EmberNodeId(rng.r#gen()));
+            }
+            let key_budget = rng.gen_range(4..16);
+            store.set_key_budget_for_test(key_budget);
+            if rng.gen_bool(0.5) {
+                store.set_byte_budget_for_test(unit * rng.gen_range(8..40));
+            }
+            store.set_publisher_shares_for_test(rng.gen_range(1..5), unit * rng.gen_range(3..20));
+            for step in 0..300 {
+                let (key, data, signature) = &pool[rng.gen_range(0..pool.len())];
+                match rng.gen_range(0..16) {
+                    0..=7 => {
+                        let record = CheckedRecord { data: data.clone(), signature: *signature };
+                        store.store_checked(*key, record, None);
+                    }
+                    8 => {
+                        let mut held: Vec<[u8; 16]> = store.entries.keys().copied().collect();
+                        held.sort();
+                        if !held.is_empty() {
+                            let at = held[rng.gen_range(0..held.len())];
+                            let index = rng.gen_range(0..store.entries[&at].len());
+                            store.lapse_for_test(&at, index);
+                        }
+                    }
+                    9 => {
+                        store.expire();
+                    }
+                    10 => {
+                        let publisher = publishers[rng.gen_range(0..publishers.len())].verifying_key().to_bytes();
+                        let files: HashSet<[u8; 16]> = (0..rng.gen_range(1..3))
+                            .map(|_| {
+                                let mut file = [0u8; 16];
+                                file[0] = rng.gen_range(0..6);
+                                file
+                            })
+                            .collect();
+                        store.drop_publisher_files(&publisher, &files);
+                    }
+                    11 => {
+                        let interval = Duration::from_secs(rng.gen_range(0..2));
+                        store.take_republish_batch(interval, rng.gen_range(1..8), rng.gen_bool(0.3));
+                    }
+                    12 => store.mark_republish_due(key, signature),
+                    13 => {
+                        let records = (0..rng.gen_range(1..4))
+                            .map(|_| {
+                                let (key, data, signature) = &pool[rng.gen_range(0..pool.len())];
+                                PersistedRecord {
+                                    key: *key,
+                                    data: data.clone(),
+                                    signature: *signature,
+                                    publisher_key: data[73..105].try_into().unwrap(),
+                                    created_at: 0,
+                                    attributed_ip: None,
+                                }
+                            })
+                            .collect();
+                        store.restore_verified(VerifiedRecords(records));
+                    }
+                    14 => {
+                        if rng.gen_bool(0.5) {
+                            store.set_responsibility_filtered(rng.gen_bool(0.5));
+                        } else {
+                            store.set_publisher_shares_for_test(rng.gen_range(1..5), unit * rng.gen_range(3..20));
+                        }
+                    }
+                    _ => {
+                        let publisher = &publishers[rng.gen_range(0..publishers.len())];
+                        store.set_local_publisher_key(publisher.verifying_key().to_bytes());
+                    }
+                }
+                if let Some(wrong) = store_disagreement(&store) {
+                    panic!("round {round}, step {step}: {wrong}");
+                }
+                saw_full |= store.entries.len() == key_budget;
+                saw_crowding |= store.publisher_index.anyone_over_share();
+            }
+        }
+        assert!(saw_full, "no sequence filled the key budget");
+        assert!(saw_crowding, "no sequence put a publisher over its share");
     }
 }

@@ -3061,8 +3061,6 @@
 
   /** This identity's feeds, for "Add to feed"; `null` while they load. */
   let myFeeds: { salt: string; title: string; item_count: number }[] | null = $state(null);
-  /** Feeds exist only while Ember is on. */
-  let feedsAvailable = $derived($appSettings?.ember_native_enabled === true);
 
   async function loadMyFeeds() {
     myFeeds = null;
@@ -6125,7 +6123,7 @@
   {@const moveTargets = categoryMoveTargets(ctxMenu.file)}
   {@const tagAddTargets = emberTagTargets(ctxMenu.file, true)}
   {@const tagRemoveTargets = emberTagTargets(ctxMenu.file, false)}
-  {@const feedTargetCount = feedsAvailable ? feedTargets(ctxMenu.file).length : 0}
+  {@const feedTargetCount = feedTargets(ctxMenu.file).length}
   {@const multi = ctxActsOnChecked(ctxMenu.file)}
   {@const bulkLocked = multi && bulkBusy}
   <!-- `bulkLocked`: the bulk actions drop a request made while another runs. -->
@@ -6214,7 +6212,7 @@
         {/if}
       </div>
     {/if}
-    {#if feedsAvailable && feedTargetCount > 0}
+    {#if feedTargetCount > 0}
       <!-- Only for files a feed can list: shared with everyone, with their
            Ember digest. Added as an edit; the feed is published from Feeds. -->
       <div

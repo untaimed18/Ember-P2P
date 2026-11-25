@@ -681,8 +681,7 @@ footer.doc-end {
 <h3>1.2 Relationship to KAD and eD2K</h3>
 <p>
   EmberDHT is a <em>second network</em>, not a replacement. It is always on
-  (<code>ember_native_enabled</code>). The settings switch remains visible but cannot
-  be turned off. The overlay rides the same UDP socket as KAD (port 4672 by
+  (<code>ember_native_enabled</code>), with no switch to turn it off. The overlay rides the same UDP socket as KAD (port 4672 by
   default) and is demultiplexed by a two-byte magic, so one forwarded port
   serves both stacks.
 </p>
@@ -2706,7 +2705,7 @@ footer.doc-end {
     <tr><td>Publish/search drivers, maintenance, KAD bridge</td><td><code>network/mod.rs</code></td></tr>
     <tr><td>Rendezvous KAD key</td><td><code>kad/publish.rs</code> · <code>ember_rendezvous_key()</code></td></tr>
     <tr><td>User-facing status</td><td>Ember Network page (<code>/ember</code>), status bar</td></tr>
-    <tr><td>Settings</td><td>Settings → Network · <code>ember_native_enabled</code> (always on)</td></tr>
+    <tr><td>Settings</td><td>None: <code>ember_native_enabled</code> is forced on at load and has no switch</td></tr>
     <tr><td>Dev harness</td><td><code>add_ember_dht_contact</code>, <code>ember_dht_ping_peer</code>, <code>ember_dht_find_node</code>, <code>ember_dht_iterative_find_node</code>, <code>ember_dht_publish_keyword</code>, <code>ember_dht_find_value</code>, <code>ember_dht_run_maintenance</code></td></tr>
     <tr><td>Standing work log</td><td><code>docs/ember-dht.md</code></td></tr>
   </tbody>

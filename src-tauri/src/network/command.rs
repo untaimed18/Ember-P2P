@@ -2615,7 +2615,6 @@ async fn handle_command_inner(
             state.stats.tcp_status = format!("{:?}", state.firewall_checker.tcp_status());
             state.stats.udp_status = format!("{:?}", state.firewall_checker.udp_status());
             // EmberDHT status-bar gauges — same sources as GetEmberDiagnostics.
-            state.stats.ember_native_enabled = settings.ember_native_enabled;
             let (ember_contacts, ember_verified) = ember_dht_ui_contact_counts(state);
             state.stats.ember_dht_contacts = ember_contacts;
             state.stats.ember_dht_verified_contacts = ember_verified;
@@ -2643,7 +2642,6 @@ async fn handle_command_inner(
             let mut diag = state.ember_diagnostics.clone();
             mirror_ember_dht_counters(state, &mut diag);
             diag.ember_peers_known = state.known_ember_peers.len() as u32;
-            diag.ember_native_enabled = settings.ember_native_enabled;
             diag.ember_sessions = state.ember_transport.session_count() as u32;
             diag.local_noise_public_key =
                 hex::encode(state.ember_transport.local_noise_public_key());

@@ -187,6 +187,45 @@
           <p>Every Ember release, newest first. These are the same notes published on <a href="https://github.com/untaimed18/Ember-P2P/releases" target="_blank" rel="noopener">GitHub Releases</a>. Ember can also update itself in-app once a signed release is published.</p>
         </div>
 
+        <article class="release" id="release-1-8-1">
+              <div class="release-header">
+                <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.8.1" target="_blank" rel="noopener">Ember v1.8.1</a></h3>
+                <time class="release-date" datetime="2026-11-25">November 25, 2026</time>
+              </div>
+              <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.8.1" target="_blank" rel="noopener"><code>v1.8.1</code></a></p>
+              <div class="release-notes">
+                <p>A fixes release. Cancelling a download that others were taking parts of now stops their uploads at once, Ember no longer uses any library with a published security advisory, and the wording the 1.8.0 checks left is finished in all ten languages.</p>
+
+                <h4>Before you upgrade</h4>
+
+                <ul>
+                  <li><strong>The Ember DHT wire version is unchanged at version 4, and no channel format changes,</strong> so 1.8.1 works with everyone 1.8.0 works with</li>
+                  <li><strong>Secure identification is unchanged on the wire.</strong> Ember&rsquo;s new RSA library makes the same keys and signatures byte for byte, so eMule and Ember peers that already know you see no difference</li>
+                </ul>
+
+                <h4>What&rsquo;s Fixed</h4>
+
+                <ul>
+                  <li><strong>Uploads:</strong> cancelling a download that other users were taking parts of from you stops their uploads at once; the upload used to show and vanish five to ten times first. A peer asking for a file you cancelled, deleted, unshared or made friends-only is told you no longer have it, rather than being put back in the queue for it</li>
+                  <li><strong>Downloads:</strong> Ember stops waiting in a peer&rsquo;s queue as soon as that peer says it no longer has the file, and drops it as a source, as eMule does</li>
+                  <li><strong>KAD:</strong> the firewall tile says <em>Checking</em> until KAD&rsquo;s own check or an eD2K server&rsquo;s answer settles it, rather than <em>Firewalled</em> from what UPnP reported alone</li>
+                  <li><strong>Connect through:</strong> an interface that drops just as Ember goes online is waited for again, rather than reported as the TCP port being in use, which left the session without incoming connections. Shared folders due to be checked while Ember waits for the interface are checked once it is back, and the log no longer calls that a failure</li>
+                  <li><strong>Channels:</strong> a member past the hour&rsquo;s mail allowance no longer holds up the mail of every other conversation. The notice for a channel deleted on another of your devices reads as one sentence with the channel&rsquo;s name in bold, in every language</li>
+                  <li><strong>Feeds:</strong> <em>Share files from this feed</em> works when the download folder is shared only in part or without its subfolders: the feed&rsquo;s folder joins your shared folders and leaves them when the feed stops sharing, and cannot be unshared by hand meanwhile</li>
+                  <li><strong>Deleting files:</strong> Ember names the Trash on Linux and the Recycle Bin on Windows. emberd deletes files outright, since nothing empties a trash on a server, and its pages say so</li>
+                  <li><strong>eMule import:</strong> an Incoming folder Ember cannot use as its download folder says so in your language, rather than in English inside <em>Could not prepare the import</em></li>
+                  <li><strong>File pickers:</strong> the windows for choosing an IP filter, a backup, a media player or a web services list have translated titles and file types</li>
+                  <li><strong>Security:</strong> new versions of SQLite, the updater&rsquo;s zip library and two smaller libraries close their published advisories, and secure identification moves to a new RSA library that closes the Marvin timing attack (RUSTSEC-2023-0071). Every build is now checked for new advisories</li>
+                  <li><strong>Security page:</strong> the security policy&rsquo;s state no longer carries Ember&rsquo;s internal error text to the page, where it could include a file path; it goes to the log</li>
+                </ul>
+
+                <p class="full-changelog">
+                  <strong>Full Changelog</strong>
+                  <a href="https://github.com/untaimed18/Ember-P2P/compare/v1.8.0...v1.8.1" target="_blank" rel="noopener">https://github.com/untaimed18/Ember-P2P/compare/v1.8.0...v1.8.1</a>
+                </p>
+              </div>
+            </article>
+
         <article class="release" id="release-1-8-0">
               <div class="release-header">
                 <h3><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.8.0" target="_blank" rel="noopener">Ember v1.8.0</a></h3>

@@ -164,7 +164,7 @@
   // then completes.
   async function refreshLists() {
     if (unmounted || inFlightLists) return;
-    if (!diag?.ember_native_enabled) {
+    if (!diag) {
       contacts = [];
       contactsLoaded = true;
       searches = [];
@@ -298,7 +298,7 @@
     copyTimer = setTimeout(() => { copiedKey = null; }, 1500);
   }
 
-  let isActive = $derived(!!diag?.ember_native_enabled);
+  let isActive = $derived(diag !== null);
   let versionPeerNewer = $derived(diag?.ember_dht_version_peer_newer ?? 0);
   let versionPeerOlder = $derived(diag?.ember_dht_version_peer_older ?? 0);
   let versionMismatch = $derived(diag?.ember_dht_version_mismatch ?? 0);

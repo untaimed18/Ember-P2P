@@ -1762,8 +1762,8 @@ pub async fn update_settings(
     );
     // Not exposed in Settings UI — always keep friend sessions encrypted.
     settings.friend_session_encryption = true;
-    // Ember overlay is always on. The Settings / Ember-page switches stay
-    // visible but disabled, so a crafted or stale payload cannot turn it off.
+    // Ember overlay is always on and has no switch, so a crafted or stale
+    // payload cannot turn it off.
     settings.ember_native_enabled = true;
     // L20: strip bidi/zero-width/control formatters from the
     // local user's own nickname before it's stored or sent on the

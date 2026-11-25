@@ -335,8 +335,6 @@ export interface NetworkStats {
   public_udp_port?: number;
   public_tcp_port?: number;
   tcp_mapping_hold_ok?: boolean;
-  /** Ember-native Noise overlay enabled — drives the status-bar Ember dot. */
-  ember_native_enabled: boolean;
   /** Live Ember DHT routing-table contacts for the status-bar peer count. */
   ember_dht_contacts: number;
   /** Contacts that have answered us. Used for connected vs still-joining. */
@@ -396,7 +394,6 @@ export interface EmberDiagnostics {
   friend_xfer_inbound_declined?: number;
   relay_sessions_active: number;
   relay_bytes_relayed: number;
-  ember_native_enabled: boolean;
   ember_sessions: number;
   ember_pings_sent: number;
   ember_pings_received: number;

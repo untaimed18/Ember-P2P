@@ -56,7 +56,6 @@ export const networkStats = writable<NetworkStats>({
   public_udp_port: 0,
   public_tcp_port: 0,
   tcp_mapping_hold_ok: false,
-  ember_native_enabled: true,
   ember_dht_contacts: 0,
   ember_dht_verified_contacts: 0,
   stale: false,
@@ -608,7 +607,7 @@ export function cleanupNetworkStore() {
     tcp_status: 'Unknown', udp_status: 'Unknown', nat_type: 'Unknown', ember_peers: 0,
     epx_sources_received: 0, stun_keepalive_active: false,
     public_udp_port: 0, public_tcp_port: 0, tcp_mapping_hold_ok: false,
-    ember_native_enabled: true, ember_dht_contacts: 0, ember_dht_verified_contacts: 0,
+    ember_dht_contacts: 0, ember_dht_verified_contacts: 0,
     stale: false, degraded: false,
     degraded_reason: undefined, last_update_at: 0, last_poll_ok_at: 0,
   } as NetworkStats);
