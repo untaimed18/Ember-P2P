@@ -8,6 +8,10 @@ the desktop app and is driven from a web browser, as aMule's `amuled` is with
 and ARM64, and released with it from 1.8.0: a tarball and a `.deb` for each,
 and a Docker image for both. CI checks, lints and tests it on every push.
 
+**For users:** the website's [emberd page](emberd.html)
+(emberp2p.org/emberd.html) covers installing, setting up and using it. A
+change here that a user would notice belongs there too.
+
 ## What the user gets
 
 - **One program**, `emberd`. It needs no display, GTK or WebKit, runs as a
