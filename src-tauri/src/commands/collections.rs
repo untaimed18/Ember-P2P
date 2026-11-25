@@ -54,13 +54,40 @@ pub async fn load_collection_upload(upload: String) -> Result<Collection, String
     loaded
 }
 
-async fn create_collection_internal(
+/// emberd: a collection made from the Library, left for the browser to save
+/// (`server::saved`), where the desktop app writes it to a path the user picks.
+#[ember_macros::command(server)]
+pub async fn create_collection_for_download(
     name: String,
     author: String,
     files: Vec<CollectionFile>,
-    output_path: String,
     binary: bool,
 ) -> Result<String, String> {
+    let collection = checked_collection(name, author, files)?;
+    let file_name = format!(
+        "{}.{}",
+        crate::security::sanitize_filename(&collection.name),
+        if binary { "emulecollection" } else { "txt" }
+    );
+    let bytes = tokio::task::spawn_blocking(move || collection_bytes(&collection, binary))
+        .await
+        .map_err(|e| coded_ctx("collections_save_task_failed", "Save task failed", e))??;
+    Ok(crate::server::saved::offer(crate::server::saved::Content::Bytes(bytes), &file_name))
+}
+
+/// A collection's bytes in the chosen format.
+fn collection_bytes(collection: &Collection, binary: bool) -> Result<Vec<u8>, String> {
+    if binary {
+        collection
+            .to_binary_bytes()
+            .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))
+    } else {
+        Ok(collection.to_text_bytes().into_bytes())
+    }
+}
+
+/// A collection of `files`, held to the limits its readers enforce.
+fn checked_collection(name: String, author: String, files: Vec<CollectionFile>) -> Result<Collection, String> {
     if name.len() > MAX_COLLECTION_FIELD_LEN {
         return Err(coded_ctx(
             "collections_name_too_long",
@@ -129,11 +156,18 @@ async fn create_collection_internal(
             ));
         }
     }
-    let collection = Collection {
-        name: name.clone(),
-        author,
-        files,
-    };
+    Ok(Collection { name, author, files })
+}
+
+async fn create_collection_internal(
+    name: String,
+    author: String,
+    files: Vec<CollectionFile>,
+    output_path: String,
+    binary: bool,
+) -> Result<String, String> {
+    let collection = checked_collection(name, author, files)?;
+    let name = collection.name.clone();
     let path = std::path::PathBuf::from(&output_path);
     // Reject traversal on the *requested* path: `canonicalize` resolves `..`
     // away, so the same test on its output can never fire.
@@ -183,13 +217,7 @@ async fn create_collection_internal(
     }
     let write_path = canonical.clone();
     tokio::task::spawn_blocking(move || {
-        let bytes = if binary {
-            collection
-                .to_binary_bytes()
-                .map_err(|e| coded_ctx("collections_save_failed", "Failed to save", e))?
-        } else {
-            collection.to_text_bytes().into_bytes()
-        };
+        let bytes = collection_bytes(&collection, binary)?;
         // The user picked the destination themselves, so no approved root
         // applies; keep the crash-safe atomic write.
         crate::security::atomic_write(&write_path, &bytes, false)

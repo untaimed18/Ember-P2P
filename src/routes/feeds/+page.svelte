@@ -29,6 +29,7 @@
     markFeedRead,
     openFeedFolder,
     openFeedItem,
+    saveFeedItem,
     publishFeed,
     refreshFeed,
     setDiscoveredFeedHidden,
@@ -2606,6 +2607,18 @@
                               >
                                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true">
                                   <path d="M2 4.5V12.5h12V6H7.5L6 4.5z"/>
+                                </svg>
+                              </button>
+                            {:else}
+                              <button
+                                type="button"
+                                class="icon-btn"
+                                title={m.server_save_to_computer()}
+                                aria-label={m.server_save_named({ name: item.name })}
+                                onclick={() => void openItem(item, saveFeedItem)}
+                              >
+                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                  <path d="M8 2.5v8"/><path d="M4.5 7 8 10.5 11.5 7"/><path d="M2.5 13.5h11"/>
                                 </svg>
                               </button>
                             {/if}

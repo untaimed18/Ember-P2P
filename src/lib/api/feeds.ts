@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { saveOffered } from '$lib/runtime/web/files';
 
 /** One file in a feed. */
 export interface FeedItem {
@@ -283,6 +284,10 @@ export const openFeedItem = (publisher: string, salt: string, ed2k: string): Pro
 /** Show a followed feed's downloaded file in the file manager, as {@link openFeedItem}. */
 export const showFeedItem = (publisher: string, salt: string, ed2k: string): Promise<void> =>
   invoke('show_feed_item', { publisher, salt, ed2k });
+/** emberd: save a followed feed's downloaded file to this browser's computer,
+ *  found as {@link openFeedItem} finds it. */
+export const saveFeedItem = async (publisher: string, salt: string, ed2k: string): Promise<void> =>
+  saveOffered(await invoke<string>('save_feed_item', { publisher, salt, ed2k }));
 
 /** Walk the public feed index. Shards arrive on {@link FEEDS_FOUND_EVENT}
  *  tagged `walk` as they land; the result is the whole set. */

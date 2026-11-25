@@ -162,6 +162,7 @@ pub fn router(web: Shared, web_root: &Path) -> Router {
         .route("/api/events", get(events))
         .route("/api/media/{*path}", get(media))
         .route("/api/file/{*path}", get(download))
+        .route("/api/saved/{id}", get(saved))
         .route("/api/backup", get(download_backup).post(upload_backup))
         .route("/api/upload", post(upload))
         .fallback_service(files)
@@ -576,6 +577,30 @@ async fn download(State(web): State<Shared>, uri: Uri) -> Response {
     saved_file(file, length, &name, None)
 }
 
+/// What a command left for the browser to save (`super::saved`), sent once.
+async fn saved(uri: Uri) -> Response {
+    let id = uri.path().strip_prefix("/api/saved/").unwrap_or_default();
+    match super::saved::take(id) {
+        Some((super::saved::Content::File(file, length), name)) => saved_file(file, length, &name, None),
+        Some((super::saved::Content::Bytes(bytes), name)) => {
+            let length = bytes.len() as u64;
+            let mut response = Response::new(Body::from(bytes));
+            attachment_headers(response.headers_mut(), length, &name);
+            response
+        }
+        None => refuse(StatusCode::NOT_FOUND, "server_file_unavailable", "Save it again"),
+    }
+}
+
+/// The headers that have the browser save a response as `name`.
+fn attachment_headers(headers: &mut HeaderMap, length: u64, name: &str) {
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    if let Ok(value) = HeaderValue::from_str(&attachment(name)) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+}
+
 /// What [`saved_file`] reads from. `then_remove` goes once the response is
 /// done with it, sent in full or cut off: the server stops reading at the
 /// length it announced, so the end of the file is never seen.
@@ -613,12 +638,7 @@ fn saved_file(file: std::fs::File, length: u64, name: &str, then_remove: Option<
         }
     });
     let mut response = Response::new(Body::from_stream(chunks));
-    let headers = response.headers_mut();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
-    if let Ok(value) = HeaderValue::from_str(&attachment(name)) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
-    }
+    attachment_headers(response.headers_mut(), length, name);
     response
 }
 

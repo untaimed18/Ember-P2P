@@ -242,12 +242,13 @@
   // Silent updates. `supported` is the backend's answer for this install;
   // the status line describes what the saved setting is doing right now.
   // Sharing every release starts with the next update check, which can be an
-  // hour away: run one as soon as the setting is saved on.
+  // hour away: run one as soon as the setting is saved on. emberd, which has
+  // no update check, starts its own when the setting is saved.
   let seedingWasOn: boolean | null = null;
   $effect(() => {
     const on = $appSettings?.seed_ember_releases;
     if (on === undefined) return;
-    if (seedingWasOn === false && on) void checkForUpdates({ silent: true });
+    if (seedingWasOn === false && on && !isServer) void checkForUpdates({ silent: true });
     seedingWasOn = on;
   });
   const silentSupported = $derived($silentUpdate?.supported ?? false);
@@ -6227,9 +6228,6 @@
             </div>
             {/if}
 
-            <!-- Releases are fetched by the desktop app's updater, which emberd
-                 does not have. -->
-            {#if !isServer}
             <div class="field toggle-row">
               <div class="toggle-info">
                 <label class="toggle-title" id="seed-releases-label" for="seed-releases-switch">{m.settings_seed_ember_releases()}</label>
@@ -6242,7 +6240,6 @@
                 ariaDescribedby="seed-releases-hint"
               />
             </div>
-            {/if}
           </div>
         </div>
       </section>

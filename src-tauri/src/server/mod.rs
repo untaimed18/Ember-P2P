@@ -8,6 +8,7 @@ mod auth;
 mod config;
 mod ctl;
 mod http;
+pub(crate) mod saved;
 pub(crate) mod uploads;
 
 use std::path::{Path, PathBuf};
@@ -299,6 +300,18 @@ async fn serve_until_stopped(config: config::Config) -> i32 {
             return 1;
         }
     }
+
+    // emberd has no updater, so sharing every release needs a check of its
+    // own: hourly, as the desktop app's, from a couple of minutes after start.
+    let seed_app = app.clone();
+    tokio::spawn(async move {
+        let first = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut every = tokio::time::interval_at(first, std::time::Duration::from_secs(60 * 60));
+        loop {
+            every.tick().await;
+            crate::release_fetch::seed_newest_release(&seed_app).await;
+        }
+    });
 
     let web = Arc::new(http::Web::new(app.clone(), Arc::new(auth), &config));
     let (stop_web, stop_rx) = tokio::sync::watch::channel(false);

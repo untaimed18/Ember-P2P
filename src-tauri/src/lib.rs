@@ -47,6 +47,7 @@ mod idle;
 mod ipfilter_update;
 mod network;
 mod power;
+mod release_fetch;
 mod release_share;
 mod search;
 pub mod security;

@@ -194,13 +194,23 @@
               </div>
               <p class="release-tag"><a href="https://github.com/untaimed18/Ember-P2P/releases/tag/v1.8.1" target="_blank" rel="noopener"><code>v1.8.1</code></a></p>
               <div class="release-notes">
-                <p>A fixes release. Cancelling a download that others were taking parts of now stops their uploads at once, Ember no longer uses any library with a published security advisory, and the wording the 1.8.0 checks left is finished in all ten languages.</p>
+                <p>Cancelling a download that others were taking parts of now stops their uploads at once, Ember no longer uses any library with a published security advisory, and the eD2K server log and the rest of the wording the 1.8.0 checks left are in all ten languages. And emberd catches up with the desktop app: it saves every file it keeps to your computer, makes collections, imports from an eMule folder you name, and shares every Ember release.</p>
 
                 <h4>Before you upgrade</h4>
 
                 <ul>
                   <li><strong>The Ember DHT wire version is unchanged at version 4, and no channel format changes,</strong> so 1.8.1 works with everyone 1.8.0 works with</li>
                   <li><strong>Secure identification is unchanged on the wire.</strong> Ember&rsquo;s new RSA library makes the same keys and signatures byte for byte, so eMule and Ember peers that already know you see no difference</li>
+                </ul>
+
+                <h4>What&rsquo;s New</h4>
+
+                <h5>emberd</h5>
+                <ul>
+                  <li><strong>Save to this computer for every file emberd keeps:</strong> a followed feed&rsquo;s files, a friend&rsquo;s attachments, and files received in a channel or fetched from its library, where the desktop app has <em>Open</em> and <em>Show in folder</em></li>
+                  <li><strong>Create a collection</strong> in the Library; the browser saves it</li>
+                  <li><strong>Import from an eMule or aMule folder you name,</strong> under the folders the config lists in <code>browse_under</code>. An import on emberd shares only folders under <code>browse_under</code>, takes unfinished downloads only from those or the eMule folder itself, and leaves the download folder to the config. Before, an import found in the usual places was not held to these</li>
+                  <li><strong>Share every Ember release,</strong> in Settings &gt; About: emberd checks for a new release each hour, as the desktop app does, and shares its installers, collection and notes once each checks out against the release signature</li>
                 </ul>
 
                 <h4>What&rsquo;s Fixed</h4>

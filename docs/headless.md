@@ -225,6 +225,14 @@ into shared code fails to build there.
   player, with the desktop's `ember-media` checks.
 - `GET /api/file/{path}` is *Save to this computer*: only a file in the library
   index, opened through an approved folder, sent as an attachment.
+- `GET /api/saved/{id}` is *Save to this computer* for what the library index
+  does not hold: a followed feed's file (`save_feed_item`), a friend's
+  attachment (`save_chat_attachment`), a file received in a room or fetched
+  from its library (`save_channel_transfer`), and a collection made in the
+  Library (`create_collection_for_download`). Each command finds its file as
+  its desktop twin finds what it opens, and leaves it under a one-time id the
+  page fetches at once; an id is sent once and lapses unfetched after two
+  minutes.
 - `GET /api/backup` downloads the backup `export_backup_for_download` just
   made, once; `POST /api/backup` receives one to restore, which Settings then
   inspects and restores as it would a picked file.
@@ -342,14 +350,21 @@ the desktop app, from opening the same data.
   nothing on a server empties a trash.
 - Keeping the computer awake, and *When downloads finish*.
 - *Open file*, *Show in folder*, *Open log folder* and the external player:
-  *Save to this computer*, the in-page player, and the log path shown in
-  About.
+  *Save to this computer* (for the Library, finished downloads, followed
+  feeds' files, friends' attachments and files received in rooms), the
+  in-page player, and the log path shown in About.
 - Native pickers: the config file for folders, and a file sent from the
   browser for everything else that opens a file: a backup, an IP filter, a
-  collection, a web services list, and a file for a friend or a room.
-  Creating a collection, and importing from eMule's folder, are not offered.
+  collection, a web services list, and a file for a friend or a room. A
+  collection made in the Library is saved by the browser. eMule's or aMule's
+  folder is typed, under `browse_under`, and an import there shares only
+  folders under `browse_under`, takes unfinished downloads only from them or
+  the eMule folder itself, and never sets the download folder, which is the
+  config's.
 - Silent updates and the in-app installer: emberd is updated the way it was
-  installed.
+  installed. *Share every Ember release* works as on the desktop, from a check
+  of its own each hour (`release_fetch::seed_newest_release`) with the
+  manifest and every file verified as the updater verifies them.
 - The Windows Firewall fix, the AppImage font workaround, and dragging files
   onto the Library.
 
@@ -387,8 +402,6 @@ the desktop app, from opening the same data.
 - **A security review by a person** who did not write the interface. It has
   had an automated one, by a reviewer that was not its author, besides the
   fuzzing and the tests under load below.
-- **Importing from eMule's folder** and **creating a collection** from the
-  browser, which both pick folders.
 
 ## Testing
 

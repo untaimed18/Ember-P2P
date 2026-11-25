@@ -66,6 +66,36 @@ pub async fn pick_emule_folder(
         })
 }
 
+/// emberd: an eMule or aMule folder on the server, typed in the browser, as
+/// [`pick_emule_folder`] chooses one natively. Only under the folders its
+/// config lists in `browse_under`, the bound the share browser keeps to.
+#[ember_macros::command(server)]
+pub async fn choose_emule_folder_path(path: String) -> Result<EmuleInstall, String> {
+    let not_allowed = || {
+        coded(
+            "emule_import_folder_not_allowed",
+            "emberd can only use folders under the ones its config lists in browse_under",
+        )
+    };
+    if path.len() > 4096 || crate::security::is_network_path(&path) {
+        return Err(not_allowed());
+    }
+    let path = std::path::PathBuf::from(path.trim());
+    tokio::task::spawn_blocking(move || {
+        if crate::commands::share_browser::outside_browse_roots(&path) {
+            return Err(not_allowed());
+        }
+        emule_import::register_source(&path).ok_or_else(|| {
+            coded(
+                "emule_import_not_an_emule_folder",
+                "That folder has no eMule or aMule settings in it",
+            )
+        })
+    })
+    .await
+    .map_err(task_failed)?
+}
+
 fn parse_hash(hex_hash: &str) -> Option<[u8; 16]> {
     hex::decode(hex_hash).ok()?.try_into().ok()
 }
@@ -106,6 +136,10 @@ pub async fn preview_emule_import(
         shared_folders,
         downloading,
         library,
+        #[cfg(feature = "server")]
+        bounds: Some(crate::server::browse_under()),
+        #[cfg(not(feature = "server"))]
+        bounds: None,
     };
     tokio::task::spawn_blocking(move || emule_import::scan(source_id, &ctx))
         .await

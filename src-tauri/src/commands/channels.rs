@@ -7143,6 +7143,38 @@ pub async fn list_channel_transfers(
     await_reply(rx, "channels_xfer_failed", "No response from network").await
 }
 
+/// emberd: a file a room member sent here, or one fetched from a room's
+/// library, left for the browser to save (`server::saved`). Confined to the
+/// Channel Files of a download folder, where every receive lands, and
+/// re-resolved now rather than trusted.
+#[ember_macros::command(server)]
+pub async fn save_channel_transfer(state: crate::host::State<'_, AppState>, xfer_id: String) -> Result<String, String> {
+    let xfer_id = parse_xfer_id(&xfer_id)?;
+    let landed = crate::network::landed_receive(&xfer_id)
+        .ok_or_else(|| coded("channels_xfer_not_found", "That file is no longer here"))?;
+    let roots = state.config.read().await.settings.download_folders().roots();
+    let canonical = tokio::task::spawn_blocking(move || {
+        let dir = crate::network::ember::xfer::CHANNEL_FILES_DIR;
+        let canonical = crate::security::filesystem::verify_recorded_file(&landed, &roots, dir)
+            .map_err(|e| coded_ctx("transfers_invalid_path", "Invalid or changed download path", e))?;
+        if canonical
+            .parent()
+            .is_some_and(|parent| crate::security::filesystem::is_landing_dir(parent, dir))
+        {
+            Ok(canonical)
+        } else {
+            Err(coded("transfers_invalid_path", "Invalid or changed download path"))
+        }
+    })
+    .await
+    .map_err(|e| coded_ctx("channels_task_error", "Task error", e))??;
+    let name = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    crate::server::saved::offer_file(canonical, &name).await
+}
+
 fn parse_xfer_id(hex_str: &str) -> Result<[u8; 16], String> {
     let canonical = hex_str.trim().to_ascii_lowercase();
     let bytes = hex::decode(&canonical)

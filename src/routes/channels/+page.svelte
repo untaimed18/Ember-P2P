@@ -96,6 +96,7 @@
     listChannelMembers,
     markChannelMessagesRead,
     openChannelFilesFolder,
+    saveChannelTransfer,
     channelPresenceConfig,
     setChannelFocus,
     pickAndOfferChannelTransfer,
@@ -4905,6 +4906,17 @@
                               void openChannelFilesFolder().catch((e) => toastError(translateError(e)))}
                           >
                             {m.chat_attach_show()}
+                          </button>
+                        </div>
+                      {:else if t.status === 'complete' && t.direction === 'receive'}
+                        <div class="xfer-actions">
+                          <button
+                            type="button"
+                            class="secondary"
+                            onclick={() =>
+                              void saveChannelTransfer(t.xfer_id).catch((e) => toastError(translateError(e)))}
+                          >
+                            {m.server_save_to_computer()}
                           </button>
                         </div>
                       {/if}

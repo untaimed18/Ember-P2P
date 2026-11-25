@@ -2195,6 +2195,9 @@ pub(super) async fn apply_xfer_finish(
         if let Some(sender) = ember::crypto::node_id_from_ed25519_bytes(&result.peer) {
             credit_manager.write().await.add_downloaded_over_ember(&sender, result.size);
         }
+        if let Some(landed) = result.final_path.clone() {
+            note_landed_receive(result.xfer_id, landed);
+        }
     }
     // Tell the sender how it ended either way. It has no other way to find
     // out: it answers requests and then hears nothing, so without this its
@@ -2249,6 +2252,38 @@ pub(super) fn remember_declined_xfer(
     finished_xfers()
         .lock()
         .record(xfer_id, channel_id, peer, reply, std::time::Instant::now());
+}
+
+/// Receives completed this session, newest last, and where each landed.
+/// emberd's "Save to this computer" (`commands::channels::save_channel_transfer`)
+/// reads it; nothing records the path anywhere else. A room's transfers list
+/// shows a completed receive only until the page reloads, which an emberd
+/// restart makes it do, so this needs to outlast one page's session alone.
+const LANDED_RECEIVES_KEPT: usize = 1024;
+
+fn landed_receives() -> &'static parking_lot::Mutex<std::collections::VecDeque<([u8; 16], std::path::PathBuf)>> {
+    static LANDED: std::sync::OnceLock<parking_lot::Mutex<std::collections::VecDeque<([u8; 16], std::path::PathBuf)>>> =
+        std::sync::OnceLock::new();
+    LANDED.get_or_init(Default::default)
+}
+
+fn note_landed_receive(xfer_id: [u8; 16], landed: std::path::PathBuf) {
+    let mut landed_receives = landed_receives().lock();
+    landed_receives.retain(|(id, _)| *id != xfer_id);
+    if landed_receives.len() >= LANDED_RECEIVES_KEPT {
+        landed_receives.pop_front();
+    }
+    landed_receives.push_back((xfer_id, landed));
+}
+
+/// Where the receive `xfer_id` landed, if it completed this session.
+#[cfg(feature = "server")]
+pub(crate) fn landed_receive(xfer_id: &[u8; 16]) -> Option<std::path::PathBuf> {
+    landed_receives()
+        .lock()
+        .iter()
+        .find(|(id, _)| id == xfer_id)
+        .map(|(_, path)| path.clone())
 }
 
 /// Receives that have ended here, with the verdict their sender was sent.

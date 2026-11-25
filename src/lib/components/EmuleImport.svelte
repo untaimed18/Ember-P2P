@@ -13,6 +13,7 @@
     getEmuleImportReport,
     pendingEmuleImport,
     pickEmuleFolder,
+    chooseEmuleFolderPath,
     previewEmuleImport,
     stageEmuleImport,
     type EmuleDownload,
@@ -189,6 +190,21 @@
     }
   }
 
+  /** emberd: the folder typed in, where the desktop app picks one. */
+  let serverPath = $state('');
+  async function readServerFolder() {
+    const path = serverPath.trim();
+    if (!path || reading || staging) return;
+    error = '';
+    try {
+      const chosen = await chooseEmuleFolderPath(path);
+      installs = [...installs.filter((i) => i.id !== chosen.id), chosen];
+      await load(chosen);
+    } catch (e) {
+      error = translateError(e, m.emule_import_read_failed());
+    }
+  }
+
   function currentSelection(): EmuleImportSelection | null {
     if (!preview) return null;
     return {
@@ -281,6 +297,7 @@
       case 'covered': return m.emule_import_folder_covered();
       case 'already_shared': return m.emule_import_folder_already();
       case 'contains_shared': return m.emule_import_folder_contains_shared();
+      case 'outside_server': return m.emule_import_folder_outside_server();
       default: return '';
     }
   }
@@ -291,6 +308,7 @@
       case 'already_downloading': return m.emule_import_download_already();
       case 'already_have': return m.emule_import_download_have();
       case 'in_use': return m.emule_import_download_in_use();
+      case 'outside_server': return m.emule_import_download_outside_server();
       default: return '';
     }
   }
@@ -338,26 +356,44 @@
     </div>
   {/if}
 
+  {#snippet serverFolderForm()}
+    <form class="folder-input" onsubmit={(e) => { e.preventDefault(); void readServerFolder(); }}>
+      <input
+        bind:value={serverPath}
+        placeholder={preview?.source.path ?? m.channels_library_server_path()}
+        aria-label={m.emule_import_folder_label()}
+        spellcheck="false"
+        autocomplete="off"
+      />
+      <button type="submit" class="folder-btn" disabled={reading || staging || !serverPath.trim()}>
+        {m.emule_import_read_folder()}
+      </button>
+    </form>
+  {/snippet}
+
   {#if mode === 'settings'}
     <!-- The same read-only path and Browse pair as the download folder: the
-         folder comes from the picker or detection, never from typing. -->
+         folder comes from the picker or detection, never from typing, except
+         on emberd, whose folder is typed and kept under browse_under. -->
     <div class="group">
       <h4 class="subsection-title">{m.emule_import_group_source()}</h4>
       <div class="row">
         <span class="row-label">{m.emule_import_folder_label()}</span>
-        <div class="folder-input">
-          <input
-            readonly
-            value={preview?.source.path ?? ''}
-            placeholder={detecting ? m.emule_import_detecting() : ''}
-            aria-label={m.emule_import_folder_label()}
-          />
-          {#if !isServer}
+        {#if isServer}
+          {@render serverFolderForm()}
+        {:else}
+          <div class="folder-input">
+            <input
+              readonly
+              value={preview?.source.path ?? ''}
+              placeholder={detecting ? m.emule_import_detecting() : ''}
+              aria-label={m.emule_import_folder_label()}
+            />
             <button type="button" class="folder-btn" onclick={pickFolder} disabled={reading || staging}>
               {m.settings_browse()}
             </button>
-          {/if}
-        </div>
+          </div>
+        {/if}
         {#if reading}
           <span class="hint">{m.emule_import_reading()}</span>
         {:else if preview}
@@ -418,6 +454,8 @@
         <button type="button" class="ghost" onclick={pickFolder} disabled={reading || staging}>
           {m.emule_import_choose()}
         </button>
+      {:else if !preview}
+        {@render serverFolderForm()}
       {/if}
     </div>
   {/if}
@@ -641,7 +679,8 @@
             <ToggleSwitch bind:checked={wantPreferences} ariaLabel={m.emule_import_preferences_toggle()} />
           </div>
         {/if}
-        {#if preview.incoming_dir}
+        <!-- emberd's download folder is its config's. -->
+        {#if preview.incoming_dir && !isServer}
           <div class="toggle-row">
             <div class="toggle-info">
               <span class="toggle-title">{m.emule_import_incoming()}</span>

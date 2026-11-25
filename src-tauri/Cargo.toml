@@ -131,7 +131,7 @@ sha2 = "0.10"
 base64 = "0.22"
 minisign-verify = "0.2.5"
 semver = "1"
-url = "2"
+url = { version = "2", features = ["serde"] }
 igd-next = { version = "0.17", features = ["aio_tokio"] }
 socket2 = "0.6"
 tracing-appender = "0.2"

@@ -2171,6 +2171,12 @@ pub async fn update_settings(
 
     crate::sharing::disk::set_hash_at_low_priority(settings.hash_low_priority);
     crate::release_share::configure(&settings);
+    // emberd has no update check for sharing to start at, so it starts now.
+    #[cfg(feature = "server")]
+    if settings.seed_ember_releases && !old_settings.seed_ember_releases {
+        let app = app.clone();
+        crate::host::async_runtime::spawn(async move { crate::release_fetch::seed_newest_release(&app).await });
+    }
     // The folders of feeds that share their files follow the download folder.
     if settings.download_folder != old_settings.download_folder
         && !crate::sharing::feed_downloads::sharing_folders().is_empty()

@@ -190,6 +190,8 @@ pub(crate) use self::downloads::{
     apply_transfer_completion_write, apply_transfer_status_write, transfer_status_write_clock,
     TransferStatusWriteClock,
 };
+#[cfg(feature = "server")]
+pub(crate) use self::channel_xfer::landed_receive;
 pub(crate) use self::friends::{deliver_friend_request_verdict, FriendRequestVerdict};
 pub use self::search::SearchMoreOutcome;
 pub(crate) use self::search::clip_note_comment;

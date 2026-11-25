@@ -179,26 +179,15 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   time.
 - **`emberd`,** the headless build for servers, NAS boxes and Docker, ships
   with 1.8.0: tarballs and `.deb`s for x86-64 and ARM64 and a Docker image,
-  with `emberd ctl`, uploads from the browser and browser notifications. Left,
-  as listed under *Still to do* in [headless.md](headless.md): a security
-  review by a person who did not write it, and importing from eMule's folder
-  and creating a collection from the browser. Then the desktop can offer the
-  same web interface behind a switch, as *Decisions* there describes. Its
-  server-side host types also give tests of the network loop an event sink
-  without Tauri's `test` feature (see *Split `NetworkState` per stack* below).
-  Found by the 1.8.0 checks, and hidden in the browser for now rather than
-  built:
-  - *Save to this computer* for what emberd keeps outside the Library: feed
-    downloads (Feeds' Open, Show in folder and Open feed folder call
-    `#[desktop]` commands), received chat attachments and room-library
-    fetches. `/api/file` serves indexed files only, and these are never
-    indexed; extending `open_library_file_for_download` to the feed and
-    receive folders is the likely route.
-  - *Share every Ember release* (`seed_ember_releases`): `release_share.rs`
-    holds the setting and the seed folder, but the fetch is driven from
-    `commands/updater.rs`, which emberd does not build. A server that stays on
-    is what the switch is for, so move the release fetch out of the desktop
-    updater.
+  with `emberd ctl`, uploads from the browser and browser notifications. 1.8.1
+  adds *Save to this computer* for feeds' files, attachments and files
+  received in rooms, collections, eMule import from a typed folder, and
+  release sharing. Left, as listed under *Still to do* in
+  [headless.md](headless.md): a security review by a person who did not write
+  it. Then the desktop can offer the same web interface behind a switch, as
+  *Decisions* there describes. Its server-side host types also give tests of
+  the network loop an event sink without Tauri's `test` feature (see *Split
+  `NetworkState` per stack* below).
 
 ## 6. Code health
 
@@ -247,8 +236,11 @@ Detail for every item here is in `ember-dht.md`: "Outstanding work" items 1,
   the one for blocking a friend. Since then, new in every language by
   machine: the deleted-elsewhere banner as a whole sentence, the eMule
   import's refused Incoming folder, the file pickers' titles and filter
-  names, the Linux wording of the delete texts (`*_trash`), and the eD2K
-  server log (`server_log_*`, the reasons as `server_log_reason_*`).
+  names, the Linux wording of the delete texts (`*_trash`), the eD2K
+  server log (`server_log_*`, the reasons as `server_log_reason_*`), and
+  emberd's eMule import notes and named Save button
+  (`emule_import_*_outside_server`, `emule_import_read_folder`,
+  `server_save_named`).
 
 ## 8. Left from the 1.8.0 checks
 

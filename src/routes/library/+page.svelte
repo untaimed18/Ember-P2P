@@ -4562,9 +4562,7 @@
         {m.library_open_collection()}
       {/if}
     </button>
-    {#if !isServer}
-      <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
-    {/if}
+    <button class="ghost" onclick={() => openCreateDialog()}>{m.library_create_collection()}</button>
     <button class="ghost" onclick={() => (categoriesOpen = true)} title={m.transfers_categories_subtitle()}>{m.library_categories_button()}</button>
     <button class="ghost" onclick={handleReload} disabled={reloading}>{m.library_reload()}</button>
   </div>
