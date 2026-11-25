@@ -45,7 +45,7 @@ library.
 ### With the .deb (Debian, Ubuntu)
 
 ```sh
-sudo apt install ./emberd_1.8.0_amd64.deb
+sudo apt install ./emberd_*_amd64.deb
 sudo nano /etc/emberd/emberd.toml       # the folders, and where it listens
 sudo systemctl enable --now emberd
 journalctl -u emberd                    # the setup code for the first visit
